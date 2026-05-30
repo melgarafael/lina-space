@@ -7,8 +7,8 @@
 
 | Story | Crate | Status | Dono | Critério de aceite (resumo) |
 |---|---|---|---|---|
-| W0-1 PTY Manager | `lina-pty` | 🔲 a fazer | — | 8 PTYs concorrentes, PID distinto, 3 SOs |
-| W0-2 VtBackend + alacritty | `lina-vt` | 🔲 a fazer | — | grid célula-a-célula; bracketed-paste mode; damage |
+| W0-1 PTY Manager | `lina-pty` | ✅ done (Mac) | LLM Engineer | 4 testes ok · 8 PTYs PID distinto · single-owner |
+| W0-2 VtBackend + alacritty | `lina-vt` | ✅ done | Arquiteto | 6 testes ok · grid célula-a-célula · bracketed-paste · damage |
 | W0-3 pty-host isolado | `lina-core` | 🔲 a fazer | — | flow-control segura RAM; panic isola painel |
 | W0-4 Workspace Bus / Supervisor | `lina-core` | 🔲 a fazer | — | writes seriais sem interleave; ciclo detectado |
 | W0-5 Event Store | `lina-core` | 🔲 a fazer | — | replay determinístico (hash igual 2x) |

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Porta de futuro (CLAUDE.md): backend libghostty-vt. DESLIGADA na Onda 0.
+ghostty = []
+
 [dependencies]
 thiserror.workspace = true
-# TODO(W0-2): alacritty_terminal (git-pin) por trás da trait VtBackend.
+alacritty_terminal = "0.26"
