@@ -8,6 +8,9 @@ members = [
     "crates/lina-secrets",
     "crates/lina-cli-profiles",
 ]
+# Spikes da Onda 1 (gpui vs Slint): crates EXPERIMENTAIS fora do workspace —
+# um spike que nao compila nao pode derrubar o build do core.
+exclude = ["spikes/spike-gpui", "spikes/spike-slint"]
 
 [workspace.package]
 version = "0.0.1"

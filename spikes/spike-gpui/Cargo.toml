@@ -1,0 +1,12 @@
+[package]
+name = "spike-gpui"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Spike W1-1 — gpui (pré-1.0, git-pin de zed-industries/zed). EXPERIMENTAL.
+# Reusa o terminal real do core via path.
+[dependencies]
+lina-pty = { path = "../../crates/lina-pty" }
+lina-vt = { path = "../../crates/lina-vt" }
+# TODO(W1-1): gpui (git rev pinado) + accesskit. Documentar o esforço de fazer compilar.

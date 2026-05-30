@@ -1,0 +1,12 @@
+[package]
+name = "spike-slint"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# Spike W1-2 — Slint (release estável; a11y via AccessKit por feature flag). EXPERIMENTAL.
+# Reusa o terminal real do core via path.
+[dependencies]
+lina-pty = { path = "../../crates/lina-pty" }
+lina-vt = { path = "../../crates/lina-vt" }
+# TODO(W1-2): slint (versão estável) + composição de wgpu::Texture. Documentar o esforço.
