@@ -1,0 +1,24 @@
+[package]
+name = "lina-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# Secret Vault (W0-7): cofre nativo do SO. Backend escolhido por plataforma
+# abaixo — o core do crate fica atrás da trait `SecretStore`, então os testes
+# rodam headless com um backend em memória (sem Keychain real, sem prompt).
+keyring = { version = "3", default-features = false }
+# Entropia do SO para o secret de webhook auto-gerado (consumido depois pelo
+# nó-Gatilho). Sem CSPRNG na std — `getrandom` é o primitivo cross-platform.
+getrandom = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }

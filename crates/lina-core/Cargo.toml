@@ -12,4 +12,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+serial_test = "3.4.0"
 # TODO: tokio (bus), rusqlite (event store), serde/serde_json (envelope) — ao implementar W0-4/W0-5.

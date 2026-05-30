@@ -1,0 +1,12 @@
+[package]
+name = "lina-cli-profiles"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# W0-8: CLI Profiles declarativos. serde+toml ficam locais a ESTE crate (escopo da story);
+# não entram no workspace raiz. Versões explícitas, alinhadas ao Cargo.lock (serde 1.0.228, toml 0.9.x).
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"

@@ -1,0 +1,33 @@
+# CLI Profile — Claude Code (Anthropic) · story W0-8
+#
+# Toda a especificidade deste CLI vive AQUI (TOML), nunca compilada no core
+# (CLAUDE.md §Neutralidade multi-CLI). Trocar de CLI = trocar de profile.
+
+# Identificador estável (chave no registry). Um profile custom de mesmo id
+# (no diretório do usuário) sobrescreve este default.
+id = "claude-code"
+
+# Único ponto que conhece o binário. Args ficam aqui, fora do core.
+program = "claude"
+# Saída estruturada linha-a-linha (parse incremental no PTY vivo).
+args = ["--output-format", "stream-json", "--verbose"]
+
+# Entrega A2A faseada (CLAUDE.md §A2A): bracketed-paste -> submit_delay -> Enter
+# (0x0D) enviado SEPARADO, em fila serial por terminal.
+delivery = "pty_inject"
+submit_delay_ms = 300
+
+# Heurística "prompt pronto para receber input": uma linha começando com o glifo
+# de prompt da TUI (> ou ❯). String literal TOML (aspas simples) p/ não escapar o
+# regex. Compilação/validação do regex no load é incremento de W0-9.
+prompt_ready_regex = '(?m)^\s*[>❯]\s'
+
+# Fim-de-resposta (consumido por W0-10): no modo stream-json o Claude Code encerra
+# a resposta com uma linha JSON de tipo "result" ({"type":"result","subtype":...}).
+[end_signal]
+kind = "stream_json"
+event_type = "result"
+
+# Janela de quietude (ms) p/ heurística de idle e timeout do `ask` A2A (W0-9/W0-10).
+idle_ms = 1500
+ask_timeout_ms = 120000

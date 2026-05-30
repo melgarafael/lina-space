@@ -5,6 +5,8 @@ members = [
     "crates/lina-vt",
     "crates/lina-core",
     "crates/lina-host",
+    "crates/lina-secrets",
+    "crates/lina-cli-profiles",
 ]
 
 [workspace.package]
