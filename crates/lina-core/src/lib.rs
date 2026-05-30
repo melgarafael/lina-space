@@ -37,6 +37,13 @@ pub use events::{
     apply, DomainEvent, EventRecord, EventStore, ProjectedNode, ProjectedState, StoreError,
 };
 
+/// Entrega A2A faseada (W0-9) + contrato de fim-de-resposta (W0-10).
+mod a2a;
+pub use a2a::{
+    build_paste, deliver_a2a, sanitize_paste, A2aError, DeliveryOutcome, EndDetector, EndOutcome,
+    EndResult, GridSense, InjectPolicy,
+};
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para
@@ -428,7 +435,7 @@ impl Drop for PtyHost {
 
 /// Recupera o guard mesmo se o mutex estiver envenenado (um terminal pode ter
 /// entrado em panic segurando o lock; queremos seguir vivos, não propagar).
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -1091,7 +1098,9 @@ impl Supervisor {
             .ok_or(SupervisorError::LockTimeout(node))
     }
 
-    fn enqueue(&self, node: NodeId, op: WriteOp) -> Result<(), SupervisorError> {
+    /// Enfileira um `WriteOp` na fila SERIAL do terminal (1 consumidor → sem
+    /// interleave de bytes). Base da entrega A2A faseada de W0-9 (ver `a2a::deliver_a2a`).
+    pub fn enqueue_write(&self, node: NodeId, op: WriteOp) -> Result<(), SupervisorError> {
         let map = lock(&self.terminals);
         let tc = map.get(&node).ok_or(SupervisorError::NodeNotFound(node))?;
         tc.tx
@@ -1107,12 +1116,12 @@ impl Supervisor {
         timeout: Duration,
     ) -> Result<(), SupervisorError> {
         let _g = self.lock_pty(node, Writer::Human, timeout)?;
-        self.enqueue(node, WriteOp::HumanKeys(keys.to_vec()))
+        self.enqueue_write(node, WriteOp::HumanKeys(keys.to_vec()))
     }
 
-    /// Injeção de agente: transação atômica (lock lógico → `AgentText` → `Submit` →
-    /// solta). O delay faseado real (W0-9) é do consumidor/CLI Profile; aqui a
-    /// ATOMICIDADE garante que o humano nunca entre entre o texto e o Enter.
+    /// Injeção de agente SIMPLES (texto cru + Enter), atômica sob o lock lógico. A
+    /// entrega A2A faseada completa (bracketed-paste sanitizado + `submit_delay` +
+    /// Enter separado, conforme CLI Profile) é `a2a::deliver_a2a` (W0-9).
     pub fn inject_agent(
         &self,
         target: NodeId,
@@ -1121,14 +1130,14 @@ impl Supervisor {
         timeout: Duration,
     ) -> Result<(), SupervisorError> {
         let _g = self.lock_pty(target, Writer::Agent(from), timeout)?;
-        self.enqueue(
+        self.enqueue_write(
             target,
             WriteOp::AgentText {
                 from,
                 bytes: text.to_vec(),
             },
         )?;
-        self.enqueue(target, WriteOp::Submit { from: Some(from) })
+        self.enqueue_write(target, WriteOp::Submit { from: Some(from) })
     }
 
     /// Log das ops já aplicadas no terminal (observabilidade/teste).
