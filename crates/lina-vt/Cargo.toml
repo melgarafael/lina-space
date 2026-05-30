@@ -1,0 +1,9 @@
+[package]
+name = "lina-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# TODO(W0-2): alacritty_terminal (git-pin) por trás da trait VtBackend.

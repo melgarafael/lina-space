@@ -1,0 +1,10 @@
+[package]
+name = "lina-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+# TODO(W0-1): portable-pty vendorizado (patch 3 flags ConPTY). Adicionar ao vendorizar.

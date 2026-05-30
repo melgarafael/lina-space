@@ -1,0 +1,15 @@
+[package]
+name = "lina-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lina-pty = { path = "../lina-pty" }
+lina-vt = { path = "../lina-vt" }
+lina-host = { path = "../lina-host" }
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+# TODO: tokio (bus), rusqlite (event store), serde/serde_json (envelope) — ao implementar W0-4/W0-5.

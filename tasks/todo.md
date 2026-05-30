@@ -1,0 +1,23 @@
+# Lina Space — Plano de Construção (Onda 0)
+
+> Painel compartilhado. Backlog canônico: vault `Debriefing Vibe Coding/32 - Epico Fase 0 (MVP)`.
+> Gate de saída da Onda 0: core roda **headless nos 3 SOs**, abre N PTYs, injeta A2A faseada, recupera de `kill -9`.
+
+## Onda 0 — Core framework-agnóstico (Trilho A)
+
+| Story | Crate | Status | Dono | Critério de aceite (resumo) |
+|---|---|---|---|---|
+| W0-1 PTY Manager | `lina-pty` | 🔲 a fazer | — | 8 PTYs concorrentes, PID distinto, 3 SOs |
+| W0-2 VtBackend + alacritty | `lina-vt` | 🔲 a fazer | — | grid célula-a-célula; bracketed-paste mode; damage |
+| W0-3 pty-host isolado | `lina-core` | 🔲 a fazer | — | flow-control segura RAM; panic isola painel |
+| W0-4 Workspace Bus / Supervisor | `lina-core` | 🔲 a fazer | — | writes seriais sem interleave; ciclo detectado |
+| W0-5 Event Store | `lina-core` | 🔲 a fazer | — | replay determinístico (hash igual 2x) |
+| W0-6 Recuperação pós-crash visível | `lina-core` | 🔲 a fazer | — | reconstrói após kill -9, banner |
+| W0-7 Secret Vault | `lina-secrets` | 🔲 a fazer | — | segredo no keyring por SO; zero em claro |
+| W0-8 CLI Profiles TOML | `lina-cli-profiles` | 🔲 a fazer | — | delivery/submit_delay/prompt_ready_regex/end_signal |
+| W0-9 Entrega A2A faseada | `lina-core` | 🔲 a fazer | — | bracketed-paste → delay → Enter separado; fila serial |
+| W0-10 Fim-de-resposta | `lina-core` | 🔲 a fazer | — | result > idle(grid) > timeout, com guards |
+| W0-11 trait UiHost | `lina-host` | 🟡 esqueleto | — | core não importa toolkit; shell dummy implementa |
+
+## Log
+- Scaffold do workspace criado (CLAUDE.md, Cargo workspace, 4 crates stub que compilam).
