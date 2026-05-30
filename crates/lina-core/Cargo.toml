@@ -12,7 +12,9 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# W0-4: pub/sub in-process do Workspace Bus (broadcast usável sem runtime: send + try_recv).
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 serial_test = "3.4.0"
-# TODO: tokio (bus), rusqlite (event store), serde/serde_json (envelope) — ao implementar W0-4/W0-5.
+# TODO: rusqlite (event store), serde/serde_json (envelope JSON na fronteira) — W0-5.

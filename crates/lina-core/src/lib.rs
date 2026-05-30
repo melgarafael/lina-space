@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use lina_pty::{PtyError, PtyManager};
 use thiserror::Error;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Re-exports do contrato de UI para os consumidores do core.
@@ -44,6 +45,39 @@ pub struct A2aEnvelope {
     pub intent: Option<String>,
     pub hops: u8,
     pub await_reply: bool,
+    /// Caminho percorrido — base da detecção de loop de mensagem. Começa em `[from]`.
+    pub trace: Vec<NodeId>,
+    /// Hop-count restante (anti-loop). Ao chegar a 0, a mensagem é dropada.
+    pub ttl: u8,
+}
+
+/// TTL default de um envelope (hop-count máximo antes de dropar por loop).
+pub const DEFAULT_TTL: u8 = 6;
+
+impl A2aEnvelope {
+    /// Novo envelope com id `msg_<UUID v7>` (ordenável por tempo, semântica ULID) e
+    /// `trace` iniciado em `from`.
+    #[must_use]
+    pub fn new(from: NodeId, to: Recipient, intent: Option<String>) -> Self {
+        Self {
+            id: format!("msg_{}", Uuid::now_v7()),
+            root_cause_id: None,
+            from,
+            to,
+            intent,
+            hops: 0,
+            await_reply: false,
+            trace: vec![from],
+            ttl: DEFAULT_TTL,
+        }
+    }
+
+    /// Marca o envelope como bloqueante (espera `reply` correlacionado).
+    #[must_use]
+    pub fn awaiting(mut self) -> Self {
+        self.await_reply = true;
+        self
+    }
 }
 
 /// Endereçamento de mensagem: nó específico, papel (late-bound) ou broadcast.
@@ -522,7 +556,862 @@ fn flush(
     });
 }
 
-// TODO(W0-4): Workspace Bus / Supervisor (NodeRegistry, MailQueues serial, wait-for-graph).
+// ════════════════════════ Workspace Bus / Supervisor (W0-4) ════════════════════════
+//
+// O broker in-process que torna "estar no workspace = estar conectado": roster de nós
+// (NodeRegistry), 1 fila SERIAL de escrita por terminal (humano e agente nunca
+// interleavam bytes no master), locks lógicos de PTY com timeout, wait-for-graph
+// (detecta ciclo de `ask` sem travar), endereçamento node|role|broadcast com papel
+// late-bound, e pub/sub in-process (tokio::sync::broadcast). Ver [[20 - Arquitetura
+// Tecnica]] §3 e [[47 - R2 LLM Engineer]] §1.
+
+/// Estado de um nó no roster (presença = `status != Dead`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeStatus {
+    Starting,
+    Running,
+    Idle,
+    Busy,
+    Blocked,
+    Dead,
+}
+
+impl NodeStatus {
+    /// Presença: o nó está vivo (qualquer estado menos `Dead`).
+    #[must_use]
+    pub fn is_alive(self) -> bool {
+        self != NodeStatus::Dead
+    }
+    /// Disponível para receber trabalho (preferido na resolução `first-idle`).
+    #[must_use]
+    pub fn is_available(self) -> bool {
+        matches!(
+            self,
+            NodeStatus::Idle | NodeStatus::Running | NodeStatus::Starting
+        )
+    }
+}
+
+/// Linha do roster: id (UUID v7), nome, papel (lido do nome — doc 21) e status.
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub id: NodeId,
+    pub name: String,
+    pub role: Option<String>,
+    pub status: NodeStatus,
+}
+
+/// Política de resolução de endereço por papel (late-bound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolePolicy {
+    /// Primeiro nó disponível (idle/running/starting); senão o primeiro vivo.
+    FirstIdle,
+    /// Rodízio entre os nós vivos do papel.
+    RoundRobin,
+    /// Todos os nós vivos do papel.
+    All,
+}
+
+/// Quem escreve no master (para a fila serial e o lock lógico).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writer {
+    Human,
+    Agent(NodeId),
+}
+
+/// Operação de escrita serial num terminal. Humano e agente passam pela MESMA fila;
+/// nunca interleavam bytes no master.
+#[derive(Debug, Clone)]
+pub enum WriteOp {
+    /// Teclas digitadas pelo humano.
+    HumanKeys(Vec<u8>),
+    /// Texto injetado por um agente (em produção já em bracketed-paste sanitizado — W0-9).
+    AgentText { from: NodeId, bytes: Vec<u8> },
+    /// Enter como keystroke separado (`0x0D`) — o que de fato submete (W0-9).
+    Submit { from: Option<NodeId> },
+}
+
+impl WriteOp {
+    /// Bytes que esta op escreve no master.
+    #[must_use]
+    pub fn bytes(&self) -> Vec<u8> {
+        match self {
+            WriteOp::HumanKeys(b) => b.clone(),
+            WriteOp::AgentText { bytes, .. } => bytes.clone(),
+            WriteOp::Submit { .. } => vec![0x0D],
+        }
+    }
+}
+
+/// Eventos do barramento (pub/sub in-process).
+#[derive(Debug, Clone)]
+pub enum BusEvent {
+    NodeSpawned {
+        node: NodeId,
+    },
+    NodeDied {
+        node: NodeId,
+    },
+    NodeStatus {
+        node: NodeId,
+        status: NodeStatus,
+    },
+    Message {
+        id: String,
+        from: NodeId,
+        to: Recipient,
+    },
+}
+
+/// Erros do supervisor.
+#[derive(Debug, Error)]
+pub enum SupervisorError {
+    /// Nó não está no roster.
+    #[error("nó {0} não está no workspace")]
+    NodeNotFound(NodeId),
+    /// Registrar este await fecharia um ciclo no wait-for-graph (deadlock de `ask`).
+    #[error("ciclo de await detectado: {waiter} -> {target} fecharia o grafo")]
+    CycleDetected { waiter: NodeId, target: NodeId },
+    /// Não conseguiu o lock lógico do PTY dentro do timeout.
+    #[error("timeout ao adquirir o lock lógico do PTY do nó {0}")]
+    LockTimeout(NodeId),
+}
+
+/// Lock lógico de PTY com TTL — Arc-backed (o guard limpa no drop). Aquisição por
+/// polling com timeout; um holder mais velho que o TTL (ex.: nó morto que o segurava)
+/// é reclamável.
+#[derive(Clone)]
+pub struct PtyLock(Arc<Mutex<LockState>>);
+
+struct LockState {
+    holder: Option<Writer>,
+    since: Instant,
+    ttl: Duration,
+}
+
+/// Guarda do lock lógico; libera no drop.
+pub struct PtyGuard {
+    lock: PtyLock,
+}
+
+impl PtyLock {
+    fn new(ttl: Duration) -> Self {
+        Self(Arc::new(Mutex::new(LockState {
+            holder: None,
+            since: Instant::now(),
+            ttl,
+        })))
+    }
+
+    fn acquire(&self, who: Writer, timeout: Duration) -> Option<PtyGuard> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let mut st = lock(&self.0);
+                let expired = st.holder.is_some() && st.since.elapsed() >= st.ttl;
+                if st.holder.is_none() || expired {
+                    st.holder = Some(who);
+                    st.since = Instant::now();
+                    return Some(PtyGuard { lock: self.clone() });
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Quem detém o lock agora (diagnóstico/teste).
+    #[must_use]
+    pub fn holder(&self) -> Option<Writer> {
+        lock(&self.0).holder
+    }
+}
+
+impl Drop for PtyGuard {
+    fn drop(&mut self) {
+        lock(&self.lock.0).holder = None;
+    }
+}
+
+/// Grafo wait-for: `waiter -> target` (cada nó bloqueado em `ask` espera 1 alvo).
+#[derive(Default)]
+struct WaitForGraph {
+    awaiting: HashMap<NodeId, NodeId>,
+}
+
+impl WaitForGraph {
+    /// Tenta registrar `waiter` esperando `target`. `Err` se fecharia um ciclo
+    /// (`target` alcança `waiter` seguindo as arestas) — NÃO insere nesse caso.
+    fn add(&mut self, waiter: NodeId, target: NodeId) -> Result<(), ()> {
+        let mut cur = target;
+        loop {
+            if cur == waiter {
+                return Err(()); // fecharia um ciclo
+            }
+            match self.awaiting.get(&cur) {
+                Some(&next) => cur = next,
+                None => break,
+            }
+        }
+        self.awaiting.insert(waiter, target);
+        Ok(())
+    }
+
+    fn remove(&mut self, waiter: NodeId) {
+        self.awaiting.remove(&waiter);
+    }
+}
+
+/// Configuração do supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct SupervisorConfig {
+    /// TTL do lock lógico de PTY (um holder mais velho que isto é reclamável).
+    pub lock_ttl: Duration,
+    /// Capacidade do canal de pub/sub.
+    pub event_capacity: usize,
+    /// Tamanho máximo do log de ops aplicadas por terminal (observabilidade).
+    pub applied_log_cap: usize,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            lock_ttl: Duration::from_secs(30),
+            event_capacity: 1024,
+            applied_log_cap: 4096,
+        }
+    }
+}
+
+struct TermChannel {
+    tx: Sender<WriteOp>,
+    lock: PtyLock,
+    applied: Arc<Mutex<Vec<WriteOp>>>,
+    consumer: Option<JoinHandle<()>>,
+}
+
+/// Consumidor SERIAL da fila de escrita de um terminal: drena `rx` e aplica cada op
+/// ao writer do master, uma de cada vez — bytes nunca interleavam.
+fn serial_writer(
+    rx: Receiver<WriteOp>,
+    mut writer: Box<dyn Write + Send>,
+    applied: Arc<Mutex<Vec<WriteOp>>>,
+    cap: usize,
+) {
+    while let Ok(op) = rx.recv() {
+        let bytes = op.bytes();
+        // Erro de escrita não derruba o supervisor — o terminal pode ter saído.
+        if writer.write_all(&bytes).is_err() {
+            break;
+        }
+        let _ = writer.flush();
+        let mut log = lock(&applied);
+        log.push(op);
+        if log.len() > cap {
+            let excess = log.len() - cap;
+            log.drain(0..excess);
+        }
+    }
+}
+
+/// Broker in-process: roster, filas serial por terminal, locks lógicos, wait-for-graph,
+/// endereçamento e pub/sub. `Send + Sync` — compartilhe via `Arc<Supervisor>`.
+pub struct Supervisor {
+    registry: Mutex<HashMap<NodeId, NodeInfo>>,
+    order: Mutex<Vec<NodeId>>,
+    terminals: Mutex<HashMap<NodeId, TermChannel>>,
+    waitfor: Mutex<WaitForGraph>,
+    rr: Mutex<HashMap<String, usize>>,
+    events: broadcast::Sender<BusEvent>,
+    config: SupervisorConfig,
+}
+
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Supervisor {
+    /// Supervisor com a configuração padrão.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_config(SupervisorConfig::default())
+    }
+
+    /// Supervisor com configuração customizada.
+    #[must_use]
+    pub fn with_config(config: SupervisorConfig) -> Self {
+        let (events, _) = broadcast::channel(config.event_capacity);
+        Self {
+            registry: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            terminals: Mutex::new(HashMap::new()),
+            waitfor: Mutex::new(WaitForGraph::default()),
+            rr: Mutex::new(HashMap::new()),
+            events,
+            config,
+        }
+    }
+
+    /// Assina o pub/sub. O assinante recebe os eventos publicados DEPOIS da assinatura.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<BusEvent> {
+        self.events.subscribe()
+    }
+
+    fn publish(&self, ev: BusEvent) {
+        let _ = self.events.send(ev);
+    }
+
+    /// Registra um nó: gera UUID v7, sobe o consumidor serial de escrita ligado a
+    /// `writer` (em produção, o writer do master do pty-host; em teste, um sink) e
+    /// publica `NodeSpawned`. Status inicial `Starting`.
+    pub fn register(
+        &self,
+        name: impl Into<String>,
+        role: Option<String>,
+        writer: Box<dyn Write + Send>,
+    ) -> NodeId {
+        let id = Uuid::now_v7();
+        let (tx, rx) = mpsc::channel::<WriteOp>();
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let cap = self.config.applied_log_cap;
+
+        let consumer = {
+            let applied = Arc::clone(&applied);
+            thread::Builder::new()
+                .name(format!("lina-bus-writer-{id}"))
+                .spawn(move || serial_writer(rx, writer, applied, cap))
+                .ok()
+        };
+
+        lock(&self.registry).insert(
+            id,
+            NodeInfo {
+                id,
+                name: name.into(),
+                role,
+                status: NodeStatus::Starting,
+            },
+        );
+        lock(&self.order).push(id);
+        lock(&self.terminals).insert(
+            id,
+            TermChannel {
+                tx,
+                lock: PtyLock::new(self.config.lock_ttl),
+                applied,
+                consumer,
+            },
+        );
+        self.publish(BusEvent::NodeSpawned { node: id });
+        id
+    }
+
+    /// Marca um nó como `Dead`: para sua fila de escrita, limpa qualquer await
+    /// de/para ele (não trava quem o esperava) e publica `NodeDied`. Mantém a linha
+    /// no roster (como Dead) para observabilidade; a resolução o ignora.
+    pub fn mark_dead(&self, node: NodeId) -> Result<(), SupervisorError> {
+        {
+            let mut reg = lock(&self.registry);
+            let info = reg
+                .get_mut(&node)
+                .ok_or(SupervisorError::NodeNotFound(node))?;
+            info.status = NodeStatus::Dead;
+        }
+        self.stop_terminal(node);
+        {
+            let mut wf = lock(&self.waitfor);
+            wf.remove(node);
+            wf.awaiting.retain(|_, target| *target != node);
+        }
+        self.publish(BusEvent::NodeDied { node });
+        Ok(())
+    }
+
+    /// Remove um nó por completo (roster + fila). Publica `NodeDied`.
+    pub fn unregister(&self, node: NodeId) -> Result<(), SupervisorError> {
+        let existed = lock(&self.registry).remove(&node).is_some();
+        lock(&self.order).retain(|n| *n != node);
+        self.stop_terminal(node);
+        {
+            let mut wf = lock(&self.waitfor);
+            wf.remove(node);
+            wf.awaiting.retain(|_, target| *target != node);
+        }
+        if existed {
+            self.publish(BusEvent::NodeDied { node });
+            Ok(())
+        } else {
+            Err(SupervisorError::NodeNotFound(node))
+        }
+    }
+
+    fn stop_terminal(&self, node: NodeId) {
+        let tc = lock(&self.terminals).remove(&node);
+        if let Some(mut tc) = tc {
+            let handle = tc.consumer.take();
+            drop(tc); // dropa o `tx` → `rx.recv()` retorna Err → consumidor encerra
+            if let Some(h) = handle {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Atualiza o status de um nó e publica `NodeStatus`.
+    pub fn set_status(&self, node: NodeId, status: NodeStatus) -> Result<(), SupervisorError> {
+        {
+            let mut reg = lock(&self.registry);
+            let info = reg
+                .get_mut(&node)
+                .ok_or(SupervisorError::NodeNotFound(node))?;
+            info.status = status;
+        }
+        self.publish(BusEvent::NodeStatus { node, status });
+        Ok(())
+    }
+
+    /// Define/atualiza o papel de um nó.
+    pub fn set_role(&self, node: NodeId, role: Option<String>) -> Result<(), SupervisorError> {
+        let mut reg = lock(&self.registry);
+        let info = reg
+            .get_mut(&node)
+            .ok_or(SupervisorError::NodeNotFound(node))?;
+        info.role = role;
+        Ok(())
+    }
+
+    /// Snapshot da linha de um nó.
+    #[must_use]
+    pub fn get(&self, node: NodeId) -> Option<NodeInfo> {
+        lock(&self.registry).get(&node).cloned()
+    }
+
+    /// Roster completo, em ordem de registro (determinístico).
+    #[must_use]
+    pub fn list(&self) -> Vec<NodeInfo> {
+        let reg = lock(&self.registry);
+        lock(&self.order)
+            .iter()
+            .filter_map(|id| reg.get(id).cloned())
+            .collect()
+    }
+
+    /// Quantidade de nós no roster (inclui Dead até `unregister`).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        lock(&self.registry).len()
+    }
+
+    /// Resolve um endereço em nós concretos. Papel é **late-bound** e ignora nós
+    /// `Dead`: se o reviewer morre e outro nasce, `role:reviewer` continua válido.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        to: &Recipient,
+        policy: RolePolicy,
+        exclude: Option<NodeId>,
+    ) -> Vec<NodeId> {
+        let reg = lock(&self.registry);
+        let order = lock(&self.order);
+        let role = match to {
+            Recipient::Node(id) => {
+                let ok = Some(*id) != exclude && reg.get(id).is_some_and(|n| n.status.is_alive());
+                return if ok { vec![*id] } else { vec![] };
+            }
+            Recipient::Broadcast => {
+                return order
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        Some(*id) != exclude && reg.get(id).is_some_and(|n| n.status.is_alive())
+                    })
+                    .collect();
+            }
+            Recipient::Role(r) => r.as_str(),
+        };
+
+        let candidates: Vec<NodeId> = order
+            .iter()
+            .copied()
+            .filter(|id| {
+                Some(*id) != exclude
+                    && reg
+                        .get(id)
+                        .is_some_and(|n| n.status.is_alive() && n.role.as_deref() == Some(role))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return vec![];
+        }
+
+        match policy {
+            RolePolicy::All => candidates,
+            RolePolicy::FirstIdle => {
+                let pick = candidates
+                    .iter()
+                    .copied()
+                    .find(|id| reg.get(id).is_some_and(|n| n.status.is_available()))
+                    .unwrap_or(candidates[0]);
+                vec![pick]
+            }
+            RolePolicy::RoundRobin => {
+                drop(reg);
+                drop(order);
+                let mut rr = lock(&self.rr);
+                let counter = rr.entry(role.to_string()).or_insert(0);
+                let pick = candidates[*counter % candidates.len()];
+                *counter = counter.wrapping_add(1);
+                vec![pick]
+            }
+        }
+    }
+
+    /// Adquire o lock lógico do PTY de `node` (timeout) para uma transação de escrita.
+    pub fn lock_pty(
+        &self,
+        node: NodeId,
+        who: Writer,
+        timeout: Duration,
+    ) -> Result<PtyGuard, SupervisorError> {
+        let lk = lock(&self.terminals)
+            .get(&node)
+            .map(|t| t.lock.clone())
+            .ok_or(SupervisorError::NodeNotFound(node))?;
+        lk.acquire(who, timeout)
+            .ok_or(SupervisorError::LockTimeout(node))
+    }
+
+    fn enqueue(&self, node: NodeId, op: WriteOp) -> Result<(), SupervisorError> {
+        let map = lock(&self.terminals);
+        let tc = map.get(&node).ok_or(SupervisorError::NodeNotFound(node))?;
+        tc.tx
+            .send(op)
+            .map_err(|_| SupervisorError::NodeNotFound(node))
+    }
+
+    /// Escrita do humano: transação atômica (lock lógico → `HumanKeys` → solta).
+    pub fn write_human(
+        &self,
+        node: NodeId,
+        keys: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SupervisorError> {
+        let _g = self.lock_pty(node, Writer::Human, timeout)?;
+        self.enqueue(node, WriteOp::HumanKeys(keys.to_vec()))
+    }
+
+    /// Injeção de agente: transação atômica (lock lógico → `AgentText` → `Submit` →
+    /// solta). O delay faseado real (W0-9) é do consumidor/CLI Profile; aqui a
+    /// ATOMICIDADE garante que o humano nunca entre entre o texto e o Enter.
+    pub fn inject_agent(
+        &self,
+        target: NodeId,
+        from: NodeId,
+        text: &[u8],
+        timeout: Duration,
+    ) -> Result<(), SupervisorError> {
+        let _g = self.lock_pty(target, Writer::Agent(from), timeout)?;
+        self.enqueue(
+            target,
+            WriteOp::AgentText {
+                from,
+                bytes: text.to_vec(),
+            },
+        )?;
+        self.enqueue(target, WriteOp::Submit { from: Some(from) })
+    }
+
+    /// Log das ops já aplicadas no terminal (observabilidade/teste).
+    #[must_use]
+    pub fn applied_ops(&self, node: NodeId) -> Vec<WriteOp> {
+        lock(&self.terminals)
+            .get(&node)
+            .map(|t| lock(&t.applied).clone())
+            .unwrap_or_default()
+    }
+
+    /// Registra que `waiter` espera o `reply` de `target` (ask bloqueante). Retorna
+    /// `CycleDetected` na hora (sem travar) se fecharia um ciclo no wait-for-graph.
+    pub fn begin_await(&self, waiter: NodeId, target: NodeId) -> Result<(), SupervisorError> {
+        lock(&self.waitfor)
+            .add(waiter, target)
+            .map_err(|()| SupervisorError::CycleDetected { waiter, target })
+    }
+
+    /// Encerra o await de `waiter` (chegou o reply ou deu timeout).
+    pub fn end_await(&self, waiter: NodeId) {
+        lock(&self.waitfor).remove(waiter);
+    }
+
+    /// Resolve os destinatários de um envelope aplicando anti-loop de mensagem
+    /// (`ttl`/`trace`) e publica `Message`. Devolve os alvos que devem receber (sem o
+    /// remetente nem nós já no `trace`). Vazio = dropado (loop/ttl) ou sem alvo vivo.
+    pub fn route(&self, env: &A2aEnvelope, policy: RolePolicy) -> Vec<NodeId> {
+        if env.ttl == 0 {
+            return vec![];
+        }
+        let fresh: Vec<NodeId> = self
+            .resolve(&env.to, policy, Some(env.from))
+            .into_iter()
+            .filter(|t| !env.trace.contains(t))
+            .collect();
+        if !fresh.is_empty() {
+            self.publish(BusEvent::Message {
+                id: env.id.clone(),
+                from: env.from,
+                to: env.to.clone(),
+            });
+        }
+        fresh
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let nodes: Vec<NodeId> = lock(&self.terminals).keys().copied().collect();
+        for node in nodes {
+            self.stop_terminal(node);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bus_tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if cond() {
+                return true;
+            }
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn sink() -> Box<dyn Write + Send> {
+        Box::new(std::io::sink())
+    }
+
+    const T: Duration = Duration::from_secs(5);
+
+    /// Critério (a): 3 nós no registry; writes concorrentes humano + 2 agentes no
+    /// MESMO terminal → ordem serial, sem interleave de bytes, e cada injeção de
+    /// agente (texto+Enter) é atômica (lock lógico). `#[serial]` pela concorrência.
+    #[test]
+    #[serial]
+    fn three_nodes_and_concurrent_writes_stay_serial_without_interleave() {
+        let sup = Arc::new(Supervisor::new());
+        let agent_a = sup.register("@Dev Frontend", Some("frontend".into()), sink());
+        let agent_b = sup.register("@Dev Backend", Some("backend".into()), sink());
+        let target = sup.register("@QA", Some("qa".into()), sink());
+        assert_eq!(sup.count(), 3, "3 nós no registry");
+
+        let iters = 60usize;
+        let mut handles = Vec::new();
+
+        // 1 humano martelando o terminal `target`.
+        {
+            let sup = Arc::clone(&sup);
+            handles.push(thread::spawn(move || {
+                for i in 0..iters {
+                    sup.write_human(target, format!("h{i};").as_bytes(), T)
+                        .expect("write_human");
+                }
+            }));
+        }
+        // 2 agentes injetando (texto + Enter) concorrentemente no MESMO terminal.
+        for from in [agent_a, agent_b] {
+            let sup = Arc::clone(&sup);
+            handles.push(thread::spawn(move || {
+                for i in 0..iters {
+                    sup.inject_agent(target, from, format!("a{i};").as_bytes(), T)
+                        .expect("inject_agent");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join produtor");
+        }
+
+        // humano: `iters` HumanKeys; cada agente: `iters` AgentText + `iters` Submit.
+        let expected = iters + 2 * (iters + iters);
+        assert!(
+            poll_until(T, || sup.applied_ops(target).len() == expected),
+            "todas as ops deveriam ter sido aplicadas em série"
+        );
+
+        let ops = sup.applied_ops(target);
+        // (i) ATOMICIDADE: cada AgentText é IMEDIATAMENTE seguido pelo seu Submit
+        //     (mesmo agente), sem nenhum HumanKeys no meio.
+        for (i, op) in ops.iter().enumerate() {
+            if let WriteOp::AgentText { from, .. } = op {
+                match ops.get(i + 1) {
+                    Some(WriteOp::Submit { from: Some(s) }) => {
+                        assert_eq!(s, from, "o Submit deve ser do mesmo agente que o texto")
+                    }
+                    other => {
+                        panic!("AgentText deveria ser seguido pelo seu Submit; veio {other:?}")
+                    }
+                }
+            }
+        }
+        // (ii) contagem por tipo bate — nada perdido, duplicado ou embaralhado.
+        let humans = ops
+            .iter()
+            .filter(|o| matches!(o, WriteOp::HumanKeys(_)))
+            .count();
+        let texts = ops
+            .iter()
+            .filter(|o| matches!(o, WriteOp::AgentText { .. }))
+            .count();
+        let submits = ops
+            .iter()
+            .filter(|o| matches!(o, WriteOp::Submit { .. }))
+            .count();
+        assert_eq!(humans, iters);
+        assert_eq!(texts, 2 * iters);
+        assert_eq!(submits, 2 * iters);
+    }
+
+    /// Critério (b): ciclo de await A→B→A dispara `CycleDetected` e NÃO trava (a 2ª
+    /// chamada retorna em <2s, provado por thread + recv_timeout).
+    #[test]
+    fn await_cycle_is_detected_and_does_not_hang() {
+        let sup = Arc::new(Supervisor::new());
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+
+        sup.begin_await(a, b).expect("A→B deve registrar");
+
+        // B→A fecharia A→B→A. Roda em thread e exige retorno rápido (não-bloqueante).
+        let (tx, rx) = mpsc::channel();
+        {
+            let sup = Arc::clone(&sup);
+            thread::spawn(move || {
+                let _ = tx.send(sup.begin_await(b, a));
+            });
+        }
+        let res = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("begin_await NÃO travou (retornou em <2s)");
+        assert!(
+            matches!(res, Err(SupervisorError::CycleDetected { .. })),
+            "deveria detectar o ciclo"
+        );
+
+        // Sem a aresta de B: ao A liberar, B→A passa a ser válido.
+        sup.end_await(a);
+        sup.begin_await(b, a).expect("B→A ok após A liberar");
+        sup.end_await(b);
+    }
+
+    /// Critério (c): `role:reviewer` resolve para o nó VIVO depois que o reviewer
+    /// original é marcado `dead` (late-bound, ignora mortos).
+    #[test]
+    fn role_resolves_to_live_node_after_original_dies() {
+        let sup = Supervisor::new();
+        let r1 = sup.register("@Reviewer 1", Some("reviewer".into()), sink());
+        let r2 = sup.register("@Reviewer 2", Some("reviewer".into()), sink());
+
+        // Ambos vivos: `All` retorna os dois, em ordem de registro.
+        assert_eq!(
+            sup.resolve(&Recipient::Role("reviewer".into()), RolePolicy::All, None),
+            vec![r1, r2]
+        );
+
+        // Mata o reviewer original.
+        sup.mark_dead(r1).expect("mark_dead");
+
+        // `role:reviewer` agora resolve só para o vivo (r2), em qualquer política.
+        assert_eq!(
+            sup.resolve(
+                &Recipient::Role("reviewer".into()),
+                RolePolicy::FirstIdle,
+                None
+            ),
+            vec![r2],
+            "first-idle deve cair no reviewer vivo"
+        );
+        assert_eq!(
+            sup.resolve(
+                &Recipient::Role("reviewer".into()),
+                RolePolicy::RoundRobin,
+                None
+            ),
+            vec![r2],
+            "round-robin entre vivos também ignora o morto"
+        );
+        assert_eq!(
+            sup.resolve(&Recipient::Role("reviewer".into()), RolePolicy::All, None),
+            vec![r2]
+        );
+    }
+
+    /// Pub/sub emite o ciclo de vida do nó (spawned → status → died). `try_recv` é
+    /// síncrono; `send` é imediato — sem runtime tokio.
+    #[test]
+    fn pubsub_emits_node_lifecycle() {
+        let sup = Supervisor::new();
+        let mut rx = sup.subscribe();
+        let n = sup.register("@Dev", Some("dev".into()), sink());
+        sup.set_status(n, NodeStatus::Busy).expect("status");
+        sup.mark_dead(n).expect("dead");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BusEvent::NodeSpawned { node } if *node == n)),
+            "deveria ter NodeSpawned"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, BusEvent::NodeStatus { node, status: NodeStatus::Busy } if *node == n)
+            ),
+            "deveria ter NodeStatus(Busy)"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BusEvent::NodeDied { node } if *node == n)),
+            "deveria ter NodeDied"
+        );
+    }
+
+    /// Endereçamento por papel + anti-loop de mensagem (`trace`/`ttl`) no `route`.
+    #[test]
+    fn route_resolves_role_and_drops_loops() {
+        let sup = Supervisor::new();
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", Some("reviewer".into()), sink());
+
+        // role:reviewer → b (vivo).
+        let env = A2aEnvelope::new(a, Recipient::Role("reviewer".into()), Some("ask".into()));
+        assert_eq!(sup.route(&env, RolePolicy::FirstIdle), vec![b]);
+
+        // alvo já no trace → dropado (anti-loop).
+        let mut looped = A2aEnvelope::new(a, Recipient::Node(b), Some("ask".into()));
+        looped.trace.push(b);
+        assert!(sup.route(&looped, RolePolicy::FirstIdle).is_empty());
+
+        // ttl=0 → dropado.
+        let mut dead = A2aEnvelope::new(a, Recipient::Node(b), None);
+        dead.ttl = 0;
+        assert!(sup.route(&dead, RolePolicy::FirstIdle).is_empty());
+    }
+}
 // TODO(W0-5): Event Store (rusqlite WAL + JSONL + snapshots; replay determinístico).
 // TODO(W0-6): recuperação pós-crash visível (integrity_check -> preservar -> rebuild).
 
