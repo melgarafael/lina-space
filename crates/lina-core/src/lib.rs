@@ -31,6 +31,12 @@ pub use lina_vt::VtBackend;
 
 use lina_vt::AlacrittyBackend;
 
+/// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
+mod events;
+pub use events::{
+    apply, DomainEvent, EventRecord, EventStore, ProjectedNode, ProjectedState, StoreError,
+};
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para

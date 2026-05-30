@@ -11,10 +11,14 @@ lina-host = { path = "../lina-host" }
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-uuid.workspace = true
+# W0-5: feature `serde` (aditiva) para serializar NodeId/UUID no payload dos eventos.
+uuid = { workspace = true, features = ["serde"] }
 # W0-4: pub/sub in-process do Workspace Bus (broadcast usável sem runtime: send + try_recv).
 tokio = { version = "1", features = ["sync"] }
+# W0-5/W0-6: event store (SQLite WAL, SQLite embutido via `bundled`) + JSONL/snapshots.
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 
 [dev-dependencies]
 serial_test = "3.4.0"
-# TODO: rusqlite (event store), serde/serde_json (envelope JSON na fronteira) — W0-5.
