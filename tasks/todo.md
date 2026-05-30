@@ -1,4 +1,6 @@
-# Lina Space — Plano de Construção (Onda 0)
+# Lina Space — Plano de Construção
+
+> ✅ **ONDA 0 COMPLETA (11/11)** — 55 testes verdes, 6 commits. Core headless: PTY+VT+Bus+EventStore+Recovery+A2A.
 
 > Painel compartilhado. Backlog canônico: vault `Debriefing Vibe Coding/32 - Epico Fase 0 (MVP)`.
 > Gate de saída da Onda 0: core roda **headless nos 3 SOs**, abre N PTYs, injeta A2A faseada, recupera de `kill -9`.
