@@ -82,27 +82,47 @@ impl GridSense for Arc<Mutex<Box<dyn VtBackend>>> {
 
 // ───────────────────────────── construção do payload ─────────────────────────────
 
-/// Remove os marcadores de bracketed-paste (`ESC[200~`/`ESC[201~`) do payload. O
-/// `ESC[201~` é o vetor do CVE-2021-31701 (fecharia o bloco e escaparia da colagem);
-/// removemos os dois por segurança — o wrapper legítimo é adicionado por [`build_paste`].
+/// Sanitiza o payload de uma colagem A2A para que ele NÃO possa submeter por conta
+/// própria — a invariante load-bearing de W0-9 é "o único submit é o
+/// [`WriteOp::Submit`] separado". Remove:
+/// - os marcadores de bracketed-paste (`ESC[200~`/`ESC[201~`): o `ESC[201~` é o vetor
+///   do CVE-2021-31701 (fecharia o bloco e escaparia da colagem);
+/// - o **carriage return** (`\r`, `0x0D`): é literalmente a tecla de Enter; um CR
+///   injetado no texto submeteria comando(s) antes do `Submit` (terminal CR injection).
+///
+/// O `\n` (LF) é tratado por [`build_paste`] conforme o modo (mantido no bracketed,
+/// onde é multilinha segura; removido no modo-linha, onde também submeteria).
 #[must_use]
 pub fn sanitize_paste(text: &str) -> String {
-    text.replace(PASTE_END_STR, "").replace(PASTE_BEGIN_STR, "")
+    text.replace(PASTE_END_STR, "")
+        .replace(PASTE_BEGIN_STR, "")
+        .replace('\r', "")
 }
 
 /// Bytes do passo "colar texto" da fila serial. Em bracketed-paste mode, embrulha em
-/// `ESC[200~ … ESC[201~`; senão, texto puro. SEMPRE sanitiza e **nunca** inclui `\r`
-/// (o Enter é um [`WriteOp::Submit`] separado — a correção load-bearing).
+/// `ESC[200~ … ESC[201~` (o `\n` do payload é conteúdo de colagem válido — multilinha);
+/// senão (modo-linha/cooked), texto puro **sem nenhum terminador de linha**. SEMPRE
+/// passa por [`sanitize_paste`] (sem marcadores, sem `\r`) — o Enter é um
+/// [`WriteOp::Submit`] separado (a correção load-bearing).
 #[must_use]
 pub fn build_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    let clean = sanitize_paste(text);
+    let mut clean = sanitize_paste(text); // sem marcadores de paste e sem CR
     if bracketed {
+        // Modo bracketed: o TUI trata o bloco como colagem; LF = multilinha (seguro).
+        debug_assert!(!clean.contains('\r'), "sanitize_paste deve remover todo CR");
         let mut out = Vec::with_capacity(clean.len() + PASTE_BEGIN.len() + PASTE_END.len());
         out.extend_from_slice(PASTE_BEGIN);
         out.extend_from_slice(clean.as_bytes());
         out.extend_from_slice(PASTE_END);
         out
     } else {
+        // Modo-linha (cooked): um LF também submeteria. Remove `\n` para que o ÚNICO
+        // submit seja o `Submit` separado.
+        clean = clean.replace('\n', "");
+        debug_assert!(
+            !clean.contains('\r') && !clean.contains('\n'),
+            "modo-linha: payload não pode conter terminador de linha"
+        );
         clean.into_bytes()
     }
 }
@@ -374,6 +394,31 @@ mod tests {
         assert!(bytes.starts_with(PASTE_BEGIN) && bytes.ends_with(PASTE_END));
         // Nunca um `\r` no texto colado (o Enter é um Submit separado).
         assert!(!bytes.contains(&b'\r'));
+    }
+
+    /// W0-9 segurança (terminal CR injection): um payload com `\r` (e, no modo-linha,
+    /// `\n`) NUNCA produz um byte de submit — só o `WriteOp::Submit` separado submete.
+    #[test]
+    fn cr_lf_injection_cannot_self_submit() {
+        // CR é sempre removido (é a tecla de Enter).
+        assert_eq!(sanitize_paste("cmd\r"), "cmd");
+        assert_eq!(sanitize_paste("a\r\nb"), "a\nb"); // CR fora; LF decidido por build_paste
+
+        // bracketed: CR sumiu, LF preservado (colagem multilinha válida e segura).
+        let braq = build_paste("linha1\r\nlinha2", true);
+        assert!(!braq.contains(&b'\r'), "sem CR no payload bracketed");
+        assert!(
+            braq.contains(&b'\n'),
+            "LF preservado em bracketed (multilinha)"
+        );
+
+        // modo-linha (não bracketed): nem CR nem LF — nada pode pré-submeter.
+        let plain = build_paste("benigno\r\nrm -rf /\n", false);
+        assert!(
+            !plain.contains(&b'\r') && !plain.contains(&b'\n'),
+            "modo-linha: nenhum terminador de linha pode pré-submeter"
+        );
+        assert_eq!(plain, b"benignorm -rf /");
     }
 
     /// `build_paste` sem bracketed = texto puro (sanitizado), sem wrapper, sem `\r`.

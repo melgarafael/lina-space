@@ -19,6 +19,7 @@
 | W0-8 CLI Profiles TOML | `lina-cli-profiles` | ✅ done | Analista | 9 testes; Delivery/EndSignal enums; registry override; TOML inválido erra limpo |
 | W0-9 Entrega A2A faseada | `lina-core` | ✅ done | LLM Engineer | sequência faseada · fila serial · sanitiza ESC[201~ · allow-list |
 | W0-10 Fim-de-resposta | `lina-core` | ✅ done | LLM Engineer | result>idle>timeout · nunca trunca silencioso |
+| 🚪 **GATE e2e Onda 0** | `lina-core/tests` | ✅ done | LLM Engineer | onda0_exit_gate_end_to_end: 2 PTYs reais + A2A faseada A→B (round-trip) + crash/corrupção + recovery do JSONL (fingerprint idêntico). 5/5 |
 | W0-11 trait UiHost | `lina-host` | ✅ done | Arquiteto | 5 testes · UiHost+InputSink+HeadlessUiHost · zero deps toolkit |
 
 ## Log

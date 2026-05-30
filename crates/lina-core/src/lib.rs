@@ -18,18 +18,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use lina_pty::{PtyError, PtyManager};
+use lina_pty::PtyError;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-/// Re-exports do contrato de UI para os consumidores do core.
-pub use lina_host::{HostEvent, NodeId, UiHost};
-/// Re-exports da camada de PTY/VT para montar comandos e ler o grid.
-pub use lina_pty::PtyCommand;
-pub use lina_vt::VtBackend;
-
-use lina_vt::AlacrittyBackend;
+/// Re-exports da camada de PTY/VT para abrir terminais e ler o grid (gate E2E inclusive).
+pub use lina_cli_profiles::CliProfile;
+/// Re-exports do contrato de UI para os consumidores do core (e o host headless de teste).
+pub use lina_host::{BusTarget, HeadlessUiHost, HostEvent, NodeId, NodeKind, UiHost};
+pub use lina_pty::{PtyCommand, PtyManager};
+pub use lina_vt::{AlacrittyBackend, VtBackend};
 
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
