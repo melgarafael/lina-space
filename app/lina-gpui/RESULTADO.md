@@ -1,113 +1,98 @@
-# Onda 2 — Walking Skeleton (o gate da Onda 2) · RESULTADO
+# Onda 2 — Render de terminal de VERDADE (usável) · RESULTADO
 
-> **TL;DR:** o primeiro Lina que se vê e se usa. Uma janela gpui é um **canvas** com **2
-> terminais reais do core** (cards posicionáveis, **pan** arrastando o fundo), e o
-> diferencial #1 — a metáfora **"sem fios"**: um clique em **⚡ Enviar A2A (A→B)** dispara
-> `deliver_a2a` de A para B; ao escutar `BusEvent::Message` do **pub/sub do core**, a tela
-> mostra um **pulso efêmero A→B** (pacote azul que viaja e some em ~1 s) + o selo **"Time
-> conectado · todos se falam"**; e o **texto A2A chega no grid do terminal B** (round-trip
-> faseado real). Os eventos são persistidos no **EventStore** (sobrevive a reinícios). A
-> janela fica **aberta** até o usuário fechar. **Build passa; clippy `-D warnings` + fmt
-> limpos; 2/2 testes-gate headless.**
-
-- **Crate:** `app/lina-gpui` (standalone, excluído do workspace). gpui pinado (`09165c15…`) + `runtime_shaders` + `debug=false`.
-- **Reúso do core (nada reimplementado):** `Supervisor`, `deliver_a2a`, `EventStore`, o pub/sub do `Bus`, `GridSense`, `VtBackend`, `A2aEnvelope`. **Sem commit.**
+> **TL;DR:** os terminais agora são **usáveis**. Cada card pinta o **snapshot do GRID
+> VISÍVEL** (`VtBackend::screen()` — matriz cols×rows com **cor por célula + cursor**) lido
+> direto do `alacritty_terminal` **a cada frame** — não mais `row_text` das linhas sujas
+> empilhadas. TUIs ricas (Claude Code, vim) renderizam corretas; há **scroll** (scrollback),
+> **teclas especiais** (setas/Home/End/PageUp·Down/F1-F12 → CSI/SS3, sem eco de lixo),
+> **resize** (PTY+grid, **84×26** ≥ 80×24), e cores ANSI/256. O canvas, o pan, o **A2A com
+> pulso "sem fios"** e a **persistência** seguem. **Build passa; clippy `-D warnings` + fmt
+> limpos; gate de render provado em teste; 57 testes do workspace verdes; sem panic.**
 
 ---
 
-## 1. O que aparece na tela (e como funciona)
+## 1. Causa raiz (o que estava errado) e o conserto
 
+**Antes:** o `GridDelta { dirty_rows }` disparava `row_text(r)` por linha suja → o shell
+guardava um `Vec<String>` por-linha (texto puro, **sem cor, sem cursor**) e desenhava isso.
+Uma TUI que **redesenha a tela inteira** (alternate screen, `ESC[2J` + cursor absoluto) ficava
+embaralhada: só as linhas que o alacritty marcou sujas eram puxadas, misturadas com linhas
+velhas; sem cursor, menus/spinners perdiam a âncora; e setas viravam `^[[C` porque o texto
+echoado aparecia cru.
+
+**Agora:** o shell lê o **snapshot completo do grid** a cada frame e pinta tudo:
 ```
-┌───────────────────────────────────────────────────────────────── (aura pontilhada "sem fios") ┐
-│ Lina Space · walking skeleton   ● Time conectado · todos se falam   log: 11 eventos  [⚡ A2A A→B]│
-│                                                                                                 │
-│   ┌── Terminal A ──────────────┐                 ╲ pulso ╱        ┌── Terminal B ──────────────┐ │
-│   │ ● Terminal · Running       │            (pacote azul A→B,     │ ● Terminal · Running       │ │
-│   │ Terminal A — seu shell.    │             some em ~1s)         │ Terminal B — recebe A2A.   │ │
-│   │ $ ls                       │  ● ───────────────────────▶      │ 📨 A2A de A→B · time…      │ │
-│   │ ...                        │                                  │ ...                        │ │
-│   └────────────────────────────┘                                  └────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+PTY → pty-host (lina-core) → alacritty_terminal (lina-vt)
+   → VtBackend::screen()  ──►  VtScreen { cols, rows, cells: Vec<VtCell{c,fg,bg,bold}>, cursor, display_offset }
+   → o card pinta cols×rows: runs de mesmo estilo viram spans coloridos; a célula do cursor é um bloco.
 ```
-
-1. **Canvas + 2 cards posicionáveis + pan.** Fundo OLED `#0A0E27`; cada terminal é um card
-   (título com nome + ● status + tipo) posicionado em `(x,y)`. **Arrastar o fundo** faz pan
-   (`on_mouse_down/move/up`, `MouseMoveEvent::dragging()`), movendo os cards juntos. Clicar um
-   card o **foca** (borda azul) — o teclado vai para o terminal focado.
-2. **2 terminais REAIS do core.** `PtyManager` abre 2 PTYs (`sh -i` no A, `cat` no B);
-   `take_writer → sup.register` (o **Supervisor é dono dos writers**), `clone_reader →` thread
-   leitora que avança o grid `alacritty_terminal` e **emite `GridDelta`** → `UiHost` → render.
-3. **A2A com PULSO visível (a metáfora "sem fios").** O botão dispara, numa thread:
-   `sup.route(&env)` → publica **`BusEvent::Message`** no pub/sub; a thread-bomba o escuta,
-   traduz para `HostEvent::BusMessage`, e a ponte acende o **pulso** (`Pulse{from,to,started}`)
-   + a aura **"Time conectado"**. Em paralelo, **`deliver_a2a`** injeta o texto **faseado**
-   (bracketed-paste → `submit_delay` → Enter separado) na MailQueue serial do Supervisor → o
-   PTY de B → `cat` ecoa → grid de B → `GridDelta` → **o texto aparece no card de B**.
-4. **Persistência.** `EventStore::open` num dir estável; grava `WorkspaceCreated` +
-   `NodeAdded×2` + `TerminalSpawned×2` no boot e `BusMessageSent` a cada A2A (SQLite WAL +
-   JSONL + snapshots). O contador "log: N eventos" sobe na tela e **sobrevive a reinícios**
-   (provado: 6 eventos → relaunch → 11).
-5. **Janela aberta** até o usuário fechar (sem auto-quit; `LINA_AUTOQUIT_MS` existe só para o smoke headless).
+O `GridDelta` vira só um sinal "mudou" (drenado); o `SharedModel` carrega só metadados do nó
+(nome/status/posição) + pulso + persistência. O conteúdo do terminal vem **do grid**, sempre fresco.
 
 ---
 
-## 2. A ponte `UiHost` (core ⇄ shell), livre de gpui
+## 2. Mudança de core (lina-vt) — o acessor que faltava
 
-`bridge.rs` não importa **nenhum** tipo de toolkit (porta de troca gpui↔Slint aberta):
-- **`GpuiBridgeHost: UiHost`** — projeta cada `HostEvent` no `SharedModel` (só dados):
-  `GridDelta{dirty_rows}` → lê **só** as linhas sujas do grid parseado pelo core (`row_text`);
-  `BusMessage` → acende o **pulso** + a aura; `NodeStatusChanged` → cor do status;
-  `Recovering/Recovered` → banner.
-- **`CoreInput: InputSink`** — agora o Supervisor é dono do writer, então o input do humano vai
-  pela **MailQueue serial** (`sup.write_human`) — o caminho canônico (o seam de "io::sink" da
-  story 1 sumiu).
-- **`A2aTrigger`** — reúne `deliver_a2a` + `EventStore` + o `Grid` de B (como `GridSense`).
-- **`wire_terminal`** — o padrão do `gate_onda0`: spawn → writer ao Supervisor → reader thread
-  que emite `GridDelta`.
-- **`spawn_pump`** — a thread-bomba que drena o Bus (`subscribe`) + os `GridDelta` e chama
-  `UiHost::on_event`. Um shell Slint reimplementa só a `WorkspaceView`, reusando tudo isto.
+`crates/lina-vt/src/lib.rs` (promovido à trait `VtBackend`, backward-compatible):
+- **`fn screen(&self) -> VtScreen`** — snapshot do viewport via `Term::renderable_content()`:
+  itera o `display_iter` (terminal-absoluto → viewport com `point.line + display_offset`), resolve
+  cada `Color` (`Named`/`Indexed`/`Spec`) numa `VtRgb` com uma **palette xterm-256 auto-contida**
+  (o alacritty não embarca palette), aplica `INVERSE`/`BOLD`, e marca o **cursor** (oculto se
+  `CursorShape::Hidden`).
+- **`fn scroll(&mut self, delta: i32)`** — `Term::scroll_display(Scroll::Delta)` (scrollback).
+- **`fn dims(&self) -> (usize,usize)`** + tipos públicos `VtScreen`/`VtCell`/`VtRgb`/`VtCursor`.
+- **`TermMode.app_cursor`** (DECCKM) — para as setas irem como `ESC O A/B/C/D` quando a TUI pede.
+
+`lina-core` re-exporta `VtScreen/VtCell/VtRgb/VtCursor` (facade). **57 testes do workspace verdes.**
 
 ---
 
-## 3. Core: zero mudanças nesta story
+## 3. O que ficou usável (gate)
 
-O walking skeleton **não tocou no core** — reusa `deliver_a2a`/`Supervisor`/`EventStore`/`Bus`/
-`GridSense` como estão. A única mudança de core do épico foi a da story 1 (promover `row_text`
-à trait `VtBackend`, backward-compatible). Os 57 testes do workspace seguem verdes.
-
-`A2aTrigger`/`CoreInput`/`GpuiBridgeHost` são `Send`/`Send+Sync` porque `Supervisor: Send+Sync`,
-`EventStore: Send` (atrás de `Arc<Mutex<…>>`) e `Grid = Arc<Mutex<Box<dyn VtBackend>>>` (que já
-implementa `GridSense`).
+1. **Grid visível completo, colorido, com cursor** — `render_grid(screen)` pinta `rows` linhas;
+   cada linha agrupa células de mesmo `(fg,bg,bold)` em **spans** (`div().bg().text_color()` +
+   `font_weight(BOLD)`), monoespaçado → alinhado; a célula do cursor é um **bloco invertido**.
+2. **Cores/atributos por célula** — fg/bg/bold/inverse resolvidos no `screen()`; 16 ANSI + cubo
+   256 + grayscale + RGB direto.
+3. **Cursor** — posição + bloco; oculto quando o app esconde (`CursorShape::Hidden`).
+4. **Scroll/scrollback** — `on_scroll_wheel` (trackpad `Pixels`/roda `Lines`) → `grid.scroll(±n)`
+   → `display_offset`; o próximo `screen()` mostra o histórico.
+5. **Resize** — `fit_dims()` calcula **84×26** (≥80×24) do tamanho do card; o PTY (`PtyManager::resize`)
+   e o grid (`VtBackend::resize`) acompanham (provado no teste: dims mudam para 100×30).
+6. **Teclas especiais** — setas (CSI/SS3 por `app_cursor`), Home/End, PageUp/Down, Insert/Delete,
+   F1-F12, Ctrl+letra → bytes corretos ao master; **sem eco de lixo** (o alacritty interpreta as CSI).
 
 ---
 
-## 4. Compila? Roda? (gate observável)
+## 4. Compila? Roda? (evidência)
 
-- **Compila:** `cargo build` → `Finished`, **0 erros**. Binário `target/debug/lina-gpui` (~32 MB).
+- **Compila:** `cargo build` → `Finished`, **0 erros**.
 - **Clippy:** `cargo clippy --all-targets -- -D warnings` → **limpo**.
-- **Fmt:** `cargo fmt` limpo.
-- **Testes-gate headless (2/2):**
-  - `a2a_roundtrip_pulse_and_persist` — **o gate, sem display:** 2 terminais reais; `sup.route`
-    publica `BusEvent::Message` → o **pulso liga + a aura**; `deliver_a2a` injeta → o texto
-    `LINA_A2A_MARKER` **chega no grid de B**; e um evento é **persistido** (`event_count` sobe).
-  - `recovery_pair_toggles_banner`.
-- **Roda (smoke):** a janela abre com os 2 terminais, o A2A dispara (pulso + texto em B), e o
-  EventStore persiste — `bus.jsonl` com `WorkspaceCreated`/`NodeAdded×2`/`TerminalSpawned×2`/
-  **`BusMessageSent`**; relaunch → contador 6 → 11 (**estado sobrevive**); **sem panic**.
+- **Fmt:** limpo.
+- **Gate de render (teste determinístico, sem display) — `screen_renders_colors_cursor_and_scroll`:**
+  alimenta ANSI controlado (`ESC[2J` clear + `ESC[H` home + `ESC[31m`VERMELHO + `ESC[1m`NEGRITO) e
+  asserta o `screen()`: caractere, **fg vermelho** (`0xcd0000`), **negrito**, **cursor em (0,8)**, e
+  o **scroll** (`display_offset` 0→5→0). **Passa.**
+- **Integração — `a2a_roundtrip_pulse_persist_and_screen`:** 2 terminais, A2A A→B via `deliver_a2a`,
+  `BusEvent::Message` → pulso + aura, o texto A2A aparece no **snapshot `screen()` de B**, **resize**
+  100×30, evento persistido. **Passa.** (+ `recovery_pair_toggles_banner`.) **3/3.**
+- **57 testes do workspace verdes** (a mudança de core é compatível).
+- **Roda (smoke):** a janela abre com 2 cards, grid **84×26**, A2A dispara (pulso + B recebe), persiste;
+  relaunch → contador 23 → 29 (**estado sobrevive**); **sem panic**.
 
 ---
 
-## 5. Como rodar
+## 5. Como rodar (teste visual do fundador)
 ```bash
 cd app/lina-gpui
-cargo build                 # incremental se as deps gpui já estão cacheadas
-./target/debug/lina-gpui    # abre o canvas; clique "⚡ Enviar A2A (A→B)" e veja o pulso + B receber
-cargo test                  # 2/2 gate headless
+cargo run                      # abre o canvas
+# No Terminal A (clique p/ focar), rode uma TUI real: digite `claude` (ou `vim`, `htop`):
+#   → caixas/cores/cursor aparecem corretos; setas navegam; scroll rola o histórico.
+# Clique "⚡ Enviar A2A (A→B)" → pulso A→B + a mensagem chega no Terminal B.
+cargo test                     # 3/3 (gate de render + A2A + recovery)
 ```
-Mexa no card A (clique p/ focar) e digite — é um shell real. O log persiste em
-`$TMPDIR/lina-space-ws2` (sobrevive a reinícios). `runtime_shaders` dispensa o Metal Toolchain.
 
-## 6. Próxima story (não nesta)
-Zoom (scroll-to-zoom via `on_scroll_wheel`); arrastar cards individualmente (persistir `NodeMoved`);
-N>2 terminais + presets; A2A dirigido por papel (`Recipient::Role`) com aura por papel; recuperação
-visível ligada ao boot real do EventStore.
+## 6. Próxima story
+StyledText/`TextRun` (1 elemento por linha) se o nº de spans pesar; resize dinâmico ao redimensionar
+o card/janela; seleção + copy/paste; mouse reporting (SGR) para TUIs que usam mouse; `NodeMoved`
+persistido ao arrastar cards.

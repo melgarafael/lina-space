@@ -1,0 +1,13 @@
+   Compiling lina-vt v0.0.1 (/Users/rafaelmelgaco/einstein workspace/lina-space/crates/lina-vt)
+   Compiling lina-core v0.0.1 (/Users/rafaelmelgaco/einstein workspace/lina-space/crates/lina-core)
+   Compiling lina-gpui v0.0.1 (/Users/rafaelmelgaco/einstein workspace/lina-space/app/lina-gpui)
+warning: unused import: `Role`
+  --> src/main.rs:18:19
+   |
+18 |     Render, Rgba, Role, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window, WindowBounds,
+   |                   ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `lina-gpui` (bin "lina-gpui") generated 1 warning (run `cargo fix --bin "lina-gpui" -p lina-gpui` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized] target(s) in 45.38s

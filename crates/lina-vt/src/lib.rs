@@ -8,17 +8,69 @@
 use std::collections::BTreeSet;
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode as AlacTermMode;
 use alacritty_terminal::term::{Config, Term, TermDamage};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 
-/// Modos do terminal relevantes ao A2A (ex.: bracketed-paste).
+/// Modos do terminal relevantes ao A2A e ao input (bracketed-paste; cursor-keys DECCKM).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TermMode {
     pub bracketed_paste: bool,
+    /// DECCKM (application cursor keys): setas viram `ESC O A/B/C/D` em vez de `ESC [ …`.
+    pub app_cursor: bool,
+}
+
+/// Cor RGB resolvida (sem vazar tipos do alacritty no contrato `VtBackend`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VtRgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// Uma célula renderizável do grid: caractere + cores **já resolvidas** (inverse aplicado)
+/// + negrito. É o que o shell desenha (texto colorido), sem reparsing.
+#[derive(Debug, Clone, Copy)]
+pub struct VtCell {
+    pub c: char,
+    pub fg: VtRgb,
+    pub bg: VtRgb,
+    pub bold: bool,
+}
+
+/// Cursor visível: posição (linha/coluna do viewport) + se está visível.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VtCursor {
+    pub line: usize,
+    pub col: usize,
+    pub visible: bool,
+}
+
+/// **Snapshot do GRID VISÍVEL** (cols×rows de células + cursor + offset de scroll). É o
+/// produto central do render de terminal de verdade: TUIs redesenham a tela inteira, então
+/// o shell pinta este snapshot a cada frame — não deltas de linha empilhados.
+#[derive(Debug, Clone)]
+pub struct VtScreen {
+    pub cols: usize,
+    pub rows: usize,
+    /// `rows * cols` células, row-major (linha 0 = topo do viewport).
+    pub cells: Vec<VtCell>,
+    pub cursor: VtCursor,
+    /// Quantas linhas o viewport está rolado para o passado (0 = no fundo, ao vivo).
+    pub display_offset: usize,
+}
+
+impl VtScreen {
+    /// As `cols` células da linha `line` do viewport.
+    #[must_use]
+    pub fn row(&self, line: usize) -> &[VtCell] {
+        let start = line * self.cols;
+        let end = (start + self.cols).min(self.cells.len());
+        self.cells.get(start..end).unwrap_or(&[])
+    }
 }
 
 /// Contrato do motor de emulação VT. `alacritty_terminal` é a impl da Onda 0.
@@ -38,6 +90,14 @@ pub trait VtBackend: Send {
     /// re-lê **só** essas linhas do grid (lê o grid parseado, não OCR de pixel).
     /// Índice fora do viewport devolve `String` vazia.
     fn row_text(&self, viewport_line: usize) -> String;
+    /// **Snapshot do grid VISÍVEL atual** (cols×rows + cores resolvidas + cursor) — a base
+    /// do render de terminal de verdade (W2): o shell pinta a tela inteira a cada frame.
+    fn screen(&self) -> VtScreen;
+    /// Rola o histórico (scrollback): `delta > 0` sobe para o passado, `< 0` desce; o
+    /// próximo `screen()` reflete o novo `display_offset`.
+    fn scroll(&mut self, delta_lines: i32);
+    /// Dimensões atuais do grid `(cols, rows)`.
+    fn dims(&self) -> (usize, usize);
     fn resize(&mut self, cols: u16, rows: u16);
 }
 
@@ -139,8 +199,10 @@ impl VtBackend for AlacrittyBackend {
     }
 
     fn mode(&self) -> TermMode {
+        let m = self.term.mode();
         TermMode {
-            bracketed_paste: self.term.mode().contains(AlacTermMode::BRACKETED_PASTE),
+            bracketed_paste: m.contains(AlacTermMode::BRACKETED_PASTE),
+            app_cursor: m.contains(AlacTermMode::APP_CURSOR),
         }
     }
 
@@ -168,6 +230,82 @@ impl VtBackend for AlacrittyBackend {
             .collect()
     }
 
+    fn screen(&self) -> VtScreen {
+        let cols = self.size.cols;
+        let rows = self.size.rows;
+        // Defaults casados com o card do shell (fg claro / bg do terminal).
+        let default_fg = VtRgb {
+            r: 0xc8,
+            g: 0xd3,
+            b: 0xf5,
+        };
+        let default_bg = VtRgb {
+            r: 0x0d,
+            g: 0x12,
+            b: 0x28,
+        };
+        let blank = VtCell {
+            c: ' ',
+            fg: default_fg,
+            bg: default_bg,
+            bold: false,
+        };
+        let mut cells = vec![blank; rows.saturating_mul(cols)];
+
+        // `renderable_content` dá o viewport ATUAL (respeitando o display_offset do scroll).
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+        let cur = content.cursor;
+        for indexed in content.display_iter {
+            // `point` é terminal-absoluto (linhas negativas = scrollback). Converte p/ viewport.
+            let vline = indexed.point.line.0 + display_offset as i32;
+            if vline < 0 {
+                continue;
+            }
+            let (line, col) = (vline as usize, indexed.point.column.0);
+            if line >= rows || col >= cols {
+                continue;
+            }
+            let cell = indexed.cell;
+            let bold = cell.flags.contains(Flags::BOLD);
+            let mut fg = resolve_color(cell.fg, default_fg, default_bg);
+            let mut bg = resolve_color(cell.bg, default_fg, default_bg);
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let c = if cell.c == '\0' { ' ' } else { cell.c };
+            cells[line * cols + col] = VtCell { c, fg, bg, bold };
+        }
+
+        let cur_vline = cur.point.line.0 + display_offset as i32;
+        let visible = cur.shape != alacritty_terminal::vte::ansi::CursorShape::Hidden
+            && cur_vline >= 0
+            && (cur_vline as usize) < rows;
+        let cursor = VtCursor {
+            line: cur_vline.max(0) as usize,
+            col: cur.point.column.0.min(cols.saturating_sub(1)),
+            visible,
+        };
+
+        VtScreen {
+            cols,
+            rows,
+            cells,
+            cursor,
+            display_offset,
+        }
+    }
+
+    fn scroll(&mut self, delta_lines: i32) {
+        self.term.scroll_display(Scroll::Delta(delta_lines));
+        // Rolar muda a tela inteira: marca tudo danificado p/ o próximo snapshot.
+        self.damage_all();
+    }
+
+    fn dims(&self) -> (usize, usize) {
+        (self.size.cols, self.size.rows)
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) {
         self.size = GridSize {
             cols: usize::from(cols.max(1)),
@@ -176,6 +314,72 @@ impl VtBackend for AlacrittyBackend {
         self.term.resize(self.size);
         // Um resize redesenha tudo: marca o viewport inteiro como danificado.
         self.damage_all();
+    }
+}
+
+/// Tabela xterm 256 cores (auto-contida — o `alacritty_terminal` não embarca palette).
+fn xterm256(idx: u8) -> VtRgb {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0x00, 0x00, 0x00),
+        (0xcd, 0x00, 0x00),
+        (0x00, 0xcd, 0x00),
+        (0xcd, 0xcd, 0x00),
+        (0x00, 0x00, 0xee),
+        (0xcd, 0x00, 0xcd),
+        (0x00, 0xcd, 0xcd),
+        (0xe5, 0xe5, 0xe5),
+        (0x7f, 0x7f, 0x7f),
+        (0xff, 0x00, 0x00),
+        (0x00, 0xff, 0x00),
+        (0xff, 0xff, 0x00),
+        (0x5c, 0x5c, 0xff),
+        (0xff, 0x00, 0xff),
+        (0x00, 0xff, 0xff),
+        (0xff, 0xff, 0xff),
+    ];
+    if idx < 16 {
+        let (r, g, b) = ANSI[idx as usize];
+        VtRgb { r, g, b }
+    } else if idx < 232 {
+        let i = idx - 16;
+        let to = |v: u8| -> u8 {
+            if v == 0 {
+                0
+            } else {
+                55 + v * 40
+            }
+        };
+        VtRgb {
+            r: to(i / 36),
+            g: to((i % 36) / 6),
+            b: to(i % 6),
+        }
+    } else {
+        let v = 8u8.saturating_add((idx - 232).saturating_mul(10));
+        VtRgb { r: v, g: v, b: v }
+    }
+}
+
+/// Resolve uma `Color` do alacritty (`Named`/`Indexed`/`Spec`) numa `VtRgb` concreta.
+fn resolve_color(color: Color, default_fg: VtRgb, default_bg: VtRgb) -> VtRgb {
+    match color {
+        Color::Spec(rgb) => VtRgb {
+            r: rgb.r,
+            g: rgb.g,
+            b: rgb.b,
+        },
+        Color::Indexed(i) => xterm256(i),
+        Color::Named(NamedColor::Foreground) => default_fg,
+        Color::Named(NamedColor::Background) => default_bg,
+        Color::Named(NamedColor::Cursor) => default_fg,
+        Color::Named(named) => {
+            let i = named as usize;
+            if i < 16 {
+                xterm256(i as u8)
+            } else {
+                default_fg
+            }
+        }
     }
 }
 
@@ -217,6 +421,15 @@ impl VtBackend for GhosttyBackend {
         unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
     }
     fn row_text(&self, _viewport_line: usize) -> String {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn screen(&self) -> VtScreen {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn scroll(&mut self, _delta_lines: i32) {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn dims(&self) -> (usize, usize) {
         unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
     }
     fn resize(&mut self, _cols: u16, _rows: u16) {

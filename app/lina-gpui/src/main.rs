@@ -1,10 +1,9 @@
-//! `lina-gpui` — o **walking skeleton** do Lina Space (gate da Onda 2): o primeiro Lina
-//! que se VÊ e se USA. Um canvas gpui com **2 terminais reais do core**, **pan**, e o
-//! diferencial #1 — a metáfora **"sem fios"**: um A2A A→B dispara um **pulso efêmero**
-//! visível (ao escutar `BusEvent::Message` do pub/sub do core) e o texto **chega no grid
-//! de B** (round-trip faseado real, via `deliver_a2a`). Eventos persistidos no EventStore.
-//!
-//! Toda a tradução core↔UI vive em [`bridge`] (livre de gpui). Esta camada só desenha.
+//! `lina-gpui` — o **walking skeleton com render de terminal de verdade** (Onda 2). Canvas
+//! gpui com 2 terminais reais do core; cada card pinta o **snapshot do grid VISÍVEL**
+//! (`VtBackend::screen()`) a cada frame — cols×rows com **cores por célula + cursor** —
+//! então TUIs ricas (Claude Code, vim) aparecem corretas. **Scroll** (scrollback),
+//! **teclas especiais** (setas/Home/End/PageUp·Down/F-keys → CSI), **resize** (PTY+grid),
+//! e o diferencial **A2A com pulso "sem fios"**. Tradução core↔UI em [`bridge`] (gpui-free).
 
 mod bridge;
 
@@ -15,13 +14,15 @@ use std::time::Duration;
 
 use gpui::{
     div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, Context, FocusHandle,
-    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, Render,
-    Role, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    FontWeight, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    Point, Render, Rgba, Role, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
 use lina_core::{
-    DomainEvent, EventStore, NodeStatus as CoreStatus, PtyCommand, PtyManager, Supervisor,
+    DomainEvent, EventStore, NodeStatus as CoreStatus, PtyCommand, PtyManager, Supervisor, VtRgb,
+    VtScreen,
 };
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
@@ -30,11 +31,25 @@ use bridge::{
     Model, NodeView, SharedModel,
 };
 
-const CARD_W: f32 = 420.0;
-const CARD_H: f32 = 380.0;
+const CARD_W: f32 = 680.0;
+const CARD_H: f32 = 500.0;
+/// Métricas aproximadas da célula monoespaçada (Menlo 13px) — definem cols×rows do PTY.
+const CELL_W: f32 = 7.84;
+const CELL_H: f32 = 17.0;
+const FONT_PX: f32 = 13.0;
 
-/// Traduz uma `Keystroke` do gpui em bytes para o PTY (igual à story 1).
-fn keystroke_to_bytes(ks: &Keystroke) -> Vec<u8> {
+/// Quantas cols×rows cabem na área de grid de um card (>= 80×24, "tamanho útil").
+fn fit_dims() -> (u16, u16) {
+    let pad = 8.0;
+    let title = 34.0;
+    let cols = (((CARD_W - 2.0 * pad) / CELL_W).floor() as u16).max(80);
+    let rows = (((CARD_H - title - 2.0 * pad) / CELL_H).floor() as u16).max(24);
+    (cols, rows)
+}
+
+/// Traduz uma `Keystroke` em bytes para o PTY. Imprimíveis via `key_char`; setas como
+/// CSI (ou SS3 em `app_cursor`/DECCKM); Home/End/PageUp·Down/Insert/Delete/F1-F12; Ctrl+letra.
+fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
     let key = ks.key.as_str();
     if ks.modifiers.control && key.len() == 1 {
         if let Some(c) = key.chars().next() {
@@ -43,16 +58,42 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Vec<u8> {
             }
         }
     }
+    // Setas/Home/End: ESC O X em application-cursor-keys, ESC [ X em modo normal.
+    let csi = |c: u8| -> Vec<u8> {
+        if app_cursor {
+            vec![0x1b, b'O', c]
+        } else {
+            vec![0x1b, b'[', c]
+        }
+    };
     match key {
         "enter" | "return" => return vec![0x0D],
         "backspace" => return vec![0x7f],
         "tab" => return vec![0x09],
         "escape" => return vec![0x1b],
         "space" => return vec![b' '],
-        "up" => return vec![0x1b, b'[', b'A'],
-        "down" => return vec![0x1b, b'[', b'B'],
-        "right" => return vec![0x1b, b'[', b'C'],
-        "left" => return vec![0x1b, b'[', b'D'],
+        "up" => return csi(b'A'),
+        "down" => return csi(b'B'),
+        "right" => return csi(b'C'),
+        "left" => return csi(b'D'),
+        "home" => return csi(b'H'),
+        "end" => return csi(b'F'),
+        "pageup" => return vec![0x1b, b'[', b'5', b'~'],
+        "pagedown" => return vec![0x1b, b'[', b'6', b'~'],
+        "insert" => return vec![0x1b, b'[', b'2', b'~'],
+        "delete" => return vec![0x1b, b'[', b'3', b'~'],
+        "f1" => return vec![0x1b, b'O', b'P'],
+        "f2" => return vec![0x1b, b'O', b'Q'],
+        "f3" => return vec![0x1b, b'O', b'R'],
+        "f4" => return vec![0x1b, b'O', b'S'],
+        "f5" => return vec![0x1b, b'[', b'1', b'5', b'~'],
+        "f6" => return vec![0x1b, b'[', b'1', b'7', b'~'],
+        "f7" => return vec![0x1b, b'[', b'1', b'8', b'~'],
+        "f8" => return vec![0x1b, b'[', b'1', b'9', b'~'],
+        "f9" => return vec![0x1b, b'[', b'2', b'0', b'~'],
+        "f10" => return vec![0x1b, b'[', b'2', b'1', b'~'],
+        "f11" => return vec![0x1b, b'[', b'2', b'3', b'~'],
+        "f12" => return vec![0x1b, b'[', b'2', b'4', b'~'],
         _ => {}
     }
     if let Some(kc) = &ks.key_char {
@@ -66,22 +107,103 @@ fn keystroke_to_bytes(ks: &Keystroke) -> Vec<u8> {
     Vec::new()
 }
 
+#[inline]
+fn rgba(c: VtRgb) -> Rgba {
+    Rgba {
+        r: c.r as f32 / 255.0,
+        g: c.g as f32 / 255.0,
+        b: c.b as f32 / 255.0,
+        a: 1.0,
+    }
+}
+
+/// Pinta UMA linha do grid: agrupa células de mesmo estilo em runs (flex-row de spans),
+/// com a célula do cursor como bloco invertido (accent). Monoespaçado → tudo alinha.
+fn render_line(cells: &[lina_core::VtCell], cursor_col: Option<usize>) -> impl IntoElement {
+    struct Run {
+        fg: VtRgb,
+        bg: VtRgb,
+        bold: bool,
+        text: String,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for (col, cell) in cells.iter().enumerate() {
+        let (fg, bg, bold) = if cursor_col == Some(col) {
+            // Bloco do cursor: bg accent, fg escuro.
+            (
+                VtRgb {
+                    r: 0x0a,
+                    g: 0x0e,
+                    b: 0x27,
+                },
+                VtRgb {
+                    r: 0x7a,
+                    g: 0xa2,
+                    b: 0xf7,
+                },
+                false,
+            )
+        } else {
+            (cell.fg, cell.bg, cell.bold)
+        };
+        let ch = match cell.c {
+            '\0' | '\t' => ' ',
+            other => other,
+        };
+        match runs.last_mut() {
+            Some(r) if r.fg == fg && r.bg == bg && r.bold == bold => r.text.push(ch),
+            _ => runs.push(Run {
+                fg,
+                bg,
+                bold,
+                text: ch.to_string(),
+            }),
+        }
+    }
+    div().flex().flex_row().children(runs.into_iter().map(|r| {
+        let span = div()
+            .bg(rgba(r.bg))
+            .text_color(rgba(r.fg))
+            .child(text!(r.text));
+        if r.bold {
+            span.font_weight(FontWeight::BOLD)
+        } else {
+            span
+        }
+    }))
+}
+
+/// Pinta o GRID VISÍVEL inteiro (snapshot atual) — uma linha por linha do viewport.
+fn render_grid(screen: &VtScreen) -> impl IntoElement {
+    let cur = screen.cursor;
+    div()
+        .flex()
+        .flex_col()
+        .font_family("Menlo")
+        .text_size(px(FONT_PX))
+        .children((0..screen.rows).map(move |r| {
+            let cursor_col = (cur.visible && cur.line == r).then_some(cur.col);
+            render_line(screen.row(r), cursor_col)
+        }))
+}
+
 /// O canvas gpui — a ÚNICA parte que conhece o toolkit.
 struct WorkspaceView {
     model: Model,
+    grids: BTreeMap<NodeId, Grid>,
     input: Arc<dyn InputSink>,
     a2a: Arc<A2aTrigger>,
     focused: NodeId,
     focus: FocusHandle,
-    /// Offset de pan (arrastar o fundo). Tudo em `Pixels` (soma direta com `px(pos)`).
     pan: Point<Pixels>,
-    /// `(mouse_inicial, pan_inicial)` enquanto arrasta o fundo.
     drag: Option<(Point<Pixels>, Point<Pixels>)>,
 }
 
 impl WorkspaceView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         model: Model,
+        grids: BTreeMap<NodeId, Grid>,
         input: Arc<dyn InputSink>,
         a2a: Arc<A2aTrigger>,
         focused: NodeId,
@@ -92,6 +214,7 @@ impl WorkspaceView {
         window.focus(&focus, cx);
         Self {
             model,
+            grids,
             input,
             a2a,
             focused,
@@ -102,7 +225,12 @@ impl WorkspaceView {
     }
 
     fn handle_key(&mut self, ev: &KeyDownEvent) {
-        let bytes = keystroke_to_bytes(&ev.keystroke);
+        let app_cursor = self
+            .grids
+            .get(&self.focused)
+            .map(|g| lock(g).mode().app_cursor)
+            .unwrap_or(false);
+        let bytes = keystroke_to_bytes(&ev.keystroke, app_cursor);
         if !bytes.is_empty() {
             self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
         }
@@ -111,10 +239,8 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Poll do SharedModel a cada frame (também anima o pulso efêmero).
         window.request_animation_frame();
 
-        // Snapshot do estado projetado.
         let (cards, pulse, connected, event_count, recovering) = {
             let m = lock(&self.model);
             let cards: Vec<(NodeId, NodeView)> = m
@@ -127,7 +253,6 @@ impl Render for WorkspaceView {
         let pan = self.pan;
         let focused = self.focused;
 
-        // ── canvas (fundo escuro OLED + AURA pontilhada "sem fios") ──────────────
         let aura_color = if connected {
             rgb(0x7aa2f7)
         } else {
@@ -143,8 +268,6 @@ impl Render for WorkspaceView {
             .border_dashed()
             .border_color(aura_color)
             .text_color(rgb(0xc8d3f5))
-            .font_family("Menlo")
-            // PAN: arrastar o fundo.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, ev: &MouseDownEvent, _w, _cx| {
@@ -168,16 +291,15 @@ impl Render for WorkspaceView {
                 view.handle_key(ev);
             }));
 
-        // ── os 2 cards-terminal (posicionados; pan move todos juntos) ────────────
         for (idx, (id, nv)) in cards.iter().enumerate() {
             let x = px(nv.x) + pan.x;
             let y = px(nv.y) + pan.y;
-            let card_border = if *id == focused {
+            let node_id = *id;
+            let card_border = if node_id == focused {
                 rgb(0x7aa2f7)
             } else {
                 rgb(0x2a3152)
             };
-            let node_id = *id;
             let status_dot = match nv.status {
                 NodeStatus::Idle => rgb(0x9ece6a),
                 NodeStatus::Busy | NodeStatus::Running => rgb(0xe0af68),
@@ -193,6 +315,7 @@ impl Render for WorkspaceView {
                 .px_3()
                 .py_2()
                 .bg(rgb(0x141a36))
+                .text_color(rgb(0x7aa2f7))
                 .child(div().size(px(9.0)).rounded_full().bg(status_dot))
                 .child(text!(nv.name.clone()))
                 .child(
@@ -201,25 +324,19 @@ impl Render for WorkspaceView {
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
 
-            let grid = div()
+            // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
+            let mut body = div()
                 .id(("grid", idx))
                 .role(Role::Terminal)
                 .aria_label(nv.name.clone())
-                .flex()
-                .flex_col()
                 .flex_1()
-                .p_2()
-                .text_size(px(12.0))
-                .children(nv.rows.iter().enumerate().map(|(i, line)| {
-                    let line = line.trim_end().to_string();
-                    div()
-                        .id(("row", idx * 1000 + i))
-                        .child(text!(if line.is_empty() {
-                            " ".to_string()
-                        } else {
-                            line
-                        }))
-                }));
+                .overflow_hidden()
+                .p_1()
+                .bg(rgb(0x0d1228));
+            if let Some(g) = self.grids.get(&node_id) {
+                let screen = lock(g).screen();
+                body = body.child(render_grid(&screen));
+            }
 
             let card = div()
                 .id(("card", idx))
@@ -238,13 +355,25 @@ impl Render for WorkspaceView {
                 .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, _cx| {
                     view.focused = node_id;
                 }))
+                .on_scroll_wheel(cx.listener(move |view, ev: &ScrollWheelEvent, _w, _cx| {
+                    let dy: f32 = match ev.delta {
+                        ScrollDelta::Lines(p) => p.y,
+                        ScrollDelta::Pixels(p) => p.y / px(CELL_H),
+                    };
+                    let delta = dy.round() as i32;
+                    if delta != 0 {
+                        if let Some(g) = view.grids.get(&node_id) {
+                            lock(g).scroll(delta);
+                        }
+                    }
+                }))
                 .child(title)
-                .child(grid);
+                .child(body);
 
             root = root.child(card);
         }
 
-        // ── PULSO efêmero A→B (a metáfora "sem fios": aparece e some em ~1s) ──────
+        // PULSO efêmero A→B.
         if let Some(p) = pulse {
             if let Some(t) = p.progress() {
                 let center = |id: NodeId| -> Option<Point<Pixels>> {
@@ -256,11 +385,9 @@ impl Render for WorkspaceView {
                     })
                 };
                 if let (Some(a), Some(b)) = (center(p.from), center(p.to)) {
-                    // Pacote viajando de A→B (interpolação componente-a-componente).
                     let dot_x = a.x + (b.x - a.x) * t;
                     let dot_y = a.y + (b.y - a.y) * t;
                     let alpha = (1.0 - t).clamp(0.0, 1.0);
-                    // Halo (ripple) + núcleo do pacote.
                     root = root.child(
                         div()
                             .absolute()
@@ -285,7 +412,7 @@ impl Render for WorkspaceView {
             }
         }
 
-        // ── barra superior: título · selo "Time conectado" · log · botão A2A ─────
+        // Barra superior.
         let mut topbar = div()
             .absolute()
             .top_0()
@@ -299,7 +426,9 @@ impl Render for WorkspaceView {
             .py_2()
             .bg(rgb(0x0c1130))
             .text_color(rgb(0x7aa2f7))
-            .child(text!("Lina Space · walking skeleton"));
+            .child(text!(
+                "Lina Space · terminais reais (clique p/ focar · digite · scroll)"
+            ));
 
         if connected {
             topbar = topbar.child(
@@ -356,13 +485,13 @@ impl Render for WorkspaceView {
 }
 
 fn main() {
-    // ── PERSISTÊNCIA: EventStore num diretório estável (sobrevive entre execuções) ──
+    let (cols, rows) = fit_dims();
+
     let dir = std::env::temp_dir().join("lina-space-ws2");
     let store = Arc::new(Mutex::new(
         EventStore::open(&dir).expect("abrir EventStore"),
     ));
 
-    // ── CORE: 2 PTYs reais, writers ao Supervisor (input + A2A pela MailQueue) ──────
     let mut pty = PtyManager::new();
     let sup = Arc::new(Supervisor::new());
     let bus_rx = sup.subscribe();
@@ -370,29 +499,46 @@ fn main() {
 
     let cmd_a = PtyCommand::new("sh")
         .arg("-c")
-        .arg("printf 'Terminal A — seu shell. Digite comandos (Enter executa).\\r\\n'; exec sh -i")
+        .arg("printf 'Terminal A — seu shell. Rode comandos ou ate uma TUI (ex: claude).\\r\\n'; exec sh -i")
         .env("TERM", "xterm-256color");
     let cmd_b = PtyCommand::new("sh")
         .arg("-c")
         .arg("printf 'Terminal B — recebe mensagens A2A (sem fios).\\r\\n'; exec cat")
         .env("TERM", "xterm-256color");
 
-    let (node_a, grid_a) =
-        wire_terminal(&mut pty, &sup, &delta_tx, "A", "Terminal A", cmd_a).expect("wire A");
-    let (node_b, grid_b) =
-        wire_terminal(&mut pty, &sup, &delta_tx, "B", "Terminal B", cmd_b).expect("wire B");
+    let (node_a, grid_a) = wire_terminal(
+        &mut pty,
+        &sup,
+        &delta_tx,
+        "A",
+        "Terminal A",
+        cmd_a,
+        cols,
+        rows,
+    )
+    .expect("wire A");
+    let (node_b, grid_b) = wire_terminal(
+        &mut pty,
+        &sup,
+        &delta_tx,
+        "B",
+        "Terminal B",
+        cmd_b,
+        cols,
+        rows,
+    )
+    .expect("wire B");
     let _ = sup.set_status(node_a, CoreStatus::Running);
     let _ = sup.set_status(node_b, CoreStatus::Running);
 
-    // ── PERSISTÊNCIA: grava a criação do workspace + nós + terminais ───────────────
     {
         let mut s = lock(&store);
         let _ = s.append(&DomainEvent::WorkspaceCreated {
             name: "walking-skeleton".into(),
         });
         for (node, name, x, y) in [
-            (node_a, "Terminal A", 60.0_f64, 130.0_f64),
-            (node_b, "Terminal B", 540.0, 130.0),
+            (node_a, "Terminal A", 30.0_f64, 96.0_f64),
+            (node_b, "Terminal B", 740.0, 96.0),
         ] {
             let _ = s.append(&DomainEvent::NodeAdded {
                 node,
@@ -408,29 +554,27 @@ fn main() {
     }
     let event_count = lock(&store).event_count().unwrap_or(0);
 
-    // ── Estado projetado: semeia os 2 cards (nome + posição) ───────────────────────
     let model: Model = Arc::new(Mutex::new(SharedModel::default()));
     {
         let mut m = lock(&model);
         m.seed_node(
             node_a,
-            NodeView::new("Terminal A", NodeKind::Terminal, 60.0, 130.0),
+            NodeView::new("Terminal A", NodeKind::Terminal, 30.0, 96.0),
         );
         m.seed_node(
             node_b,
-            NodeView::new("Terminal B", NodeKind::Terminal, 540.0, 130.0),
+            NodeView::new("Terminal B", NodeKind::Terminal, 740.0, 96.0),
         );
         m.event_count = event_count;
     }
 
-    // ── PONTE: grids → bridge; thread-bomba projeta deltas + Bus (pulso) ───────────
     let mut grids: BTreeMap<NodeId, Grid> = BTreeMap::new();
     grids.insert(node_a, Arc::clone(&grid_a));
     grids.insert(node_b, Arc::clone(&grid_b));
-    let bridge = GpuiBridgeHost::new(Arc::clone(&model), grids);
+
+    let bridge = GpuiBridgeHost::new(Arc::clone(&model));
     let mut pump = spawn_pump(bridge, delta_rx, bus_rx).expect("subir a ponte core→UI");
 
-    // ── Input + gatilho A2A (A→B), reusando deliver_a2a + EventStore ───────────────
     let input: Arc<dyn InputSink> = Arc::new(CoreInput::new(Arc::clone(&sup)));
     let a2a = Arc::new(A2aTrigger::new(
         Arc::clone(&sup),
@@ -443,14 +587,12 @@ fn main() {
     ));
 
     eprintln!(
-        "lina-gpui: walking skeleton · log em {} · {event_count} eventos",
+        "lina-gpui: render de terminal · grid {cols}x{rows} · log {} · {event_count} eventos",
         dir.display()
     );
 
-    // Watchdog opcional só p/ verificação headless (NÃO liga por padrão → janela fica aberta).
     if let Ok(raw) = std::env::var("LINA_AUTOQUIT_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
-            // Dispara um A2A automático antes de encerrar, p/ o smoke exercitar o pulso.
             let a2a_auto = Arc::clone(&a2a);
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(ms / 2));
@@ -461,25 +603,27 @@ fn main() {
         }
     }
 
-    // ── SHELL gpui: o canvas. Janela fica ABERTA até o usuário fechar. ─────────────
     application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1040.0), px(660.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1450.0), px(640.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Lina Space — walking skeleton (2 terminais · sem fios)".into()),
+                    title: Some("Lina Space — terminais reais (render de grid · sem fios)".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| WorkspaceView::new(model, input, a2a, node_a, window, cx)),
+            |window, cx| {
+                cx.new(|cx| WorkspaceView::new(model, grids, input, a2a, node_a, window, cx))
+            },
         )
         .expect("abrir a janela gpui");
         cx.activate(true);
     });
 
     pump.stop();
+    let _ = grid_a;
     drop(sup);
     drop(pty);
 }

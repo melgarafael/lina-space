@@ -28,7 +28,7 @@ pub use lina_cli_profiles::CliProfile;
 /// Re-exports do contrato de UI para os consumidores do core (e o host headless de teste).
 pub use lina_host::{BusTarget, HeadlessUiHost, HostEvent, NodeId, NodeKind, UiHost};
 pub use lina_pty::{PtyCommand, PtyManager};
-pub use lina_vt::{AlacrittyBackend, VtBackend};
+pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen};
 
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
