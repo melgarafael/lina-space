@@ -1,0 +1,27 @@
+[package]
+name = "lina-gpui"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+# SHELL gpui do Lina (Onda 2): a PONTE real core <-> gpui via `lina_host::UiHost` +
+# `InputSink`. Crate standalone, EXCLUÍDO do workspace (raiz `Cargo.toml` `exclude`) —
+# um shell experimental não pode derrubar o build do core.
+[dependencies]
+lina-core = { path = "../../crates/lina-core" }
+lina-host = { path = "../../crates/lina-host" }
+# Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
+tokio = { version = "1", features = ["sync"] }
+# gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal
+# Toolchain offline; ver spikes/spike-gpui/RESULTADO.md §1).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea93604231eaf30ca4c25f1cd6" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea93604231eaf30ca4c25f1cd6", default-features = false, features = ["font-kit", "runtime_shaders"] }
+
+[dev-dependencies]
+# Só nos testes: cunhar `NodeId` (UUID v7) para exercitar `bus_to_host`.
+uuid = { version = "1", features = ["v7"] }
+
+# Disco apertado (~5.8 GiB) + a árvore gpui é grande: corta debuginfo (>50% do target),
+# como o spike. Não é produto — é o primeiro shell ponta-a-ponta.
+[profile.dev]
+debug = false

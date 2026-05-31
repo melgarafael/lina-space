@@ -33,6 +33,11 @@ pub trait VtBackend: Send {
     /// Última linha não-vazia do grid já parseado (sem ANSI) — para detectar
     /// prompt-pronto no A2A, **lendo o grid, não OCR de pixel**.
     fn last_nonempty_line(&self) -> String;
+    /// Texto puro (sem ANSI) de uma linha do viewport — base do render incremental
+    /// do shell de UI (W2): ao receber `HostEvent::GridDelta { dirty_rows }`, a UI
+    /// re-lê **só** essas linhas do grid (lê o grid parseado, não OCR de pixel).
+    /// Índice fora do viewport devolve `String` vazia.
+    fn row_text(&self, viewport_line: usize) -> String;
     fn resize(&mut self, cols: u16, rows: u16);
 }
 
@@ -102,21 +107,6 @@ impl AlacrittyBackend {
         self.term.grid()
     }
 
-    /// Lineariza uma linha do viewport para texto puro (sem ANSI), pulando os
-    /// espaçadores de caractere largo. Tabs já chegam expandidos em espaços pelo
-    /// próprio emulador, então a saída é texto cru pronto para consumo.
-    fn row_text(&self, viewport_line: usize) -> String {
-        if viewport_line >= self.size.rows {
-            return String::new();
-        }
-        let row = &self.grid()[Line(viewport_line as i32)];
-        (0..self.size.cols)
-            .map(|col| &row[Column(col)])
-            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            .map(|cell| cell.c)
-            .collect()
-    }
-
     /// Marca todas as linhas do viewport como danificadas (usado em resize).
     fn damage_all(&mut self) {
         self.damage.clear();
@@ -161,6 +151,21 @@ impl VtBackend for AlacrittyBackend {
             .map(|text| text.trim_end().to_string())
             .find(|text| !text.is_empty())
             .unwrap_or_default()
+    }
+
+    /// Lineariza uma linha do viewport para texto puro (sem ANSI), pulando os
+    /// espaçadores de caractere largo. Tabs já chegam expandidos em espaços pelo
+    /// próprio emulador, então a saída é texto cru pronto para consumo.
+    fn row_text(&self, viewport_line: usize) -> String {
+        if viewport_line >= self.size.rows {
+            return String::new();
+        }
+        let row = &self.grid()[Line(viewport_line as i32)];
+        (0..self.size.cols)
+            .map(|col| &row[Column(col)])
+            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .map(|cell| cell.c)
+            .collect()
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -209,6 +214,9 @@ impl VtBackend for GhosttyBackend {
         unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
     }
     fn last_nonempty_line(&self) -> String {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn row_text(&self, _viewport_line: usize) -> String {
         unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
     }
     fn resize(&mut self, _cols: u16, _rows: u16) {
