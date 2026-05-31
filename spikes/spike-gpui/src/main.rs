@@ -28,8 +28,8 @@ use lina_vt::{AlacrittyBackend, VtBackend};
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
 const SCROLLBACK: usize = 22;
-const MAX_FRAMES: u64 = 240;
-const WALL_CAP: Duration = Duration::from_secs(6);
+const MAX_FRAMES: u64 = 1_000_000;
+const WALL_CAP: Duration = Duration::from_secs(300);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -200,7 +200,7 @@ fn main() {
 
     // watchdog: garante que o processo encerra mesmo se a janela não fechar.
     thread::spawn(|| {
-        thread::sleep(Duration::from_secs(9));
+        thread::sleep(Duration::from_secs(330));
         std::process::exit(0);
     });
 

@@ -37,7 +37,7 @@ Estas abstrações existem na Fase 0 **para o futuro caber**. Mantenha-as vivas:
 - **Linguagem:** Rust, **processo único**, GPU-first. Sem runtime JS, sem IPC renderer↔core. **Tauri e Electron descartados.**
 - **Terminal:** `portable-pty` (vendorizado, patch 3 flags ConPTY) + `alacritty_terminal` (atrás de `VtBackend`).
 - **Render:** `wgpu` (1 Device/Surface; N terminais = geometria, atlas de glifos + instancing) + `vello` (vetor do canvas) + `cosmic-text`/`swash` (texto) + `accesskit` (a11y) + `winit` (janela/IME).
-- **Framework de UI:** **NÃO travado** — `gpui`-pinado (default provisório) vs `Slint` (plano B), decidido por **spike medido** (Onda 1 do épico). Até lá, o core fica atrás de `UiHost`.
+- **Framework de UI:** ✅ **gpui** (decidido na Onda 1 por spike medido — 120Hz + AccessKit 1ª classe; ver vault `33 - Decisao de Framework de UI`). Pin de SHA `09165c15…` + vendoring + `runtime_shaders` no macOS. O core fica atrás de `UiHost` (porta de troca p/ Slint preservada se a governança do gpui piorar). Shell em gpui.
 - **Persistência:** `rusqlite` (SQLite WAL) + JSONL append-only + snapshots. Webhooks: `axum`. Segredos: `keyring`.
 - **A2A:** injeção no PTY vivo **faseada** (bracketed-paste → `submit_delay` ~0.3s → Enter `0x0D` separado; fila serial por terminal); `--resume` como fallback; declarado por CLI Profile.
 

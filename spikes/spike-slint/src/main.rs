@@ -204,7 +204,7 @@ fn main() {
     let quit = slint::Timer::default();
     quit.start(
         slint::TimerMode::SingleShot,
-        Duration::from_millis(3500),
+        Duration::from_millis(300000),
         || {
             let _ = slint::quit_event_loop();
         },
