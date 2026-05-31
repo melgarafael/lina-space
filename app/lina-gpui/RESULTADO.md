@@ -1,13 +1,32 @@
-# Onda 2 — Render de terminal de VERDADE (usável) · RESULTADO
+# Onda 2 — Render de terminal de VERDADE + todo nó é um SHELL REAL · RESULTADO
 
-> **TL;DR:** os terminais agora são **usáveis**. Cada card pinta o **snapshot do GRID
-> VISÍVEL** (`VtBackend::screen()` — matriz cols×rows com **cor por célula + cursor**) lido
-> direto do `alacritty_terminal` **a cada frame** — não mais `row_text` das linhas sujas
-> empilhadas. TUIs ricas (Claude Code, vim) renderizam corretas; há **scroll** (scrollback),
-> **teclas especiais** (setas/Home/End/PageUp·Down/F1-F12 → CSI/SS3, sem eco de lixo),
-> **resize** (PTY+grid, **84×26** ≥ 80×24), e cores ANSI/256. O canvas, o pan, o **A2A com
-> pulso "sem fios"** e a **persistência** seguem. **Build passa; clippy `-D warnings` + fmt
-> limpos; gate de render provado em teste; 57 testes do workspace verdes; sem panic.**
+> **TL;DR:** os terminais são **usáveis** e **todos idênticos em capacidade**. Cada card pinta
+> o **snapshot do GRID VISÍVEL** (`VtBackend::screen()` — cols×rows com **cor por célula +
+> cursor**) lido do `alacritty_terminal` **a cada frame** (não mais `row_text` empilhado), e
+> **TODO terminal (A, B, …) roda um SHELL INTERATIVO REAL** (`$SHELL` com fallback `/bin/sh`)
+> — sem mock/`cat`. O fundador clica no B, digita `claude`/`ls` e funciona **igual ao A**. O
+> A2A continua (botão injeta um comando em B via `deliver_a2a`, com pulso "sem fios"), mas o B
+> também aceita o humano digitar — o A2A é só **mais uma fonte de input pela fila serial do
+> Supervisor**. Há scroll, teclas especiais (CSI/SS3 sem lixo), resize (**84×26** ≥ 80×24),
+> cores ANSI/256, canvas/pan e persistência. **Build passa; clippy `-D warnings` + fmt limpos;
+> render e A2A provados em teste; core 57 testes verdes (core intocado nesta correção); sem panic.**
+
+---
+
+## 0. Conserto de design: nada de terminal mock — todo nó é um shell real
+
+Antes, o Terminal B rodava `cat` (só ecoava) — um receptor mock que não aceitava comandos.
+**Agora** `main.rs` cria **todo** terminal com o mesmo `shell_cmd(name)`: um banner neutro + `exec
+"${SHELL:-/bin/sh}" -i` — o shell do usuário (zsh/bash/fish) com fallback `/bin/sh`, interativo,
+**idêntico** para A, B, C…. Consequências:
+- **Input do humano** já roteia para o nó **focado** (`handle_key → self.focused →
+  CoreInput::write_human`): clicar no B e digitar escreve no PTY do B; no A, no A. Vale para os dois.
+- **O A2A coexiste:** o botão injeta um **comando válido** (`echo '…'`) de A→B via `deliver_a2a`
+  (bracketed-paste faseado → Enter), que entra pela **MailQueue serial** do Supervisor — a mesma
+  fila do input humano. Logo o B é um shell normal que recebe tanto o humano quanto o A2A, sem
+  conflito (a fila serializa). O texto chega e **roda** no shell do B; o pulso A→B aparece.
+- **Textos neutros:** banner de cada terminal = "Terminal X — shell interativo (digite comandos;
+  rode claude/vim/…)". Nada de "recebe mensagens A2A".
 
 ---
 
@@ -85,10 +104,11 @@ O `GridDelta` vira só um sinal "mudou" (drenado); o `SharedModel` carrega só m
 ## 5. Como rodar (teste visual do fundador)
 ```bash
 cd app/lina-gpui
-cargo run                      # abre o canvas
-# No Terminal A (clique p/ focar), rode uma TUI real: digite `claude` (ou `vim`, `htop`):
-#   → caixas/cores/cursor aparecem corretos; setas navegam; scroll rola o histórico.
-# Clique "⚡ Enviar A2A (A→B)" → pulso A→B + a mensagem chega no Terminal B.
+cargo run                      # abre o canvas (ou rode o binário pronto: ./target/debug/lina-gpui)
+# Clique no Terminal A (ou no B — IDÊNTICOS) p/ focar; ambos são shells reais:
+#   digite `claude` (ou `ls`, `vim`, `htop`) → caixas/cores/cursor corretos; setas navegam; scroll rola.
+# Digitar no B escreve no PTY do B; no A, no A (roteamento pelo nó focado).
+# Clique "⚡ Enviar A2A (A→B)" → pulso A→B + o comando injetado RODA no shell do B (que segue digitável).
 cargo test                     # 3/3 (gate de render + A2A + recovery)
 ```
 

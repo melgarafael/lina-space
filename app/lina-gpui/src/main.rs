@@ -47,6 +47,19 @@ fn fit_dims() -> (u16, u16) {
     (cols, rows)
 }
 
+/// Comando de um terminal: um **SHELL INTERATIVO REAL** — o do usuário (`$SHELL`) com
+/// fallback `/bin/sh`. Idêntico para TODOS os nós: aceita teclado, roda claude/codex/vim,
+/// etc. Mostra um banner neutro e dá `exec` no shell (sem mock/`cat`).
+fn shell_cmd(name: &str) -> PtyCommand {
+    PtyCommand::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
+             exec \"${{SHELL:-/bin/sh}}\" -i"
+        ))
+        .env("TERM", "xterm-256color")
+}
+
 /// Traduz uma `Keystroke` em bytes para o PTY. Imprimíveis via `key_char`; setas como
 /// CSI (ou SS3 em `app_cursor`/DECCKM); Home/End/PageUp·Down/Insert/Delete/F1-F12; Ctrl+letra.
 fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
@@ -462,8 +475,11 @@ impl Render for WorkspaceView {
                     .text_color(rgb(0xeef1ff))
                     .cursor_pointer()
                     .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
-                        view.a2a
-                            .fire("📨 A2A de A→B · time conectado (sem fios)".to_string());
+                        // O B é um shell real: injeta um COMANDO válido (roda limpo nele).
+                        view.a2a.fire(
+                            "echo '📨 A2A recebido de Terminal A · cooperacao sem fios'"
+                                .to_string(),
+                        );
                     }))
                     .child(text!("⚡ Enviar A2A (A→B)")),
             );
@@ -497,14 +513,10 @@ fn main() {
     let bus_rx = sup.subscribe();
     let (delta_tx, delta_rx) = std::sync::mpsc::channel();
 
-    let cmd_a = PtyCommand::new("sh")
-        .arg("-c")
-        .arg("printf 'Terminal A — seu shell. Rode comandos ou ate uma TUI (ex: claude).\\r\\n'; exec sh -i")
-        .env("TERM", "xterm-256color");
-    let cmd_b = PtyCommand::new("sh")
-        .arg("-c")
-        .arg("printf 'Terminal B — recebe mensagens A2A (sem fios).\\r\\n'; exec cat")
-        .env("TERM", "xterm-256color");
+    // Todo terminal é um SHELL INTERATIVO REAL e COMPLETO — idêntico em capacidade.
+    // Não há terminal mock/receptor: o B aceita teclado e roda claude/vim igual ao A.
+    let cmd_a = shell_cmd("Terminal A");
+    let cmd_b = shell_cmd("Terminal B");
 
     let (node_a, grid_a) = wire_terminal(
         &mut pty,
@@ -596,7 +608,7 @@ fn main() {
             let a2a_auto = Arc::clone(&a2a);
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(ms / 2));
-                a2a_auto.fire("📨 A2A automatico (smoke)".to_string());
+                a2a_auto.fire("echo '📨 A2A automatico (smoke)'".to_string());
                 thread::sleep(Duration::from_millis(ms / 2));
                 std::process::exit(0);
             });

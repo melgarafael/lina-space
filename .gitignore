@@ -6,3 +6,9 @@ Cargo.lock
 *.db-wal
 *.db-shm
 .lina/
+
+# targets dos crates excluidos do workspace
+app/*/target/
+spikes/*/target/
+**/Cargo.lock
+!Cargo.lock

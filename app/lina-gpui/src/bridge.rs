@@ -635,6 +635,10 @@ mod tests {
         b.scroll(5);
         assert_eq!(b.screen().display_offset, 5, "scroll sobe 5 no histórico");
         b.scroll(-100);
-        assert_eq!(b.screen().display_offset, 0, "scroll desce de volta ao fundo");
+        assert_eq!(
+            b.screen().display_offset,
+            0,
+            "scroll desce de volta ao fundo"
+        );
     }
 }
