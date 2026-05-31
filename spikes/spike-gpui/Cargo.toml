@@ -9,4 +9,20 @@ publish = false
 [dependencies]
 lina-pty = { path = "../../crates/lina-pty" }
 lina-vt = { path = "../../crates/lina-vt" }
-# TODO(W1-1): gpui (git rev pinado) + accesskit. Documentar o esforço de fazer compilar.
+# W1-1: gpui só existe como git dep do monorepo Zed (NÃO há crate no crates.io).
+# SHA AUDITADO (pinado, não branch/tag móvel) — resolvido do HEAD em 2026-05-30:
+#   09165c15dc5d1fea93604231eaf30ca4c25f1cd6  (gpui v0.2.2)
+# `gpui` sozinho NÃO traz o renderer Metal (gpui_platform é dev-dep do gpui). Para
+# abrir uma janela real é preciso `gpui_platform` (que puxa `gpui_macos`). O backend
+# mac, por DEFAULT, compila os shaders .metal OFFLINE no build.rs via `xcrun metal`
+# /`metallib` → exige o Metal Toolchain (componente sob demanda, AUSENTE no Xcode 26
+# desta máquina). A feature `runtime_shaders` desvia para compilação em runtime
+# (Metal.framework) e dispensa o toolchain offline. Ver RESULTADO.md §1.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea93604231eaf30ca4c25f1cd6" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea93604231eaf30ca4c25f1cd6", default-features = false, features = ["font-kit", "runtime_shaders"] }
+
+# Spike num host com disco quase cheio (~2.6 GB livres): a árvore debug do gpui +
+# renderer Metal não cabe COM debuginfo. Cortamos o debuginfo (não é produto; só
+# medimos janela/frame timing). Reduz o target em >50% e acelera o link.
+[profile.dev]
+debug = false
