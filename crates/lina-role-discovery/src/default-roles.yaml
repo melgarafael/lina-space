@@ -1,0 +1,69 @@
+# default-roles.yaml — registry canônico de papéis do Lina Space (story W3-1).
+#
+# Fonte da verdade: vault "21 - Camada de IA e Orquestracao" §2.2, que estende
+# `maestri-orchestrator/references/role-mapping.md` (mesmos patterns + os papéis
+# novos CURADOR e AUTOMATOR). Este arquivo é EMBUTIDO no binário via include_str!
+# — descoberta de papel é puro Rust, sem I/O nem rede em produção.
+#
+# Convenções:
+#   * A ORDEM importa: "first match wins" (doc §2.1). Não reordene sem motivo.
+#   * `patterns` são fragmentos REGEX (case-insensitive), SEM o marcador `@`
+#     (o `@` é estrutural e tratado pelo matcher) e SEM âncoras (^ $ \b): o
+#     matcher adiciona as âncoras conforme a estratégia (exato/prefixo/keyword).
+#   * `needs_confirmation` omitido = false (papel declarado é confiável). Só o
+#     fallback DEVELOPER nasce true: papel indeterminado pede gate humano
+#     (postura "assistido" do doc §6).
+
+fallback:
+  role: DEVELOPER
+  skills: [senior-frontend, senior-backend]
+  needs_confirmation: true
+
+roles:
+  - role: MAESTRO
+    patterns: [maestro, orquest, coord, lider, master]
+    skills: [maestri-orchestrator]
+
+  - role: ARQUITETO
+    patterns: [arquiteto, architect, arch]
+    skills: [senior-architect]
+
+  - role: FRONTEND
+    patterns: ["front.?end", "dev front", ui, react]
+    skills: [senior-frontend, frontend-design, unique-ui-design]
+
+  - role: BACKEND
+    patterns: ["back.?end", "dev back", api, server, node]
+    skills: [senior-backend, tomik-db-doctrine]
+
+  - role: LLM_ENGINEER
+    patterns: [ia, llm, prompt, agent]
+    skills: [senior-prompt-engineer, ai-agent-qa]
+
+  - role: DATA_ENGINEER
+    patterns: [dados, db, database, sql, supabase]
+    skills: [tomik-db-doctrine, agent-runtime-data-split]
+
+  - role: UIUX_DESIGNER
+    patterns: ["ui.?ux", ux, design]
+    skills: [ui-ux-pro-max, ui-ux-auditor, unique-ui-design]
+
+  - role: WRITER
+    patterns: [writer, copy, redator, lp]
+    skills: [growthOS-sales-page, social-content]
+
+  - role: QA
+    patterns: [qa, teste, quality]
+    skills: [e2e-product-qa]
+
+  - role: BUG_FIXER
+    patterns: [bug, fixer, debug]
+    skills: [autonomous-bug-fixer]
+
+  - role: CURADOR
+    patterns: [curador, tino, novidades, news, scout]
+    skills: [tino-refresh, find-skills]
+
+  - role: AUTOMATOR
+    patterns: [automacao, webhook, gatilho, trigger, flow]
+    skills: [mcp-builder]

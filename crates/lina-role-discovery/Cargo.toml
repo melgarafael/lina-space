@@ -1,0 +1,17 @@
+[package]
+name = "lina-role-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# W3-1: role-discovery por NOME, puro Rust, ZERO LLM, ZERO rede.
+# serde + serde_yaml ficam locais a ESTE crate (escopo da story); não entram no
+# workspace raiz — mesmo padrão de escopo de lina-cli-profiles (serde/toml locais).
+# `regex` já está na árvore do Cargo.lock (dep transitiva); usá-la como dep direta
+# não baixa nada novo e honra fielmente os patterns regex do doc 21 (`ui.?ux`,
+# `back.?end`) com casamento por fronteira de palavra (sem falso-positivo de substring).
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1"
