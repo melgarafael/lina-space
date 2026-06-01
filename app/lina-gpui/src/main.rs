@@ -21,18 +21,16 @@ use gpui::{
 use gpui_platform::application;
 
 use lina_core::{
-    DomainEvent, EventStore, NodeStatus as CoreStatus, PtyCommand, PtyManager, Supervisor, VtRgb,
-    VtScreen,
+    DomainEvent, EventStore, NodeStatus as CoreStatus, PtyManager, Supervisor, VtRgb, VtScreen,
 };
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
 use bridge::{
-    demo_profile, lock, spawn_pump, wire_terminal, A2aTrigger, CoreInput, GpuiBridgeHost, Grid,
-    Model, NodeView, SharedModel,
+    demo_profile, lock, pan_to_reveal, shell_cmd, spawn_pump, wire_terminal, A2aTrigger,
+    CmdFactory, CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, SharedModel, CARD_H,
+    CARD_W,
 };
 
-const CARD_W: f32 = 680.0;
-const CARD_H: f32 = 500.0;
 /// Métricas aproximadas da célula monoespaçada (Menlo 13px) — definem cols×rows do PTY.
 const CELL_W: f32 = 7.84;
 const CELL_H: f32 = 17.0;
@@ -45,19 +43,6 @@ fn fit_dims() -> (u16, u16) {
     let cols = (((CARD_W - 2.0 * pad) / CELL_W).floor() as u16).max(80);
     let rows = (((CARD_H - title - 2.0 * pad) / CELL_H).floor() as u16).max(24);
     (cols, rows)
-}
-
-/// Comando de um terminal: um **SHELL INTERATIVO REAL** — o do usuário (`$SHELL`) com
-/// fallback `/bin/sh`. Idêntico para TODOS os nós: aceita teclado, roda claude/codex/vim,
-/// etc. Mostra um banner neutro e dá `exec` no shell (sem mock/`cat`).
-fn shell_cmd(name: &str) -> PtyCommand {
-    PtyCommand::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
-             exec \"${{SHELL:-/bin/sh}}\" -i"
-        ))
-        .env("TERM", "xterm-256color")
 }
 
 /// Traduz uma `Keystroke` em bytes para o PTY. Imprimíveis via `key_char`; setas como
@@ -200,10 +185,10 @@ fn render_grid(screen: &VtScreen) -> impl IntoElement {
         }))
 }
 
-/// O canvas gpui — a ÚNICA parte que conhece o toolkit.
+/// O canvas gpui — a ÚNICA parte que conhece o toolkit. O estado dos nós (add/remove, model,
+/// grids) vive no [`NodeManager`] gpui-free; a view só renderiza, roteia input e foca.
 struct WorkspaceView {
-    model: Model,
-    grids: BTreeMap<NodeId, Grid>,
+    nodes: NodeManager,
     input: Arc<dyn InputSink>,
     a2a: Arc<A2aTrigger>,
     focused: NodeId,
@@ -213,10 +198,8 @@ struct WorkspaceView {
 }
 
 impl WorkspaceView {
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        model: Model,
-        grids: BTreeMap<NodeId, Grid>,
+        nodes: NodeManager,
         input: Arc<dyn InputSink>,
         a2a: Arc<A2aTrigger>,
         focused: NodeId,
@@ -226,8 +209,7 @@ impl WorkspaceView {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         Self {
-            model,
-            grids,
+            nodes,
             input,
             a2a,
             focused,
@@ -237,13 +219,60 @@ impl WorkspaceView {
         }
     }
 
-    fn handle_key(&mut self, ev: &KeyDownEvent) {
-        let app_cursor = self
-            .grids
-            .get(&self.focused)
-            .map(|g| lock(g).mode().app_cursor)
-            .unwrap_or(false);
-        let bytes = keystroke_to_bytes(&ev.keystroke, app_cursor);
+    /// Auto-pan: traz o card do nó `node` INTEIRAMENTE para dentro da viewport visível. É o que
+    /// faz o terminal recém-criado **aparecer** — o [`next_free_slot`] pode posicioná-lo além da
+    /// borda da janela (3 cards de 680px não cabem numa janela de 1450px), e o pan o revela.
+    fn reveal(&mut self, node: NodeId, window: &Window) {
+        let card = lock(&self.nodes.model).nodes.get(&node).map(|v| (v.x, v.y));
+        if let Some(card) = card {
+            let vp = window.viewport_size();
+            let (nx, ny) = pan_to_reveal(
+                (f32::from(self.pan.x), f32::from(self.pan.y)),
+                card,
+                (f32::from(vp.width), f32::from(vp.height)),
+            );
+            self.pan = point(px(nx), px(ny));
+        }
+    }
+
+    /// Fecha o nó focado, reposiciona o foco num nó vivo (nunca tela em branco) e o revela.
+    fn close_focused(&mut self, window: &Window) {
+        let node = self.focused;
+        if let Err(e) = self.nodes.remove_node(node) {
+            eprintln!("lina-gpui: fechar nó focado: {e}");
+            return;
+        }
+        // `first` num let SEPARADO: solta o lock do model ANTES do reveal (que re-locka o
+        // model) — em edition 2021 o guard temporário de um `if let` viveria por todo o bloco,
+        // causando re-lock na mesma thread (deadlock).
+        let first = lock(&self.nodes.model).order.first().copied();
+        if let Some(first) = first {
+            self.focused = first;
+            self.reveal(first, window);
+        }
+    }
+
+    fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window) {
+        let ks = &ev.keystroke;
+        // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona um terminal (foca e REVELA);
+        // ⌘⌫ fecha o nó focado (sem o conflito do ⌘W com o "fechar janela" do OS).
+        if ks.modifiers.platform && ks.key == "t" {
+            match self.nodes.add_node() {
+                Ok(node) => {
+                    self.focused = node;
+                    self.reveal(node, window);
+                }
+                Err(e) => eprintln!("lina-gpui: add_node (⌘T): {e}"),
+            }
+            return;
+        }
+        if ks.modifiers.platform && ks.key == "backspace" {
+            self.close_focused(window);
+            return;
+        }
+        let grid = lock(&self.nodes.grids).get(&self.focused).cloned();
+        let app_cursor = grid.map(|g| lock(&g).mode().app_cursor).unwrap_or(false);
+        let bytes = keystroke_to_bytes(ks, app_cursor);
         if !bytes.is_empty() {
             self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
         }
@@ -254,15 +283,19 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
 
-        let (cards, pulse, connected, event_count, recovering) = {
-            let m = lock(&self.model);
-            let cards: Vec<(NodeId, NodeView)> = m
-                .order
-                .iter()
-                .filter_map(|n| m.nodes.get(n).map(|v| (*n, v.clone())))
-                .collect();
-            (cards, m.pulse, m.connected, m.event_count, m.recovering)
+        // Os cards desenhados DERIVAM do NodeManager (não de 2 fixos) — add/remove refletem aqui.
+        let cards = self.nodes.cards();
+        let (pulse, connected, event_count, recovering) = {
+            let m = lock(&self.nodes.model);
+            (m.pulse, m.connected, m.event_count, m.recovering)
         };
+        // O foco deve apontar SEMPRE a um nó vivo: se o focado saiu (✕/⌘⌫/pump), o destaque
+        // sumiria e as teclas iriam p/ um nó morto. Reaponta para o primeiro card vivo.
+        if !cards.iter().any(|(id, _)| *id == self.focused) {
+            if let Some((first, _)) = cards.first() {
+                self.focused = *first;
+            }
+        }
         let pan = self.pan;
         let focused = self.focused;
 
@@ -300,8 +333,8 @@ impl Render for WorkspaceView {
                     view.drag = None;
                 }),
             )
-            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, _w, _cx| {
-                view.handle_key(ev);
+            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, _cx| {
+                view.handle_key(ev, window);
             }));
 
         for (idx, (id, nv)) in cards.iter().enumerate() {
@@ -320,7 +353,7 @@ impl Render for WorkspaceView {
                 _ => rgb(0x7aa2f7),
             };
 
-            let title = div()
+            let mut title = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -336,6 +369,35 @@ impl Render for WorkspaceView {
                         .text_color(rgb(0x5b658f))
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
+            // O ✕ só aparece quando há >1 card: o ÚLTIMO nó nunca pode ser fechado (o canvas
+            // jamais fica em branco), então não mostramos um botão que recusaria a ação.
+            if cards.len() > 1 {
+                title = title.child(div().flex_1()).child(
+                    div()
+                        .id(("close", idx))
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(0x33202c))
+                        .text_color(rgb(0xf7768e))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _ev: &ClickEvent, window, _cx| {
+                            if let Err(e) = view.nodes.remove_node(node_id) {
+                                eprintln!("lina-gpui: fechar terminal: {e}");
+                                return;
+                            }
+                            // Reposiciona o foco num nó vivo (nunca tela em branco) e o revela.
+                            // `first` em let separado: solta o lock do model antes do reveal.
+                            if view.focused == node_id {
+                                let first = lock(&view.nodes.model).order.first().copied();
+                                if let Some(first) = first {
+                                    view.focused = first;
+                                    view.reveal(first, window);
+                                }
+                            }
+                        }))
+                        .child(text!("✕")),
+                );
+            }
 
             // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
             let mut body = div()
@@ -346,8 +408,9 @@ impl Render for WorkspaceView {
                 .overflow_hidden()
                 .p_1()
                 .bg(rgb(0x0d1228));
-            if let Some(g) = self.grids.get(&node_id) {
-                let screen = lock(g).screen();
+            let grid = lock(&self.nodes.grids).get(&node_id).cloned();
+            if let Some(g) = grid {
+                let screen = lock(&g).screen();
                 body = body.child(render_grid(&screen));
             }
 
@@ -366,7 +429,10 @@ impl Render for WorkspaceView {
                 .rounded_md()
                 .overflow_hidden()
                 .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, _cx| {
-                    view.focused = node_id;
+                    // Só foca se o nó ainda existe (o ✕ pode tê-lo removido neste clique).
+                    if lock(&view.nodes.model).nodes.contains_key(&node_id) {
+                        view.focused = node_id;
+                    }
                 }))
                 .on_scroll_wheel(cx.listener(move |view, ev: &ScrollWheelEvent, _w, _cx| {
                     let dy: f32 = match ev.delta {
@@ -375,8 +441,9 @@ impl Render for WorkspaceView {
                     };
                     let delta = dy.round() as i32;
                     if delta != 0 {
-                        if let Some(g) = view.grids.get(&node_id) {
-                            lock(g).scroll(delta);
+                        let grid = lock(&view.nodes.grids).get(&node_id).cloned();
+                        if let Some(g) = grid {
+                            lock(&g).scroll(delta);
                         }
                     }
                 }))
@@ -459,13 +526,16 @@ impl Render for WorkspaceView {
             );
         }
 
-        topbar = topbar
-            .child(
-                div()
-                    .text_color(rgb(0x5b658f))
-                    .child(text!(format!("log: {event_count} eventos"))),
-            )
-            .child(
+        topbar = topbar.child(
+            div()
+                .text_color(rgb(0x5b658f))
+                .child(text!(format!("log: {event_count} eventos"))),
+        );
+
+        // O ⚡ A2A (A→B) só aparece com AMBOS os alvos vivos: se o fundador fechar A ou B,
+        // escondemos o botão em vez de deixá-lo falhar em silêncio.
+        if self.a2a.ready() {
+            topbar = topbar.child(
                 div()
                     .id("a2a-btn")
                     .px_3()
@@ -483,6 +553,29 @@ impl Render for WorkspaceView {
                     }))
                     .child(text!("⚡ Enviar A2A (A→B)")),
             );
+        }
+
+        topbar = topbar.child(
+            div()
+                .id("add-terminal-btn")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(0x2c7a4b))
+                .text_color(rgb(0xeef1ff))
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _ev: &ClickEvent, window, _cx| {
+                    // Cria um shell real novo, idêntico aos demais, foca e o TRAZ p/ a viewport.
+                    match view.nodes.add_node() {
+                        Ok(node) => {
+                            view.focused = node;
+                            view.reveal(node, window);
+                        }
+                        Err(e) => eprintln!("lina-gpui: add_node: {e}"),
+                    }
+                }))
+                .child(text!("➕ Terminal")),
+        );
 
         if recovering {
             topbar = topbar.child(
@@ -508,37 +601,44 @@ fn main() {
         EventStore::open(&dir).expect("abrir EventStore"),
     ));
 
-    let mut pty = PtyManager::new();
+    let pty = Arc::new(Mutex::new(PtyManager::new()));
     let sup = Arc::new(Supervisor::new());
     let bus_rx = sup.subscribe();
     let (delta_tx, delta_rx) = std::sync::mpsc::channel();
 
-    // Todo terminal é um SHELL INTERATIVO REAL e COMPLETO — idêntico em capacidade.
-    // Não há terminal mock/receptor: o B aceita teclado e roda claude/vim igual ao A.
-    let cmd_a = shell_cmd("Terminal A");
-    let cmd_b = shell_cmd("Terminal B");
+    // Fábrica de nós: todo terminal é um SHELL INTERATIVO REAL e COMPLETO — idêntico em
+    // capacidade (o B aceita teclado e roda claude/vim igual ao A). Add/remove em runtime
+    // reusa EXATAMENTE esta fábrica via NodeManager.
+    let cmd_factory: CmdFactory = Arc::new(shell_cmd);
 
-    let (node_a, grid_a) = wire_terminal(
-        &mut pty,
-        &sup,
-        &delta_tx,
-        "A",
-        "Terminal A",
-        cmd_a,
-        cols,
-        rows,
-    )
+    // Os 2 nós iniciais (A, B), pela MESMA fiação dos nós adicionados em runtime.
+    let (node_a, grid_a) = {
+        let mut p = lock(&pty);
+        wire_terminal(
+            &mut p,
+            &sup,
+            &delta_tx,
+            "A",
+            "Terminal A",
+            (*cmd_factory)("Terminal A"),
+            cols,
+            rows,
+        )
+    }
     .expect("wire A");
-    let (node_b, grid_b) = wire_terminal(
-        &mut pty,
-        &sup,
-        &delta_tx,
-        "B",
-        "Terminal B",
-        cmd_b,
-        cols,
-        rows,
-    )
+    let (node_b, grid_b) = {
+        let mut p = lock(&pty);
+        wire_terminal(
+            &mut p,
+            &sup,
+            &delta_tx,
+            "B",
+            "Terminal B",
+            (*cmd_factory)("Terminal B"),
+            cols,
+            rows,
+        )
+    }
     .expect("wire B");
     let _ = sup.set_status(node_a, CoreStatus::Running);
     let _ = sup.set_status(node_b, CoreStatus::Running);
@@ -580,9 +680,15 @@ fn main() {
         m.event_count = event_count;
     }
 
-    let mut grids: BTreeMap<NodeId, Grid> = BTreeMap::new();
-    grids.insert(node_a, Arc::clone(&grid_a));
-    grids.insert(node_b, Arc::clone(&grid_b));
+    let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    {
+        let mut g = lock(&grids);
+        g.insert(node_a, Arc::clone(&grid_a));
+        g.insert(node_b, Arc::clone(&grid_b));
+    }
+    let mut keys: BTreeMap<NodeId, String> = BTreeMap::new();
+    keys.insert(node_a, "A".to_string());
+    keys.insert(node_b, "B".to_string());
 
     let bridge = GpuiBridgeHost::new(Arc::clone(&model));
     let mut pump = spawn_pump(bridge, delta_rx, bus_rx).expect("subir a ponte core→UI");
@@ -598,18 +704,52 @@ fn main() {
         Arc::clone(&model),
     ));
 
+    // O dono dos nós em runtime (add/remove): reusa pty/sup/store/model/grids. O `seq` inicia
+    // em 2 porque A=0 e B=1 já consumiram os rótulos A/B.
+    let nodes = NodeManager::new(
+        Arc::clone(&pty),
+        Arc::clone(&sup),
+        Arc::clone(&store),
+        Arc::clone(&model),
+        Arc::clone(&grids),
+        keys,
+        delta_tx,
+        cols,
+        rows,
+        2,
+        cmd_factory,
+    );
+
     eprintln!(
         "lina-gpui: render de terminal · grid {cols}x{rows} · log {} · {event_count} eventos",
         dir.display()
     );
 
-    if let Ok(raw) = std::env::var("LINA_AUTOQUIT_MS") {
-        if let Ok(ms) = raw.parse::<u64>() {
+    // DEMO: timer de auto-quit da janela. Antes ele só existia quando a env
+    // LINA_AUTOQUIT_MS estava setada (caminho de smoke/CI: dispara um A2A no meio e
+    // fecha); sem a env, a janela ficava aberta indefinidamente. Para o fundador
+    // (não-técnico) validar o Terminal B COM CALMA, agora há um auto-quit PADRÃO de
+    // 5 min quando a env não é dada — sem A2A surpresa.
+    // DEMO: reverter para sem-auto-quit-padrão (timer só via env) após validação.
+    const DEMO_AUTOQUIT_MS: u64 = 1_800_000; // 30 min (demo do fundador — reverter p/ 300_000 ou só-env após validar)
+    match std::env::var("LINA_AUTOQUIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        // Smoke/CI: a env (curta) dispara um A2A no meio e fecha — comportamento de teste.
+        Some(ms) => {
             let a2a_auto = Arc::clone(&a2a);
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(ms / 2));
                 a2a_auto.fire("echo '📨 A2A automatico (smoke)'".to_string());
                 thread::sleep(Duration::from_millis(ms / 2));
+                std::process::exit(0);
+            });
+        }
+        // DEMO: sem env → auto-quit calmo de 5 min (sem A2A surpresa) p/ validação visual.
+        None => {
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(DEMO_AUTOQUIT_MS));
                 std::process::exit(0);
             });
         }
@@ -626,9 +766,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |window, cx| {
-                cx.new(|cx| WorkspaceView::new(model, grids, input, a2a, node_a, window, cx))
-            },
+            |window, cx| cx.new(|cx| WorkspaceView::new(nodes, input, a2a, node_a, window, cx)),
         )
         .expect("abrir a janela gpui");
         cx.activate(true);

@@ -271,12 +271,22 @@ impl A2aTrigger {
                     from,
                     to: format!("node:{to}"),
                 });
-                s.event_count().unwrap_or(0)
+                s.event_count().ok()
             };
             let mut m = lock(&model);
-            m.event_count = count;
+            if let Some(c) = count {
+                m.event_count = c;
+            }
             m.touch();
         });
+    }
+
+    /// O gatilho A→B só faz sentido com **ambos** os nós vivos. A UI usa isto para esconder o
+    /// botão ⚡ quando o usuário fecha A ou B (nunca um botão que falha em silêncio).
+    #[must_use]
+    pub fn ready(&self) -> bool {
+        let m = lock(&self.model);
+        m.nodes.contains_key(&self.from) && m.nodes.contains_key(&self.to)
     }
 }
 
@@ -387,6 +397,305 @@ pub fn wire_terminal(
             .map_err(|e| e.to_string())?;
     }
     Ok((node, grid))
+}
+
+/// Layout do card no canvas (fonte única — o render em `main` reusa estes valores).
+pub const CARD_W: f32 = 680.0;
+pub const CARD_H: f32 = 500.0;
+
+/// Fábrica do comando de um nó: um **SHELL INTERATIVO REAL** — o do usuário (`$SHELL`, com
+/// fallback `/bin/sh`), idêntico para TODOS os nós (aceita teclado, roda claude/vim/…). Mostra
+/// um banner neutro e dá `exec` no shell (sem mock/`cat`). É gpui-free (vive aqui, não no main).
+#[must_use]
+pub fn shell_cmd(name: &str) -> PtyCommand {
+    PtyCommand::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
+             exec \"${{SHELL:-/bin/sh}}\" -i"
+        ))
+        .env("TERM", "xterm-256color")
+}
+
+/// Fábrica injetável de comando por nome: o app passa [`shell_cmd`] (shell real); os testes
+/// passam um comando leve (`cat`) p/ serem determinísticos e headless.
+pub type CmdFactory = Arc<dyn Fn(&str) -> PtyCommand + Send + Sync>;
+
+/// Rótulo amigável do `seq`-ésimo terminal: A, B, C… Z, depois `#27`, `#28`, …
+fn node_label(seq: u32) -> String {
+    if seq < 26 {
+        ((b'A' + seq as u8) as char).to_string()
+    } else {
+        format!("#{}", seq + 1)
+    }
+}
+
+/// Primeira posição numa grade que NÃO sobrepõe nenhum card existente (lê o `model`). Garante
+/// o invariante "posicionar sem sobrepor"; o pan do canvas revela colunas/linhas além da tela.
+#[must_use]
+fn next_free_slot(model: &SharedModel) -> (f32, f32) {
+    const MARGIN_X: f32 = 30.0;
+    const MARGIN_Y: f32 = 96.0;
+    const GAP: f32 = 30.0;
+    const COLS: u32 = 4;
+    let existing: Vec<(f32, f32)> = model
+        .order
+        .iter()
+        .filter_map(|n| model.nodes.get(n))
+        .map(|v| (v.x, v.y))
+        .collect();
+    for k in 0u32..10_000 {
+        let x = MARGIN_X + (k % COLS) as f32 * (CARD_W + GAP);
+        let y = MARGIN_Y + (k / COLS) as f32 * (CARD_H + GAP);
+        let collides = existing.iter().any(|&(ex, ey)| {
+            x < ex + CARD_W + GAP
+                && x + CARD_W + GAP > ex
+                && y < ey + CARD_H + GAP
+                && y + CARD_H + GAP > ey
+        });
+        if !collides {
+            return (x, y);
+        }
+    }
+    (MARGIN_X, MARGIN_Y)
+}
+
+/// Ajuste MÍNIMO do pan (offset do canvas, em px) para trazer um `card` (posição em coords de
+/// canvas) **inteiramente para dentro** do `viewport` visível, respeitando a barra superior no
+/// topo. Não mexe no que já está visível. É o que faz o card recém-adicionado **aparecer**: o
+/// [`next_free_slot`] pode colocá-lo além da janela (680px de card não cabem 3 lado a lado numa
+/// janela de 1450px) — o pan o revela. gpui-free → testável.
+#[must_use]
+pub fn pan_to_reveal(pan: (f32, f32), card: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
+    const MARGIN: f32 = 16.0;
+    const TOPBAR: f32 = 44.0; // a barra superior cobre o topo do canvas
+    let (mut px, mut py) = pan;
+    let (cx, cy) = card;
+    let (vw, vh) = viewport;
+    // Eixo X: empurra p/ a esquerda se passa da direita; depois p/ a direita se passa da esquerda.
+    if cx + px + CARD_W > vw - MARGIN {
+        px = vw - MARGIN - CARD_W - cx;
+    }
+    if cx + px < MARGIN {
+        px = MARGIN - cx;
+    }
+    // Eixo Y: idem, com a topbar reservada no topo.
+    if cy + py + CARD_H > vh - MARGIN {
+        py = vh - MARGIN - CARD_H - cy;
+    }
+    if cy + py < TOPBAR + MARGIN {
+        py = TOPBAR + MARGIN - cy;
+    }
+    (px, py)
+}
+
+/// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
+/// (`PtyManager`, `Supervisor`, `EventStore`), a projeção (`SharedModel`) e os grids, e sabe
+/// ADICIONAR e REMOVER nós-terminal mantendo o **event log como fonte da verdade** (emite
+/// `NodeAdded`/`TerminalSpawned`/`NodeRemoved` persistidos e reconstruíveis). Sem `unwrap` em
+/// caminho de produção; sem panic ao remover (o reader fecha sozinho no EOF do PTY morto).
+pub struct NodeManager {
+    pty: Arc<Mutex<PtyManager>>,
+    sup: Arc<Supervisor>,
+    store: Arc<Mutex<EventStore>>,
+    pub model: Model,
+    pub grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+    keys: Mutex<BTreeMap<NodeId, String>>,
+    delta_tx: Sender<GridDelta>,
+    cmd_factory: CmdFactory,
+    cols: u16,
+    rows: u16,
+    seq: Mutex<u32>,
+}
+
+impl NodeManager {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        pty: Arc<Mutex<PtyManager>>,
+        sup: Arc<Supervisor>,
+        store: Arc<Mutex<EventStore>>,
+        model: Model,
+        grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+        keys: BTreeMap<NodeId, String>,
+        delta_tx: Sender<GridDelta>,
+        cols: u16,
+        rows: u16,
+        seq_start: u32,
+        cmd_factory: CmdFactory,
+    ) -> Self {
+        Self {
+            pty,
+            sup,
+            store,
+            model,
+            grids,
+            keys: Mutex::new(keys),
+            delta_tx,
+            cmd_factory,
+            cols,
+            rows,
+            seq: Mutex::new(seq_start),
+        }
+    }
+
+    /// Nº de nós vivos (projeção).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        lock(&self.model).order.len()
+    }
+
+    /// A lista ORDENADA de cards a renderizar — exatamente o que o `render` itera. O conjunto
+    /// de cards na tela DERIVA daqui (não de nós fixos), então add/remove refletem na UI.
+    #[must_use]
+    pub fn cards(&self) -> Vec<(NodeId, NodeView)> {
+        let m = lock(&self.model);
+        m.order
+            .iter()
+            .filter_map(|n| m.nodes.get(n).map(|v| (*n, v.clone())))
+            .collect()
+    }
+
+    /// ADICIONA um nó: um shell real novo (idêntico aos demais) com PTY + grid próprios,
+    /// registrado no Supervisor, posicionado **sem sobrepor**, com `NodeAdded` +
+    /// `TerminalSpawned` persistidos. Devolve o `NodeId` (para focar).
+    ///
+    /// Ordem: spawna o PTY → **persiste primeiro** (event log = fonte da verdade) → só então
+    /// projeta no model. Se a persistência falhar, **desfaz** o PTY recém-criado (`retire_pty`)
+    /// e devolve `Err` — nada de nó visível sem evento no log.
+    pub fn add_node(&self) -> Result<NodeId, String> {
+        let seq = {
+            let mut s = lock(&self.seq);
+            let v = *s;
+            *s = s.wrapping_add(1);
+            v
+        };
+        let name = format!("Terminal {}", node_label(seq));
+        let key = format!("t{seq}");
+        let cmd = (*self.cmd_factory)(&name);
+
+        // Slot calculado ANTES de o nó existir: imune ao placeholder (0,0) que o pump cria.
+        let (x, y) = next_free_slot(&lock(&self.model));
+
+        let (node, grid) = {
+            let mut p = lock(&self.pty);
+            wire_terminal(
+                &mut p,
+                &self.sup,
+                &self.delta_tx,
+                &key,
+                &name,
+                cmd,
+                self.cols,
+                self.rows,
+            )?
+        };
+
+        // PERSISTE antes de tocar o model. Se falhar, desfaz o nó (sem ghost no model/log).
+        let count = {
+            let mut s = lock(&self.store);
+            if let Err(e) = s.append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: f64::from(x),
+                y: f64::from(y),
+            }) {
+                drop(s);
+                self.retire_pty(node, key);
+                return Err(e.to_string());
+            }
+            if let Err(e) = s.append(&DomainEvent::TerminalSpawned {
+                node,
+                cli: name.clone(),
+            }) {
+                drop(s);
+                self.retire_pty(node, key);
+                return Err(e.to_string());
+            }
+            s.event_count().ok()
+        };
+
+        // Projeção: INSERE sobrescrevendo qualquer placeholder do pump (corrida do Bus).
+        {
+            let mut m = lock(&self.model);
+            m.nodes
+                .insert(node, NodeView::new(name.clone(), NodeKind::Terminal, x, y));
+            if !m.order.contains(&node) {
+                m.order.push(node);
+            }
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+
+        // Running (emite NodeStatus → o pump pinta o ponto de status do card).
+        let _ = self.sup.set_status(node, CoreStatus::Running);
+
+        lock(&self.grids).insert(node, grid);
+        lock(&self.keys).insert(node, key);
+        Ok(node)
+    }
+
+    /// REMOVE um nó: **persiste `NodeRemoved` primeiro** (event log = fonte da verdade; se
+    /// falhar, nada muda e a operação é retriável), depois tira do model/grids/keys (feedback
+    /// visual instantâneo) e encerra o PTY em **thread de fundo** via [`Self::retire_pty`] (não
+    /// congela a UI; o reader fecha sozinho no EOF). **NUNCA** remove o último — o canvas jamais
+    /// fica em branco (invariante não-técnico). Sem panic.
+    pub fn remove_node(&self, node: NodeId) -> Result<(), String> {
+        if self.count() <= 1 {
+            return Err("o canvas nunca fica em branco: não removo o último nó".into());
+        }
+        let key = lock(&self.keys)
+            .get(&node)
+            .cloned()
+            .ok_or_else(|| format!("nó {node} sem PTY registrado"))?;
+
+        // PERSISTE primeiro: o replay reconstrói SEM este nó. Falha aqui não muda nada.
+        let count = {
+            let mut s = lock(&self.store);
+            s.append(&DomainEvent::NodeRemoved { node })
+                .map_err(|e| e.to_string())?;
+            s.event_count().ok()
+        };
+
+        // Projeção: tira do model, dos grids e das keys (instantâneo).
+        {
+            let mut m = lock(&self.model);
+            m.nodes.remove(&node);
+            m.order.retain(|n| *n != node);
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+        lock(&self.grids).remove(&node);
+        lock(&self.keys).remove(&node);
+
+        // Encerra o PTY em background (não bloqueia o thread de UI por até 2s).
+        self.retire_pty(node, key);
+        Ok(())
+    }
+
+    /// Encerra um PTY já fora do canvas **sem bloquear o thread de UI**: desregistra do
+    /// Supervisor na hora e mata o processo (SIGTERM→SIGKILL, até 2s) numa thread de fundo.
+    fn retire_pty(&self, node: NodeId, key: String) {
+        if let Err(e) = self.sup.unregister(node) {
+            eprintln!("lina-gpui: unregister do nó {node} falhou: {e}");
+        }
+        let pty = Arc::clone(&self.pty);
+        if let Err(e) = thread::Builder::new()
+            .name(format!("lina-kill-{key}"))
+            .spawn(move || {
+                if let Err(e) = lock(&pty).kill(key.as_str(), Duration::from_secs(2)) {
+                    eprintln!("lina-gpui: kill do PTY {key} falhou: {e}");
+                }
+                let _ = lock(&pty).remove(key.as_str());
+            })
+        {
+            eprintln!("lina-gpui: thread de kill não pôde subir: {e}");
+        }
+    }
 }
 
 /// Handle da thread-bomba (background) da ponte; encerra no `stop`/`Drop`.
@@ -639,6 +948,218 @@ mod tests {
             b.screen().display_offset,
             0,
             "scroll desce de volta ao fundo"
+        );
+    }
+
+    /// Monta um `NodeManager` headless (PTYs `cat`, sem gpui/pump) com 2 nós seed (A, B),
+    /// como o `main` faz, e devolve também `store`/`model` para os asserts.
+    fn test_manager(tag: &str) -> (NodeManager, Arc<Mutex<EventStore>>, Model) {
+        let dir = std::env::temp_dir().join(format!("lina-nm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("open store")));
+
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        // Fábrica leve: terminais de teste rodam `cat` (determinístico, sem shell real).
+        let cmd_factory: CmdFactory = Arc::new(|_name: &str| PtyCommand::new("cat"));
+
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut keys: BTreeMap<NodeId, String> = BTreeMap::new();
+
+        for (k, name) in [("A", "Terminal A"), ("B", "Terminal B")] {
+            let (node, grid) = {
+                let mut p = lock(&pty);
+                wire_terminal(
+                    &mut p,
+                    &sup,
+                    &delta_tx,
+                    k,
+                    name,
+                    (*cmd_factory)(name),
+                    80,
+                    24,
+                )
+                .expect("wire seed")
+            };
+            lock(&model).seed_node(node, NodeView::new(name, NodeKind::Terminal, 0.0, 0.0));
+            lock(&grids).insert(node, grid);
+            keys.insert(node, k.to_string());
+        }
+
+        let nm = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            Arc::clone(&grids),
+            keys,
+            delta_tx,
+            80,
+            24,
+            2,
+            cmd_factory,
+        );
+        (nm, store, model)
+    }
+
+    /// **GATE de ADD (headless, determinístico):** `add_node` sobe a contagem 2→3, dá um grid
+    /// ao novo nó, persiste NodeAdded+TerminalSpawned, e o event log RECONSTRÓI o novo nó
+    /// (`project()`) — provando "todo nó é shell real + o log é a fonte da verdade".
+    #[test]
+    fn add_node_grows_count_persists_and_reconstructs() {
+        let (nm, store, model) = test_manager("add");
+        assert_eq!(lock(&model).order.len(), 2, "começa com 2 nós (A, B)");
+        let before = lock(&store).event_count().expect("count");
+
+        let id = nm.add_node().expect("add_node cria um nó");
+
+        assert_eq!(
+            lock(&model).order.len(),
+            3,
+            "add_node sobe a contagem para 3"
+        );
+        assert!(
+            lock(&model).nodes.contains_key(&id),
+            "o novo nó está no model"
+        );
+        assert!(
+            lock(&nm.grids).contains_key(&id),
+            "o novo nó tem grid próprio"
+        );
+        assert_eq!(
+            lock(&store).event_count().expect("count"),
+            before + 2,
+            "persiste NodeAdded + TerminalSpawned"
+        );
+        let projected = lock(&store).project().expect("project");
+        assert!(
+            projected.nodes.contains_key(&id),
+            "o event log reconstrói o novo nó (fonte da verdade)"
+        );
+    }
+
+    /// **GATE de REMOVE (headless, determinístico):** após add (3 nós), `remove_node` desce a
+    /// contagem 3→2, encerra o PTY e tira do grid, persiste NodeRemoved, e o replay fica SEM o
+    /// nó. Invariante não-técnico: o ÚLTIMO nó nunca sai (o canvas jamais fica em branco). Sem
+    /// panic do começo ao fim.
+    #[test]
+    fn remove_node_shrinks_count_persists_and_never_empties() {
+        let (nm, store, model) = test_manager("remove");
+        let id = nm.add_node().expect("add p/ ter o que remover");
+        assert_eq!(lock(&model).order.len(), 3);
+        let before = lock(&store).event_count().expect("count");
+
+        nm.remove_node(id).expect("remove_node encerra o nó");
+
+        assert_eq!(
+            lock(&model).order.len(),
+            2,
+            "remove_node desce a contagem para 2"
+        );
+        assert!(!lock(&model).nodes.contains_key(&id), "o nó sai do model");
+        assert!(!lock(&nm.grids).contains_key(&id), "o grid é removido");
+        assert_eq!(
+            lock(&store).event_count().expect("count"),
+            before + 1,
+            "persiste NodeRemoved"
+        );
+        let projected = lock(&store).project().expect("project");
+        assert!(
+            !projected.nodes.contains_key(&id),
+            "o replay reconstrói SEM o nó removido"
+        );
+
+        // Invariante não-técnico: tenta esvaziar; o ÚLTIMO nó nunca sai.
+        let remaining: Vec<NodeId> = lock(&model).order.clone();
+        for n in remaining {
+            let _ = nm.remove_node(n);
+        }
+        assert_eq!(
+            lock(&model).order.len(),
+            1,
+            "sempre sobra ao menos 1 nó (nunca tela em branco)"
+        );
+        let last = lock(&model).order[0];
+        assert!(
+            nm.remove_node(last).is_err(),
+            "remover o último deve ser recusado"
+        );
+    }
+
+    /// **Regressão do bug do fundador (➕ não mostra card):** o conjunto de cards que o `render`
+    /// desenha DERIVA do NodeManager (não de 2 fixos). `cards()` é exatamente o que o render
+    /// itera — add entra na lista, remove sai.
+    #[test]
+    fn rendered_cards_derive_from_node_manager() {
+        let (nm, _store, _model) = test_manager("cards");
+        let initial: Vec<NodeId> = nm.cards().iter().map(|(id, _)| *id).collect();
+        assert_eq!(initial.len(), 2, "começa com 2 cards (A, B)");
+
+        let id = nm.add_node().expect("add");
+        let after_add: Vec<NodeId> = nm.cards().iter().map(|(id, _)| *id).collect();
+        assert_eq!(after_add.len(), 3, "o card novo entra na lista renderizada");
+        assert!(
+            after_add.contains(&id),
+            "o card renderizado novo é o nó adicionado"
+        );
+
+        nm.remove_node(id).expect("remove");
+        let after_remove: Vec<NodeId> = nm.cards().iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            after_remove.len(),
+            2,
+            "o card removido sai da lista renderizada"
+        );
+        assert!(
+            !after_remove.contains(&id),
+            "o card removido não é mais renderizado"
+        );
+    }
+
+    /// **Regressão da CAUSA-RAIZ (card novo nasce fora da viewport):** na janela 1450×640 o 3º
+    /// card cai em x≈1450 — totalmente FORA da tela com pan=0 (era por isso que "nada aparecia").
+    /// `pan_to_reveal` traz o card inteiramente para dentro do viewport — é o que destrava o ➕.
+    #[test]
+    fn new_card_slot_is_offscreen_and_reveal_fixes_it() {
+        let viewport = (1450.0_f32, 640.0_f32);
+
+        // Reproduz o layout: 2 nós em (30,96) e (740,96) → próximo slot livre é o do 3º card.
+        let mut model = SharedModel::default();
+        model.seed_node(
+            uuid::Uuid::from_u128(1),
+            NodeView::new("Terminal A", NodeKind::Terminal, 30.0, 96.0),
+        );
+        model.seed_node(
+            uuid::Uuid::from_u128(2),
+            NodeView::new("Terminal B", NodeKind::Terminal, 740.0, 96.0),
+        );
+        let (cx, cy) = next_free_slot(&model);
+
+        // BUG: com pan=(0,0) o card [cx, cx+CARD_W] passa da borda direita da viewport.
+        let visible_at_zero =
+            cx >= 0.0 && cx + CARD_W <= viewport.0 && cy >= 0.0 && cy + CARD_H <= viewport.1;
+        assert!(
+            !visible_at_zero,
+            "com pan=0 o card novo (x={cx}, +{CARD_W}) NÃO cabe na viewport {} — é o bug",
+            viewport.0
+        );
+
+        // FIX: pan_to_reveal traz o card INTEIRAMENTE para dentro da viewport visível.
+        let (px, py) = pan_to_reveal((0.0, 0.0), (cx, cy), viewport);
+        let (left, top) = (cx + px, cy + py);
+        assert!(left >= 0.0, "borda esquerda dentro (left={left})");
+        assert!(
+            left + CARD_W <= viewport.0,
+            "borda direita dentro (right={})",
+            left + CARD_W
+        );
+        assert!(top >= 0.0, "borda de cima dentro (top={top})");
+        assert!(
+            top + CARD_H <= viewport.1,
+            "borda de baixo dentro (bottom={})",
+            top + CARD_H
         );
     }
 }
