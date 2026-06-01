@@ -12,3 +12,7 @@ app/*/target/
 spikes/*/target/
 **/Cargo.lock
 !Cargo.lock
+
+# artefatos efemeros da orquestracao Maestri (nao versionar)
+.entrega-*.md
+.crosscheck-*.md
