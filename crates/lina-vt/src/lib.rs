@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode as AlacTermMode;
 use alacritty_terminal::term::{Config, Term, TermDamage};
@@ -73,6 +74,62 @@ impl VtScreen {
     }
 }
 
+// ─────────────────────── Seleção & Mouse reporting (aditivo à W0-2) ───────────────────────
+
+/// Protocolo de **mouse reporting** que o TUI ativou via DECSET. O `lina-vt`
+/// fala exclusivamente SGR (modo 1006); este enum diz **quais eventos** o TUI
+/// quer receber. Os três modos são mutuamente exclusivos no emulador.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseProtocol {
+    /// `?1000h` — só press/release de botões (e roda). Sem movimento.
+    ReportClick,
+    /// `?1002h` — press/release + movimento **enquanto um botão está pressionado** (drag).
+    ButtonMotion,
+    /// `?1003h` — press/release + **todo** movimento, mesmo sem botão (hover).
+    AnyMotion,
+}
+
+/// Botão de um evento de mouse. A roda (`WheelUp`/`WheelDown`) é reportada como
+/// um "press" em todos os protocolos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+/// Natureza do evento de mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    /// Movimento do ponteiro (drag se houver botão; hover se `button == None`).
+    Motion,
+}
+
+/// Modificadores de teclado ativos no momento do evento (somados ao código SGR).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MouseModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+/// Um evento de mouse em coordenadas de **viewport** (0-based). `button == None`
+/// representa movimento sem botão pressionado (só relevante em `AnyMotion`).
+#[derive(Debug, Clone, Copy)]
+pub struct MouseEvent {
+    pub button: Option<MouseButton>,
+    pub kind: MouseEventKind,
+    /// Coluna do viewport (0-based; vira 1-based na sequência SGR).
+    pub col: usize,
+    /// Linha do viewport (0-based; vira 1-based na sequência SGR).
+    pub row: usize,
+    pub mods: MouseModifiers,
+}
+
 /// Contrato do motor de emulação VT. `alacritty_terminal` é a impl da Onda 0.
 pub trait VtBackend: Send {
     /// Aplica bytes vindos do PTY ao grid.
@@ -99,6 +156,36 @@ pub trait VtBackend: Send {
     /// Dimensões atuais do grid `(cols, rows)`.
     fn dims(&self) -> (usize, usize);
     fn resize(&mut self, cols: u16, rows: u16);
+
+    // ── Seleção de texto (headless; respeita wrap de linha) ──
+
+    /// Define a seleção **inclusiva** entre duas células do viewport (0-based),
+    /// modo livre (não-retangular). A ordem dos pontos não importa — o backend
+    /// normaliza (topo-esquerda → baixo-direita). Coordenadas fora do grid são
+    /// saturadas para a borda. Sobrescreve qualquer seleção anterior.
+    fn set_selection(&mut self, start_col: usize, start_row: usize, end_col: usize, end_row: usize);
+    /// Texto da seleção atual (sem ANSI), **respeitando wrap**: linhas que
+    /// continuam na seguinte (`WRAPLINE`) concatenam sem `\n`. `None` se não há
+    /// seleção ativa.
+    fn selection_text(&self) -> Option<String>;
+    /// Limpa a seleção atual (após isto, `selection_text()` devolve `None`).
+    fn clear_selection(&mut self);
+
+    // ── Mouse reporting (SGR 1006) ──
+
+    /// Protocolo de mouse que o TUI pediu (`None` = não pediu nada).
+    fn mouse_protocol(&self) -> Option<MouseProtocol>;
+    /// `true` se o TUI pediu qualquer mouse reporting.
+    fn is_mouse_reporting(&self) -> bool {
+        self.mouse_protocol().is_some()
+    }
+    /// Codifica `event` na sequência **SGR 1006** (`CSI < Cb ; Cx ; Cy M` para
+    /// press/motion, `… m` para release) a enviar ao PTY, ou `None` quando
+    /// nenhum byte deve ser gerado: o TUI não pediu mouse reporting, não negociou
+    /// a codificação SGR (`?1006h`), ou o evento não pertence ao protocolo ativo
+    /// (ex.: movimento em `ReportClick`). TUIs que não pedem mouse **nunca**
+    /// recebem bytes.
+    fn encode_mouse(&self, event: MouseEvent) -> Option<Vec<u8>>;
 }
 
 // ───────────────────────── AlacrittyBackend (impl da Onda 0) ─────────────────────────
@@ -171,6 +258,16 @@ impl AlacrittyBackend {
     fn damage_all(&mut self) {
         self.damage.clear();
         self.damage.extend(0..self.size.rows);
+    }
+
+    /// Converte uma célula do viewport (`col`, `row` 0-based) num `Point`
+    /// absoluto do grid, saturando às bordas e descontando o scroll atual
+    /// (`display_offset`) — inverso da conversão feita em `screen()`.
+    fn viewport_point(&self, col: usize, row: usize) -> Point {
+        let col = col.min(self.size.cols.saturating_sub(1));
+        let row = row.min(self.size.rows.saturating_sub(1));
+        let abs_line = row as i32 - self.term.grid().display_offset() as i32;
+        Point::new(Line(abs_line), Column(col))
     }
 }
 
@@ -315,6 +412,58 @@ impl VtBackend for AlacrittyBackend {
         // Um resize redesenha tudo: marca o viewport inteiro como danificado.
         self.damage_all();
     }
+
+    fn set_selection(
+        &mut self,
+        start_col: usize,
+        start_row: usize,
+        end_col: usize,
+        end_row: usize,
+    ) {
+        // Normaliza para ordem de leitura (linha, depois coluna): a ponta
+        // "anterior" recebe Side::Left e a "posterior" Side::Right, garantindo
+        // que AMBAS as células de borda entrem na seleção, venha o arraste da
+        // direção que vier.
+        let (a, b) = ((start_row, start_col), (end_row, end_col));
+        let (first, last) = if a <= b { (a, b) } else { (b, a) };
+        let start = self.viewport_point(first.1, first.0);
+        let end = self.viewport_point(last.1, last.0);
+        let mut sel = Selection::new(SelectionType::Simple, start, Side::Left);
+        sel.update(end, Side::Right);
+        self.term.selection = Some(sel);
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+
+    fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    fn mouse_protocol(&self) -> Option<MouseProtocol> {
+        let m = self.term.mode();
+        // Os modos são mutuamente exclusivos; vamos do mais abrangente ao menos.
+        if m.contains(AlacTermMode::MOUSE_MOTION) {
+            Some(MouseProtocol::AnyMotion)
+        } else if m.contains(AlacTermMode::MOUSE_DRAG) {
+            Some(MouseProtocol::ButtonMotion)
+        } else if m.contains(AlacTermMode::MOUSE_REPORT_CLICK) {
+            Some(MouseProtocol::ReportClick)
+        } else {
+            None
+        }
+    }
+
+    fn encode_mouse(&self, event: MouseEvent) -> Option<Vec<u8>> {
+        let protocol = self.mouse_protocol()?;
+        // Falamos exclusivamente SGR 1006: sem `?1006h` negociado, não emitimos
+        // (codificações legacy X10/UTF-8 estão fora de escopo nesta fase).
+        if !self.term.mode().contains(AlacTermMode::SGR_MOUSE) {
+            return None;
+        }
+        encode_sgr_mouse(event, protocol)
+    }
 }
 
 /// Tabela xterm 256 cores (auto-contida — o `alacritty_terminal` não embarca palette).
@@ -383,6 +532,70 @@ fn resolve_color(color: Color, default_fg: VtRgb, default_bg: VtRgb) -> VtRgb {
     }
 }
 
+/// Codifica um evento de mouse na sequência **SGR 1006**, filtrando pelo
+/// `protocol` ativo. Devolve `None` quando o evento não deve ser reportado nesse
+/// protocolo. Convenção de bytes (xterm): `CSI < Cb ; Cx ; Cy M` para
+/// press/motion/roda, `… m` para release.
+///
+/// `Cb` = código do botão (Left 0, Middle 1, Right 2, sem-botão 3, roda 64/65),
+/// somado a modificadores (Shift 4, Alt 8, Ctrl 16) e ao bit de movimento (32,
+/// exceto roda). `Cx`/`Cy` são 1-based (SGR não tem o teto de 223 do X10).
+fn encode_sgr_mouse(ev: MouseEvent, protocol: MouseProtocol) -> Option<Vec<u8>> {
+    let is_wheel = matches!(
+        ev.button,
+        Some(MouseButton::WheelUp | MouseButton::WheelDown)
+    );
+    let is_motion = ev.kind == MouseEventKind::Motion;
+
+    // "Sem botão" só é coerente em movimento (hover); descarta press/release sem botão.
+    if ev.button.is_none() && !is_motion {
+        return None;
+    }
+
+    // Filtragem por protocolo (a roda é sempre reportada).
+    if is_motion && !is_wheel {
+        match ev.button {
+            // Movimento sem botão: só no modo "todo movimento".
+            None if protocol != MouseProtocol::AnyMotion => return None,
+            // Drag (movimento com botão): exige ButtonMotion ou AnyMotion.
+            Some(_) if protocol == MouseProtocol::ReportClick => return None,
+            _ => {}
+        }
+    }
+
+    // Código do botão (Cb). A roda já embute o bit 64; "sem botão" = 3.
+    let mut cb: u32 = match ev.button {
+        Some(MouseButton::Left) => 0,
+        Some(MouseButton::Middle) => 1,
+        Some(MouseButton::Right) => 2,
+        Some(MouseButton::WheelUp) => 64,
+        Some(MouseButton::WheelDown) => 65,
+        None => 3,
+    };
+    if ev.mods.shift {
+        cb += 4;
+    }
+    if ev.mods.alt {
+        cb += 8;
+    }
+    if ev.mods.control {
+        cb += 16;
+    }
+    if is_motion && !is_wheel {
+        cb += 32;
+    }
+
+    let cx = ev.col + 1;
+    let cy = ev.row + 1;
+    // Release usa o sufixo minúsculo 'm'; press/motion/roda usam 'M'.
+    let suffix = if ev.kind == MouseEventKind::Release && !is_wheel {
+        'm'
+    } else {
+        'M'
+    };
+    Some(format!("\x1b[<{cb};{cx};{cy}{suffix}").into_bytes())
+}
+
 // ───────────────────────── GhosttyBackend (porta de futuro) ─────────────────────────
 //
 // Âncora de continuidade do CLAUDE.md: quando `libghostty-vt` (C-ABI) for adotado,
@@ -433,6 +646,27 @@ impl VtBackend for GhosttyBackend {
         unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
     }
     fn resize(&mut self, _cols: u16, _rows: u16) {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn set_selection(
+        &mut self,
+        _start_col: usize,
+        _start_row: usize,
+        _end_col: usize,
+        _end_row: usize,
+    ) {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn selection_text(&self) -> Option<String> {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn clear_selection(&mut self) {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn mouse_protocol(&self) -> Option<MouseProtocol> {
+        unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
+    }
+    fn encode_mouse(&self, _event: MouseEvent) -> Option<Vec<u8>> {
         unimplemented!("GhosttyBackend: habilitar ao adotar libghostty-vt (ver CLAUDE.md)")
     }
 }
@@ -555,5 +789,237 @@ mod tests {
     fn backend_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<AlacrittyBackend>();
+    }
+
+    // ───────────────────────────── Seleção de texto ─────────────────────────────
+
+    /// Seleção de uma única linha extrai exatamente as células inclusas.
+    #[test]
+    fn selection_extracts_single_line_text() {
+        let mut b = AlacrittyBackend::new(20, 4);
+        b.advance(b"\x1b[2J\x1b[H\x1b[1;1Hhello world");
+        // "hello" = colunas 0..=4 da linha 0.
+        b.set_selection(0, 0, 4, 0);
+        assert_eq!(b.selection_text().as_deref(), Some("hello"));
+    }
+
+    /// Seleção em múltiplas linhas SEM wrap junta com `\n`.
+    #[test]
+    fn selection_spans_multiple_lines_with_newline() {
+        let mut b = AlacrittyBackend::new(20, 4);
+        // Duas linhas independentes: "foo" (linha 0) e "bar" (linha 1).
+        b.advance(b"\x1b[2J\x1b[H\x1b[1;1Hfoo\x1b[2;1Hbar");
+        b.set_selection(0, 0, 2, 1);
+        assert_eq!(b.selection_text().as_deref(), Some("foo\nbar"));
+    }
+
+    /// Seleção atravessando uma linha com `WRAPLINE` concatena SEM `\n`
+    /// (a linha continua na seguinte — é uma só linha lógica).
+    #[test]
+    fn selection_respects_wrapline_no_newline() {
+        // Grid de 5 colunas: "abcdefgh" transborda e faz wrap (DECAWM default).
+        let mut b = AlacrittyBackend::new(5, 4);
+        b.advance(b"\x1b[2J\x1b[Habcdefgh");
+        // linha 0 = "abcde" (marcada WRAPLINE), linha 1 = "fgh".
+        b.set_selection(0, 0, 2, 1);
+        assert_eq!(b.selection_text().as_deref(), Some("abcdefgh"));
+    }
+
+    /// A ordem dos pontos não importa (fim → início dá o mesmo texto).
+    #[test]
+    fn selection_is_direction_agnostic() {
+        let mut b = AlacrittyBackend::new(20, 4);
+        b.advance(b"\x1b[2J\x1b[H\x1b[1;1Hhello");
+        b.set_selection(4, 0, 0, 0);
+        assert_eq!(b.selection_text().as_deref(), Some("hello"));
+    }
+
+    /// `clear_selection` zera a seleção; `selection_text` volta a `None`.
+    #[test]
+    fn clear_selection_yields_none() {
+        let mut b = AlacrittyBackend::new(20, 4);
+        b.advance(b"\x1b[2J\x1b[Hhello");
+        b.set_selection(0, 0, 4, 0);
+        assert!(b.selection_text().is_some());
+        b.clear_selection();
+        assert_eq!(b.selection_text(), None);
+    }
+
+    /// Sem seleção definida, `selection_text` é `None`.
+    #[test]
+    fn no_selection_returns_none() {
+        let b = AlacrittyBackend::new(10, 3);
+        assert_eq!(b.selection_text(), None);
+    }
+
+    // ─────────────────────────── Mouse reporting (SGR 1006) ───────────────────────────
+
+    /// Liga um protocolo de mouse + a codificação SGR (`?1006h`).
+    fn enable_mouse(b: &mut AlacrittyBackend, decset: &[u8]) {
+        b.advance(decset);
+        b.advance(b"\x1b[?1006h");
+    }
+
+    /// Critério (c): TUI que NÃO pede mouse não gera byte algum.
+    #[test]
+    fn no_mouse_bytes_when_mode_not_requested() {
+        let b = AlacrittyBackend::new(80, 24);
+        assert!(!b.is_mouse_reporting());
+        assert_eq!(b.mouse_protocol(), None);
+        let ev = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Press,
+            col: 0,
+            row: 0,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(b.encode_mouse(ev), None, "sem reporting → nenhum byte");
+    }
+
+    /// Press e release do botão esquerdo batem byte a byte (sufixo M vs m).
+    #[test]
+    fn sgr_press_and_release_left_button() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        enable_mouse(&mut b, b"\x1b[?1000h");
+        assert_eq!(b.mouse_protocol(), Some(MouseProtocol::ReportClick));
+
+        // Press na coluna 0, linha 0 → 1;1. Cb=0, sufixo 'M'.
+        let press = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Press,
+            col: 0,
+            row: 0,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(b.encode_mouse(press).as_deref(), Some(&b"\x1b[<0;1;1M"[..]));
+
+        // Release na coluna 9, linha 4 → 10;5. Cb=0, sufixo 'm'.
+        let release = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Release,
+            col: 9,
+            row: 4,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(
+            b.encode_mouse(release).as_deref(),
+            Some(&b"\x1b[<0;10;5m"[..])
+        );
+    }
+
+    /// `ReportClick` (1000) não reporta movimento.
+    #[test]
+    fn report_click_suppresses_motion() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        enable_mouse(&mut b, b"\x1b[?1000h");
+        let drag = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Motion,
+            col: 3,
+            row: 2,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(b.encode_mouse(drag), None, "ReportClick não reporta motion");
+    }
+
+    /// `ButtonMotion` (1002) reporta drag (bit 32) mas não hover sem botão.
+    #[test]
+    fn button_motion_reports_drag_with_motion_bit() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        enable_mouse(&mut b, b"\x1b[?1002h");
+        assert_eq!(b.mouse_protocol(), Some(MouseProtocol::ButtonMotion));
+
+        // Drag com esquerdo: Cb = 0 + 32 = 32. col 5,row 3 → 6;4.
+        let drag = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Motion,
+            col: 5,
+            row: 3,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(b.encode_mouse(drag).as_deref(), Some(&b"\x1b[<32;6;4M"[..]));
+
+        // Movimento SEM botão não é reportado em ButtonMotion.
+        let hover = MouseEvent {
+            button: None,
+            kind: MouseEventKind::Motion,
+            col: 5,
+            row: 3,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(b.encode_mouse(hover), None);
+    }
+
+    /// `AnyMotion` (1003) reporta hover sem botão: Cb = 3 + 32 = 35.
+    #[test]
+    fn any_motion_reports_buttonless_hover() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        enable_mouse(&mut b, b"\x1b[?1003h");
+        assert_eq!(b.mouse_protocol(), Some(MouseProtocol::AnyMotion));
+        let hover = MouseEvent {
+            button: None,
+            kind: MouseEventKind::Motion,
+            col: 0,
+            row: 0,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(
+            b.encode_mouse(hover).as_deref(),
+            Some(&b"\x1b[<35;1;1M"[..])
+        );
+    }
+
+    /// Roda (Cb=64) e modificadores (Shift 4 + Ctrl 16) somam corretamente.
+    #[test]
+    fn wheel_and_modifiers_encode() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        enable_mouse(&mut b, b"\x1b[?1000h");
+
+        // Roda para cima: Cb=64. col 0,row 0 → 1;1.
+        let wheel = MouseEvent {
+            button: Some(MouseButton::WheelUp),
+            kind: MouseEventKind::Press,
+            col: 0,
+            row: 0,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(
+            b.encode_mouse(wheel).as_deref(),
+            Some(&b"\x1b[<64;1;1M"[..])
+        );
+
+        // Esquerdo + Shift(4) + Ctrl(16) = Cb 20. col 2,row 1 → 3;2.
+        let mods = MouseModifiers {
+            shift: true,
+            alt: false,
+            control: true,
+        };
+        let click = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Press,
+            col: 2,
+            row: 1,
+            mods,
+        };
+        assert_eq!(
+            b.encode_mouse(click).as_deref(),
+            Some(&b"\x1b[<20;3;2M"[..])
+        );
+    }
+
+    /// Mouse reporting ativo MAS sem SGR negociado → nenhum byte (só falamos SGR).
+    #[test]
+    fn no_sgr_means_no_bytes_even_with_reporting() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        b.advance(b"\x1b[?1000h"); // pede mouse, mas NÃO `?1006h`
+        assert!(b.is_mouse_reporting(), "o protocolo está ativo…");
+        let ev = MouseEvent {
+            button: Some(MouseButton::Left),
+            kind: MouseEventKind::Press,
+            col: 0,
+            row: 0,
+            mods: MouseModifiers::default(),
+        };
+        assert_eq!(b.encode_mouse(ev), None, "…mas sem SGR não emitimos bytes");
     }
 }
