@@ -26,9 +26,9 @@ use lina_core::{
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
 use bridge::{
-    demo_profile, lock, pan_to_reveal, shell_cmd, spawn_pump, wire_terminal, A2aTrigger,
-    CmdFactory, CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, SharedModel, CARD_H,
-    CARD_W,
+    card_visible, demo_profile, hit_test, lock, shell_cmd, spawn_pump, wire_terminal, A2aTrigger,
+    Camera, CmdFactory, CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, SharedModel,
+    CARD_H, CARD_W,
 };
 
 /// Métricas aproximadas da célula monoespaçada (Menlo 13px) — definem cols×rows do PTY.
@@ -171,14 +171,24 @@ fn render_line(cells: &[lina_core::VtCell], cursor_col: Option<usize>) -> impl I
     }))
 }
 
-/// Pinta o GRID VISÍVEL inteiro (snapshot atual) — uma linha por linha do viewport.
-fn render_grid(screen: &VtScreen) -> impl IntoElement {
+/// Fator de zoom para um evento de scroll (gentil; o zoom absoluto é clampado na [`Camera`]).
+fn scroll_zoom_factor(delta: ScrollDelta) -> f32 {
+    let dy: f32 = match delta {
+        ScrollDelta::Lines(p) => p.y,
+        ScrollDelta::Pixels(p) => p.y / px(40.0),
+    };
+    (1.0 + dy * 0.08).clamp(0.5, 1.5)
+}
+
+/// Pinta o GRID VISÍVEL inteiro (snapshot atual) — uma linha por linha do viewport. `scale` =
+/// zoom do canvas (a fonte monoespaçada escala junto, mantendo o alinhamento do grid).
+fn render_grid(screen: &VtScreen, scale: f32) -> impl IntoElement {
     let cur = screen.cursor;
     div()
         .flex()
         .flex_col()
         .font_family("Menlo")
-        .text_size(px(FONT_PX))
+        .text_size(px(FONT_PX * scale))
         .children((0..screen.rows).map(move |r| {
             let cursor_col = (cur.visible && cur.line == r).then_some(cur.col);
             render_line(screen.row(r), cursor_col)
@@ -193,8 +203,13 @@ struct WorkspaceView {
     a2a: Arc<A2aTrigger>,
     focused: NodeId,
     focus: FocusHandle,
-    pan: Point<Pixels>,
-    drag: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Câmera 2D do canvas (pan + zoom). Transform world↔screen, culling e hit-test usam ela.
+    camera: Camera,
+    /// Arrasto do FUNDO (pan): `(mouse_inicial_em_tela, pan_inicial)` em px de tela.
+    drag: Option<((f32, f32), (f32, f32))>,
+    /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
+    z_order: BTreeMap<NodeId, u64>,
+    z_next: u64,
 }
 
 impl WorkspaceView {
@@ -214,9 +229,37 @@ impl WorkspaceView {
             a2a,
             focused,
             focus,
-            pan: point(px(0.0), px(0.0)),
+            camera: Camera::default(),
             drag: None,
+            z_order: BTreeMap::new(),
+            z_next: 0,
         }
+    }
+
+    /// Marca `node` como focado e o traz para a FRENTE (z mais alto): clicar/abrir um card o põe
+    /// no topo da pilha (z-order).
+    fn focus(&mut self, node: NodeId) {
+        self.focused = node;
+        self.z_next = self.z_next.wrapping_add(1);
+        self.z_order.insert(node, self.z_next);
+    }
+
+    /// z (profundidade) de um nó: maior = mais à frente; nós nunca focados ficam no fundo (0).
+    fn z_of(&self, node: &NodeId) -> u64 {
+        self.z_order.get(node).copied().unwrap_or(0)
+    }
+
+    /// Cards em ordem de z CRESCENTE (último = topo) — base do render (desenha o topo por
+    /// último) e do hit-test (resolve sobreposição pelo maior z).
+    fn cards_z_asc(&self) -> Vec<(NodeId, (f32, f32))> {
+        let mut cz: Vec<(NodeId, (f32, f32))> = self
+            .nodes
+            .cards()
+            .iter()
+            .map(|(id, nv)| (*id, (nv.x, nv.y)))
+            .collect();
+        cz.sort_by_key(|(id, _)| self.z_of(id));
+        cz
     }
 
     /// Auto-pan: traz o card do nó `node` INTEIRAMENTE para dentro da viewport visível. É o que
@@ -226,12 +269,11 @@ impl WorkspaceView {
         let card = lock(&self.nodes.model).nodes.get(&node).map(|v| (v.x, v.y));
         if let Some(card) = card {
             let vp = window.viewport_size();
-            let (nx, ny) = pan_to_reveal(
-                (f32::from(self.pan.x), f32::from(self.pan.y)),
+            self.camera.reveal(
                 card,
+                (CARD_W, CARD_H),
                 (f32::from(vp.width), f32::from(vp.height)),
             );
-            self.pan = point(px(nx), px(ny));
         }
     }
 
@@ -242,24 +284,25 @@ impl WorkspaceView {
             eprintln!("lina-gpui: fechar nó focado: {e}");
             return;
         }
+        self.z_order.remove(&node);
         // `first` num let SEPARADO: solta o lock do model ANTES do reveal (que re-locka o
         // model) — em edition 2021 o guard temporário de um `if let` viveria por todo o bloco,
         // causando re-lock na mesma thread (deadlock).
         let first = lock(&self.nodes.model).order.first().copied();
         if let Some(first) = first {
-            self.focused = first;
+            self.focus(first);
             self.reveal(first, window);
         }
     }
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window) {
         let ks = &ev.keystroke;
-        // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona um terminal (foca e REVELA);
-        // ⌘⌫ fecha o nó focado (sem o conflito do ⌘W com o "fechar janela" do OS).
+        // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona (foca+revela); ⌘⌫ fecha o focado;
+        // ⌘+ / ⌘- dão zoom in/out no centro da viewport.
         if ks.modifiers.platform && ks.key == "t" {
             match self.nodes.add_node() {
                 Ok(node) => {
-                    self.focused = node;
+                    self.focus(node);
                     self.reveal(node, window);
                 }
                 Err(e) => eprintln!("lina-gpui: add_node (⌘T): {e}"),
@@ -268,6 +311,17 @@ impl WorkspaceView {
         }
         if ks.modifiers.platform && ks.key == "backspace" {
             self.close_focused(window);
+            return;
+        }
+        if ks.modifiers.platform && (ks.key == "=" || ks.key == "+" || ks.key == "-") {
+            let vp = window.viewport_size();
+            let center = (f32::from(vp.width) / 2.0, f32::from(vp.height) / 2.0);
+            let factor = if ks.key == "-" { 0.8 } else { 1.25 };
+            self.camera.zoom_by(center, factor);
+            return;
+        }
+        if ks.modifiers.platform && ks.key == "0" {
+            self.camera.reset(); // ⌘0: volta ao home (resgate da vista).
             return;
         }
         let grid = lock(&self.nodes.grids).get(&self.focused).cloned();
@@ -284,7 +338,7 @@ impl Render for WorkspaceView {
         window.request_animation_frame();
 
         // Os cards desenhados DERIVAM do NodeManager (não de 2 fixos) — add/remove refletem aqui.
-        let cards = self.nodes.cards();
+        let mut cards = self.nodes.cards();
         let (pulse, connected, event_count, recovering) = {
             let m = lock(&self.nodes.model);
             (m.pulse, m.connected, m.event_count, m.recovering)
@@ -296,7 +350,33 @@ impl Render for WorkspaceView {
                 self.focused = *first;
             }
         }
-        let pan = self.pan;
+        // Limpa z_order de nós mortos: remoções pelo pump (NodeDied) não passam pelos handlers
+        // de UI, então a entrada ficaria órfã (vazamento ao longo de uma sessão longa).
+        self.z_order
+            .retain(|id, _| cards.iter().any(|(cid, _)| cid == id));
+
+        let vp = window.viewport_size();
+        let viewport = (f32::from(vp.width), f32::from(vp.height));
+        // NUNCA tela em branco: se NADA está visível e o usuário NÃO está arrastando, recentra a
+        // câmera (⌘0 / botão 🏠 fazem o mesmo sob demanda). Durante o arrasto, deixa rolar livre.
+        if self.drag.is_none()
+            && !cards.is_empty()
+            && !cards
+                .iter()
+                .any(|(_, nv)| card_visible(&self.camera, (nv.x, nv.y), (CARD_W, CARD_H), viewport))
+        {
+            self.camera.reset();
+        }
+        // IDs de elemento ESTÁVEIS por nó (independem de cull/z-order): ordena por NodeId, que é
+        // total e estável p/ o mesmo conjunto de nós — o gpui reusa o elemento certo entre frames.
+        let eid: BTreeMap<NodeId, usize> = {
+            let mut ids: Vec<NodeId> = cards.iter().map(|(id, _)| *id).collect();
+            ids.sort();
+            ids.into_iter().enumerate().map(|(i, id)| (id, i)).collect()
+        };
+        // Z-ORDER: desenha do fundo p/ o topo — o focado/maior z por último, sobre os demais.
+        cards.sort_by_key(|(id, _)| self.z_of(id));
+        let cam = self.camera;
         let focused = self.focused;
 
         let aura_color = if connected {
@@ -316,14 +396,23 @@ impl Render for WorkspaceView {
             .text_color(rgb(0xc8d3f5))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, ev: &MouseDownEvent, _w, _cx| {
-                    view.drag = Some((ev.position, view.pan));
+                cx.listener(|view, ev: &MouseDownEvent, window, _cx| {
+                    // PAN só ao arrastar o FUNDO (não sobre um card VISÍVEL → sem zona morta).
+                    let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    let v = window.viewport_size();
+                    let vp = (f32::from(v.width), f32::from(v.height));
+                    if hit_test(&view.camera, pos, &view.cards_z_asc(), (CARD_W, CARD_H), vp)
+                        .is_none()
+                    {
+                        view.drag = Some((pos, view.camera.pan));
+                    }
                 }),
             )
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, _cx| {
                 if ev.dragging() {
                     if let Some((mouse0, pan0)) = view.drag {
-                        view.pan = pan0 + (ev.position - mouse0);
+                        let now = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        view.camera.pan = (pan0.0 + now.0 - mouse0.0, pan0.1 + now.1 - mouse0.1);
                     }
                 }
             }))
@@ -333,14 +422,37 @@ impl Render for WorkspaceView {
                     view.drag = None;
                 }),
             )
+            .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, _cx| {
+                // ZOOM ao rolar no FUNDO; sobre um card VISÍVEL, o handler do card cuida.
+                let cursor = (f32::from(ev.position.x), f32::from(ev.position.y));
+                let v = window.viewport_size();
+                let vp = (f32::from(v.width), f32::from(v.height));
+                if hit_test(
+                    &view.camera,
+                    cursor,
+                    &view.cards_z_asc(),
+                    (CARD_W, CARD_H),
+                    vp,
+                )
+                .is_none()
+                {
+                    view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
+                }
+            }))
             .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, _cx| {
                 view.handle_key(ev, window);
             }));
 
         for (idx, (id, nv)) in cards.iter().enumerate() {
-            let x = px(nv.x) + pan.x;
-            let y = px(nv.y) + pan.y;
             let node_id = *id;
+            // ID de elemento ESTÁVEL por nó (não o idx do loop, que muda com cull/z-order).
+            let card_eid = eid.get(&node_id).copied().unwrap_or(idx);
+            // CULLING: cards fora da viewport não geram trabalho de render (grid pulado).
+            if !card_visible(&cam, (nv.x, nv.y), (CARD_W, CARD_H), viewport) {
+                continue;
+            }
+            let (sx, sy) = cam.world_to_screen((nv.x, nv.y));
+            let z = cam.zoom;
             let card_border = if node_id == focused {
                 rgb(0x7aa2f7)
             } else {
@@ -361,8 +473,9 @@ impl Render for WorkspaceView {
                 .px_3()
                 .py_2()
                 .bg(rgb(0x141a36))
+                .text_size(px(13.0 * z))
                 .text_color(rgb(0x7aa2f7))
-                .child(div().size(px(9.0)).rounded_full().bg(status_dot))
+                .child(div().size(px(9.0 * z)).rounded_full().bg(status_dot))
                 .child(text!(nv.name.clone()))
                 .child(
                     div()
@@ -374,7 +487,7 @@ impl Render for WorkspaceView {
             if cards.len() > 1 {
                 title = title.child(div().flex_1()).child(
                     div()
-                        .id(("close", idx))
+                        .id(("close", card_eid))
                         .px_2()
                         .rounded_md()
                         .bg(rgb(0x33202c))
@@ -385,12 +498,13 @@ impl Render for WorkspaceView {
                                 eprintln!("lina-gpui: fechar terminal: {e}");
                                 return;
                             }
+                            view.z_order.remove(&node_id);
                             // Reposiciona o foco num nó vivo (nunca tela em branco) e o revela.
                             // `first` em let separado: solta o lock do model antes do reveal.
                             if view.focused == node_id {
                                 let first = lock(&view.nodes.model).order.first().copied();
                                 if let Some(first) = first {
-                                    view.focused = first;
+                                    view.focus(first);
                                     view.reveal(first, window);
                                 }
                             }
@@ -401,7 +515,7 @@ impl Render for WorkspaceView {
 
             // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
             let mut body = div()
-                .id(("grid", idx))
+                .id(("grid", card_eid))
                 .role(Role::Terminal)
                 .aria_label(nv.name.clone())
                 .flex_1()
@@ -411,16 +525,16 @@ impl Render for WorkspaceView {
             let grid = lock(&self.nodes.grids).get(&node_id).cloned();
             if let Some(g) = grid {
                 let screen = lock(&g).screen();
-                body = body.child(render_grid(&screen));
+                body = body.child(render_grid(&screen, z));
             }
 
             let card = div()
-                .id(("card", idx))
+                .id(("card", card_eid))
                 .absolute()
-                .left(x)
-                .top(y)
-                .w(px(CARD_W))
-                .h(px(CARD_H))
+                .left(px(sx))
+                .top(px(sy))
+                .w(px(CARD_W * z))
+                .h(px(CARD_H * z))
                 .flex()
                 .flex_col()
                 .bg(rgb(0x0d1228))
@@ -429,12 +543,19 @@ impl Render for WorkspaceView {
                 .rounded_md()
                 .overflow_hidden()
                 .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, _cx| {
-                    // Só foca se o nó ainda existe (o ✕ pode tê-lo removido neste clique).
+                    // Só foca se o nó ainda existe (o ✕ pode tê-lo removido neste clique). Focar
+                    // bombeia o card ao topo (z-order).
                     if lock(&view.nodes.model).nodes.contains_key(&node_id) {
-                        view.focused = node_id;
+                        view.focus(node_id);
                     }
                 }))
                 .on_scroll_wheel(cx.listener(move |view, ev: &ScrollWheelEvent, _w, _cx| {
+                    // ⌘+scroll sobre o card = zoom do canvas; scroll normal = rolar o terminal.
+                    if ev.modifiers.platform {
+                        let cursor = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
+                        return;
+                    }
                     let dy: f32 = match ev.delta {
                         ScrollDelta::Lines(p) => p.y,
                         ScrollDelta::Pixels(p) => p.y / px(CELL_H),
@@ -458,10 +579,9 @@ impl Render for WorkspaceView {
             if let Some(t) = p.progress() {
                 let center = |id: NodeId| -> Option<Point<Pixels>> {
                     cards.iter().find(|(n, _)| *n == id).map(|(_, nv)| {
-                        point(
-                            px(nv.x + CARD_W / 2.0) + pan.x,
-                            px(nv.y + CARD_H / 2.0) + pan.y,
-                        )
+                        let (cx2, cy2) =
+                            cam.world_to_screen((nv.x + CARD_W / 2.0, nv.y + CARD_H / 2.0));
+                        point(px(cx2), px(cy2))
                     })
                 };
                 if let (Some(a), Some(b)) = (center(p.from), center(p.to)) {
@@ -568,13 +688,30 @@ impl Render for WorkspaceView {
                     // Cria um shell real novo, idêntico aos demais, foca e o TRAZ p/ a viewport.
                     match view.nodes.add_node() {
                         Ok(node) => {
-                            view.focused = node;
+                            view.focus(node);
                             view.reveal(node, window);
                         }
                         Err(e) => eprintln!("lina-gpui: add_node: {e}"),
                     }
                 }))
                 .child(text!("➕ Terminal")),
+        );
+
+        // 🏠 Centralizar: resgata a vista (pan/zoom → home). Sempre visível p/ o não-técnico
+        // nunca ficar perdido no canvas (mesmo efeito do ⌘0).
+        topbar = topbar.child(
+            div()
+                .id("home-btn")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(0x2a3152))
+                .text_color(rgb(0xc8d3f5))
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
+                    view.camera.reset();
+                }))
+                .child(text!("🏠 Centralizar")),
         );
 
         if recovering {

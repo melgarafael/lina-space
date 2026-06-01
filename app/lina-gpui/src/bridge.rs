@@ -460,33 +460,134 @@ fn next_free_slot(model: &SharedModel) -> (f32, f32) {
     (MARGIN_X, MARGIN_Y)
 }
 
-/// Ajuste MÍNIMO do pan (offset do canvas, em px) para trazer um `card` (posição em coords de
-/// canvas) **inteiramente para dentro** do `viewport` visível, respeitando a barra superior no
-/// topo. Não mexe no que já está visível. É o que faz o card recém-adicionado **aparecer**: o
-/// [`next_free_slot`] pode colocá-lo além da janela (680px de card não cabem 3 lado a lado numa
-/// janela de 1450px) — o pan o revela. gpui-free → testável.
+/// Limites de zoom do canvas (escala). Fora deles o zoom satura.
+pub const ZOOM_MIN: f32 = 0.4;
+pub const ZOOM_MAX: f32 = 2.0;
+
+/// **Câmera 2D do canvas (gpui-free → testável):** `pan` (translação em px de TELA) + `zoom`
+/// (escala). É o coração do scene-graph 2D: `screen = world * zoom + pan`. O render aplica isto
+/// por card; o culling e o hit-test usam a MESMA transformação (uma só fonte da verdade).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Camera {
+    pub pan: (f32, f32),
+    pub zoom: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            pan: (0.0, 0.0),
+            zoom: 1.0,
+        }
+    }
+}
+
+impl Camera {
+    /// Mundo → tela.
+    #[must_use]
+    pub fn world_to_screen(&self, w: (f32, f32)) -> (f32, f32) {
+        (w.0 * self.zoom + self.pan.0, w.1 * self.zoom + self.pan.1)
+    }
+
+    /// Tela → mundo (inverso exato de [`Self::world_to_screen`]).
+    #[must_use]
+    pub fn screen_to_world(&self, s: (f32, f32)) -> (f32, f32) {
+        // O zoom é sempre clampado em [ZOOM_MIN, ZOOM_MAX] (>0) via `zoom_by`/`reset`/`default`;
+        // o assert documenta o invariante e pega regressão de quem mexer no campo direto.
+        debug_assert!(
+            self.zoom > 0.0 && self.zoom.is_finite(),
+            "Camera::zoom deve ser positivo e finito"
+        );
+        (
+            (s.0 - self.pan.0) / self.zoom,
+            (s.1 - self.pan.1) / self.zoom,
+        )
+    }
+
+    /// Volta a câmera ao "home": pan zerado, zoom 1.0 (⌘0 / botão 🏠) — resgata a vista quando
+    /// o usuário se perde no canvas (invariante não-técnico: nunca ficar sem nada visível).
+    pub fn reset(&mut self) {
+        *self = Camera::default();
+    }
+
+    /// Zoom multiplicando por `factor`, mantendo o ponto de MUNDO sob `cursor` (em tela) fixo —
+    /// é o que impede o zoom "sob o cursor" de escorregar. Clampa em [`ZOOM_MIN`, `ZOOM_MAX`].
+    pub fn zoom_by(&mut self, cursor: (f32, f32), factor: f32) {
+        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        let w = self.screen_to_world(cursor);
+        self.zoom = new_zoom;
+        self.pan = (cursor.0 - w.0 * new_zoom, cursor.1 - w.1 * new_zoom);
+    }
+
+    /// Ajuste MÍNIMO do `pan` para trazer um card (canto sup-esq em coords de MUNDO) inteiro
+    /// para dentro da `viewport`, na escala atual, respeitando a barra superior. É o auto-pan
+    /// que faz o nó recém-criado aparecer (o `next_free_slot` pode pôr o card além da janela).
+    pub fn reveal(&mut self, card_world: (f32, f32), card_size: (f32, f32), viewport: (f32, f32)) {
+        const MARGIN: f32 = 16.0;
+        const TOPBAR: f32 = 44.0;
+        let (cw, ch) = (card_size.0 * self.zoom, card_size.1 * self.zoom);
+        // 2 iterações convergem nas DUAS bordas: o caso normal resolve na 1ª; se o card for
+        // maior que (viewport - margens) — ex.: janela encolhida — a 2ª prioriza esq/topo.
+        for _ in 0..2 {
+            let (sx, sy) = self.world_to_screen(card_world);
+            if sx + cw > viewport.0 - MARGIN {
+                self.pan.0 -= sx + cw - (viewport.0 - MARGIN);
+            }
+            let sx = self.world_to_screen(card_world).0;
+            if sx < MARGIN {
+                self.pan.0 += MARGIN - sx;
+            }
+            if sy + ch > viewport.1 - MARGIN {
+                self.pan.1 -= sy + ch - (viewport.1 - MARGIN);
+            }
+            let sy = self.world_to_screen(card_world).1;
+            if sy < TOPBAR + MARGIN {
+                self.pan.1 += TOPBAR + MARGIN - sy;
+            }
+        }
+    }
+}
+
+/// **CULLING:** o card (canto sup-esq em mundo, tamanho `card_size`) intersecta a viewport
+/// visível sob a câmera? O render pula os invisíveis — com muitos nós, só os visíveis trabalham.
 #[must_use]
-pub fn pan_to_reveal(pan: (f32, f32), card: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
-    const MARGIN: f32 = 16.0;
-    const TOPBAR: f32 = 44.0; // a barra superior cobre o topo do canvas
-    let (mut px, mut py) = pan;
-    let (cx, cy) = card;
-    let (vw, vh) = viewport;
-    // Eixo X: empurra p/ a esquerda se passa da direita; depois p/ a direita se passa da esquerda.
-    if cx + px + CARD_W > vw - MARGIN {
-        px = vw - MARGIN - CARD_W - cx;
-    }
-    if cx + px < MARGIN {
-        px = MARGIN - cx;
-    }
-    // Eixo Y: idem, com a topbar reservada no topo.
-    if cy + py + CARD_H > vh - MARGIN {
-        py = vh - MARGIN - CARD_H - cy;
-    }
-    if cy + py < TOPBAR + MARGIN {
-        py = TOPBAR + MARGIN - cy;
-    }
-    (px, py)
+pub fn card_visible(
+    cam: &Camera,
+    world_pos: (f32, f32),
+    card_size: (f32, f32),
+    viewport: (f32, f32),
+) -> bool {
+    let (sx, sy) = cam.world_to_screen(world_pos);
+    let (sw, sh) = (card_size.0 * cam.zoom, card_size.1 * cam.zoom);
+    sx < viewport.0 && sx + sw > 0.0 && sy < viewport.1 && sy + sh > 0.0
+}
+
+/// **HIT-TEST:** qual card está sob `screen_pt`? Recebe os cards em ordem de z CRESCENTE
+/// (último = topo); devolve o de MAIOR z cujo retângulo de tela contém o ponto (resolução de
+/// sobreposição). `None` se o ponto caiu no fundo do canvas.
+#[must_use]
+pub fn hit_test(
+    cam: &Camera,
+    screen_pt: (f32, f32),
+    cards_z_asc: &[(NodeId, (f32, f32))],
+    card_size: (f32, f32),
+    viewport: (f32, f32),
+) -> Option<NodeId> {
+    let (sw, sh) = (card_size.0 * cam.zoom, card_size.1 * cam.zoom);
+    cards_z_asc
+        .iter()
+        .rev()
+        // Só cards VISÍVEIS são hittable: um card cullado (off-screen) não tem elemento na tela,
+        // logo não pode "roubar" o clique/scroll e criar uma zona morta de pan/zoom.
+        .filter(|(_, pos)| card_visible(cam, *pos, card_size, viewport))
+        .find_map(|(id, world_pos)| {
+            let (sx, sy) = cam.world_to_screen(*world_pos);
+            let inside = screen_pt.0 >= sx
+                && screen_pt.0 <= sx + sw
+                && screen_pt.1 >= sy
+                && screen_pt.1 <= sy + sh;
+            inside.then_some(*id)
+        })
 }
 
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
@@ -1120,7 +1221,7 @@ mod tests {
 
     /// **Regressão da CAUSA-RAIZ (card novo nasce fora da viewport):** na janela 1450×640 o 3º
     /// card cai em x≈1450 — totalmente FORA da tela com pan=0 (era por isso que "nada aparecia").
-    /// `pan_to_reveal` traz o card inteiramente para dentro do viewport — é o que destrava o ➕.
+    /// `Camera::reveal` traz o card inteiramente para dentro do viewport — destrava o ➕.
     #[test]
     fn new_card_slot_is_offscreen_and_reveal_fixes_it() {
         let viewport = (1450.0_f32, 640.0_f32);
@@ -1146,9 +1247,10 @@ mod tests {
             viewport.0
         );
 
-        // FIX: pan_to_reveal traz o card INTEIRAMENTE para dentro da viewport visível.
-        let (px, py) = pan_to_reveal((0.0, 0.0), (cx, cy), viewport);
-        let (left, top) = (cx + px, cy + py);
+        // FIX: Camera::reveal traz o card INTEIRAMENTE para dentro da viewport (escala atual).
+        let mut cam = Camera::default();
+        cam.reveal((cx, cy), (CARD_W, CARD_H), viewport);
+        let (left, top) = cam.world_to_screen((cx, cy));
         assert!(left >= 0.0, "borda esquerda dentro (left={left})");
         assert!(
             left + CARD_W <= viewport.0,
@@ -1161,5 +1263,126 @@ mod tests {
             "borda de baixo dentro (bottom={})",
             top + CARD_H
         );
+    }
+
+    /// **GATE W2-2 — transform da câmera (round-trip tela↔mundo):** `screen_to_world` desfaz
+    /// `world_to_screen` para vários pan/zoom.
+    #[test]
+    fn camera_transform_roundtrips() {
+        for &(pan, zoom) in &[
+            ((0.0, 0.0), 1.0_f32),
+            ((120.0, -45.0), 0.5),
+            ((-300.0, 80.0), 1.8),
+        ] {
+            let cam = Camera { pan, zoom };
+            for &w in &[(0.0_f32, 0.0_f32), (740.0, 96.0), (1450.0, 626.0)] {
+                let s = cam.world_to_screen(w);
+                let back = cam.screen_to_world(s);
+                assert!(
+                    (back.0 - w.0).abs() < 0.01 && (back.1 - w.1).abs() < 0.01,
+                    "round-trip falhou: w={w:?} pan={pan:?} zoom={zoom} -> back={back:?}"
+                );
+            }
+        }
+    }
+
+    /// **GATE W2-2 — zoom mantém o ponto sob o cursor estável + clampa nos limites.**
+    #[test]
+    fn zoom_keeps_cursor_point_stable_and_clamps() {
+        let mut cam = Camera::default();
+        let cursor = (700.0, 300.0);
+        let world_before = cam.screen_to_world(cursor);
+        cam.zoom_by(cursor, 1.5);
+        let world_after = cam.screen_to_world(cursor);
+        assert!(
+            (world_before.0 - world_after.0).abs() < 0.01
+                && (world_before.1 - world_after.1).abs() < 0.01,
+            "o ponto de mundo sob o cursor deve ficar estável no zoom"
+        );
+        for _ in 0..50 {
+            cam.zoom_by(cursor, 2.0);
+        }
+        assert!(
+            (cam.zoom - ZOOM_MAX).abs() < 1e-4,
+            "zoom satura em ZOOM_MAX (={ZOOM_MAX})"
+        );
+        for _ in 0..50 {
+            cam.zoom_by(cursor, 0.5);
+        }
+        assert!(
+            (cam.zoom - ZOOM_MIN).abs() < 1e-4,
+            "zoom satura em ZOOM_MIN (={ZOOM_MIN})"
+        );
+    }
+
+    /// **GATE W2-2 — culling: cards fora da viewport não geram render.**
+    #[test]
+    fn culling_marks_offscreen_cards() {
+        let cam = Camera::default();
+        let vp = (1450.0, 640.0);
+        assert!(
+            card_visible(&cam, (30.0, 96.0), (CARD_W, CARD_H), vp),
+            "card on-screen é visível"
+        );
+        assert!(
+            !card_visible(&cam, (5000.0, 5000.0), (CARD_W, CARD_H), vp),
+            "card muito longe é cullado"
+        );
+        let panned = Camera {
+            pan: (-3000.0, 0.0),
+            zoom: 1.0,
+        };
+        assert!(
+            !card_visible(&panned, (30.0, 96.0), (CARD_W, CARD_H), vp),
+            "pan tira o card da viewport"
+        );
+    }
+
+    /// **GATE W2-2 — hit-test: sobreposição resolve pelo MAIOR z; fora de tudo é None.**
+    #[test]
+    fn hit_test_resolves_overlap_by_z_top() {
+        let cam = Camera::default();
+        let a = uuid::Uuid::from_u128(1);
+        let b = uuid::Uuid::from_u128(2);
+        // a e b sobrepostos. Ordem z-CRESCENTE [a, b] → b é o topo.
+        let vp = (1450.0_f32, 640.0_f32);
+        let cards = vec![(a, (100.0_f32, 100.0_f32)), (b, (140.0_f32, 130.0_f32))];
+        let pt = (200.0, 200.0); // dentro de ambos
+        assert_eq!(
+            hit_test(&cam, pt, &cards, (CARD_W, CARD_H), vp),
+            Some(b),
+            "o de maior z (topo) recebe o hit"
+        );
+        let cards_rev = vec![(b, (140.0_f32, 130.0_f32)), (a, (100.0_f32, 100.0_f32))];
+        assert_eq!(
+            hit_test(&cam, pt, &cards_rev, (CARD_W, CARD_H), vp),
+            Some(a),
+            "o topo muda com o z"
+        );
+        assert_eq!(
+            hit_test(&cam, (1000.0, 600.0), &cards, (CARD_W, CARD_H), vp),
+            None,
+            "fora de todos os cards é None"
+        );
+        // Card CULLADO (fora da viewport) NÃO é hittable — sem zona morta de pan/zoom.
+        let far = vec![(a, (5000.0_f32, 5000.0_f32))];
+        assert_eq!(
+            hit_test(&cam, (5010.0, 5010.0), &far, (CARD_W, CARD_H), vp),
+            None,
+            "card cullado (off-screen) não recebe hit"
+        );
+    }
+
+    /// **GATE W2-2 — `reset` volta a câmera ao home** (resgate da vista: ⌘0 / 🏠).
+    #[test]
+    fn camera_reset_goes_home() {
+        let mut cam = Camera {
+            pan: (-2500.0, 800.0),
+            zoom: 1.7,
+        };
+        cam.reset();
+        assert_eq!(cam, Camera::default());
+        assert_eq!(cam.pan, (0.0, 0.0));
+        assert!((cam.zoom - 1.0).abs() < 1e-6);
     }
 }
