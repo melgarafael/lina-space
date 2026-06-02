@@ -33,7 +33,8 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
 pub use events::{
-    apply, DomainEvent, EventRecord, EventStore, ProjectedNode, ProjectedState, StoreError,
+    apply, BlockReason, DomainEvent, EventRecord, EventStore, ProjectedNode, ProjectedState,
+    StoreError,
 };
 
 /// Entrega A2A faseada (W0-9) + contrato de fim-de-resposta (W0-10).
@@ -46,8 +47,8 @@ pub use a2a::{
 /// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
 mod mailbox;
 pub use mailbox::{
-    now_ms, parse_target, render_message_block, AgentPresence, MailMessage, Mailbox, TargetSpec,
-    MAIL_SCHEMA_V1,
+    now_ms, parse_target, render_message_block, render_message_block_full, AgentPresence,
+    MailMessage, Mailbox, TargetSpec, MAIL_SCHEMA_V1,
 };
 
 /// W3-4: roteador do supervisor (pipeline `route_message` com guardrails 0-4).

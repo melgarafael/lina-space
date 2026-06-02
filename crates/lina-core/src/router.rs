@@ -9,13 +9,13 @@
 //! `dedupe(id, 60s)` → `anti-loop(hops)` → `remetente existe` → `alvo existe` → `autonomia` →
 //! `gate de fan-out` → `orçamento(root_cause_id)` → `anti-deadlock(wait-for)` → **rota + entrega**.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::events::{DomainEvent, EventStore, StoreError};
-use crate::mailbox::{parse_target, render_message_block, MailMessage, Mailbox, TargetSpec};
+use crate::events::{BlockReason, DomainEvent, EventStore, StoreError};
+use crate::mailbox::{parse_target, render_message_block_full, MailMessage, Mailbox, TargetSpec};
 use crate::plan::PlanError;
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, Recipient, RolePolicy, Supervisor};
 
@@ -91,6 +91,9 @@ pub enum RouteOutcome {
     BudgetExceeded,
     /// `--await` fecharia um ciclo no wait-for-graph (deadlock).
     Deadlock,
+    /// W3-7 (§2.1): adicionar `sender→target` fecharia um CICLO no grafo de handoffs do mesmo
+    /// `root_cause_id` (A→B→A por mensagens novas) — ortogonal a `hops`/`trace`.
+    LoopDetected,
     /// A entrega faseada falhou (PTY do alvo).
     DeliveryFailed(String),
     /// Falha ao persistir o roteamento no event log (não entregamos o que não logamos).
@@ -139,6 +142,11 @@ pub struct Router {
     seen: HashMap<String, u64>,
     /// `(root_cause_id, remetente)` → orçamento por turno (contagem + carimbo p/ poda temporal).
     budget: HashMap<(String, NodeId), BudgetEntry>,
+    /// W3-7 (A2): nó → `(root_cause_id, hops)` da última mensagem ENTREGUE a ele. Quando esse nó
+    /// depois submete uma msg com `root=None`, o supervisor DERIVA o root (herdado) e `hops = +1`
+    /// daqui — o enforcement de cadeia vem do binding do supervisor, não do campo que a CLI não
+    /// preenche. Bounded pelo roster (1 entrada por nó, sobrescrita) → não precisa de poda.
+    delivered_root: HashMap<NodeId, (String, u8)>,
 }
 
 impl Router {
@@ -157,6 +165,7 @@ impl Router {
             config,
             seen: HashMap::new(),
             budget: HashMap::new(),
+            delivered_root: HashMap::new(),
         }
     }
 
@@ -178,15 +187,24 @@ impl Router {
     where
         D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
     {
-        let msgs = self.mailbox.drain().unwrap_or_else(|e| {
+        // A6: drena de forma RECUPERÁVEL — move para `.inflight` e reprocessa órfãos de um crash.
+        let msgs = self.mailbox.drain_to_inflight().unwrap_or_else(|e| {
             // Falha de I/O ao listar o outbox (disco/permissão): as mensagens NÃO são perdidas
-            // (ficam no outbox para o próximo tick), mas a falha é VISÍVEL (stderr), nunca silenciosa.
+            // (ficam no outbox/.inflight para o próximo tick), mas a falha é VISÍVEL, nunca silenciosa.
             eprintln!("lina-core: pump não conseguiu drenar a mailbox (será retentado): {e}");
             Vec::new()
         });
         msgs.into_iter()
             .map(|m| {
                 let outcome = self.route_message(&m, store, now_ms, &mut deliver);
+                // A6: só CONFIRMA (remove de `.inflight`) quando o evento durável foi persistido
+                // (`MessageRouted`/`RouteBlocked`/plan). Em `PersistFailed` o registro PERMANECE em
+                // `.inflight` para o próximo tick — nada se perde num crash entre drenar e logar.
+                if !matches!(outcome, RouteOutcome::PersistFailed(_)) {
+                    if let Err(e) = self.mailbox.ack_inflight(&m.id) {
+                        eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
+                    }
+                }
                 (m.id, outcome)
             })
             .collect()
@@ -206,6 +224,8 @@ impl Router {
         // ── Guardrail: dedupe por `id` na janela (design §3). Poda `seen` E `budget` (A5).
         self.prune_expired(now_ms);
         if self.seen.contains_key(&msg.id) {
+            // ADR 0003: `duplicate` NÃO é logado (anti-amplificação A4 — sob flood viraria um
+            // amplificador de escrita). A duplicata é benigna por definição.
             return RouteOutcome::Duplicate;
         }
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
@@ -218,15 +238,23 @@ impl Router {
             return self.handle_plan(msg, store);
         }
 
-        // ── Guardrail: anti-loop por profundidade (`hops`).
-        if msg.hops > self.config.max_depth {
-            return RouteOutcome::HopLimit;
-        }
-
-        // ── Guardrail 0a: remetente existe no roster vivo.
+        // ── Guardrail 0a: remetente existe no roster vivo. Resolvido ANTES do anti-loop por
+        //    profundidade — precisamos do `NodeId` do sender para derivar root/hops do binding (A2).
         let Some(sender) = self.sup.node_by_name(&msg.from) else {
+            log_block(store, msg, BlockReason::UnknownSender);
             return RouteOutcome::UnknownSender(msg.from.clone());
         };
+
+        // ── A2: deriva `root_cause_id`/`hops` EFETIVOS. Root explícito → confia; senão herda do
+        //    binding `delivered_root[sender]` (root herdado + hops+1); sem binding → o nó é a raiz.
+        let (root, hops) = self.derive_root_hops(msg, sender);
+
+        // ── Guardrail: anti-loop por PROFUNDIDADE sobre os `hops` EFETIVOS (antes `msg.hops` ficava
+        //    sempre 0 na cadeia real → o guard era inerte; agora cresce 0→1→2…).
+        if hops > self.config.max_depth {
+            log_block(store, msg, BlockReason::HopLimit);
+            return RouteOutcome::HopLimit;
+        }
 
         // ── Guardrail 0b: alvo existe (resolve SEM efeito colateral — não publica ainda).
         let (recipient, policy) = match parse_target(&msg.to) {
@@ -234,32 +262,37 @@ impl Router {
             TargetSpec::Role(r) => (Recipient::Role(r), RolePolicy::FirstIdle),
             TargetSpec::Name(n) => match self.sup.node_by_name(&n) {
                 Some(id) => (Recipient::Node(id), RolePolicy::FirstIdle),
-                None => return RouteOutcome::NoTarget,
+                None => {
+                    log_block(store, msg, BlockReason::NoTarget);
+                    return RouteOutcome::NoTarget;
+                }
             },
         };
         let preview = self.sup.resolve(&recipient, policy, Some(sender));
         if preview.is_empty() {
+            log_block(store, msg, BlockReason::NoTarget);
             return RouteOutcome::NoTarget;
         }
 
         // ── Guardrail 1: autonomia (manual recusa delegação).
         if self.config.autonomy.blocks_delegation() && is_delegation(&msg.intent) {
+            log_block(store, msg, BlockReason::BlockedByAutonomy);
             return RouteOutcome::BlockedByAutonomy;
         }
 
         // ── Guardrail: gate de fan-out (broadcast > N alvos pede confirmação humana).
         if matches!(recipient, Recipient::Broadcast) && preview.len() > self.config.fanout_gate {
+            log_block(store, msg, BlockReason::FanoutGated);
             return RouteOutcome::FanoutGated {
                 count: preview.len(),
             };
         }
 
-        // ── Guardrail 3: orçamento de delegação por `root_cause_id`/agente. Sem root explícito,
-        //    a própria mensagem é a raiz (o turno do usuário que disparou a CLI). Aqui só CHECAMOS;
-        //    o incremento vem DEPOIS do persist bem-sucedido — uma falha de log não envenena a
-        //    conta (a conta reflete delegação EFETIVADA, não tentada).
-        let root = msg.root_cause_id.clone().unwrap_or_else(|| msg.id.clone());
         let is_deleg = is_delegation(&msg.intent);
+
+        // ── Guardrail 3: orçamento por `(root_cause_id, agente)`. Com a propagação do root (A2),
+        //    delegações da mesma cadeia acumulam contra o mesmo root (antes cada msg nova era uma
+        //    raiz fresca e a conta nunca batia). Só CHECA aqui; incrementa após o persist.
         if is_deleg {
             let count = self
                 .budget
@@ -267,62 +300,107 @@ impl Router {
                 .map(|e| e.count)
                 .unwrap_or(0);
             if count >= self.config.delegation_budget {
+                log_block(store, msg, BlockReason::BudgetExceeded);
                 return RouteOutcome::BudgetExceeded;
             }
         }
 
-        // ── Guardrail 2: anti-deadlock (só `--await`): se registrar `sender→target` fecharia um
-        //    ciclo no wait-for-graph, recusa. É uma CHECAGEM PURA — desfazemos a aresta na hora
-        //    (o modelo de mailbox é fire-and-forget; a CLI não bloqueia de fato, então uma aresta
-        //    persistente seria órfã e geraria falsos deadlocks depois).
-        if msg.await_reply {
-            for &target in &preview {
-                match self.sup.begin_await(sender, target) {
-                    Ok(()) => self.sup.end_await(sender), // rollback imediato (só checagem)
-                    Err(_) => return RouteOutcome::Deadlock,
+        // ── Guardrail (§2.1): anti-loop por GRAFO DE EVENTOS handoff `from→to` filtrado pelo
+        //    `root_cause_id`. Pega A→B→A formado por mensagens NOVAS sob o mesmo root — que `hops`/
+        //    `trace` NÃO pegam (cada `MailMessage::new` zera ambos). Só ask/handoff a 1 alvo
+        //    (broadcast é gateado à parte). Topologia de eventos: independe do texto.
+        if is_deleg && !matches!(recipient, Recipient::Broadcast) {
+            if let Some(&target) = preview.first() {
+                match handoff_would_loop(store, &root, sender, target) {
+                    Ok(true) => {
+                        log_block(store, msg, BlockReason::LoopDetected);
+                        return RouteOutcome::LoopDetected;
+                    }
+                    Ok(false) => {}
+                    // Não conseguimos LER o log para verificar o ciclo → falha segura (não roteia).
+                    Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
                 }
             }
         }
 
-        // ── Passou. Carimba o envelope canônico (root_cause_id, hops, await) e ROTEIA (publica
-        //    `BusEvent::Message` + devolve os alvos frescos, sem o remetente nem nós já no trace).
+        // ── Guardrail 2: anti-deadlock (só `--await`): se registrar `sender→target` fecharia um
+        //    ciclo no wait-for-graph, recusa. CHECAGEM PURA com rollback imediato (a mailbox é
+        //    fire-and-forget; aresta persistente seria órfã e geraria falsos deadlocks).
+        if msg.await_reply {
+            for &target in &preview {
+                match self.sup.begin_await(sender, target) {
+                    Ok(()) => self.sup.end_await(sender),
+                    Err(_) => {
+                        log_block(store, msg, BlockReason::Deadlock);
+                        return RouteOutcome::Deadlock;
+                    }
+                }
+            }
+        }
+
+        // ── Passou. Carimba o envelope com root/hops EFETIVOS e ROTEIA (publica `BusEvent::Message`
+        //    + devolve os alvos frescos, sem o remetente nem nós já no trace).
         let mut env = A2aEnvelope::new(sender, recipient.clone(), Some(intent_or_ask(&msg.intent)));
         env.root_cause_id = Some(root.clone());
-        env.hops = msg.hops;
+        env.hops = hops;
         env.await_reply = msg.await_reply;
         let targets = self.sup.route(&env, policy);
         if targets.is_empty() {
+            log_block(store, msg, BlockReason::NoTarget);
             return RouteOutcome::NoTarget;
         }
 
-        // Persiste o ROTEAMENTO antes de entregar (não entregamos o que não conseguimos logar).
+        // Persiste o ROTEAMENTO (com root/hops/to_node p/ o grafo anti-loop) antes de entregar.
+        let to_node = if matches!(recipient, Recipient::Broadcast) {
+            None
+        } else {
+            targets.first().copied()
+        };
         if let Err(e) = store.append(&DomainEvent::MessageRouted {
             id: msg.id.clone(),
             from: sender,
             to: msg.to.clone(),
             intent: intent_or_ask(&msg.intent),
+            root_cause_id: root.clone(),
+            hops,
+            to_node,
         }) {
+            // Exceção do ADR 0003: não há como logar a falha de logar (recai em stderr/PersistFailed).
             return RouteOutcome::PersistFailed(e.to_string());
         }
         // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada). Carimba o tempo
-        // para a poda temporal (A5) — sem isso o mapa cresceria sem limite (vazamento de memória).
+        // para a poda temporal (A5).
         if is_deleg {
-            let entry = self.budget.entry((root, sender)).or_insert(BudgetEntry {
-                count: 0,
-                last_ms: now_ms,
-            });
+            let entry = self
+                .budget
+                .entry((root.clone(), sender))
+                .or_insert(BudgetEntry {
+                    count: 0,
+                    last_ms: now_ms,
+                });
             entry.count += 1;
             entry.last_ms = now_ms;
         }
 
-        // Renderiza o bloco [LINA::MSG] (sentinela + terminador LINA) e entrega a cada alvo.
+        // Renderiza o bloco [LINA::MSG] (com root_cause_id/hops achatados — auditoria/UX) e entrega.
         let to_label = recipient_label(&recipient, &msg.to);
-        let block = render_message_block(&msg.id, &msg.from, &to_label, &msg.intent, &msg.payload);
+        let block = render_message_block_full(
+            &msg.id,
+            &msg.from,
+            &to_label,
+            &msg.intent,
+            &msg.payload,
+            &root,
+            hops,
+        );
         let mut delivered = Vec::with_capacity(targets.len());
         for target in targets {
             match deliver(target, sender, &block) {
                 Ok(_) => {
                     delivered.push(target);
+                    // A2: registra que `target` recebeu esta cadeia → futuras submissões dele herdam
+                    //     o root e ganham hops+1 (binding do supervisor, não confiança no campo).
+                    self.delivered_root.insert(target, (root.clone(), hops));
                     if let Err(e) = store.append(&DomainEvent::MessageDelivered {
                         id: msg.id.clone(),
                         to: target,
@@ -358,6 +436,20 @@ impl Router {
             .retain(|_, &mut t| now_ms.saturating_sub(t) < window);
         self.budget
             .retain(|_, e| now_ms.saturating_sub(e.last_ms) < window);
+    }
+
+    /// **A2: deriva o `(root_cause_id, hops)` EFETIVOS** de uma mensagem submetida por `sender`.
+    /// Root explícito na msg → confia nele (hops da msg). Sem root, mas com binding
+    /// `delivered_root[sender]` → herda o root e `hops + 1` (a cadeia cresce). Sem binding → o nó é
+    /// a própria raiz (turno de origem; ex.: o humano disparou a CLI).
+    fn derive_root_hops(&self, msg: &MailMessage, sender: NodeId) -> (String, u8) {
+        if let Some(r) = &msg.root_cause_id {
+            return (r.clone(), msg.hops);
+        }
+        if let Some((root, h)) = self.delivered_root.get(&sender) {
+            return (root.clone(), h.saturating_add(1));
+        }
+        (msg.id.clone(), msg.hops)
     }
 
     /// **W3-5: aplica um intent de plano** (`plan.claim`/`plan.check`). Valida o comando contra a
@@ -478,6 +570,90 @@ fn recipient_label(recipient: &Recipient, raw_to: &str) -> String {
     }
 }
 
+/// **ADR 0003: apenda `RouteBlocked` antes de retornar uma recusa** — o log é o livro-razão das
+/// recusas (validável headless). Falha ao logar é VISÍVEL (stderr), nunca silenciosa. `duplicate`
+/// é a exceção (não chama isto — anti-amplificação A4); `PersistFailed` também (não loga a falha de
+/// logar). Reason é `Copy` → segue usável no `eprintln`.
+fn log_block(store: &mut EventStore, msg: &MailMessage, reason: BlockReason) {
+    if let Err(e) = store.append(&DomainEvent::RouteBlocked {
+        id: msg.id.clone(),
+        reason,
+        from: msg.from.clone(),
+        to: msg.to.clone(),
+    }) {
+        eprintln!(
+            "lina-core: CRÍTICO — falha ao logar RouteBlocked({reason:?}) para {}: {e}",
+            msg.id
+        );
+    }
+}
+
+/// **§2.1: o grafo de handoffs FECHARIA UM CICLO?** Reconstrói as arestas `from→to_node` dos eventos
+/// `MessageRouted` do log com o MESMO `root_cause_id` e responde se `target` JÁ ALCANÇA `sender` —
+/// nesse caso adicionar `sender→target` fecha um ciclo (A→B→A por mensagens novas sob o mesmo turno).
+/// Identidades em `NodeId` (uniformes); independe do texto. Derivável do log (invariante #4).
+///
+/// # Errors
+/// Falha ao ler o event log.
+fn handoff_would_loop(
+    store: &EventStore,
+    root_cause_id: &str,
+    sender: NodeId,
+    target: NodeId,
+) -> Result<bool, StoreError> {
+    let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for rec in store.events()? {
+        if rec.kind != "MessageRouted" {
+            continue;
+        }
+        let same_root = rec
+            .payload
+            .get("root_cause_id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == root_cause_id);
+        if !same_root {
+            continue;
+        }
+        let from = rec
+            .payload
+            .get("from")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<NodeId>().ok());
+        let to = rec
+            .payload
+            .get("to_node")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<NodeId>().ok());
+        if let (Some(f), Some(t)) = (from, to) {
+            adj.entry(f).or_default().push(t);
+        }
+    }
+    Ok(reaches(&adj, target, sender))
+}
+
+/// `true` se há um caminho `start → … → goal` no grafo dirigido `adj` (DFS, à prova de ciclos).
+fn reaches(adj: &HashMap<NodeId, Vec<NodeId>>, start: NodeId, goal: NodeId) -> bool {
+    if start == goal {
+        return true;
+    }
+    let mut stack = vec![start];
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    while let Some(n) = stack.pop() {
+        if !visited.insert(n) {
+            continue;
+        }
+        if let Some(nexts) = adj.get(&n) {
+            for &m in nexts {
+                if m == goal {
+                    return true;
+                }
+                stack.push(m);
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,6 +714,23 @@ mod tests {
         (Router::new(Arc::clone(&sup), mb), sup, dir)
     }
 
+    /// Os `reason` (snake_case) de todos os `RouteBlocked` no log — base das asserções de bloqueio
+    /// (ADR 0003 / AC-4.1: a recusa é assertada NO LOG, não só no enum de retorno).
+    fn blocked_reasons(store: &EventStore) -> Vec<String> {
+        store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == "RouteBlocked")
+            .filter_map(|r| {
+                r.payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect()
+    }
+
     #[test]
     fn ask_routes_resolves_names_and_delivers() {
         let (mut router, sup, dir) = router_with("happy");
@@ -576,6 +769,11 @@ mod tests {
             RouteOutcome::Duplicate
         );
         assert_eq!(rec.borrow().len(), 1, "só a 1ª entregou");
+        // ADR 0003 (anti-amplificação A4): `duplicate` NÃO apenda RouteBlocked.
+        assert!(
+            !blocked_reasons(&ts.store).contains(&"duplicate".to_string()),
+            "duplicate não pode virar evento (amplificaria escrita sob flood)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -623,6 +821,8 @@ mod tests {
             RouteOutcome::BudgetExceeded
         );
         assert_eq!(rec.borrow().len(), DELEGATION_BUDGET as usize);
+        // AC-4.1: a recusa por orçamento está NO LOG.
+        assert!(blocked_reasons(&ts.store).contains(&"budget_exceeded".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -641,6 +841,7 @@ mod tests {
             RouteOutcome::HopLimit
         );
         assert!(rec.borrow().is_empty());
+        assert!(blocked_reasons(&ts.store).contains(&"hop_limit".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -663,6 +864,10 @@ mod tests {
             router.route_message(&no_target, &mut ts.store, 1000, &mut deliver),
             RouteOutcome::NoTarget
         );
+        // AC-4.1: ambas as recusas estão NO LOG.
+        let reasons = blocked_reasons(&ts.store);
+        assert!(reasons.contains(&"unknown_sender".to_string()));
+        assert!(reasons.contains(&"no_target".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -688,6 +893,7 @@ mod tests {
             RouteOutcome::BlockedByAutonomy
         );
         assert!(rec.borrow().is_empty());
+        assert!(blocked_reasons(&ts.store).contains(&"blocked_by_autonomy".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -706,6 +912,7 @@ mod tests {
             router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
             RouteOutcome::Deadlock
         );
+        assert!(blocked_reasons(&ts.store).contains(&"deadlock".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -727,6 +934,7 @@ mod tests {
             RouteOutcome::FanoutGated { count: 4 }
         );
         assert!(rec.borrow().is_empty(), "broadcast gateado não entrega");
+        assert!(blocked_reasons(&ts.store).contains(&"fanout_gated".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -990,6 +1198,219 @@ mod tests {
         assert!(
             router.budget.keys().all(|(root, _)| *root == later.id),
             "só a entrada do turno recente sobrevive (a de 1000 foi podada)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── W3-7a: anti-loop de grafo / propagação / A6 ─────────────────────────
+
+    /// AC-7.1: A→B→A por mensagens NOVAS sob o mesmo `root_cause_id` (hops<4, ids distintos) →
+    /// `LoopDetected` + `RouteBlocked{loop_detected}`. Trocar o root → passa (ciclo é por-turno).
+    /// Prova ortogonalidade a `hops`/`trace`.
+    #[test]
+    fn loop_detected_blocks_cycle_and_is_orthogonal_to_root() {
+        let (mut router, sup, dir) = router_with("loop");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("loop");
+        let (_rec, mut deliver) = recorder();
+
+        // Semeia o log com um handoff A→B sob o root "R" (aresta a→b no grafo).
+        ts.store
+            .append(&DomainEvent::MessageRouted {
+                id: "msg_seedAB".into(),
+                from: a,
+                to: "@B".into(),
+                intent: "ask".into(),
+                root_cause_id: "R".into(),
+                hops: 0,
+                to_node: Some(b),
+            })
+            .expect("seed A→B");
+
+        // B→A com o MESMO root "R", id NOVO (hops 0) → fecharia A→B→A → LoopDetected.
+        let mut back = MailMessage::new("@B", "@A", "ask", "volta");
+        back.root_cause_id = Some("R".into());
+        assert_eq!(
+            router.route_message(&back, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::LoopDetected
+        );
+        assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
+
+        // Mesma topologia, root DIFERENTE → passa (o ciclo é por-turno; ortogonal a hops/ttl).
+        let mut other = MailMessage::new("@B", "@A", "ask", "outro turno");
+        other.root_cause_id = Some("R2".into());
+        assert!(
+            matches!(
+                router.route_message(&other, &mut ts.store, 1001, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "ciclo de OUTRO root não deve ser bloqueado"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A2: numa cadeia A→B→C com `root=None`, o supervisor PROPAGA o root (binding) e `hops` cresce
+    /// 0→1 — observável nos `MessageRouted` do log (antes ambos nasciam root fresco / hops 0).
+    #[test]
+    fn root_and_hops_propagate_along_chain() {
+        let (mut router, sup, dir) = router_with("propagate");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("propagate");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B: A é origem (sem binding) → root = id da própria msg, hops 0.
+        let m1 = MailMessage::new("@A", "@B", "ask", "faz X");
+        assert!(matches!(
+            router.route_message(&m1, &mut ts.store, 1, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        // B→C: B submete com root=None → herda o root de A (binding) e hops = 0+1 = 1.
+        let m2 = MailMessage::new("@B", "@C", "ask", "faz Y");
+        assert!(matches!(
+            router.route_message(&m2, &mut ts.store, 2, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        let routed: Vec<_> = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "MessageRouted")
+            .collect();
+        assert_eq!(routed.len(), 2);
+        let root0 = routed[0].payload["root_cause_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let root1 = routed[1].payload["root_cause_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(root0, m1.id, "a raiz é o turno de origem (id de A)");
+        assert_eq!(root1, root0, "B herdou o root de A (propagação)");
+        assert_eq!(routed[0].payload["hops"].as_u64(), Some(0));
+        assert_eq!(
+            routed[1].payload["hops"].as_u64(),
+            Some(1),
+            "hops cresceu 0→1 na cadeia propagada"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A2/AC: a propagação faz `hops` crescer até `max_depth` e o guard de profundidade CORTA a
+    /// cadeia real (antes inerte, pois `msg.hops` ficava sempre 0).
+    #[test]
+    fn hop_limit_cuts_propagated_chain_at_max_depth() {
+        let (mut router, sup, dir) = router_with("hopchain");
+        for i in 0..=5 {
+            sup.register(format!("@n{i}"), None, sink());
+        }
+        let mut ts = TmpStore::new("hopchain");
+        let (_rec, mut deliver) = recorder();
+
+        // Cadeia n0→n1→…→n5 (root=None, herdado): hops 0,1,2,3,4 — todas entregam.
+        for i in 0..5u64 {
+            let m = MailMessage::new(format!("@n{i}"), format!("@n{}", i + 1), "ask", "vai");
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, i + 1, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "hop {i} deveria entregar (hops <= max_depth)"
+            );
+        }
+        // n5 está em hops=4; sua submissão deriva hops=5 > max_depth(4) → HopLimit (antes do alvo/loop).
+        let over = MailMessage::new("@n5", "@n0", "ask", "estoura");
+        assert_eq!(
+            router.route_message(&over, &mut ts.store, 100, &mut deliver),
+            RouteOutcome::HopLimit
+        );
+        assert!(blocked_reasons(&ts.store).contains(&"hop_limit".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A2: a propagação do root FAZ o orçamento acumular — um delegador repetido sob o root herdado
+    /// estoura o teto (antes cada msg nova nascia com root fresco e a conta nunca batia).
+    #[test]
+    fn budget_accumulates_under_inherited_root() {
+        let (mut router, sup, dir) = router_with("budget-inherit");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("budget-inherit");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B estabelece o root do turno e o binding de B.
+        let m0 = MailMessage::new("@A", "@B", "ask", "inicia");
+        router.route_message(&m0, &mut ts.store, 1, &mut deliver);
+
+        // B delega DELEGATION_BUDGET vezes (root herdado, root=None) → todas contam contra (root, B).
+        for i in 0..DELEGATION_BUDGET {
+            let m = MailMessage::new("@B", "@C", "ask", format!("d{i}"));
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, 10 + i as u64, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "delegação {i} de B (root herdado) deveria passar"
+            );
+        }
+        // A (teto+1)-ésima de B, mesmo root herdado → estoura.
+        let over = MailMessage::new("@B", "@C", "ask", "demais");
+        assert_eq!(
+            router.route_message(&over, &mut ts.store, 999, &mut deliver),
+            RouteOutcome::BudgetExceeded
+        );
+        assert!(blocked_reasons(&ts.store).contains(&"budget_exceeded".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AC-A6: `pump` é recuperável a crash — a mensagem drenada sobrevive em `.inflight` até o evento
+    /// durável; um órfão (crash entre drenar e persistir) é REPROCESSADO; após persistir, `.inflight`
+    /// fica vazio (confirmado).
+    #[test]
+    fn pump_recovers_inflight_after_crash() {
+        let (mut router, sup, dir) = router_with("a6");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("a6");
+        let (rec, deliver) = recorder();
+
+        let m = MailMessage::new("@A", "@B", "ask", "oi");
+        router.mailbox().enqueue(&m).expect("enqueue");
+
+        // "Crash": drena para .inflight mas NÃO roteia/persiste (não chamamos pump).
+        let drained = router.mailbox().drain_to_inflight().expect("drain");
+        assert_eq!(drained.len(), 1, "drenou (não-destrutivo) para .inflight");
+        let inflight = router
+            .mailbox()
+            .inflight_dir()
+            .join(format!("{}.json", m.id));
+        assert!(
+            inflight.exists(),
+            "a mensagem sobrevive em .inflight (recuperável, não deletada)"
+        );
+
+        // Reabre: pump reprocessa o órfão, persiste MessageRouted e CONFIRMA (remove de .inflight).
+        let results = router.pump(&mut ts.store, 1000, deliver);
+        assert_eq!(results.len(), 1, "órfão reprocessado");
+        assert!(matches!(results[0].1, RouteOutcome::Delivered { .. }));
+        assert_eq!(rec.borrow().len(), 1, "entregue uma vez");
+        assert!(
+            !inflight.exists(),
+            "após persistir, .inflight foi confirmado (vazio)"
+        );
+        assert!(
+            ts.store
+                .events()
+                .unwrap()
+                .iter()
+                .any(|r| r.kind == "MessageRouted"),
+            "o roteamento ficou durável no log"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

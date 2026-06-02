@@ -45,6 +45,22 @@ pub enum StoreError {
 
 // ───────────────────────────── catálogo de eventos do domínio ─────────────────────────────
 
+/// W3-7 (ADR 0003): motivo TIPADO de uma recusa de roteamento — projetável e assertável do log.
+/// Serializa em `snake_case` (`"hop_limit"`, `"loop_detected"`, …) para casar a tabela do ADR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockReason {
+    Duplicate,
+    HopLimit,
+    UnknownSender,
+    NoTarget,
+    BlockedByAutonomy,
+    FanoutGated,
+    BudgetExceeded,
+    Deadlock,
+    LoopDetected,
+}
+
 /// Catálogo canônico de eventos do domínio (subconjunto da [[20 - Arquitetura Tecnica]]
 /// §4.2 suficiente para a Onda 0). Internamente *tagged* por `event` → o nome da
 /// variante é o `kind` persistido.
@@ -105,11 +121,30 @@ pub enum DomainEvent {
         from: NodeId,
         to: String,
         intent: String,
+        /// W3-7 (A2): turno de origem propagado pelo supervisor — filtro do grafo anti-loop (§2.1).
+        #[serde(default)]
+        root_cause_id: String,
+        /// W3-7 (A2): profundidade da cadeia neste salto (cresce a cada hop herdado).
+        #[serde(default)]
+        hops: u8,
+        /// W3-7 (§2.1): alvo resolvido (NodeId) — aresta `from→to_node` do grafo de handoffs.
+        /// `None` para broadcast (não entra no anti-loop por ciclo).
+        #[serde(default)]
+        to_node: Option<NodeId>,
     },
     /// W3-4: a mensagem `id` foi entregue ao PTY do alvo (`deliver_a2a` faseado concluiu).
     MessageDelivered {
         id: String,
         to: NodeId,
+    },
+    /// W3-7 (ADR 0003): recusa de guardrail no roteamento — o log é o livro-razão das recusas.
+    /// `from`/`to` são NOMES (cobre `unknown_sender`, em que `from` não resolve a `NodeId`).
+    /// `duplicate` NÃO é apendado (anti-amplificação A4 — ver `Router::route_message`).
+    RouteBlocked {
+        id: String,
+        reason: BlockReason,
+        from: String,
+        to: String,
     },
     /// W3-5: um item foi semeado no plano compartilhado (`status:todo`, `@owner:?`).
     PlanItemAdded {
@@ -160,6 +195,7 @@ impl DomainEvent {
             DomainEvent::Handshake { .. } => "Handshake",
             DomainEvent::MessageRouted { .. } => "MessageRouted",
             DomainEvent::MessageDelivered { .. } => "MessageDelivered",
+            DomainEvent::RouteBlocked { .. } => "RouteBlocked",
             DomainEvent::PlanItemAdded { .. } => "PlanItemAdded",
             DomainEvent::PlanDecisionAdded { .. } => "PlanDecisionAdded",
             DomainEvent::PlanClaimed { .. } => "PlanClaimed",
@@ -319,10 +355,11 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::PlanDecisionAdded { text } => state.plan.apply_decision_added(text.clone()),
         DomainEvent::PlanClaimed { item, by, .. } => state.plan.apply_claimed(item, by),
         DomainEvent::PlanChecked { item, by, .. } => state.plan.apply_checked(item, by),
-        // Handshake/entrega/notas/snapshot são META (observabilidade no log) — sem efeito
+        // Handshake/entrega/recusa/notas/snapshot são META (observabilidade no log) — sem efeito
         // na projeção do canvas; o roster vivo é do Supervisor, não da projeção.
         DomainEvent::Handshake { .. }
         | DomainEvent::MessageDelivered { .. }
+        | DomainEvent::RouteBlocked { .. }
         | DomainEvent::NoteUpdated { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }

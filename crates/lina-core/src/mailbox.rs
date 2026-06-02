@@ -180,6 +180,14 @@ impl Mailbox {
         self.root.join("outbox")
     }
 
+    /// `<.lina>/outbox/.inflight` — A6: mensagens drenadas mas ainda não persistidas (roteadas ou
+    /// bloqueadas). Um crash entre o drain e o persist deixa o arquivo aqui → reprocessado no próximo
+    /// `drain_to_inflight` (recuperável). O ack (`ack_inflight`) só remove após o evento durável.
+    #[must_use]
+    pub fn inflight_dir(&self) -> PathBuf {
+        self.outbox_dir().join(".inflight")
+    }
+
     /// `<.lina>/agents.json` — o mapa do time (presença).
     #[must_use]
     pub fn agents_path(&self) -> PathBuf {
@@ -222,130 +230,99 @@ impl Mailbox {
         Ok(())
     }
 
-    /// **Drena** o `outbox`: lê todos os `*.json` em ordem de `id` (UUID v7 → ordem temporal =
-    /// FIFO), desserializa e REMOVE cada arquivo (consumido). Arquivos ilegíveis/corrompidos são
-    /// removidos e pulados (não travam a fila). Devolve as mensagens em ordem.
+    /// **Drena** o `outbox` de forma DESTRUTIVA: lê os `*.json` em ordem de `id` (UUID v7 → FIFO),
+    /// desserializa e REMOVE cada arquivo (consumido). Arquivos ilegíveis/perigosos são descartados.
+    /// Mantido para uso direto/legado; o caminho de produção (`Router::pump`) usa
+    /// [`Mailbox::drain_to_inflight`], que é recuperável a crash (A6).
     ///
     /// # Errors
     /// Falha ao listar o diretório (que não seja "não existe", tratado como vazio).
     pub fn drain(&self) -> std::io::Result<Vec<MailMessage>> {
-        let dir = self.outbox_dir();
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-
-        // Coleta só os `.json` finalizados (ignora `.json.tmp` de escritas em andamento).
-        let mut files: Vec<PathBuf> = rd
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
-        files.sort(); // nome = msg_<UUID v7>.json → ordenação lexicográfica = ordem temporal.
-
-        // A4: teto de mensagens por tick — um flood de arquivos não pode travar o supervisor numa
-        // passada (o `drain` roda sob o lock do EventStore). O restante (já ordenado, mais novo)
-        // fica para o próximo `drain`. Cap NUNCA silencioso.
-        if files.len() > MAX_DRAIN_BATCH {
-            eprintln!(
-                "lina-core: mailbox drenando {MAX_DRAIN_BATCH} de {} mensagens neste tick (teto MAX_DRAIN_BATCH); o restante fica para o proximo tick",
-                files.len()
-            );
-            files.truncate(MAX_DRAIN_BATCH);
-        }
-
+        let files = collect_sorted_json(&self.outbox_dir(), true)?;
         let mut out = Vec::with_capacity(files.len());
         for path in files {
-            // M3 (anti-TOCTOU): rejeita symlink/não-regular ANTES de abrir (não segue → não bloqueia
-            // num FIFO/dispositivo) e, a partir daí, valida tamanho e LÊ do MESMO fd — `metadata()` e
-            // `take()` operam sobre o arquivo aberto, fechando o gap stat-vs-read (arquivo
-            // trocado/crescido após o stat). O `drain` roda na thread do supervisor: nada pode
-            // bloquear/explodir RAM aqui.
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if !meta.is_file() => {
-                    eprintln!(
-                        "lina-core: mailbox descartou entrada não-regular (symlink?): {}",
-                        path.display()
-                    );
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "lina-core: mailbox falhou ao ler metadados de {}: {e}",
-                        path.display()
-                    );
-                    continue;
-                }
-            }
-            // Abre UMA vez; daqui em diante tamanho e leitura vêm do fd, não do path.
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("lina-core: mailbox falhou ao abrir {}: {e}", path.display());
-                    continue;
-                }
-            };
-            match file.metadata() {
-                Ok(m) if !m.is_file() => {
-                    eprintln!(
-                        "lina-core: mailbox descartou entrada não-regular (fd): {}",
-                        path.display()
-                    );
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                Ok(m) if m.len() > MAX_MSG_BYTES => {
-                    eprintln!(
-                        "lina-core: mailbox descartou mensagem de {} bytes (> {MAX_MSG_BYTES}): {}",
-                        m.len(),
-                        path.display()
-                    );
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "lina-core: mailbox falhou no fstat de {}: {e}",
-                        path.display()
-                    );
-                    continue;
-                }
-            }
-            // Lê no MÁXIMO MAX_MSG_BYTES do fd — se o arquivo cresceu após o stat, o `take` corta
-            // (sem leitura ilimitada, nem mesmo de /dev/zero).
-            let mut data = String::new();
-            if let Err(e) = (&file).take(MAX_MSG_BYTES).read_to_string(&mut data) {
-                eprintln!("lina-core: mailbox falhou ao ler {}: {e}", path.display());
-                continue;
-            }
-            match serde_json::from_str::<MailMessage>(&data) {
-                Ok(msg) => {
-                    // A1: rejeita id forjado (fora de `msg_<alnum>`) — não entrega ao roteador um id
-                    // capaz de forjar linhas do bloco. Descartado ruidosamente, como o oversize.
-                    if !valid_msg_id(&msg.id) {
-                        eprintln!(
-                            "lina-core: mailbox descartou mensagem com id invalido {:?}: {}",
-                            msg.id,
-                            path.display()
-                        );
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
+            match inspect_file(&path) {
+                FileVerdict::Valid(msg) => {
                     let _ = std::fs::remove_file(&path); // consumido
-                    out.push(msg);
+                    out.push(*msg);
                 }
-                Err(e) => {
-                    // Mensagem corrompida: remove para não travar a fila (mas registra).
-                    tracing::warn!(path = %path.display(), error = %e, "mailbox: mensagem ilegível descartada");
+                FileVerdict::Discard => {
                     let _ = std::fs::remove_file(&path);
                 }
+                FileVerdict::Skip => {}
             }
         }
         Ok(out)
+    }
+
+    /// **A6 — drena de forma RECUPERÁVEL.** Não deleta: move cada `*.json` válido do `outbox` para
+    /// `outbox/.inflight/<id>.json` (durável até o `ack_inflight`, que o supervisor só chama APÓS
+    /// persistir o evento — `MessageRouted`/`RouteBlocked`). Idempotente: órfãos já em `.inflight`
+    /// (de um crash entre o drain e o persist) são REPROCESSADOS primeiro (ordem temporal). Lixo
+    /// (symlink/oversize/id forjado/JSON corrompido) é removido, como no `drain`.
+    ///
+    /// # Errors
+    /// Falha de I/O ao listar/criar diretório.
+    pub fn drain_to_inflight(&self) -> std::io::Result<Vec<MailMessage>> {
+        let inflight = self.inflight_dir();
+        let mut out = Vec::new();
+
+        // (1) Órfãos de um crash anterior: já estão em `.inflight` → reprocessa sem mover.
+        for path in collect_sorted_json(&inflight, false)? {
+            match inspect_file(&path) {
+                FileVerdict::Valid(msg) => out.push(*msg),
+                FileVerdict::Discard => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                FileVerdict::Skip => {}
+            }
+        }
+
+        // (2) Novos do `outbox`: move cada válido para `.inflight` (capeado por tick — A4).
+        let news = collect_sorted_json(&self.outbox_dir(), true)?;
+        if !news.is_empty() {
+            std::fs::create_dir_all(&inflight)?;
+        }
+        for path in news {
+            match inspect_file(&path) {
+                FileVerdict::Valid(msg) => {
+                    // `msg.id` já passou por `valid_msg_id` (em `inspect_file`) → nome de arquivo seguro.
+                    let dest = inflight.join(format!("{}.json", msg.id));
+                    if let Err(e) = std::fs::rename(&path, &dest) {
+                        // Não perde a mensagem: deixa no outbox para o próximo tick (VISÍVEL).
+                        eprintln!(
+                            "lina-core: mailbox falhou ao mover {} p/ inflight: {e}",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    out.push(*msg);
+                }
+                FileVerdict::Discard => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                FileVerdict::Skip => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// **A6 — confirma** que a mensagem `id` foi processada (evento durável persistido): remove
+    /// `outbox/.inflight/<id>.json`. Idempotente (ausência = OK). Valida o `id` (defesa: não remove
+    /// fora do `.inflight`).
+    ///
+    /// # Errors
+    /// Falha de I/O que não seja "não existe".
+    pub fn ack_inflight(&self, id: &str) -> std::io::Result<()> {
+        if !valid_msg_id(id) {
+            return Ok(()); // id inseguro: nada a confiar nele para compor um caminho
+        }
+        let path = self.inflight_dir().join(format!("{id}.json"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Escreve o `agents.json` (mapa do time). Atômico (tmp + rename).
@@ -403,6 +380,119 @@ impl Mailbox {
     }
 }
 
+/// Lista os `*.json` finalizados de `dir` (ignora `.json.tmp` e subdirs como `.inflight`), ordenados
+/// por nome (= ordem temporal do UUID v7 = FIFO). Se `cap`, aplica o teto A4 `MAX_DRAIN_BATCH` (com
+/// log, nunca silencioso). `dir` inexistente → vazio.
+fn collect_sorted_json(dir: &Path, cap: bool) -> std::io::Result<Vec<PathBuf>> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut files: Vec<PathBuf> = rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    if cap && files.len() > MAX_DRAIN_BATCH {
+        eprintln!(
+            "lina-core: mailbox drenando {MAX_DRAIN_BATCH} de {} mensagens neste tick (teto MAX_DRAIN_BATCH); o restante fica para o proximo tick",
+            files.len()
+        );
+        files.truncate(MAX_DRAIN_BATCH);
+    }
+    Ok(files)
+}
+
+/// Veredito de inspecionar UM arquivo da fila SEM dispor dele — quem chama remove/move/deixa.
+enum FileVerdict {
+    /// Mensagem válida e segura (`id` = `msg_<alnum>`, arquivo regular, <= teto). `Box` p/ não
+    /// inchar a enum (clippy `large_enum_variant`).
+    Valid(Box<MailMessage>),
+    /// Inválida/perigosa (symlink, oversize, JSON corrompido, id forjado) → o caller REMOVE.
+    Discard,
+    /// Erro transiente de I/O (open/fstat/read) → o caller DEIXA para o próximo tick.
+    Skip,
+}
+
+/// Inspeciona um arquivo da fila: M3 (anti-TOCTOU) — rejeita symlink/não-regular ANTES de abrir (não
+/// segue → não bloqueia num FIFO), valida tamanho e LÊ do MESMO fd (`metadata()`+`take()` fecham o
+/// gap stat-vs-read); A1 — rejeita `id` forjado. NÃO remove/move o arquivo (decisão do caller).
+fn inspect_file(path: &Path) -> FileVerdict {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            eprintln!(
+                "lina-core: mailbox descartou entrada não-regular (symlink?): {}",
+                path.display()
+            );
+            return FileVerdict::Discard;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "lina-core: mailbox falhou ao ler metadados de {}: {e}",
+                path.display()
+            );
+            return FileVerdict::Skip;
+        }
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("lina-core: mailbox falhou ao abrir {}: {e}", path.display());
+            return FileVerdict::Skip;
+        }
+    };
+    match file.metadata() {
+        Ok(m) if !m.is_file() => {
+            eprintln!(
+                "lina-core: mailbox descartou entrada não-regular (fd): {}",
+                path.display()
+            );
+            return FileVerdict::Discard;
+        }
+        Ok(m) if m.len() > MAX_MSG_BYTES => {
+            eprintln!(
+                "lina-core: mailbox descartou mensagem de {} bytes (> {MAX_MSG_BYTES}): {}",
+                m.len(),
+                path.display()
+            );
+            return FileVerdict::Discard;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "lina-core: mailbox falhou no fstat de {}: {e}",
+                path.display()
+            );
+            return FileVerdict::Skip;
+        }
+    }
+    // Lê no MÁXIMO MAX_MSG_BYTES do fd — se o arquivo cresceu após o stat, o `take` corta.
+    let mut data = String::new();
+    if let Err(e) = (&file).take(MAX_MSG_BYTES).read_to_string(&mut data) {
+        eprintln!("lina-core: mailbox falhou ao ler {}: {e}", path.display());
+        return FileVerdict::Skip;
+    }
+    match serde_json::from_str::<MailMessage>(&data) {
+        // A1: rejeita `id` forjado (fora de `msg_<alnum>`) — não entrega um id capaz de forjar linhas.
+        Ok(msg) if valid_msg_id(&msg.id) => FileVerdict::Valid(Box::new(msg)),
+        Ok(msg) => {
+            eprintln!(
+                "lina-core: mailbox descartou mensagem com id invalido {:?}: {}",
+                msg.id,
+                path.display()
+            );
+            FileVerdict::Discard
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "mailbox: mensagem ilegível descartada");
+            FileVerdict::Discard
+        }
+    }
+}
+
 /// **Renderiza o bloco `[LINA::MSG]`** (design §3) — o texto que o supervisor injeta no PTY do
 /// alvo. Chave→valor em linhas; sentinela de prefixo `[LINA::MSG]` e terminador **`[/LINA::MSG]`**
 /// (namespace `LINA`, não o resíduo `ESTUDIO` do doc 21). A sentinela é UX/legibilidade — o
@@ -430,6 +520,40 @@ pub fn render_message_block(
     format!(
         "[LINA::MSG]\n\
          id: {id}\n\
+         from: {from_name}\n\
+         to: {to_name}\n\
+         intent: {intent}\n\
+         payload: {payload}\n\
+         [EXPECTED] responda ao colega no formato pedido; narre ao usuario so o resultado em pt-br.\n\
+         [/LINA::MSG]"
+    )
+}
+
+/// **Renderiza o bloco `[LINA::MSG]` COMPLETO** (W3-7) — como [`render_message_block`], mas inclui
+/// `root_cause_id` e `hops` (auditoria/UX), achatados/neutralizados como os demais campos. O
+/// ENFORCEMENT de cadeia NÃO depende destes campos (vem do binding do supervisor — A2); aqui são
+/// apenas informativos para o agente/observador.
+#[must_use]
+pub fn render_message_block_full(
+    id: &str,
+    from_name: &str,
+    to_name: &str,
+    intent: &str,
+    payload: &str,
+    root_cause_id: &str,
+    hops: u8,
+) -> String {
+    let id = one_line(&neutralize_sentinels(id));
+    let root_cause_id = one_line(&neutralize_sentinels(root_cause_id));
+    let from_name = one_line(from_name);
+    let to_name = one_line(to_name);
+    let intent = one_line(if intent.is_empty() { "ask" } else { intent });
+    let payload = one_line(&neutralize_sentinels(payload));
+    format!(
+        "[LINA::MSG]\n\
+         id: {id}\n\
+         root_cause_id: {root_cause_id}\n\
+         hops: {hops}\n\
          from: {from_name}\n\
          to: {to_name}\n\
          intent: {intent}\n\
@@ -780,6 +904,40 @@ mod tests {
         let second = mb.drain().expect("drain 2");
         assert_eq!(second.len(), 50, "o restante fica para o próximo tick");
         assert!(mb.drain().expect("drain 3").is_empty(), "depois, vazio");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A6: `drain_to_inflight` é NÃO-destrutivo e recuperável — a msg vai para `.inflight` (some do
+    /// outbox), um 2º drain (simulando crash antes do ack) REPROCESSA o órfão, e `ack_inflight`
+    /// limpa (idempotente).
+    #[test]
+    fn drain_to_inflight_is_recoverable_and_ack_clears() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-a6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+        let m = MailMessage::new("@A", "@B", "ask", "oi");
+        mb.enqueue(&m).expect("enqueue");
+
+        // 1º drain: move para .inflight (durável), sai do outbox.
+        let d1 = mb.drain_to_inflight().expect("drain 1");
+        assert_eq!(d1.len(), 1);
+        let infl = mb.inflight_dir().join(format!("{}.json", m.id));
+        assert!(infl.exists(), "a msg está durável em .inflight");
+        assert!(
+            !mb.outbox_dir().join(format!("{}.json", m.id)).exists(),
+            "saiu do outbox (não duplica na próxima leitura de outbox)"
+        );
+
+        // "Crash" antes do ack: 2º drain REPROCESSA o órfão (idempotente, recuperável).
+        let d2 = mb.drain_to_inflight().expect("drain 2");
+        assert_eq!(d2.len(), 1, "órfão de .inflight reprocessado");
+        assert_eq!(d2[0].id, m.id);
+
+        // ack remove de .inflight; drains seguintes vêm vazios; ack é idempotente.
+        mb.ack_inflight(&m.id).expect("ack");
+        assert!(!infl.exists(), "ack limpou o .inflight");
+        assert!(mb.drain_to_inflight().expect("drain 3").is_empty());
+        mb.ack_inflight(&m.id).expect("ack idempotente");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
