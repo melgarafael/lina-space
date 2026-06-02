@@ -53,9 +53,13 @@ pub use mailbox::{
 /// W3-4: roteador do supervisor (pipeline `route_message` com guardrails 0-4).
 mod router;
 pub use router::{
-    AutonomyLevel, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS, DELEGATION_BUDGET,
-    FANOUT_GATE, MAX_DEPTH,
+    AutonomyLevel, PlanOpError, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS,
+    DELEGATION_BUDGET, FANOUT_GATE, MAX_DEPTH,
 };
+
+/// W3-5: plano compartilhado (`.lina/plan.md`) — projeção event-sourced, escritor único supervisor.
+mod plan;
+pub use plan::{ItemState, Plan, PlanError, PlanItem, PLAN_SCHEMA_V1};
 
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///

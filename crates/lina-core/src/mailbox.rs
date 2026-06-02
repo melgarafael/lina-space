@@ -60,6 +60,11 @@ pub struct MailMessage {
     /// orçamento de delegação por `root_cause_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_cause_id: Option<String>,
+    /// Recurso referenciado pela mensagem (envelope §3.4): item do plano (`plan:T4`) ou arquivo
+    /// (`file:docs/api.md`). Aditivo/retrocompatível — JSON usa a chave `ref`. Em `plan.claim`/
+    /// `plan.check` carrega o item; ver [`MailMessage::plan_ref`].
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_id: Option<String>,
     /// Saltos A→B→C já dados (anti-loop por profundidade; corta em `max_depth`).
     #[serde(default)]
     pub hops: u8,
@@ -86,6 +91,7 @@ impl MailMessage {
             payload: payload.into(),
             await_reply: false,
             root_cause_id: None,
+            ref_id: None,
             hops: 0,
             ts_ms: now_ms(),
         }
@@ -96,6 +102,22 @@ impl MailMessage {
     pub fn awaiting(mut self) -> Self {
         self.await_reply = true;
         self
+    }
+
+    /// Define o `ref` (encadeável). Para um item de plano use `plan:<id>`.
+    #[must_use]
+    pub fn with_ref(mut self, reference: impl Into<String>) -> Self {
+        self.ref_id = Some(reference.into());
+        self
+    }
+
+    /// O id do item de plano referenciado, se houver — tira o prefixo `plan:` (tolerante: aceita o
+    /// id cru também). `None` se a mensagem não tem `ref`. Base de `plan.claim`/`plan.check`.
+    #[must_use]
+    pub fn plan_ref(&self) -> Option<&str> {
+        self.ref_id
+            .as_deref()
+            .map(|r| r.strip_prefix("plan:").unwrap_or(r))
     }
 }
 
@@ -140,6 +162,13 @@ impl Mailbox {
     #[must_use]
     pub fn agents_path(&self) -> PathBuf {
         self.root.join("agents.json")
+    }
+
+    /// `<.lina>/plan.md` — o plano compartilhado (W3-5). Escritor único: o supervisor; qualquer
+    /// processo pode LER direto (`lina plan read`).
+    #[must_use]
+    pub fn plan_path(&self) -> PathBuf {
+        self.root.join("plan.md")
     }
 
     /// **Deposita** uma mensagem no `outbox` de forma ATÔMICA: escreve `<id>.json.tmp` e renomeia
@@ -258,6 +287,32 @@ impl Mailbox {
             Ok(data) => serde_json::from_str(&data)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// **Escreve o `plan.md`** (W3-5) de forma ATÔMICA (tmp + rename) — o supervisor é o único a
+    /// chamar isto. `contents` já é o `Plan::render()` da projeção.
+    ///
+    /// # Errors
+    /// Falha de I/O ao criar o diretório, escrever o tmp ou renomear.
+    pub fn write_plan(&self, contents: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.root)?;
+        let final_path = self.plan_path();
+        let tmp_path = self.root.join("plan.md.tmp");
+        std::fs::write(&tmp_path, contents)?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    }
+
+    /// Lê o `plan.md` cru. `None` se ainda não existe (sem plano). Read-only — qualquer processo pode.
+    ///
+    /// # Errors
+    /// Falha de I/O que não seja "não existe".
+    pub fn read_plan(&self) -> std::io::Result<Option<String>> {
+        match std::fs::read_to_string(self.plan_path()) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }

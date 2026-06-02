@@ -12,8 +12,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::events::{DomainEvent, EventStore};
+use thiserror::Error;
+
+use crate::events::{DomainEvent, EventStore, StoreError};
 use crate::mailbox::{parse_target, render_message_block, MailMessage, Mailbox, TargetSpec};
+use crate::plan::PlanError;
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, Recipient, RolePolicy, Supervisor};
 
 /// Janela de dedupe por `id` (design §3: dedupe em 60s).
@@ -92,6 +95,24 @@ pub enum RouteOutcome {
     DeliveryFailed(String),
     /// Falha ao persistir o roteamento no event log (não entregamos o que não logamos).
     PersistFailed(String),
+    /// W3-5: intent de plano (`plan.claim`/`plan.check`) aplicado ao `plan.md` + logado — NÃO
+    /// entregue a nenhuma PTY (não é delegação A2A).
+    PlanApplied { intent: String, item: String },
+    /// W3-5: intent de plano recusado pela regra do plano (item inexistente, conflito de owner,
+    /// não-owner, ou `ref` ausente) — sem corromper o `plan.md`.
+    PlanRejected(String),
+}
+
+/// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
+/// validação ([`PlanError`]) + persistência ([`StoreError`]) + escrita do arquivo (I/O).
+#[derive(Debug, Error)]
+pub enum PlanOpError {
+    #[error("plano: {0}")]
+    Plan(#[from] PlanError),
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// `true` se o `intent` é uma delegação (sujeita ao gate de autonomia). `handshake`/`status` não
@@ -181,6 +202,13 @@ impl Router {
         }
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
         self.seen.insert(msg.id.clone(), now_ms);
+
+        // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
+        //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
+        //    dedupe (reenvios são absorvidos), antes do pipeline de delegação/resolução de alvo.
+        if is_plan_intent(&msg.intent) {
+            return self.handle_plan(msg, store);
+        }
 
         // ── Guardrail: anti-loop por profundidade (`hops`).
         if msg.hops > self.config.max_depth {
@@ -313,6 +341,106 @@ impl Router {
         self.seen
             .retain(|_, &mut t| now_ms.saturating_sub(t) < window);
     }
+
+    /// **W3-5: aplica um intent de plano** (`plan.claim`/`plan.check`). Valida o comando contra a
+    /// projeção atual (fonte da verdade), loga o evento ANTES de tocar o disco, e reescreve o
+    /// `.lina/plan.md` (escritor único). NÃO entrega a nenhuma PTY.
+    fn handle_plan(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        let Some(item) = msg.plan_ref() else {
+            return RouteOutcome::PlanRejected("mensagem de plano sem campo 'ref'".into());
+        };
+        let item = item.to_string();
+        let by = msg.from.clone();
+
+        // Projeção atual = base da VALIDAÇÃO. `plan` é mutado pelo comando e, se aceito, vira a
+        // projeção pós-evento (apply_* infalível == a mutação do try_*), poupando reprojeção.
+        let mut plan = match store.project() {
+            Ok(state) => state.plan,
+            Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+        };
+
+        let event = match msg.intent.as_str() {
+            "plan.claim" => match plan.try_claim(&item, &by) {
+                Ok(()) => DomainEvent::PlanClaimed {
+                    id: msg.id.clone(),
+                    item: item.clone(),
+                    by: by.clone(),
+                },
+                Err(e) => return RouteOutcome::PlanRejected(e.to_string()),
+            },
+            "plan.check" => match plan.try_check(&item, &by) {
+                Ok(()) => DomainEvent::PlanChecked {
+                    id: msg.id.clone(),
+                    item: item.clone(),
+                    by: by.clone(),
+                },
+                Err(e) => return RouteOutcome::PlanRejected(e.to_string()),
+            },
+            other => {
+                return RouteOutcome::PlanRejected(format!("intent de plano desconhecido: {other}"))
+            }
+        };
+
+        // Log = fonte da verdade ANTES de escrever a projeção (não escrevemos o que não logamos).
+        if let Err(e) = store.append(&event) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        if let Err(e) = self.mailbox.write_plan(&plan.render()) {
+            // O evento já está no log → o replay reconstrói. A projeção em disco divergiu: ALTO e
+            // VISÍVEL (stderr), nunca silencioso (invariante #4 — o log é a fonte da verdade).
+            eprintln!(
+                "lina-core: CRÍTICO — plan.{} logado mas plan.md não reescrito: {e}",
+                msg.intent
+            );
+        }
+        RouteOutcome::PlanApplied {
+            intent: msg.intent.clone(),
+            item,
+        }
+    }
+
+    /// **W3-5: semeia um item no plano** (chamado pelo supervisor/app, não pela mailbox): loga
+    /// `PlanItemAdded` e reescreve o `plan.md`. O item nasce `status:todo` / `@owner:?`.
+    ///
+    /// # Errors
+    /// [`PlanOpError::Plan`] se o id já existe; [`PlanOpError::Store`]/[`PlanOpError::Io`] em falha
+    /// de persistência/escrita.
+    pub fn seed_plan_item(
+        &mut self,
+        store: &mut EventStore,
+        item: impl Into<String>,
+        desc: impl Into<String>,
+    ) -> Result<(), PlanOpError> {
+        let item = item.into();
+        let desc = desc.into();
+        let mut plan = store.project()?.plan;
+        plan.add_item(item.clone(), desc.clone())?;
+        store.append(&DomainEvent::PlanItemAdded { item, desc })?;
+        self.mailbox.write_plan(&plan.render())?;
+        Ok(())
+    }
+
+    /// **W3-5: adiciona uma decisão viva ao plano** — loga `PlanDecisionAdded` e reescreve o `plan.md`.
+    ///
+    /// # Errors
+    /// [`PlanOpError::Store`]/[`PlanOpError::Io`] em falha de persistência/escrita.
+    pub fn seed_plan_decision(
+        &mut self,
+        store: &mut EventStore,
+        text: impl Into<String>,
+    ) -> Result<(), PlanOpError> {
+        let text = text.into();
+        let mut plan = store.project()?.plan;
+        plan.add_decision(text.clone());
+        store.append(&DomainEvent::PlanDecisionAdded { text })?;
+        self.mailbox.write_plan(&plan.render())?;
+        Ok(())
+    }
+}
+
+/// `true` se o intent é uma operação de plano (aplicada ao `plan.md`, nunca entregue a PTY).
+fn is_plan_intent(intent: &str) -> bool {
+    matches!(intent, "plan.claim" | "plan.check")
 }
 
 /// `intent` ou `"ask"` se vazio (default canônico).
@@ -335,7 +463,7 @@ fn recipient_label(recipient: &Recipient, raw_to: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventStore;
+    use crate::events::{DomainEvent, EventStore};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -600,6 +728,215 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].1, RouteOutcome::Delivered { .. }));
         assert_eq!(rec.borrow().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────────── W3-5: plano compartilhado ─────────────────────────────
+
+    /// Router + store novos com um plano semeado (workspace + T1/T2 + uma decisão), tudo via log.
+    fn seeded_plan_router(tag: &str) -> (Router, std::path::PathBuf, TmpStore) {
+        let (mut router, _sup, dir) = router_with(tag);
+        let mut ts = TmpStore::new(tag);
+        ts.store
+            .append(&DomainEvent::WorkspaceCreated {
+                name: "App X".into(),
+            })
+            .expect("workspace");
+        router
+            .seed_plan_item(&mut ts.store, "T1", "desenhar schema")
+            .expect("seed T1");
+        router
+            .seed_plan_item(&mut ts.store, "T2", "implementar api")
+            .expect("seed T2");
+        router
+            .seed_plan_decision(&mut ts.store, "Backend usa Postgres")
+            .expect("seed decisao");
+        (router, dir, ts)
+    }
+
+    /// Aceite W3-5 (b): `plan claim T1` por @A → o `plan.md` mostra T1 `@owner:@A status:doing` E o
+    /// evento `plan.claim` no log carrega `id`/`item`/`by` no MESMO registro. NÃO entrega a PTY.
+    #[test]
+    fn plan_claim_applies_to_file_and_logs_event_fields() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-claim");
+        let (rec, mut deliver) = recorder();
+
+        let msg = MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1");
+        let out = router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::PlanApplied {
+                intent: "plan.claim".into(),
+                item: "T1".into()
+            }
+        );
+        assert!(rec.borrow().is_empty(), "intent de plano NAO entrega a PTY");
+
+        // (i) projeção em disco.
+        let live = router
+            .mailbox()
+            .read_plan()
+            .expect("read")
+            .expect("plan.md existe");
+        assert!(
+            live.contains("- [~] T1 :: desenhar schema :: @owner:@A :: status:doing"),
+            "plan.md deveria mostrar T1 doing/@A; veio:\n{live}"
+        );
+
+        // (ii) campos no MESMO registro do log.
+        let recs = ts.store.events().expect("events");
+        let claim = recs
+            .iter()
+            .find(|r| r.kind == "PlanClaimed")
+            .expect("evento PlanClaimed no log");
+        assert_eq!(
+            claim.payload["id"].as_str(),
+            Some(msg.id.as_str()),
+            "id da msg"
+        );
+        assert_eq!(claim.payload["item"].as_str(), Some("T1"), "ref do item");
+        assert_eq!(claim.payload["by"].as_str(), Some("@A"), "quem reivindicou");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Aceite W3-5 (c): claim de item já ownereado por OUTRO → rejeitado, sem corromper o plano.
+    #[test]
+    fn plan_claim_conflict_is_rejected_without_corruption() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-conflict");
+        let (_rec, mut deliver) = recorder();
+
+        let a = MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1");
+        assert!(matches!(
+            router.route_message(&a, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::PlanApplied { .. }
+        ));
+        let b = MailMessage::new("@B", "plan", "plan.claim", "").with_ref("plan:T1");
+        assert!(matches!(
+            router.route_message(&b, &mut ts.store, 1001, &mut deliver),
+            RouteOutcome::PlanRejected(_)
+        ));
+
+        let live = router.mailbox().read_plan().unwrap().unwrap();
+        assert!(
+            live.contains("@owner:@A :: status:doing"),
+            "T1 segue com @A"
+        );
+        assert!(!live.contains("@owner:@B"), "@B nao deve ter assumido nada");
+        let claims = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "PlanClaimed")
+            .count();
+        assert_eq!(claims, 1, "o claim conflitante nao deve gerar evento");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Aceite W3-5 (d): `check` pelo owner → `done` + evento `plan.check`; `check` por não-owner →
+    /// rejeitado (sem mudar o status).
+    #[test]
+    fn plan_check_requires_owner_and_logs() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-check");
+        let (_rec, mut deliver) = recorder();
+
+        let claim = MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1");
+        router.route_message(&claim, &mut ts.store, 1000, &mut deliver);
+
+        // não-owner @B não conclui.
+        let bad = MailMessage::new("@B", "plan", "plan.check", "").with_ref("plan:T1");
+        assert!(matches!(
+            router.route_message(&bad, &mut ts.store, 1001, &mut deliver),
+            RouteOutcome::PlanRejected(_)
+        ));
+        assert!(
+            router
+                .mailbox()
+                .read_plan()
+                .unwrap()
+                .unwrap()
+                .contains("@owner:@A :: status:doing"),
+            "check de nao-owner nao muda o status"
+        );
+
+        // owner @A conclui.
+        let good = MailMessage::new("@A", "plan", "plan.check", "").with_ref("plan:T1");
+        assert!(matches!(
+            router.route_message(&good, &mut ts.store, 1002, &mut deliver),
+            RouteOutcome::PlanApplied { .. }
+        ));
+        let live = router.mailbox().read_plan().unwrap().unwrap();
+        assert!(
+            live.contains("- [x] T1 :: desenhar schema :: @owner:@A :: status:done"),
+            "{live}"
+        );
+        let checks = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "PlanChecked")
+            .count();
+        assert_eq!(checks, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan intent sem `ref` → rejeitado limpo (sem panic, sem corromper).
+    #[test]
+    fn plan_intent_without_ref_is_rejected() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-noref");
+        let (_rec, mut deliver) = recorder();
+        let msg = MailMessage::new("@A", "plan", "plan.claim", ""); // sem with_ref
+        assert!(matches!(
+            router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::PlanRejected(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Aceite W3-5 (e): replay do log reconstrói o `plan.md` IDÊNTICO (reabre o store do mesmo log).
+    #[test]
+    fn replay_reconstructs_plan_md_identically() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-replay");
+        let (_rec, mut deliver) = recorder();
+
+        for (from, intent, item, t) in [
+            ("@A", "plan.claim", "plan:T1", 1000u64),
+            ("@A", "plan.check", "plan:T1", 1001u64),
+            ("@B", "plan.claim", "plan:T2", 1002u64),
+        ] {
+            let msg = MailMessage::new(from, "plan", intent, "").with_ref(item);
+            assert!(
+                matches!(
+                    router.route_message(&msg, &mut ts.store, t, &mut deliver),
+                    RouteOutcome::PlanApplied { .. }
+                ),
+                "{intent} {item} deveria aplicar"
+            );
+        }
+
+        let live = router
+            .mailbox()
+            .read_plan()
+            .expect("read")
+            .expect("plan.md existe");
+
+        // Reconstrói reabrindo o store do MESMO log em disco → projeta → renderiza.
+        let reopened = EventStore::open(&ts.dir).expect("reabrir store");
+        let reconstructed = reopened.project().expect("project").plan.render();
+
+        assert_eq!(
+            live, reconstructed,
+            "replay do log deve reconstruir o plan.md identico"
+        );
+        assert!(live.contains("- [x] T1 :: desenhar schema :: @owner:@A :: status:done"));
+        assert!(live.contains("- [~] T2 :: implementar api :: @owner:@B :: status:doing"));
+        assert!(live.contains("- Backend usa Postgres"));
+        assert!(
+            live.starts_with("# Plano — App X\n"),
+            "cabecalho do workspace"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

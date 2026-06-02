@@ -30,6 +30,8 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::plan::Plan;
+
 /// Erros do event store / recuperação.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -109,6 +111,28 @@ pub enum DomainEvent {
         id: String,
         to: NodeId,
     },
+    /// W3-5: um item foi semeado no plano compartilhado (`status:todo`, `@owner:?`).
+    PlanItemAdded {
+        item: String,
+        desc: String,
+    },
+    /// W3-5: uma decisão viva foi adicionada ao plano.
+    PlanDecisionAdded {
+        text: String,
+    },
+    /// W3-5: `lina plan claim` aplicado pelo supervisor. `id`=id da mensagem de origem;
+    /// `item`=ref do item; `by`=quem reivindicou. Projeta `@owner:by` + `status:doing`.
+    PlanClaimed {
+        id: String,
+        item: String,
+        by: String,
+    },
+    /// W3-5: `lina plan check` aplicado pelo supervisor. Projeta `status:done` (campos como acima).
+    PlanChecked {
+        id: String,
+        item: String,
+        by: String,
+    },
     NoteUpdated {
         name: String,
         hash: String,
@@ -136,6 +160,10 @@ impl DomainEvent {
             DomainEvent::Handshake { .. } => "Handshake",
             DomainEvent::MessageRouted { .. } => "MessageRouted",
             DomainEvent::MessageDelivered { .. } => "MessageDelivered",
+            DomainEvent::PlanItemAdded { .. } => "PlanItemAdded",
+            DomainEvent::PlanDecisionAdded { .. } => "PlanDecisionAdded",
+            DomainEvent::PlanClaimed { .. } => "PlanClaimed",
+            DomainEvent::PlanChecked { .. } => "PlanChecked",
             DomainEvent::NoteUpdated { .. } => "NoteUpdated",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
         }
@@ -206,6 +234,10 @@ pub struct ProjectedState {
     pub workspace_name: Option<String>,
     pub nodes: BTreeMap<NodeId, ProjectedNode>,
     pub bus_messages: u64,
+    /// W3-5: plano compartilhado projetado do log (`#[serde(default)]` → snapshots antigos
+    /// desserializam com plano vazio). É a fonte do `.lina/plan.md` (escritor único: supervisor).
+    #[serde(default)]
+    pub plan: Plan,
 }
 
 impl ProjectedState {
@@ -221,7 +253,11 @@ impl ProjectedState {
 /// Reducer puro: aplica um evento ao estado projetado.
 pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
     match event {
-        DomainEvent::WorkspaceCreated { name } => state.workspace_name = Some(name.clone()),
+        DomainEvent::WorkspaceCreated { name } => {
+            state.workspace_name = Some(name.clone());
+            // O cabeçalho do plano espelha o nome do workspace (projeção → `# Plano — <name>`).
+            state.plan.workspace = name.clone();
+        }
         DomainEvent::NodeAdded { node, kind, x, y } => {
             state.nodes.insert(
                 *node,
@@ -275,6 +311,14 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::BusMessageSent { .. } | DomainEvent::MessageRouted { .. } => {
             state.bus_messages += 1;
         }
+        // W3-5: o plano é uma projeção do log — fatos já validados quando logados, aplicados
+        // incondicionalmente no replay (a validação vive no comando, não na projeção).
+        DomainEvent::PlanItemAdded { item, desc } => {
+            state.plan.apply_item_added(item.clone(), desc.clone());
+        }
+        DomainEvent::PlanDecisionAdded { text } => state.plan.apply_decision_added(text.clone()),
+        DomainEvent::PlanClaimed { item, by, .. } => state.plan.apply_claimed(item, by),
+        DomainEvent::PlanChecked { item, by, .. } => state.plan.apply_checked(item, by),
         // Handshake/entrega/notas/snapshot são META (observabilidade no log) — sem efeito
         // na projeção do canvas; o roster vivo é do Supervisor, não da projeção.
         DomainEvent::Handshake { .. }
@@ -506,6 +550,35 @@ impl EventStore {
             .conn
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
         Ok(n as u64)
+    }
+
+    /// Registros do log em ordem de `seq` (só-leitura). Permite inspecionar os CAMPOS de um evento
+    /// no registro (ex.: asserir `id`/`item`/`by` de um `PlanClaimed`), não só sua presença.
+    pub fn events(&self) -> Result<Vec<EventRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, ts, kind, version, payload FROM events ORDER BY seq ASC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, ts, kind, version, payload_str) = row?;
+            out.push(EventRecord {
+                seq: seq as u64,
+                ts: ts as u64,
+                kind,
+                version: version as u32,
+                payload: serde_json::from_str(&payload_str)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Caminho do diretório do workspace.

@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Some("whoami") => run_whoami(args.iter().any(|a| a == "--bootstrap")),
         Some("ask") => run_ask(&args[1..]),
         Some("handshake") => run_handshake(),
+        Some("plan") => run_plan(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -33,7 +34,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL]\n  lina handshake"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL]\n  lina handshake\n  lina plan read | claim <id> | check <id>"
     );
 }
 
@@ -146,6 +147,71 @@ fn run_ask(args: &[String]) -> ExitCode {
     match mailbox.enqueue(&msg) {
         Ok(()) => {
             println!("ok: mensagem {} enfileirada para {}", msg.id, msg.to);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `lina plan ...` (W3-5) — `read` (read-only, lê o `.lina/plan.md`) | `claim`/`check <id>`
+/// (depositam um intent na mailbox; o supervisor, escritor único, aplica ao plano e loga).
+fn run_plan(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("read") => run_plan_read(),
+        Some("claim") => run_plan_intent("plan.claim", args.get(1)),
+        Some("check") => run_plan_intent("plan.check", args.get(1)),
+        _ => {
+            usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina plan read` — imprime o `.lina/plan.md` cru (qualquer processo pode ler; só o supervisor escreve).
+fn run_plan_read() -> ExitCode {
+    let mailbox = Mailbox::new(mailbox_root());
+    match mailbox.read_plan() {
+        Ok(Some(text)) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            println!("(sem plano ainda — nenhum item no workspace)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao ler o plano: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `lina plan claim|check <id>` — monta o envelope de plano (intent=`plan.claim`/`plan.check`,
+/// `ref=plan:<id>`, `from`=este terminal) e o deposita na mailbox. O bin é processo SEPARADO e NÃO
+/// escreve no `plan.md` — quem aplica é o supervisor.
+fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
+    let Some(id) = id else {
+        eprintln!("lina: '{intent}' exige o id do item (ex.: lina plan claim T1)");
+        usage();
+        return ExitCode::from(2);
+    };
+    let from = match load_input() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Alvo sentinela "plan": o supervisor intercepta por INTENT, não por alvo. `ref=plan:<id>` liga
+    // ao item do plano (envelope §3.4). payload vazio.
+    let msg = MailMessage::new(from, "plan", intent, "").with_ref(format!("plan:{id}"));
+    let mailbox = Mailbox::new(mailbox_root());
+    match mailbox.enqueue(&msg) {
+        Ok(()) => {
+            println!("ok: {intent} do item {id} enfileirado (msg {})", msg.id);
             ExitCode::SUCCESS
         }
         Err(e) => {
