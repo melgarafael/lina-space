@@ -8,7 +8,7 @@
 //!    **mailbox** (`.lina/outbox/`) — exatamente o que o bin `lina` faz.
 //! 3. **O supervisor (Router) drena a mailbox**, aplica os guardrails 0-4 (alvo existe → autonomia
 //!    → orçamento → anti-deadlock), **publica `BusEvent::Message`** (pulso A→B do Bus), persiste
-//!    `MessageRouted`/`MessageDelivered` no event log (`bus.jsonl`) e **injeta** o bloco
+//!    `MessageRouted`/`MessageDelivered` no event log (`log.jsonl`) e **injeta** o bloco
 //!    `[LINA::MSG]` no PTY de B via a entrega faseada (`deliver_a2a`).
 //! 4. **B RECEBE o bloco**: o `screen()` de B mostra `[LINA::MSG]`, `from: @A` e o payload `oi`.
 //! 5. **Dedupe**: re-depositar a MESMA mensagem (mesmo `id`) na janela é ignorado (não re-injeta).
@@ -171,7 +171,7 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
     let mut bus_rx = sup.subscribe(); // assina ANTES de qualquer evento.
 
     let tmp = TempDir::new();
-    // O event log vive sob `<.lina>/events` (o `bus.jsonl` é o espelho append-only).
+    // O event log vive sob `<.lina>/events` (o `log.jsonl` é o espelho append-only).
     let lina_dir = tmp.path().join(".lina");
     let mut store = EventStore::open(lina_dir.join("events")).expect("abrir event store");
     store
@@ -290,10 +290,10 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
     }
     assert!(saw_message, "o pulso A→B deveria ter passado pelo Bus");
 
-    // (3-log) Os eventos de roteamento/entrega foram PERSISTIDOS no event log (bus.jsonl) — com os
+    // (3-log) Os eventos de roteamento/entrega foram PERSISTIDOS no event log (log.jsonl) — com os
     // CAMPOS certos no MESMO registro (uma linha = um EventRecord JSON), não só "aparece no arquivo".
-    let jsonl =
-        std::fs::read_to_string(lina_dir.join("events").join("bus.jsonl")).expect("ler bus.jsonl");
+    let jsonl = std::fs::read_to_string(lina_dir.join("events").join("log.jsonl"))
+        .expect("ler events/log.jsonl");
     let routed = jsonl
         .lines()
         .find(|l| l.contains("MessageRouted"))

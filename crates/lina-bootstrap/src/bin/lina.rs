@@ -34,7 +34,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL]\n  lina handshake\n  lina plan read | claim <id> | check <id>"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)"
     );
 }
 
@@ -81,6 +81,7 @@ fn run_ask(args: &[String]) -> ExitCode {
     let mut intent = String::from("ask");
     let mut await_reply = false;
     let mut role: Option<String> = None;
+    let mut reply_to: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -92,6 +93,16 @@ fn run_ask(args: &[String]) -> ExitCode {
                     Some(v) => intent = v.clone(),
                     None => {
                         eprintln!("lina: --intent exige um valor");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--reply-to" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => reply_to = Some(v.clone()),
+                    None => {
+                        eprintln!("lina: --reply-to exige o id da pergunta");
                         return ExitCode::from(2);
                     }
                 }
@@ -142,6 +153,9 @@ fn run_ask(args: &[String]) -> ExitCode {
     let mut msg = MailMessage::new(from, to, intent, payload);
     if await_reply {
         msg = msg.awaiting();
+    }
+    if let Some(rt) = reply_to {
+        msg = msg.replying_to(rt);
     }
     let mailbox = Mailbox::new(mailbox_root());
     match mailbox.enqueue(&msg) {

@@ -87,6 +87,11 @@ pub struct MailMessage {
     /// `plan.check` carrega o item; ver [`MailMessage::plan_ref`].
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub ref_id: Option<String>,
+    /// W3-7b (ADR 0002): `id` da mensagem-pergunta que ESTA mensagem responde (envelope §3.4). O
+    /// supervisor casa com um `await` pendente e o fecha (`AwaitClosed{Replied}` + libera o
+    /// wait-for-graph). Aditivo/retrocompatível.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
     /// Saltos A→B→C já dados (anti-loop por profundidade; corta em `max_depth`).
     #[serde(default)]
     pub hops: u8,
@@ -114,6 +119,7 @@ impl MailMessage {
             await_reply: false,
             root_cause_id: None,
             ref_id: None,
+            reply_to: None,
             hops: 0,
             ts_ms: now_ms(),
         }
@@ -123,6 +129,13 @@ impl MailMessage {
     #[must_use]
     pub fn awaiting(mut self) -> Self {
         self.await_reply = true;
+        self
+    }
+
+    /// Marca esta mensagem como RESPOSTA à pergunta `id` (encadeável) — fecha o `await` (ADR 0002).
+    #[must_use]
+    pub fn replying_to(mut self, id: impl Into<String>) -> Self {
+        self.reply_to = Some(id.into());
         self
     }
 
@@ -416,9 +429,26 @@ enum FileVerdict {
     Skip,
 }
 
+/// Abre `path` para leitura SEM seguir symlink no último componente. **Unix:** `O_NOFOLLOW`
+/// (M3 — fecha a janela symlink-swap entre o `symlink_metadata` e o `open`; abrir um symlink falha
+/// com `ELOOP` → o caller trata como erro transiente e o próximo tick descarta via pré-checagem).
+/// **Outras plataformas:** `File::open` normal (sem regressão; a pré-checagem já cobre o caso comum).
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// Inspeciona um arquivo da fila: M3 (anti-TOCTOU) — rejeita symlink/não-regular ANTES de abrir (não
-/// segue → não bloqueia num FIFO), valida tamanho e LÊ do MESMO fd (`metadata()`+`take()` fecham o
-/// gap stat-vs-read); A1 — rejeita `id` forjado. NÃO remove/move o arquivo (decisão do caller).
+/// segue → não bloqueia num FIFO), abre com `O_NOFOLLOW` (unix), valida tamanho e LÊ do MESMO fd
+/// (`metadata()`+`take()` fecham o gap stat-vs-read); A1 — rejeita `id` forjado. NÃO remove/move.
 fn inspect_file(path: &Path) -> FileVerdict {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() => {
@@ -437,7 +467,8 @@ fn inspect_file(path: &Path) -> FileVerdict {
             return FileVerdict::Skip;
         }
     }
-    let file = match std::fs::File::open(path) {
+    // Abre UMA vez (sem seguir symlink em unix — O_NOFOLLOW); tamanho e leitura vêm do fd.
+    let file = match open_no_follow(path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("lina-core: mailbox falhou ao abrir {}: {e}", path.display());
@@ -939,5 +970,22 @@ mod tests {
         assert!(mb.drain_to_inflight().expect("drain 3").is_empty());
         mb.ack_inflight(&m.id).expect("ack idempotente");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W3-7b: `reply_to` faz round-trip pelo JSON e é omitido quando ausente (aditivo/retrocompatível).
+    #[test]
+    fn reply_to_roundtrips_and_defaults_none() {
+        let m = MailMessage::new("@A", "@B", "ask", "resposta").replying_to("msg_q1");
+        let back: MailMessage =
+            serde_json::from_str(&serde_json::to_string(&m).expect("ser")).expect("de");
+        assert_eq!(back.reply_to.as_deref(), Some("msg_q1"));
+
+        let plain = MailMessage::new("@A", "@B", "ask", "oi");
+        let pj = serde_json::to_string(&plain).expect("ser");
+        assert!(!pj.contains("reply_to"), "reply_to None é omitido do JSON");
+        assert!(serde_json::from_str::<MailMessage>(&pj)
+            .expect("de")
+            .reply_to
+            .is_none());
     }
 }

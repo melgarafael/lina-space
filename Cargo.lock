@@ -831,6 +831,7 @@ name = "lina-core"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "libc",
  "lina-cli-profiles",
  "lina-host",
  "lina-pty",

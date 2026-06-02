@@ -7,7 +7,7 @@
 //! ## Estratificação (ver [[20 - Arquitetura Tecnica]] §4)
 //! - **SQLite WAL** (`events`): log append-only imutável — NUNCA `UPDATE`/`DELETE`.
 //!   Projeção rápida e queryável.
-//! - **`bus.jsonl`** append-only: **espelho redundante** do log (autoridade de
+//! - **`log.jsonl`** append-only: **espelho redundante** do log (autoridade de
 //!   disaster-recovery). Se o `.db` corromper, o estado é reconstruído 100% daqui.
 //! - **`snapshots/snap-<seq>.json`**: estado projetado materializado (+ versão) que
 //!   encurta o replay.
@@ -59,6 +59,17 @@ pub enum BlockReason {
     BudgetExceeded,
     Deadlock,
     LoopDetected,
+}
+
+/// W3-7b (ADR 0002): motivo do fechamento de um `await`. Serializa em `snake_case`
+/// (`"replied"`/`"timeout"`/`"deadlock"`). `Deadlock` existe para completude do contrato, mas o
+/// `AwaitClosed{Deadlock}` NÃO é emitido — a pré-checagem recusa ANTES de abrir o ticket (ADR 0002 §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitReason {
+    Replied,
+    Timeout,
+    Deadlock,
 }
 
 /// Catálogo canônico de eventos do domínio (subconjunto da [[20 - Arquitetura Tecnica]]
@@ -146,6 +157,20 @@ pub enum DomainEvent {
         from: String,
         to: String,
     },
+    /// W3-7b (ADR 0002): `A --await--> B` aprovado → a aresta `waiter→target` foi ABERTA no
+    /// wait-for-graph (persiste até o reply/timeout). `id` = id da mensagem-pergunta (chave do reply).
+    AwaitOpened {
+        id: String,
+        waiter: NodeId,
+        target: NodeId,
+        root_cause_id: String,
+    },
+    /// W3-7b (ADR 0002): o ciclo de `await` `id` fechou (`Replied` pelo `reply_to` do alvo, ou
+    /// `Timeout` pelo sweep). Libera a aresta do wait-for-graph (`end_await`).
+    AwaitClosed {
+        id: String,
+        reason: AwaitReason,
+    },
     /// W3-5: um item foi semeado no plano compartilhado (`status:todo`, `@owner:?`).
     PlanItemAdded {
         item: String,
@@ -196,6 +221,8 @@ impl DomainEvent {
             DomainEvent::MessageRouted { .. } => "MessageRouted",
             DomainEvent::MessageDelivered { .. } => "MessageDelivered",
             DomainEvent::RouteBlocked { .. } => "RouteBlocked",
+            DomainEvent::AwaitOpened { .. } => "AwaitOpened",
+            DomainEvent::AwaitClosed { .. } => "AwaitClosed",
             DomainEvent::PlanItemAdded { .. } => "PlanItemAdded",
             DomainEvent::PlanDecisionAdded { .. } => "PlanDecisionAdded",
             DomainEvent::PlanClaimed { .. } => "PlanClaimed",
@@ -360,6 +387,8 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::Handshake { .. }
         | DomainEvent::MessageDelivered { .. }
         | DomainEvent::RouteBlocked { .. }
+        | DomainEvent::AwaitOpened { .. }
+        | DomainEvent::AwaitClosed { .. }
         | DomainEvent::NoteUpdated { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
@@ -382,7 +411,15 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 ";
 
-/// Event store de um workspace: SQLite WAL (`events`) + espelho `bus.jsonl` +
+/// **W3-7b §4.3 — reconciliação do path do espelho.** O design e o gate da Onda 3 verificam
+/// `.lina/events/log.jsonl`; o código histórico escrevia `<store>/bus.jsonl`. DECISÃO: o espelho
+/// JSONL chama-se **`log.jsonl`** (alinha com o gate + design; o `EventStore` já é aberto em
+/// `.lina/events/`). Um único nome canônico — escritor (`open`) E leitor (`rebuild_from_jsonl`)
+/// usam esta const; nada de 3º nome. (Stores de dev com `bus.jsonl` antigo ficam órfãos — sem
+/// migração no MVP, pois não há dados persistentes de produção.)
+const JSONL_FILE: &str = "log.jsonl";
+
+/// Event store de um workspace: SQLite WAL (`events`) + espelho `log.jsonl` (§4.3) +
 /// snapshots. Single-thread (a `Connection` do rusqlite não é `Sync`); o supervisor
 /// futuro a embrulha sob lock.
 pub struct EventStore {
@@ -403,7 +440,7 @@ impl EventStore {
         let snapshots_dir = dir.join("snapshots");
         std::fs::create_dir_all(&snapshots_dir)?;
         let db_path = dir.join("lina.db");
-        let jsonl_path = dir.join("bus.jsonl");
+        let jsonl_path = dir.join(JSONL_FILE);
 
         let conn = Connection::open(&db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -425,7 +462,7 @@ impl EventStore {
 
     /// Abertura RESILIENTE (W0-6): roda `PRAGMA integrity_check`; se o `.db` estiver
     /// corrompido, **preserva** o arquivo (`lina.db.corrupt-<ts>`), reconstrói do
-    /// `bus.jsonl` e emite `Recovering` → `Recovered` no `UiHost` — nunca silencioso.
+    /// `log.jsonl` e emite `Recovering` → `Recovered` no `UiHost` — nunca silencioso.
     pub fn open_or_recover(dir: impl AsRef<Path>, ui: &mut dyn UiHost) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -444,11 +481,11 @@ impl EventStore {
         Ok(store)
     }
 
-    /// Reconstrói o `.db` (novo) reaplicando o espelho `bus.jsonl`. Linhas ilegíveis
+    /// Reconstrói o `.db` (novo) reaplicando o espelho `log.jsonl`. Linhas ilegíveis
     /// são postas em **quarentena** (warn + segue) — não engole erro silenciosamente.
     fn rebuild_from_jsonl(dir: &Path) -> Result<Self, StoreError> {
         let mut store = Self::open(dir)?; // `lina.db` novo+schema (o corrompido já foi renomeado)
-        let jsonl = dir.join("bus.jsonl");
+        let jsonl = dir.join(JSONL_FILE);
         if !jsonl.exists() {
             return Ok(store);
         }

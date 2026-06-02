@@ -33,8 +33,8 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
 pub use events::{
-    apply, BlockReason, DomainEvent, EventRecord, EventStore, ProjectedNode, ProjectedState,
-    StoreError,
+    apply, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, ProjectedNode,
+    ProjectedState, StoreError,
 };
 
 /// Entrega A2A faseada (W0-9) + contrato de fim-de-resposta (W0-10).

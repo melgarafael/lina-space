@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::events::{BlockReason, DomainEvent, EventStore, StoreError};
+use crate::events::{AwaitReason, BlockReason, DomainEvent, EventStore, StoreError};
 use crate::mailbox::{parse_target, render_message_block_full, MailMessage, Mailbox, TargetSpec};
 use crate::plan::PlanError;
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, Recipient, RolePolicy, Supervisor};
@@ -27,6 +27,9 @@ pub const MAX_DEPTH: u8 = 4;
 pub const DELEGATION_BUDGET: u32 = 8;
 /// Acima de N alvos, um `broadcast` exige confirmação humana (gate de fan-out).
 pub const FANOUT_GATE: usize = 3;
+/// W3-7b (ADR 0002): teto de tempo (ms) de um `await` sem reply antes de fechar por Timeout (sweep
+/// no `pump`). Default generoso — o reply é o caminho comum; o timeout só evita ticket órfão eterno.
+pub const AWAIT_TIMEOUT_MS: u64 = 300_000;
 
 /// Nível de autonomia do workspace (espelho leve do `lina_bootstrap::Autonomy` — o core NÃO
 /// depende do bootstrap; o app traduz). Só `Manual` muda o roteamento (recusa delegação).
@@ -56,6 +59,8 @@ pub struct RouterConfig {
     pub delegation_budget: u32,
     pub fanout_gate: usize,
     pub autonomy: AutonomyLevel,
+    /// W3-7b: teto de tempo de um `await` sem reply (fecha por `Timeout` no sweep do `pump`).
+    pub await_timeout_ms: u64,
 }
 
 impl Default for RouterConfig {
@@ -66,6 +71,7 @@ impl Default for RouterConfig {
             delegation_budget: DELEGATION_BUDGET,
             fanout_gate: FANOUT_GATE,
             autonomy: AutonomyLevel::Assisted,
+            await_timeout_ms: AWAIT_TIMEOUT_MS,
         }
     }
 }
@@ -132,6 +138,15 @@ struct BudgetEntry {
     last_ms: u64,
 }
 
+/// W3-7b (ADR 0002): ticket em memória de um `await` aberto. Guarda só o necessário para FECHAR
+/// (`waiter` → `end_await`; `opened_ms` → timeout); o contexto completo (`target`/`root_cause_id`)
+/// já está durável no evento `AwaitOpened` (log = fonte da verdade), sem duplicar aqui.
+#[derive(Clone, Copy)]
+struct AwaitTicket {
+    waiter: NodeId,
+    opened_ms: u64,
+}
+
 /// **Roteador do supervisor.** Detém o `Arc<Supervisor>` (roster + filas serial + pub/sub) e o
 /// estado de guardrail (dedupe/orçamento). Single-thread por design (escritor único de `.lina/`).
 pub struct Router {
@@ -147,6 +162,9 @@ pub struct Router {
     /// daqui — o enforcement de cadeia vem do binding do supervisor, não do campo que a CLI não
     /// preenche. Bounded pelo roster (1 entrada por nó, sobrescrita) → não precisa de poda.
     delivered_root: HashMap<NodeId, (String, u8)>,
+    /// W3-7b (ADR 0002): `id` da pergunta → ticket do `await` aberto. Fechado pelo `reply_to` casado
+    /// (`Replied`) ou pelo sweep de timeout (`Timeout`) — em ambos, `end_await` libera o wait-for-graph.
+    pending: HashMap<String, AwaitTicket>,
 }
 
 impl Router {
@@ -166,6 +184,7 @@ impl Router {
             seen: HashMap::new(),
             budget: HashMap::new(),
             delivered_root: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -187,6 +206,8 @@ impl Router {
     where
         D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
     {
+        // W3-7b (ADR 0002): fecha tickets de `await` vencidos (Timeout) antes de processar o tick.
+        self.sweep_await_timeouts(store, now_ms);
         // A6: drena de forma RECUPERÁVEL — move para `.inflight` e reprocessa órfãos de um crash.
         let msgs = self.mailbox.drain_to_inflight().unwrap_or_else(|e| {
             // Falha de I/O ao listar o outbox (disco/permissão): as mensagens NÃO são perdidas
@@ -230,6 +251,11 @@ impl Router {
         }
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
         self.seen.insert(msg.id.clone(), now_ms);
+
+        // ── W3-7b (ADR 0002): se ESTA msg é um REPLY (`reply_to`) que casa um `await` pendente,
+        //    FECHA o ticket (end_await + AwaitClosed{Replied}) — independe do roteamento da própria
+        //    resposta, que segue normalmente para entregar ao waiter.
+        self.close_await_on_reply(msg, store);
 
         // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
         //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
@@ -309,7 +335,9 @@ impl Router {
         //    `root_cause_id`. Pega A→B→A formado por mensagens NOVAS sob o mesmo root — que `hops`/
         //    `trace` NÃO pegam (cada `MailMessage::new` zera ambos). Só ask/handoff a 1 alvo
         //    (broadcast é gateado à parte). Topologia de eventos: independe do texto.
-        if is_deleg && !matches!(recipient, Recipient::Broadcast) {
+        //    Um REPLY (`reply_to`) é a back-edge LEGÍTIMA da pergunta (A→B→A é esperado quando B
+        //    responde a A) → pula o guard, senão a própria resposta seria barrada como loop.
+        if is_deleg && msg.reply_to.is_none() && !matches!(recipient, Recipient::Broadcast) {
             if let Some(&target) = preview.first() {
                 match handoff_would_loop(store, &root, sender, target) {
                     Ok(true) => {
@@ -323,20 +351,38 @@ impl Router {
             }
         }
 
-        // ── Guardrail 2: anti-deadlock (só `--await`): se registrar `sender→target` fecharia um
-        //    ciclo no wait-for-graph, recusa. CHECAGEM PURA com rollback imediato (a mailbox é
-        //    fire-and-forget; aresta persistente seria órfã e geraria falsos deadlocks).
-        if msg.await_reply {
-            for &target in &preview {
-                match self.sup.begin_await(sender, target) {
-                    Ok(()) => self.sup.end_await(sender),
-                    Err(_) => {
-                        log_block(store, msg, BlockReason::Deadlock);
-                        return RouteOutcome::Deadlock;
+        // ── Guardrail 2 / ABERTURA do await (ADR 0002): para `--await`, `begin_await` é a CHECAGEM
+        //    de deadlock E a abertura. ask/handoff (1 alvo): se Ok, a aresta FICA (liberada só no
+        //    reply/timeout) — `await_target` lembra o alvo p/ abrir o ticket após o persist, ou
+        //    rollback se a rota/persist falhar. broadcast: mantém a checagem PURA (rollback), sem
+        //    lifecycle (multi-alvo não cabe no wait-for-graph 1-por-waiter; foge ao ADR, single-target).
+        let await_target: Option<NodeId> = if msg.await_reply {
+            if matches!(recipient, Recipient::Broadcast) {
+                for &target in &preview {
+                    match self.sup.begin_await(sender, target) {
+                        Ok(()) => self.sup.end_await(sender),
+                        Err(_) => {
+                            log_block(store, msg, BlockReason::Deadlock);
+                            return RouteOutcome::Deadlock;
+                        }
                     }
                 }
+                None
+            } else {
+                match preview.first().copied() {
+                    Some(target) => match self.sup.begin_await(sender, target) {
+                        Ok(()) => Some(target), // aresta ABERTA (fica até reply/timeout)
+                        Err(_) => {
+                            log_block(store, msg, BlockReason::Deadlock);
+                            return RouteOutcome::Deadlock;
+                        }
+                    },
+                    None => None,
+                }
             }
-        }
+        } else {
+            None
+        };
 
         // ── Passou. Carimba o envelope com root/hops EFETIVOS e ROTEIA (publica `BusEvent::Message`
         //    + devolve os alvos frescos, sem o remetente nem nós já no trace).
@@ -346,6 +392,9 @@ impl Router {
         env.await_reply = msg.await_reply;
         let targets = self.sup.route(&env, policy);
         if targets.is_empty() {
+            if await_target.is_some() {
+                self.sup.end_await(sender); // rollback da aresta aberta acima (rota falhou)
+            }
             log_block(store, msg, BlockReason::NoTarget);
             return RouteOutcome::NoTarget;
         }
@@ -365,8 +414,33 @@ impl Router {
             hops,
             to_node,
         }) {
+            if await_target.is_some() {
+                self.sup.end_await(sender); // rollback: não abrimos await sem roteamento durável
+            }
             // Exceção do ADR 0003: não há como logar a falha de logar (recai em stderr/PersistFailed).
             return RouteOutcome::PersistFailed(e.to_string());
+        }
+
+        // ── ADR 0002: roteamento durável → ABRE o lifecycle do await (a aresta já está segurada).
+        //    O `AwaitOpened` registra o contexto completo no log (fonte da verdade); o `pending`
+        //    guarda só o necessário p/ fechar (reply/timeout).
+        if let Some(target) = await_target {
+            if let Err(e) = store.append(&DomainEvent::AwaitOpened {
+                id: msg.id.clone(),
+                waiter: sender,
+                target,
+                root_cause_id: root.clone(),
+            }) {
+                self.sup.end_await(sender); // rollback: não abrimos o que não conseguimos logar
+                return RouteOutcome::PersistFailed(e.to_string());
+            }
+            self.pending.insert(
+                msg.id.clone(),
+                AwaitTicket {
+                    waiter: sender,
+                    opened_ms: now_ms,
+                },
+            );
         }
         // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada). Carimba o tempo
         // para a poda temporal (A5).
@@ -450,6 +524,49 @@ impl Router {
             return (root.clone(), h.saturating_add(1));
         }
         (msg.id.clone(), msg.hops)
+    }
+
+    /// **W3-7b (ADR 0002): fecha o `await` se `msg` é o REPLY casado.** Se `msg.reply_to` aponta a um
+    /// ticket pendente: `end_await(waiter)` (libera o wait-for-graph) + `AwaitClosed{Replied}` +
+    /// remove de `pending`. No-op sem `reply_to`/ticket. A resposta segue o roteamento normal à parte.
+    fn close_await_on_reply(&mut self, msg: &MailMessage, store: &mut EventStore) {
+        let Some(reply_to) = msg.reply_to.as_deref() else {
+            return;
+        };
+        let Some(ticket) = self.pending.remove(reply_to) else {
+            return;
+        };
+        self.sup.end_await(ticket.waiter);
+        if let Err(e) = store.append(&DomainEvent::AwaitClosed {
+            id: reply_to.to_string(),
+            reason: AwaitReason::Replied,
+        }) {
+            eprintln!("lina-core: falha ao logar AwaitClosed(replied) p/ {reply_to}: {e}");
+        }
+    }
+
+    /// **W3-7b (ADR 0002): fecha tickets de `await` vencidos** (`now - opened_ms > await_timeout_ms`)
+    /// com `AwaitClosed{Timeout}` + `end_await`. Chamado no `pump` — evita ticket/aresta órfã eterna
+    /// (lição A5: estado que cresce sem poda). Sem reply nem timeout, o ticket persistiria.
+    fn sweep_await_timeouts(&mut self, store: &mut EventStore, now_ms: u64) {
+        let timeout = self.config.await_timeout_ms;
+        let expired: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, t)| now_ms.saturating_sub(t.opened_ms) > timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            if let Some(ticket) = self.pending.remove(&id) {
+                self.sup.end_await(ticket.waiter);
+                if let Err(e) = store.append(&DomainEvent::AwaitClosed {
+                    id: id.clone(),
+                    reason: AwaitReason::Timeout,
+                }) {
+                    eprintln!("lina-core: falha ao logar AwaitClosed(timeout) p/ {id}: {e}");
+                }
+            }
+        }
     }
 
     /// **W3-5: aplica um intent de plano** (`plan.claim`/`plan.check`). Valida o comando contra a
@@ -1412,6 +1529,112 @@ mod tests {
                 .any(|r| r.kind == "MessageRouted"),
             "o roteamento ficou durável no log"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── W3-7b: await/reply lifecycle (ADR 0002) ─────────────────────────
+
+    /// Acha o 1º registro de um `kind` no log (helper das asserções de await).
+    fn first_event<'a>(
+        recs: &'a [crate::events::EventRecord],
+        kind: &str,
+    ) -> &'a crate::events::EventRecord {
+        recs.iter()
+            .find(|r| r.kind == kind)
+            .unwrap_or_else(|| panic!("evento {kind} ausente no log"))
+    }
+
+    /// AC-ADR (open→reply→release): `B --await--> A` apenda `AwaitOpened`; antes do reply,
+    /// `A --await--> B` é `Deadlock`; o reply de A (`reply_to`) apenda `AwaitClosed{replied}` e
+    /// LIBERA o wait-for-graph → um novo `A --await--> B` volta a ser PERMITIDO. (Roots explícitos
+    /// distintos isolam o teste do anti-loop por grafo, que é per-root.)
+    #[test]
+    fn await_lifecycle_open_reply_releases_waitgraph() {
+        let (mut router, sup, dir) = router_with("await-lifecycle");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("await-lifecycle");
+        let (_rec, mut deliver) = recorder();
+
+        // (1) B --await--> A: abre o await (aresta b→a segurada) + AwaitOpened no log.
+        let mut q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
+        q.root_cause_id = Some("r1".into());
+        assert!(matches!(
+            router.route_message(&q, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let recs = ts.store.events().unwrap();
+        let opened = first_event(&recs, "AwaitOpened");
+        assert_eq!(opened.payload["id"].as_str(), Some(q.id.as_str()));
+        assert_eq!(
+            opened.payload["waiter"].as_str(),
+            Some(b.to_string().as_str()),
+            "waiter = B"
+        );
+        assert_eq!(
+            opened.payload["target"].as_str(),
+            Some(a.to_string().as_str()),
+            "target = A"
+        );
+
+        // (2) A --await--> B agora fecharia o ciclo no wait-for-graph (b→a vivo) → Deadlock.
+        let mut back = MailMessage::new("@A", "@B", "ask", "contra").awaiting();
+        back.root_cause_id = Some("r2".into());
+        assert_eq!(
+            router.route_message(&back, &mut ts.store, 1001, &mut deliver),
+            RouteOutcome::Deadlock
+        );
+
+        // (3) Reply de A → B com reply_to=q.id: fecha o ticket (AwaitClosed{replied}) + libera b→a.
+        let mut reply = MailMessage::new("@A", "@B", "ask", "resposta");
+        reply.root_cause_id = Some("r3".into());
+        reply.reply_to = Some(q.id.clone());
+        assert!(matches!(
+            router.route_message(&reply, &mut ts.store, 1002, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let recs = ts.store.events().unwrap();
+        let closed = first_event(&recs, "AwaitClosed");
+        assert_eq!(closed.payload["id"].as_str(), Some(q.id.as_str()));
+        assert_eq!(closed.payload["reason"].as_str(), Some("replied"));
+
+        // (4) A --await--> B de NOVO → PERMITIDO (o reply liberou o wait-for-graph; antes era Deadlock).
+        let mut again = MailMessage::new("@A", "@B", "ask", "retoma").awaiting();
+        again.root_cause_id = Some("r4".into());
+        assert!(
+            matches!(
+                router.route_message(&again, &mut ts.store, 1003, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "após o reply liberar o wait-for-graph, A--await-->B volta a ser permitido"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AC-ADR (timeout): um `await` sem reply até o teto fecha por `AwaitClosed{timeout}` no sweep
+    /// do `pump`.
+    #[test]
+    fn await_timeout_closes_ticket() {
+        let (mut router, sup, dir) = router_with("await-timeout");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("await-timeout");
+        let (_rec, mut deliver) = recorder();
+
+        let mut q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
+        q.root_cause_id = Some("r1".into());
+        assert!(matches!(
+            router.route_message(&q, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        // pump muito depois do teto (mailbox vazia) → o sweep fecha o ticket por Timeout.
+        let results = router.pump(&mut ts.store, 1000 + AWAIT_TIMEOUT_MS + 1, deliver);
+        assert!(results.is_empty(), "mailbox vazia — só o sweep roda");
+        let recs = ts.store.events().unwrap();
+        let closed = first_event(&recs, "AwaitClosed");
+        assert_eq!(closed.payload["id"].as_str(), Some(q.id.as_str()));
+        assert_eq!(closed.payload["reason"].as_str(), Some("timeout"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
