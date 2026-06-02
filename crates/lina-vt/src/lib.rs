@@ -33,13 +33,22 @@ pub struct VtRgb {
 }
 
 /// Uma célula renderizável do grid: caractere + cores **já resolvidas** (inverse aplicado)
-/// + negrito. É o que o shell desenha (texto colorido), sem reparsing.
+/// + negrito + **largura do cluster**. É o que o shell desenha (texto colorido), sem reparsing.
 #[derive(Debug, Clone, Copy)]
 pub struct VtCell {
     pub c: char,
     pub fg: VtRgb,
     pub bg: VtRgb,
     pub bold: bool,
+    /// Largura da célula em **colunas de terminal**, lida dos flags do alacritty (W2-4):
+    /// - `1` = normal (1 coluna);
+    /// - `2` = **cabeça** de cluster wide (CJK/emoji): ocupa esta coluna **e a seguinte**;
+    /// - `0` = **continuação/spacer** (a coluna à direita de um wide): o render NÃO desenha,
+    ///   é coberta pela cabeça. Mantê-la no grid preserva o alinhamento coluna-a-coluna.
+    ///
+    /// Acentos combinantes pt-br (ex.: `a` + U+0301) NÃO criam célula: o alacritty os
+    /// anexa como *zerowidth* à base, então a base permanece `width == 1`.
+    pub width: u8,
 }
 
 /// Cursor visível: posição (linha/coluna do viewport) + se está visível.
@@ -346,6 +355,7 @@ impl VtBackend for AlacrittyBackend {
             fg: default_fg,
             bg: default_bg,
             bold: false,
+            width: 1,
         };
         let mut cells = vec![blank; rows.saturating_mul(cols)];
 
@@ -371,7 +381,26 @@ impl VtBackend for AlacrittyBackend {
                 std::mem::swap(&mut fg, &mut bg);
             }
             let c = if cell.c == '\0' { ' ' } else { cell.c };
-            cells[line * cols + col] = VtCell { c, fg, bg, bold };
+            // Largura do cluster, direto dos flags do alacritty: cabeça wide = 2 colunas;
+            // spacer (à direita do wide, ou o de fim-de-linha quando o wide não cabe) = 0;
+            // qualquer outra = 1. Combinantes pt-br ficam embutidos na base (não chegam aqui).
+            let width = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                0
+            } else {
+                1
+            };
+            cells[line * cols + col] = VtCell {
+                c,
+                fg,
+                bg,
+                bold,
+                width,
+            };
         }
 
         let cur_vline = cur.point.line.0 + display_offset as i32;
@@ -1021,5 +1050,76 @@ mod tests {
             mods: MouseModifiers::default(),
         };
         assert_eq!(b.encode_mouse(ev), None, "…mas sem SGR não emitimos bytes");
+    }
+
+    // ──────────────── W2-4: largura de cluster (wide/grapheme) — corpus golden ────────────────
+
+    /// `(char, width)` das células da linha 0 ATÉ o primeiro vazio — base dos goldens.
+    fn row_prefix(b: &AlacrittyBackend) -> Vec<(char, u8)> {
+        b.screen()
+            .row(0)
+            .iter()
+            .map(|c| (c.c, c.width))
+            .take_while(|(c, w)| !(*c == ' ' && *w == 1))
+            .collect()
+    }
+
+    /// CORPUS GOLDEN — a estrutura `(char, width)` DETERMINÍSTICA que o alacritty 0.26
+    /// produz para cada fixture. Snapshot exato (observado via `--nocapture`, não presumido).
+    ///
+    /// Critérios do épico W2-4 cobertos:
+    /// - CJK ("中") e emoji ("😀") são **cabeça wide (2) + spacer (0)** → ocupam 2 células;
+    /// - o acento combinante pt-br (`a`+U+0301) NÃO cria célula (zerowidth na base) → o `b`
+    ///   seguinte fica na col 1 → **acento em 1 célula**;
+    /// - a **emoji-família ZWJ** começa wide. NB FIEL: o alacritty mede por *code point*
+    ///   (East Asian Width) e **não** colapsa o cluster ZWJ — cada sub-emoji é wide, então
+    ///   a família alinha em **8 colunas** (4×`[2,0]`), não em 2. O golden registra a verdade
+    ///   do motor (uma camada de grapheme-clustering ZWJ seria render-side, fora da W2-4).
+    #[test]
+    fn width_corpus_golden() {
+        // (nome, entrada, prefixo esperado de `(char, width)`).
+        type Golden = (&'static str, &'static str, &'static [(char, u8)]);
+        let corpus: &[Golden] = &[
+            ("ascii", "Hi", &[('H', 1), ('i', 1)]),
+            ("cjk", "中", &[('中', 2), (' ', 0)]),
+            ("emoji", "😀", &[('😀', 2), (' ', 0)]),
+            ("combining-ptbr", "a\u{0301}b", &[('a', 1), ('b', 1)]),
+            (
+                "zwj-family",
+                "👨\u{200d}👩\u{200d}👧\u{200d}👦",
+                &[
+                    ('👨', 2),
+                    (' ', 0),
+                    ('👩', 2),
+                    (' ', 0),
+                    ('👧', 2),
+                    (' ', 0),
+                    ('👦', 2),
+                    (' ', 0),
+                ],
+            ),
+        ];
+        for (name, input, expected) in corpus {
+            let mut b = AlacrittyBackend::new(20, 2);
+            b.advance(input.as_bytes());
+            assert_eq!(
+                &row_prefix(&b),
+                expected,
+                "corpus golden divergiu em [{name}]"
+            );
+        }
+    }
+
+    /// ALINHAMENTO dinâmico: o glifo escrito APÓS um wide cai na coluna correta (col 2),
+    /// não na 1 — o spacer preserva a grade. Complementa o golden estático.
+    #[test]
+    fn width_wide_char_aligns_following_glyph() {
+        let mut b = AlacrittyBackend::new(10, 2);
+        b.advance("中".as_bytes());
+        b.advance(b"x");
+        let cells: Vec<(char, u8)> = b.screen().row(0).iter().map(|c| (c.c, c.width)).collect();
+        assert_eq!(cells[0], ('中', 2));
+        assert_eq!(cells[1].1, 0, "spacer ocupa a col 1");
+        assert_eq!(cells[2], ('x', 1), "o 'x' alinha na col 2 (após o wide)");
     }
 }
