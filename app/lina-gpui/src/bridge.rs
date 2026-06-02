@@ -11,11 +11,15 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+// W3-2: motor de bootstrap turno-0 (gera o `<workspace>/CLAUDE.md` por terminal).
+use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 
 use lina_core::{
     deliver_a2a, A2aEnvelope, AlacrittyBackend, BusEvent, CliProfile, DeliveryOutcome, DomainEvent,
@@ -701,6 +705,73 @@ pub fn encode_pointer(
     })
 }
 
+/// **W3-2 · Escritor de bootstrap por terminal (gpui-free).** Mantém o renderer + a config do
+/// workspace (vault, autonomia, caminho do bin `lina`) e escreve, no **cwd de cada terminal**
+/// (`<ws_root>/<key>/`), os arquivos dos DOIS canais do design §1: `CLAUDE.md` (doutrina/8 blocos,
+/// canal à prova de falhas), `.lina/bootstrap.json` (estado vivo p/ o `lina whoami`) e
+/// `.claude/settings.json` (hook `SessionStart`, só Claude Code). **Reescreve TODOS a cada mudança
+/// de roster** — o arquivo é a âncora.
+pub struct BootstrapWriter {
+    bootstrapper: Bootstrapper,
+    ws_root: PathBuf,
+    vault_path: String,
+    autonomy: Autonomy,
+    lina_bin: String,
+}
+
+impl BootstrapWriter {
+    /// # Errors
+    /// Falha se o registry de papéis default não construir (não deve ocorrer em produção).
+    pub fn new(
+        ws_root: PathBuf,
+        vault_path: String,
+        autonomy: Autonomy,
+        lina_bin: String,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            bootstrapper: Bootstrapper::new().map_err(|e| e.to_string())?,
+            ws_root,
+            vault_path,
+            autonomy,
+            lina_bin,
+        })
+    }
+
+    /// Diretório (cwd) do terminal `key`.
+    #[must_use]
+    pub fn dir_for(&self, key: &str) -> PathBuf {
+        self.ws_root.join(key)
+    }
+
+    /// Escreve os arquivos de bootstrap de **UM** terminal (`key`/`name`) com o `roster` dado.
+    /// Usado tanto no `rewrite_all` quanto no write-before-spawn do `add_node` (o nó novo já sobe
+    /// com o `CLAUDE.md` no `cwd`). Erro de I/O é logado (best-effort): o app não trava por isto.
+    pub fn write_one(&self, key: &str, name: &str, roster: &[String]) {
+        let input = BootstrapInput::new(
+            name.to_string(),
+            roster.to_vec(),
+            self.vault_path.clone(),
+            self.autonomy,
+        );
+        if let Err(e) =
+            self.bootstrapper
+                .write_terminal_files(&self.dir_for(key), &input, &self.lina_bin)
+        {
+            eprintln!("lina-gpui: bootstrap de {name} falhou: {e}");
+        }
+    }
+
+    /// Reescreve os arquivos de TODOS os terminais `(key, name)` — o `roster` é o conjunto dos
+    /// nomes. Chamar a cada mudança de roster (add/remove/renomear). Erros de I/O são logados
+    /// (best-effort): o app não trava por causa do bootstrap.
+    pub fn rewrite_all(&self, terminals: &[(String, String)]) {
+        let roster: Vec<String> = terminals.iter().map(|(_, name)| name.clone()).collect();
+        for (key, name) in terminals {
+            self.write_one(key, name, &roster);
+        }
+    }
+}
+
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
 /// (`PtyManager`, `Supervisor`, `EventStore`), a projeção (`SharedModel`) e os grids, e sabe
 /// ADICIONAR e REMOVER nós-terminal mantendo o **event log como fonte da verdade** (emite
@@ -718,6 +789,8 @@ pub struct NodeManager {
     cols: u16,
     rows: u16,
     seq: Mutex<u32>,
+    /// W3-2: se presente, gera/reescreve o `CLAUDE.md` por terminal a cada mudança de roster.
+    bootstrap: Option<BootstrapWriter>,
 }
 
 impl NodeManager {
@@ -735,6 +808,7 @@ impl NodeManager {
         rows: u16,
         seq_start: u32,
         cmd_factory: CmdFactory,
+        bootstrap: Option<BootstrapWriter>,
     ) -> Self {
         Self {
             pty,
@@ -748,7 +822,75 @@ impl NodeManager {
             cols,
             rows,
             seq: Mutex::new(seq_start),
+            bootstrap,
         }
+    }
+
+    /// W3-2: snapshot `(key, name)` de todos os terminais vivos, na ordem do canvas.
+    fn terminals_snapshot(&self) -> Vec<(String, String)> {
+        let keys = lock(&self.keys);
+        let m = lock(&self.model);
+        m.order
+            .iter()
+            .filter_map(|n| {
+                keys.get(n)
+                    .and_then(|k| m.nodes.get(n).map(|v| (k.clone(), v.name.clone())))
+            })
+            .collect()
+    }
+
+    /// W3-2: reescreve o `CLAUDE.md`/estado de TODOS os terminais (o arquivo é a âncora a cada
+    /// mudança de roster). No-op se o bootstrap não está configurado.
+    pub fn rewrite_bootstrap(&self) {
+        if let Some(bw) = &self.bootstrap {
+            bw.rewrite_all(&self.terminals_snapshot());
+        }
+    }
+
+    /// W3-2: cwd do terminal `key` (cria o diretório). `None` se o bootstrap não está configurado.
+    fn ensure_cwd(&self, key: &str) -> Option<PathBuf> {
+        let bw = self.bootstrap.as_ref()?;
+        let dir = bw.dir_for(key);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("lina-gpui: criar cwd {} falhou: {e}", dir.display());
+        }
+        Some(dir)
+    }
+
+    /// W3-2: renomeia um nó — persiste `NodeRenamed`, atualiza o model e **reescreve** os
+    /// `CLAUDE.md` (o roster mudou → todos os colegas veem o nome novo). Sem reiniciar o app.
+    pub fn rename_node(&self, node: NodeId, new_name: &str) -> Result<(), String> {
+        // Defesa-em-profundidade na fronteira: o renderer já sanitiza, mas rejeitar aqui um nome
+        // vazio/controle/`{{`/`}}` dá erro cedo (em vez de um nome mutilado) e nunca persiste lixo.
+        let trimmed = new_name.trim();
+        if trimmed.is_empty()
+            || trimmed.chars().any(char::is_control)
+            || trimmed.contains("{{")
+            || trimmed.contains("}}")
+        {
+            return Err(format!("nome de terminal inválido: {new_name:?}"));
+        }
+        let count = {
+            let mut s = lock(&self.store);
+            s.append(&DomainEvent::NodeRenamed {
+                node,
+                name: new_name.to_string(),
+            })
+            .map_err(|e| e.to_string())?;
+            s.event_count().ok()
+        };
+        {
+            let mut m = lock(&self.model);
+            if let Some(v) = m.nodes.get_mut(&node) {
+                v.name = new_name.to_string();
+            }
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+        self.rewrite_bootstrap();
+        Ok(())
     }
 
     /// Nº de nós vivos (projeção).
@@ -784,7 +926,23 @@ impl NodeManager {
         };
         let name = format!("Terminal {}", node_label(seq));
         let key = format!("t{seq}");
-        let cmd = (*self.cmd_factory)(&name);
+        // W3-2: o terminal spawna no SEU cwd (<ws_root>/<key>), onde fica o CLAUDE.md dele.
+        let mut cmd = (*self.cmd_factory)(&name);
+        if let Some(dir) = self.ensure_cwd(&key) {
+            cmd = cmd.cwd(dir);
+            // write-before-spawn: a doutrina do nó NOVO é gravada ANTES do PTY subir (o shell já
+            // encontra o CLAUDE.md no cwd). Só o nó novo aqui — os existentes são atualizados no
+            // `rewrite_bootstrap()` ao final; se o spawn falhar, eles não viram um colega fantasma.
+            if let Some(bw) = &self.bootstrap {
+                let mut roster: Vec<String> = self
+                    .terminals_snapshot()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .collect();
+                roster.push(name.clone());
+                bw.write_one(&key, &name, &roster);
+            }
+        }
 
         // Slot calculado ANTES de o nó existir: imune ao placeholder (0,0) que o pump cria.
         let (x, y) = next_free_slot(&lock(&self.model));
@@ -846,6 +1004,8 @@ impl NodeManager {
 
         lock(&self.grids).insert(node, grid);
         lock(&self.keys).insert(node, key);
+        // W3-2: roster mudou → reescreve os CLAUDE.md (o novo nó + os existentes ganham o colega).
+        self.rewrite_bootstrap();
         Ok(node)
     }
 
@@ -886,6 +1046,8 @@ impl NodeManager {
 
         // Encerra o PTY em background (não bloqueia o thread de UI por até 2s).
         self.retire_pty(node, key);
+        // W3-2: roster mudou → reescreve os CLAUDE.md (os colegas restantes não listam o removido).
+        self.rewrite_bootstrap();
         Ok(())
     }
 
@@ -1165,7 +1327,10 @@ mod tests {
 
     /// Monta um `NodeManager` headless (PTYs `cat`, sem gpui/pump) com 2 nós seed (A, B),
     /// como o `main` faz, e devolve também `store`/`model` para os asserts.
-    fn test_manager(tag: &str) -> (NodeManager, Arc<Mutex<EventStore>>, Model) {
+    fn test_manager(
+        tag: &str,
+        bootstrap: Option<BootstrapWriter>,
+    ) -> (NodeManager, Arc<Mutex<EventStore>>, Model) {
         let dir = std::env::temp_dir().join(format!("lina-nm-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("open store")));
@@ -1212,6 +1377,7 @@ mod tests {
             24,
             2,
             cmd_factory,
+            bootstrap,
         );
         (nm, store, model)
     }
@@ -1221,7 +1387,7 @@ mod tests {
     /// (`project()`) — provando "todo nó é shell real + o log é a fonte da verdade".
     #[test]
     fn add_node_grows_count_persists_and_reconstructs() {
-        let (nm, store, model) = test_manager("add");
+        let (nm, store, model) = test_manager("add", None);
         assert_eq!(lock(&model).order.len(), 2, "começa com 2 nós (A, B)");
         let before = lock(&store).event_count().expect("count");
 
@@ -1258,7 +1424,7 @@ mod tests {
     /// panic do começo ao fim.
     #[test]
     fn remove_node_shrinks_count_persists_and_never_empties() {
-        let (nm, store, model) = test_manager("remove");
+        let (nm, store, model) = test_manager("remove", None);
         let id = nm.add_node().expect("add p/ ter o que remover");
         assert_eq!(lock(&model).order.len(), 3);
         let before = lock(&store).event_count().expect("count");
@@ -1305,7 +1471,7 @@ mod tests {
     /// itera — add entra na lista, remove sai.
     #[test]
     fn rendered_cards_derive_from_node_manager() {
-        let (nm, _store, _model) = test_manager("cards");
+        let (nm, _store, _model) = test_manager("cards", None);
         let initial: Vec<NodeId> = nm.cards().iter().map(|(id, _)| *id).collect();
         assert_eq!(initial.len(), 2, "começa com 2 cards (A, B)");
 
@@ -1597,5 +1763,57 @@ mod tests {
             encode_pointer(&b, PtrAction::Press, (0, 0), (false, false, false)).as_deref(),
             Some(&b"\x1b[<0;1;1M"[..])
         );
+    }
+
+    /// **GATE W3-2 (integração):** criar um terminal escreve o `<cwd>/CLAUDE.md`; uma mudança de
+    /// roster (add/rename/remove) **REESCREVE** os arquivos dos colegas — o arquivo é a âncora.
+    #[test]
+    fn bootstrap_writes_and_rewrites_on_roster_change() {
+        let ws = std::env::temp_dir().join(format!("lina-w32-int-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, _store, model) = test_manager("boot", Some(bw));
+        nm.rewrite_bootstrap(); // seed inicial: escreve A e B.
+
+        let a_md = ws.join("A").join("CLAUDE.md");
+        let a1 = std::fs::read_to_string(&a_md).expect("CLAUDE.md de A");
+        // Doutrina canônica: 8 BLOCOS marcados `<!-- ===== BLOCO N · … -->` (1ª e última presentes).
+        assert!(
+            a1.contains("===== BLOCO 1 ·") && a1.contains("===== BLOCO 8 ·"),
+            "8 blocos canônicos"
+        );
+        assert!(a1.contains("Terminal B"), "A lista B como colega");
+
+        // ADD: novo terminal C → CLAUDE.md próprio (no cwd dele) e o de A REESCRITO com C.
+        let c = nm.add_node().expect("add C");
+        assert!(
+            ws.join("t2").join("CLAUDE.md").exists(),
+            "C tem CLAUDE.md no seu cwd"
+        );
+        let a2 = std::fs::read_to_string(&a_md).expect("re-read A");
+        assert!(a2.contains("Terminal C"), "A reescrito com o colega C");
+
+        // RENAME: renomear B reescreve o CLAUDE.md de A (diff observável) sem reiniciar.
+        let b_id = lock(&model).order.get(1).copied().expect("B existe");
+        nm.rename_node(b_id, "@QA Tester").expect("rename B");
+        let a3 = std::fs::read_to_string(&a_md).expect("re-read A pós-rename");
+        assert_ne!(a2, a3, "rename mudou o CLAUDE.md de A");
+        assert!(
+            a3.contains("@QA Tester") && !a3.contains("Terminal B"),
+            "nome novo no lugar do antigo"
+        );
+
+        // REMOVE: tirar C reescreve A sem C.
+        nm.remove_node(c).expect("remove C");
+        let a4 = std::fs::read_to_string(&a_md).expect("re-read A pós-remove");
+        assert!(!a4.contains("Terminal C"), "A não lista mais C");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

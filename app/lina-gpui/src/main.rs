@@ -26,11 +26,13 @@ use lina_core::{
 };
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
+use lina_bootstrap::Autonomy;
+
 use bridge::{
     card_visible, cell_in_selection, demo_profile, encode_pointer, hit_test, lock, normalize_sel,
-    screen_to_cell, shell_cmd, spawn_pump, wire_terminal, A2aTrigger, Camera, CmdFactory,
-    CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, PtrAction, SharedModel, CARD_H,
-    CARD_W, CELL_H, CELL_W,
+    screen_to_cell, shell_cmd, spawn_pump, wire_terminal, A2aTrigger, BootstrapWriter, Camera,
+    CmdFactory, CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, PtrAction,
+    SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
 
 /// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
@@ -473,6 +475,24 @@ impl WorkspaceView {
         }
     }
 
+    /// ⌘R: renomeia o terminal focado para o PRÓXIMO nome do ciclo (nomes que o role-discovery
+    /// resolve em papéis distintos). Persiste `NodeRenamed` e reescreve os `CLAUDE.md`.
+    fn rename_focused_cycle(&mut self) {
+        const NAMES: [&str; 5] = ["@Arquiteto", "@Dev Backend", "@QA", "@Frontend", "@Maestro"];
+        let cur = lock(&self.nodes.model)
+            .nodes
+            .get(&self.focused)
+            .map(|v| v.name.clone());
+        let Some(cur) = cur else { return };
+        let idx = NAMES
+            .iter()
+            .position(|n| *n == cur)
+            .map_or(0, |i| (i + 1) % NAMES.len());
+        if let Err(e) = self.nodes.rename_node(self.focused, NAMES[idx]) {
+            eprintln!("lina-gpui: renomear: {e}");
+        }
+    }
+
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         // ⌘C copia a seleção; ⌘V cola no PTY focado (bracketed-paste). Ctrl+C/V seguem p/ o PTY.
@@ -482,6 +502,12 @@ impl WorkspaceView {
         }
         if ks.modifiers.platform && ks.key == "v" {
             self.paste_clipboard(cx);
+            return;
+        }
+        // ⌘R renomeia o terminal focado (W3-2): cicla nomes role-suggestivos → o papel é
+        // re-resolvido (W3-1) e o `CLAUDE.md` de TODOS é reescrito, SEM reiniciar o app.
+        if ks.modifiers.platform && ks.key == "r" {
+            self.rename_focused_cycle();
             return;
         }
         // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona (foca+revela); ⌘⌫ fecha o focado;
@@ -1000,6 +1026,28 @@ fn main() {
     // reusa EXATAMENTE esta fábrica via NodeManager.
     let cmd_factory: CmdFactory = Arc::new(shell_cmd);
 
+    // W3-2 · BOOTSTRAP turno-0: o app escreve `<cwd>/CLAUDE.md` (8 blocos) por terminal e o
+    // reescreve a cada mudança de roster. ws_root por terminal; vault/autonomia/bin `lina`
+    // configuráveis por env (LINA_VAULT/LINA_BIN). O bootstrap é best-effort (não trava o app).
+    let ws_root = std::env::temp_dir().join("lina-space-ws3");
+    let vault_path =
+        std::env::var("LINA_VAULT").unwrap_or_else(|_| ws_root.join("vault").display().to_string());
+    let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
+    let bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
+        .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
+        .ok();
+
+    // Cada terminal spawna no SEU cwd (<ws_root>/<key>), onde fica o CLAUDE.md dele.
+    let (mut cmd_a, mut cmd_b) = ((*cmd_factory)("Terminal A"), (*cmd_factory)("Terminal B"));
+    if let Some(bw) = &bootstrap {
+        let da = bw.dir_for("A");
+        let _ = std::fs::create_dir_all(&da);
+        cmd_a = cmd_a.cwd(da);
+        let db = bw.dir_for("B");
+        let _ = std::fs::create_dir_all(&db);
+        cmd_b = cmd_b.cwd(db);
+    }
+
     // Os 2 nós iniciais (A, B), pela MESMA fiação dos nós adicionados em runtime.
     let (node_a, grid_a) = {
         let mut p = lock(&pty);
@@ -1009,7 +1057,7 @@ fn main() {
             &delta_tx,
             "A",
             "Terminal A",
-            (*cmd_factory)("Terminal A"),
+            cmd_a,
             cols,
             rows,
         )
@@ -1023,7 +1071,7 @@ fn main() {
             &delta_tx,
             "B",
             "Terminal B",
-            (*cmd_factory)("Terminal B"),
+            cmd_b,
             cols,
             rows,
         )
@@ -1107,7 +1155,10 @@ fn main() {
         rows,
         2,
         cmd_factory,
+        bootstrap,
     );
+    // W3-2: escreve o CLAUDE.md/estado inicial de A e B (roster = {A, B}).
+    nodes.rewrite_bootstrap();
 
     eprintln!(
         "lina-gpui: render de terminal · grid {cols}x{rows} · log {} · {event_count} eventos",

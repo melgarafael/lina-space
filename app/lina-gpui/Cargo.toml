@@ -14,6 +14,8 @@ lina-host = { path = "../../crates/lina-host" }
 # (MouseEvent/MouseButton/…). Dep direta (path; não modifica o crate) p/ usar `encode_mouse`.
 # Mesma instância path do core → os tipos VtScreen/VtBackend unificam (sem conflito).
 lina-vt = { path = "../../crates/lina-vt" }
+# W3-2: motor de bootstrap turno-0 — gera `<workspace>/CLAUDE.md` (8 blocos) ao criar/mudar nós.
+lina-bootstrap = { path = "../../crates/lina-bootstrap" }
 # Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
 tokio = { version = "1", features = ["sync"] }
 # gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal
