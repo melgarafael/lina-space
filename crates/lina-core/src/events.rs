@@ -90,6 +90,25 @@ pub enum DomainEvent {
         from: NodeId,
         to: String,
     },
+    /// W3-4: um colega anunciou presença (`lina handshake`). Meta/observabilidade — o
+    /// roster vivo é do Supervisor; aqui só registramos a entrada no log (`agent.joined`).
+    Handshake {
+        node: NodeId,
+        name: String,
+    },
+    /// W3-4: o supervisor ROTEOU uma mensagem da mailbox (passou os guardrails 0-4) e a
+    /// despachou para `to` (alvo resolvido). `id` = id da mensagem (dedupe/anti-loop).
+    MessageRouted {
+        id: String,
+        from: NodeId,
+        to: String,
+        intent: String,
+    },
+    /// W3-4: a mensagem `id` foi entregue ao PTY do alvo (`deliver_a2a` faseado concluiu).
+    MessageDelivered {
+        id: String,
+        to: NodeId,
+    },
     NoteUpdated {
         name: String,
         hash: String,
@@ -114,6 +133,9 @@ impl DomainEvent {
             DomainEvent::TerminalSpawned { .. } => "TerminalSpawned",
             DomainEvent::TerminalExited { .. } => "TerminalExited",
             DomainEvent::BusMessageSent { .. } => "BusMessageSent",
+            DomainEvent::Handshake { .. } => "Handshake",
+            DomainEvent::MessageRouted { .. } => "MessageRouted",
+            DomainEvent::MessageDelivered { .. } => "MessageDelivered",
             DomainEvent::NoteUpdated { .. } => "NoteUpdated",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
         }
@@ -249,9 +271,16 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
                 n.status = Some("Dead".into());
             }
         }
-        DomainEvent::BusMessageSent { .. } => state.bus_messages += 1,
-        // Notas vivem no FS (camada 4); SnapshotTaken é meta — sem efeito de projeção.
-        DomainEvent::NoteUpdated { .. } | DomainEvent::SnapshotTaken { .. } => {}
+        // W3-4: roteamento conta como mensagem do bus (mesma contagem de BusMessageSent).
+        DomainEvent::BusMessageSent { .. } | DomainEvent::MessageRouted { .. } => {
+            state.bus_messages += 1;
+        }
+        // Handshake/entrega/notas/snapshot são META (observabilidade no log) — sem efeito
+        // na projeção do canvas; o roster vivo é do Supervisor, não da projeção.
+        DomainEvent::Handshake { .. }
+        | DomainEvent::MessageDelivered { .. }
+        | DomainEvent::NoteUpdated { .. }
+        | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
 

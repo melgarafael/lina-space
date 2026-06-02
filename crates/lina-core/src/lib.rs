@@ -43,6 +43,20 @@ pub use a2a::{
     EndResult, GridSense, InjectPolicy,
 };
 
+/// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
+mod mailbox;
+pub use mailbox::{
+    now_ms, parse_target, render_message_block, AgentPresence, MailMessage, Mailbox, TargetSpec,
+    MAIL_SCHEMA_V1,
+};
+
+/// W3-4: roteador do supervisor (pipeline `route_message` com guardrails 0-4).
+mod router;
+pub use router::{
+    AutonomyLevel, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS, DELEGATION_BUDGET,
+    FANOUT_GATE, MAX_DEPTH,
+};
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para
@@ -436,6 +450,12 @@ impl Drop for PtyHost {
 /// entrado em panic segurando o lock; queremos seguir vivos, não propagar).
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Normaliza um nome para o casamento tolerante (`node_by_name`): tira espaços e o `@` inicial,
+/// minúsculas. `"@Dev Backend"` → `"dev backend"`.
+fn normalize_name(s: &str) -> String {
+    s.trim().trim_start_matches('@').trim().to_ascii_lowercase()
 }
 
 /// Wrapper da thread de leitura: roda o loop dentro de `catch_unwind` e marca o
@@ -1016,6 +1036,32 @@ impl Supervisor {
     #[must_use]
     pub fn count(&self) -> usize {
         lock(&self.registry).len()
+    }
+
+    /// W3-4: resolve um **nome** do roster para o `NodeId` de um nó **vivo**. A CLI (`lina ask`)
+    /// só conhece nomes (de `.lina/bootstrap.json`); o supervisor faz a ponte nome→`NodeId`. Casa
+    /// o nome exato primeiro (ordem de registro, determinístico); senão tenta uma forma tolerante
+    /// (sem `@` à frente, case-insensitive) — o leigo/skill pode escrever `@B` para `@b`.
+    #[must_use]
+    pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
+        let reg = lock(&self.registry);
+        let order = lock(&self.order);
+        for id in order.iter() {
+            if let Some(n) = reg.get(id) {
+                if n.status.is_alive() && n.name == name {
+                    return Some(*id);
+                }
+            }
+        }
+        let want = normalize_name(name);
+        for id in order.iter() {
+            if let Some(n) = reg.get(id) {
+                if n.status.is_alive() && normalize_name(&n.name) == want {
+                    return Some(*id);
+                }
+            }
+        }
+        None
     }
 
     /// Resolve um endereço em nós concretos. Papel é **late-bound** e ignora nós
