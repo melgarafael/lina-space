@@ -215,8 +215,25 @@ impl Router {
             eprintln!("lina-core: pump não conseguiu drenar a mailbox (será retentado): {e}");
             Vec::new()
         });
+        // D1: dedupe DURÁVEL (à prova de restart E de ack-falho). O `seen` em memória zera no restart
+        // e é podado por tempo; sem isso, um órfão em `.inflight` (crash entre `MessageRouted`+entrega
+        // ao PTY e o `ack`) seria RE-ENTREGUE (2ª injeção irreversível). Antes de (re)processar,
+        // consulta o LOG: um id que JÁ tem `MessageRouted` foi roteado+entregue antes → confirma e
+        // PULA. Uma varredura por tick, só quando há o que processar (custo da classe W2, diferido).
+        let already_routed: HashSet<String> = if msgs.is_empty() {
+            HashSet::new()
+        } else {
+            routed_ids(store)
+        };
         msgs.into_iter()
             .map(|m| {
+                if already_routed.contains(&m.id) {
+                    // Órfão já roteado/entregue antes do crash → NÃO re-entrega; confirma e segue.
+                    if let Err(e) = self.mailbox.ack_inflight(&m.id) {
+                        eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
+                    }
+                    return (m.id, RouteOutcome::Duplicate);
+                }
                 let outcome = self.route_message(&m, store, now_ms, &mut deliver);
                 // A6: só CONFIRMA (remove de `.inflight`) quando o evento durável foi persistido
                 // (`MessageRouted`/`RouteBlocked`/plan). Em `PersistFailed` o registro PERMANECE em
@@ -252,10 +269,12 @@ impl Router {
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
         self.seen.insert(msg.id.clone(), now_ms);
 
-        // ── W3-7b (ADR 0002): se ESTA msg é um REPLY (`reply_to`) que casa um `await` pendente,
-        //    FECHA o ticket (end_await + AwaitClosed{Replied}) — independe do roteamento da própria
-        //    resposta, que segue normalmente para entregar ao waiter.
-        self.close_await_on_reply(msg, store);
+        // ── W3-7b (ADR 0002) + fix reply_to-bypass: se ESTA msg é um REPLY que CASA um await
+        //    pendente, FECHA o ticket (end_await + AwaitClosed{Replied}). `is_legit_reply` = casou um
+        //    ticket REAL — capturado AQUI (antes do guard de loop, que vem depois e veria o `pending`
+        //    já esvaziado). Só um reply legítimo pula o anti-loop (back-edge da pergunta); um
+        //    `reply_to` FORJADO sem ticket → `false` → passa pelo anti-loop normal.
+        let is_legit_reply = self.close_await_on_reply(msg, store);
 
         // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
         //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
@@ -271,8 +290,9 @@ impl Router {
             return RouteOutcome::UnknownSender(msg.from.clone());
         };
 
-        // ── A2: deriva `root_cause_id`/`hops` EFETIVOS. Root explícito → confia; senão herda do
-        //    binding `delivered_root[sender]` (root herdado + hops+1); sem binding → o nó é a raiz.
+        // ── A2 + W1: deriva `root_cause_id`/`hops` EFETIVOS do BINDING interno (jamais dos campos
+        //    forjáveis da mailbox): herda do `delivered_root[sender]` (root + hops+1); sem binding,
+        //    o nó é a raiz a profundidade 0. É o que torna orçamento/grafo/hop-limit à prova de forja.
         let (root, hops) = self.derive_root_hops(msg, sender);
 
         // ── Guardrail: anti-loop por PROFUNDIDADE sobre os `hops` EFETIVOS (antes `msg.hops` ficava
@@ -335,9 +355,9 @@ impl Router {
         //    `root_cause_id`. Pega A→B→A formado por mensagens NOVAS sob o mesmo root — que `hops`/
         //    `trace` NÃO pegam (cada `MailMessage::new` zera ambos). Só ask/handoff a 1 alvo
         //    (broadcast é gateado à parte). Topologia de eventos: independe do texto.
-        //    Um REPLY (`reply_to`) é a back-edge LEGÍTIMA da pergunta (A→B→A é esperado quando B
-        //    responde a A) → pula o guard, senão a própria resposta seria barrada como loop.
-        if is_deleg && msg.reply_to.is_none() && !matches!(recipient, Recipient::Broadcast) {
+        //    Um REPLY LEGÍTIMO (`is_legit_reply`: casou um ticket pendente) é a back-edge esperada
+        //    da pergunta → pula o guard. `reply_to` forjado (sem ticket) NÃO pula (passa pelo guard).
+        if is_deleg && !is_legit_reply && !matches!(recipient, Recipient::Broadcast) {
             if let Some(&target) = preview.first() {
                 match handoff_would_loop(store, &root, sender, target) {
                     Ok(true) => {
@@ -474,7 +494,18 @@ impl Router {
                     delivered.push(target);
                     // A2: registra que `target` recebeu esta cadeia → futuras submissões dele herdam
                     //     o root e ganham hops+1 (binding do supervisor, não confiança no campo).
-                    self.delivered_root.insert(target, (root.clone(), hops));
+                    // P1 (anti-envenenamento): NÃO sobrescrever um binding VIVO com um root DIFERENTE
+                    //     — senão uma msg de entrada sob root fresco faria a vítima "esquecer" a
+                    //     cadeia ativa e escapar do orçamento/loop. Fixa quando ausente; dentro do
+                    //     MESMO root, atualiza os hops. (Conservador: na dúvida, mantém o root vivo.)
+                    //     Decisão computada ANTES do insert para não segurar o empréstimo do `get`.
+                    let keep_existing = matches!(
+                        self.delivered_root.get(&target),
+                        Some((existing, _)) if *existing != root
+                    );
+                    if !keep_existing {
+                        self.delivered_root.insert(target, (root.clone(), hops));
+                    }
                     if let Err(e) = store.append(&DomainEvent::MessageDelivered {
                         id: msg.id.clone(),
                         to: target,
@@ -512,29 +543,30 @@ impl Router {
             .retain(|_, e| now_ms.saturating_sub(e.last_ms) < window);
     }
 
-    /// **A2: deriva o `(root_cause_id, hops)` EFETIVOS** de uma mensagem submetida por `sender`.
-    /// Root explícito na msg → confia nele (hops da msg). Sem root, mas com binding
-    /// `delivered_root[sender]` → herda o root e `hops + 1` (a cadeia cresce). Sem binding → o nó é
-    /// a própria raiz (turno de origem; ex.: o humano disparou a CLI).
+    /// **A2 + W1: deriva o `(root_cause_id, hops)` EFETIVOS** de uma mensagem de `sender`.
+    /// **SEGURANÇA (W1):** o outbox é canal NÃO-autenticado → NUNCA confiar em `msg.root_cause_id`/
+    /// `msg.hops` para DECISÃO DE CADEIA (são forjáveis; um root fresco por msg zeraria orçamento,
+    /// esvaziaria a partição do grafo anti-loop e manteria hops=0 — burlando os 3 guardrails de uma
+    /// vez). O root/hops vêm SEMPRE do binding interno que o supervisor carimba na ENTREGA
+    /// (`delivered_root[sender]`); sem binding, o nó é a própria raiz a profundidade 0. (O campo no
+    /// bloco renderizado segue informativo p/ o agente; o ENFORCEMENT não o usa.)
     fn derive_root_hops(&self, msg: &MailMessage, sender: NodeId) -> (String, u8) {
-        if let Some(r) = &msg.root_cause_id {
-            return (r.clone(), msg.hops);
+        match self.delivered_root.get(&sender) {
+            Some((root, h)) => (root.clone(), h.saturating_add(1)),
+            None => (msg.id.clone(), 0),
         }
-        if let Some((root, h)) = self.delivered_root.get(&sender) {
-            return (root.clone(), h.saturating_add(1));
-        }
-        (msg.id.clone(), msg.hops)
     }
 
-    /// **W3-7b (ADR 0002): fecha o `await` se `msg` é o REPLY casado.** Se `msg.reply_to` aponta a um
-    /// ticket pendente: `end_await(waiter)` (libera o wait-for-graph) + `AwaitClosed{Replied}` +
-    /// remove de `pending`. No-op sem `reply_to`/ticket. A resposta segue o roteamento normal à parte.
-    fn close_await_on_reply(&mut self, msg: &MailMessage, store: &mut EventStore) {
+    /// **W3-7b (ADR 0002): fecha o `await` se `msg` é o REPLY casado.** Devolve `true` SE e só se o
+    /// `msg.reply_to` casou um ticket REAL em `pending` (reply legítimo a um await aberto) — então
+    /// `end_await(waiter)` (libera o wait-for-graph) + `AwaitClosed{Replied}` + remove de `pending`.
+    /// `reply_to` ausente/FORJADO (sem ticket) → `false` (NÃO é reply legítimo → não pula o anti-loop).
+    fn close_await_on_reply(&mut self, msg: &MailMessage, store: &mut EventStore) -> bool {
         let Some(reply_to) = msg.reply_to.as_deref() else {
-            return;
+            return false;
         };
         let Some(ticket) = self.pending.remove(reply_to) else {
-            return;
+            return false; // reply_to forjado / sem ticket → não autoriza pular o anti-loop
         };
         self.sup.end_await(ticket.waiter);
         if let Err(e) = store.append(&DomainEvent::AwaitClosed {
@@ -543,6 +575,7 @@ impl Router {
         }) {
             eprintln!("lina-core: falha ao logar AwaitClosed(replied) p/ {reply_to}: {e}");
         }
+        true
     }
 
     /// **W3-7b (ADR 0002): fecha tickets de `await` vencidos** (`now - opened_ms > await_timeout_ms`)
@@ -703,6 +736,24 @@ fn log_block(store: &mut EventStore, msg: &MailMessage, reason: BlockReason) {
             msg.id
         );
     }
+}
+
+/// **D1: ids já roteados (têm `MessageRouted` no log).** Dedupe DURÁVEL — sobrevive ao restart (o
+/// `seen` em memória zera) e ao ack-falho. Best-effort: erro de leitura → conjunto vazio (a pior
+/// hipótese recai no `seen` em memória + no `inspect_file`; nunca pior que antes). Custo da classe
+/// W2 (varredura do log), diferido para o round de performance.
+fn routed_ids(store: &EventStore) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    if let Ok(recs) = store.events() {
+        for rec in recs {
+            if rec.kind == "MessageRouted" {
+                if let Some(id) = rec.payload.get("id").and_then(|v| v.as_str()) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// **§2.1: o grafo de handoffs FECHARIA UM CICLO?** Reconstrói as arestas `from→to_node` dos eventos
@@ -911,54 +962,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W1: o `root_cause_id` da mailbox é IGNORADO — forjar um root fresco/distinto por mensagem NÃO
+    /// reseta a contagem. O orçamento acumula sob o root DERIVADO do binding; um delegador repetido
+    /// estoura o teto mesmo forjando um root distinto a cada msg.
     #[test]
     fn delegation_budget_is_enforced_per_root_cause() {
         let (mut router, sup, dir) = router_with("budget");
         let _a = sup.register("@A", None, sink());
         let _b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
         let mut ts = TmpStore::new("budget");
-        let (rec, mut deliver) = recorder();
+        let (_rec, mut deliver) = recorder();
 
-        // 8 delegações com o MESMO root_cause_id passam; a 9ª estoura.
+        // A→B estabelece o binding de B (root = id da msg de A — carimbado na entrega).
+        let m0 = MailMessage::new("@A", "@B", "ask", "inicia");
+        router.route_message(&m0, &mut ts.store, 1, &mut deliver);
+
+        // B delega DELEGATION_BUDGET vezes, CADA uma com um root_cause_id FORJADO distinto → todas
+        // ignoram o forjado e contam contra (root herdado, B); a (teto+1)-ésima estoura.
         for i in 0..DELEGATION_BUDGET {
-            let mut msg = MailMessage::new("@A", "@B", "ask", format!("t{i}"));
-            msg.root_cause_id = Some("turn_1".into());
+            let mut msg = MailMessage::new("@B", "@C", "ask", format!("t{i}"));
+            msg.root_cause_id = Some(format!("forjado-{i}")); // IGNORADO (W1)
             assert!(
                 matches!(
-                    router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
+                    router.route_message(&msg, &mut ts.store, 10 + i as u64, &mut deliver),
                     RouteOutcome::Delivered { .. }
                 ),
-                "delegação {i} deveria passar"
+                "delegação {i} deveria passar (root forjado ignorado)"
             );
         }
-        let mut over = MailMessage::new("@A", "@B", "ask", "demais");
-        over.root_cause_id = Some("turn_1".into());
+        let mut over = MailMessage::new("@B", "@C", "ask", "demais");
+        over.root_cause_id = Some("forjado-final".into());
         assert_eq!(
-            router.route_message(&over, &mut ts.store, 1000, &mut deliver),
+            router.route_message(&over, &mut ts.store, 999, &mut deliver),
             RouteOutcome::BudgetExceeded
         );
-        assert_eq!(rec.borrow().len(), DELEGATION_BUDGET as usize);
         // AC-4.1: a recusa por orçamento está NO LOG.
         assert!(blocked_reasons(&ts.store).contains(&"budget_exceeded".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W1: `msg.hops` é forjável (outbox não-autenticado) → IGNORADO. Uma msg de ORIGEM com hops=99
+    /// é tratada como profundidade 0 (entregue), NÃO cortada. O hop-limit real vem da cadeia derivada
+    /// do binding (ver `hop_limit_cuts_propagated_chain_at_max_depth`).
     #[test]
-    fn hops_over_max_depth_is_anti_loop_dropped() {
-        let (mut router, sup, dir) = router_with("hops");
+    fn forged_hops_are_ignored() {
+        let (mut router, sup, dir) = router_with("forged-hops");
         let _a = sup.register("@A", None, sink());
         let _b = sup.register("@B", None, sink());
-        let mut ts = TmpStore::new("hops");
-        let (rec, mut deliver) = recorder();
+        let mut ts = TmpStore::new("forged-hops");
+        let (_rec, mut deliver) = recorder();
 
         let mut msg = MailMessage::new("@A", "@B", "ask", "oi");
-        msg.hops = MAX_DEPTH + 1;
-        assert_eq!(
-            router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
-            RouteOutcome::HopLimit
+        msg.hops = 99; // forjado — deve ser ignorado
+        assert!(
+            matches!(
+                router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "hops forjado é ignorado — origem é profundidade 0, sem HopLimit"
         );
-        assert!(rec.borrow().is_empty());
-        assert!(blocked_reasons(&ts.store).contains(&"hop_limit".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1321,49 +1384,34 @@ mod tests {
 
     // ───────────────────────── W3-7a: anti-loop de grafo / propagação / A6 ─────────────────────────
 
-    /// AC-7.1: A→B→A por mensagens NOVAS sob o mesmo `root_cause_id` (hops<4, ids distintos) →
-    /// `LoopDetected` + `RouteBlocked{loop_detected}`. Trocar o root → passa (ciclo é por-turno).
-    /// Prova ortogonalidade a `hops`/`trace`.
+    /// W1 + §2.1: A→B→A por mensagens NOVAS, CADA uma com `root_cause_id` FORJADO DISTINTO e hops=0
+    /// (o vetor que ANTES burlava o anti-loop) → o forjado é IGNORADO, o root vem do BINDING, o grafo
+    /// amarra a cadeia e o 2º salto (B→A) fecha o ciclo → `LoopDetected` + `RouteBlocked{loop_detected}`.
     #[test]
-    fn loop_detected_blocks_cycle_and_is_orthogonal_to_root() {
+    fn forged_root_does_not_bypass_loop_detection() {
         let (mut router, sup, dir) = router_with("loop");
-        let a = sup.register("@A", None, sink());
-        let b = sup.register("@B", None, sink());
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("loop");
         let (_rec, mut deliver) = recorder();
 
-        // Semeia o log com um handoff A→B sob o root "R" (aresta a→b no grafo).
-        ts.store
-            .append(&DomainEvent::MessageRouted {
-                id: "msg_seedAB".into(),
-                from: a,
-                to: "@B".into(),
-                intent: "ask".into(),
-                root_cause_id: "R".into(),
-                hops: 0,
-                to_node: Some(b),
-            })
-            .expect("seed A→B");
+        // A→B (root forjado "fresh1", IGNORADO): origem → root real = id da msg; loga a aresta A→B.
+        let mut m1 = MailMessage::new("@A", "@B", "ask", "ida");
+        m1.root_cause_id = Some("fresh1".into());
+        assert!(matches!(
+            router.route_message(&m1, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
 
-        // B→A com o MESMO root "R", id NOVO (hops 0) → fecharia A→B→A → LoopDetected.
-        let mut back = MailMessage::new("@B", "@A", "ask", "volta");
-        back.root_cause_id = Some("R".into());
+        // B→A (root forjado DISTINTO "fresh2", IGNORADO): B herda o root de A (binding) → o grafo sob
+        // esse root tem A→B; adicionar B→A fecharia o ciclo → LoopDetected (forja não escapou).
+        let mut m2 = MailMessage::new("@B", "@A", "ask", "volta");
+        m2.root_cause_id = Some("fresh2".into());
         assert_eq!(
-            router.route_message(&back, &mut ts.store, 1000, &mut deliver),
+            router.route_message(&m2, &mut ts.store, 1001, &mut deliver),
             RouteOutcome::LoopDetected
         );
         assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
-
-        // Mesma topologia, root DIFERENTE → passa (o ciclo é por-turno; ortogonal a hops/ttl).
-        let mut other = MailMessage::new("@B", "@A", "ask", "outro turno");
-        other.root_cause_id = Some("R2".into());
-        assert!(
-            matches!(
-                router.route_message(&other, &mut ts.store, 1001, &mut deliver),
-                RouteOutcome::Delivered { .. }
-            ),
-            "ciclo de OUTRO root não deve ser bloqueado"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1544,10 +1592,11 @@ mod tests {
             .unwrap_or_else(|| panic!("evento {kind} ausente no log"))
     }
 
-    /// AC-ADR (open→reply→release): `B --await--> A` apenda `AwaitOpened`; antes do reply,
-    /// `A --await--> B` é `Deadlock`; o reply de A (`reply_to`) apenda `AwaitClosed{replied}` e
-    /// LIBERA o wait-for-graph → um novo `A --await--> B` volta a ser PERMITIDO. (Roots explícitos
-    /// distintos isolam o teste do anti-loop por grafo, que é per-root.)
+    /// AC-ADR (open→reply→release): `B --await--> A` apenda `AwaitOpened` e SEGURA a aresta `b→a` no
+    /// wait-for-graph (enquanto aberta, `A --await--> B` é deadlock). O reply de A (`reply_to` casa o
+    /// ticket) apenda `AwaitClosed{replied}` e LIBERA a aresta → `A --await--> B` volta a ser
+    /// permitido. A liberação é verificada DIRETO no wait-for-graph (`sup.begin_await`) — isola do
+    /// anti-loop por grafo, que sob W1 também amarraria A↔B pelo root do binding.
     #[test]
     fn await_lifecycle_open_reply_releases_waitgraph() {
         let (mut router, sup, dir) = router_with("await-lifecycle");
@@ -1556,9 +1605,8 @@ mod tests {
         let mut ts = TmpStore::new("await-lifecycle");
         let (_rec, mut deliver) = recorder();
 
-        // (1) B --await--> A: abre o await (aresta b→a segurada) + AwaitOpened no log.
-        let mut q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
-        q.root_cause_id = Some("r1".into());
+        // (1) B --await--> A: abre o await (AwaitOpened + pending; aresta b→a viva no wait-for-graph).
+        let q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
         assert!(matches!(
             router.route_message(&q, &mut ts.store, 1000, &mut deliver),
             RouteOutcome::Delivered { .. }
@@ -1577,20 +1625,17 @@ mod tests {
             "target = A"
         );
 
-        // (2) A --await--> B agora fecharia o ciclo no wait-for-graph (b→a vivo) → Deadlock.
-        let mut back = MailMessage::new("@A", "@B", "ask", "contra").awaiting();
-        back.root_cause_id = Some("r2".into());
-        assert_eq!(
-            router.route_message(&back, &mut ts.store, 1001, &mut deliver),
-            RouteOutcome::Deadlock
+        // Enquanto aberto, b→a está vivo: a--await-->b fecharia o ciclo (deadlock no wait-for-graph).
+        assert!(
+            sup.begin_await(a, b).is_err(),
+            "b→a vivo → a--await-->b seria deadlock"
         );
 
-        // (3) Reply de A → B com reply_to=q.id: fecha o ticket (AwaitClosed{replied}) + libera b→a.
-        let mut reply = MailMessage::new("@A", "@B", "ask", "resposta");
-        reply.root_cause_id = Some("r3".into());
-        reply.reply_to = Some(q.id.clone());
+        // (2) Reply de A → B (`reply_to` = q.id CASA o ticket): fecha (AwaitClosed{replied}) e libera
+        //     b→a. O guard de loop é pulado SÓ por ser reply legítimo (ticket real em pending).
+        let reply = MailMessage::new("@A", "@B", "ask", "resposta").replying_to(q.id.clone());
         assert!(matches!(
-            router.route_message(&reply, &mut ts.store, 1002, &mut deliver),
+            router.route_message(&reply, &mut ts.store, 1001, &mut deliver),
             RouteOutcome::Delivered { .. }
         ));
         let recs = ts.store.events().unwrap();
@@ -1598,15 +1643,10 @@ mod tests {
         assert_eq!(closed.payload["id"].as_str(), Some(q.id.as_str()));
         assert_eq!(closed.payload["reason"].as_str(), Some("replied"));
 
-        // (4) A --await--> B de NOVO → PERMITIDO (o reply liberou o wait-for-graph; antes era Deadlock).
-        let mut again = MailMessage::new("@A", "@B", "ask", "retoma").awaiting();
-        again.root_cause_id = Some("r4".into());
+        // (3) Liberado: a--await-->b agora é PERMITIDO (b→a foi removido pelo reply).
         assert!(
-            matches!(
-                router.route_message(&again, &mut ts.store, 1003, &mut deliver),
-                RouteOutcome::Delivered { .. }
-            ),
-            "após o reply liberar o wait-for-graph, A--await-->B volta a ser permitido"
+            sup.begin_await(a, b).is_ok(),
+            "após o reply, o wait-for-graph foi liberado"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1621,8 +1661,7 @@ mod tests {
         let mut ts = TmpStore::new("await-timeout");
         let (_rec, mut deliver) = recorder();
 
-        let mut q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
-        q.root_cause_id = Some("r1".into());
+        let q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
         assert!(matches!(
             router.route_message(&q, &mut ts.store, 1000, &mut deliver),
             RouteOutcome::Delivered { .. }
@@ -1635,6 +1674,130 @@ mod tests {
         let closed = first_event(&recs, "AwaitClosed");
         assert_eq!(closed.payload["id"].as_str(), Some(q.id.as_str()));
         assert_eq!(closed.payload["reason"].as_str(), Some("timeout"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── Hardening Round 3: regressões do roteador ─────────────────────────
+
+    /// reply_to-bypass: um `reply_to` FORJADO (sem ticket em `pending`) NÃO pula o anti-loop. Um
+    /// `reply_to` que CASA um ticket real (reply legítimo) pula (back-edge da pergunta).
+    #[test]
+    fn forged_reply_to_does_not_bypass_loop() {
+        let (mut router, sup, dir) = router_with("replybypass");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("replybypass");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B (origem) loga a aresta A→B sob o root do binding.
+        let m1 = MailMessage::new("@A", "@B", "ask", "ida");
+        assert!(matches!(
+            router.route_message(&m1, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        // B→A com reply_to FORJADO (não casa ticket) → NÃO pula o anti-loop → fecha o ciclo → bloqueado.
+        let forged = MailMessage::new("@B", "@A", "ask", "volta").replying_to("msg_naoexiste");
+        assert_eq!(
+            router.route_message(&forged, &mut ts.store, 1001, &mut deliver),
+            RouteOutcome::LoopDetected,
+            "reply_to forjado (sem ticket) não pode escapar do anti-loop"
+        );
+        assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1: uma mensagem de ENTRADA sob root fresco NÃO envenena o binding da vítima. A→B fixa B em
+    /// R1; um atacante manda B sob outro root; B delega `root=None` → ainda herda R1 (não o do atacante).
+    #[test]
+    fn delivered_root_not_poisoned_by_foreign_root() {
+        let (mut router, sup, dir) = router_with("poison");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let _x = sup.register("@X", None, sink());
+        let mut ts = TmpStore::new("poison");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B: fixa o binding de B em R1 = id da msg de A.
+        let m_ab = MailMessage::new("@A", "@B", "ask", "cadeia R1");
+        router.route_message(&m_ab, &mut ts.store, 1, &mut deliver);
+        let r1 = m_ab.id.clone();
+
+        // Atacante X→B sob root fresco (X é origem → root = id da msg de X, != R1).
+        let m_xb = MailMessage::new("@X", "@B", "ask", "envenena");
+        router.route_message(&m_xb, &mut ts.store, 2, &mut deliver);
+
+        // B delega (root=None) → deriva do binding. P1: deve seguir R1 (não o root do atacante).
+        let m_bc = MailMessage::new("@B", "@C", "ask", "delega");
+        assert!(matches!(
+            router.route_message(&m_bc, &mut ts.store, 3, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let routed = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "MessageRouted")
+            .find(|r| r.payload["to"].as_str() == Some("@C"))
+            .expect("MessageRouted de B→C");
+        assert_eq!(
+            routed.payload["root_cause_id"].as_str(),
+            Some(r1.as_str()),
+            "B herdou R1, não o root fresco do atacante (binding não foi envenenado)"
+        );
+        // sanidade: o root do atacante não é R1.
+        assert_ne!(m_xb.id, r1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1: após um RESTART (perda do `seen` em memória), um órfão em `.inflight` que JÁ tem
+    /// `MessageRouted` no log NÃO é re-entregue — o pump consulta o log durável, confirma e pula.
+    #[test]
+    fn no_redelivery_after_restart_when_already_routed() {
+        let (router, sup, dir) = router_with("d1");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("d1");
+
+        // Enqueue + drena para .inflight (drenado, prestes a rotear).
+        let m = MailMessage::new("@A", "@B", "ask", "oi");
+        router.mailbox().enqueue(&m).expect("enqueue");
+        let drained = router.mailbox().drain_to_inflight().expect("drain");
+        assert_eq!(drained.len(), 1);
+        let infl = router
+            .mailbox()
+            .inflight_dir()
+            .join(format!("{}.json", m.id));
+        assert!(infl.exists(), "órfão em .inflight");
+
+        // Simula "roteado + entregue ao PTY" e CRASH antes do ack: persiste MessageRouted{id=m.id}.
+        ts.store
+            .append(&DomainEvent::MessageRouted {
+                id: m.id.clone(),
+                from: a,
+                to: "@B".into(),
+                intent: "ask".into(),
+                root_cause_id: m.id.clone(),
+                hops: 0,
+                to_node: Some(b),
+            })
+            .expect("persist routed");
+
+        // RESTART: descarta o Router (perde `seen`) e cria um novo sobre o MESMO .lina + store.
+        drop(router);
+        let mut router2 = Router::new(Arc::clone(&sup), Mailbox::new(dir.join(".lina")));
+        let (rec2, deliver2) = recorder();
+        let results = router2.pump(&mut ts.store, 5000, deliver2);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0].1, RouteOutcome::Duplicate),
+            "órfão já roteado no log → Duplicate (sem 2ª entrega)"
+        );
+        assert!(rec2.borrow().is_empty(), "NENHUMA 2ª injeção no PTY");
+        assert!(!infl.exists(), "órfão confirmado (.inflight limpo)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

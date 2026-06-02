@@ -280,8 +280,10 @@ impl Mailbox {
         let inflight = self.inflight_dir();
         let mut out = Vec::new();
 
-        // (1) Órfãos de um crash anterior: já estão em `.inflight` → reprocessa sem mover.
-        for path in collect_sorted_json(&inflight, false)? {
+        // (1) Órfãos de um crash anterior: já estão em `.inflight` → reprocessa sem mover. D2: o teto
+        //     A4 (`cap=true`) vale TAMBÉM aqui — senão um `.inflight` cheio (acks falhando, crashes
+        //     repetidos, ou arquivos plantados) reintroduziria o stall head-of-line que o A4 fechou.
+        for path in collect_sorted_json(&inflight, true)? {
             match inspect_file(&path) {
                 FileVerdict::Valid(msg) => out.push(*msg),
                 FileVerdict::Discard => {
@@ -987,5 +989,28 @@ mod tests {
             .expect("de")
             .reply_to
             .is_none());
+    }
+
+    /// D2: o reprocessamento de órfãos em `.inflight` respeita o teto A4 (`MAX_DRAIN_BATCH`) — um
+    /// `.inflight` cheio não reintroduz o stall head-of-line.
+    #[test]
+    fn inflight_reprocessing_is_capped() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-d2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+        std::fs::create_dir_all(mb.inflight_dir()).expect("mkdir inflight");
+        // Planta MAX_DRAIN_BATCH+50 órfãos VÁLIDOS direto em .inflight.
+        for _ in 0..(MAX_DRAIN_BATCH + 50) {
+            let m = MailMessage::new("@A", "@B", "ask", "x");
+            let json = serde_json::to_string(&m).expect("ser");
+            std::fs::write(mb.inflight_dir().join(format!("{}.json", m.id)), json).expect("write");
+        }
+        let drained = mb.drain_to_inflight().expect("drain");
+        assert_eq!(
+            drained.len(),
+            MAX_DRAIN_BATCH,
+            "órfãos de .inflight são capeados no teto A4 (cap=true)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
