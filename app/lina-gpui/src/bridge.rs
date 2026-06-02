@@ -10,8 +10,9 @@
 //! (nome, status, posição), o pulso A2A e o contador de persistência.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -524,18 +525,197 @@ pub fn wire_terminal(
 pub const CARD_W: f32 = 680.0;
 pub const CARD_H: f32 = 500.0;
 
+/// Candidatos a raiz do repo (onde vivem `assets/` e `target/`), em ordem de preferência: o
+/// derivado do `CARGO_MANIFEST_DIR` (resolvido pelo cargo em build — não é literal da máquina) e
+/// os ancestrais do executável atual (cobre o binário realocado em runtime). Quem chama filtra por
+/// existência do recurso, então tolera candidatos inexistentes.
+fn repo_root_candidates() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // CARGO_MANIFEST_DIR = `<repo>/app/lina-gpui` → `app` → `<repo>`.
+    if let Some(repo) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+    {
+        roots.push(repo.to_path_buf());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        roots.extend(exe.ancestors().map(Path::to_path_buf));
+    }
+    roots
+}
+
+/// Nome do executável `lina` no SO atual (`lina.exe` no Windows).
+fn lina_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "lina.exe"
+    } else {
+        "lina"
+    }
+}
+
+/// Diretório que contém o binário `lina`, para prependê-lo ao `PATH` do shell filho — assim
+/// `lina ask`/`handshake`/`plan` rodam DENTRO do terminal sem setup manual. Tenta, em ordem:
+/// (1) o diretório de `LINA_BIN`, se este for um caminho (override explícito); (2) ao lado do
+/// executável atual; (3) `target/{debug,release}` do repo — onde o crate `lina-bootstrap` builda o
+/// bin `lina` (workspace separado do app, logo NÃO fica ao lado do `lina-gpui`). Devolve o 1º que
+/// existe; `None` se nada resolver (o shell ainda herda o `PATH` do pai → sem regressão).
+fn lina_bin_dir() -> Option<PathBuf> {
+    let exe = lina_exe_name();
+    let has_lina = |dir: &Path| dir.join(exe).is_file();
+
+    // 1) LINA_BIN como caminho → use seu diretório. Nome puro ("lina") cai para os próximos.
+    if let Some(bin) = std::env::var_os("LINA_BIN") {
+        let p = PathBuf::from(&bin);
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                return Some(parent.to_path_buf());
+            }
+        }
+    }
+
+    // 2) Ao lado do executável atual.
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            if has_lina(dir) {
+                return Some(dir.to_path_buf());
+            }
+        }
+    }
+
+    // 3) target/{debug,release} do repo.
+    for repo in repo_root_candidates() {
+        for profile in ["debug", "release"] {
+            let cand = repo.join("target").join(profile);
+            if has_lina(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+
+    None
+}
+
+/// Prepõe `dir` ao `PATH` `current` sem duplicar (idempotente), com o separador do SO (`;` no
+/// Windows, `:` no resto) via [`std::env::split_paths`]/[`std::env::join_paths`]. Função PURA — é o
+/// ponto coberto pelo teste unitário do builder do env.
+///
+/// # Errors
+/// Propaga `JoinPathsError` se algum componente contiver o separador de `PATH`.
+fn prepend_dir_to_path(
+    dir: &Path,
+    current: Option<&OsStr>,
+) -> Result<OsString, std::env::JoinPathsError> {
+    let mut dirs: Vec<PathBuf> = vec![dir.to_path_buf()];
+    if let Some(cur) = current {
+        dirs.extend(std::env::split_paths(cur).filter(|p| p.as_path() != dir));
+    }
+    std::env::join_paths(dirs)
+}
+
+/// Valor de `PATH` para o shell filho: o diretório do `lina` na frente do `PATH` herdado. `None`
+/// se não há diretório do `lina` resolvível, ou se o `PATH` resultante não for UTF-8 (degradação
+/// graciosa com erro VISÍVEL — o `PtyCommand` só carrega env UTF-8).
+fn lina_path_value() -> Option<String> {
+    let dir = lina_bin_dir()?;
+    let current = std::env::var_os("PATH");
+    match prepend_dir_to_path(&dir, current.as_deref()) {
+        Ok(joined) => joined.into_string().map_or_else(
+            |_| {
+                eprintln!("lina-gpui: PATH com bytes não-UTF8; `lina` não foi prependido ao shell");
+                None
+            },
+            Some,
+        ),
+        Err(e) => {
+            eprintln!("lina-gpui: não montei o PATH do shell (lina pode faltar no terminal): {e}");
+            None
+        }
+    }
+}
+
+/// Caminho relativo da skill `lina-agent-bus` dentro de `assets/`.
+const AGENT_BUS_SKILL_REL: &str = "lina-skills/lina-agent-bus";
+
+/// Raiz da skill `lina-agent-bus` (o dir que contém `SKILL.md`), resolvida sem caminho absoluto
+/// hardcoded: (1) `$LINA_ASSETS/lina-skills/lina-agent-bus` (override do dir `assets/`); (2)
+/// `<repo>/assets/...` por [`repo_root_candidates`]. `None` se não achar (instalação é best-effort).
+fn agent_bus_skill_src() -> Option<PathBuf> {
+    let has_skill = |dir: &Path| dir.join("SKILL.md").is_file();
+
+    if let Some(assets) = std::env::var_os("LINA_ASSETS") {
+        let cand = PathBuf::from(assets).join(AGENT_BUS_SKILL_REL);
+        if has_skill(&cand) {
+            return Some(cand);
+        }
+    }
+    for repo in repo_root_candidates() {
+        let cand = repo.join("assets").join(AGENT_BUS_SKILL_REL);
+        if has_skill(&cand) {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Copia recursivamente o conteúdo de `src` para `dest`, sobrescrevendo (idempotente). Função pura
+/// de I/O — coberta pelo teste do skill installer.
+///
+/// # Errors
+/// Propaga o 1º erro de I/O (ler diretório, criar diretório, copiar arquivo).
+fn copy_skill_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_skill_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Instala a skill `lina-agent-bus` em `<cwd>/.claude/skills/lina-agent-bus/` (idempotente). É o
+/// que faz o terminal carregar o A2A automático no turno 0 — sem o setup manual da demo. Best-effort
+/// com erro VISÍVEL (`eprintln`): nunca trava o app (mesma postura do bootstrap/mailbox).
+fn install_agent_bus_skill(cwd: &Path) {
+    let Some(src) = agent_bus_skill_src() else {
+        eprintln!(
+            "lina-gpui: skill `lina-agent-bus` não encontrada (defina LINA_ASSETS p/ o dir assets/); \
+             {} sobe sem A2A automático",
+            cwd.display()
+        );
+        return;
+    };
+    let dest = cwd.join(".claude").join("skills").join("lina-agent-bus");
+    if let Err(e) = copy_skill_tree(&src, &dest) {
+        eprintln!(
+            "lina-gpui: copiar a skill `lina-agent-bus` para {} falhou: {e}",
+            dest.display()
+        );
+    }
+}
+
 /// Fábrica do comando de um nó: um **SHELL INTERATIVO REAL** — o do usuário (`$SHELL`, com
 /// fallback `/bin/sh`), idêntico para TODOS os nós (aceita teclado, roda claude/vim/…). Mostra
 /// um banner neutro e dá `exec` no shell (sem mock/`cat`). É gpui-free (vive aqui, não no main).
+/// Prepõe o diretório do `lina` ao `PATH` do filho para o A2A funcionar sem setup manual.
 #[must_use]
 pub fn shell_cmd(name: &str) -> PtyCommand {
-    PtyCommand::new("sh")
+    let cmd = PtyCommand::new("sh")
         .arg("-c")
         .arg(format!(
             "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
              exec \"${{SHELL:-/bin/sh}}\" -i"
         ))
-        .env("TERM", "xterm-256color")
+        .env("TERM", "xterm-256color");
+    // Garante o `lina` no PATH do shell filho (A2A sem setup manual): prepõe o dir do binário
+    // `lina` ao PATH herdado. Best-effort — sem resolução, o shell ainda herda o PATH do pai.
+    match lina_path_value() {
+        Some(path) => cmd.env("PATH", path),
+        None => cmd,
+    }
 }
 
 /// Fábrica injetável de comando por nome: o app passa [`shell_cmd`] (shell real); os testes
@@ -862,18 +1042,23 @@ impl BootstrapWriter {
     /// Usado tanto no `rewrite_all` quanto no write-before-spawn do `add_node` (o nó novo já sobe
     /// com o `CLAUDE.md` no `cwd`). Erro de I/O é logado (best-effort): o app não trava por isto.
     pub fn write_one(&self, key: &str, name: &str, roster: &[String]) {
+        let dir = self.dir_for(key);
         let input = BootstrapInput::new(
             name.to_string(),
             roster.to_vec(),
             self.vault_path.clone(),
             self.autonomy,
         );
-        if let Err(e) =
-            self.bootstrapper
-                .write_terminal_files(&self.dir_for(key), &input, &self.lina_bin)
+        if let Err(e) = self
+            .bootstrapper
+            .write_terminal_files(&dir, &input, &self.lina_bin)
         {
             eprintln!("lina-gpui: bootstrap de {name} falhou: {e}");
         }
+        // Instala a skill `lina-agent-bus` no cwd do terminal → A2A automático no turno 0
+        // (idempotente, best-effort com erro visível). Cobre A/B no boot (via `rewrite_all`) E os
+        // nós adicionados em runtime (write-before-spawn do `add_node`). Não duplica lógica.
+        install_agent_bus_skill(&dir);
     }
 
     /// Reescreve os arquivos de TODOS os terminais `(key, name)` — o `roster` é o conjunto dos
@@ -1930,5 +2115,66 @@ mod tests {
         assert!(!a4.contains("Terminal C"), "A não lista mais C");
 
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// **GATE (env builder do PATH):** o diretório do `lina` entra na FRENTE do `PATH`, preserva o
+    /// herdado, usa o separador do SO (round-trip por `split_paths`) e é idempotente (não duplica).
+    /// Função pura → headless e determinística.
+    #[test]
+    fn prepend_dir_to_path_puts_lina_dir_first_and_is_idempotent() {
+        let dir = PathBuf::from("/opt/lina/bin");
+        let other = PathBuf::from("/usr/bin");
+
+        // Com PATH herdado: o dir do lina vem primeiro e o herdado é preservado.
+        let cur = std::env::join_paths([&other]).expect("join cur");
+        let got = prepend_dir_to_path(&dir, Some(cur.as_os_str())).expect("join");
+        let parts: Vec<PathBuf> = std::env::split_paths(&got).collect();
+        assert_eq!(parts.first(), Some(&dir), "o dir do lina vem primeiro");
+        assert!(parts.contains(&other), "preserva o PATH herdado");
+
+        // Idempotente: se o dir já está no PATH, não duplica.
+        let cur2 = std::env::join_paths([&dir, &other]).expect("join cur2");
+        let got2 = prepend_dir_to_path(&dir, Some(cur2.as_os_str())).expect("join2");
+        let parts2: Vec<PathBuf> = std::env::split_paths(&got2).collect();
+        assert_eq!(
+            parts2.iter().filter(|p| **p == dir).count(),
+            1,
+            "não duplica o dir do lina"
+        );
+        assert_eq!(parts2.first(), Some(&dir), "ainda na frente após dedupe");
+
+        // Sem PATH herdado: só o dir do lina.
+        let got3 = prepend_dir_to_path(&dir, None).expect("join3");
+        let parts3: Vec<PathBuf> = std::env::split_paths(&got3).collect();
+        assert_eq!(parts3, vec![dir], "sem PATH herdado, só o dir do lina");
+    }
+
+    /// **GATE (skill installer):** instalar a skill cria `<cwd>/.claude/skills/lina-agent-bus/SKILL.md`
+    /// (resolvendo a fonte via CARGO_MANIFEST_DIR → `<repo>/assets`) e é idempotente em recriação.
+    /// Teste headless: copia para um tmpdir e confere o arquivo.
+    #[test]
+    fn installs_agent_bus_skill_into_cwd_idempotently() {
+        let cwd = std::env::temp_dir().join(format!("lina-skill-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cwd);
+        std::fs::create_dir_all(&cwd).expect("cwd");
+
+        install_agent_bus_skill(&cwd);
+        let skill = cwd
+            .join(".claude")
+            .join("skills")
+            .join("lina-agent-bus")
+            .join("SKILL.md");
+        assert!(skill.is_file(), "SKILL.md instalada: {}", skill.display());
+        let body = std::fs::read_to_string(&skill).expect("ler SKILL.md");
+        assert!(
+            body.contains("lina-agent-bus"),
+            "o conteúdo da skill foi copiado"
+        );
+
+        // Idempotência: reinstalar sobre o existente não falha e mantém o arquivo.
+        install_agent_bus_skill(&cwd);
+        assert!(skill.is_file(), "idempotente em recriação");
+
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 }
