@@ -31,9 +31,10 @@ use lina_bootstrap::Autonomy;
 use bridge::{
     card_visible, cell_in_selection, demo_profile, encode_pointer, hit_test, lock, normalize_sel,
     screen_to_cell, shell_cmd, spawn_pump, wire_terminal, A2aTrigger, BootstrapWriter, Camera,
-    CmdFactory, CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, PtrAction,
-    SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    CmdFactory, CoreInput, GpuiBridgeHost, Grid, MailboxPump, Model, NodeManager, NodeView,
+    PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
+use lina_core::Mailbox;
 
 /// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
 const FONT_PX: f32 = 13.0;
@@ -1030,6 +1031,12 @@ fn main() {
     // reescreve a cada mudança de roster. ws_root por terminal; vault/autonomia/bin `lina`
     // configuráveis por env (LINA_VAULT/LINA_BIN). O bootstrap é best-effort (não trava o app).
     let ws_root = std::env::temp_dir().join("lina-space-ws3");
+    // W3-4: a mailbox compartilhada do workspace (`<ws_root>/.lina`). `LINA_HOME` aponta os
+    // terminais (que herdam o env) para cá → `lina ask`/`handshake` depositam no MESMO outbox que
+    // o supervisor (o `MailboxPump`) observa. (Vale para A/B e para os nós adicionados em runtime.)
+    let mailbox_dir = ws_root.join(".lina");
+    let _ = std::fs::create_dir_all(&mailbox_dir);
+    std::env::set_var("LINA_HOME", &mailbox_dir);
     let vault_path =
         std::env::var("LINA_VAULT").unwrap_or_else(|_| ws_root.join("vault").display().to_string());
     let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
@@ -1159,6 +1166,17 @@ fn main() {
     );
     // W3-2: escreve o CLAUDE.md/estado inicial de A e B (roster = {A, B}).
     nodes.rewrite_bootstrap();
+
+    // W3-4: sobe o SUPERVISOR que observa a mailbox (`<ws_root>/.lina/outbox/`). A partir daqui,
+    // um `lina ask @B "oi"` de qualquer terminal trafega: outbox → guardrails → deliver_a2a → B.
+    MailboxPump::new(
+        Arc::clone(&sup),
+        Arc::clone(&store),
+        Arc::clone(&grids),
+        Mailbox::new(&mailbox_dir),
+        Arc::clone(&model),
+    )
+    .spawn();
 
     eprintln!(
         "lina-gpui: render de terminal · grid {cols}x{rows} · log {} · {event_count} eventos",

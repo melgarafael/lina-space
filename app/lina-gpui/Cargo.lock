@@ -3076,6 +3076,7 @@ dependencies = [
 name = "lina-bootstrap"
 version = "0.0.1"
 dependencies = [
+ "lina-core",
  "lina-role-discovery",
  "serde",
  "serde_json",

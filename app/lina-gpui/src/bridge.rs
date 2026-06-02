@@ -22,9 +22,10 @@ use std::time::{Duration, Instant};
 use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 
 use lina_core::{
-    deliver_a2a, A2aEnvelope, AlacrittyBackend, BusEvent, CliProfile, DeliveryOutcome, DomainEvent,
-    EventStore, GridDelta, InjectPolicy, NodeStatus as CoreStatus, PtyCommand, PtyManager,
-    Recipient, RolePolicy, Supervisor, VtBackend,
+    deliver_a2a, now_ms, A2aEnvelope, AgentPresence, AlacrittyBackend, BusEvent, CliProfile,
+    DeliveryOutcome, DomainEvent, EventStore, GridDelta, InjectPolicy, Mailbox,
+    NodeStatus as CoreStatus, PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router,
+    Supervisor, VtBackend,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W2-4: tipos de mouse reporting do motor VT (não re-exportados pelo core) — para `encode_mouse`.
@@ -312,6 +313,120 @@ pub fn demo_profile() -> CliProfile {
         kind = "idle"
     "#;
     CliProfile::from_toml_str(src, "<demo>").expect("profile da demo deve parsear")
+}
+
+/// **W3-4 · O supervisor OBSERVA a mailbox.** Numa thread de fundo, drena o `.lina/outbox/`
+/// (onde a CLI `lina ask` deposita), roteia pelos guardrails do [`Router`] e ENTREGA ao PTY do
+/// alvo via `deliver_a2a` (faseado) usando o grid+perfil de cada terminal. É o **escritor único**
+/// de `.lina/` (também reescreve o `agents.json` quando o roster muda). Roda numa thread só → o
+/// estado de dedupe/orçamento do `Router` é local (sem locks).
+pub struct MailboxPump {
+    router: Router,
+    sup: Arc<Supervisor>,
+    store: Arc<Mutex<EventStore>>,
+    grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+    profile: CliProfile,
+    model: Model,
+    /// Último roster escrito no `agents.json` (evita reescrever a cada tick sem mudança).
+    last_roster: Vec<AgentPresence>,
+}
+
+impl MailboxPump {
+    /// Cria o pump enraizado na `mailbox` (o `.lina/` compartilhado do workspace).
+    #[must_use]
+    pub fn new(
+        sup: Arc<Supervisor>,
+        store: Arc<Mutex<EventStore>>,
+        grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+        mailbox: Mailbox,
+        model: Model,
+    ) -> Self {
+        Self {
+            router: Router::new(Arc::clone(&sup), mailbox),
+            sup,
+            store,
+            grids,
+            profile: demo_profile(),
+            model,
+            last_roster: Vec::new(),
+        }
+    }
+
+    /// Sobe a thread que observa a mailbox (drena → roteia → entrega) a cada ~120 ms.
+    pub fn spawn(mut self) -> JoinHandle<()> {
+        thread::spawn(move || loop {
+            self.refresh_agents();
+            self.tick();
+            thread::sleep(Duration::from_millis(120));
+        })
+    }
+
+    /// Reescreve `agents.json` (o mapa do time que a skill `lina-agent-bus` lê) quando o roster
+    /// mudar — o supervisor é o ESCRITOR ÚNICO de `.lina/`.
+    fn refresh_agents(&mut self) {
+        let roster: Vec<AgentPresence> = self
+            .sup
+            .list()
+            .into_iter()
+            .map(|n| AgentPresence {
+                name: n.name,
+                role: n.role,
+                status: format!("{:?}", n.status),
+            })
+            .collect();
+        if roster != self.last_roster {
+            if let Err(e) = self.router.mailbox().write_agents(&roster) {
+                eprintln!("lina-gpui: falha ao escrever agents.json: {e}");
+            }
+            self.last_roster = roster;
+        }
+    }
+
+    /// Um tick: drena a mailbox e roteia. A entrega resolve o grid do alvo e injeta faseado.
+    fn tick(&mut self) {
+        let sup = Arc::clone(&self.sup);
+        let grids = Arc::clone(&self.grids);
+        let profile = self.profile.clone();
+        let deliver = move |target: NodeId, from: NodeId, text: &str| {
+            let grid = lock(&grids).get(&target).cloned();
+            match grid {
+                Some(g) => deliver_a2a(
+                    &sup,
+                    target,
+                    from,
+                    text,
+                    &profile,
+                    &g,
+                    InjectPolicy::AllowAll,
+                )
+                .map_err(|e| e.to_string()),
+                None => Err(format!("sem grid para o alvo {target}")),
+            }
+        };
+
+        let results = {
+            let mut store = lock(&self.store);
+            self.router.pump(&mut store, now_ms(), deliver)
+        };
+
+        // Se algo roteou, atualiza o event_count da UI (e narra no stderr os bloqueios — nunca
+        // falha em silêncio: o usuário/dev vê POR QUE uma mensagem não passou).
+        let mut routed = false;
+        for (id, outcome) in &results {
+            match outcome {
+                RouteOutcome::Delivered { .. } | RouteOutcome::Duplicate => routed = true,
+                other => eprintln!("lina-gpui: mensagem {id} não roteada: {other:?}"),
+            }
+        }
+        if routed {
+            let count = lock(&self.store).event_count().ok();
+            let mut m = lock(&self.model);
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+    }
 }
 
 /// Mapeia o `NodeStatus` do core (Bus) para o `NodeStatus` do contrato de UI.
