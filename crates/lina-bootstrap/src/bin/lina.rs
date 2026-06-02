@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use lina_bootstrap::{BootstrapInput, Bootstrapper};
-use lina_core::{MailMessage, Mailbox};
+use lina_core::{check_action, parse_autonomy, DomainEvent, EventStore, MailMessage, Mailbox};
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
 const INPUT_PATH: &str = ".lina/bootstrap.json";
@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         Some("ask") => run_ask(&args[1..]),
         Some("handshake") => run_handshake(),
         Some("plan") => run_plan(&args[1..]),
+        Some("guard") => run_guard(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -34,7 +35,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (guard: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)"
     );
 }
 
@@ -233,6 +234,98 @@ fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Diretório do event store do workspace (`<.lina>/events/`). O gate apenda o `ActionGated`
+/// aqui — mesmo log que o supervisor projeta (invariante #4: log = fonte da verdade).
+fn events_dir() -> PathBuf {
+    mailbox_root().join("events")
+}
+
+/// `lina guard --check-action --cmd "<comando>" --autonomy <manual|assistido|autonomo>` (W3-6,
+/// AC-6.2): classifica o comando (pattern-match determinístico, ZERO LLM), aplica a matriz
+/// nível×classe e imprime a decisão (`allow`/`ask`/`deny`). Quando a decisão NÃO é `allow`, apenda
+/// `ActionGated{cmd, class, decision}` ao event log. `routine` (allow) não toca o log.
+fn run_guard(args: &[String]) -> ExitCode {
+    let mut check_action_flag = false;
+    let mut cmd: Option<String> = None;
+    let mut autonomy: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check-action" => check_action_flag = true,
+            "--cmd" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => cmd = Some(v.clone()),
+                    None => {
+                        eprintln!("lina: --cmd exige o comando a checar");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--autonomy" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => autonomy = Some(v.clone()),
+                    None => {
+                        eprintln!("lina: --autonomy exige um valor (manual|assistido|autonomo)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("lina: argumento desconhecido para guard: {other}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+
+    if !check_action_flag {
+        eprintln!("lina: guard exige --check-action");
+        usage();
+        return ExitCode::from(2);
+    }
+    let (Some(cmd), Some(autonomy)) = (cmd, autonomy) else {
+        eprintln!("lina: guard exige --cmd \"<comando>\" e --autonomy <nivel>");
+        usage();
+        return ExitCode::from(2);
+    };
+    let level = match parse_autonomy(&autonomy) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let verdict = check_action(&cmd, level);
+    // Sempre imprime a decisão (o hook/shim lê esta linha).
+    println!("{}", verdict.decision.as_str());
+
+    // Livro-razão das recusas: só apenda quando NÃO é allow (ação routine não polui o log).
+    if verdict.decision != lina_core::Decision::Allow {
+        let mut store = match EventStore::open(events_dir()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lina: falha ao abrir o event store: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let event = DomainEvent::ActionGated {
+            cmd,
+            class: verdict.class.as_str().to_string(),
+            decision: verdict.decision.as_str().to_string(),
+        };
+        if let Err(e) = store.append(&event) {
+            eprintln!("lina: falha ao apendar ActionGated: {e}");
+            return ExitCode::from(1);
+        }
+    }
+
+    ExitCode::SUCCESS
 }
 
 /// `lina handshake` — registra presença (0 broadcast) e lista os colegas do workspace.

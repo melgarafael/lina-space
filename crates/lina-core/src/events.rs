@@ -171,6 +171,15 @@ pub enum DomainEvent {
         id: String,
         reason: AwaitReason,
     },
+    /// W3-6 (AC-6.2): o gate de execução interceptou uma ação `gated-*` e a recusou/confirmou.
+    /// É o livro-razão das ações barradas (mesmo princípio do `RouteBlocked`): apendado SÓ quando
+    /// a decisão NÃO é `allow` (ação `routine` permitida não polui o log). `class` ∈
+    /// {`gated-soft`,`gated-hard`}; `decision` ∈ {`ask`,`deny`}. META — sem efeito na projeção.
+    ActionGated {
+        cmd: String,
+        class: String,
+        decision: String,
+    },
     /// W3-5: um item foi semeado no plano compartilhado (`status:todo`, `@owner:?`).
     PlanItemAdded {
         item: String,
@@ -223,6 +232,7 @@ impl DomainEvent {
             DomainEvent::RouteBlocked { .. } => "RouteBlocked",
             DomainEvent::AwaitOpened { .. } => "AwaitOpened",
             DomainEvent::AwaitClosed { .. } => "AwaitClosed",
+            DomainEvent::ActionGated { .. } => "ActionGated",
             DomainEvent::PlanItemAdded { .. } => "PlanItemAdded",
             DomainEvent::PlanDecisionAdded { .. } => "PlanDecisionAdded",
             DomainEvent::PlanClaimed { .. } => "PlanClaimed",
@@ -389,6 +399,7 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::RouteBlocked { .. }
         | DomainEvent::AwaitOpened { .. }
         | DomainEvent::AwaitClosed { .. }
+        | DomainEvent::ActionGated { .. }
         | DomainEvent::NoteUpdated { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }

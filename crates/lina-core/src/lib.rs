@@ -62,6 +62,12 @@ pub use router::{
 mod plan;
 pub use plan::{ItemState, Plan, PlanError, PlanItem, PLAN_SCHEMA_V1};
 
+/// W3-6: núcleo determinístico do gate de execução (classe de ação × autonomia → decisão).
+mod guard;
+pub use guard::{
+    check_action, classify, decide, parse_autonomy, ActionClass, Decision, GateDecision, GuardError,
+};
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para
