@@ -835,6 +835,7 @@ dependencies = [
  "lina-cli-profiles",
  "lina-host",
  "lina-pty",
+ "lina-secrets",
  "lina-vt",
  "regex",
  "rusqlite",

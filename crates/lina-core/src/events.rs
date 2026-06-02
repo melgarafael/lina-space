@@ -180,6 +180,22 @@ pub enum DomainEvent {
         class: String,
         decision: String,
     },
+    /// W3-6c (ADR 0004): o broker `lina do` EXECUTOU uma ação custodiada (`gated-hard-external`)
+    /// após confirmação humana, obtendo o segredo do SecretVault — que o agente NÃO tem no env do
+    /// PTY. Livro-razão da execução brokerada. `requester` é a identidade auto-declarada do
+    /// pedido (A3 pendente → autoria NÃO-autenticada). NUNCA carrega o segredo. META — sem projeção.
+    BrokerExecuted {
+        action: String,
+        requester: String,
+    },
+    /// W3-6c (ADR 0004): o broker RECUSOU executar uma ação custodiada. `reason` ∈
+    /// {`unconfirmed` (sem gate humano), `no_secret` (segredo ausente do cofre → a custódia
+    /// bloqueia: sem segredo não há caminho de execução), `exec_failed`}. É a prova observável da
+    /// custódia: sem confirmação E/OU sem segredo, a ação não roda. META — sem projeção.
+    BrokerDenied {
+        action: String,
+        reason: String,
+    },
     /// W3-7c (§2.2): uso de tokens REPORTADO para um nó. É a FONTE de uso do teto de custo — o app
     /// a emite ao observar o fim-de-resposta da CLI (W0-10); aqui o `CostLedger` (router) a soma por
     /// janela contábil. META — sem efeito na projeção do canvas; o ledger reconstrói por replay.
@@ -254,6 +270,8 @@ impl DomainEvent {
             DomainEvent::AwaitOpened { .. } => "AwaitOpened",
             DomainEvent::AwaitClosed { .. } => "AwaitClosed",
             DomainEvent::ActionGated { .. } => "ActionGated",
+            DomainEvent::BrokerExecuted { .. } => "BrokerExecuted",
+            DomainEvent::BrokerDenied { .. } => "BrokerDenied",
             DomainEvent::TokenUsageReported { .. } => "TokenUsageReported",
             DomainEvent::CostCeilingHit { .. } => "CostCeilingHit",
             DomainEvent::CostCeilingResumed { .. } => "CostCeilingResumed",
@@ -424,6 +442,8 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::AwaitOpened { .. }
         | DomainEvent::AwaitClosed { .. }
         | DomainEvent::ActionGated { .. }
+        | DomainEvent::BrokerExecuted { .. }
+        | DomainEvent::BrokerDenied { .. }
         // W3-7c: uso/teto de custo são META — o `CostLedger` (router) os reconstrói varrendo o log,
         // não pela projeção do canvas (mesmo padrão do grafo anti-loop §2.1).
         | DomainEvent::TokenUsageReported { .. }

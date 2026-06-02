@@ -107,8 +107,8 @@ fn env(tag: &str, cfg: RouterConfig) -> Env {
 /// — nunca do `RouteOutcome` em memória (que só um harness in-process enxerga).
 fn jsonl(dir: &std::path::Path) -> Vec<EventRecord> {
     let path = dir.join("log.jsonl");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("ler {}: {e}", path.display()));
+    let data =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("ler {}: {e}", path.display()));
     data.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str::<EventRecord>(l).expect("linha do log.jsonl = EventRecord"))
@@ -150,7 +150,10 @@ fn a_auto_orquestracao_so_turno_zero() {
     //     só registramos a entrada no log, events.rs:124). Nenhum input humano além do turno-0.
     for (node, name) in [(a, "@A"), (b, "@B")] {
         e.store
-            .append(&DomainEvent::Handshake { node, name: name.into() })
+            .append(&DomainEvent::Handshake {
+                node,
+                name: name.into(),
+            })
             .expect("Handshake");
     }
 
@@ -162,7 +165,8 @@ fn a_auto_orquestracao_so_turno_zero() {
     let claim = MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1");
     assert!(
         matches!(
-            e.router.route_message(&claim, &mut e.store, 1000, &mut deliver),
+            e.router
+                .route_message(&claim, &mut e.store, 1000, &mut deliver),
             RouteOutcome::PlanApplied { .. }
         ),
         "plan.claim de @A deveria aplicar"
@@ -172,7 +176,8 @@ fn a_auto_orquestracao_so_turno_zero() {
     let ask = MailMessage::new("@A", "@B", "ask", "toca o item");
     let ask_id = ask.id.clone();
     assert!(matches!(
-        e.router.route_message(&ask, &mut e.store, 1001, &mut deliver),
+        e.router
+            .route_message(&ask, &mut e.store, 1001, &mut deliver),
         RouteOutcome::Delivered { .. }
     ));
 
@@ -205,7 +210,11 @@ fn a_auto_orquestracao_so_turno_zero() {
         Some(ask_id.as_str()),
         "root é o turno de origem (id de @A — derivado do binding, não forjável)"
     );
-    assert_eq!(p_u64(routed[0], "hops"), Some(0), "@A é origem → profundidade 0");
+    assert_eq!(
+        p_u64(routed[0], "hops"),
+        Some(0),
+        "@A é origem → profundidade 0"
+    );
 
     // ZERO root estranho: todos os eventos que CARREGAM root (MessageRouted/AwaitOpened) têm o mesmo.
     let roots: BTreeSet<&str> = recs
@@ -254,8 +263,16 @@ fn b_gate_duro_classifica_e_loga() {
     // force-push em main: ask (gated-hard) em TODOS os níveis — autonomia jamais afrouxa o piso.
     for lvl in ["manual", "assistido", "autonomo"] {
         let d = gate(&mut e.store, "git push --force origin main", lvl);
-        assert_ne!(d, Decision::Allow, "force-push em main NUNCA é allow ({lvl})");
-        assert_eq!(d, Decision::Ask, "gated-hard é ask (piso), nunca deny ({lvl})");
+        assert_ne!(
+            d,
+            Decision::Allow,
+            "force-push em main NUNCA é allow ({lvl})"
+        );
+        assert_eq!(
+            d,
+            Decision::Ask,
+            "gated-hard é ask (piso), nunca deny ({lvl})"
+        );
     }
     // push em feature: ask em assistido (gated-soft) … e allow SEM evento em autônomo (afrouxa soft).
     assert_eq!(
@@ -307,13 +324,15 @@ fn c_anti_loop_por_turno() {
 
     let m1 = MailMessage::new("@A", "@B", "ask", "ida"); // A é origem → root R1 = m1.id; aresta A→B.
     assert!(matches!(
-        e.router.route_message(&m1, &mut e.store, 1000, &mut deliver),
+        e.router
+            .route_message(&m1, &mut e.store, 1000, &mut deliver),
         RouteOutcome::Delivered { .. }
     ));
     // B→A herda R1 do binding (hops 1 < 4, id distinto); adicionar B→A fecha o ciclo sob R1.
     let m2 = MailMessage::new("@B", "@A", "ask", "volta");
     assert_eq!(
-        e.router.route_message(&m2, &mut e.store, 1001, &mut deliver),
+        e.router
+            .route_message(&m2, &mut e.store, 1001, &mut deliver),
         RouteOutcome::LoopDetected
     );
     assert!(
@@ -329,7 +348,8 @@ fn c_anti_loop_por_turno() {
     let fresh = MailMessage::new("@B", "@A", "ask", "novo turno"); // B é origem → root próprio, grafo vazio.
     assert!(
         matches!(
-            e2.router.route_message(&fresh, &mut e2.store, 2000, &mut deliver2),
+            e2.router
+                .route_message(&fresh, &mut e2.store, 2000, &mut deliver2),
             RouteOutcome::Delivered { .. }
         ),
         "B→A num turno fresco não fecha ciclo (o anti-loop é por-turno)"
@@ -400,8 +420,16 @@ fn d_teto_de_custo_pausa_e_reabre() {
     // ── Assert DO LOG ── exatamente 1 CostCeilingHit{tokens:150, day:YYYY-MM-DD}; Paused observável.
     let recs = jsonl(&e.store_dir());
     let hits: Vec<&EventRecord> = recs.iter().filter(|r| r.kind == "CostCeilingHit").collect();
-    assert_eq!(hits.len(), 1, "1 CostCeilingHit na transição (anti-amplificação A4)");
-    assert_eq!(p_u64(hits[0], "tokens"), Some(150), "o hit registra a soma da janela");
+    assert_eq!(
+        hits.len(),
+        1,
+        "1 CostCeilingHit na transição (anti-amplificação A4)"
+    );
+    assert_eq!(
+        p_u64(hits[0], "tokens"),
+        Some(150),
+        "o hit registra a soma da janela"
+    );
     let day = p_str(hits[0], "day").expect("day no hit").to_string();
     assert!(
         day.len() == 10 && day.as_bytes()[4] == b'-' && day.as_bytes()[7] == b'-',
@@ -412,7 +440,9 @@ fn d_teto_de_custo_pausa_e_reabre() {
         "o ledger reconstruído do log indica Paused (projeção observável, invariante #6)"
     );
     assert!(
-        !recs.iter().any(|r| r.kind == "MessageRouted" && p_str(r, "id") == Some(m2.id.as_str())),
+        !recs
+            .iter()
+            .any(|r| r.kind == "MessageRouted" && p_str(r, "id") == Some(m2.id.as_str())),
         "a delegação gateada NÃO foi roteada (nada entregue no teto)"
     );
 
@@ -461,9 +491,13 @@ fn e_await_reply_autenticado() {
 
     // (2) @C (não-target) lê o id no log e injeta {from:@C, reply_to:q.id} → NÃO fecha.
     let intruder = MailMessage::new("@C", "@A", "ask", "intruso").replying_to(q.id.clone());
-    let _ = e.router.route_message(&intruder, &mut e.store, 1001, &mut deliver);
+    let _ = e
+        .router
+        .route_message(&intruder, &mut e.store, 1001, &mut deliver);
     assert!(
-        !jsonl(&e.store_dir()).iter().any(|r| r.kind == "AwaitClosed"),
+        !jsonl(&e.store_dir())
+            .iter()
+            .any(|r| r.kind == "AwaitClosed"),
         "reply de não-participante NÃO pode logar AwaitClosed"
     );
     assert!(
@@ -474,7 +508,8 @@ fn e_await_reply_autenticado() {
     // (3) O target REAL (@B) responde para o waiter (@A) → fecha (AwaitClosed{replied} + libera).
     let reply = MailMessage::new("@B", "@A", "ask", "resposta").replying_to(q.id.clone());
     assert!(matches!(
-        e.router.route_message(&reply, &mut e.store, 1002, &mut deliver),
+        e.router
+            .route_message(&reply, &mut e.store, 1002, &mut deliver),
         RouteOutcome::Delivered { .. }
     ));
 
@@ -485,9 +520,20 @@ fn e_await_reply_autenticado() {
         .find(|r| r.kind == "AwaitOpened")
         .expect("AwaitOpened no log");
     assert_eq!(p_str(opened, "id"), Some(q.id.as_str()));
-    assert_eq!(p_str(opened, "waiter"), Some(a.to_string().as_str()), "waiter = @A");
-    assert_eq!(p_str(opened, "target"), Some(b.to_string().as_str()), "target = @B");
-    assert!(p_str(opened, "root_cause_id").is_some(), "AwaitOpened carrega o root");
+    assert_eq!(
+        p_str(opened, "waiter"),
+        Some(a.to_string().as_str()),
+        "waiter = @A"
+    );
+    assert_eq!(
+        p_str(opened, "target"),
+        Some(b.to_string().as_str()),
+        "target = @B"
+    );
+    assert!(
+        p_str(opened, "root_cause_id").is_some(),
+        "AwaitOpened carrega o root"
+    );
 
     let closed: Vec<&EventRecord> = recs.iter().filter(|r| r.kind == "AwaitClosed").collect();
     assert_eq!(closed.len(), 1, "só o reply autenticado fecha o ticket");
@@ -538,13 +584,15 @@ fn f_blocks_logados_e_dedupe_ausente() {
         for i in 0..5u64 {
             let m = MailMessage::new(format!("@n{i}"), format!("@n{}", i + 1), "ask", "vai");
             assert!(matches!(
-                e.router.route_message(&m, &mut e.store, i + 1, &mut deliver),
+                e.router
+                    .route_message(&m, &mut e.store, i + 1, &mut deliver),
                 RouteOutcome::Delivered { .. }
             ));
         }
         let over = MailMessage::new("@n5", "@n0", "ask", "estoura");
         assert_eq!(
-            e.router.route_message(&over, &mut e.store, 100, &mut deliver),
+            e.router
+                .route_message(&over, &mut e.store, 100, &mut deliver),
             RouteOutcome::HopLimit
         );
         assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"hop_limit".to_string()));
@@ -593,13 +641,15 @@ fn f_blocks_logados_e_dedupe_ausente() {
         for i in 0..DELEGATION_BUDGET {
             let m = MailMessage::new("@B", "@C", "ask", format!("d{i}"));
             assert!(matches!(
-                e.router.route_message(&m, &mut e.store, 10 + i as u64, &mut deliver),
+                e.router
+                    .route_message(&m, &mut e.store, 10 + i as u64, &mut deliver),
                 RouteOutcome::Delivered { .. }
             ));
         }
         let over = MailMessage::new("@B", "@C", "ask", "demais");
         assert_eq!(
-            e.router.route_message(&over, &mut e.store, 999, &mut deliver),
+            e.router
+                .route_message(&over, &mut e.store, 999, &mut deliver),
             RouteOutcome::BudgetExceeded
         );
         assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"budget_exceeded".to_string()));
@@ -625,12 +675,14 @@ fn f_blocks_logados_e_dedupe_ausente() {
         e.sup.register("@A", None, sink());
         let ghost = MailMessage::new("@Ghost", "@A", "ask", "oi");
         assert_eq!(
-            e.router.route_message(&ghost, &mut e.store, 1, &mut deliver),
+            e.router
+                .route_message(&ghost, &mut e.store, 1, &mut deliver),
             RouteOutcome::UnknownSender("@Ghost".into())
         );
         let nobody = MailMessage::new("@A", "@Nobody", "ask", "oi");
         assert_eq!(
-            e.router.route_message(&nobody, &mut e.store, 2, &mut deliver),
+            e.router
+                .route_message(&nobody, &mut e.store, 2, &mut deliver),
             RouteOutcome::NoTarget
         );
         let reasons = block_reasons(&jsonl(&e.store_dir()));
@@ -695,7 +747,10 @@ fn g_contrato_envelope_e_terminador() {
     assert!(full.contains("root_cause_id: msg_turno0") && full.contains("hops: 2"));
     assert!(full.contains("from: @A") && full.contains("payload: oi"));
     assert!(full.trim_end().ends_with("[/LINA::MSG]"));
-    assert!(!full.contains("ESTUDIO"), "namespace é LINA, nunca o resíduo ESTUDIO");
+    assert!(
+        !full.contains("ESTUDIO"),
+        "namespace é LINA, nunca o resíduo ESTUDIO"
+    );
 
     // Bloco básico idem (sem root/hops).
     let basic = render_message_block("msg_1", "@A", "@B", "ask", "oi");

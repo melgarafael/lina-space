@@ -68,6 +68,13 @@ pub use guard::{
     check_action, classify, decide, parse_autonomy, ActionClass, Decision, GateDecision, GuardError,
 };
 
+/// W3-6c (ADR 0004): broker de ação custodiada (`lina do`) — custódia de segredo é o gate duro real.
+mod broker;
+pub use broker::{
+    lookup_action, run_custody, BrokerError, BrokerOutcome, BrokerRequest, CustodyAction,
+    CLASS_GATED_HARD_EXTERNAL, CUSTODY_ACTIONS,
+};
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para

@@ -15,7 +15,8 @@ use std::process::ExitCode;
 
 use lina_bootstrap::{autonomy_from_env, pretooluse_output, BootstrapInput, Bootstrapper};
 use lina_core::{
-    check_action, now_ms, parse_autonomy, CostLedger, DomainEvent, EventStore, MailMessage, Mailbox,
+    check_action, lookup_action, now_ms, parse_autonomy, CostLedger, DomainEvent, EventStore,
+    MailMessage, Mailbox, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
         Some("plan") => run_plan(&args[1..]),
         Some("guard") => run_guard(&args[1..]),
         Some("resume") => run_resume(&args[1..]),
+        Some("do") => run_do(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -39,7 +41,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume --confirm   (W3-7c: retoma o workspace pausado pelo teto de custo; gate humano)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume --confirm: tira do estado Paused apos teto de custo; sem --confirm, nao faz nada)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume --confirm   (W3-7c: retoma o workspace pausado pelo teto de custo; gate humano)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume --confirm: tira do estado Paused apos teto de custo; sem --confirm, nao faz nada)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -397,6 +399,84 @@ fn run_resume(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `lina do <action> [args]` (W3-6c, ADR 0004) — **verbo brokerado de ação custodiada** do lado
+/// do AGENTE. O agente NÃO executa a ação: ele não tem o segredo (deploy key/API key/token — vive
+/// só no SecretVault do Lina) nem caminho de confirmação humana. Este verbo:
+///   1. valida que `<action>` é custodiada (registry do broker);
+///   2. apenda `ActionGated{class:"gated-hard-external", decision:"ask"}` (o gate disparou — piso);
+///   3. apenda `BrokerDenied{reason:"unconfirmed"}` (sem gate humano, a tentativa do agente é
+///      bloqueada — prova de custódia: o agente, sozinho, NUNCA executa);
+///   4. registra o pedido na mailbox (intent `broker.do`) para o supervisor rodar o gate humano +
+///      `run_custody` (que obtém o segredo do cofre e executa — fora deste binário).
+///
+/// A ação real NÃO roda aqui (este crate nem linka `lina-secrets`: o agente não tem acesso ao cofre).
+fn run_do(args: &[String]) -> ExitCode {
+    let Some(action) = args.first() else {
+        eprintln!("lina: 'do' exige uma acao custodiada (ex.: lina do deploy --env prod)");
+        usage();
+        return ExitCode::from(2);
+    };
+    let Some(custody) = lookup_action(action) else {
+        eprintln!("lina: acao '{action}' nao e custodiada. Acoes suportadas: deploy | pay | send");
+        return ExitCode::from(2);
+    };
+    let rest = &args[1..];
+    let display = if rest.is_empty() {
+        format!("lina do {action}")
+    } else {
+        format!("lina do {action} {}", rest.join(" "))
+    };
+
+    // Identidade do requisitante: auto-declarada (A3 pendente — autoria NÃO-autenticada, ADR 0004 §4).
+    let requester = load_input()
+        .map(|i| i.terminal_name)
+        .unwrap_or_else(|_| "agente-desconhecido".to_string());
+
+    let mut store = match EventStore::open(events_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: falha ao abrir o event store: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // (2) O gate disparou: ação externa custodiada → ask em qualquer nível (piso de custódia).
+    let gated = DomainEvent::ActionGated {
+        cmd: display.clone(),
+        class: CLASS_GATED_HARD_EXTERNAL.to_string(),
+        decision: "ask".to_string(),
+    };
+    if let Err(e) = store.append(&gated) {
+        eprintln!("lina: falha ao apendar ActionGated: {e}");
+        return ExitCode::from(1);
+    }
+    // (3) O agente não tem confirmação humana → a tentativa é bloqueada (custódia).
+    let denied = DomainEvent::BrokerDenied {
+        action: action.clone(),
+        reason: "unconfirmed".to_string(),
+    };
+    if let Err(e) = store.append(&denied) {
+        eprintln!("lina: falha ao apendar BrokerDenied: {e}");
+        return ExitCode::from(1);
+    }
+
+    // (4) Registra o pedido para o supervisor (gate humano + execução com o segredo do cofre).
+    let msg = MailMessage::new(&requester, "broker", "broker.do", rest.join(" "))
+        .with_ref(format!("do:{action}"));
+    let mailbox = Mailbox::new(mailbox_root());
+    if let Err(e) = mailbox.enqueue(&msg) {
+        eprintln!("lina: falha ao registrar o pedido custodiado na mailbox: {e}");
+        return ExitCode::from(1);
+    }
+
+    println!(
+        "gated: acao custodiada '{action}' ({}) requer confirmacao humana.",
+        custody.desc
+    );
+    println!("registrado para o supervisor (msg {}). O agente NAO executa: o segredo vive so no cofre do Lina.", msg.id);
+    ExitCode::SUCCESS
 }
 
 /// `lina handshake` — registra presença (0 broadcast) e lista os colegas do workspace.
