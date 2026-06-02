@@ -808,6 +808,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lina-bootstrap"
+version = "0.0.1"
+dependencies = [
+ "lina-role-discovery",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lina-cli-profiles"
 version = "0.0.1"
 dependencies = [

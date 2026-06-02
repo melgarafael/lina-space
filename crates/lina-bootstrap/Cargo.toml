@@ -1,0 +1,19 @@
+[package]
+name = "lina-bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# W3-2: motor de bootstrap turno-0. Renderiza `<workspace>/CLAUDE.md` (8 blocos) + o bloco de
+# estado vivo (`lina whoami --bootstrap`). Puro Rust, ZERO LLM. Consome `lina-role-discovery`.
+[dependencies]
+lina-role-discovery = { path = "../lina-role-discovery" }
+# serde/serde_json locais a ESTE crate (escopo da story) — mesmo padrão de lina-role-discovery
+# (serde local). Serializa o BootstrapInput: o app escreve `.lina/bootstrap.json`, o bin `lina` lê.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Binário `lina` (verbo `whoami --bootstrap`).
+[[bin]]
+name = "lina"
+path = "src/bin/lina.rs"
