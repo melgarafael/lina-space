@@ -121,6 +121,14 @@ fn is_delegation(intent: &str) -> bool {
     matches!(intent, "ask" | "handoff" | "broadcast" | "review" | "")
 }
 
+/// Entrada do orçamento de delegação: contagem + carimbo (ms) do último toque. O carimbo habilita a
+/// poda temporal (A5), simétrica à de `seen`, para o mapa não crescer sem limite numa sessão longa.
+#[derive(Clone, Copy)]
+struct BudgetEntry {
+    count: u32,
+    last_ms: u64,
+}
+
 /// **Roteador do supervisor.** Detém o `Arc<Supervisor>` (roster + filas serial + pub/sub) e o
 /// estado de guardrail (dedupe/orçamento). Single-thread por design (escritor único de `.lina/`).
 pub struct Router {
@@ -129,8 +137,8 @@ pub struct Router {
     config: RouterConfig,
     /// `id` → carimbo (ms) da primeira vez que vimos — dedupe por janela.
     seen: HashMap<String, u64>,
-    /// `(root_cause_id, remetente)` → nº de delegações — orçamento por turno.
-    budget: HashMap<(String, NodeId), u32>,
+    /// `(root_cause_id, remetente)` → orçamento por turno (contagem + carimbo p/ poda temporal).
+    budget: HashMap<(String, NodeId), BudgetEntry>,
 }
 
 impl Router {
@@ -195,8 +203,8 @@ impl Router {
     where
         D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
     {
-        // ── Guardrail: dedupe por `id` na janela (design §3). Limpa entradas velhas (O(n) raro).
-        self.prune_seen(now_ms);
+        // ── Guardrail: dedupe por `id` na janela (design §3). Poda `seen` E `budget` (A5).
+        self.prune_expired(now_ms);
         if self.seen.contains_key(&msg.id) {
             return RouteOutcome::Duplicate;
         }
@@ -256,7 +264,7 @@ impl Router {
             let count = self
                 .budget
                 .get(&(root.clone(), sender))
-                .copied()
+                .map(|e| e.count)
                 .unwrap_or(0);
             if count >= self.config.delegation_budget {
                 return RouteOutcome::BudgetExceeded;
@@ -296,9 +304,15 @@ impl Router {
         }) {
             return RouteOutcome::PersistFailed(e.to_string());
         }
-        // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada).
+        // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada). Carimba o tempo
+        // para a poda temporal (A5) — sem isso o mapa cresceria sem limite (vazamento de memória).
         if is_deleg {
-            *self.budget.entry((root, sender)).or_insert(0) += 1;
+            let entry = self.budget.entry((root, sender)).or_insert(BudgetEntry {
+                count: 0,
+                last_ms: now_ms,
+            });
+            entry.count += 1;
+            entry.last_ms = now_ms;
         }
 
         // Renderiza o bloco [LINA::MSG] (sentinela + terminador LINA) e entrega a cada alvo.
@@ -335,11 +349,15 @@ impl Router {
         }
     }
 
-    /// Remove entradas de dedupe mais velhas que a janela (mantém o mapa enxuto).
-    fn prune_seen(&mut self, now_ms: u64) {
+    /// Remove entradas de dedupe (`seen`) E de orçamento (`budget`) mais velhas que a janela. As duas
+    /// crescem com o tráfego; sem podar `budget` junto, ele vazaria memória numa sessão longa (A5),
+    /// ao contrário de `seen` que já era podado.
+    fn prune_expired(&mut self, now_ms: u64) {
         let window = self.config.dedupe_window_ms;
         self.seen
             .retain(|_, &mut t| now_ms.saturating_sub(t) < window);
+        self.budget
+            .retain(|_, e| now_ms.saturating_sub(e.last_ms) < window);
     }
 
     /// **W3-5: aplica um intent de plano** (`plan.claim`/`plan.check`). Valida o comando contra a
@@ -936,6 +954,42 @@ mod tests {
         assert!(
             live.starts_with("# Plano — App X\n"),
             "cabecalho do workspace"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A5: o `budget` é podado na mesma janela do `seen` — entradas velhas somem (sem vazamento).
+    #[test]
+    fn budget_entries_are_pruned_after_window() {
+        let (mut router, sup, dir) = router_with("budget-prune");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("budget-prune");
+        let (_rec, mut deliver) = recorder();
+
+        // Uma delegação cria uma entrada de budget (carimbada em t=1000).
+        let msg = MailMessage::new("@A", "@B", "ask", "oi");
+        assert!(matches!(
+            router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert_eq!(router.budget.len(), 1, "delegacao cria entrada de budget");
+
+        // Bem depois da janela, qualquer route_message roda a poda no topo → a entrada velha some;
+        // só a nova (do turno recente) permanece.
+        let later = MailMessage::new("@A", "@B", "ask", "depois");
+        assert!(matches!(
+            router.route_message(&later, &mut ts.store, DEDUPE_WINDOW_MS + 2000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert_eq!(
+            router.budget.len(),
+            1,
+            "a entrada velha foi podada; não acumula sem limite"
+        );
+        assert!(
+            router.budget.keys().all(|(root, _)| *root == later.id),
+            "só a entrada do turno recente sobrevive (a de 1000 foi podada)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
