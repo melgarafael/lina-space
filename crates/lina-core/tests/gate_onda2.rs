@@ -312,8 +312,11 @@ fn onda2_exit_gate_end_to_end() {
             == "GATEPROMPT"),
         "B deveria mostrar o prompt 'GATEPROMPT' no grid"
     );
+    // B emite `GATEPROMPT` e a sequência `ESC[?2004h` em printfs SEPARADOS; o prompt pode chegar ao
+    // grid um flush ANTES de o modo ser parseado. Espera-POR-CONDIÇÃO (não assert imediato) elimina
+    // a corrida — mesmo padrão do poll do prompt acima.
     assert!(
-        lock(&wired_b.grid).mode().bracketed_paste,
+        poll_until(T, || lock(&wired_b.grid).mode().bracketed_paste),
         "B deve estar em bracketed-paste mode"
     );
 
