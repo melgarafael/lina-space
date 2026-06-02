@@ -138,12 +138,15 @@ struct BudgetEntry {
     last_ms: u64,
 }
 
-/// W3-7b (ADR 0002): ticket em memória de um `await` aberto. Guarda só o necessário para FECHAR
-/// (`waiter` → `end_await`; `opened_ms` → timeout); o contexto completo (`target`/`root_cause_id`)
-/// já está durável no evento `AwaitOpened` (log = fonte da verdade), sem duplicar aqui.
+/// W3-7b (ADR 0002): ticket em memória de um `await` aberto. Guarda o necessário para FECHAR
+/// (`waiter` → `end_await`; `opened_ms` → timeout) E para AUTENTICAR o fechamento: `target` é o nó
+/// que o waiter aguarda — só um reply VINDO desse `target` (sender já resolvido pelo supervisor)
+/// pode fechar o ticket. Sem `target` aqui, o `reply_to` (campo do outbox, público no log) decidiria
+/// o await de outro nó (Round 4: confused-deputy). O contexto completo segue durável no `AwaitOpened`.
 #[derive(Clone, Copy)]
 struct AwaitTicket {
     waiter: NodeId,
+    target: NodeId,
     opened_ms: u64,
 }
 
@@ -269,16 +272,10 @@ impl Router {
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
         self.seen.insert(msg.id.clone(), now_ms);
 
-        // ── W3-7b (ADR 0002) + fix reply_to-bypass: se ESTA msg é um REPLY que CASA um await
-        //    pendente, FECHA o ticket (end_await + AwaitClosed{Replied}). `is_legit_reply` = casou um
-        //    ticket REAL — capturado AQUI (antes do guard de loop, que vem depois e veria o `pending`
-        //    já esvaziado). Só um reply legítimo pula o anti-loop (back-edge da pergunta); um
-        //    `reply_to` FORJADO sem ticket → `false` → passa pelo anti-loop normal.
-        let is_legit_reply = self.close_await_on_reply(msg, store);
-
         // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
         //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
         //    dedupe (reenvios são absorvidos), antes do pipeline de delegação/resolução de alvo.
+        //    (Round 4: intent de plano nunca fecha await — o desvio precede o lifecycle do reply.)
         if is_plan_intent(&msg.intent) {
             return self.handle_plan(msg, store);
         }
@@ -289,6 +286,15 @@ impl Router {
             log_block(store, msg, BlockReason::UnknownSender);
             return RouteOutcome::UnknownSender(msg.from.clone());
         };
+
+        // ── W3-7b (ADR 0002) + Round 4 (confused-deputy): se ESTA msg é um REPLY que CASA um await
+        //    pendente E vem do `target` aguardado, FECHA o ticket (end_await + AwaitClosed{Replied}).
+        //    Capturado AQUI — DEPOIS da resolução do `sender` (o fechamento só pode ocorrer com
+        //    remetente legítimo/resolvido) e do desvio de plano, mas ANTES do guard de loop (que vem
+        //    depois e veria o `pending` já esvaziado). `is_legit_reply` = casou um ticket REAL cujo
+        //    `target == sender`. Só um reply legítimo pula o anti-loop (back-edge da pergunta); um
+        //    `reply_to` forjado/de-não-participante → `false` → passa pelo anti-loop normal.
+        let is_legit_reply = self.close_await_on_reply(msg, sender, store);
 
         // ── A2 + W1: deriva `root_cause_id`/`hops` EFETIVOS do BINDING interno (jamais dos campos
         //    forjáveis da mailbox): herda do `delivered_root[sender]` (root + hops+1); sem binding,
@@ -458,6 +464,7 @@ impl Router {
                 msg.id.clone(),
                 AwaitTicket {
                     waiter: sender,
+                    target,
                     opened_ms: now_ms,
                 },
             );
@@ -557,17 +564,45 @@ impl Router {
         }
     }
 
-    /// **W3-7b (ADR 0002): fecha o `await` se `msg` é o REPLY casado.** Devolve `true` SE e só se o
-    /// `msg.reply_to` casou um ticket REAL em `pending` (reply legítimo a um await aberto) — então
-    /// `end_await(waiter)` (libera o wait-for-graph) + `AwaitClosed{Replied}` + remove de `pending`.
-    /// `reply_to` ausente/FORJADO (sem ticket) → `false` (NÃO é reply legítimo → não pula o anti-loop).
-    fn close_await_on_reply(&mut self, msg: &MailMessage, store: &mut EventStore) -> bool {
+    /// **W3-7b (ADR 0002) + Round 4: fecha o `await` se `msg` é o REPLY AUTENTICADO casado.** Devolve
+    /// `true` SE e só se: (1) `msg.reply_to` casou um ticket REAL em `pending`, (2) o `sender` (já
+    /// resolvido pelo supervisor) é o `target` que o waiter aguardava, e (3) o `to` da resposta é o
+    /// próprio waiter. Só então: `end_await(waiter)` (libera o wait-for-graph) + `AwaitClosed{Replied}`
+    /// + remove de `pending`.
+    ///
+    /// **SEGURANÇA (Round 4, confused-deputy):** o `id` da pergunta é PÚBLICO (vaza no `log.jsonl` e no
+    /// bloco `[LINA::MSG]`). Sem a checagem `sender == ticket.target`, qualquer nó C (identidade real,
+    /// sem forjar `from`) fecharia o await de B só escrevendo `{from:@C, reply_to:q.id}` — apagando a
+    /// aresta `B→A` do wait-for-graph, injetando um `AwaitClosed{Replied}` espúrio e pulando o
+    /// anti-loop. O fechamento NUNCA é decidido pelo campo do outbox: só o PARTICIPANTE autenticado
+    /// (o `target` aguardado) vence. Sem casar → `false`: a msg de C segue como mensagem COMUM, sujeita
+    /// a todos os guardrails. PEEK antes de remover — um reply ilegítimo NÃO consome o ticket.
+    fn close_await_on_reply(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        store: &mut EventStore,
+    ) -> bool {
         let Some(reply_to) = msg.reply_to.as_deref() else {
             return false;
         };
-        let Some(ticket) = self.pending.remove(reply_to) else {
+        let Some(&ticket) = self.pending.get(reply_to) else {
             return false; // reply_to forjado / sem ticket → não autoriza pular o anti-loop
         };
+        // O remetente da resposta TEM de ser o `target` que o waiter aguardava (não um terceiro que
+        // só leu o `id` no log). E a resposta tem de voltar PARA o waiter (defesa em profundidade).
+        if sender != ticket.target {
+            return false;
+        }
+        let to_is_waiter = matches!(
+            parse_target(&msg.to),
+            TargetSpec::Name(n) if self.sup.node_by_name(&n) == Some(ticket.waiter)
+        );
+        if !to_is_waiter {
+            return false;
+        }
+        // Autenticado → AGORA consome o ticket e fecha.
+        self.pending.remove(reply_to);
         self.sup.end_await(ticket.waiter);
         if let Err(e) = store.append(&DomainEvent::AwaitClosed {
             id: reply_to.to_string(),
@@ -1674,6 +1709,109 @@ mod tests {
         let closed = first_event(&recs, "AwaitClosed");
         assert_eq!(closed.payload["id"].as_str(), Some(q.id.as_str()));
         assert_eq!(closed.payload["reason"].as_str(), Some("timeout"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 4 (confused-deputy): um nó C de identidade REAL (sem forjar `from`) que apenas LEU o
+    /// `id` da pergunta no log NÃO fecha o `await` de B só por escrever `reply_to = q.id`. O fechamento
+    /// é decidido pelo PARTICIPANTE autenticado: só o `target` aguardado (A) fecha. Prova que (a) o
+    /// reply de C (target ≠ sender) NÃO consome o ticket (sobrevive em `pending`; NENHUM `AwaitClosed`)
+    /// e (b) o reply do A real fecha normalmente (`AwaitClosed{replied}` + aresta liberada).
+    #[test]
+    fn reply_from_non_target_does_not_close_await() {
+        let (mut router, sup, dir) = router_with("await-intruder");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("await-intruder");
+        let (_rec, mut deliver) = recorder();
+
+        // (1) B --await--> A: abre o ticket (aresta b→a viva → a--await-->b seria deadlock).
+        let q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
+        assert!(matches!(
+            router.route_message(&q, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert!(
+            sup.begin_await(a, b).is_err(),
+            "ticket aberto: b→a vivo no wait-for-graph"
+        );
+
+        // (2) C lê q.id no log e injeta {from:@C, reply_to:q.id}. Como sender(C) ≠ target(A), NÃO fecha.
+        let intruder = MailMessage::new("@C", "@A", "ask", "intruso").replying_to(q.id.clone());
+        let _ = router.route_message(&intruder, &mut ts.store, 1001, &mut deliver);
+        let recs = ts.store.events().unwrap();
+        assert!(
+            !recs.iter().any(|r| r.kind == "AwaitClosed"),
+            "reply de não-participante NÃO pode logar AwaitClosed"
+        );
+        assert!(
+            sup.begin_await(a, b).is_err(),
+            "o ticket de B SOBREVIVE ao reply forjado de C (aresta b→a intacta)"
+        );
+
+        // (3) O target REAL (A) responde → fecha normalmente (AwaitClosed{replied}, aresta liberada).
+        let reply = MailMessage::new("@A", "@B", "ask", "resposta").replying_to(q.id.clone());
+        assert!(matches!(
+            router.route_message(&reply, &mut ts.store, 1002, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let recs = ts.store.events().unwrap();
+        let closed = first_event(&recs, "AwaitClosed");
+        assert_eq!(closed.payload["id"].as_str(), Some(q.id.as_str()));
+        assert_eq!(closed.payload["reason"].as_str(), Some("replied"));
+        assert!(
+            sup.begin_await(a, b).is_ok(),
+            "o reply do participante autenticado liberou o wait-for-graph"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 4 (defesa em profundidade): mesmo vindo do `target` legítimo (A), um reply cujo `to` NÃO
+    /// é o waiter (B) não fecha o ticket — a resposta tem de voltar PARA quem perguntou. Só o reply
+    /// bem-endereçado de A (`to = @B`) fecha. Verifica o participante autenticado E o destino corretos.
+    #[test]
+    fn reply_to_wrong_destination_does_not_close_await() {
+        let (mut router, sup, dir) = router_with("await-misaddressed");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("await-misaddressed");
+        let (_rec, mut deliver) = recorder();
+
+        // B --await--> A.
+        let q = MailMessage::new("@B", "@A", "ask", "pergunta").awaiting();
+        assert!(matches!(
+            router.route_message(&q, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        // A responde, MAS endereça a @C (não ao waiter B) → não fecha (to ≠ waiter).
+        let misaddressed = MailMessage::new("@A", "@C", "ask", "errado").replying_to(q.id.clone());
+        let _ = router.route_message(&misaddressed, &mut ts.store, 1001, &mut deliver);
+        let recs = ts.store.events().unwrap();
+        assert!(
+            !recs.iter().any(|r| r.kind == "AwaitClosed"),
+            "reply mal-endereçado (to ≠ waiter) NÃO fecha o ticket"
+        );
+        assert!(
+            sup.begin_await(a, b).is_err(),
+            "ticket de B sobrevive ao reply mal-endereçado de A"
+        );
+
+        // A responde bem-endereçado (to = @B) → fecha.
+        let good = MailMessage::new("@A", "@B", "ask", "resposta").replying_to(q.id.clone());
+        assert!(matches!(
+            router.route_message(&good, &mut ts.store, 1002, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let recs = ts.store.events().unwrap();
+        let closed = first_event(&recs, "AwaitClosed");
+        assert_eq!(closed.payload["reason"].as_str(), Some("replied"));
+        assert!(
+            sup.begin_await(a, b).is_ok(),
+            "reply bem-endereçado do target liberou o wait-for-graph"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
