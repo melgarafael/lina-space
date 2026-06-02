@@ -1060,6 +1060,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **W3-6c A3 (AC):** uma msg escrita no outbox POR-NÓ de @X com `from` FORJADO=@Y é roteada como
+    /// vinda de @X — a ORIGEM (diretório-dono, atribuída pelo `drain` do supervisor) vence o campo. A
+    /// entrega registra `from` = NodeId de @X (nunca @Y) e o bloco diz `from: @X`. O supervisor é o
+    /// `pump`; o `drain` autentica a origem; o router não precisou mudar (deriva sender de `msg.from`).
+    #[test]
+    fn per_node_outbox_authenticates_origin_over_forged_from() {
+        let (mut router, sup, dir) = router_with("a3");
+        let x = sup.register("@X", None, sink());
+        let b = sup.register("@B", None, sink());
+        let y = sup.register("@Y", None, sink()); // @Y existe: a diferença é a ORIGEM, não a inexistência
+        let mut ts = TmpStore::new("a3");
+        let (rec, mut deliver) = recorder();
+
+        // Campo `from` FORJADO = @Y, mas o arquivo é escrito no outbox do nó @X.
+        let m = MailMessage::new("@Y", "@B", "ask", "deploy prod");
+        router
+            .mailbox()
+            .enqueue_as("@X", &m)
+            .expect("enqueue_as @X");
+
+        let outcomes = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0].1, RouteOutcome::Delivered { .. }));
+
+        let calls = rec.borrow();
+        assert_eq!(calls.len(), 1, "uma entrega");
+        assert_eq!(calls[0].0, b, "alvo é @B");
+        assert_eq!(calls[0].1, x, "a origem @X vence o campo forjado @Y");
+        assert_ne!(calls[0].1, y, "jamais atribuído ao @Y forjado");
+        assert!(
+            calls[0].2.contains("from: @X"),
+            "o bloco entregue atribui from: @X"
+        );
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn duplicate_id_within_window_is_ignored() {
         let (mut router, sup, dir) = router_with("dedupe");

@@ -193,6 +193,17 @@ impl Mailbox {
         self.root.join("outbox")
     }
 
+    /// **W3-6c A3 — outbox POR-NÓ.** `<.lina>/outbox/<node>/` — o subdiretório de UM terminal. A
+    /// atribuição de origem do supervisor (`drain*`) usa o NOME do diretório-dono como `from`
+    /// AUTENTICADO, vencendo o campo `from` (forjável) da mensagem. `None` se `node` não é um nome de
+    /// diretório seguro (vazio, com separador de path, `.`/`..`, ou começando com `.` — que colidiria
+    /// com `.inflight`/ocultos). A inforjabilidade FORTE (um PTY só escreve no SEU dir) é fronteira do
+    /// app (caminho/token injetado no spawn); aqui está o mecanismo + a validação de nome.
+    #[must_use]
+    pub fn outbox_node_dir(&self, node: &str) -> Option<PathBuf> {
+        valid_node_name(node).then(|| self.outbox_dir().join(node))
+    }
+
     /// `<.lina>/outbox/.inflight` — A6: mensagens drenadas mas ainda não persistidas (roteadas ou
     /// bloqueadas). Um crash entre o drain e o persist deixa o arquivo aqui → reprocessado no próximo
     /// `drain_to_inflight` (recuperável). O ack (`ack_inflight`) só remove após o evento durável.
@@ -232,15 +243,25 @@ impl Mailbox {
                 ),
             ));
         }
-        let dir = self.outbox_dir();
-        std::fs::create_dir_all(&dir)?;
-        let json = serde_json::to_string_pretty(msg)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let final_path = dir.join(format!("{}.json", msg.id));
-        let tmp_path = dir.join(format!("{}.json.tmp", msg.id));
-        std::fs::write(&tmp_path, json)?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        Ok(())
+        write_msg_atomic(&self.outbox_dir(), msg)
+    }
+
+    /// **W3-6c A3 — deposita no outbox POR-NÓ** `<.lina>/outbox/<node>/<id>.json` (atômico). O
+    /// terminal usa isto passando o SEU próprio nome de nó; o supervisor, ao drenar, atribui
+    /// `from = <node>` (o dono do diretório), ignorando o campo `from` da mensagem. Assim a ORIGEM
+    /// vence o campo (auditoria/atribuição autenticada — ADR 0004 AC-0004.4).
+    ///
+    /// # Errors
+    /// `InvalidInput` se `node` não é um nome de diretório seguro ou se `msg.id` é inválido; I/O ao
+    /// criar o diretório/escrever/renomear.
+    pub fn enqueue_as(&self, node: &str, msg: &MailMessage) -> std::io::Result<()> {
+        let dir = self.outbox_node_dir(node).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("nome de no invalido para outbox por-no: {node:?}"),
+            )
+        })?;
+        write_msg_atomic(&dir, msg)
     }
 
     /// **Drena** o `outbox` de forma DESTRUTIVA: lê os `*.json` em ordem de `id` (UUID v7 → FIFO),
@@ -257,6 +278,20 @@ impl Mailbox {
             match inspect_file(&path) {
                 FileVerdict::Valid(msg) => {
                     let _ = std::fs::remove_file(&path); // consumido
+                    out.push(*msg);
+                }
+                FileVerdict::Discard => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                FileVerdict::Skip => {}
+            }
+        }
+        // W3-6c A3: subdirs por-nó — a ORIGEM (nome do diretório-dono) vence o campo `from` (forjável).
+        for (node, path) in collect_node_outbox(&self.outbox_dir(), true)? {
+            match inspect_file(&path) {
+                FileVerdict::Valid(mut msg) => {
+                    msg.from = node; // atribuição AUTENTICADA pela origem
+                    let _ = std::fs::remove_file(&path);
                     out.push(*msg);
                 }
                 FileVerdict::Discard => {
@@ -311,6 +346,31 @@ impl Mailbox {
                         );
                         continue;
                     }
+                    out.push(*msg);
+                }
+                FileVerdict::Discard => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                FileVerdict::Skip => {}
+            }
+        }
+
+        // (3) W3-6c A3 — subdirs POR-NÓ: carimba `from` = origem autenticada (nome do dir-dono) e
+        //     PERSISTE a msg já autenticada no `.inflight` (flat). Reescreve (não renomeia) porque o
+        //     `.inflight` não guarda o dir de origem — a recuperação pós-crash precisa do `from` já no
+        //     arquivo. Capeado por tick (A4). Mesma robustez: falha de persist deixa no subdir (visível).
+        for (node, path) in collect_node_outbox(&self.outbox_dir(), true)? {
+            match inspect_file(&path) {
+                FileVerdict::Valid(mut msg) => {
+                    msg.from = node;
+                    if let Err(e) = write_msg_atomic(&inflight, &msg) {
+                        eprintln!(
+                            "lina-core: mailbox falhou ao persistir {} (por-no) em inflight: {e}",
+                            msg.id
+                        );
+                        continue; // deixa no subdir para o próximo tick (nada se perde, VISÍVEL)
+                    }
+                    let _ = std::fs::remove_file(&path); // origem consumida só após o inflight durável
                     out.push(*msg);
                 }
                 FileVerdict::Discard => {
@@ -413,6 +473,74 @@ fn collect_sorted_json(dir: &Path, cap: bool) -> std::io::Result<Vec<PathBuf>> {
     if cap && files.len() > MAX_DRAIN_BATCH {
         eprintln!(
             "lina-core: mailbox drenando {MAX_DRAIN_BATCH} de {} mensagens neste tick (teto MAX_DRAIN_BATCH); o restante fica para o proximo tick",
+            files.len()
+        );
+        files.truncate(MAX_DRAIN_BATCH);
+    }
+    Ok(files)
+}
+
+/// `true` se `s` é um nome de subdiretório POR-NÓ seguro para o outbox (W3-6c A3): não-vazio,
+/// limitado, sem separador de path / NUL, e **não começa com `.`** — o que exclui de uma vez o
+/// `.inflight`, os ocultos, e os perigosos `.`/`..` (path-traversal). Nomes de terminal legítimos
+/// (`@Dev 01`, `Terminal B`) passam.
+fn valid_node_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 255 && !s.starts_with('.') && !s.contains(['/', '\\', '\0'])
+}
+
+/// Escrita ATÔMICA de uma `MailMessage` em `dir` (`<id>.json` via tmp+rename). Valida o `id` (B1: um
+/// id com `/`/`..` escaparia do diretório) ANTES de tocar o disco. Base de `enqueue`/`enqueue_as` e da
+/// persistência por-nó no `.inflight`.
+fn write_msg_atomic(dir: &Path, msg: &MailMessage) -> std::io::Result<()> {
+    if !valid_msg_id(&msg.id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "id de mensagem invalido (esperado msg_<alnum>): {:?}",
+                msg.id
+            ),
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    let json = serde_json::to_string_pretty(msg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let final_path = dir.join(format!("{}.json", msg.id));
+    let tmp_path = dir.join(format!("{}.json.tmp", msg.id));
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
+/// W3-6c A3: lista `(node_name, json_path)` dos `*.json` em TODOS os subdirs por-nó do `outbox` —
+/// exclui `.inflight`/ocultos/inseguros (via [`valid_node_name`]). Ordenado pelo nome do arquivo
+/// (`id` v7 = FIFO global entre nós); capeado por `MAX_DRAIN_BATCH` se `cap` (com log). `outbox`
+/// inexistente → vazio.
+fn collect_node_outbox(outbox: &Path, cap: bool) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let rd = match std::fs::read_dir(outbox) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for entry in rd.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue; // só subdirs por-nó (os *.json flat são tratados pelo caminho legado)
+        }
+        let Some(node) = entry.file_name().to_str().map(str::to_owned) else {
+            continue; // nome não-UTF8 → não é um nó legítimo
+        };
+        if !valid_node_name(&node) {
+            continue; // `.inflight`, ocultos, inseguros
+        }
+        for p in collect_sorted_json(&path, false)? {
+            files.push((node.clone(), p));
+        }
+    }
+    files.sort_by(|a, b| a.1.file_name().cmp(&b.1.file_name()));
+    if cap && files.len() > MAX_DRAIN_BATCH {
+        eprintln!(
+            "lina-core: mailbox (por-no) drenando {MAX_DRAIN_BATCH} de {} mensagens neste tick; o restante fica para o proximo tick",
             files.len()
         );
         files.truncate(MAX_DRAIN_BATCH);
@@ -1011,6 +1139,135 @@ mod tests {
             MAX_DRAIN_BATCH,
             "órfãos de .inflight são capeados no teto A4 (cap=true)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── W3-6c A3: outbox por-nó (origem autenticada) ─────────────────────────
+
+    /// `enqueue_as` escreve no subdir do nó e REJEITA nomes inseguros (sem tocar o disco para eles).
+    #[test]
+    fn enqueue_as_writes_to_node_subdir_and_rejects_unsafe() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-pn-enq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+
+        let m = MailMessage::new("@Y", "@B", "ask", "oi"); // from forjado
+        mb.enqueue_as("@X", &m).expect("enqueue_as @X");
+        assert!(
+            mb.outbox_dir()
+                .join("@X")
+                .join(format!("{}.json", m.id))
+                .exists(),
+            "a msg foi para o subdir do nó @X"
+        );
+
+        // Nomes inseguros: `.inflight` (colisão), traversal, vazio → erro, nada escrito.
+        for bad in [".inflight", "../evil", "a/b", ".", ".."] {
+            assert!(
+                mb.enqueue_as(bad, &m).is_err(),
+                "nome de nó inseguro {bad:?} deve ser rejeitado"
+            );
+            assert!(
+                mb.outbox_node_dir(bad).is_none(),
+                "{bad:?} não é dir seguro"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **AC A3:** uma msg no outbox POR-NÓ de @X com `from` FORJADO=@Y é drenada com `from`=@X — a
+    /// ORIGEM (diretório-dono) vence o campo. O resto da mensagem fica intacto.
+    #[test]
+    fn per_node_drain_attributes_from_to_dir_owner() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-pn-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+
+        let forged = MailMessage::new("@Y", "@B", "ask", "paga agora"); // from = @Y (forjado)
+        mb.enqueue_as("@X", &forged).expect("enqueue_as @X");
+
+        let drained = mb.drain().expect("drain");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].from, "@X",
+            "a origem (dir @X) vence o campo forjado @Y"
+        );
+        assert_eq!(drained[0].payload, "paga agora", "resto da msg intacto");
+        assert_eq!(drained[0].id, forged.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **AC A3 + A6:** `drain_to_inflight` carimba `from`=@X E persiste a msg JÁ autenticada no
+    /// `.inflight` — a recuperação pós-crash (2º drain) reprocessa com `from`=@X (não há dir de origem
+    /// no `.inflight` flat, então a autenticação tem de estar NO arquivo).
+    #[test]
+    fn per_node_drain_to_inflight_authenticates_and_recovers() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-pn-infl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+
+        let forged = MailMessage::new("@Y", "@B", "ask", "oi");
+        mb.enqueue_as("@X", &forged).expect("enqueue_as @X");
+
+        let d1 = mb.drain_to_inflight().expect("drain 1");
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].from, "@X", "origem autenticada no drain");
+
+        // O .inflight (flat) carrega o `from` autenticado — recuperável sem o dir de origem.
+        let infl = mb.inflight_dir().join(format!("{}.json", forged.id));
+        assert!(infl.exists(), "msg durável no .inflight");
+        let stored: MailMessage =
+            serde_json::from_str(&std::fs::read_to_string(&infl).expect("read inflight"))
+                .expect("parse inflight");
+        assert_eq!(stored.from, "@X", "o .inflight guarda o from autenticado");
+        assert!(
+            !mb.outbox_dir()
+                .join("@X")
+                .join(format!("{}.json", forged.id))
+                .exists(),
+            "o subdir de origem foi consumido após o inflight durável"
+        );
+
+        // "Crash" antes do ack: 2º drain reprocessa o órfão JÁ autenticado.
+        let d2 = mb.drain_to_inflight().expect("drain 2");
+        assert_eq!(d2.len(), 1);
+        assert_eq!(
+            d2[0].from, "@X",
+            "órfão reprocessado mantém origem autenticada"
+        );
+        mb.ack_inflight(&forged.id).expect("ack");
+        assert!(mb.drain_to_inflight().expect("drain 3").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Retrocompat: outbox FLAT (legado) e POR-NÓ coexistem num mesmo drain — o flat mantém o `from`
+    /// do campo; o por-nó usa o dir-dono. Nenhum gate legado quebra.
+    #[test]
+    fn flat_and_per_node_outboxes_coexist() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-pn-mix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+
+        mb.enqueue(&MailMessage::new("@A", "@B", "ask", "flat"))
+            .expect("enqueue flat");
+        mb.enqueue_as("@X", &MailMessage::new("@Y", "@B", "ask", "pernode"))
+            .expect("enqueue_as");
+
+        let drained = mb.drain().expect("drain");
+        assert_eq!(drained.len(), 2, "flat + por-nó no mesmo drain");
+        let from_of = |payload: &str| {
+            drained
+                .iter()
+                .find(|m| m.payload == payload)
+                .map(|m| m.from.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            from_of("flat"),
+            "@A",
+            "flat (legado) mantém o from do campo"
+        );
+        assert_eq!(from_of("pernode"), "@X", "por-nó usa o dir-dono");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
