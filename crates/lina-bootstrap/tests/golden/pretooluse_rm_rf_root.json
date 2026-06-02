@@ -1,0 +1,1 @@
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"comando 'rm -rf /': ação destrutiva ou com custódia de segredo (gated-hard) — confirmação humana obrigatória"}}

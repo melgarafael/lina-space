@@ -9,10 +9,11 @@
 //! - `lina handshake` (W3-4): registra presença (ping na mailbox, **0 broadcast**) e imprime os
 //!   colegas do workspace (de `.lina/agents.json` ou do roster do bootstrap).
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use lina_bootstrap::{BootstrapInput, Bootstrapper};
+use lina_bootstrap::{autonomy_from_env, pretooluse_output, BootstrapInput, Bootstrapper};
 use lina_core::{check_action, parse_autonomy, DomainEvent, EventStore, MailMessage, Mailbox};
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -35,7 +36,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (guard: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)"
     );
 }
 
@@ -247,6 +248,12 @@ fn events_dir() -> PathBuf {
 /// nível×classe e imprime a decisão (`allow`/`ask`/`deny`). Quando a decisão NÃO é `allow`, apenda
 /// `ActionGated{cmd, class, decision}` ao event log. `routine` (allow) não toca o log.
 fn run_guard(args: &[String]) -> ExitCode {
+    // Modo hook `PreToolUse` (Claude Code, tier 1): lê o JSON do stdin e emite a decisão do gate
+    // em JSON no stdout. É um caminho SEPARADO do verbo `--check-action` (W3-6a).
+    if args.iter().any(|a| a == "--pretooluse") {
+        return run_pretooluse();
+    }
+
     let mut check_action_flag = false;
     let mut cmd: Option<String> = None;
     let mut autonomy: Option<String> = None;
@@ -325,6 +332,26 @@ fn run_guard(args: &[String]) -> ExitCode {
         }
     }
 
+    ExitCode::SUCCESS
+}
+
+/// `lina guard --pretooluse` (W3-6, AC-6.3) — **hook `PreToolUse` do Claude Code (tier 1)**.
+/// Lê no stdin o JSON do `PreToolUse`, extrai o comando (`tool_input.command` p/ Bash), reusa o
+/// núcleo determinístico do gate (ZERO LLM) e emite no stdout APENAS o JSON
+/// `{"hookSpecificOutput":{...}}`. A autonomia vem de `LINA_AUTONOMY` (default `assistido`).
+///
+/// **Robustez (regra do `SessionStart`, W3-2):** NUNCA imprime texto cru no stdout. Em qualquer
+/// falha (stdin ilegível, JSON inválido) emite um JSON fail-safe `ask` e loga em stderr. Sempre
+/// sai com `SUCCESS` — o gate fala pelo conteúdo do JSON, não pelo exit code (o harness lê o JSON).
+fn run_pretooluse() -> ExitCode {
+    let mut raw = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+        // stdin ilegível → fail-safe `ask` (decisão volta ao humano), diagnóstico em stderr.
+        eprintln!("lina: falha ao ler stdin do PreToolUse: {e}");
+        println!("{}", pretooluse_output("", &autonomy_from_env()));
+        return ExitCode::SUCCESS;
+    }
+    println!("{}", pretooluse_output(&raw, &autonomy_from_env()));
     ExitCode::SUCCESS
 }
 

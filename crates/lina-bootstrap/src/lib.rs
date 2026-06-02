@@ -15,6 +15,10 @@ use std::path::Path;
 use lina_role_discovery::{RegistryError, RoleAssignment, RoleRegistry};
 use serde::{Deserialize, Serialize};
 
+/// W3-6 (AC-6.3): lógica pura do hook `PreToolUse` do Claude Code (gate de execução tier 1).
+pub mod pretooluse;
+pub use pretooluse::{autonomy_from_env, pretooluse_output, AUTONOMY_ENV};
+
 /// Templates CANÔNICOS embutidos (fonte da verdade do Spec Writer). Mesmos 13 placeholders; só o
 /// gatilho de bootstrap muda por CLI. Um rebuild re-embute se o Spec Writer atualizar os arquivos.
 const CLAUDE_TEMPLATE: &str = include_str!("../../../assets/lina-doctrine/CLAUDE.md");
@@ -407,17 +411,27 @@ impl Bootstrapper {
     }
 }
 
-/// JSON do `<cwd>/.claude/settings.json`: hook `SessionStart` que roda `<lina_bin> whoami
-/// --bootstrap`. O caminho do bin é **single-quoted** (paths podem ter espaços, ex.:
-/// `.../einstein workspace/...`) com escape de aspas — neutraliza metacaracteres de shell.
+/// JSON do `<cwd>/.claude/settings.json` com os DOIS hooks do Claude Code:
+/// - `SessionStart` → `<lina_bin> whoami --bootstrap` (estado vivo turno-0, W3-2);
+/// - `PreToolUse` (matcher `Bash`) → `<lina_bin> guard --pretooluse` (gate de execução DURO,
+///   W3-6 AC-6.3 — o harness obriga toda chamada `Bash` a passar pelo gate antes de rodar).
+///
+/// O caminho do bin é **single-quoted** (paths podem ter espaços, ex.: `.../einstein workspace/...`)
+/// com escape de aspas — neutraliza metacaracteres de shell. O matcher é `Bash` porque o gate mira
+/// o **comando real**; Write/Edit são `local-reversible` (a matriz os libera) e o handler do
+/// `--pretooluse` já devolve `allow` para qualquer tool não-Bash, se o matcher for alargado depois.
 #[must_use]
 pub fn hook_settings_json(lina_bin: &str) -> String {
     let quoted = format!("'{}'", lina_bin.replace('\'', "'\\''"));
-    let cmd = format!("{quoted} whoami --bootstrap");
+    let session_cmd = format!("{quoted} whoami --bootstrap");
+    let pretooluse_cmd = format!("{quoted} guard --pretooluse");
     let v = serde_json::json!({
         "hooks": {
             "SessionStart": [
-                { "hooks": [ { "type": "command", "command": cmd } ] }
+                { "hooks": [ { "type": "command", "command": session_cmd } ] }
+            ],
+            "PreToolUse": [
+                { "matcher": "Bash", "hooks": [ { "type": "command", "command": pretooluse_cmd } ] }
             ]
         }
     });
