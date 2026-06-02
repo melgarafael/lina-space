@@ -150,7 +150,9 @@ impl Router {
         D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
     {
         let msgs = self.mailbox.drain().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "pump: falha ao drenar a mailbox");
+            // Falha de I/O ao listar o outbox (disco/permissão): as mensagens NÃO são perdidas
+            // (ficam no outbox para o próximo tick), mas a falha é VISÍVEL (stderr), nunca silenciosa.
+            eprintln!("lina-core: pump não conseguiu drenar a mailbox (será retentado): {e}");
             Vec::new()
         });
         msgs.into_iter()
@@ -217,14 +219,20 @@ impl Router {
         }
 
         // ── Guardrail 3: orçamento de delegação por `root_cause_id`/agente. Sem root explícito,
-        //    a própria mensagem é a raiz (o turno do usuário que disparou a CLI).
+        //    a própria mensagem é a raiz (o turno do usuário que disparou a CLI). Aqui só CHECAMOS;
+        //    o incremento vem DEPOIS do persist bem-sucedido — uma falha de log não envenena a
+        //    conta (a conta reflete delegação EFETIVADA, não tentada).
         let root = msg.root_cause_id.clone().unwrap_or_else(|| msg.id.clone());
-        if is_delegation(&msg.intent) {
-            let count = self.budget.entry((root.clone(), sender)).or_insert(0);
-            if *count >= self.config.delegation_budget {
+        let is_deleg = is_delegation(&msg.intent);
+        if is_deleg {
+            let count = self
+                .budget
+                .get(&(root.clone(), sender))
+                .copied()
+                .unwrap_or(0);
+            if count >= self.config.delegation_budget {
                 return RouteOutcome::BudgetExceeded;
             }
-            *count += 1;
         }
 
         // ── Guardrail 2: anti-deadlock (só `--await`): se registrar `sender→target` fecharia um
@@ -243,7 +251,7 @@ impl Router {
         // ── Passou. Carimba o envelope canônico (root_cause_id, hops, await) e ROTEIA (publica
         //    `BusEvent::Message` + devolve os alvos frescos, sem o remetente nem nós já no trace).
         let mut env = A2aEnvelope::new(sender, recipient.clone(), Some(intent_or_ask(&msg.intent)));
-        env.root_cause_id = Some(root);
+        env.root_cause_id = Some(root.clone());
         env.hops = msg.hops;
         env.await_reply = msg.await_reply;
         let targets = self.sup.route(&env, policy);
@@ -260,6 +268,10 @@ impl Router {
         }) {
             return RouteOutcome::PersistFailed(e.to_string());
         }
+        // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada).
+        if is_deleg {
+            *self.budget.entry((root, sender)).or_insert(0) += 1;
+        }
 
         // Renderiza o bloco [LINA::MSG] (sentinela + terminador LINA) e entrega a cada alvo.
         let to_label = recipient_label(&recipient, &msg.to);
@@ -273,11 +285,17 @@ impl Router {
                         id: msg.id.clone(),
                         to: target,
                     }) {
-                        tracing::warn!(error = %e, "route_message: falha ao logar MessageDelivered");
+                        // A entrega ao PTY já ocorreu (irreversível) mas não foi logada — o event
+                        // log é a fonte da verdade, então a inconsistência é ALTA e VISÍVEL (stderr),
+                        // nunca um warn silencioso de tracing.
+                        eprintln!(
+                            "lina-core: CRÍTICO — entregue mas NÃO logado (MessageDelivered {} → {target}): {e}",
+                            msg.id
+                        );
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(%target, error = %e, "route_message: entrega faseada falhou");
+                    eprintln!("lina-core: entrega faseada falhou (alvo {target}): {e}");
                 }
             }
         }
@@ -542,6 +560,27 @@ mod tests {
             router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
             RouteOutcome::Deadlock
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broadcast_over_fanout_gate_needs_confirmation() {
+        // 4 colegas vivos (> FANOUT_GATE=3) → um broadcast é GATEADO (pede confirmação humana),
+        // não entregue. (Guarda de segurança do design §4: broadcast grande não dispara sozinho.)
+        let (mut router, sup, dir) = router_with("fanout");
+        let _a = sup.register("@A", None, sink());
+        for n in ["@B1", "@B2", "@B3", "@B4"] {
+            sup.register(n, None, sink());
+        }
+        let mut ts = TmpStore::new("fanout");
+        let (rec, mut deliver) = recorder();
+
+        let msg = MailMessage::new("@A", "*", "broadcast", "atenção a todos");
+        assert_eq!(
+            router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::FanoutGated { count: 4 }
+        );
+        assert!(rec.borrow().is_empty(), "broadcast gateado não entrega");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

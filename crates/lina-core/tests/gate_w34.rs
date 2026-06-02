@@ -13,8 +13,10 @@
 //! 4. **B RECEBE o bloco**: o `screen()` de B mostra `[LINA::MSG]`, `from: @A` e o payload `oi`.
 //! 5. **Dedupe**: re-depositar a MESMA mensagem (mesmo `id`) na janela é ignorado (não re-injeta).
 //!
-//! O anti-loop (`hops`/`trace`) e o orçamento são exercitados nos testes unitários de `router`
-//! (mesma crate, `cargo test -p lina-core`); aqui focamos o caminho REAL ponta-a-ponta + dedupe.
+//! Os demais guardrails — anti-loop (`hops`), orçamento, autonomia (`manual`), gate de fan-out
+//! (`broadcast` > N) e anti-deadlock (wait-for) — são exercitados um a um nos testes unitários de
+//! `router` (mesma crate, `cargo test -p lina-core`). Aqui focamos o caminho REAL ponta-a-ponta
+//! (PTY → tela) + dedupe.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -288,16 +290,28 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
     }
     assert!(saw_message, "o pulso A→B deveria ter passado pelo Bus");
 
-    // (3-log) Os eventos de roteamento/entrega foram PERSISTIDOS no event log (bus.jsonl).
+    // (3-log) Os eventos de roteamento/entrega foram PERSISTIDOS no event log (bus.jsonl) — com os
+    // CAMPOS certos no MESMO registro (uma linha = um EventRecord JSON), não só "aparece no arquivo".
     let jsonl =
         std::fs::read_to_string(lina_dir.join("events").join("bus.jsonl")).expect("ler bus.jsonl");
+    let routed = jsonl
+        .lines()
+        .find(|l| l.contains("MessageRouted"))
+        .unwrap_or_else(|| panic!("nenhum MessageRouted no log; jsonl = {jsonl}"));
     assert!(
-        jsonl.contains("MessageRouted") && jsonl.contains(&ask_id),
-        "o roteamento deveria estar no log com o id da mensagem"
+        routed.contains(&ask_id)
+            && routed.contains(&node_a.to_string())
+            && routed.contains("\"to\":\"@B\"")
+            && routed.contains("\"intent\":\"ask\""),
+        "o MessageRouted deveria ter id={ask_id}, from={node_a}, to=@B, intent=ask; veio: {routed}"
     );
+    let delivered = jsonl
+        .lines()
+        .find(|l| l.contains("MessageDelivered"))
+        .unwrap_or_else(|| panic!("nenhum MessageDelivered no log; jsonl = {jsonl}"));
     assert!(
-        jsonl.contains("MessageDelivered"),
-        "a entrega deveria estar no log"
+        delivered.contains(&ask_id) && delivered.contains(&node_b.to_string()),
+        "o MessageDelivered deveria ter id={ask_id} e to={node_b}; veio: {delivered}"
     );
 
     // (5) DEDUPE: re-depositar a MESMA mensagem (mesmo id) é ignorado — B não recebe de novo.

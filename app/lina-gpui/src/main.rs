@@ -1035,7 +1035,14 @@ fn main() {
     // terminais (que herdam o env) para cá → `lina ask`/`handshake` depositam no MESMO outbox que
     // o supervisor (o `MailboxPump`) observa. (Vale para A/B e para os nós adicionados em runtime.)
     let mailbox_dir = ws_root.join(".lina");
-    let _ = std::fs::create_dir_all(&mailbox_dir);
+    if let Err(e) = std::fs::create_dir_all(&mailbox_dir) {
+        // Não fatal (o resto do app — canvas, terminais — funciona sem A2A), mas VISÍVEL: sem a
+        // mailbox, `lina ask` não terá para onde escrever.
+        eprintln!(
+            "lina-gpui: não criou a mailbox {} (A2A indisponível): {e}",
+            mailbox_dir.display()
+        );
+    }
     std::env::set_var("LINA_HOME", &mailbox_dir);
     let vault_path =
         std::env::var("LINA_VAULT").unwrap_or_else(|_| ws_root.join("vault").display().to_string());
@@ -1169,7 +1176,9 @@ fn main() {
 
     // W3-4: sobe o SUPERVISOR que observa a mailbox (`<ws_root>/.lina/outbox/`). A partir daqui,
     // um `lina ask @B "oi"` de qualquer terminal trafega: outbox → guardrails → deliver_a2a → B.
-    MailboxPump::new(
+    // Thread DAEMON (observador de fundo): o app sai via `process::exit`, que encerra a thread —
+    // o handle é mantido só para deixar o ciclo de vida explícito.
+    let _mailbox_pump = MailboxPump::new(
         Arc::clone(&sup),
         Arc::clone(&store),
         Arc::clone(&grids),
