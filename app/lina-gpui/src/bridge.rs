@@ -23,6 +23,8 @@ use lina_core::{
     Recipient, RolePolicy, Supervisor, VtBackend,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
+// W2-4: tipos de mouse reporting do motor VT (não re-exportados pelo core) — para `encode_mouse`.
+use lina_vt::{MouseButton as VtBtn, MouseEvent, MouseEventKind, MouseModifiers};
 use tokio::sync::broadcast;
 
 /// Quanto tempo o pulso A→B fica visível na tela (efêmero).
@@ -588,6 +590,115 @@ pub fn hit_test(
                 && screen_pt.1 <= sy + sh;
             inside.then_some(*id)
         })
+}
+
+// ─────────────────────────── W2-4: seleção + mouse reporting ───────────────────────────
+
+/// Métricas da célula monoespaçada (Menlo 13px). Definem cols×rows (`fit_dims`) E a conversão
+/// tela→célula da seleção/mouse — uma só fonte da verdade.
+pub const CELL_W: f32 = 7.84;
+pub const CELL_H: f32 = 17.0;
+
+/// Origem X do grid DENTRO do card, em px NÃO escalados: borda(2) + padding do corpo(4).
+const GRID_OX: f32 = 6.0;
+/// Parte FIXA da origem Y: borda(2) + padding vertical do título(16) + padding do corpo(4). A
+/// linha de texto do título escala com o zoom → soma-se `CELL_H * zoom` em [`screen_to_cell`].
+const GRID_OY_FIXED: f32 = 22.0;
+
+/// **Tela → célula do viewport** (0-based), ciente de pan/zoom: inverte a transformação da
+/// câmera + a origem do grid no card. Satura na borda do grid. Casa o clique/arraste do mouse
+/// com a célula certa para `set_selection`/`encode_mouse`.
+#[must_use]
+pub fn screen_to_cell(
+    cam: &Camera,
+    card_world: (f32, f32),
+    screen_pt: (f32, f32),
+    dims: (usize, usize),
+) -> (usize, usize) {
+    let z = cam.zoom;
+    let (sx, sy) = cam.world_to_screen(card_world);
+    let gx = sx + GRID_OX;
+    let gy = sy + GRID_OY_FIXED + CELL_H * z;
+    let col = (((screen_pt.0 - gx) / (CELL_W * z)).floor()).clamp(0.0, (dims.0.max(1) - 1) as f32);
+    let row = (((screen_pt.1 - gy) / (CELL_H * z)).floor()).clamp(0.0, (dims.1.max(1) - 1) as f32);
+    (col as usize, row as usize)
+}
+
+/// Normaliza uma seleção `anchor → head` para ordem de leitura: `(sc, sr, ec, er)` com
+/// `(sr,sc) <= (er,ec)`. A direção do arraste não importa (igual ao `set_selection` do backend).
+#[must_use]
+pub fn normalize_sel(anchor: (usize, usize), head: (usize, usize)) -> (usize, usize, usize, usize) {
+    let ((ac, ar), (hc, hr)) = (anchor, head);
+    if (ar, ac) <= (hr, hc) {
+        (ac, ar, hc, hr)
+    } else {
+        (hc, hr, ac, ar)
+    }
+}
+
+/// A célula `(col,row)` está na seleção **stream** (não-retangular) `(sc,sr)..(ec,er)`? Espelha
+/// o que o `selection_text()` extrai: linha inicial de `sc` ao fim, linhas do meio inteiras,
+/// linha final do início a `ec`. Usado p/ DESTACAR as células no render.
+#[must_use]
+pub fn cell_in_selection(
+    col: usize,
+    row: usize,
+    sc: usize,
+    sr: usize,
+    ec: usize,
+    er: usize,
+) -> bool {
+    if row < sr || row > er {
+        false
+    } else if sr == er {
+        col >= sc && col <= ec
+    } else if row == sr {
+        col >= sc
+    } else if row == er {
+        col <= ec
+    } else {
+        true
+    }
+}
+
+/// Ação de ponteiro que a UI traduz em **mouse reporting** (subconjunto usado pelo app).
+#[derive(Clone, Copy, Debug)]
+pub enum PtrAction {
+    Press,
+    Release,
+    Motion,
+    WheelUp,
+    WheelDown,
+}
+
+/// Codifica uma ação de ponteiro na célula `cell` para o PTY **se** o TUI pediu mouse reporting;
+/// senão `None` (a UI então seleciona/rola). Reusa `VtBackend::encode_mouse` (SGR 1006) — não
+/// reimplementa o protocolo. `mods` = `(shift, alt, control)`.
+#[must_use]
+pub fn encode_pointer(
+    grid: &dyn VtBackend,
+    action: PtrAction,
+    cell: (usize, usize),
+    mods: (bool, bool, bool),
+) -> Option<Vec<u8>> {
+    let (button, kind) = match action {
+        PtrAction::Press => (Some(VtBtn::Left), MouseEventKind::Press),
+        PtrAction::Release => (Some(VtBtn::Left), MouseEventKind::Release),
+        PtrAction::Motion => (Some(VtBtn::Left), MouseEventKind::Motion),
+        PtrAction::WheelUp => (Some(VtBtn::WheelUp), MouseEventKind::Press),
+        PtrAction::WheelDown => (Some(VtBtn::WheelDown), MouseEventKind::Press),
+    };
+    grid.encode_mouse(MouseEvent {
+        button,
+        kind,
+        col: cell.0,
+        row: cell.1,
+        mods: MouseModifiers {
+            shift: mods.0,
+            alt: mods.1,
+            control: mods.2,
+        },
+    })
 }
 
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
@@ -1384,5 +1495,107 @@ mod tests {
         assert_eq!(cam, Camera::default());
         assert_eq!(cam.pan, (0.0, 0.0));
         assert!((cam.zoom - 1.0).abs() < 1e-6);
+    }
+
+    /// **GATE W2-4 — tela→célula (round-trip) ciente de pan/zoom:** o centro da célula
+    /// `(col,row)` mapeia de volta para `(col,row)`.
+    #[test]
+    fn screen_to_cell_maps_under_pan_zoom() {
+        let dims = (80usize, 24usize);
+        let card = (30.0_f32, 96.0_f32);
+        for cam in [
+            Camera::default(),
+            Camera {
+                pan: (120.0, -40.0),
+                zoom: 1.5,
+            },
+            Camera {
+                pan: (-200.0, 60.0),
+                zoom: 0.6,
+            },
+        ] {
+            let z = cam.zoom;
+            let (sx, sy) = cam.world_to_screen(card);
+            let (gx, gy) = (sx + GRID_OX, sy + GRID_OY_FIXED + CELL_H * z);
+            for &(col, row) in &[(0usize, 0usize), (10, 5), (40, 12), (79, 23)] {
+                let px = gx + (col as f32 + 0.5) * CELL_W * z;
+                let py = gy + (row as f32 + 0.5) * CELL_H * z;
+                assert_eq!(
+                    screen_to_cell(&cam, card, (px, py), dims),
+                    (col, row),
+                    "cam={cam:?} célula ({col},{row})"
+                );
+            }
+        }
+        // Fora do grid satura na borda (não estoura).
+        assert_eq!(
+            screen_to_cell(&Camera::default(), card, (-9999.0, -9999.0), dims),
+            (0, 0)
+        );
+        assert_eq!(
+            screen_to_cell(&Camera::default(), card, (9_999_999.0, 9_999_999.0), dims),
+            (79, 23)
+        );
+    }
+
+    /// **GATE W2-4 — membership da seleção stream** (espelha o `selection_text` do backend).
+    #[test]
+    fn selection_membership_is_stream_not_rectangle() {
+        // 1 linha, direção invertida → normaliza.
+        let (sc, sr, ec, er) = normalize_sel((5, 1), (2, 1));
+        assert_eq!((sc, sr, ec, er), (2, 1, 5, 1));
+        assert!(cell_in_selection(2, 1, sc, sr, ec, er) && cell_in_selection(5, 1, sc, sr, ec, er));
+        assert!(
+            !cell_in_selection(1, 1, sc, sr, ec, er) && !cell_in_selection(6, 1, sc, sr, ec, er)
+        );
+        assert!(!cell_in_selection(3, 0, sc, sr, ec, er));
+        // Multi-linha (3,1)→(2,3): linha 1 de col>=3; linha 2 inteira; linha 3 col<=2.
+        let (sc, sr, ec, er) = normalize_sel((3, 1), (2, 3));
+        assert_eq!((sc, sr, ec, er), (3, 1, 2, 3));
+        assert!(
+            cell_in_selection(3, 1, sc, sr, ec, er) && cell_in_selection(79, 1, sc, sr, ec, er)
+        );
+        assert!(!cell_in_selection(2, 1, sc, sr, ec, er));
+        assert!(
+            cell_in_selection(0, 2, sc, sr, ec, er) && cell_in_selection(79, 2, sc, sr, ec, er)
+        );
+        assert!(
+            cell_in_selection(2, 3, sc, sr, ec, er) && !cell_in_selection(3, 3, sc, sr, ec, er)
+        );
+    }
+
+    /// **GATE W2-4 — seleção por células → `selection_text` correto** (usa a primitiva do core).
+    #[test]
+    fn selection_cells_yield_expected_text() {
+        let mut b = AlacrittyBackend::new(20, 4);
+        b.advance(b"\x1b[2J\x1b[H\x1b[1;1Hhello world");
+        b.set_selection(0, 0, 4, 0);
+        assert_eq!(b.selection_text().as_deref(), Some("hello"));
+        b.clear_selection();
+        assert_eq!(b.selection_text(), None);
+    }
+
+    /// **GATE W2-4 — roteamento mouse:** quando o TUI pede reporting, `encode_pointer` gera os
+    /// bytes SGR certos; quando NÃO pede, devolve `None` (a UI então seleciona).
+    #[test]
+    fn pointer_routes_to_encode_when_reporting_else_selection() {
+        let mut b = AlacrittyBackend::new(80, 24);
+        b.advance(b"\x1b[2J\x1b[Hhello world");
+        // SEM reporting → encode = None (a UI seleciona); set_selection segue funcionando.
+        assert!(!b.is_mouse_reporting());
+        assert_eq!(
+            encode_pointer(&b, PtrAction::Press, (0, 0), (false, false, false)),
+            None
+        );
+        b.set_selection(0, 0, 4, 0);
+        assert_eq!(b.selection_text().as_deref(), Some("hello"));
+        b.clear_selection();
+        // COM reporting (?1000h + ?1006h) → press na (0,0) = CSI<0;1;1M.
+        b.advance(b"\x1b[?1000h\x1b[?1006h");
+        assert!(b.is_mouse_reporting());
+        assert_eq!(
+            encode_pointer(&b, PtrAction::Press, (0, 0), (false, false, false)).as_deref(),
+            Some(&b"\x1b[<0;1;1M"[..])
+        );
     }
 }

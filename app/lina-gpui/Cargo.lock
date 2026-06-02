@@ -3108,6 +3108,7 @@ dependencies = [
  "gpui_platform",
  "lina-core",
  "lina-host",
+ "lina-vt",
  "tokio",
  "uuid",
 ]

@@ -10,6 +10,10 @@ publish = false
 [dependencies]
 lina-core = { path = "../../crates/lina-core" }
 lina-host = { path = "../../crates/lina-host" }
+# W2-4 selection/mouse: o `lina_core` re-exporta o GRID/VtBackend mas NÃO os tipos de mouse
+# (MouseEvent/MouseButton/…). Dep direta (path; não modifica o crate) p/ usar `encode_mouse`.
+# Mesma instância path do core → os tipos VtScreen/VtBackend unificam (sem conflito).
+lina-vt = { path = "../../crates/lina-vt" }
 # Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
 tokio = { version = "1", features = ["sync"] }
 # gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal

@@ -13,28 +13,34 @@ use std::thread;
 use std::time::Duration;
 
 use gpui::{
-    div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, Context, FocusHandle,
-    FontWeight, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    Point, Render, Rgba, Role, ScrollDelta, ScrollWheelEvent, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, ClipboardItem, Context,
+    FocusHandle, FontWeight, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, Rgba, Role, ScrollDelta, ScrollWheelEvent,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
 use lina_core::{
-    DomainEvent, EventStore, NodeStatus as CoreStatus, PtyManager, Supervisor, VtRgb, VtScreen,
+    build_paste, DomainEvent, EventStore, NodeStatus as CoreStatus, PtyManager, Supervisor, VtRgb,
+    VtScreen,
 };
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
 use bridge::{
-    card_visible, demo_profile, hit_test, lock, shell_cmd, spawn_pump, wire_terminal, A2aTrigger,
-    Camera, CmdFactory, CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, SharedModel,
-    CARD_H, CARD_W,
+    card_visible, cell_in_selection, demo_profile, encode_pointer, hit_test, lock, normalize_sel,
+    screen_to_cell, shell_cmd, spawn_pump, wire_terminal, A2aTrigger, Camera, CmdFactory,
+    CoreInput, GpuiBridgeHost, Grid, Model, NodeManager, NodeView, PtrAction, SharedModel, CARD_H,
+    CARD_W, CELL_H, CELL_W,
 };
 
-/// Métricas aproximadas da célula monoespaçada (Menlo 13px) — definem cols×rows do PTY.
-const CELL_W: f32 = 7.84;
-const CELL_H: f32 = 17.0;
+/// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
 const FONT_PX: f32 = 13.0;
+/// Cor de fundo das células SELECIONADAS (W2-4) — azul fosco, mantém o texto legível.
+const SELECTION_BG: VtRgb = VtRgb {
+    r: 0x33,
+    g: 0x45,
+    b: 0x73,
+};
 
 /// Quantas cols×rows cabem na área de grid de um card (>= 80×24, "tamanho útil").
 fn fit_dims() -> (u16, u16) {
@@ -117,7 +123,12 @@ fn rgba(c: VtRgb) -> Rgba {
 
 /// Pinta UMA linha do grid: agrupa células de mesmo estilo em runs (flex-row de spans),
 /// com a célula do cursor como bloco invertido (accent). Monoespaçado → tudo alinha.
-fn render_line(cells: &[lina_core::VtCell], cursor_col: Option<usize>) -> impl IntoElement {
+fn render_line(
+    cells: &[lina_core::VtCell],
+    cursor_col: Option<usize>,
+    row: usize,
+    sel: Option<(usize, usize, usize, usize)>,
+) -> impl IntoElement {
     struct Run {
         fg: VtRgb,
         bg: VtRgb,
@@ -126,6 +137,8 @@ fn render_line(cells: &[lina_core::VtCell], cursor_col: Option<usize>) -> impl I
     }
     let mut runs: Vec<Run> = Vec::new();
     for (col, cell) in cells.iter().enumerate() {
+        let selected =
+            sel.is_some_and(|(sc, sr, ec, er)| cell_in_selection(col, row, sc, sr, ec, er));
         let (fg, bg, bold) = if cursor_col == Some(col) {
             // Bloco do cursor: bg accent, fg escuro.
             (
@@ -141,6 +154,9 @@ fn render_line(cells: &[lina_core::VtCell], cursor_col: Option<usize>) -> impl I
                 },
                 false,
             )
+        } else if selected {
+            // Célula SELECIONADA: bg de destaque, mantém fg/negrito (texto legível).
+            (cell.fg, SELECTION_BG, cell.bold)
         } else {
             (cell.fg, cell.bg, cell.bold)
         };
@@ -182,7 +198,11 @@ fn scroll_zoom_factor(delta: ScrollDelta) -> f32 {
 
 /// Pinta o GRID VISÍVEL inteiro (snapshot atual) — uma linha por linha do viewport. `scale` =
 /// zoom do canvas (a fonte monoespaçada escala junto, mantendo o alinhamento do grid).
-fn render_grid(screen: &VtScreen, scale: f32) -> impl IntoElement {
+fn render_grid(
+    screen: &VtScreen,
+    scale: f32,
+    sel: Option<(usize, usize, usize, usize)>,
+) -> impl IntoElement {
     let cur = screen.cursor;
     div()
         .flex()
@@ -191,8 +211,16 @@ fn render_grid(screen: &VtScreen, scale: f32) -> impl IntoElement {
         .text_size(px(FONT_PX * scale))
         .children((0..screen.rows).map(move |r| {
             let cursor_col = (cur.visible && cur.line == r).then_some(cur.col);
-            render_line(screen.row(r), cursor_col)
+            render_line(screen.row(r), cursor_col, r, sel)
         }))
+}
+
+/// Seleção de texto ativa (W2-4): em qual nó e o range de células `anchor → head` do viewport.
+#[derive(Clone, Copy)]
+struct Sel {
+    node: NodeId,
+    anchor: (usize, usize),
+    head: (usize, usize),
 }
 
 /// O canvas gpui — a ÚNICA parte que conhece o toolkit. O estado dos nós (add/remove, model,
@@ -210,6 +238,12 @@ struct WorkspaceView {
     /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
     z_order: BTreeMap<NodeId, u64>,
     z_next: u64,
+    /// W2-4: seleção de texto atual (destacada no render; copiada no ⌘C).
+    sel: Option<Sel>,
+    /// `true` enquanto um arraste de seleção está em curso.
+    dragging_sel: bool,
+    /// `Some(node)` enquanto um "press" de mouse reporting está ativo nesse nó (motion/release).
+    report_node: Option<NodeId>,
 }
 
 impl WorkspaceView {
@@ -233,6 +267,150 @@ impl WorkspaceView {
             drag: None,
             z_order: BTreeMap::new(),
             z_next: 0,
+            sel: None,
+            dragging_sel: false,
+            report_node: None,
+        }
+    }
+
+    // ───────────────────────── W2-4: seleção · copiar/colar · mouse ─────────────────────────
+
+    /// Posição (mundo) de um nó na projeção.
+    fn node_pos(&self, node: NodeId) -> Option<(f32, f32)> {
+        lock(&self.nodes.model).nodes.get(&node).map(|v| (v.x, v.y))
+    }
+
+    /// Clona o handle do grid de um nó (solta o lock do mapa antes de lockar o grid).
+    fn grid_of(&self, node: NodeId) -> Option<Grid> {
+        lock(&self.nodes.grids).get(&node).cloned()
+    }
+
+    /// Célula `(col,row)` do viewport sob um ponto de TELA, ciente de pan/zoom.
+    fn screen_cell(&self, node: NodeId, screen_pt: (f32, f32)) -> Option<(usize, usize)> {
+        let pos = self.node_pos(node)?;
+        let g = self.grid_of(node)?;
+        let dims = lock(&g).dims();
+        Some(screen_to_cell(&self.camera, pos, screen_pt, dims))
+    }
+
+    /// Traduz uma ação de ponteiro em bytes SGR e injeta no PTY. Devolve `true` se o TUI pediu
+    /// mouse reporting E o evento gerou bytes — checa e codifica sob o MESMO lock do grid
+    /// (`encode_mouse` testa o reporting por dentro), então é ATÔMICO: sem janela de corrida com
+    /// a thread leitora. `false` = a UI trata (seleciona/rola).
+    fn send_pointer(
+        &self,
+        node: NodeId,
+        action: PtrAction,
+        cell: (usize, usize),
+        mods: (bool, bool, bool),
+    ) -> bool {
+        let Some(g) = self.grid_of(node) else {
+            return false;
+        };
+        let bytes = {
+            let guard = lock(&g);
+            encode_pointer(&**guard, action, cell, mods)
+        };
+        match bytes {
+            Some(b) => {
+                self.input.submit(node, WriteOp::HumanKeys(b));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Limpa a seleção (no backend e na UI).
+    fn clear_selection_state(&mut self) {
+        if let Some(sel) = self.sel.take() {
+            if let Some(g) = self.grid_of(sel.node) {
+                lock(&g).clear_selection();
+            }
+        }
+    }
+
+    /// Estende a seleção em curso até a célula sob `screen_pt` (chamado no arraste). Só toca o
+    /// backend quando a CÉLULA muda (o mousemove dispara a ~60Hz, muitas vezes na mesma célula).
+    fn extend_selection(&mut self, screen_pt: (f32, f32)) {
+        let Some((node, anchor, head)) = self.sel.as_ref().map(|s| (s.node, s.anchor, s.head))
+        else {
+            return;
+        };
+        let Some(cell) = self.screen_cell(node, screen_pt) else {
+            return;
+        };
+        if cell == head {
+            return;
+        }
+        if let Some(sel) = self.sel.as_mut() {
+            sel.head = cell;
+        }
+        if let Some(g) = self.grid_of(node) {
+            lock(&g).set_selection(anchor.0, anchor.1, cell.0, cell.1);
+        }
+    }
+
+    /// Texto da seleção atual (do backend, respeitando wrap), ou `None`.
+    fn selection_text(&self) -> Option<String> {
+        let sel = self.sel.as_ref()?;
+        let g = self.grid_of(sel.node)?;
+        let t = lock(&g).selection_text();
+        t
+    }
+
+    /// O nó focado está em modo bracketed-paste?
+    fn focused_bracketed(&self) -> bool {
+        self.grid_of(self.focused)
+            .is_some_and(|g| lock(&g).mode().bracketed_paste)
+    }
+
+    /// Mouse-down sobre o grid de um nó: reporta ao TUI (se pediu mouse) OU inicia seleção.
+    fn pointer_down(&mut self, node: NodeId, ev: &MouseDownEvent) {
+        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+        let Some(cell) = self.screen_cell(node, pos) else {
+            return;
+        };
+        let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+        self.focus(node);
+        // Toda nova interação no grid zera a seleção anterior (de qualquer card).
+        self.clear_selection_state();
+        // `send_pointer` é atômico: se o TUI pediu mouse, reporta o press e devolve `true` (NÃO
+        // seleciona); senão, inicia a seleção neste card.
+        if self.send_pointer(node, PtrAction::Press, cell, mods) {
+            self.report_node = Some(node);
+        } else {
+            self.sel = Some(Sel {
+                node,
+                anchor: cell,
+                head: cell,
+            });
+            self.dragging_sel = true;
+        }
+    }
+
+    /// ⌘C: copia o texto da seleção para o clipboard do sistema.
+    fn copy_selection(&self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// ⌘V: cola o clipboard no PTY focado via bracketed-paste (sanitizado por `build_paste`).
+    fn paste_clipboard(&self, cx: &mut Context<Self>) {
+        // Guard: só cola se o nó focado ainda está vivo — o pump pode tê-lo removido (NodeDied)
+        // entre o frame e este keystroke. Evita colagem perdida num nó fantasma.
+        if !lock(&self.nodes.model).nodes.contains_key(&self.focused) {
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let bytes = build_paste(&text, self.focused_bracketed());
+        if !bytes.is_empty() {
+            self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
         }
     }
 
@@ -295,8 +473,17 @@ impl WorkspaceView {
         }
     }
 
-    fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window) {
+    fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // ⌘C copia a seleção; ⌘V cola no PTY focado (bracketed-paste). Ctrl+C/V seguem p/ o PTY.
+        if ks.modifiers.platform && ks.key == "c" {
+            self.copy_selection(cx);
+            return;
+        }
+        if ks.modifiers.platform && ks.key == "v" {
+            self.paste_clipboard(cx);
+            return;
+        }
         // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona (foca+revela); ⌘⌫ fecha o focado;
         // ⌘+ / ⌘- dão zoom in/out no centro da viewport.
         if ks.modifiers.platform && ks.key == "t" {
@@ -354,6 +541,20 @@ impl Render for WorkspaceView {
         // de UI, então a entrada ficaria órfã (vazamento ao longo de uma sessão longa).
         self.z_order
             .retain(|id, _| cards.iter().any(|(cid, _)| cid == id));
+        // W2-4: invalida seleção / mouse-report se o nó referenciado morreu (mesma disciplina) —
+        // senão um ⌘C copiaria de um nó fantasma e o estado ficaria stale.
+        if self
+            .sel
+            .is_some_and(|s| !cards.iter().any(|(id, _)| *id == s.node))
+        {
+            self.clear_selection_state();
+        }
+        if self
+            .report_node
+            .is_some_and(|n| !cards.iter().any(|(id, _)| *id == n))
+        {
+            self.report_node = None;
+        }
 
         let vp = window.viewport_size();
         let viewport = (f32::from(vp.width), f32::from(vp.height));
@@ -409,17 +610,40 @@ impl Render for WorkspaceView {
                 }),
             )
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, _cx| {
-                if ev.dragging() {
-                    if let Some((mouse0, pan0)) = view.drag {
-                        let now = (f32::from(ev.position.x), f32::from(ev.position.y));
-                        view.camera.pan = (pan0.0 + now.0 - mouse0.0, pan0.1 + now.1 - mouse0.1);
+                let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                if let Some((mouse0, pan0)) = view.drag {
+                    if ev.dragging() {
+                        view.camera.pan = (pan0.0 + pos.0 - mouse0.0, pan0.1 + pos.1 - mouse0.1);
+                    }
+                } else if view.dragging_sel {
+                    // Estende a seleção até a célula sob o cursor (mesmo fora do card).
+                    view.extend_selection(pos);
+                } else if let Some(node) = view.report_node {
+                    // Mouse reporting: movimento com botão (drag) → o TUI recebe (se quiser).
+                    let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+                    if let Some(cell) = view.screen_cell(node, pos) {
+                        view.send_pointer(node, PtrAction::Motion, cell, mods);
                     }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, _ev, _w, _cx| {
+                cx.listener(|view, ev: &MouseUpEvent, _w, _cx| {
                     view.drag = None;
+                    if view.dragging_sel {
+                        view.dragging_sel = false;
+                        // "Clicar simples limpa": sem arraste (anchor==head) → sem seleção.
+                        if view.sel.is_some_and(|s| s.anchor == s.head) {
+                            view.clear_selection_state();
+                        }
+                    }
+                    if let Some(node) = view.report_node.take() {
+                        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+                        if let Some(cell) = view.screen_cell(node, pos) {
+                            view.send_pointer(node, PtrAction::Release, cell, mods);
+                        }
+                    }
                 }),
             )
             .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, _cx| {
@@ -439,8 +663,8 @@ impl Render for WorkspaceView {
                     view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
                 }
             }))
-            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, _cx| {
-                view.handle_key(ev, window);
+            .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
+                view.handle_key(ev, window, cx);
             }));
 
         for (idx, (id, nv)) in cards.iter().enumerate() {
@@ -513,6 +737,11 @@ impl Render for WorkspaceView {
                 );
             }
 
+            // Range de seleção (normalizado) para ESTE card, se a seleção pertence a ele.
+            let card_sel = self
+                .sel
+                .filter(|s| s.node == node_id)
+                .map(|s| normalize_sel(s.anchor, s.head));
             // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
             let mut body = div()
                 .id(("grid", card_eid))
@@ -521,11 +750,18 @@ impl Render for WorkspaceView {
                 .flex_1()
                 .overflow_hidden()
                 .p_1()
-                .bg(rgb(0x0d1228));
+                .bg(rgb(0x0d1228))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, ev: &MouseDownEvent, _w, _cx| {
+                        // Sobre o grid: mouse reporting (se o TUI pediu) OU inicia seleção.
+                        view.pointer_down(node_id, ev);
+                    }),
+                );
             let grid = lock(&self.nodes.grids).get(&node_id).cloned();
             if let Some(g) = grid {
                 let screen = lock(&g).screen();
-                body = body.child(render_grid(&screen, z));
+                body = body.child(render_grid(&screen, z, card_sel));
             }
 
             let card = div()
@@ -560,6 +796,22 @@ impl Render for WorkspaceView {
                         ScrollDelta::Lines(p) => p.y,
                         ScrollDelta::Pixels(p) => p.y / px(CELL_H),
                     };
+                    // Mouse reporting: tenta reportar a roda (atômico); se o TUI consumiu, NÃO rola
+                    // o scrollback. Sem pré-check separado de reporting (evita a corrida).
+                    if dy != 0.0 {
+                        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+                        if let Some(cell) = view.screen_cell(node_id, pos) {
+                            let action = if dy > 0.0 {
+                                PtrAction::WheelUp
+                            } else {
+                                PtrAction::WheelDown
+                            };
+                            if view.send_pointer(node_id, action, cell, mods) {
+                                return;
+                            }
+                        }
+                    }
                     let delta = dy.round() as i32;
                     if delta != 0 {
                         let grid = lock(&view.nodes.grids).get(&node_id).cloned();
