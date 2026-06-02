@@ -8,6 +8,9 @@ license.workspace = true
 # estado vivo (`lina whoami --bootstrap`). Puro Rust, ZERO LLM. Consome `lina-role-discovery`.
 [dependencies]
 lina-role-discovery = { path = "../lina-role-discovery" }
+# W3-4: o bin `lina ask`/`handshake` reusa o contrato `lina/msg@1` (MailMessage) e a Mailbox de
+# `lina-core` — UM ÚNICO tipo de envelope (sem fragmentação). Sem ciclo: lina-core não depende daqui.
+lina-core = { path = "../lina-core" }
 # serde/serde_json locais a ESTE crate (escopo da story) — mesmo padrão de lina-role-discovery
 # (serde local). Serializa o BootstrapInput: o app escreve `.lina/bootstrap.json`, o bin `lina` lê.
 serde = { version = "1", features = ["derive"] }
