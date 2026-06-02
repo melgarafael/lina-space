@@ -14,7 +14,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use lina_bootstrap::{autonomy_from_env, pretooluse_output, BootstrapInput, Bootstrapper};
-use lina_core::{check_action, parse_autonomy, DomainEvent, EventStore, MailMessage, Mailbox};
+use lina_core::{
+    check_action, now_ms, parse_autonomy, CostLedger, DomainEvent, EventStore, MailMessage, Mailbox,
+};
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
 const INPUT_PATH: &str = ".lina/bootstrap.json";
@@ -27,6 +29,7 @@ fn main() -> ExitCode {
         Some("handshake") => run_handshake(),
         Some("plan") => run_plan(&args[1..]),
         Some("guard") => run_guard(&args[1..]),
+        Some("resume") => run_resume(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -36,7 +39,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume --confirm   (W3-7c: retoma o workspace pausado pelo teto de custo; gate humano)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume --confirm: tira do estado Paused apos teto de custo; sem --confirm, nao faz nada)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)"
     );
 }
 
@@ -353,6 +356,47 @@ fn run_pretooluse() -> ExitCode {
     }
     println!("{}", pretooluse_output(&raw, &autonomy_from_env()));
     ExitCode::SUCCESS
+}
+
+/// `lina resume --confirm` (W3-7c, §2.2) — **GATE humano de retomada do teto de custo.** Sem
+/// `--confirm`, não faz nada (a retomada exige confirmação explícita — invariante #6: estado salvo,
+/// humano decide). Com `--confirm`: se o workspace está `Paused` (CostLedger reconstruído do log),
+/// apenda `CostCeilingResumed` (sai de Paused + abre nova janela contábil). Se não está pausado, é
+/// no-op informativo. Mesmo event store que o supervisor projeta (invariante #4).
+fn run_resume(args: &[String]) -> ExitCode {
+    if !args.iter().any(|a| a == "--confirm") {
+        eprintln!("lina: resume exige --confirm (gate humano de retomada do teto de custo)");
+        usage();
+        return ExitCode::from(2);
+    }
+    let mut store = match EventStore::open(events_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: falha ao abrir o event store: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let ledger = match CostLedger::replay(&store, now_ms()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("lina: falha ao reconstruir o ledger de custo: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if !ledger.paused {
+        println!("ok: workspace nao esta pausado (nada a retomar)");
+        return ExitCode::SUCCESS;
+    }
+    match store.append(&DomainEvent::CostCeilingResumed { day: ledger.day }) {
+        Ok(_) => {
+            println!("ok: workspace retomado (teto de custo liberado; nova janela contabil)");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao apendar CostCeilingResumed: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// `lina handshake` — registra presença (0 broadcast) e lista os colegas do workspace.

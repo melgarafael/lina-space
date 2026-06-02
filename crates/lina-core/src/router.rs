@@ -61,6 +61,10 @@ pub struct RouterConfig {
     pub autonomy: AutonomyLevel,
     /// W3-7b: teto de tempo de um `await` sem reply (fecha por `Timeout` no sweep do `pump`).
     pub await_timeout_ms: u64,
+    /// W3-7c (§2.2): teto de tokens por workspace/dia. `0` = DESLIGADO (sem teto). Ao a soma da
+    /// janela contábil atingir este valor, o workspace entra em `Paused` (gate humano via `lina
+    /// resume`, não kill — invariante #6).
+    pub token_budget_day: u64,
 }
 
 impl Default for RouterConfig {
@@ -72,6 +76,7 @@ impl Default for RouterConfig {
             fanout_gate: FANOUT_GATE,
             autonomy: AutonomyLevel::Assisted,
             await_timeout_ms: AWAIT_TIMEOUT_MS,
+            token_budget_day: 0, // desligado por padrão (opt-in por workspace)
         }
     }
 }
@@ -100,6 +105,10 @@ pub enum RouteOutcome {
     /// W3-7 (§2.1): adicionar `sender→target` fecharia um CICLO no grafo de handoffs do mesmo
     /// `root_cause_id` (A→B→A por mensagens novas) — ortogonal a `hops`/`trace`.
     LoopDetected,
+    /// W3-7c (§2.2): o teto de custo (`token_budget_day`) foi atingido — o workspace está `Paused`.
+    /// A delegação NÃO é entregue; é um GATE (humano confirma com `lina resume --confirm`), não kill.
+    /// DISTINTO de `BudgetExceeded` (orçamento de DELEGAÇÃO por `root_cause_id`); este é o teto de TOKENS.
+    CostCeiling,
     /// A entrega faseada falhou (PTY do alvo).
     DeliveryFailed(String),
     /// Falha ao persistir o roteamento no event log (não entregamos o que não logamos).
@@ -341,6 +350,32 @@ impl Router {
         }
 
         let is_deleg = is_delegation(&msg.intent);
+
+        // ── Guardrail (§2.2): TETO DE CUSTO por workspace/dia. Workspace-level (precede o orçamento
+        //    por-cadeia): se a soma de uso da janela contábil atingiu `token_budget_day`, o workspace
+        //    está `Paused` e nenhuma delegação sai — é GATE humano (`lina resume`), não kill (inv #6).
+        //    DISTINTO de `BudgetExceeded` (delegação/root). `CostCeilingHit` é apendado SÓ na TRANSIÇÃO
+        //    para Paused (anti-amplificação A4): se já pausado, bloqueia sem re-logar. Event-sourced:
+        //    o ledger é reconstruído do log (invariante #4), então o teste pode semear o uso direto.
+        if is_deleg && self.config.token_budget_day > 0 {
+            let ledger = match CostLedger::replay(store, now_ms) {
+                Ok(l) => l,
+                // Não conseguimos LER o log para somar o uso → falha segura (não roteia).
+                Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+            };
+            if ledger.paused {
+                return RouteOutcome::CostCeiling; // já pausado: bloqueia sem re-apender (A4)
+            }
+            if ledger.tokens >= self.config.token_budget_day {
+                if let Err(e) = store.append(&DomainEvent::CostCeilingHit {
+                    day: ledger.day.clone(),
+                    tokens: ledger.tokens,
+                }) {
+                    return RouteOutcome::PersistFailed(e.to_string());
+                }
+                return RouteOutcome::CostCeiling; // transição → Paused
+            }
+        }
 
         // ── Guardrail 3: orçamento por `(root_cause_id, agente)`. Com a propagação do root (A2),
         //    delegações da mesma cadeia acumulam contra o mesmo root (antes cada msg nova era uma
@@ -857,10 +892,82 @@ fn reaches(adj: &HashMap<NodeId, Vec<NodeId>>, start: NodeId, goal: NodeId) -> b
     false
 }
 
+/// **W3-7c (§2.2): teto de custo — agregador de uso por workspace/dia, EVENT-SOURCED.** Reconstrói
+/// o estado do teto varrendo o event log (invariante #4: o log é a fonte da verdade; nada de campo
+/// efêmero) — mesmo padrão do grafo anti-loop (`handoff_would_loop`). Não toca o `ProjectedState`:
+/// o uso/teto são META do canvas, mas observáveis e replayáveis.
+///
+/// **Janela contábil:** soma os `TokenUsageReported` apendados DEPOIS do último `CostCeilingResumed`
+/// (que zera a janela). Sem o reset, retomar reabriria com a soma anterior ainda > teto e a próxima
+/// delegação re-pausaria — `lina resume` não "reabriria" de fato. `paused` segue o último evento de
+/// teto visto (`CostCeilingHit` → pausado; `CostCeilingResumed` → liberado).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostLedger {
+    /// Dia-UTC (`YYYY-MM-DD`) DERIVADO do relógio do roteador (`now_ms`) — rótulo do `CostCeilingHit`.
+    pub day: String,
+    /// Soma de tokens da janela contábil atual (desde o último `CostCeilingResumed`).
+    pub tokens: u64,
+    /// `true` se o workspace está em `Paused` (último evento de teto foi um `CostCeilingHit`).
+    pub paused: bool,
+}
+
+impl CostLedger {
+    /// Reconstrói o ledger do log. `now_ms` define o rótulo `day` (UTC) do teto eventual.
+    ///
+    /// # Errors
+    /// Falha ao ler o event log.
+    pub fn replay(store: &EventStore, now_ms: u64) -> Result<Self, StoreError> {
+        let mut tokens: u64 = 0;
+        let mut paused = false;
+        for rec in store.events()? {
+            match rec.kind.as_str() {
+                "TokenUsageReported" => {
+                    let t = rec
+                        .payload
+                        .get("tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    tokens = tokens.saturating_add(t);
+                }
+                "CostCeilingHit" => paused = true,
+                // Retomada humana: sai de Paused E zera a janela contábil (novo período).
+                "CostCeilingResumed" => {
+                    paused = false;
+                    tokens = 0;
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            day: utc_day(now_ms),
+            tokens,
+            paused,
+        })
+    }
+}
+
+/// Dia-UTC (`YYYY-MM-DD`) de um instante em ms desde a época. Algoritmo civil-from-days de Howard
+/// Hinnant (puro, sem dependência de fuso/calendário externo) — determinístico para o rótulo do teto.
+fn utc_day(now_ms: u64) -> String {
+    let days = (now_ms / 86_400_000) as i64; // dias inteiros desde 1970-01-01 (UTC)
+                                             // civil_from_days: converte a contagem de dias na época para (ano, mês, dia) do calendário civil.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{DomainEvent, EventStore};
+    use crate::events::{DomainEvent, EventRecord, EventStore};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1936,6 +2043,133 @@ mod tests {
         );
         assert!(rec2.borrow().is_empty(), "NENHUMA 2ª injeção no PTY");
         assert!(!infl.exists(), "órfão confirmado (.inflight limpo)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Registros de um `kind` no log (helper das asserções do teto de custo).
+    fn records_of_kind(store: &EventStore, kind: &str) -> Vec<EventRecord> {
+        store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == kind)
+            .collect()
+    }
+
+    /// **AC-7.2 (W3-7c) — TETO DE CUSTO, headless via event log.** Semeando eventos de uso
+    /// (`TokenUsageReported`) que SOMAM > `token_budget_day`, a próxima delegação retorna o outcome
+    /// NOVO `CostCeiling` E apenda `CostCeilingHit{day, tokens}` (workspace `Paused`, observável no
+    /// log). ANTES do teto, a delegação é normal (sem `CostCeilingHit`). `CostCeilingResumed` (o que
+    /// `lina resume --confirm` apenda) REABRE a janela: a delegação volta a funcionar. Distinto do
+    /// orçamento de delegação (`BudgetExceeded`).
+    #[test]
+    fn cost_ceiling_pauses_delegation_until_resume() {
+        const NOW: u64 = 1_700_000_000_000; // ms fixos (≈2023-11-14 UTC) → `day` determinístico
+        let dir = std::env::temp_dir().join(format!("lina-router-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sup = Arc::new(Supervisor::new());
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let cfg = RouterConfig {
+            token_budget_day: 100,
+            ..RouterConfig::default()
+        };
+        let mut router =
+            Router::with_config(Arc::clone(&sup), Mailbox::new(dir.join(".lina")), cfg);
+        let mut ts = TmpStore::new("cost");
+        let (rec, mut deliver) = recorder();
+
+        // ── (1) ANTES do teto (uso=0 < 100): delegação NORMAL, sem CostCeilingHit.
+        let m1 = MailMessage::new("@A", "@B", "ask", "antes");
+        assert!(
+            matches!(
+                router.route_message(&m1, &mut ts.store, NOW, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "antes do teto a delegação deve entregar normalmente"
+        );
+        assert!(
+            records_of_kind(&ts.store, "CostCeilingHit").is_empty(),
+            "sem uso reportado, nenhum teto pode ter sido batido"
+        );
+
+        // ── Semeia o USO direto no store (no app, viria do fim-de-resposta da CLI — W0-10): 70 + 80
+        //    = 150 > 100. É a FONTE de uso event-sourced que o CostLedger soma por replay.
+        ts.store
+            .append(&DomainEvent::TokenUsageReported {
+                node: "@B".into(),
+                tokens: 70,
+            })
+            .expect("seed usage 70");
+        ts.store
+            .append(&DomainEvent::TokenUsageReported {
+                node: "@B".into(),
+                tokens: 80,
+            })
+            .expect("seed usage 80");
+
+        // ── (2) Uso (150) ≥ teto (100): a próxima delegação retorna CostCeiling, NÃO entrega, e
+        //    apenda CostCeilingHit{day, tokens}; o workspace fica Paused (observável no log).
+        let before = rec.borrow().len();
+        let m2 = MailMessage::new("@A", "@B", "ask", "estoura");
+        assert_eq!(
+            router.route_message(&m2, &mut ts.store, NOW, &mut deliver),
+            RouteOutcome::CostCeiling,
+            "ao atingir o teto, a delegação é gateada (Paused), não entregue"
+        );
+        assert_eq!(
+            rec.borrow().len(),
+            before,
+            "NADA foi entregue ao PTY no teto"
+        );
+        let hits = records_of_kind(&ts.store, "CostCeilingHit");
+        assert_eq!(hits.len(), 1, "exatamente 1 CostCeilingHit na transição");
+        assert_eq!(
+            hits[0].payload.get("tokens").and_then(|v| v.as_u64()),
+            Some(150),
+            "o hit registra a soma da janela"
+        );
+        assert_eq!(
+            hits[0].payload.get("day").and_then(|v| v.as_str()),
+            Some(utc_day(NOW).as_str()),
+            "o hit registra o dia-UTC derivado do relógio do roteador"
+        );
+        // Projeção observável do estado Paused, reconstruída do log (invariante #4).
+        assert!(
+            CostLedger::replay(&ts.store, NOW).expect("ledger").paused,
+            "o ledger reconstruído do log deve indicar Paused"
+        );
+
+        // ── (2b) ANTI-AMPLIFICAÇÃO (A4): já pausado, uma nova delegação ainda bloqueia, mas NÃO
+        //    apenda um 2º CostCeilingHit.
+        let m3 = MailMessage::new("@A", "@B", "ask", "ainda pausado");
+        assert_eq!(
+            router.route_message(&m3, &mut ts.store, NOW, &mut deliver),
+            RouteOutcome::CostCeiling
+        );
+        assert_eq!(
+            records_of_kind(&ts.store, "CostCeilingHit").len(),
+            1,
+            "delegação sob Paused não re-apenda o teto (anti-amplificação)"
+        );
+
+        // ── (3) RETOMADA: `lina resume --confirm` apenda CostCeilingResumed → sai de Paused e ZERA a
+        //    janela. A delegação volta a funcionar (sem re-pausar com a soma antiga).
+        ts.store
+            .append(&DomainEvent::CostCeilingResumed { day: utc_day(NOW) })
+            .expect("resume");
+        assert!(
+            !CostLedger::replay(&ts.store, NOW).expect("ledger").paused,
+            "após resume o workspace não está mais Paused"
+        );
+        let m4 = MailMessage::new("@A", "@B", "ask", "depois do resume");
+        assert!(
+            matches!(
+                router.route_message(&m4, &mut ts.store, NOW, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "após resume a delegação volta a entregar"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

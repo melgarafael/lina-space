@@ -180,6 +180,27 @@ pub enum DomainEvent {
         class: String,
         decision: String,
     },
+    /// W3-7c (§2.2): uso de tokens REPORTADO para um nó. É a FONTE de uso do teto de custo — o app
+    /// a emite ao observar o fim-de-resposta da CLI (W0-10); aqui o `CostLedger` (router) a soma por
+    /// janela contábil. META — sem efeito na projeção do canvas; o ledger reconstrói por replay.
+    TokenUsageReported {
+        node: String,
+        tokens: u64,
+    },
+    /// W3-7c (§2.2): a soma de uso da janela atingiu `token_budget_day` → o workspace entrou em
+    /// `Paused`. Livro-razão do teto (mesmo princípio do `RouteBlocked`): apendado SÓ na TRANSIÇÃO
+    /// para Paused (anti-amplificação A4 — não a cada delegação bloqueada). É GATE, não kill: o
+    /// estado fica salvo e visível (invariante #6) até `lina resume --confirm`.
+    CostCeilingHit {
+        day: String,
+        tokens: u64,
+    },
+    /// W3-7c (§2.2): humano confirmou a retomada (`lina resume --confirm`) → sai de `Paused` e ABRE
+    /// uma nova janela contábil (o ledger zera a soma a partir daqui; sem isso, a soma anterior
+    /// re-pausaria na próxima delegação).
+    CostCeilingResumed {
+        day: String,
+    },
     /// W3-5: um item foi semeado no plano compartilhado (`status:todo`, `@owner:?`).
     PlanItemAdded {
         item: String,
@@ -233,6 +254,9 @@ impl DomainEvent {
             DomainEvent::AwaitOpened { .. } => "AwaitOpened",
             DomainEvent::AwaitClosed { .. } => "AwaitClosed",
             DomainEvent::ActionGated { .. } => "ActionGated",
+            DomainEvent::TokenUsageReported { .. } => "TokenUsageReported",
+            DomainEvent::CostCeilingHit { .. } => "CostCeilingHit",
+            DomainEvent::CostCeilingResumed { .. } => "CostCeilingResumed",
             DomainEvent::PlanItemAdded { .. } => "PlanItemAdded",
             DomainEvent::PlanDecisionAdded { .. } => "PlanDecisionAdded",
             DomainEvent::PlanClaimed { .. } => "PlanClaimed",
@@ -400,6 +424,11 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::AwaitOpened { .. }
         | DomainEvent::AwaitClosed { .. }
         | DomainEvent::ActionGated { .. }
+        // W3-7c: uso/teto de custo são META — o `CostLedger` (router) os reconstrói varrendo o log,
+        // não pela projeção do canvas (mesmo padrão do grafo anti-loop §2.1).
+        | DomainEvent::TokenUsageReported { .. }
+        | DomainEvent::CostCeilingHit { .. }
+        | DomainEvent::CostCeilingResumed { .. }
         | DomainEvent::NoteUpdated { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }

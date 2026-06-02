@@ -54,7 +54,7 @@ pub use mailbox::{
 /// W3-4: roteador do supervisor (pipeline `route_message` com guardrails 0-4).
 mod router;
 pub use router::{
-    AutonomyLevel, PlanOpError, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS,
+    AutonomyLevel, CostLedger, PlanOpError, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS,
     DELEGATION_BUDGET, FANOUT_GATE, MAX_DEPTH,
 };
 
