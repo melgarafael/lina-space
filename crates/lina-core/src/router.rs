@@ -131,6 +131,12 @@ pub enum RouteOutcome {
     /// no `.inflight`, durável), NÃO injetada. Drena ao [`Router::resume`]. É GATE humano, não kill
     /// (inv #6): nada se perde, o estado fica salvo e visível.
     Queued,
+    /// FIX #22 (backlog): PING DE PRESENÇA (`lina handshake`, `intent=handshake`, `to=*`) reconhecido e
+    /// absorvido. Fire-and-forget: o roster vivo é do Supervisor (events.rs:141), então esta msg NÃO
+    /// delega, NÃO entrega a ninguém (0 broadcast) e — crucialmente — NÃO loga `RouteBlocked`. DISTINTO
+    /// de `UnknownSender("")`: o drain FLAT do handshake anonimiza `from → ""`, e antes deste desfecho a
+    /// presença morria como erro espúrio no log (ruído que PARECIA falha, mas é o caminho esperado).
+    Presence,
 }
 
 /// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
@@ -384,6 +390,17 @@ impl Router {
         }
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
         self.seen.insert(msg.id.clone(), now_ms);
+
+        // ── FIX #22 (backlog): PING DE PRESENÇA (`lina handshake`: intent=handshake, to=*) é
+        //    fire-and-forget — o roster vivo é do Supervisor (events.rs:141), não desta rota. Desviado
+        //    AQUI, ANTES da resolução de `from`: o drain FLAT do handshake ANONIMIZA `from → ""`, então
+        //    sem este desvio a presença morreria em `UnknownSender("")` + `RouteBlocked` ESPÚRIO — ruído
+        //    que PARECE erro no stderr do app mas é o caminho esperado. Não delega, não entrega, e NÃO
+        //    loga erro. Erros REAIS (ask/handoff com alvo inválido, ou qualquer intent ≠ handshake)
+        //    seguem o pipeline normal e AINDA logam `RouteBlocked` — não mascaramos nada além da presença.
+        if is_presence(msg) {
+            return RouteOutcome::Presence;
+        }
 
         // ── Guardrail 0a (Round 6 — ELEVADO p/ ANTES do desvio de plano): remetente existe no roster
         //    vivo. O `NodeId` resolvido é a ORIGEM autenticada — TANTO a delegação QUANTO o intent de
@@ -911,6 +928,15 @@ fn is_plan_intent(intent: &str) -> bool {
     matches!(intent, "plan.claim" | "plan.check")
 }
 
+/// FIX #22: `true` se a mensagem é um PING DE PRESENÇA (`lina handshake`): `intent == "handshake"` E
+/// alvo broadcast (`to == "*"`). Fire-and-forget — o roster vivo é do Supervisor (events.rs:141); a msg
+/// não delega nem entrega a ninguém. Reconhecê-la cedo evita o `UnknownSender("")` + `RouteBlocked`
+/// espúrio (o drain FLAT do handshake anonimiza `from → ""`). Exige AMBOS os predicados → um `ask`/
+/// `handoff` real com alvo inválido (intent ≠ handshake) NÃO casa e segue logando como erro REAL.
+fn is_presence(msg: &MailMessage) -> bool {
+    msg.intent.as_str() == "handshake" && matches!(parse_target(&msg.to), TargetSpec::Broadcast)
+}
+
 /// `intent` ou `"ask"` se vazio (default canônico).
 fn intent_or_ask(intent: &str) -> String {
     if intent.is_empty() {
@@ -1332,6 +1358,68 @@ mod tests {
             outcomes[0].1,
             RouteOutcome::UnknownSender(String::new()),
             "FLAT anonimizado → from vazio → UnknownSender(\"\") (a assinatura do log de uso real)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX #22 (backlog) — o `lina handshake` (presença, `to=*`) é absorvido como `Presence` e NÃO
+    /// loga `RouteBlocked`: o ruído "mensagem … não roteada: UnknownSender(\"\")" no stderr do app some
+    /// na ORIGEM (sem desfecho de erro). Exatamente o caminho FLAT do `flat_outbox_…` acima, só que com
+    /// `intent=handshake` + `to=*` — e o desfecho inverte de erro para presença benigna.
+    #[test]
+    fn handshake_presence_is_absorbed_not_route_blocked() {
+        let (mut router, sup, dir) = router_with("presence");
+        let _a = sup.register("Terminal A", None, sink());
+        let mut ts = TmpStore::new("presence");
+        let (rec, mut deliver) = recorder();
+
+        // Como o `lina handshake` real (lina.rs): enqueue FLAT, intent=handshake, to=*.
+        router
+            .mailbox()
+            .enqueue(&MailMessage::new(
+                "Terminal A",
+                "*",
+                "handshake",
+                "Terminal A entrou no workspace",
+            ))
+            .expect("enqueue handshake");
+
+        let outcomes = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            RouteOutcome::Presence,
+            "handshake é presença benigna, não UnknownSender(\"\")"
+        );
+        assert!(
+            blocked_reasons(&ts.store).is_empty(),
+            "presença NÃO loga RouteBlocked — sem ruído de erro no log (a fonte do stderr do app)"
+        );
+        assert!(
+            rec.borrow().is_empty(),
+            "0 broadcast: a presença não injeta em ninguém"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX #22 — NÃO mascaramos erros REAIS: uma msg de delegação (`ask`) com `from` resolvível mas
+    /// alvo INEXISTENTE AINDA loga `RouteBlocked{no_target}`. Só o handshake/presença é silenciado.
+    #[test]
+    fn real_message_with_invalid_target_still_logs_block() {
+        let (mut router, sup, dir) = router_with("realbad");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("realbad");
+        let (_rec, mut deliver) = recorder();
+
+        // from resolvível (@A), to inexistente (@Ghost), intent REAL (ask) → NoTarget + RouteBlocked.
+        let msg = MailMessage::new("@A", "@Ghost", "ask", "oi");
+        let outcome = router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+        assert_eq!(outcome, RouteOutcome::NoTarget);
+        assert!(
+            blocked_reasons(&ts.store)
+                .iter()
+                .any(|r| r == "no_target"),
+            "erro REAL (alvo inválido) AINDA loga RouteBlocked — a presença não afrouxou o pipeline"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

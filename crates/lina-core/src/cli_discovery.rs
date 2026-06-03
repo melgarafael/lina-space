@@ -7,8 +7,11 @@
 //! em caminho de produção. A varredura do `PATH` é fatorada numa função pura
 //! ([`find_in_path`]) injetável por teste; a resolução de versão é um passo separado.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -70,15 +73,85 @@ fn is_executable_file(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Roda `<bin> --version` e devolve a 1ª linha não-vazia trimada. `None` em qualquer falha
-/// (binário some, exit≠0, stdout vazio) — sem `unwrap`; o achado fica com `version: None`.
+/// W4-1 FIX #22 — teto de tempo de um `<bin> --version` (anti-DoS / PATH-poison): um binário PLANTADO
+/// que TRAVA não pode pendurar a descoberta/UI. 2s é folgado p/ um `--version` legítimo (resolve em ms)
+/// e curto o bastante p/ não travar o check-up. Injetável por [`query_version_with_timeout`] (teste rápido).
+const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// W4-1 FIX #22 — teto de BYTES lidos do stdout (anti-flood): um binário que despeja saída infinita não
+/// pode estourar memória nem girar p/ sempre. Um `--version` real cabe de sobra em 4 KiB.
+const MAX_VERSION_BYTES: usize = 4096;
+
+/// Roda `<bin> --version` e devolve a 1ª linha não-vazia trimada. `None` em qualquer falha (binário
+/// some, exit≠0, stdout vazio, TIMEOUT) — sem `unwrap`; o achado fica com `version: None`. Usa o teto
+/// de tempo padrão ([`VERSION_TIMEOUT`]); a varredura segue mesmo que um CLI trave (FIX #22).
 #[must_use]
 pub fn query_version(bin: &Path) -> Option<String> {
-    let out = Command::new(bin).arg("--version").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
+    query_version_with_timeout(bin, VERSION_TIMEOUT)
+}
+
+/// [`query_version`] com timeout INJETÁVEL — teste determinístico e rápido (não precisa esperar os 2s
+/// de produção). Spawna `<bin> --version`, lê o stdout num thread com TETO de bytes ([`MAX_VERSION_BYTES`])
+/// e espera no máx. `timeout`; se estourar, **mata o filho** e devolve `None` (a descoberta NÃO trava
+/// nem entra em pânico — invariante #2 local-first segue intacta). `stderr` é descartado p/ não bloquear
+/// em flood de erro.
+#[must_use]
+pub fn query_version_with_timeout(bin: &Path, timeout: Duration) -> Option<String> {
+    let mut child = Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Lê o stdout FORA da thread de espera, com teto de bytes, e sinaliza o fim por canal. Sem isto, um
+    // filho que enche o buffer do pipe (e não sai) travaria a leitura — e o timeout abaixo é quem o mata.
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(256);
+        let mut chunk = [0_u8; 256];
+        loop {
+            match out.read(&mut chunk) {
+                Ok(0) => break, // EOF (o filho fechou o stdout)
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() >= MAX_VERSION_BYTES {
+                        break; // teto de bytes: para de acumular (anti-flood)
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(buf); // canal pode estar fechado (timeout já desistiu): ignore.
+    });
+
+    let result = match rx.recv_timeout(timeout) {
+        // O reader terminou (EOF ou teto). Encerra o filho (no-op se já saiu — devolve o status real do
+        // zumbi; encerra de fato se o teto cortou e ele ainda escrevia) e lê o status p/ o mesmo
+        // contrato do código original (exit≠0 → sem versão).
+        Ok(buf) => {
+            let _ = child.kill();
+            match child.wait() {
+                Ok(status) if status.success() => parse_version(&buf),
+                _ => None,
+            }
+        }
+        // TIMEOUT (ou reader morto): mata o filho e desiste — a descoberta NÃO pendura.
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    };
+    let _ = reader.join(); // o kill fechou o pipe → o reader desbloqueia e encerra (sem thread órfã).
+    result
+}
+
+/// 1ª linha não-vazia trimada do stdout de um `--version` (UTF-8 lossy). Fatorada p/ clareza e teste.
+fn parse_version(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
@@ -190,5 +263,53 @@ mod tests {
     #[test]
     fn discover_empty_path_finds_nothing() {
         assert!(discover_clis_in("").is_empty());
+    }
+
+    /// Escreve um "CLI" falso EXECUTÁVEL com um corpo de script arbitrário (p/ simular travamento etc.).
+    #[cfg(unix)]
+    fn write_cli_script(dir: &Path, id: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(id);
+        std::fs::write(&p, body).expect("escrever cli falso");
+        let mut perm = std::fs::metadata(&p).expect("metadata").permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).expect("chmod");
+        p
+    }
+
+    /// FIX #22 — um binário que TRAVA no `--version` não pendura a descoberta: o timeout o mata e
+    /// devolve `None` LOGO (não nos 30s do sleep). Timeout injetado curto p/ o teste ser rápido.
+    #[cfg(unix)]
+    #[test]
+    fn query_version_times_out_on_hanging_binary() {
+        use std::time::Instant;
+        let dir = TempDir::new("hang");
+        // `exec sleep` → o PRÓPRIO processo filho dorme (1 só PID), então `kill` o encerra de fato.
+        let bin = write_cli_script(dir.path(), "claude", "#!/bin/sh\nexec sleep 30\n");
+
+        let t0 = Instant::now();
+        let v = query_version_with_timeout(&bin, Duration::from_millis(200));
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            v, None,
+            "binário travado → sem versão (não bloqueia a descoberta)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deve retornar logo após o timeout (~200ms), não pendurar — levou {elapsed:?}"
+        );
+    }
+
+    /// FIX #22 — regressão: um `--version` NORMAL (rápido) AINDA resolve sob o caminho com timeout.
+    #[cfg(unix)]
+    #[test]
+    fn query_version_resolves_fast_binary_under_timeout() {
+        let dir = TempDir::new("fast");
+        let bin = write_fake_cli(dir.path(), "claude", "claude 1.2.3");
+        assert_eq!(
+            query_version_with_timeout(&bin, Duration::from_secs(2)).as_deref(),
+            Some("claude 1.2.3"),
+        );
     }
 }
