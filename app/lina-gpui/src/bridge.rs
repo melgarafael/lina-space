@@ -510,6 +510,7 @@ impl MailboxPump {
             match outcome {
                 RouteOutcome::Delivered { .. } | RouteOutcome::Duplicate => routed = true,
                 RouteOutcome::Queued => {} // freio ativo: enfileirada de propósito, sem ruído
+                RouteOutcome::Presence => {} // ping de presença (handshake/broadcast): absorvido, sem ruído
                 other => eprintln!("lina-gpui: mensagem {id} não roteada: {other:?}"),
             }
         }
