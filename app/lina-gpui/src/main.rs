@@ -1218,7 +1218,9 @@ impl Render for WorkspaceView {
             }
         }
 
-        // Barra superior.
+        // Barra superior. BUG 3: `flex_wrap` → os botões QUEBRAM em 2+ linhas quando não cabem na
+        // largura (nada é "comido"/cortado; tudo acessível em qualquer tamanho de janela, sem scroll
+        // escondido). `gap_2` (mais compacto que `gap_4`) cabe mais por linha.
         let mut topbar = div()
             .absolute()
             .top_0()
@@ -1226,8 +1228,9 @@ impl Render for WorkspaceView {
             .right_0()
             .flex()
             .flex_row()
+            .flex_wrap()
             .items_center()
-            .gap_4()
+            .gap_2()
             .px_4()
             .py_2()
             .bg(rgb(0x0c1130))
@@ -1425,10 +1428,18 @@ impl Render for WorkspaceView {
         let paused = lock(&self.brake).paused;
         // W4-6 gap3: o rótulo do rodapé reflete o EFETIVO (fonte única) — não o override cru.
         let reduce_motion = a11y::reduce_motion_effective(self.reduce_motion);
+        // BUG 5: rótulo em linguagem de leigo (sem "orquestração" cru) + legenda explicando o que faz.
         let (freio_bg, freio_txt) = if paused {
-            (0x2c7a4b, "▶ Retomar orquestração")
+            (0x2c7a4b, "▶ Retomar cooperação dos agentes")
         } else {
-            (0xe0af68, "⏸ Pausar orquestração")
+            (0xe0af68, "⏸ Pausar cooperação dos agentes")
+        };
+        // BUG 5: o toggle deixa EXPLÍCITO o que liga/desliga (ANIMAÇÕES) + cor de estado óbvia (âmbar
+        // quando desligadas = "redução ativa"). `reduce_motion` já é o EFETIVO (fonte única, W4-6).
+        let (anim_bg, anim_fg, anim_txt) = if reduce_motion {
+            (0xe0af68, 0x11111b, "🎞 Animações: DESLIGADAS")
+        } else {
+            (0x2a3152, 0xc8d3f5, "🎞 Animações: ligadas")
         };
         let mut footer = div()
             .absolute()
@@ -1437,8 +1448,10 @@ impl Render for WorkspaceView {
             .right_0()
             .flex()
             .flex_row()
+            // BUG 3: o rodapé também QUEBRA em linhas quando não cabe (freio + animações + legenda).
+            .flex_wrap()
             .items_center()
-            .gap_4()
+            .gap_2()
             .px_4()
             .py_2()
             .bg(rgb(0x0c1130))
@@ -1463,21 +1476,21 @@ impl Render for WorkspaceView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x2a3152))
-                    .text_color(rgb(0xc8d3f5))
+                    .bg(rgb(anim_bg))
+                    .text_color(rgb(anim_fg))
                     .cursor_pointer()
                     .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
                         view.reduce_motion = !view.reduce_motion;
                     }))
-                    .child(text!(if reduce_motion {
-                        "🎞 Movimento: desligado"
-                    } else {
-                        "🎞 Movimento: ligado"
-                    })),
-            );
+                    .child(text!(anim_txt)),
+            )
+            // BUG 5: legenda SEMPRE visível explicando o freio em linguagem de leigo.
+            .child(div().text_color(rgb(0x5b658f)).child(text!(
+                "ℹ Cooperação = os agentes se delegam tarefas sozinhos · Pausar segura isso (nada se perde, retoma quando quiser)"
+            )));
         if paused {
             footer = footer.child(div().text_color(rgb(0xe0af68)).child(text!(
-                "⏸ orquestração pausada · novas delegações ficam na fila (nada se perde)"
+                "⏸ pausado · novas delegações ficam na FILA (nada se perde; nenhum trabalho some)"
             )));
         }
 

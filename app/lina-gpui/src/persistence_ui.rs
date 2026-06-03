@@ -744,23 +744,28 @@ impl PersistenceView {
                     .flex_row()
                     .items_center()
                     .gap_3()
+                    // BUG 5: rótulo claro pelo ESTADO das animações (não o duplo-negativo "Reduzir
+                    // animações: ligado"). Botão mostra ligadas/desligadas + cor de estado óbvia.
                     .child(
                         div()
                             .w(px(160.0))
                             .text_color(rgb(TEXT))
-                            .child(text!("Reduzir animações")),
+                            .child(text!("Animações da interface")),
                     )
                     .child(self.button(
                         "toggle-reduce-motion",
                         if s.reduce_motion {
-                            "ligado"
+                            "desligadas"
                         } else {
-                            "desligado"
+                            "ligadas"
                         },
-                        if s.reduce_motion { 0x2c7a4b } else { 0x2a3152 },
+                        if s.reduce_motion { 0xe0af68 } else { 0x2a3152 },
                         cx,
                         |v, _w, _cx| v.model.toggle_reduce_motion(),
-                    )),
+                    ))
+                    .child(div().text_color(rgb(MUTED)).child(text!(
+                        "(desligar reduz o movimento na tela — acessibilidade)"
+                    ))),
             )
             .child(
                 div()
