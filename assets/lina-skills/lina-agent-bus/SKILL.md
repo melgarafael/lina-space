@@ -139,7 +139,8 @@ Esta é a metade que realiza o critério do fundador: o usuário fala em portugu
 2. **Escolha o verbo** pelo tipo de pedido:
    - pergunta curta / "fala com", "manda um oi", "pergunta" → **`lina ask`**
    - entregar/transferir uma tarefa com contexto → **`lina handoff`** (fire-and-forget por padrão)
-   - mesma coisa para vários → **`lina broadcast --role X`** (cuidado com o gate de fan-out)
+   - **avisar TODOS os terminais** ("manda pra todos", "avisa o time todo", "fala com todo mundo", "manda oi pros N terminais") → **`lina broadcast "*" "<msg>"`** — UM comando entrega a TODOS os vivos de uma vez (alternativa: `lina list` → iterar `lina ask "@Nome" "<msg>"` um a um; não precisa ser simultâneo). É a 1ª onda que VOCÊ (humano) pediu: o app entrega a TODOS **sem pedir confirmação** (como mandar no grupo do time). NÃO confunda com re-espalhar algo que um COLEGA te mandou — isso é cascata e os freios entram (ver guardrails, §7).
+   - mesma mensagem só a um PAPEL → **`lina broadcast --role X "<msg>"`** (ex.: só o QA, só os devs — não todos)
    - "vê como tá o fulano", sem mandar prompt → **`lina check`**
 3. **Narre em pt-br ANTES/ENQUANTO age** (bloco 8) e **só then** dispare o verbo.
 4. **Respeite a autonomia** (bloco 5 do system message): em `manual`, `handoff`/`broadcast` são **bloqueados** — você só PROPÕE; em `assistido`, propõe e espera o "sim"; em `autonomo`, age e narra.
@@ -151,10 +152,11 @@ Esta é a metade que realiza o critério do fundador: o usuário fala em portugu
 | "manda oi pro Terminal B" | `lina ask "@Terminal B" "oi"` | "Mandei um oi pro Terminal B. 👍" |
 | "pergunta pro arquiteto qual o contrato da API" | `lina ask "@Arquiteto" "qual o contrato da API de leads?"` | "Vou confirmar isso com quem cuida da estrutura. Já volto." |
 | "pede pro backend montar a API de leads" | `lina handoff "@Dev Backend" "montar a API de leads conforme o contrato" --ref plan:T4 --context docs/api-contract.md` | "Pedi pro nosso especialista de servidor montar a parte técnica do formulário. Te aviso quando ficar pronto." |
-| "manda todo mundo do QA revisar" | `lina broadcast "revisem a entrega do formulário" --role QA` | "Pedi pra equipe de qualidade dar uma conferida. (Se forem muitos, te peço o ok antes.)" |
+| "manda oi pros 27 terminais" / "avisa o time todo" | `lina broadcast "*" "oi, time! tudo certo por aí?"` | "Avisei todos os terminais. 👍" |
+| "manda todo mundo do QA revisar" | `lina broadcast "revisem a entrega do formulário" --role QA` | "Pedi pra equipe de qualidade dar uma conferida." |
 | "vê como tá o frontend" | `lina check "@Dev Frontend"` | "Dei uma espiada: o pessoal do visual ainda está trabalhando nisso." |
 
-> Se o pedido envolver **ação irreversível** (publicar, deploy, enviar e-mail real, gastar dinheiro) ou **fan-out grande**, PARE e peça confirmação sim/não ao usuário (bloco 7 do system message) antes de disparar.
+> Se o pedido envolver **ação irreversível** (publicar, deploy, enviar e-mail real, gastar dinheiro), PARE e peça confirmação sim/não ao usuário (bloco 7 do system message) antes de disparar. **Avisar todos os terminais NÃO é irreversível** — quando o usuário pede "manda pra todos", o pedido dele JÁ é a autorização: dispare `lina broadcast "*"` e narre (respeitando a autonomia — em `manual`/`assistido` você propõe/confirma como em qualquer ação; em `autonomo`, age e narra). O antigo "se forem muitos, peço o ok" era o gate DURO de fan-out — ele agora só vale para a CASCATA (re-espalhar), não para a 1ª onda que o humano pede.
 
 ---
 
@@ -162,12 +164,17 @@ Esta é a metade que realiza o critério do fundador: o usuário fala em portugu
 
 - `lina ask "@Nome" "pergunta"` — pergunta bloqueante curta (sem transferir dono).
 - `lina handoff "@Nome" "tarefa" [--context arq|note] [--ref plan:ID] [--await]` — delega COM cadeia de responsabilidade; **fire-and-forget por padrão**, `--await` só p/ folhas.
-- `lina broadcast "msg" --role PAPEL[,PAPEL...]` — mesma mensagem a um(ns) papel(is).
+- `lina broadcast "*" "msg"` — avisa **TODOS** os terminais vivos (fan-out de 1 comando). `--role PAPEL[,PAPEL...]` restringe a um(ns) papel(is). A 1ª onda que o humano pede entrega a todos **sem gate**; **re-espalhar** (cascata) é que pede ok.
 - `lina check "@Nome"` — lê o progresso do colega SEM mandar prompt (não interrompe).
 - `lina status RUNNING|DONE|BLOCKED "..."` — reporta seu estado ao board.
 - `lina handshake` — apresenta-se ao time (1x, turno 0).
 - `lina list` — roster vivo (quem está, papel, status, claims).
 
-**Guardrails que o app aplica sozinho** (você não precisa contá-los, mas conheça): orçamento de
-~8 delegações por turno (por `root_cause_id`), profundidade de cadeia ≤ 4 (`hops`), anti-deadlock
-(recusa `--await` recíproco), anti-loop (grafo de eventos), e gate humano em ação irreversível.
+**Guardrails que o app aplica sozinho** (você não precisa contá-los, mas conheça) — ADR 0007:
+- **Fan-out INICIAL que o humano pede** (você disparando `lina broadcast "*"` a mando dele): entrega
+  a TODOS **sem gate** — é a 1ª onda legítima, igual mandar no grupo.
+- **Freios anti-tempestade valem na CASCATA** (re-espalhar algo que um colega te mandou): aí o gate de
+  fan-out (broadcast a > N alvos → pede confirmação humana) e o orçamento (~8 delegações por
+  `root_cause_id`) entram. **Regra de ouro: nunca faça broadcast em resposta a um broadcast.**
+- **Sempre, em qualquer onda:** profundidade de cadeia ≤ 4 (`hops`), anti-deadlock (recusa `--await`
+  recíproco), anti-loop (grafo de eventos), e **gate humano + custódia em ação irreversível** (ADR 0004).

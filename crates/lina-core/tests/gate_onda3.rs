@@ -641,19 +641,45 @@ fn f_blocks_logados_e_dedupe_ausente() {
         assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"blocked_by_autonomy".to_string()));
     }
 
-    // fanout_gated (broadcast > FANOUT_GATE alvos).
+    // fanout_gated — SÓ na CASCATA (ADR 0007): o invariante MUDOU. A 1ª onda de ORIGEM pedida pelo
+    // humano (`hops==0`) entrega a TODOS sem gate; o gate de fan-out dispara quando um nó que RECEBEU
+    // uma entrega RE-ESPALHA (`hops>=1`, onde mora a tempestade). Cobrimos OS DOIS lados:
+    // (b) CASCATA > FANOUT_GATE → AINDA gateado (os 2 asserts originais, movidos para a cascata).
     {
-        let mut e = env("f-fanout", RouterConfig::default());
+        let mut e = env("f-fanout-cascata", RouterConfig::default());
+        e.sup.register("@A", None, sink());
+        e.sup.register("@Relay", None, sink());
+        for n in ["@B1", "@B2", "@B3", "@B4"] {
+            e.sup.register(n, None, sink());
+        }
+        // @A→@Relay: @Relay RECEBE uma entrega → ganha binding → seu broadcast vira CASCATA (hops>=1).
+        let seed = MailMessage::new("@A", "@Relay", "ask", "espalha isto");
+        e.router.route_message(&seed, &mut e.store, 1, &mut deliver);
+        // @Relay re-broadcasta a todos os vivos exceto ele (@A,@B1..@B4 = 5 > FANOUT_GATE=3) → GATEADO.
+        let m = MailMessage::new("@Relay", "*", "broadcast", "todos");
+        assert_eq!(
+            e.router.route_message(&m, &mut e.store, 2, &mut deliver),
+            RouteOutcome::FanoutGated { count: 5 }
+        );
+        assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"fanout_gated".to_string()));
+    }
+    // (a) ORIGEM > FANOUT_GATE → ENTREGA a TODOS, com ZERO fanout_gated (o NOVO invariante do ADR 0007).
+    {
+        let mut e = env("f-fanout-origem", RouterConfig::default());
         e.sup.register("@A", None, sink());
         for n in ["@B1", "@B2", "@B3", "@B4"] {
             e.sup.register(n, None, sink());
         }
-        let m = MailMessage::new("@A", "*", "broadcast", "todos");
-        assert_eq!(
+        // @A nunca recebeu A2A → ORIGEM (hops==0): a 1ª onda do humano entrega a todos, SEM gate humano.
+        let m = MailMessage::new("@A", "*", "broadcast", "oi a todos");
+        assert!(matches!(
             e.router.route_message(&m, &mut e.store, 1, &mut deliver),
-            RouteOutcome::FanoutGated { count: 4 }
+            RouteOutcome::Delivered { .. }
+        ));
+        assert!(
+            !block_reasons(&jsonl(&e.store_dir())).contains(&"fanout_gated".to_string()),
+            "fan-out de ORIGEM não gera fanout_gated (ADR 0007)"
         );
-        assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"fanout_gated".to_string()));
     }
 
     // budget_exceeded (root herdado acumula > DELEGATION_BUDGET).

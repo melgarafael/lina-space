@@ -27,6 +27,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("whoami") => run_whoami(args.iter().any(|a| a == "--bootstrap")),
         Some("ask") => run_ask(&args[1..]),
+        Some("broadcast") => run_broadcast(&args[1..]),
         Some("handshake") => run_handshake(),
         Some("plan") => run_plan(&args[1..]),
         Some("guard") => run_guard(&args[1..]),
@@ -42,7 +43,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -205,6 +206,22 @@ fn run_ask(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `lina broadcast "*" "<msg>"` (ou `--role PAPEL`) — açúcar de `lina ask` para o **fan-out**: avisa
+/// TODOS os nós vivos (alvo `*`) ou um papel inteiro. É um adaptador FINO sobre [`run_ask`] (reusa
+/// parsing, autenticação de origem por dir-dono e escrita no outbox); só carimba `intent=broadcast`
+/// quando não há `--intent` explícito. O destino `*` precede com naturalidade o gate de fan-out do
+/// router (ADR 0007): a 1ª onda de ORIGEM (o agente pedido pelo humano, `hops==0`) entrega a todos SEM
+/// confirmação; a CASCATA (`hops>=1`, re-espalhar) segue gateada. O alvo NÃO é default-implícito: o
+/// chamador passa `"*"` (ou `--role`) — sem alvo, recai no `usage()` do `run_ask` (sem ambiguidade).
+fn run_broadcast(args: &[String]) -> ExitCode {
+    let mut forwarded: Vec<String> = args.to_vec();
+    if !args.iter().any(|a| a == "--intent") {
+        forwarded.push("--intent".to_string());
+        forwarded.push("broadcast".to_string());
+    }
+    run_ask(&forwarded)
 }
 
 /// `lina plan ...` (W3-5) — `read` (read-only, lê o `.lina/plan.md`) | `claim`/`check <id>`

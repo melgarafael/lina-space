@@ -466,8 +466,16 @@ impl Router {
             return RouteOutcome::BlockedByAutonomy;
         }
 
-        // ── Guardrail: gate de fan-out (broadcast > N alvos pede confirmação humana).
-        if matches!(recipient, Recipient::Broadcast) && preview.len() > self.config.fanout_gate {
+        // ── Guardrail: gate de fan-out — SÓ na CASCATA (ADR 0007). `hops` é EFETIVO (do binding, não
+        //    forjável — `derive_root_hops`/W1): `hops==0` é a ORIGEM (o agente foi pedido pelo humano e
+        //    NÃO recebeu A2A → sem binding) e a 1ª onda dela entrega a TODOS (igual o Maestri); `hops>=1`
+        //    é o sender RE-ESPALHANDO algo que recebeu — onde mora a tempestade — e segue gateado (pede
+        //    confirmação humana). Um agente NÃO compra fan-out livre forjando `hops`: o valor vem do
+        //    binding carimbado numa entrega real. Backstops finais intactos (MAX_DEPTH/anti-loop/custódia).
+        if hops >= 1
+            && matches!(recipient, Recipient::Broadcast)
+            && preview.len() > self.config.fanout_gate
+        {
             log_block(store, msg, BlockReason::FanoutGated);
             return RouteOutcome::FanoutGated {
                 count: preview.len(),
@@ -502,10 +510,13 @@ impl Router {
             }
         }
 
-        // ── Guardrail 3: orçamento por `(root_cause_id, agente)`. Com a propagação do root (A2),
-        //    delegações da mesma cadeia acumulam contra o mesmo root (antes cada msg nova era uma
-        //    raiz fresca e a conta nunca batia). Só CHECA aqui; incrementa após o persist.
-        if is_deleg {
+        // ── Guardrail 3: orçamento por `(root_cause_id, agente)` — SÓ na CASCATA (`hops>=1`, ADR 0007).
+        //    Com a propagação do root (A2), delegações da mesma cadeia acumulam contra o mesmo root. A
+        //    ORIGEM (`hops==0`) JÁ escapava por construção — cada msg de origem ganha um root FRESCO
+        //    (`msg.id`, W1), então `(root, sender)` nunca acumula; o `hops>=1` torna isso EXPLÍCITO no
+        //    ponto de decisão (defesa em profundidade: dois motivos independentes p/ a origem não ser
+        //    limitada). Só CHECA aqui; incrementa após o persist (mesma condição).
+        if is_deleg && hops >= 1 {
             let count = self
                 .budget
                 .get(&(root.clone(), sender))
@@ -636,8 +647,10 @@ impl Router {
                 },
             );
         }
-        // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada). Carimba o tempo
-        // para a poda temporal (A5).
+        // Roteamento logado → AGORA contabiliza o orçamento (delegação efetivada). Conta TODA delegação
+        // (bookkeeping/observabilidade + poda A5): a entrada de ORIGEM é inofensiva (root FRESCO por msg
+        // → nunca re-checada) e é PODADA pela janela. O ENFORCEMENT cascata-only vive no CHECK acima
+        // (`hops>=1`), não aqui. Carimba o tempo para a poda temporal (A5).
         if is_deleg {
             let entry = self
                 .budget
@@ -1602,25 +1615,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **fanout-fix (a) — o BUG do fundador:** um broadcast de ORIGEM-USUÁRIO (o agente foi pedido
+    /// pelo humano e NÃO recebeu nenhuma A2A → sem binding → `hops==0`) para N > `FANOUT_GATE` nós
+    /// vivos ENTREGA a TODOS, sem gate humano e com ZERO `RouteBlocked` (igual o Maestri faz). É a 1ª
+    /// onda legítima; a tempestade mora na CASCATA (re-espalhamento), coberta pelo teste (b).
     #[test]
-    fn broadcast_over_fanout_gate_needs_confirmation() {
-        // 4 colegas vivos (> FANOUT_GATE=3) → um broadcast é GATEADO (pede confirmação humana),
-        // não entregue. (Guarda de segurança do design §4: broadcast grande não dispara sozinho.)
-        let (mut router, sup, dir) = router_with("fanout");
+    fn user_origin_broadcast_fans_out_to_all_without_gate() {
+        let (mut router, sup, dir) = router_with("fanout-origin");
         let _a = sup.register("@A", None, sink());
+        // 5 colegas vivos (> FANOUT_GATE=3).
+        for n in ["@B1", "@B2", "@B3", "@B4", "@B5"] {
+            sup.register(n, None, sink());
+        }
+        let mut ts = TmpStore::new("fanout-origin");
+        let (rec, mut deliver) = recorder();
+
+        // @A nunca recebeu A2A → ORIGEM (hops==0): a 1ª onda pedida pelo humano.
+        let msg = MailMessage::new("@A", "*", "broadcast", "oi a todos");
+        match router.route_message(&msg, &mut ts.store, 1000, &mut deliver) {
+            RouteOutcome::Delivered { targets } => {
+                assert_eq!(
+                    targets.len(),
+                    5,
+                    "fan-out inicial entrega a TODOS os 5 vivos"
+                );
+            }
+            other => panic!("origem deve entregar a todos (sem gate), veio {other:?}"),
+        }
+        assert_eq!(rec.borrow().len(), 5, "5 entregas REAIS");
+        assert!(
+            blocked_reasons(&ts.store).is_empty(),
+            "ZERO RouteBlocked: o fan-out inicial não é barrado pelo FANOUT_GATE"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **fanout-fix (b):** broadcast em CASCATA (o sender RECEBEU uma entrega → ganhou binding →
+    /// `hops>=1`, está RE-ESPALHANDO) para > `FANOUT_GATE` alvos AINDA é GATEADO (pede confirmação
+    /// humana, não entrega) — a tempestade mora aqui. (Antes, este teste cobria o broadcast de origem;
+    /// o invariante mudou: origem LIBERA — teste (a) —, cascata MANTÉM o freio.)
+    #[test]
+    fn cascade_broadcast_over_fanout_gate_still_gated() {
+        let (mut router, sup, dir) = router_with("fanout-cascade");
+        let _a = sup.register("@A", None, sink());
+        let _relay = sup.register("@Relay", None, sink());
         for n in ["@B1", "@B2", "@B3", "@B4"] {
             sup.register(n, None, sink());
         }
-        let mut ts = TmpStore::new("fanout");
+        let mut ts = TmpStore::new("fanout-cascade");
         let (rec, mut deliver) = recorder();
 
-        let msg = MailMessage::new("@A", "*", "broadcast", "atenção a todos");
-        assert_eq!(
-            router.route_message(&msg, &mut ts.store, 1000, &mut deliver),
-            RouteOutcome::FanoutGated { count: 4 }
+        // A→Relay: Relay RECEBE uma entrega → ganha binding → suas mensagens viram CASCATA (hops>=1).
+        let seed = MailMessage::new("@A", "@Relay", "ask", "espalha isto");
+        assert!(matches!(
+            router.route_message(&seed, &mut ts.store, 1, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let delivered_before = rec.borrow().len(); // 1 (a entrega do seed)
+
+        // Relay re-broadcasta (CASCATA) para > FANOUT_GATE alvos → GATEADO (não entrega).
+        let bc = MailMessage::new("@Relay", "*", "broadcast", "todos!");
+        let out = router.route_message(&bc, &mut ts.store, 2, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::FanoutGated { .. }),
+            "broadcast em CASCATA > gate segue gateado: {out:?}"
         );
-        assert!(rec.borrow().is_empty(), "broadcast gateado não entrega");
+        assert_eq!(
+            rec.borrow().len(),
+            delivered_before,
+            "broadcast cascata gateado NÃO entrega"
+        );
         assert!(blocked_reasons(&ts.store).contains(&"fanout_gated".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **fanout-fix (d):** delegações de ORIGEM (cada `lina ask` do agente pedido pelo humano é sua
+    /// própria raiz — `hops==0`, root fresco por msg via W1/A2) NÃO são limitadas pelo
+    /// `DELEGATION_BUDGET` — o humano pode mandar > BUDGET avisos 1-a-1. (A CASCATA segue limitada —
+    /// ver `delegation_budget_is_enforced_per_root_cause`.)
+    #[test]
+    fn origin_delegations_are_not_limited_by_budget() {
+        let (mut router, sup, dir) = router_with("budget-origin");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("budget-origin");
+        let (_rec, mut deliver) = recorder();
+
+        // @A nunca recebe A2A → cada ask é ORIGEM (hops==0, root fresco). Manda BUDGET+5 asks 1-a-1.
+        for i in 0..(DELEGATION_BUDGET + 5) {
+            let m = MailMessage::new("@A", "@B", "ask", format!("aviso {i}"));
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, 1000 + u64::from(i), &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "aviso de ORIGEM {i} deve entregar — origem não é limitada por orçamento"
+            );
+        }
+        assert!(
+            !blocked_reasons(&ts.store).contains(&"budget_exceeded".to_string()),
+            "nenhum budget_exceeded num fan-out 1-a-1 de origem"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
