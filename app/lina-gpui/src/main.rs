@@ -1506,6 +1506,13 @@ impl Render for WorkspaceView {
         }
 
         let root = root.child(topbar).child(footer);
+        // BUG 4 · M2: overlay CENTRAL e proeminente do modo "Novo Agente" — o feedback no topbar é
+        // discreto demais ("clico, nada acontece, nao sei pra que serve"). Modal sobre o canvas: o
+        // usuário VÊ que entrou no modo + o que digitar. Mutuamente exclusivo com a paleta (topo).
+        let root = match &self.naming {
+            Some(buf) => root.child(naming_overlay(buf)),
+            None => root,
+        };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
         if self.palette.is_open() {
             root.child(self.palette.render())
@@ -1513,6 +1520,60 @@ impl Render for WorkspaceView {
             root
         }
     }
+}
+
+/// BUG 4 · M2: overlay CENTRAL do modo "Novo Agente" — modal sobre o canvas com título, instrução,
+/// o nome digitado (com cursor) ou um placeholder, e as teclas. Torna o modo VISÍVEL (o feedback no
+/// topbar é discreto demais). Não-interativo: o teclado (`handle_key`) dirige (Enter cria · Esc cancela).
+fn naming_overlay(buf: &str) -> impl IntoElement {
+    let (typed, typed_fg) = if buf.is_empty() {
+        ("Digite o nome do agente…".to_string(), rgb(0x5b658f))
+    } else {
+        (format!("{buf}▌"), rgb(0xeef1ff))
+    };
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_6()
+                .py_5()
+                .rounded_lg()
+                .bg(rgb(0x141a36))
+                .border_2()
+                .border_color(rgb(0x6c4ad1))
+                .child(
+                    div()
+                        .text_size(px(22.0))
+                        .text_color(rgb(0xeef1ff))
+                        .child(text!("✦ Novo Agente")),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(0x9aa5d4))
+                        .child(text!("Digite o nome — o papel vem do nome")),
+                )
+                .child(
+                    div()
+                        .text_size(px(26.0))
+                        .text_color(typed_fg)
+                        .child(text!(typed)),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(0x5b658f))
+                        .child(text!("Enter cria · Esc cancela")),
+                ),
+        )
 }
 
 fn main() {

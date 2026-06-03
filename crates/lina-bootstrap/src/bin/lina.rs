@@ -63,22 +63,15 @@ fn broker_mailbox_root() -> PathBuf {
 }
 
 /// **W3-6c A3 — enfileira no outbox POR-NÓ** (`enqueue_as`) para o A2A (`lina ask`): cada PTY escreve
-/// no SEU subdir e o supervisor atribui `from` = dir-dono (origem inforjável). Fallback VISÍVEL (nunca
-/// silencioso) ao outbox flat se o nome do nó não for um subdir seguro — A3 degradado, mas o A2A não
-/// quebra (o router tem seus próprios guardrails). **NÃO usar na fila de broker:** lá o `from` decide o
-/// que o humano lê no gate, então `lina do`/`lina resume` usam `enqueue_as` ESTRITO (sem fallback flat —
-/// hole 3); um fallback flat reabriria a forja do requester.
+/// no SEU subdir e o supervisor atribui `from` = dir-dono (origem inforjável). **ESTRITO — SEM fallback
+/// ao outbox flat** (BUG 2 / regressão do Round 6): desde a anonimização A3 do drain flat (o `from` do
+/// flat vira VAZIO, anti-impersonação), um fallback flat depositaria a msg num caminho cujo `from=""` o
+/// router RECUSA como `UnknownSender` → a mensagem SOME em silêncio (o que o fundador viu: "envio nada
+/// acontece"). Falhar VISÍVEL é melhor: um nome de nó inseguro/vazio retorna `Err` (o `lina ask` imprime
+/// e sai 1), em vez de degradar para um caminho que será descartado. Mesma doutrina ESTRITA já usada por
+/// `lina do`/`lina resume` (hole 3) — o `from` autenticado por origem é a ÚNICA via.
 fn enqueue_per_node(mailbox: &Mailbox, node: &str, msg: &MailMessage) -> std::io::Result<()> {
-    match mailbox.enqueue_as(node, msg) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            eprintln!(
-                "lina: A3 degradado — no {node:?} nao e subdir seguro ({e}); caindo no outbox flat (from NAO autenticado)"
-            );
-            mailbox.enqueue(msg)
-        }
-        Err(e) => Err(e),
-    }
+    mailbox.enqueue_as(node, msg)
 }
 
 fn load_input() -> Result<BootstrapInput, String> {

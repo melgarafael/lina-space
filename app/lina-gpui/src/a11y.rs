@@ -251,10 +251,11 @@ mod tests {
         );
     }
 
-    /// Rótulo do nó anuncia o badge (reuso do W4-2): Idle → "💤 dormindo"; `needs_human` → "precisa de você".
+    /// Rótulo do nó anuncia o badge (reuso do W4-2): Idle → "aguardando" (BUG 1: VIVO mas idle,
+    /// NUNCA "dormindo"); `needs_human` → "precisa de você".
     #[test]
     fn node_label_announces_badge_state() {
-        assert!(node_label("Revisor", NodeStatus::Idle, false).contains("dormindo"));
+        assert!(node_label("Revisor", NodeStatus::Idle, false).contains("aguardando"));
         assert!(node_label("Dev", NodeStatus::Busy, false).contains("rodando"));
         assert!(node_label("QA", NodeStatus::Dead, false).contains("encerrado"));
         assert!(node_label("Revisor", NodeStatus::Idle, false).starts_with("Revisor —"));

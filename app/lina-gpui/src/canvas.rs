@@ -34,8 +34,9 @@ pub enum BadgeKind {
     NeedsYou,
     /// "rodando" — vivo e produzindo saída.
     Running,
-    /// "💤 dormindo" — ocioso (prompt pronto, sem atividade). Reativa ao focar, sem fingir vivo.
-    Sleeping,
+    /// "aguardando" — VIVO mas sem saída recente (o agente terminou e espera você). **NÃO é
+    /// "dormindo"**: o CLI continua rodando; só não está produzindo output AGORA. Nunca por falta de FOCO.
+    Waiting,
     /// "encerrado" — o processo do CLI morreu (Dead) ou o painel quebrou (Crashed).
     Stopped,
 }
@@ -61,11 +62,11 @@ impl Badge {
                     "rodando".to_string()
                 }
             }
-            BadgeKind::Sleeping => {
+            BadgeKind::Waiting => {
                 if self.unseen > 0 {
-                    format!("💤 dormindo · {} novas", self.unseen)
+                    format!("aguardando · {} novas", self.unseen)
                 } else {
-                    "💤 dormindo".to_string()
+                    "aguardando".to_string()
                 }
             }
             BadgeKind::Stopped => "encerrado".to_string(),
@@ -79,7 +80,7 @@ impl Badge {
         match self.kind {
             BadgeKind::NeedsYou => 0xe0af68, // âmbar (o mesmo do gate de custódia)
             BadgeKind::Running => 0x2c7a4b,  // verde
-            BadgeKind::Sleeping => 0x3a3f5a, // cinza-azulado fosco
+            BadgeKind::Waiting => 0x3a3f5a,  // cinza-azulado fosco (neutro, NÃO alarmante)
             BadgeKind::Stopped => 0x6b2b3a,  // bordô apagado
         }
     }
@@ -109,10 +110,12 @@ pub fn aggregate_badge(status: NodeStatus, needs_human: bool, unseen: u32) -> Ba
     } else {
         match status {
             NodeStatus::Busy | NodeStatus::Running | NodeStatus::Starting => BadgeKind::Running,
-            NodeStatus::Idle => BadgeKind::Sleeping,
+            // BUG 1: VIVO mas sem saída recente = "aguardando" (NÃO "dormindo"). Um chat aberto que
+            // terminou a resposta está vivo/pronto — nunca "dormindo" por falta de foco ou de output.
+            NodeStatus::Idle => BadgeKind::Waiting,
             NodeStatus::Crashed | NodeStatus::Dead => BadgeKind::Stopped,
             // `NodeStatus` é `#[non_exhaustive]`: um estado FUTURO do core cai aqui → assume "rodando"
-            // (vivo, neutro) em vez de fingir encerrado/dormindo.
+            // (vivo, neutro) em vez de fingir encerrado.
             _ => BadgeKind::Running,
         }
     };
@@ -175,7 +178,8 @@ mod tests {
         );
         assert_eq!(
             aggregate_badge(NodeStatus::Idle, false, 0).kind,
-            BadgeKind::Sleeping
+            BadgeKind::Waiting,
+            "BUG 1: VIVO mas idle = aguardando, NUNCA dormindo"
         );
         assert_eq!(
             aggregate_badge(NodeStatus::Dead, false, 0).kind,
@@ -192,11 +196,11 @@ mod tests {
     fn badge_label_is_honest_and_counts_unseen() {
         assert_eq!(
             aggregate_badge(NodeStatus::Idle, false, 3).label(),
-            "💤 dormindo · 3 novas"
+            "aguardando · 3 novas"
         );
         assert_eq!(
             aggregate_badge(NodeStatus::Idle, false, 0).label(),
-            "💤 dormindo"
+            "aguardando"
         );
         assert_eq!(
             aggregate_badge(NodeStatus::Busy, false, 0).label(),
