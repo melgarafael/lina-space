@@ -34,9 +34,9 @@ use std::time::Duration;
 
 use gpui::{
     div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, ClipboardItem, Context,
-    FocusHandle, FontWeight, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, Rgba, Role, ScrollDelta, ScrollWheelEvent,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    Entity, FocusHandle, FontWeight, InputHandler, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, Role, ScrollDelta,
+    ScrollWheelEvent, TitlebarOptions, UTF16Selection, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -77,8 +77,12 @@ fn fit_dims() -> (u16, u16) {
     (cols, rows)
 }
 
-/// Traduz uma `Keystroke` em bytes para o PTY. Imprimíveis via `key_char`; setas como
-/// CSI (ou SS3 em `app_cursor`/DECCKM); Home/End/PageUp·Down/Insert/Delete/F1-F12; Ctrl+letra.
+/// Traduz uma `Keystroke` em bytes para o PTY — APENAS teclas de controle/navegação: Ctrl+letra;
+/// Enter/Backspace/Tab/Escape; setas como CSI (ou SS3 em `app_cursor`/DECCKM); Home/End/PageUp·Down/
+/// Insert/Delete/F1-F12. **Imprimíveis (letras, dígitos, espaço, acentos, CJK) NÃO saem por aqui:**
+/// fluem pelo IME do SO (`InputHandler::replace_text_in_range` → [`composed_text_to_pty_bytes`]),
+/// espelhando o `to_esc_str` do terminal do Zed. Emiti-los aqui duplicaria o caractere (o gpui já o
+/// injeta via `insertText`); ver o roteamento em `gpui_macos::window::handle_key_event`.
 fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
     let key = ks.key.as_str();
     if ks.modifiers.control && key.len() == 1 {
@@ -101,7 +105,6 @@ fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
         "backspace" => return vec![0x7f],
         "tab" => return vec![0x09],
         "escape" => return vec![0x1b],
-        "space" => return vec![b' '],
         "up" => return csi(b'A'),
         "down" => return csi(b'B'),
         "right" => return csi(b'C'),
@@ -126,15 +129,120 @@ fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
         "f12" => return vec![0x1b, b'[', b'2', b'4', b'~'],
         _ => {}
     }
-    if let Some(kc) = &ks.key_char {
-        if !kc.is_empty() {
-            return kc.clone().into_bytes();
-        }
-    }
-    if key.chars().count() == 1 {
-        return key.as_bytes().to_vec();
-    }
     Vec::new()
+}
+
+/// W2-4 (dívida IME): texto COMPOSTO pelo IME do SO (dead-keys pt-br ´~^, cedilha, CJK) → bytes UTF-8
+/// para o PTY do nó focado. É o análogo de `key_char` em [`keystroke_to_bytes`], mas a partir do
+/// caractere FINAL (já composto) que o sistema entrega via `InputHandler::replace_text_in_range`.
+/// Texto vazio → sem bytes (o chamador NÃO submete um `WriteOp`).
+fn composed_text_to_pty_bytes(text: &str) -> Vec<u8> {
+    text.as_bytes().to_vec()
+}
+
+/// Ponte IME→PTY (W2-4): o IME do SO entrega aqui o TEXTO COMPOSTO (dead-keys pt-br ´~^, cedilha,
+/// CJK) e nós o escrevemos no PTY do nó focado. Espelha o `TerminalInputHandler` do terminal do Zed
+/// (mesmo SHA de gpui): o terminal não tem buffer de texto local — o pre-edit (marcado) é rastreado
+/// só p/ o protocolo `NSTextInputClient`, e o caractere final vai ao PTY no `replace_text_in_range`.
+///
+/// É REGISTRADO 1×/frame no `paint` de um `gpui::canvas` (única fase válida p/ `Window::handle_input`),
+/// atrelado ao foco do canvas (`self.focus`). Lê/escreve o estado IME via o handle `Entity`.
+struct ImeHandler {
+    view: Entity<WorkspaceView>,
+}
+
+impl InputHandler for ImeHandler {
+    /// Ponto de inserção (sem seleção) → sinaliza ao SO que há um contexto de texto ativo; sem isto a
+    /// composição de dead-keys não inicia. (Não distinguimos alt-screen aqui — ver nota na entrega.)
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    /// Faixa do texto MARCADO (pre-edit) em UTF-16 — o SO usa-a p/ saber o que substituir ao compor.
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        self.view.read(cx).ime_marked_range_utf16()
+    }
+
+    /// Não expomos o documento (o "texto" é o scrollback do PTY, não editável pelo IME).
+    fn text_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<String> {
+        None
+    }
+
+    /// COMMIT: o caractere final composto chega aqui (ex. "á") → vira bytes no PTY do nó focado.
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, view_cx| {
+            view.ime_clear_marked(view_cx);
+            view.ime_commit(text);
+        });
+    }
+
+    /// COMPOSIÇÃO em curso: o SO marca o pre-edit (ex. o "´" pendente). Rastreamos sem enviar ao PTY.
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |view, view_cx| {
+            view.ime_set_marked(new_text.to_string(), view_cx);
+        });
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |view, view_cx| view.ime_clear_marked(view_cx));
+    }
+
+    /// Sem janela de candidatos posicionada — dead-keys não a usam (MVP; CJK apareceria na origem).
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Terminal: queremos REPETIÇÃO de tecla (e dead-keys compõem via IME de qualquer forma), não o
+    /// popup de acentos do macOS (press-and-hold). Espelha o terminal do Zed.
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
 }
 
 #[inline]
@@ -297,6 +405,14 @@ struct WorkspaceView {
     /// BUG A/B (instrumentação): última linha de diagnóstico de cards logada — loga só na MUDANÇA
     /// (rows/zona/dim), sem spammar o stderr a 60fps. O Maestro lê o stderr p/ validar por DADOS.
     diag_last_frame: String,
+    /// PULSO (instrumentação): último diagnóstico do pulso A→B logado — loga só na MUDANÇA de estado
+    /// dos gates (reduce-motion, id∈cards, progress), sem spammar a 60fps. Revela por DADOS qual gate
+    /// corta a animação no caminho do `lina ask` real (o `eprintln` do nascimento fica na ponte).
+    diag_last_pulse: String,
+    /// W2-4 (dívida IME): texto MARCADO (pre-edit) da composição em curso — ex. o "´" pendente entre
+    /// a dead-key e a vogal. Rastreado só p/ o protocolo `NSTextInputClient` (o SO pergunta a faixa
+    /// marcada); NÃO é renderizado inline (a TUI não tem onde mostrá-lo). `None` = fora de composição.
+    ime_marked: Option<String>,
 }
 
 impl WorkspaceView {
@@ -336,7 +452,45 @@ impl WorkspaceView {
             palette: palette::PaletteState::default(),
             creating: None,
             diag_last_frame: String::new(),
+            diag_last_pulse: String::new(),
+            ime_marked: None,
         }
+    }
+
+    // === IME (W2-4): a composição do SO (dead-keys ´~^, cedilha, CJK) entra por estes ganchos, ===
+    // === chamados pelo `ImeHandler` no `paint`. Espelham os helpers do terminal do Zed.         ===
+
+    /// COMMIT: escreve o texto FINAL composto (ex. "á") nos bytes do PTY do nó focado — mesma rota de
+    /// um keystroke imprimível, mas a partir do caractere já montado pelo IME. Vazio → não submete.
+    fn ime_commit(&mut self, text: &str) {
+        let bytes = composed_text_to_pty_bytes(text);
+        if !bytes.is_empty() {
+            self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
+        }
+    }
+
+    /// Marca o pre-edit (composição em curso). Texto vazio é equivalente a limpar a marca.
+    fn ime_set_marked(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return self.ime_clear_marked(cx);
+        }
+        self.ime_marked = Some(text);
+        cx.notify();
+    }
+
+    /// Sai do estado de composição (commit, cancelamento ou `unmarkText` do SO).
+    fn ime_clear_marked(&mut self, cx: &mut Context<Self>) {
+        if self.ime_marked.is_some() {
+            self.ime_marked = None;
+            cx.notify();
+        }
+    }
+
+    /// Faixa do texto marcado em UNIDADES UTF-16 (o que o `NSTextInputClient` espera).
+    fn ime_marked_range_utf16(&self) -> Option<std::ops::Range<usize>> {
+        self.ime_marked
+            .as_ref()
+            .map(|t| 0..t.encode_utf16().count())
     }
 
     /// W4-2 · M1: a lista de comandos da paleta (rebuild a cada Cmd-K — o roster muda). Comandos
@@ -636,6 +790,10 @@ impl WorkspaceView {
                     }
                 }
             }
+            // Modo modal: a janela do canvas é dona do teclado. `stop_propagation` marca a tecla como
+            // consumida → o gpui NÃO a roteia ao `insertText` do IME (gpui_macos `handle_key_event`),
+            // senão a letra do nome também VAZARIA ao PTY do nó focado (dupla escrita).
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -679,6 +837,8 @@ impl WorkspaceView {
                     }
                 }
             }
+            // Modal: consome a tecla p/ o IME não vazar a letra do título ao PTY (ver naming acima).
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -693,6 +853,8 @@ impl WorkspaceView {
             if let Some(action) = self.palette.handle_key(ks.key.as_str(), ch) {
                 self.run_palette_action(action, window);
             }
+            // Modal: consome a tecla de filtro p/ o IME não vazar a query ao PTY (ver naming acima).
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -975,6 +1137,23 @@ impl Render for WorkspaceView {
                 view.handle_key(ev, window, cx);
             }));
 
+        // W2-4 (dívida IME): registra o handler de IME do gpui ATRELADO ao foco do canvas — sem ele as
+        // dead-keys (´~^) compõem no SO mas o caractere final NUNCA chega ao PTY. Um `gpui::canvas` de
+        // área ZERO existe só p/ chamar `handle_input` no `paint` (única fase válida). O loop de animação
+        // (`request_animation_frame`, topo do render) re-registra o handler a cada frame. Mirror do Zed.
+        let ime_view = cx.entity();
+        let ime_focus = self.focus.clone();
+        root = root.child(
+            gpui::canvas(
+                move |_bounds, _window, _cx| {},
+                move |_bounds, _prepaint, window, cx| {
+                    window.handle_input(&ime_focus, ImeHandler { view: ime_view }, cx);
+                },
+            )
+            .absolute()
+            .size(px(0.0)),
+        );
+
         // BUG A/B (instrumentação): acumula 1 linha por card (rows/zona/dim) e loga após o loop SÓ se
         // mudou (sem spammar a 60fps). O Maestro confirma por DADOS que as rows batem + zona/dim ok.
         let mut frame_diag = String::new();
@@ -1188,10 +1367,28 @@ impl Render for WorkspaceView {
         // animação é suprimida (a entrega A2A ocorre igual; o pulso é decorativo).
         // W4-6 gap3: reduce-motion lido da FONTE ÚNICA `a11y::reduce_motion_effective` (SO/env sempre
         // respeitado + override do rodapé) — o W4-3 só inverte o bool.
-        if let Some(p) = pulse
-            .filter(|_| wiring::animate_pulse(a11y::reduce_motion_effective(self.reduce_motion)))
-        {
-            if let Some(t) = p.progress() {
+        if let Some(p) = pulse {
+            // INSTRUMENTAÇÃO (de-dup): por que o pulso A→B (não) ANIMA na tela. O Maestro lê o stderr
+            // p/ validar por DADOS qual gate corta — reduce-motion (`animate=false`), id fora de `cards`
+            // (`from_in_cards`/`to_in_cards=false`), ou já expirado (`progressing=false`). Tudo `true` +
+            // sem dot visto ⇒ o problema é de paint/percepção, não de estado.
+            let rm_eff = a11y::reduce_motion_effective(self.reduce_motion);
+            let animate = wiring::animate_pulse(rm_eff);
+            let prog = p.progress();
+            let from_in = cards.iter().any(|(n, _)| *n == p.from);
+            let to_in = cards.iter().any(|(n, _)| *n == p.to);
+            let diag = format!(
+                "from={} to={} reduce_motion_eff={rm_eff} animate={animate} progressing={} from_in_cards={from_in} to_in_cards={to_in} n_cards={}",
+                p.from,
+                p.to,
+                prog.is_some(),
+                cards.len()
+            );
+            if diag != self.diag_last_pulse {
+                eprintln!("lina-gpui: pulso · {diag}");
+                self.diag_last_pulse = diag;
+            }
+            if let Some(t) = prog.filter(|_| animate) {
                 let center = |id: NodeId| -> Option<Point<Pixels>> {
                     cards.iter().find(|(n, _)| *n == id).map(|(_, nv)| {
                         let (cx2, cy2) =
@@ -1902,4 +2099,26 @@ fn main() {
     let _ = grid_a;
     drop(sup);
     drop(pty);
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+
+    // W2-4 (dívida IME): o texto COMPOSTO que o IME entrega (dead-keys pt-br ´~^, cedilha, CJK) deve
+    // virar exatamente os bytes UTF-8 que vão ao PTY do nó focado — é o análogo de `key_char`, mas a
+    // partir do caractere FINAL composto. Determinístico e sem gpui (a UI não roda headless).
+    #[test]
+    fn composed_text_dead_keys_pt_br_to_utf8_bytes() {
+        // ´ + a = á ; ~ + a = ã ; ^ + e = ê ; ~ + o = õ ; cedilha = ç (UTF-8 de cada).
+        assert_eq!(composed_text_to_pty_bytes("á"), vec![0xC3, 0xA1]);
+        assert_eq!(composed_text_to_pty_bytes("ã"), vec![0xC3, 0xA3]);
+        assert_eq!(composed_text_to_pty_bytes("ê"), vec![0xC3, 0xAA]);
+        assert_eq!(composed_text_to_pty_bytes("õ"), vec![0xC3, 0xB5]);
+        assert_eq!(composed_text_to_pty_bytes("ç"), vec![0xC3, 0xA7]);
+        // ASCII puro também flui por aqui (todo imprimível passou a ir pelo IME, não pelo keystroke).
+        assert_eq!(composed_text_to_pty_bytes("a"), vec![b'a']);
+        // Vazio → nada a enviar (o chamador NÃO submete WriteOp).
+        assert!(composed_text_to_pty_bytes("").is_empty());
+    }
 }

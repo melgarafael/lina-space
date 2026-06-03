@@ -167,14 +167,22 @@ impl UiHost for GpuiBridgeHost {
                     BusTarget::Node(n) => n,
                     _ => from,
                 };
-                let mut m = lock(&self.model);
-                m.pulse = Some(Pulse {
-                    from,
-                    to: target,
-                    started: Instant::now(),
-                });
-                m.connected = true;
-                m.touch();
+                {
+                    let mut m = lock(&self.model);
+                    m.pulse = Some(Pulse {
+                        from,
+                        to: target,
+                        started: Instant::now(),
+                    });
+                    m.connected = true;
+                    m.touch();
+                }
+                // INSTRUMENTAÇÃO: nascimento via Bus/projeção (o `A2aTrigger` demo OU um Router que
+                // publique `BusEvent::Message`). Distingue, no stderr, do caminho `deliver_fn` real.
+                eprintln!(
+                    "lina-gpui: pulso NASCEU via=bus/projection from={from} to={target} os_reduce_motion={}",
+                    crate::a11y::os_reduce_motion()
+                );
             }
             HostEvent::Recovering => {
                 let mut m = lock(&self.model);
@@ -408,14 +416,23 @@ impl MailboxPump {
             )
             .map_err(|e| e.to_string())?;
             // Pulso efêmero da entrega real (some sozinho via `Pulse::progress`).
-            let mut m = lock(&model);
-            m.pulse = Some(Pulse {
-                from,
-                to: target,
-                started: Instant::now(),
-            });
-            m.connected = true;
-            m.touch();
+            {
+                let mut m = lock(&model);
+                m.pulse = Some(Pulse {
+                    from,
+                    to: target,
+                    started: Instant::now(),
+                });
+                m.connected = true;
+                m.touch();
+            }
+            // INSTRUMENTAÇÃO: prova que o `lina ask` REAL acende o pulso (caminho `deliver_fn`, NÃO o
+            // `A2aTrigger` demo). O Maestro lê o stderr p/ confirmar o nascimento + `os_reduce_motion`
+            // (que o render usa no gate `animate`). Esporádico (1×/entrega) → sem flood.
+            eprintln!(
+                "lina-gpui: pulso NASCEU via=lina-ask/real from={from} to={target} os_reduce_motion={}",
+                crate::a11y::os_reduce_motion()
+            );
             Ok(out)
         }
     }
