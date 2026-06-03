@@ -10,6 +10,12 @@ mod bridge;
 mod canvas;
 // W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
 mod onboarding;
+// W4-3: chrome de conexão "sem fios" — freio (pausa de orquestração), selo por membership, reduce-motion.
+mod wiring;
+// W4-4: chrome de persistência (salvo✓ / recuperação T8 / Espaços T6 / Ajustes T7). Janela própria.
+mod persistence_ui;
+// W4-5: galeria de Focos (T3) — presets que montam o Espaço com time + papéis; gpui-free, testável.
+mod gallery;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -260,15 +266,23 @@ struct WorkspaceView {
     /// W4-2 · M2 "Novo Agente": `Some(buffer)` enquanto o humano DIGITA o nome do agente novo (modo
     /// nomeação). Enter cria (papel derivado do nome), Esc cancela. `None` = fora do modo nomeação.
     naming: Option<String>,
+    /// W4-3: FREIO da auto-orquestração, compartilhado com a [`MailboxPump`]. A UI lê `paused` p/ o
+    /// rótulo do rodapé e sinaliza `toggle_requested` ao clicar.
+    brake: wiring::Brake,
+    /// W4-3: reduce-motion (a11y). `true` → o pulso A→B NÃO anima (a entrega ocorre igual). Hoje é um
+    /// toggle no rodapé; a W4-6 liga ao setting do SO.
+    reduce_motion: bool,
 }
 
 impl WorkspaceView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         nodes: NodeManager,
         input: Arc<dyn InputSink>,
         a2a: Arc<A2aTrigger>,
         focused: NodeId,
         desk: Desk,
+        brake: wiring::Brake,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -289,6 +303,8 @@ impl WorkspaceView {
             report_node: None,
             desk,
             naming: None,
+            brake,
+            reduce_motion: false,
         }
     }
 
@@ -641,10 +657,13 @@ impl Render for WorkspaceView {
 
         // Os cards desenhados DERIVAM do NodeManager (não de 2 fixos) — add/remove refletem aqui.
         let mut cards = self.nodes.cards();
-        let (pulse, connected, event_count, recovering) = {
+        let (pulse, event_count, recovering) = {
             let m = lock(&self.nodes.model);
-            (m.pulse, m.connected, m.event_count, m.recovering)
+            (m.pulse, m.event_count, m.recovering)
         };
+        // W4-3: SELO "Time conectado" = full-mesh LÓGICO por MEMBERSHIP (≥2 nós no Espaço), derivado da
+        // presença — aparece SEM nenhum tráfego/arraste de cabo (decisão arq §2.2).
+        let connected = wiring::team_connected(cards.len());
         // O foco deve apontar SEMPRE a um nó vivo: se o focado saiu (✕/⌘⌫/pump), o destaque
         // sumiria e as teclas iriam p/ um nó morto. Reaponta para o primeiro card vivo.
         if !cards.iter().any(|(id, _)| *id == self.focused) {
@@ -986,8 +1005,9 @@ impl Render for WorkspaceView {
             root = root.child(card);
         }
 
-        // PULSO efêmero A→B.
-        if let Some(p) = pulse {
+        // PULSO efêmero A→B (a metáfora "sem fios"). W4-3: respeita REDUCE-MOTION — com ele ligado, a
+        // animação é suprimida (a entrega A2A ocorre igual; o pulso é decorativo).
+        if let Some(p) = pulse.filter(|_| wiring::animate_pulse(self.reduce_motion)) {
             if let Some(t) = p.progress() {
                 let center = |id: NodeId| -> Option<Point<Pixels>> {
                     cards.iter().find(|(n, _)| *n == id).map(|(_, nv)| {
@@ -1192,7 +1212,66 @@ impl Render for WorkspaceView {
             );
         }
 
-        root.child(topbar)
+        // W4-3 · RODAPÉ — o FREIO da auto-orquestração (sempre acessível) + toggle de reduce-motion.
+        let paused = lock(&self.brake).paused;
+        let reduce_motion = self.reduce_motion;
+        let (freio_bg, freio_txt) = if paused {
+            (0x2c7a4b, "▶ Retomar orquestração")
+        } else {
+            (0xe0af68, "⏸ Pausar orquestração")
+        };
+        let mut footer = div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_4()
+            .px_4()
+            .py_2()
+            .bg(rgb(0x0c1130))
+            .child(
+                div()
+                    .id("freio-btn")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(freio_bg))
+                    .text_color(rgb(0x11111b))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
+                        // Só SINALIZA: a MailboxPump aplica Router::pause/resume no próximo tick.
+                        lock(&view.brake).toggle_requested = true;
+                    }))
+                    .child(text!(freio_txt)),
+            )
+            .child(
+                div()
+                    .id("reduce-motion-btn")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x2a3152))
+                    .text_color(rgb(0xc8d3f5))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
+                        view.reduce_motion = !view.reduce_motion;
+                    }))
+                    .child(text!(if reduce_motion {
+                        "🎞 Movimento: desligado"
+                    } else {
+                        "🎞 Movimento: ligado"
+                    })),
+            );
+        if paused {
+            footer = footer.child(div().text_color(rgb(0xe0af68)).child(text!(
+                "⏸ orquestração pausada · novas delegações ficam na fila (nada se perde)"
+            )));
+        }
+
+        root.child(topbar).child(footer)
     }
 }
 
@@ -1260,6 +1339,8 @@ fn main() {
     }
     // Mesa de custódia compartilhada: a UI confirma (⌘⏎); a BrokerPump executa COM o segredo do cofre.
     let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+    // W4-3: FREIO compartilhado — a UI pede pausa/retoma; a MailboxPump aplica no Router e espelha.
+    let brake: wiring::Brake = wiring::new_brake();
 
     // Cada terminal spawna no SEU cwd (<ws_root>/<key>), onde fica o CLAUDE.md dele.
     let (mut cmd_a, mut cmd_b) = ((*cmd_factory)("Terminal A"), (*cmd_factory)("Terminal B"));
@@ -1398,6 +1479,7 @@ fn main() {
         Arc::clone(&grids),
         Mailbox::new(&mailbox_dir),
         Arc::clone(&model),
+        Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
     )
     .spawn();
 
@@ -1449,6 +1531,11 @@ fn main() {
         }
     }
 
+    // W4-4: handles compartilhados p/ o painel de persistência (lê event_count/recovering do model;
+    // loga WorkspaceFocusSet no store; settings.json ao lado de `dir`). Clones ANTES do `move`.
+    let panel_model = Arc::clone(&model);
+    let panel_store = Arc::clone(&store);
+    let panel_dir = dir.clone();
     application().run(move |cx: &mut App| {
         // W4-1: onboarding turno-0 (T0→T3). Env-gated (LINA_ONBOARDING) p/ não perturbar a demo do
         // canvas durante o dev paralelo; fundador valida com `LINA_ONBOARDING=1 cargo run`.
@@ -1468,10 +1555,19 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| WorkspaceView::new(nodes, input, a2a, node_a, desk, window, cx))
+                cx.new(|cx| WorkspaceView::new(nodes, input, a2a, node_a, desk, brake, window, cx))
             },
         )
         .expect("abrir a janela gpui");
+        // W4-4: painel de persistência (env-gated LINA_PERSIST_PANEL; não perturba a demo do canvas).
+        if persistence_ui::should_show() {
+            persistence_ui::open_window(
+                cx,
+                Arc::clone(&panel_model),
+                Arc::clone(&panel_store),
+                panel_dir.clone(),
+            );
+        }
         cx.activate(true);
     });
 

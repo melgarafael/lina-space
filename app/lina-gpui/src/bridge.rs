@@ -332,12 +332,16 @@ pub struct MailboxPump {
     grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
     profile: CliProfile,
     model: Model,
+    /// W4-3: estado do FREIO compartilhado com a UI (que pede pausa/retoma; a pump aplica no Router).
+    brake: crate::wiring::Brake,
     /// Último roster escrito no `agents.json` (evita reescrever a cada tick sem mudança).
     last_roster: Vec<AgentPresence>,
 }
 
 impl MailboxPump {
-    /// Cria o pump enraizado na `mailbox` (o `.lina/` compartilhado do workspace).
+    /// Cria o pump enraizado na `mailbox` (o `.lina/` compartilhado do workspace). **W4-3:** restaura
+    /// o estado do freio do log (inv #6: um app reaberto após pausar continua pausado) e o espelha no
+    /// `brake` para a UI.
     #[must_use]
     pub fn new(
         sup: Arc<Supervisor>,
@@ -345,15 +349,58 @@ impl MailboxPump {
         grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
         mailbox: Mailbox,
         model: Model,
+        brake: crate::wiring::Brake,
     ) -> Self {
+        let mut router = Router::new(Arc::clone(&sup), mailbox);
+        // W4-3: o freio é event-sourced — reconstrói `paused` do ÚLTIMO Orchestration{Paused,Resumed}.
+        if let Err(e) = router.restore_orchestration_state(&lock(&store)) {
+            eprintln!("lina-gpui: falha ao restaurar o estado do freio (segue despausado): {e}");
+        }
+        lock(&brake).paused = router.is_paused();
         Self {
-            router: Router::new(Arc::clone(&sup), mailbox),
+            router,
             sup,
             store,
             grids,
             profile: demo_profile(),
             model,
+            brake,
             last_roster: Vec::new(),
+        }
+    }
+
+    /// Constrói a closure de ENTREGA faseada (reusada por `pump` e `resume`). Captura clones `Arc`
+    /// (own → `'static`). **W4-3:** a entrega REAL acende o PULSO efêmero `from→target` no model — a
+    /// metáfora "sem fios" dirigida por evento REAL (`lina ask`), não pelo `A2aTrigger` demo.
+    fn deliver_fn(&self) -> impl FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String> {
+        let sup = Arc::clone(&self.sup);
+        let grids = Arc::clone(&self.grids);
+        let profile = self.profile.clone();
+        let model = Arc::clone(&self.model);
+        move |target, from, text| {
+            let Some(g) = lock(&grids).get(&target).cloned() else {
+                return Err(format!("sem grid para o alvo {target}"));
+            };
+            let out = deliver_a2a(
+                &sup,
+                target,
+                from,
+                text,
+                &profile,
+                &g,
+                InjectPolicy::AllowAll,
+            )
+            .map_err(|e| e.to_string())?;
+            // Pulso efêmero da entrega real (some sozinho via `Pulse::progress`).
+            let mut m = lock(&model);
+            m.pulse = Some(Pulse {
+                from,
+                to: target,
+                started: Instant::now(),
+            });
+            m.connected = true;
+            m.touch();
+            Ok(out)
         }
     }
 
@@ -387,39 +434,49 @@ impl MailboxPump {
         }
     }
 
-    /// Um tick: drena a mailbox e roteia. A entrega resolve o grid do alvo e injeta faseado.
+    /// Um tick: aplica o freio pedido pela UI, drena a mailbox e roteia. A entrega resolve o grid do
+    /// alvo, injeta faseado e acende o pulso (via [`Self::deliver_fn`]).
     fn tick(&mut self) {
-        let sup = Arc::clone(&self.sup);
-        let grids = Arc::clone(&self.grids);
-        let profile = self.profile.clone();
-        let deliver = move |target: NodeId, from: NodeId, text: &str| {
-            let grid = lock(&grids).get(&target).cloned();
-            match grid {
-                Some(g) => deliver_a2a(
-                    &sup,
-                    target,
-                    from,
-                    text,
-                    &profile,
-                    &g,
-                    InjectPolicy::AllowAll,
-                )
-                .map_err(|e| e.to_string()),
-                None => Err(format!("sem grid para o alvo {target}")),
+        // W4-3 FREIO: a UI pediu para alternar? → pausa OU retoma+DRENA a auto-orquestração no Router.
+        let toggle = std::mem::take(&mut lock(&self.brake).toggle_requested);
+        if toggle {
+            {
+                let mut store = lock(&self.store);
+                if self.router.is_paused() {
+                    let mut deliver = self.deliver_fn();
+                    match self.router.resume(&mut store, now_ms(), &mut deliver) {
+                        Ok(_) => eprintln!(
+                            "lina-gpui: orquestração RETOMADA (freio solto) — fila represada drenada"
+                        ),
+                        Err(e) => eprintln!("lina-gpui: falha ao retomar a orquestração: {e}"),
+                    }
+                } else {
+                    match self.router.pause(&mut store) {
+                        Ok(_) => eprintln!(
+                            "lina-gpui: orquestração PAUSADA (freio) — novas delegações enfileiram, nada se perde"
+                        ),
+                        Err(e) => eprintln!("lina-gpui: falha ao pausar a orquestração: {e}"),
+                    }
+                }
             }
-        };
+            lock(&self.brake).paused = self.router.is_paused();
+            lock(&self.model).touch();
+        }
 
+        let mut deliver = self.deliver_fn();
         let results = {
             let mut store = lock(&self.store);
-            self.router.pump(&mut store, now_ms(), deliver)
+            self.router.pump(&mut store, now_ms(), &mut deliver)
         };
 
         // Se algo roteou, atualiza o event_count da UI (e narra no stderr os bloqueios — nunca
-        // falha em silêncio: o usuário/dev vê POR QUE uma mensagem não passou).
+        // falha em silêncio: o usuário/dev vê POR QUE uma mensagem não passou). `Queued` é ESPERADO
+        // sob o freio (não é erro): a msg fica represada no `.inflight` até retomar.
         let mut routed = false;
         for (id, outcome) in &results {
             match outcome {
                 RouteOutcome::Delivered { .. } | RouteOutcome::Duplicate => routed = true,
+                RouteOutcome::Queued => {} // freio ativo: enfileirada de propósito, sem ruído
                 other => eprintln!("lina-gpui: mensagem {id} não roteada: {other:?}"),
             }
         }
@@ -2950,6 +3007,128 @@ mod tests {
             lock(&store).event_count().expect("count") > before,
             "evento deve persistir"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **W4-3 (headless) — pulso na ENTREGA REAL + FREIO.** Um `ask A→B` na mailbox, drenado pela
+    /// `MailboxPump`, ENTREGA e acende o PULSO (`from`=A, `to`=B) — evento real, não o A2aTrigger demo.
+    /// O FREIO pausa: um `ask` novo fica ENFILEIRADO (Queued, não entregue → sem pulso); soltar o freio
+    /// DRENA e entrega. Os pares Orchestration{Paused,Resumed} ficam no log.
+    #[test]
+    fn mailbox_pump_pulse_on_real_delivery_and_brake_queues() {
+        let dir = std::env::temp_dir().join(format!("lina-w43-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+
+        let mut pty = PtyManager::new();
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _drx) = std::sync::mpsc::channel::<GridDelta>();
+        let (node_a, grid_a) = wire_terminal(
+            &mut pty,
+            &sup,
+            &delta_tx,
+            "A",
+            "Terminal A",
+            "terminal",
+            PtyCommand::new("cat"),
+            80,
+            24,
+        )
+        .expect("wire A");
+        let (node_b, grid_b) = wire_terminal(
+            &mut pty,
+            &sup,
+            &delta_tx,
+            "B",
+            "Terminal B",
+            "terminal",
+            PtyCommand::new("cat"),
+            80,
+            24,
+        )
+        .expect("wire B");
+        let _ = sup.set_status(node_a, CoreStatus::Running);
+        let _ = sup.set_status(node_b, CoreStatus::Running);
+
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        lock(&grids).insert(node_a, grid_a);
+        lock(&grids).insert(node_b, grid_b);
+
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let brake = crate::wiring::new_brake();
+        let mailbox_root = dir.join(".lina");
+        let mut pump = MailboxPump::new(
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&grids),
+            Mailbox::new(&mailbox_root),
+            Arc::clone(&model),
+            Arc::clone(&brake),
+        );
+        let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
+        let kinds = |s: &Arc<Mutex<EventStore>>| {
+            lock(s)
+                .events()
+                .expect("eventos")
+                .into_iter()
+                .map(|r| r.kind)
+                .collect::<Vec<_>>()
+        };
+
+        // (1) ask A→B → entrega REAL → pulso A→B aceso. Round 6: o A2A real usa o outbox POR-NÓ
+        // (`enqueue_as`, origem autenticada); o flat é anônimo (`from`=""→UnknownSender), então NÃO usar.
+        outbox
+            .enqueue_as(
+                "Terminal A",
+                &MailMessage::new("Terminal A", "Terminal B", "ask", "oi 1"),
+            )
+            .expect("enfileira 1");
+        pump.tick();
+        assert!(
+            lock(&model)
+                .pulse
+                .is_some_and(|p| p.from == node_a && p.to == node_b),
+            "a entrega real do ask acende o pulso A→B"
+        );
+
+        // (2) FREIO: pausa.
+        lock(&brake).toggle_requested = true;
+        pump.tick();
+        assert!(lock(&brake).paused, "o freio pausou a orquestração");
+        assert!(
+            kinds(&store).iter().any(|k| k == "OrchestrationPaused"),
+            "OrchestrationPaused apendado no log"
+        );
+
+        // (3) Pausado: um ask novo fica ENFILEIRADO (não entrega → sem pulso novo).
+        lock(&model).pulse = None;
+        outbox
+            .enqueue_as(
+                "Terminal A",
+                &MailMessage::new("Terminal A", "Terminal B", "ask", "oi 2"),
+            )
+            .expect("enfileira 2");
+        pump.tick();
+        assert!(
+            lock(&model).pulse.is_none(),
+            "sob o freio a delegação ENFILEIRA (não injeta → sem pulso)"
+        );
+
+        // (4) Solta o freio → DRENA a fila represada → entrega → pulso + OrchestrationResumed.
+        lock(&brake).toggle_requested = true;
+        pump.tick();
+        assert!(!lock(&brake).paused, "o freio foi solto");
+        assert!(
+            kinds(&store).iter().any(|k| k == "OrchestrationResumed"),
+            "OrchestrationResumed apendado no log"
+        );
+        assert!(
+            lock(&model).pulse.is_some(),
+            "ao retomar, a fila represada drena e entrega (o pulso acende)"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
