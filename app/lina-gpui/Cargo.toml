@@ -16,6 +16,9 @@ lina-host = { path = "../../crates/lina-host" }
 lina-vt = { path = "../../crates/lina-vt" }
 # W3-2: motor de bootstrap turno-0 — gera `<workspace>/CLAUDE.md` (8 blocos) ao criar/mudar nós.
 lina-bootstrap = { path = "../../crates/lina-bootstrap" }
+# W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui p/ executar uma ação custodiada
+# (o agente nunca o tem no env). `MockStore` (em memória) na demo; `KeyringStore` em produção.
+lina-secrets = { path = "../../crates/lina-secrets" }
 # Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
 tokio = { version = "1", features = ["sync"] }
 # gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal

@@ -95,6 +95,46 @@ fn lina_do_deploy_registers_and_blocks_without_executing() {
     );
 }
 
+/// Fio 1+2 (lado-bin): `lina do` deposita o pedido na FILA DE BROKER DEDICADA por-nó
+/// (`<LINA_HOME>/broker/outbox/<no>/`), NÃO no outbox A2A (`<LINA_HOME>/outbox/`). Sem
+/// `.lina/bootstrap.json` no cwd, o requester cai no fallback `agente-desconhecido` (subdir válido).
+#[test]
+fn lina_do_enqueues_request_in_dedicated_broker_queue_per_node() {
+    let home = TempHome::new("brokerq");
+    let out = run_do(&home, &["deploy", "--env", "prod"]);
+    assert!(
+        out.status.success(),
+        "lina do deveria registrar com sucesso"
+    );
+
+    let broker_outbox = home.path().join("broker").join("outbox");
+    let node_dir = broker_outbox.join("agente-desconhecido");
+    let jsons: Vec<PathBuf> = std::fs::read_dir(&node_dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        jsons.len(),
+        1,
+        "o pedido custodiado deve estar no subdir por-nó da fila de broker ({})",
+        node_dir.display()
+    );
+
+    // E NÃO pode ter vazado para o outbox A2A (senão o Router o trataria como entrega).
+    let a2a_outbox = home.path().join("outbox");
+    assert!(
+        !a2a_outbox.exists()
+            || std::fs::read_dir(&a2a_outbox)
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(true),
+        "o pedido de broker NAO pode aparecer no outbox A2A"
+    );
+}
+
 /// Ação não custodiada via `lina do` é recusada (exit != 0) e não apenda evento.
 #[test]
 fn lina_do_unknown_action_is_rejected() {

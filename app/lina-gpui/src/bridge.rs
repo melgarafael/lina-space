@@ -23,12 +23,14 @@ use std::time::{Duration, Instant};
 use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 
 use lina_core::{
-    deliver_a2a, now_ms, A2aEnvelope, AgentPresence, AlacrittyBackend, BusEvent, CliProfile,
-    DeliveryOutcome, DomainEvent, EventStore, GridDelta, InjectPolicy, Mailbox,
-    NodeStatus as CoreStatus, PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router,
-    Supervisor, VtBackend,
+    deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
+    BrokerOutcome, BrokerRequest, BusEvent, CliProfile, DeliveryOutcome, DomainEvent, EventStore,
+    GridDelta, InjectPolicy, MailMessage, Mailbox, NodeStatus as CoreStatus, PtyCommand,
+    PtyManager, Recipient, RolePolicy, RouteOutcome, Router, Supervisor, VtBackend,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
+// W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
+use lina_secrets::{SecretStore, SecretVault};
 // W2-4: tipos de mouse reporting do motor VT (não re-exportados pelo core) — para `encode_mouse`.
 use lina_vt::{MouseButton as VtBtn, MouseEvent, MouseEventKind, MouseModifiers};
 use tokio::sync::broadcast;
@@ -430,6 +432,249 @@ impl MailboxPump {
     }
 }
 
+// ════════════════════════ W3-6c · ÚLTIMA MILHA — custódia VIVA no app (ADR 0004) ════════════════════════
+//
+// Os testes headless já provam `run_custody` (broker.rs). Aqui o APP passa a CHAMÁ-LA: drena a FILA
+// DE BROKER (`<LINA_HOME>/broker/`, irmã do outbox A2A — o `Router` nunca a varre), aplica o GATE
+// HUMANO (tecla na janela, inforjável pelo PTY do agente) e só então deixa o broker buscar o segredo
+// no cofre e executar. O agente NUNCA tem o token (vive só no [`SecretVault`]); sem confirmação
+// humana, não há caminho de execução — a custódia é o piso inquebrável.
+
+/// Um pedido custodiado aguardando o gate humano (projetado no banner da topbar).
+#[derive(Debug, Clone)]
+pub struct PendingCustody {
+    /// `id` da `MailMessage` do pedido (chave do gate).
+    pub id: String,
+    /// Ação custodiada (`deploy`/`pay`/`send`).
+    pub action: String,
+    /// Requisitante = origem AUTENTICADA (dir-dono carimbado pelo drain por-nó — A3).
+    pub requester: String,
+    /// Chave do segredo no cofre (ex.: `prod` para `deploy --env prod`).
+    pub secret_key: String,
+    /// Texto legível do banner ("🔒 … aguarda confirmação").
+    pub display: String,
+}
+
+/// **Mesa de custódia compartilhada** entre a [`BrokerPump`] (produz o pendente + executa) e a UI
+/// (que confirma com TECLA na janela — um agente no PTY não consegue sintetizá-la). A UI nunca toca
+/// o cofre nem o broker: só sinaliza `confirm_requested`; quem executa é a pump (escritora única).
+#[derive(Debug, Default)]
+pub struct CustodyDesk {
+    /// Pedido aguardando o gate humano. `None` = nada pendente.
+    pub pending: Option<PendingCustody>,
+    /// A UI sinalizou que o humano confirmou o pendente de `id`. A pump consome no próximo tick.
+    pub confirm_requested: Option<String>,
+    /// Último resultado (banner efêmero pós-execução): texto + quando nasceu.
+    pub last_result: Option<(String, Instant)>,
+}
+
+impl CustodyDesk {
+    /// Texto a exibir na topbar AGORA: o pendente (prioridade) ou o último resultado por ~6s.
+    #[must_use]
+    pub fn banner(&self) -> Option<String> {
+        if let Some(p) = &self.pending {
+            return Some(p.display.clone());
+        }
+        match &self.last_result {
+            Some((txt, born)) if born.elapsed() < Duration::from_secs(6) => Some(txt.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Handle compartilhado da mesa de custódia.
+pub type Desk = Arc<Mutex<CustodyDesk>>;
+
+/// Extrai a chave do segredo do payload do pedido (`--env <x>`); default `"default"` para ações
+/// sem ambiente (pay/send). Determinístico, ZERO interpretação semântica (invariante #1).
+fn parse_secret_key(payload: &str) -> String {
+    let toks: Vec<&str> = payload.split_whitespace().collect();
+    for w in toks.windows(2) {
+        if w[0] == "--env" {
+            return w[1].to_string();
+        }
+    }
+    "default".to_string()
+}
+
+/// **Observador da FILA DE BROKER (`<LINA_HOME>/broker/`).** Numa thread própria, drena os pedidos
+/// `broker.do`, dispara o gate humano e — só após confirmação na janela — chama [`run_custody`], que
+/// obtém o segredo do `vault` e executa. Genérico sobre o backend do cofre (`MockStore` na demo,
+/// `KeyringStore` em produção). Escritor único do estado de execução custodiada.
+pub struct BrokerPump<S: SecretStore> {
+    mailbox: Mailbox,
+    store: Arc<Mutex<EventStore>>,
+    vault: SecretVault<S>,
+    desk: Desk,
+    model: Model,
+}
+
+impl<S: SecretStore + Send + 'static> BrokerPump<S> {
+    /// Cria a pump enraizada na `mailbox` da fila de broker.
+    #[must_use]
+    pub fn new(
+        mailbox: Mailbox,
+        store: Arc<Mutex<EventStore>>,
+        vault: SecretVault<S>,
+        desk: Desk,
+        model: Model,
+    ) -> Self {
+        Self {
+            mailbox,
+            store,
+            vault,
+            desk,
+            model,
+        }
+    }
+
+    /// Sobe a thread que observa a fila de broker (gate humano + execução custodiada) a cada ~150 ms.
+    pub fn spawn(mut self) -> JoinHandle<()> {
+        thread::spawn(move || loop {
+            self.tick();
+            thread::sleep(Duration::from_millis(150));
+        })
+    }
+
+    fn tick(&mut self) {
+        // (1) Confirmação humana sinalizada pela UI? → executa COM o segredo do cofre.
+        let confirm = lock(&self.desk).confirm_requested.take();
+        if let Some(id) = confirm {
+            self.execute_confirmed(&id);
+        }
+        // (2) Novos pedidos de broker (recuperável a crash via .inflight + ack).
+        let msgs = self.mailbox.drain_to_inflight().unwrap_or_else(|e| {
+            eprintln!("lina-gpui: broker pump nao drenou a fila (sera retentado): {e}");
+            Vec::new()
+        });
+        for m in msgs {
+            self.handle_request(&m);
+            if let Err(e) = self.mailbox.ack_inflight(&m.id) {
+                eprintln!(
+                    "lina-gpui: broker pump falhou ao confirmar inflight {}: {e}",
+                    m.id
+                );
+            }
+        }
+    }
+
+    /// 1ª vista de um pedido `broker.do`: roda `run_custody(confirmed=false)` (ActionGated{ask} +
+    /// BrokerDenied{unconfirmed}; o cofre NEM é tocado) e SURFAÇA o banner do gate humano.
+    fn handle_request(&mut self, m: &MailMessage) {
+        if m.intent != "broker.do" {
+            return; // a fila é de broker; ignora ruído sem panicar (best-effort, VISÍVEL abaixo)
+        }
+        let Some(action) = m.ref_id.as_deref().and_then(|r| r.strip_prefix("do:")) else {
+            eprintln!(
+                "lina-gpui: broker.do sem ref 'do:<action>' (msg {}) — ignorado",
+                m.id
+            );
+            return;
+        };
+        let Some(custody) = lookup_action(action) else {
+            eprintln!(
+                "lina-gpui: broker.do com acao nao custodiada {action:?} (msg {}) — ignorado",
+                m.id
+            );
+            return;
+        };
+        let secret_key = parse_secret_key(&m.payload);
+        // requester = origem AUTENTICADA (o drain por-nó carimbou `from` = dir-dono).
+        let req = BrokerRequest::new(custody, secret_key.clone(), m.from.clone());
+
+        let outcome = {
+            let mut store = lock(&self.store);
+            // O app NÃO auto-confirma: 1ª passada SEM confirmação → loga o gate e bloqueia (custódia).
+            run_custody(&req, false, &self.vault, &mut store, |_| Ok(()))
+        };
+
+        match outcome {
+            Ok(BrokerOutcome::DeniedUnconfirmed) => {
+                let pend = PendingCustody {
+                    id: m.id.clone(),
+                    action: action.to_string(),
+                    requester: m.from.clone(),
+                    secret_key,
+                    display: format!(
+                        "🔒 CUSTODIA: '{}' pedido por {} — aprove com ⌘⏎ (o agente NAO tem o token)",
+                        custody.desc, m.from
+                    ),
+                };
+                lock(&self.desk).pending = Some(pend);
+                lock(&self.model).touch();
+                eprintln!(
+                    "lina-gpui: CUSTODIA — '{action}' de {} aguarda gate humano (⌘⏎). msg {}",
+                    m.from, m.id
+                );
+            }
+            Ok(other) => {
+                eprintln!("lina-gpui: broker.do {action} 1a passada inesperada: {other:?}");
+            }
+            Err(e) => eprintln!("lina-gpui: broker.do {action} falhou no gate: {e}"),
+        }
+    }
+
+    /// O humano confirmou (`id`): roda `run_custody(confirmed=true)` — o BROKER obtém o segredo do
+    /// cofre e executa (o agente nunca o teve). Marca o disco como PROVA observável e atualiza o banner.
+    fn execute_confirmed(&mut self, id: &str) {
+        let pend = lock(&self.desk).pending.clone();
+        let Some(pend) = pend.filter(|p| p.id == id) else {
+            eprintln!("lina-gpui: confirmacao para {id} sem pendente correspondente — ignorada");
+            return;
+        };
+        let Some(custody) = lookup_action(&pend.action) else {
+            eprintln!(
+                "lina-gpui: pendente com acao invalida {:?} — abortado",
+                pend.action
+            );
+            lock(&self.desk).pending = None;
+            return;
+        };
+        let req = BrokerRequest::new(custody, pend.secret_key.clone(), pend.requester.clone());
+        let exec_root = self.mailbox.root().to_path_buf();
+        let action_name = pend.action.clone();
+
+        let outcome = {
+            let mut store = lock(&self.store);
+            run_custody(&req, true, &self.vault, &mut store, |secret| {
+                // MVP: a ação externa real (deploy a um alvo) está fora do escopo; a PROVA é que o
+                // executor recebeu o segredo DO COFRE (o agente nunca o viu). Marca o disco com o
+                // TAMANHO do segredo (nunca o valor — invariante #2: o token jamais sai do cofre/executor).
+                let marker = exec_root.join(format!("executed-{action_name}.txt"));
+                std::fs::write(
+                    &marker,
+                    format!(
+                        "broker executou '{action_name}' com um segredo de {} bytes obtido do cofre (o agente nunca o teve)\n",
+                        secret.len()
+                    ),
+                )
+                .map_err(|e| format!("escrever marcador de execucao: {e}"))
+            })
+        };
+
+        let banner = match outcome {
+            Ok(BrokerOutcome::Executed) => format!(
+                "✅ '{}' executado pelo broker — segredo veio do cofre; o agente nunca o viu",
+                pend.action
+            ),
+            Ok(BrokerOutcome::DeniedNoSecret) => format!(
+                "⛔ '{}' bloqueado — segredo AUSENTE do cofre (sem token, sem acao: custodia)",
+                pend.action
+            ),
+            Ok(other) => format!("'{}' resultado inesperado: {other:?}", pend.action),
+            Err(e) => format!("⛔ '{}' falhou na execucao: {e}", pend.action),
+        };
+        eprintln!("lina-gpui: CUSTODIA — {banner}");
+        {
+            let mut d = lock(&self.desk);
+            d.pending = None;
+            d.confirm_requested = None;
+            d.last_result = Some((banner, Instant::now()));
+        }
+        lock(&self.model).touch();
+    }
+}
+
 /// Mapeia o `NodeStatus` do core (Bus) para o `NodeStatus` do contrato de UI.
 fn map_status(s: CoreStatus) -> NodeStatus {
     match s {
@@ -716,6 +961,36 @@ pub fn shell_cmd(name: &str) -> PtyCommand {
         Some(path) => cmd.env("PATH", path),
         None => cmd,
     }
+}
+
+/// **W3-6c fio 3 — env limpo do PTY do agente.** Nomes de variáveis de ambiente portadoras de
+/// segredo que NÃO podem vazar para o env de um terminal do agente: o token de ação externa vive SÓ
+/// no [`SecretVault`] do Lina (invariante #2 + ADR 0004 "o segredo nunca entra no env do PTY").
+/// `LINA_DEPLOY_TOKEN` é a semente do cofre na demo — removida do env logo após semear.
+pub const SECRET_ENV_DENYLIST: &[&str] = &[
+    "LINA_DEPLOY_TOKEN",
+    "DEPLOY_TOKEN",
+    "DEPLOY_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "STRIPE_SECRET_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "NPM_TOKEN",
+];
+
+/// Remove do **próprio env do processo do app** (que TODO PTY filho herda no spawn) as variáveis
+/// portadoras de segredo da denylist. Como os filhos herdam o env do app no momento do spawn, scrubar
+/// AQUI — antes de qualquer `wire_terminal` — garante que nenhum terminal do agente nasça com o token.
+/// Retorna os nomes efetivamente removidos (observabilidade/teste).
+pub fn scrub_pty_secret_env() -> Vec<&'static str> {
+    let mut removed = Vec::new();
+    for &key in SECRET_ENV_DENYLIST {
+        if std::env::var_os(key).is_some() {
+            std::env::remove_var(key);
+            removed.push(key);
+        }
+    }
+    removed
 }
 
 /// Fábrica injetável de comando por nome: o app passa [`shell_cmd`] (shell real); os testes
@@ -1439,6 +1714,157 @@ pub fn spawn_pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────── W3-6c última milha: custódia (fios 1 e 3) — unidades gpui-free ───────────────
+
+    /// Fio 1: a chave do segredo é extraída de `--env <x>` (deploy); default `default` (pay/send).
+    #[test]
+    fn parse_secret_key_reads_env_flag_or_defaults() {
+        assert_eq!(parse_secret_key("--env prod"), "prod");
+        assert_eq!(parse_secret_key("algo --env staging mais"), "staging");
+        assert_eq!(parse_secret_key(""), "default");
+        assert_eq!(parse_secret_key("--env"), "default"); // sem valor após a flag
+    }
+
+    /// Fio 1: o banner prioriza o pendente; sem pendente, mostra o último resultado por uma janela.
+    #[test]
+    fn custody_desk_banner_prioritizes_pending_then_shows_result() {
+        let mut desk = CustodyDesk::default();
+        assert!(desk.banner().is_none(), "vazio → sem banner");
+
+        desk.last_result = Some(("✅ deploy executado".into(), Instant::now()));
+        assert_eq!(desk.banner().as_deref(), Some("✅ deploy executado"));
+
+        desk.pending = Some(PendingCustody {
+            id: "msg_1".into(),
+            action: "deploy".into(),
+            requester: "@Dev".into(),
+            secret_key: "prod".into(),
+            display: "🔒 aguarda".into(),
+        });
+        assert_eq!(
+            desk.banner().as_deref(),
+            Some("🔒 aguarda"),
+            "o pendente vence o último resultado"
+        );
+    }
+
+    /// Fio 3: `scrub_pty_secret_env` remove do env do processo as vars portadoras de segredo (que os
+    /// PTYs filhos herdariam). Prova que o token NÃO pode chegar ao env de um terminal do agente.
+    #[test]
+    fn scrub_removes_secret_env_vars_so_children_cannot_inherit() {
+        std::env::set_var("LINA_DEPLOY_TOKEN", "TOKEN-SUPER-SECRETO");
+        assert!(std::env::var_os("LINA_DEPLOY_TOKEN").is_some());
+
+        let removed = scrub_pty_secret_env();
+        assert!(
+            removed.contains(&"LINA_DEPLOY_TOKEN"),
+            "a var semeada deve constar dos removidos"
+        );
+        assert!(
+            std::env::var_os("LINA_DEPLOY_TOKEN").is_none(),
+            "após o scrub, nenhum PTY filho herda o token (ele vive só no cofre)"
+        );
+    }
+
+    /// **Fio 1 (headless, prova de custódia VIVA no app):** com o token SÓ no cofre, um `broker.do`
+    /// na fila de broker (1) BLOQUEIA sem confirmação (ActionGated{ask}+BrokerDenied{unconfirmed},
+    /// banner pendente, executor NÃO roda) e (2) após o gate humano (confirm_requested = id) EXECUTA
+    /// com o segredo do cofre (BrokerExecuted + marcador no disco) — o agente nunca teve o token.
+    #[test]
+    fn broker_pump_gate_blocks_then_executes_on_confirm() {
+        let base = std::env::temp_dir().join(format!("lina-brokerpump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("abrir store"),
+        ));
+
+        // Token SÓ no cofre (o agente nunca o tem). Cofre em memória (MockStore).
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        vault
+            .set("deploy", "prod", "DEPLOY-KEY-DO-COFRE")
+            .expect("semear");
+
+        // Pedido custodiado na fila de broker, origem autenticada @Dev (enqueue_as).
+        let broker_mb = Mailbox::new(&broker_root);
+        let req =
+            MailMessage::new("@Dev", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        broker_mb.enqueue_as("@Dev", &req).expect("enqueue_as @Dev");
+
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            Arc::clone(&model),
+        );
+
+        // (1) 1º tick: drena → run_custody(confirmed=false) → bloqueia + banner pendente.
+        pump.tick();
+        let pend = lock(&desk).pending.clone().expect("pendente após o pedido");
+        assert_eq!(pend.action, "deploy");
+        assert_eq!(pend.requester, "@Dev", "origem autenticada (A3)");
+        assert_eq!(pend.secret_key, "prod");
+        let kinds_after_block: Vec<String> = lock(&store)
+            .events()
+            .expect("eventos")
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert!(kinds_after_block.iter().any(|k| k == "ActionGated"));
+        assert!(kinds_after_block.iter().any(|k| k == "BrokerDenied"));
+        assert!(
+            !kinds_after_block.iter().any(|k| k == "BrokerExecuted"),
+            "sem confirmação NUNCA executa"
+        );
+
+        // (2) Gate humano: a UI sinaliza a confirmação → 2º tick executa com o segredo do cofre.
+        lock(&desk).confirm_requested = Some(pend.id.clone());
+        pump.tick();
+
+        let events = lock(&store).events().expect("eventos");
+        assert!(
+            events
+                .iter()
+                .any(|r| r.kind == "BrokerExecuted" && r.payload["action"] == "deploy"),
+            "após confirmação, o broker executa COM o segredo do cofre"
+        );
+        // O segredo NUNCA pode aparecer no log (invariante #2).
+        let dump = format!(
+            "{:?}",
+            events.iter().map(|r| &r.payload).collect::<Vec<_>>()
+        );
+        assert!(
+            !dump.contains("DEPLOY-KEY-DO-COFRE"),
+            "o token não pode vazar ao log"
+        );
+
+        // Marcador de execução no disco (prova observável; carrega só o TAMANHO do segredo).
+        let marker = broker_root.join("executed-deploy.txt");
+        let body = std::fs::read_to_string(&marker).expect("marcador de execução");
+        assert!(body.contains("deploy"));
+        assert!(
+            !body.contains("DEPLOY-KEY-DO-COFRE"),
+            "o marcador não expõe o token"
+        );
+
+        // O pendente foi limpo e o banner agora mostra o resultado efêmero.
+        assert!(
+            lock(&desk).pending.is_none(),
+            "pendente limpo após executar"
+        );
+        assert!(
+            lock(&desk)
+                .banner()
+                .is_some_and(|b| b.contains("executado")),
+            "banner de resultado visível"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Texto visível do grid (via o NOVO acessor `screen()`), p/ asserts.
     fn screen_text(grid: &Grid) -> String {

@@ -30,11 +30,14 @@ use lina_bootstrap::Autonomy;
 
 use bridge::{
     card_visible, cell_in_selection, demo_profile, encode_pointer, hit_test, lock, normalize_sel,
-    screen_to_cell, shell_cmd, spawn_pump, wire_terminal, A2aTrigger, BootstrapWriter, Camera,
-    CmdFactory, CoreInput, GpuiBridgeHost, Grid, MailboxPump, Model, NodeManager, NodeView,
-    PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    screen_to_cell, scrub_pty_secret_env, shell_cmd, spawn_pump, wire_terminal, A2aTrigger,
+    BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost,
+    Grid, MailboxPump, Model, NodeManager, NodeView, PtrAction, SharedModel, CARD_H, CARD_W,
+    CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
+// W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
+use lina_secrets::{MockStore, SecretVault};
 
 /// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
 const FONT_PX: f32 = 13.0;
@@ -247,6 +250,9 @@ struct WorkspaceView {
     dragging_sel: bool,
     /// `Some(node)` enquanto um "press" de mouse reporting está ativo nesse nó (motion/release).
     report_node: Option<NodeId>,
+    /// W3-6c: mesa de custódia compartilhada com a [`BrokerPump`]. O banner do gate humano é lido
+    /// daqui; ⌘⏎ sinaliza a confirmação (tecla na janela = gate inforjável pelo PTY do agente).
+    desk: Desk,
 }
 
 impl WorkspaceView {
@@ -255,6 +261,7 @@ impl WorkspaceView {
         input: Arc<dyn InputSink>,
         a2a: Arc<A2aTrigger>,
         focused: NodeId,
+        desk: Desk,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -273,6 +280,7 @@ impl WorkspaceView {
             sel: None,
             dragging_sel: false,
             report_node: None,
+            desk,
         }
     }
 
@@ -496,6 +504,20 @@ impl WorkspaceView {
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // W3-6c (ADR 0004) — GATE HUMANO de custódia: ⌘⏎ APROVA o pedido custodiado pendente. É uma
+        // tecla NA JANELA do app: o PTY do agente não a sintetiza → confirmação inforjável (o broker
+        // só então busca o segredo do cofre e executa). NÃO vai para o terminal.
+        if ks.modifiers.platform && (ks.key == "enter" || ks.key == "return") {
+            let pending_id = lock(&self.desk).pending.as_ref().map(|p| p.id.clone());
+            match pending_id {
+                Some(id) => {
+                    lock(&self.desk).confirm_requested = Some(id);
+                    eprintln!("lina-gpui: GATE HUMANO — custódia confirmada na janela (⌘⏎)");
+                }
+                None => eprintln!("lina-gpui: ⌘⏎ sem custódia pendente (nada a confirmar)"),
+            }
+            return;
+        }
         // ⌘C copia a seleção; ⌘V cola no PTY focado (bracketed-paste). Ctrl+C/V seguem p/ o PTY.
         if ks.modifiers.platform && ks.key == "c" {
             self.copy_selection(cx);
@@ -1005,6 +1027,25 @@ impl Render for WorkspaceView {
             );
         }
 
+        // W3-6c (ADR 0004) — BANNER DE CUSTÓDIA: o gate humano VISÍVEL na tela. Âmbar = pedido
+        // pendente aguardando ⌘⏎; senão, o último resultado da execução por alguns segundos.
+        let (custody_banner, custody_pending) = {
+            let d = lock(&self.desk);
+            (d.banner(), d.pending.is_some())
+        };
+        if let Some(banner) = custody_banner {
+            let bg = if custody_pending { 0xe0af68 } else { 0x2c7a4b };
+            topbar = topbar.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(bg))
+                    .text_color(rgb(0x11111b))
+                    .child(text!(banner)),
+            );
+        }
+
         root.child(topbar)
     }
 }
@@ -1050,6 +1091,29 @@ fn main() {
     let bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
         .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
         .ok();
+
+    // ── W3-6c (ADR 0004) · COFRE DE SEGREDO + ENV LIMPO (fios 1 e 3) — ANTES de spawnar qualquer PTY.
+    // Cofre do workspace. DEMO: backend em memória (`MockStore`) p/ não tocar o keyring do SO no
+    // teatro do fundador; PRODUÇÃO trocaria por `SecretVault::new("lina-space/<ws>")` (KeyringStore).
+    // Semente OPCIONAL via `LINA_DEPLOY_TOKEN`: com ela, a custódia EXECUTA (segredo do cofre); sem
+    // ela, o cofre fica vazio e a custódia BLOQUEIA (DeniedNoSecret) — ambos provam a blindagem.
+    let custody_vault = SecretVault::with_store("lina-space/walking-skeleton", MockStore::new());
+    if let Ok(token) = std::env::var("LINA_DEPLOY_TOKEN") {
+        match custody_vault.set("deploy", "prod", &token) {
+            Ok(()) => {
+                eprintln!("lina-gpui: cofre semeado (deploy/prod) a partir de LINA_DEPLOY_TOKEN")
+            }
+            Err(e) => eprintln!("lina-gpui: nao semeou o cofre (deploy/prod): {e}"),
+        }
+    }
+    // Fio 3: os PTYs filhos herdam o env do app no spawn → remover as vars de segredo do PRÓPRIO env
+    // AQUI (antes de qualquer `wire_terminal`) garante que nenhum terminal do agente nasça com o token.
+    let scrubbed = scrub_pty_secret_env();
+    if !scrubbed.is_empty() {
+        eprintln!("lina-gpui: env limpo — vars de segredo removidas do env do app (PTYs nao as herdam): {scrubbed:?}");
+    }
+    // Mesa de custódia compartilhada: a UI confirma (⌘⏎); a BrokerPump executa COM o segredo do cofre.
+    let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
 
     // Cada terminal spawna no SEU cwd (<ws_root>/<key>), onde fica o CLAUDE.md dele.
     let (mut cmd_a, mut cmd_b) = ((*cmd_factory)("Terminal A"), (*cmd_factory)("Terminal B"));
@@ -1187,6 +1251,18 @@ fn main() {
     )
     .spawn();
 
+    // W3-6c (ADR 0004): a BROKER PUMP observa a FILA DE BROKER (`<ws_root>/.lina/broker/`, irmã do
+    // outbox A2A), aplica o gate humano (⌘⏎ na janela) e chama `run_custody` — que obtém o segredo do
+    // cofre e executa. O agente NUNCA tem o token. Thread daemon (encerra com o `process::exit`).
+    let _broker_pump = BrokerPump::new(
+        Mailbox::new(mailbox_dir.join("broker")),
+        Arc::clone(&store),
+        custody_vault,
+        Arc::clone(&desk),
+        Arc::clone(&model),
+    )
+    .spawn();
+
     eprintln!(
         "lina-gpui: render de terminal · grid {cols}x{rows} · log {} · {event_count} eventos",
         dir.display()
@@ -1233,7 +1309,9 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| WorkspaceView::new(nodes, input, a2a, node_a, window, cx)),
+            |window, cx| {
+                cx.new(|cx| WorkspaceView::new(nodes, input, a2a, node_a, desk, window, cx))
+            },
         )
         .expect("abrir a janela gpui");
         cx.activate(true);

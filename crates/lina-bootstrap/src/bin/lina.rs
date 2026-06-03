@@ -53,6 +53,30 @@ fn mailbox_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".lina"))
 }
 
+/// Raiz da **fila de broker** (`<LINA_HOME>/broker/`) — irmã do outbox A2A, drenada SÓ pela
+/// `BrokerPump` do app (o `Router` A2A nunca a varre). É onde `lina do` deposita o pedido custodiado
+/// para o supervisor rodar o gate humano + `run_custody` (ADR 0004). Separá-la do outbox A2A evita
+/// que o pedido seja tratado como entrega A2A (e consumido como `NoTarget`).
+fn broker_mailbox_root() -> PathBuf {
+    mailbox_root().join("broker")
+}
+
+/// **W3-6c A3 — enfileira no outbox POR-NÓ** (`enqueue_as`): cada PTY escreve no SEU subdir e o
+/// supervisor atribui `from` = dir-dono (origem inforjável). Fallback VISÍVEL (nunca silencioso) ao
+/// outbox flat se o nome do nó não for um subdir seguro — A3 degradado, mas o A2A não quebra.
+fn enqueue_per_node(mailbox: &Mailbox, node: &str, msg: &MailMessage) -> std::io::Result<()> {
+    match mailbox.enqueue_as(node, msg) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            eprintln!(
+                "lina: A3 degradado — no {node:?} nao e subdir seguro ({e}); caindo no outbox flat (from NAO autenticado)"
+            );
+            mailbox.enqueue(msg)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn load_input() -> Result<BootstrapInput, String> {
     let data = std::fs::read_to_string(INPUT_PATH).map_err(|e| e.to_string())?;
     serde_json::from_str(&data).map_err(|e| e.to_string())
@@ -157,7 +181,7 @@ fn run_ask(args: &[String]) -> ExitCode {
         }
     };
 
-    let mut msg = MailMessage::new(from, to, intent, payload);
+    let mut msg = MailMessage::new(from.clone(), to, intent, payload);
     if await_reply {
         msg = msg.awaiting();
     }
@@ -165,7 +189,8 @@ fn run_ask(args: &[String]) -> ExitCode {
         msg = msg.replying_to(rt);
     }
     let mailbox = Mailbox::new(mailbox_root());
-    match mailbox.enqueue(&msg) {
+    // W3-6c A3: outbox POR-NÓ — `from` é autenticado pela origem (dir-dono), não pelo campo forjável.
+    match enqueue_per_node(&mailbox, &from, &msg) {
         Ok(()) => {
             println!("ok: mensagem {} enfileirada para {}", msg.id, msg.to);
             ExitCode::SUCCESS
@@ -462,12 +487,15 @@ fn run_do(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // (4) Registra o pedido para o supervisor (gate humano + execução com o segredo do cofre).
+    // (4) Registra o pedido na FILA DE BROKER dedicada (`<LINA_HOME>/broker/`), NÃO no outbox A2A: é
+    //     uma mensagem de controle para o supervisor (gate humano + `run_custody` com o segredo do
+    //     cofre), não uma entrega a um colega. `enqueue_as` (A3): a origem (dir-dono) autentica o
+    //     `requester`, mesmo que o campo `from` seja forjado.
     let msg = MailMessage::new(&requester, "broker", "broker.do", rest.join(" "))
         .with_ref(format!("do:{action}"));
-    let mailbox = Mailbox::new(mailbox_root());
-    if let Err(e) = mailbox.enqueue(&msg) {
-        eprintln!("lina: falha ao registrar o pedido custodiado na mailbox: {e}");
+    let mailbox = Mailbox::new(broker_mailbox_root());
+    if let Err(e) = enqueue_per_node(&mailbox, &requester, &msg) {
+        eprintln!("lina: falha ao registrar o pedido custodiado na fila de broker: {e}");
         return ExitCode::from(1);
     }
 
