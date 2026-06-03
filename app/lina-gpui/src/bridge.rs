@@ -28,7 +28,8 @@ use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
     BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome, DomainEvent,
     EventStore, GridDelta, InjectPolicy, MailMessage, Mailbox, NodeStatus as CoreStatus,
-    PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router, Supervisor, VtBackend,
+    PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor,
+    VtBackend,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
@@ -97,6 +98,9 @@ pub struct SharedModel {
     pub pulse: Option<Pulse>,
     pub connected: bool,
     pub event_count: u64,
+    /// W3-7c · TETO DE CUSTO: `true` quando o `CostLedger` está em `Paused` (uso ≥ teto). Espelhado
+    /// pela `MailboxPump`; o render mostra o banner "teto atingido — pausado".
+    pub cost_paused: bool,
     pub generation: u64,
 }
 
@@ -336,12 +340,16 @@ pub struct MailboxPump {
     brake: crate::wiring::Brake,
     /// Último roster escrito no `agents.json` (evita reescrever a cada tick sem mudança).
     last_roster: Vec<AgentPresence>,
+    /// W3-7c: último `event_count` em que reconstruímos o `CostLedger` — só re-replaya quando há eventos
+    /// novos (evita replay por tick quando nada mudou).
+    last_cost_ec: u64,
 }
 
 impl MailboxPump {
     /// Cria o pump enraizado na `mailbox` (o `.lina/` compartilhado do workspace). **W4-3:** restaura
     /// o estado do freio do log (inv #6: um app reaberto após pausar continua pausado) e o espelha no
     /// `brake` para a UI.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         sup: Arc<Supervisor>,
@@ -350,8 +358,15 @@ impl MailboxPump {
         mailbox: Mailbox,
         model: Model,
         brake: crate::wiring::Brake,
+        token_budget_day: u64,
     ) -> Self {
-        let mut router = Router::new(Arc::clone(&sup), mailbox);
+        // W3-7c (TETO DE CUSTO): `token_budget_day > 0` ARMA o teto no Router (0 = desligado). O
+        // `CostLedger` soma os `TokenUsageReported` (emitidos pela bomba) e PAUSA na transição.
+        let config = RouterConfig {
+            token_budget_day,
+            ..RouterConfig::default()
+        };
+        let mut router = Router::with_config(Arc::clone(&sup), mailbox, config);
         // W4-3: o freio é event-sourced — reconstrói `paused` do ÚLTIMO Orchestration{Paused,Resumed}.
         if let Err(e) = router.restore_orchestration_state(&lock(&store)) {
             eprintln!("lina-gpui: falha ao restaurar o estado do freio (segue despausado): {e}");
@@ -366,6 +381,7 @@ impl MailboxPump {
             model,
             brake,
             last_roster: Vec::new(),
+            last_cost_ec: 0,
         }
     }
 
@@ -486,6 +502,26 @@ impl MailboxPump {
             if let Some(c) = count {
                 m.event_count = c;
             }
+            m.touch();
+        }
+        self.refresh_cost_paused();
+    }
+
+    /// W3-7c: espelha `CostLedger::paused` (teto de custo atingido) no model p/ o banner. Só re-replaya
+    /// quando há eventos NOVOS (compara `event_count`) — evita um replay do log a cada tick. Captura a
+    /// transição feita pelo próprio Router (CostCeilingHit) E a retomada pelo gate humano (CostCeilingResumed).
+    fn refresh_cost_paused(&mut self) {
+        let ec = lock(&self.store).event_count().unwrap_or(self.last_cost_ec);
+        if ec == self.last_cost_ec {
+            return;
+        }
+        self.last_cost_ec = ec;
+        let paused = CostLedger::replay(&lock(&self.store), now_ms())
+            .map(|l| l.paused)
+            .unwrap_or(false);
+        let mut m = lock(&self.model);
+        if m.cost_paused != paused {
+            m.cost_paused = paused;
             m.touch();
         }
     }
@@ -2239,40 +2275,61 @@ impl Drop for Pump {
     }
 }
 
-/// Sobe a thread-bomba: drena o Bus (lifecycle/status + **`Message` → pulso**) e os
-/// `GridDelta` (apenas para não vazar o canal — o render lê o snapshot do grid direto).
+/// Sobe a thread-bomba: drena o Bus (lifecycle/status + **`Message` → pulso**) e os `GridDelta`.
+///
+/// **W3-7c · TETO DE CUSTO REAL:** cada `GridDelta` carrega `node` + `bytes` do output do PTY → alimenta
+/// um [`crate::cost::CostMeter`]; ao fim de um turno (idle ≥ `idle_ms`) apenda `TokenUsageReported`
+/// (estimado por bytes) no `store` AUTORITATIVO (ws2) — é o que o `CostLedger` soma p/ o teto. Sem isto,
+/// o teto era INERTE (ninguém emitia uso).
 pub fn spawn_pump(
     mut bridge: GpuiBridgeHost,
     delta_rx: Receiver<GridDelta>,
     mut bus_rx: broadcast::Receiver<BusEvent>,
+    store: Arc<Mutex<EventStore>>,
+    idle_ms: u64,
 ) -> std::io::Result<Pump> {
     let stop = Arc::new(AtomicBool::new(false));
     let join = {
         let stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("lina-bridge-pump".into())
-            .spawn(move || loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let mut worked = false;
+            .spawn(move || {
+                let mut meter = crate::cost::CostMeter::new();
                 loop {
-                    match bus_rx.try_recv() {
-                        Ok(ev) => {
-                            if let Some(h) = bus_to_host(&ev) {
-                                bridge.on_event(h);
-                                worked = true;
-                            }
-                        }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-                        Err(_) => break,
+                    if stop.load(Ordering::Relaxed) {
+                        break;
                     }
-                }
-                while delta_rx.try_recv().is_ok() {
-                    worked = true;
-                }
-                if !worked {
-                    thread::sleep(Duration::from_millis(2));
+                    let mut worked = false;
+                    loop {
+                        match bus_rx.try_recv() {
+                            Ok(ev) => {
+                                if let Some(h) = bus_to_host(&ev) {
+                                    bridge.on_event(h);
+                                    worked = true;
+                                }
+                            }
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    let now = now_ms();
+                    // Mede o output de cada nó (node+bytes do GridDelta) — fonte do teto de custo.
+                    while let Ok(delta) = delta_rx.try_recv() {
+                        meter.record_output(delta.node, delta.bytes, now);
+                        worked = true;
+                    }
+                    // Fim-de-turno por idle → apenda TokenUsageReported (estimado) no store autoritativo.
+                    for (node, tokens) in meter.poll_finished_turns(now, idle_ms) {
+                        if let Err(e) = lock(&store).append(&DomainEvent::TokenUsageReported {
+                            node: node.to_string(),
+                            tokens,
+                        }) {
+                            eprintln!("lina-gpui: falha ao apendar TokenUsageReported: {e}");
+                        }
+                    }
+                    if !worked {
+                        thread::sleep(Duration::from_millis(2));
+                    }
                 }
             })?
     };
@@ -3066,6 +3123,7 @@ mod tests {
             Mailbox::new(&mailbox_root),
             Arc::clone(&model),
             Arc::clone(&brake),
+            0, // teto de custo desligado neste teste (freio/pulso)
         );
         let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -3127,6 +3185,124 @@ mod tests {
         assert!(
             lock(&model).pulse.is_some(),
             "ao retomar, a fila represada drena e entrega (o pulso acende)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **W3-7c (headless END-TO-END) — TETO DE CUSTO REAL deixa de ser INERTE.** Com o teto ARMADO
+    /// (`token_budget_day=100`), o app EMITE `TokenUsageReported` (o que faltava) somando > teto → a
+    /// PRÓXIMA delegação bate `CostCeilingHit` e o workspace fica PAUSADO (espelhado em `model.cost_paused`,
+    /// visível). Só o gate humano (`CostCeilingResumed`) reabre. Prova o teto que era inerte.
+    #[test]
+    fn cost_ceiling_goes_live_when_app_feeds_token_usage() {
+        let dir = std::env::temp_dir().join(format!("lina-teto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+        let mut pty = PtyManager::new();
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _drx) = std::sync::mpsc::channel::<GridDelta>();
+        let (node_a, grid_a) = wire_terminal(
+            &mut pty,
+            &sup,
+            &delta_tx,
+            "A",
+            "Terminal A",
+            "terminal",
+            PtyCommand::new("cat"),
+            80,
+            24,
+        )
+        .expect("wire A");
+        let (node_b, grid_b) = wire_terminal(
+            &mut pty,
+            &sup,
+            &delta_tx,
+            "B",
+            "Terminal B",
+            "terminal",
+            PtyCommand::new("cat"),
+            80,
+            24,
+        )
+        .expect("wire B");
+        let _ = sup.set_status(node_a, CoreStatus::Running);
+        let _ = sup.set_status(node_b, CoreStatus::Running);
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        lock(&grids).insert(node_a, grid_a);
+        lock(&grids).insert(node_b, grid_b);
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let brake = crate::wiring::new_brake();
+        let mailbox_root = dir.join(".lina");
+        // Teto ARMADO em 100 tokens/dia.
+        let mut pump = MailboxPump::new(
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&grids),
+            Mailbox::new(&mailbox_root),
+            Arc::clone(&model),
+            Arc::clone(&brake),
+            100,
+        );
+        let outbox = Mailbox::new(&mailbox_root);
+        let kinds = |s: &Arc<Mutex<EventStore>>| {
+            lock(s)
+                .events()
+                .expect("ev")
+                .into_iter()
+                .map(|r| r.kind)
+                .collect::<Vec<_>>()
+        };
+
+        // (1) O app OBSERVA o fim-de-resposta e EMITE TokenUsageReported (aqui direto; em produção é a
+        // bomba via CostMeter). 60 + 60 = 120 ≥ 100.
+        {
+            let mut s = lock(&store);
+            for _ in 0..2 {
+                s.append(&DomainEvent::TokenUsageReported {
+                    node: node_a.to_string(),
+                    tokens: 60,
+                })
+                .expect("uso");
+            }
+        }
+
+        // (2) A PRÓXIMA delegação bate o teto: CostCeilingHit + Paused; NÃO entrega (sem pulso).
+        outbox
+            .enqueue_as(
+                "Terminal A",
+                &MailMessage::new("Terminal A", "Terminal B", "ask", "x"),
+            )
+            .expect("enfileira");
+        pump.tick();
+        assert!(
+            kinds(&store).iter().any(|k| k == "CostCeilingHit"),
+            "a delegação sobre o teto apenda CostCeilingHit"
+        );
+        assert!(
+            lock(&model).cost_paused,
+            "o model ESPELHA o teto pausado (banner visível)"
+        );
+        assert!(
+            lock(&model).pulse.is_none(),
+            "delegação barrada pelo teto NÃO entrega"
+        );
+
+        // (3) Só o gate humano reabre: CostCeilingResumed (lina resume → ⌘⏎) → cost_paused limpa.
+        {
+            let day = CostLedger::replay(&lock(&store), now_ms())
+                .expect("ledger")
+                .day;
+            lock(&store)
+                .append(&DomainEvent::CostCeilingResumed { day })
+                .expect("resume");
+        }
+        pump.tick();
+        assert!(
+            !lock(&model).cost_paused,
+            "após o gate humano (CostCeilingResumed), o teto reabre"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

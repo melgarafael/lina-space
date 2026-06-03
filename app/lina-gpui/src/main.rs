@@ -12,10 +12,14 @@ mod canvas;
 mod onboarding;
 // W4-3: chrome de conexão "sem fios" — freio (pausa de orquestração), selo por membership, reduce-motion.
 mod wiring;
+// W3-7c · TETO DE CUSTO REAL: mede o output dos PTYs e emite TokenUsageReported (alimenta o CostLedger).
+mod cost;
 // W4-4: chrome de persistência (salvo✓ / recuperação T8 / Espaços T6 / Ajustes T7). Janela própria.
 mod persistence_ui;
 // W4-5: galeria de Focos (T3) — presets que montam o Espaço com time + papéis; gpui-free, testável.
 mod gallery;
+// W4-6: acessibilidade (AccessibleBuffer sem ANSI, live-region "resposta pronta", WCAG, reduce-motion).
+mod a11y;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -269,9 +273,11 @@ struct WorkspaceView {
     /// W4-3: FREIO da auto-orquestração, compartilhado com a [`MailboxPump`]. A UI lê `paused` p/ o
     /// rótulo do rodapé e sinaliza `toggle_requested` ao clicar.
     brake: wiring::Brake,
-    /// W4-3: reduce-motion (a11y). `true` → o pulso A→B NÃO anima (a entrega ocorre igual). Hoje é um
-    /// toggle no rodapé; a W4-6 liga ao setting do SO.
+    /// W4-3: reduce-motion (a11y). `true` → o pulso A→B NÃO anima (a entrega ocorre igual). Toggle no
+    /// rodapé; a W4-6 o inicializa do setting do SO/env (`a11y::os_reduce_motion`).
     reduce_motion: bool,
+    /// W4-6: anunciador da live-region ("resposta pronta" 1×/turno na transição →Idle, não por byte).
+    a11y_live: a11y::LiveRegion,
 }
 
 impl WorkspaceView {
@@ -304,7 +310,9 @@ impl WorkspaceView {
             desk,
             naming: None,
             brake,
-            reduce_motion: false,
+            // W4-6: inicializa do SO/env (LINA_REDUCE_MOTION); o toggle do rodapé sobrepõe depois.
+            reduce_motion: a11y::os_reduce_motion(),
+            a11y_live: a11y::LiveRegion::default(),
         }
     }
 
@@ -657,9 +665,9 @@ impl Render for WorkspaceView {
 
         // Os cards desenhados DERIVAM do NodeManager (não de 2 fixos) — add/remove refletem aqui.
         let mut cards = self.nodes.cards();
-        let (pulse, event_count, recovering) = {
+        let (pulse, event_count, recovering, cost_paused) = {
             let m = lock(&self.nodes.model);
-            (m.pulse, m.event_count, m.recovering)
+            (m.pulse, m.event_count, m.recovering, m.cost_paused)
         };
         // W4-3: SELO "Time conectado" = full-mesh LÓGICO por MEMBERSHIP (≥2 nós no Espaço), derivado da
         // presença — aparece SEM nenhum tráfego/arraste de cabo (decisão arq §2.2).
@@ -713,6 +721,15 @@ impl Render for WorkspaceView {
         cards.sort_by_key(|(id, _)| self.z_of(id));
         let cam = self.camera;
         let focused = self.focused;
+
+        // W4-6 a11y: live-region "resposta pronta" — anuncia 1×/turno na transição →Idle (status é
+        // turn-level), NUNCA a cada byte/`GridDelta`. Observa os status correntes dos nós.
+        let a11y_nodes: Vec<(NodeId, String, NodeStatus)> = cards
+            .iter()
+            .map(|(id, nv)| (*id, nv.name.clone(), nv.status))
+            .collect();
+        self.a11y_live.observe(&a11y_nodes);
+        let a11y_announce: Option<String> = self.a11y_live.current().map(str::to_string);
 
         let aura_color = if connected {
             rgb(0x7aa2f7)
@@ -879,11 +896,17 @@ impl Render for WorkspaceView {
                 .sel
                 .filter(|s| s.node == node_id)
                 .map(|s| normalize_sel(s.anchor, s.head));
+            // W4-6 a11y: "precisa de você" anunciável — há um gate de custódia pendente p/ este nó?
+            let needs_human = lock(&self.desk)
+                .queue
+                .iter()
+                .any(|p| p.requester() == nv.name);
             // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
             let mut body = div()
                 .id(("grid", card_eid))
                 .role(Role::Terminal)
-                .aria_label(nv.name.clone())
+                // W4-6 a11y: nome + estado ANUNCIÁVEL (badge do W4-2: "💤 dormindo"/"precisa de você"/…).
+                .aria_label(a11y::node_label(&nv.name, nv.status, needs_human))
                 .flex_1()
                 .overflow_hidden()
                 .p_1()
@@ -1193,6 +1216,22 @@ impl Render for WorkspaceView {
             );
         }
 
+        // W3-7c · TETO DE CUSTO atingido → workspace PAUSADO (visível). Só o gate humano reabre:
+        // `lina resume` (de um terminal) → confirmação na janela (⌘⏎) → CostCeilingResumed.
+        if cost_paused {
+            topbar = topbar.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0xf7768e))
+                    .text_color(rgb(0x11111b))
+                    .child(text!(
+                        "🛑 teto de custo atingido · workspace PAUSADO — rode `lina resume` e confirme (⌘⏎)"
+                    )),
+            );
+        }
+
         // W3-6c (ADR 0004) — BANNER DO GATE HUMANO: VISÍVEL na tela. Âmbar = pedido na frente da fila
         // aguardando ⌘⏎; senão, o último resultado da execução por alguns segundos.
         let (custody_banner, custody_pending) = {
@@ -1269,6 +1308,17 @@ impl Render for WorkspaceView {
             footer = footer.child(div().text_color(rgb(0xe0af68)).child(text!(
                 "⏸ orquestração pausada · novas delegações ficam na fila (nada se perde)"
             )));
+        }
+
+        // W4-6: a live-region (Role::Status) entra na cena — anunciada ao leitor de tela quando muda.
+        if let Some(msg) = &a11y_announce {
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .right_0()
+                    .child(a11y::live_region_element(msg)),
+            );
         }
 
         root.child(topbar).child(footer)
@@ -1436,8 +1486,17 @@ fn main() {
     keys.insert(node_a, "A".to_string());
     keys.insert(node_b, "B".to_string());
 
+    // W3-7c · TETO DE CUSTO REAL. `LINA_TOKEN_BUDGET_DAY` (tokens/dia ESTIMADOS ≈ bytes/4 de output;
+    // ver cost.rs) ARMA o teto; 0/ausente = desligado (default, sem regressão). A bomba mede o output
+    // dos PTYs e apenda TokenUsageReported no MESMO store (ws2) que o CostLedger soma.
+    let token_budget_day: u64 = std::env::var("LINA_TOKEN_BUDGET_DAY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let idle_ms = demo_profile().idle_ms.unwrap_or(200);
     let bridge = GpuiBridgeHost::new(Arc::clone(&model));
-    let mut pump = spawn_pump(bridge, delta_rx, bus_rx).expect("subir a ponte core→UI");
+    let mut pump = spawn_pump(bridge, delta_rx, bus_rx, Arc::clone(&store), idle_ms)
+        .expect("subir a ponte core→UI");
 
     let input: Arc<dyn InputSink> = Arc::new(CoreInput::new(Arc::clone(&sup)));
     let a2a = Arc::new(A2aTrigger::new(
@@ -1480,6 +1539,7 @@ fn main() {
         Mailbox::new(&mailbox_dir),
         Arc::clone(&model),
         Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
+        token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)
     )
     .spawn();
 
