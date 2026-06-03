@@ -1818,7 +1818,16 @@ fn main() {
         "lina-gpui: layout · card {CARD_W}x{CARD_H} · cell {CELL_W}x{CELL_H} · font {FONT_PX}px (line-height travada={CELL_H}) · PTY {cols}x{rows} → {rows} linhas cabem (a ultima = input)"
     );
 
-    let dir = std::env::temp_dir().join("lina-space-ws2");
+    // #22 (inv#4 · fonte-única forense): o app e o bin `lina` (do/guard/ask) compartilham UM ÚNICO
+    // event log. O bin grava em `events_dir() = <LINA_HOME>/events` (LINA_HOME é setado logo abaixo,
+    // = `<ws_root>/.lina`); aqui o app abre EXATAMENTE o mesmo diretório `<ws_root>/.lina/events`.
+    // ANTES o app abria um store paralelo em `temp/lina-space-ws2`, DISJUNTO do log do bin (ws3): a
+    // forense ficava partida em dois logs (ActionGated/BrokerDenied do bin vs. eventos do supervisor),
+    // violando o invariante "o event log é a fonte da verdade". `ws_root`/`mailbox_dir` precisam
+    // existir antes desta abertura; `EventStore::open` faz `create_dir_all` do diretório.
+    let ws_root = std::env::temp_dir().join("lina-space-ws3");
+    let mailbox_dir = ws_root.join(".lina");
+    let dir = mailbox_dir.join("events");
     let store = Arc::new(Mutex::new(
         EventStore::open(&dir).expect("abrir EventStore"),
     ));
@@ -1834,13 +1843,12 @@ fn main() {
     let cmd_factory: CmdFactory = Arc::new(shell_cmd);
 
     // W3-2 · BOOTSTRAP turno-0: o app escreve `<cwd>/CLAUDE.md` (8 blocos) por terminal e o
-    // reescreve a cada mudança de roster. ws_root por terminal; vault/autonomia/bin `lina`
+    // reescreve a cada mudança de roster. `ws_root`/`mailbox_dir` já foram definidos acima (o event
+    // store do app mora em `<ws_root>/.lina/events`, o MESMO log do bin); vault/autonomia/bin `lina`
     // configuráveis por env (LINA_VAULT/LINA_BIN). O bootstrap é best-effort (não trava o app).
-    let ws_root = std::env::temp_dir().join("lina-space-ws3");
     // W3-4: a mailbox compartilhada do workspace (`<ws_root>/.lina`). `LINA_HOME` aponta os
     // terminais (que herdam o env) para cá → `lina ask`/`handshake` depositam no MESMO outbox que
-    // o supervisor (o `MailboxPump`) observa. (Vale para A/B e para os nós adicionados em runtime.)
-    let mailbox_dir = ws_root.join(".lina");
+    // o supervisor (o `MailboxPump`) observa, e o bin `lina do/guard` apenda no MESMO event log.
     if let Err(e) = std::fs::create_dir_all(&mailbox_dir) {
         // Não fatal (o resto do app — canvas, terminais — funciona sem A2A), mas VISÍVEL: sem a
         // mailbox, `lina ask` não terá para onde escrever.
@@ -1978,7 +1986,8 @@ fn main() {
 
     // W3-7c · TETO DE CUSTO REAL. `LINA_TOKEN_BUDGET_DAY` (tokens/dia ESTIMADOS ≈ bytes/4 de output;
     // ver cost.rs) ARMA o teto; 0/ausente = desligado (default, sem regressão). A bomba mede o output
-    // dos PTYs e apenda TokenUsageReported no MESMO store (ws2) que o CostLedger soma.
+    // dos PTYs e apenda TokenUsageReported no MESMO store (`<ws_root>/.lina/events`, o log
+    // compartilhado com o bin `lina`) que o CostLedger soma.
     let token_budget_day: u64 = std::env::var("LINA_TOKEN_BUDGET_DAY")
         .ok()
         .and_then(|v| v.parse().ok())
