@@ -377,20 +377,24 @@ impl Router {
         // Marca como visto JÁ — uma 2ª cópia do mesmo id (re-drenada/reenviada) é duplicada.
         self.seen.insert(msg.id.clone(), now_ms);
 
-        // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
-        //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
-        //    dedupe (reenvios são absorvidos), antes do pipeline de delegação/resolução de alvo.
-        //    (Round 4: intent de plano nunca fecha await — o desvio precede o lifecycle do reply.)
-        if is_plan_intent(&msg.intent) {
-            return self.handle_plan(msg, store);
-        }
-
-        // ── Guardrail 0a: remetente existe no roster vivo. Resolvido ANTES do anti-loop por
-        //    profundidade — precisamos do `NodeId` do sender para derivar root/hops do binding (A2).
+        // ── Guardrail 0a (Round 6 — ELEVADO p/ ANTES do desvio de plano): remetente existe no roster
+        //    vivo. O `NodeId` resolvido é a ORIGEM autenticada — TANTO a delegação QUANTO o intent de
+        //    plano passam por aqui, então um `from` forjado/desconhecido (ex.: msg do outbox FLAT, cujo
+        //    `from` o drain anonimiza) é RECUSADO como `UnknownSender` ANTES de tocar o plano (fecha F1).
+        //    Resolvido ANTES do anti-loop por profundidade — derivamos root/hops do binding (A2).
         let Some(sender) = self.sup.node_by_name(&msg.from) else {
             log_block(store, msg, BlockReason::UnknownSender);
             return RouteOutcome::UnknownSender(msg.from.clone());
         };
+
+        // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
+        //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
+        //    dedupe (reenvios são absorvidos) E da resolução de origem (Round 6: `by` = origem
+        //    AUTENTICADA, nunca um `from` forjado), antes do pipeline de delegação/resolução de alvo.
+        //    (Round 4: intent de plano nunca fecha await — o desvio precede o lifecycle do reply.)
+        if is_plan_intent(&msg.intent) {
+            return self.handle_plan(msg, store);
+        }
 
         // ── W3-7b (ADR 0002) + Round 4 (confused-deputy): se ESTA msg é um REPLY que CASA um await
         //    pendente E vem do `target` aguardado, FECHA o ticket (end_await + AwaitClosed{Replied}).
@@ -1442,10 +1446,12 @@ mod tests {
         let mut ts = TmpStore::new("pump");
         let (rec, deliver) = recorder();
 
+        // Round 6: injeção pelo outbox POR-NÓ (autenticado por origem), como o bin real faz — o flat
+        // agora é anônimo (A3-flat) e seria recusado como UnknownSender.
         router
             .mailbox()
-            .enqueue(&MailMessage::new("@A", "@B", "ask", "oi"))
-            .expect("enqueue");
+            .enqueue_as("@A", &MailMessage::new("@A", "@B", "ask", "oi"))
+            .expect("enqueue por-no");
         let results = router.pump(&mut ts.store, 1000, deliver);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].1, RouteOutcome::Delivered { .. }));
@@ -1457,7 +1463,13 @@ mod tests {
 
     /// Router + store novos com um plano semeado (workspace + T1/T2 + uma decisão), tudo via log.
     fn seeded_plan_router(tag: &str) -> (Router, std::path::PathBuf, TmpStore) {
-        let (mut router, _sup, dir) = router_with(tag);
+        let (mut router, sup, dir) = router_with(tag);
+        // Round 6 (F1): o plano agora exige origem AUTENTICADA — o guard de remetente (`node_by_name`)
+        // foi elevado p/ ANTES do desvio de intent de plano. Registra os nós que os testes de plano
+        // usam como remetentes legítimos (@A: claim/check; @B: conflito/não-owner). Sem isto seriam
+        // `UnknownSender` — exatamente como uma origem forjada/flat passa a ser recusada.
+        sup.register("@A", None, sink());
+        sup.register("@B", None, sink());
         let mut ts = TmpStore::new(tag);
         ts.store
             .append(&DomainEvent::WorkspaceCreated {
@@ -1663,6 +1675,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Round 6 (F1): `plan.claim` com `from` de nó NÃO registrado (forjado) é RECUSADO como
+    /// `UnknownSender` ANTES de tocar o plano — o desvio de intent de plano agora passa pelo guard de
+    /// origem (elevado p/ antes do desvio). Antes do fix, aplicaria (impersonação de origem fantasma).
+    #[test]
+    fn plan_claim_from_unknown_sender_is_rejected() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-unknown-sender");
+        let (_rec, mut deliver) = recorder();
+        // @Vitima NÃO está no roster (só @A/@B registrados em seeded_plan_router).
+        let forged = MailMessage::new("@Vitima", "plan", "plan.claim", "").with_ref("plan:T1");
+        let out = router.route_message(&forged, &mut ts.store, 1000, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::UnknownSender(_)),
+            "origem forjada/desconhecida deve ser recusada; veio {out:?}"
+        );
+        let live = router.mailbox().read_plan().unwrap().unwrap();
+        assert!(
+            live.contains("- [ ] T1 :: desenhar schema :: @owner:? :: status:todo"),
+            "T1 deve seguir livre (nada aplicado); veio:\n{live}"
+        );
+        let claims = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "PlanClaimed")
+            .count();
+        assert_eq!(claims, 0, "origem forjada nao gera PlanClaimed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 6 (F1 + A3-flat, ponta-a-ponta): um `plan.claim` escrito no outbox FLAT com `from=@A`
+    /// (peer REAL) NÃO impersona — o drain anonimiza o `from` e o router o recusa (UnknownSender). É o
+    /// invariante central: nenhum campo do outbox NÃO-autenticado decide a cadeia do plano.
+    #[test]
+    fn flat_plan_claim_cannot_impersonate_real_peer() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-flat-impersonate");
+        // @A É um peer real (registrado). Mesmo assim, pela via FLAT não pode reivindicar em nome dele.
+        let forged = MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1");
+        router.mailbox().enqueue(&forged).expect("enqueue flat");
+        let (_rec, mut deliver) = recorder();
+        let results = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(results.len(), 1, "uma msg drenada");
+        assert!(
+            matches!(results[0].1, RouteOutcome::UnknownSender(_)),
+            "FLAT anonimo deve ser recusado; veio {:?}",
+            results[0].1
+        );
+        let live = router.mailbox().read_plan().unwrap().unwrap();
+        assert!(
+            live.contains("- [ ] T1 :: desenhar schema :: @owner:? :: status:todo"),
+            "T1 intacto (sem impersonacao); veio:\n{live}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 6 (contraponto): o MESMO `plan.claim`, pela via POR-NÓ (origem carimbada=@A), APLICA — e o
+    /// campo `from` forjado do arquivo é IGNORADO em favor da origem autenticada (dir-dono).
+    #[test]
+    fn per_node_plan_claim_applies_with_authenticated_origin() {
+        let (mut router, dir, mut ts) = seeded_plan_router("plan-pernode-apply");
+        // O campo `from` da msg é uma isca forjada; o por-nó o sobrescreve por "@A" (dir-dono).
+        let claim =
+            MailMessage::new("@ForjadoIgnorado", "plan", "plan.claim", "").with_ref("plan:T1");
+        router
+            .mailbox()
+            .enqueue_as("@A", &claim)
+            .expect("enqueue por-no");
+        let (_rec, mut deliver) = recorder();
+        let results = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(&results[0].1, RouteOutcome::PlanApplied { .. }),
+            "por-no autenticado deve aplicar; veio {:?}",
+            results[0].1
+        );
+        let live = router.mailbox().read_plan().unwrap().unwrap();
+        assert!(
+            live.contains("- [~] T1 :: desenhar schema :: @owner:@A :: status:doing"),
+            "T1 reivindicado por @A (origem autenticada, nao @ForjadoIgnorado); veio:\n{live}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A5: o `budget` é podado na mesma janela do `seen` — entradas velhas somem (sem vazamento).
     #[test]
     fn budget_entries_are_pruned_after_window() {
@@ -1863,7 +1958,11 @@ mod tests {
         let (rec, deliver) = recorder();
 
         let m = MailMessage::new("@A", "@B", "ask", "oi");
-        router.mailbox().enqueue(&m).expect("enqueue");
+        // Round 6: por-nó (autenticado) — o flat agora é anônimo e seria recusado no pump.
+        router
+            .mailbox()
+            .enqueue_as("@A", &m)
+            .expect("enqueue por-no");
 
         // "Crash": drena para .inflight mas NÃO roteia/persiste (não chamamos pump).
         let drained = router.mailbox().drain_to_inflight().expect("drain");
@@ -2386,7 +2485,11 @@ mod tests {
 
         // ── (2) Delegação nova sob o freio: ENFILEIRA (não injeta). Fica no `.inflight` (durável).
         let m = MailMessage::new("@A", "@B", "ask", "espera o freio");
-        router.mailbox().enqueue(&m).expect("enqueue");
+        // Round 6: por-nó (autenticado) — o flat agora é anônimo e seria recusado no pump.
+        router
+            .mailbox()
+            .enqueue_as("@A", &m)
+            .expect("enqueue por-no");
         let r1 = router.pump(&mut ts.store, 1000, &mut deliver);
         assert_eq!(r1.len(), 1);
         assert!(

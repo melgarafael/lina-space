@@ -276,7 +276,11 @@ impl Mailbox {
         let mut out = Vec::with_capacity(files.len());
         for path in files {
             match inspect_file(&path) {
-                FileVerdict::Valid(msg) => {
+                FileVerdict::Valid(mut msg) => {
+                    // Round 6 (A3-flat): o outbox FLAT é canal ANÔNIMO — `from` NÃO é carimbado pela
+                    // origem (ao contrário do por-nó abaixo), então NÃO pode nomear um peer do roster.
+                    // Anonimiza (`from` vazio) → o router o recusa como `UnknownSender`, sem impersonar.
+                    msg.from.clear();
                     let _ = std::fs::remove_file(&path); // consumido
                     out.push(*msg);
                 }
@@ -335,17 +339,21 @@ impl Mailbox {
         }
         for path in news {
             match inspect_file(&path) {
-                FileVerdict::Valid(msg) => {
-                    // `msg.id` já passou por `valid_msg_id` (em `inspect_file`) → nome de arquivo seguro.
-                    let dest = inflight.join(format!("{}.json", msg.id));
-                    if let Err(e) = std::fs::rename(&path, &dest) {
+                FileVerdict::Valid(mut msg) => {
+                    // Round 6 (A3-flat): anonimiza o `from` do FLAT (origem NÃO autenticada) ANTES de
+                    // persistir no `.inflight` — simétrico ao por-nó (que carimba `from`=dono). Reescreve
+                    // (não renomeia) p/ a recuperação pós-crash reler um `from` já anônimo, impedindo que
+                    // um `from` forjado impersone um peer nomeado depois. `msg.id` já validado (seguro).
+                    msg.from.clear();
+                    if let Err(e) = write_msg_atomic(&inflight, &msg) {
                         // Não perde a mensagem: deixa no outbox para o próximo tick (VISÍVEL).
                         eprintln!(
-                            "lina-core: mailbox falhou ao mover {} p/ inflight: {e}",
-                            path.display()
+                            "lina-core: mailbox falhou ao persistir {} (flat anonimo) em inflight: {e}",
+                            msg.id
                         );
                         continue;
                     }
+                    let _ = std::fs::remove_file(&path); // origem consumida só após o inflight durável
                     out.push(*msg);
                 }
                 FileVerdict::Discard => {
@@ -1102,6 +1110,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Round 6 (A3-flat): o `drain` do outbox FLAT ANONIMIZA o `from` — uma msg flat com `from`
+    /// nomeado (`@Boss`) sai com `from` VAZIO, então não pode impersonar um peer nomeado do roster.
+    #[test]
+    fn flat_drain_anonymizes_from() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-flatanon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+        mb.enqueue(&MailMessage::new("@Boss", "@B", "ask", "oi"))
+            .expect("enqueue flat");
+        let drained = mb.drain().expect("drain");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].from, "",
+            "from do FLAT e' anonimo (nao impersona @Boss)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 6 (A3-flat): idem na via de produção (`drain_to_inflight`) — o `from` flat é anonimizado
+    /// E persistido anônimo no `.inflight` (a recuperação pós-crash relê anônimo, não o forjado).
+    #[test]
+    fn flat_drain_to_inflight_anonymizes_from_durably() {
+        let dir =
+            std::env::temp_dir().join(format!("lina-mbox-flatanon-infl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+        let m = MailMessage::new("@Boss", "@B", "ask", "oi");
+        mb.enqueue(&m).expect("enqueue flat");
+        let d1 = mb.drain_to_inflight().expect("drain");
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].from, "", "from anonimo no retorno");
+        let stored: MailMessage = serde_json::from_str(
+            &std::fs::read_to_string(mb.inflight_dir().join(format!("{}.json", m.id)))
+                .expect("ler inflight"),
+        )
+        .expect("parse");
+        assert_eq!(
+            stored.from, "",
+            "o .inflight guarda o from anonimo (duravel)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// W3-7b: `reply_to` faz round-trip pelo JSON e é omitido quando ausente (aditivo/retrocompatível).
     #[test]
     fn reply_to_roundtrips_and_defaults_none() {
@@ -1240,8 +1291,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Retrocompat: outbox FLAT (legado) e POR-NÓ coexistem num mesmo drain — o flat mantém o `from`
-    /// do campo; o por-nó usa o dir-dono. Nenhum gate legado quebra.
+    /// Round 6 (A3-flat): outbox FLAT (legado/anônimo) e POR-NÓ coexistem num mesmo drain — o flat é
+    /// ANONIMIZADO (`from` vazio, não pode impersonar um peer); o por-nó usa o dir-dono (autenticado).
     #[test]
     fn flat_and_per_node_outboxes_coexist() {
         let dir = std::env::temp_dir().join(format!("lina-mbox-pn-mix-{}", std::process::id()));
@@ -1264,10 +1315,14 @@ mod tests {
         };
         assert_eq!(
             from_of("flat"),
-            "@A",
-            "flat (legado) mantém o from do campo"
+            "",
+            "flat é ANONIMIZADO (A3-flat) — não impersona @A"
         );
-        assert_eq!(from_of("pernode"), "@X", "por-nó usa o dir-dono");
+        assert_eq!(
+            from_of("pernode"),
+            "@X",
+            "por-nó usa o dir-dono (autenticado)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

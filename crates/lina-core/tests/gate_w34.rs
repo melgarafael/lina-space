@@ -224,11 +224,15 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
         "B deve estar em bracketed-paste mode"
     );
 
-    // (2) `lina ask @B "oi"` no contexto de A == depositar a MailMessage na mailbox (o que o bin faz).
+    // (2) `lina ask @B "oi"` no contexto de A == depositar a MailMessage no outbox POR-NÓ de @A (o que
+    //     o bin faz: `enqueue_per_node`). Round 6: o `from` é autenticado pela ORIGEM (dir-dono @A), não
+    //     pelo campo da msg — o outbox FLAT virou anônimo (A3-flat) e não nomearia um peer do roster.
     let mailbox = Mailbox::new(&lina_dir);
     let ask = MailMessage::new("@A", "@B", "ask", "oi");
     let ask_id = ask.id.clone();
-    mailbox.enqueue(&ask).expect("enqueue (lina ask)");
+    mailbox
+        .enqueue_as("@A", &ask)
+        .expect("enqueue (lina ask por-no)");
 
     // (3) O supervisor (Router) drena a mailbox e roteia. A entrega de fato é a injeção faseada
     //     no PTY do alvo (deliver_a2a com o perfil/grid de B).
@@ -319,7 +323,7 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
     let ops_before = injected_ops(&sup, node_b);
     router
         .mailbox()
-        .enqueue(&ask)
+        .enqueue_as("@A", &ask)
         .expect("re-enqueue (mesmo id)");
     let again = {
         let sup_d = Arc::clone(&sup);

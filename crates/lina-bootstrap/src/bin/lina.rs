@@ -256,9 +256,12 @@ fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
     };
     // Alvo sentinela "plan": o supervisor intercepta por INTENT, não por alvo. `ref=plan:<id>` liga
     // ao item do plano (envelope §3.4). payload vazio.
-    let msg = MailMessage::new(from, "plan", intent, "").with_ref(format!("plan:{id}"));
+    let msg = MailMessage::new(from.clone(), "plan", intent, "").with_ref(format!("plan:{id}"));
     let mailbox = Mailbox::new(mailbox_root());
-    match mailbox.enqueue(&msg) {
+    // Round 6 (F1): plano via outbox POR-NÓ (como `lina ask`) — o supervisor carimba `from`=origem
+    // (dir-dono) e o guard de origem do router valida o remetente; fecha a forja do `from` que o outbox
+    // FLAT (não-autenticado) permitia (claim/check impersonando um colega no plano compartilhado).
+    match enqueue_per_node(&mailbox, &from, &msg) {
         Ok(()) => {
             println!("ok: {intent} do item {id} enfileirado (msg {})", msg.id);
             ExitCode::SUCCESS
