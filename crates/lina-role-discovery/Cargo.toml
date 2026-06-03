@@ -3,7 +3,7 @@ name = "lina-role-discovery"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 [dependencies]
 thiserror.workspace = true
 # W3-1: role-discovery por NOME, puro Rust, ZERO LLM, ZERO rede.

@@ -3,7 +3,7 @@ name = "lina-webhooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 [dependencies]
 # Eventos de domínio (WebhookConfigured/WebhookReceived), EventStore (fonte da verdade) e
 # Workspace Bus/Supervisor (publicação ao nó-alvo) — tudo via API pública do core.

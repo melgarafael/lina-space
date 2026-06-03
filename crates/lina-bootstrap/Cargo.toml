@@ -3,7 +3,7 @@ name = "lina-bootstrap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 # W3-2: motor de bootstrap turno-0. Renderiza `<workspace>/CLAUDE.md` (8 blocos) + o bloco de
 # estado vivo (`lina whoami --bootstrap`). Puro Rust, ZERO LLM. Consome `lina-role-discovery`.
 [dependencies]

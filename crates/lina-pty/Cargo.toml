@@ -3,7 +3,7 @@ name = "lina-pty"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 [dependencies]
 # Onda 0: portable-pty do crates.io (Mac/Linux funcionam direto).
 # TODO(W5-3): vendorizar read-only + patch dos 3 flags ConPTY + bundle

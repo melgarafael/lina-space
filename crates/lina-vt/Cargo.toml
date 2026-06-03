@@ -3,7 +3,7 @@ name = "lina-vt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 [features]
 # Porta de futuro (CLAUDE.md): backend libghostty-vt. DESLIGADA na Onda 0.
 ghostty = []

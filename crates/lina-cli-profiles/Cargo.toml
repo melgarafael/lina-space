@@ -3,7 +3,7 @@ name = "lina-cli-profiles"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 [dependencies]
 thiserror.workspace = true
 # W0-8: CLI Profiles declarativos. serde+toml ficam locais a ESTE crate (escopo da story);

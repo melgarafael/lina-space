@@ -3,7 +3,7 @@ name = "lina-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
+publish = false
 [dependencies]
 lina-pty = { path = "../lina-pty" }
 lina-vt = { path = "../lina-vt" }
