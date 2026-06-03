@@ -73,8 +73,10 @@ impl Badge {
         }
     }
 
-    /// Cor de fundo do badge (RGB) — verde=rodando, âmbar=precisa de você, cinza=dormindo/encerrado.
-    /// O render usa; isolar aqui mantém o esquema honesto numa fonte só.
+    /// Cor de fundo do badge (RGB) — verde=rodando, âmbar=precisa de você, cinza=aguardando/encerrado.
+    /// BUG B: a periferia voltou a desenhar o GRID (legível), então o render NÃO usa mais este chip de
+    /// badge; reservado p/ um chip de status futuro (`allow(dead_code)` no padrão do módulo).
+    #[allow(dead_code)]
     #[must_use]
     pub fn bg(&self) -> u32 {
         match self.kind {

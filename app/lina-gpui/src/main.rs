@@ -235,6 +235,11 @@ fn render_grid(
         .flex_col()
         .font_family("Menlo")
         .text_size(px(FONT_PX * scale))
+        // BUG A: line-height EXPLÍCITA = CELL_H. A natural do Menlo 13px (~18-19px) é MAIOR que
+        // CELL_H=17, então as 26 rows (`fit_dims`) ocupavam mais que o body do card e a ÚLTIMA linha (a
+        // barra de input "❯ …" da TUI) era CLIPADA pelo `overflow_hidden`. Travando em CELL_H, as 26
+        // rows cabem exatamente (== o que `fit_dims` calcula) → o input APARECE.
+        .line_height(px(CELL_H * scale))
         .children((0..screen.rows).map(move |r| {
             let cursor_col = (cur.visible && cur.line == r).then_some(cur.col);
             render_line(screen.row(r), cursor_col, r, sel)
@@ -289,6 +294,9 @@ struct WorkspaceView {
     /// W4-2 · M3/M4: `Some((kind, buffer))` enquanto o humano DIGITA o título da nota/pasta a criar
     /// (disparado pela paleta). Enter cria + foca; Esc cancela. `None` = fora do modo criação.
     creating: Option<(creators::CreatorKind, String)>,
+    /// BUG A/B (instrumentação): última linha de diagnóstico de cards logada — loga só na MUDANÇA
+    /// (rows/zona/dim), sem spammar o stderr a 60fps. O Maestro lê o stderr p/ validar por DADOS.
+    diag_last_frame: String,
 }
 
 impl WorkspaceView {
@@ -327,6 +335,7 @@ impl WorkspaceView {
             a11y_live: a11y::LiveRegion::default(),
             palette: palette::PaletteState::default(),
             creating: None,
+            diag_last_frame: String::new(),
         }
     }
 
@@ -966,6 +975,9 @@ impl Render for WorkspaceView {
                 view.handle_key(ev, window, cx);
             }));
 
+        // BUG A/B (instrumentação): acumula 1 linha por card (rows/zona/dim) e loga após o loop SÓ se
+        // mudou (sem spammar a 60fps). O Maestro confirma por DADOS que as rows batem + zona/dim ok.
+        let mut frame_diag = String::new();
         for (idx, (id, nv)) in cards.iter().enumerate() {
             let node_id = *id;
             // ID de elemento ESTÁVEL por nó (não o idx do loop, que muda com cull/z-order).
@@ -974,6 +986,23 @@ impl Render for WorkspaceView {
             // é o MESMO culling (W2-3). Suspenso (fora da viewport) → 0 draw-calls (continue).
             let in_viewport = card_visible(&cam, (nv.x, nv.y), (CARD_W, CARD_H), viewport);
             let zone = canvas::classify_zone(node_id == focused, in_viewport);
+            // BUG B: `dim` = periferia E IDLE de verdade (sem atividade). NUNCA escurece só por falta de
+            // foco — a periferia ATIVA fica legível/normal.
+            let dim =
+                matches!(zone, canvas::Zone::Periphery) && matches!(nv.status, NodeStatus::Idle);
+            // Instrumentação: rows do grid (== o que o PTY tem) + zona + dim, por card.
+            let pty_rows = lock(&self.nodes.grids)
+                .get(&node_id)
+                .map_or(0, |g| lock(g).dims().1);
+            let drawn_rows = if zone == canvas::Zone::Suspended {
+                0
+            } else {
+                pty_rows
+            };
+            frame_diag.push_str(&format!(
+                "[{} pty_rows={pty_rows} drawn_rows={drawn_rows} zone={zone:?} dim={dim}] ",
+                nv.name
+            ));
             if zone == canvas::Zone::Suspended {
                 continue;
             }
@@ -1053,12 +1082,15 @@ impl Render for WorkspaceView {
             let mut body = div()
                 .id(("grid", card_eid))
                 .role(Role::Terminal)
-                // W4-6 a11y: nome + estado ANUNCIÁVEL (badge do W4-2: "💤 dormindo"/"precisa de você"/…).
+                // W4-6 a11y: nome + estado ANUNCIÁVEL (badge do W4-2: "aguardando"/"precisa de você"/…).
                 .aria_label(a11y::node_label(&nv.name, nv.status, needs_human))
                 .flex_1()
                 .overflow_hidden()
                 .p_1()
                 .bg(rgb(0x0d1228))
+                // BUG B: um leve dim SÓ quando o nó está IDLE de verdade (periferia sem atividade) —
+                // legível, não "apagado". A periferia ATIVA (ou focada) fica em opacidade plena.
+                .opacity(if dim { 0.82 } else { 1.0 })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, ev: &MouseDownEvent, _w, _cx| {
@@ -1098,51 +1130,18 @@ impl Render for WorkspaceView {
                         ),
                 );
             } else {
-                // W4-2 · P0 (degradação de ociosos, red-team doc 12): SÓ o nó-TERMINAL em FOCO desenha o
-                // grid ao vivo (grande, 120fps). Na PERIFERIA, cartão COMPACTO — BADGE honesto, SEM grid
-                // (custo de CPU de ocioso ~0). Clicar foca → vira grande.
+                // BUG B: foco E periferia desenham o GRID ao vivo (LEGÍVEL) — a periferia NÃO é "escura"
+                // só por estar sem foco. O que distingue é a BORDA (foco=azul, periferia=cinza, acima) +
+                // o leve `dim` (no body, acima) APENAS quando IDLE de verdade. Suspenso (fora da
+                // viewport) já deu `continue` (0 draw-calls — culling W2-3, P0 preservado).
                 match zone {
-                    canvas::Zone::Focus => {
+                    canvas::Zone::Focus | canvas::Zone::Periphery => {
                         let grid = lock(&self.nodes.grids).get(&node_id).cloned();
                         if let Some(g) = grid {
                             let screen = lock(&g).screen();
                             body = body.child(render_grid(&screen, z, card_sel));
                         }
                     }
-                    canvas::Zone::Periphery => {
-                        // "precisa de você" se há um gate humano pendente para este nó (round 5).
-                        let needs_human = lock(&self.desk)
-                            .queue
-                            .iter()
-                            .any(|p| p.requester() == nv.name);
-                        let badge = canvas::aggregate_badge(nv.status, needs_human, 0);
-                        body = body.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .size_full()
-                                .child(
-                                    div()
-                                        .px_3()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(rgb(badge.bg()))
-                                        .text_color(rgb(0x11111b))
-                                        .text_size(px(14.0 * z))
-                                        .child(text!(badge.label())),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(0x5b658f))
-                                        .text_size(px(11.0 * z))
-                                        .child(text!("clique para focar")),
-                                ),
-                        );
-                    }
-                    // Suspenso já deu `continue` acima (culling).
                     canvas::Zone::Suspended => {}
                 }
             }
@@ -1175,6 +1174,14 @@ impl Render for WorkspaceView {
                 .child(body);
 
             root = root.child(card);
+        }
+
+        // BUG A/B (instrumentação): loga a linha de diagnóstico SÓ quando muda (rows/zona/dim) — o
+        // Maestro lê o stderr e confirma, SEM ver a tela, que as rows do PTY batem com o desenhado e
+        // que a zona/dim estão certas (periferia NÃO escurece por falta de foco).
+        if !frame_diag.is_empty() && frame_diag != self.diag_last_frame {
+            eprintln!("lina-gpui: cards · {frame_diag}");
+            self.diag_last_frame = frame_diag;
         }
 
         // PULSO efêmero A→B (a metáfora "sem fios"). W4-3: respeita REDUCE-MOTION — com ele ligado, a
@@ -1580,6 +1587,12 @@ fn naming_overlay(buf: &str) -> impl IntoElement {
 
 fn main() {
     let (cols, rows) = fit_dims();
+    // BUG A (instrumentação de boot): o PTY é spawnado com EXATAMENTE estas `rows`, e o render trava a
+    // line-height em CELL_H → as `rows` cabem inteiras no card (a ÚLTIMA = barra de input da TUI). O
+    // Maestro confere: pty_rows (nos logs por-card) == estas `rows`.
+    eprintln!(
+        "lina-gpui: layout · card {CARD_W}x{CARD_H} · cell {CELL_W}x{CELL_H} · font {FONT_PX}px (line-height travada={CELL_H}) · PTY {cols}x{rows} → {rows} linhas cabem (a ultima = input)"
+    );
 
     let dir = std::env::temp_dir().join("lina-space-ws2");
     let store = Arc::new(Mutex::new(
