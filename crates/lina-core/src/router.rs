@@ -1238,6 +1238,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **DIFERENCIAL #1 (o caso do fundador "manda oi pro Terminal B") — nome COM ESPAÇO, ponta a
+    /// ponta.** Reproduz o caminho REAL do `lina ask`: o terminal escreve no SEU subdir por-nó
+    /// (`enqueue_as("Terminal A", …)`) com o campo `from` que o drain IGNORA (até VAZIO, o exato
+    /// cenário que o diagnóstico temia). O `pump` drena (`drain_to_inflight` carimba `from` =
+    /// dir-dono), `node_by_name("Terminal A")` resolve e ENTREGA — JAMAIS `UnknownSender("")`. Cobre
+    /// o gap dos testes per-nó existentes (que só usam `@X` SEM espaço); nomes de terminal reais têm
+    /// espaço, e `valid_node_name`/`collect_node_outbox` os aceitam.
+    #[test]
+    fn per_node_ask_with_spaced_name_stamps_origin_and_delivers() {
+        let (mut router, sup, dir) = router_with("spaced");
+        let a = sup.register("Terminal A", None, sink());
+        let b = sup.register("Terminal B", None, sink());
+        let mut ts = TmpStore::new("spaced");
+        let (rec, mut deliver) = recorder();
+
+        // `from` VAZIO de propósito: a origem (dir-dono) decide, nunca o campo. É o cenário do
+        // diagnóstico (from="" → UnknownSender("")); provamos que o carimbo per-nó o RESOLVE.
+        let m = MailMessage::new("", "@Terminal B", "ask", "oi");
+        router
+            .mailbox()
+            .enqueue_as("Terminal A", &m)
+            .expect("enqueue_as 'Terminal A' (nome com espaço é subdir válido)");
+
+        let outcomes = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            RouteOutcome::Delivered { targets: vec![b] },
+            "entregue a 'Terminal B' — o drain carimbou from='Terminal A' (NÃO UnknownSender(\"\"))"
+        );
+
+        let calls = rec.borrow();
+        assert_eq!(calls.len(), 1, "uma entrega");
+        assert_eq!(
+            calls[0].1, a,
+            "origem autenticada = NodeId de 'Terminal A' (campo vazio vencido)"
+        );
+        assert!(
+            calls[0].2.contains("from: Terminal A"),
+            "o bloco entregue atribui from: Terminal A (a origem, não o campo vazio)"
+        );
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **CONTRA-PROVA — de ONDE vem o `UnknownSender("")` do log de uso real.** NÃO é o `lina ask`
+    /// (por-nó, carimbado), mas o outbox FLAT (legado/anônimo — ex.: `lina handshake`, que usa
+    /// `enqueue` flat): o drain ANONIMIZA o `from` (anti-impersonação), `node_by_name("")` não
+    /// resolve → `UnknownSender("")`. Mesmos nós e router do teste acima: SÓ o caminho de enqueue
+    /// muda (flat vs por-nó) e o desfecho inverte — a string VAZIA é a assinatura do FLAT, não do per-nó.
+    #[test]
+    fn flat_outbox_message_is_unknown_empty_sender_not_per_node() {
+        let (mut router, sup, dir) = router_with("flatunknown");
+        let _a = sup.register("Terminal A", None, sink());
+        let _b = sup.register("Terminal B", None, sink());
+        let mut ts = TmpStore::new("flatunknown");
+        let (_rec, mut deliver) = recorder();
+
+        // FLAT (como `lina handshake`, lina.rs): `from` nomeado, mas o drain flat o anonimiza → "".
+        router
+            .mailbox()
+            .enqueue(&MailMessage::new("Terminal A", "@Terminal B", "ask", "oi"))
+            .expect("enqueue flat");
+
+        let outcomes = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].1,
+            RouteOutcome::UnknownSender(String::new()),
+            "FLAT anonimizado → from vazio → UnknownSender(\"\") (a assinatura do log de uso real)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn duplicate_id_within_window_is_ignored() {
         let (mut router, sup, dir) = router_with("dedupe");
