@@ -189,7 +189,15 @@ fn run_ask(args: &[String]) -> ExitCode {
     // W3-6c A3: outbox POR-NÓ — `from` é autenticado pela origem (dir-dono), não pelo campo forjável.
     match enqueue_per_node(&mailbox, &from, &msg) {
         Ok(()) => {
-            println!("ok: mensagem {} enfileirada para {}", msg.id, msg.to);
+            // Feedback HONESTO (#22): a entrega é ASSÍNCRONA — quem decide o destino final é o
+            // supervisor (guardrails anti-loop/teto de custo podem barrar DEPOIS). Não prometer
+            // "entregue"; dizer que foi enviada e que, se um limite barrar, fica no log do Espaço.
+            // (Sem o jargão "enfileirada", que confundiu o fundador não-técnico.)
+            println!(
+                "ok: enviada a {} (id {}). A entrega é automática e pode levar um instante; se um \
+                 limite de segurança (anti-loop ou teto de custo) barrar, fica registrado no log do Espaço.",
+                msg.to, msg.id
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
