@@ -1863,6 +1863,8 @@ pub struct NodeManager {
     seq: Mutex<u32>,
     /// W3-2: se presente, gera/reescreve o `CLAUDE.md` por terminal a cada mudança de roster.
     bootstrap: Option<BootstrapWriter>,
+    /// W4-2 (M3/M4): o `.lina/` do workspace — onde os criadores persistem `notes/` e `folders/`.
+    lina_dir: PathBuf,
 }
 
 impl NodeManager {
@@ -1881,6 +1883,7 @@ impl NodeManager {
         seq_start: u32,
         cmd_factory: CmdFactory,
         bootstrap: Option<BootstrapWriter>,
+        lina_dir: PathBuf,
     ) -> Self {
         Self {
             pty,
@@ -1895,7 +1898,57 @@ impl NodeManager {
             rows,
             seq: Mutex::new(seq_start),
             bootstrap,
+            lina_dir,
         }
+    }
+
+    /// **W4-2 · M3/M4 — cria uma NOTA ou PASTA** pelo nome e a torna VIVA no canvas (não só na
+    /// projeção). Reusa [`crate::creators::CreatorForm::commit`] (apenda NodeAdded{Note|Folder} +
+    /// Note/FolderCreated + NodeRenamed e persiste em `.lina/notes`|`.lina/folders`) e então SEMEIA o
+    /// nó no model com o kind certo, posicionado sem sobrepor. Devolve o `NodeId` (p/ focar). O corpo
+    /// da nota nasce vazio (editável depois no arquivo / P4).
+    pub fn create_artifact(
+        &self,
+        kind: crate::creators::CreatorKind,
+        title: &str,
+    ) -> Result<NodeId, String> {
+        let (x, y) = next_free_slot(&lock(&self.model));
+        let form = crate::creators::CreatorForm {
+            title: title.to_string(),
+            body: String::new(),
+        };
+        let node = {
+            let mut store = lock(&self.store);
+            form.commit(
+                kind,
+                &mut store,
+                &self.lina_dir,
+                (f64::from(x), f64::from(y)),
+            )
+            .map_err(|e| e.to_string())?
+        };
+        let count = lock(&self.store).event_count().ok();
+        let node_kind = match kind {
+            crate::creators::CreatorKind::Note => NodeKind::Note,
+            crate::creators::CreatorKind::Folder => NodeKind::Folder,
+        };
+        {
+            let mut m = lock(&self.model);
+            m.nodes
+                .insert(node, NodeView::new(title.trim(), node_kind, x, y));
+            if !m.order.contains(&node) {
+                m.order.push(node);
+            }
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+        eprintln!(
+            "lina-gpui: M3/M4 — {kind:?} '{}' criado (node {node})",
+            title.trim()
+        );
+        Ok(node)
     }
 
     /// W3-2: snapshot `(key, name)` de todos os terminais vivos, na ordem do canvas.
@@ -2200,10 +2253,9 @@ impl NodeManager {
         if self.count() <= 1 {
             return Err("o canvas nunca fica em branco: não removo o último nó".into());
         }
-        let key = lock(&self.keys)
-            .get(&node)
-            .cloned()
-            .ok_or_else(|| format!("nó {node} sem PTY registrado"))?;
+        // W4-2 (M3/M4): nós-ARTEFATO (Note/Folder) NÃO têm PTY/key — `None` é legítimo (só não há PTY
+        // a encerrar). Terminais têm key. Antes, `None` recusava a remoção (errava p/ Note/Folder).
+        let key = lock(&self.keys).get(&node).cloned();
 
         // PERSISTE primeiro: o replay reconstrói SEM este nó. Falha aqui não muda nada.
         let count = {
@@ -2226,8 +2278,11 @@ impl NodeManager {
         lock(&self.grids).remove(&node);
         lock(&self.keys).remove(&node);
 
-        // Encerra o PTY em background (não bloqueia o thread de UI por até 2s).
-        self.retire_pty(node, key);
+        // Encerra o PTY em background (não bloqueia o thread de UI por até 2s) — SÓ se houver (um
+        // nó-artefato Note/Folder não tem PTY).
+        if let Some(key) = key {
+            self.retire_pty(node, key);
+        }
         // W3-2: roster mudou → reescreve os CLAUDE.md (os colegas restantes não listam o removido).
         self.rewrite_bootstrap();
         Ok(())
@@ -3419,6 +3474,7 @@ mod tests {
             2,
             cmd_factory,
             bootstrap,
+            dir.join(".lina"),
         );
         (nm, store, model)
     }
@@ -3512,6 +3568,63 @@ mod tests {
             "nome com sentinela recusado"
         );
         assert_eq!(lock(&model).order.len(), 3, "recusas não criam nó");
+    }
+
+    /// **W4-2 · M3/M4 (hook ligado, headless):** `create_artifact` cria nota/pasta — apenda os eventos
+    /// (Note/FolderCreated) E SEMEIA o nó VIVO no model com o kind certo (aparece sem reabrir o app);
+    /// a projeção (replay) reconstrói o kind. E `remove_node` agora TOLERA o nó-artefato (sem PTY).
+    #[test]
+    fn create_artifact_seeds_live_node_logs_and_removes() {
+        let (nm, store, model) = test_manager("artifact", None);
+        let before = lock(&model).order.len();
+
+        let note = nm
+            .create_artifact(crate::creators::CreatorKind::Note, "Ideias")
+            .expect("cria nota");
+        assert_eq!(
+            lock(&model).order.len(),
+            before + 1,
+            "a nota aparece VIVA no model"
+        );
+        assert!(
+            lock(&model)
+                .nodes
+                .get(&note)
+                .is_some_and(|v| v.name == "Ideias" && matches!(v.kind, NodeKind::Note)),
+            "nó da nota semeado com kind Note + nome"
+        );
+
+        let folder = nm
+            .create_artifact(crate::creators::CreatorKind::Folder, "Clientes")
+            .expect("cria pasta");
+        assert!(lock(&model)
+            .nodes
+            .get(&folder)
+            .is_some_and(|v| matches!(v.kind, NodeKind::Folder)));
+
+        // Eventos no log + projeção (replay) reconstrói o kind certo (fonte da verdade).
+        let kinds: Vec<String> = lock(&store)
+            .events()
+            .expect("ev")
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert!(kinds.iter().any(|k| k == "NoteCreated"));
+        assert!(kinds.iter().any(|k| k == "FolderCreated"));
+        let proj = lock(&store).project().expect("project");
+        assert_eq!(proj.nodes.get(&note).map(|n| n.kind.as_str()), Some("Note"));
+        assert_eq!(
+            proj.nodes.get(&folder).map(|n| n.kind.as_str()),
+            Some("Folder")
+        );
+
+        // `remove_node` tolera o nó-ARTEFATO (sem PTY) — antes errava "sem PTY registrado".
+        nm.remove_node(note)
+            .expect("remover a nota (sem PTY) funciona");
+        assert!(
+            !lock(&model).nodes.contains_key(&note),
+            "a nota saiu do model"
+        );
     }
 
     /// **GATE de REMOVE (headless, determinístico):** após add (3 nós), `remove_node` desce a

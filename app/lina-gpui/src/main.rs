@@ -286,6 +286,9 @@ struct WorkspaceView {
     a11y_live: a11y::LiveRegion,
     /// W4-2 · M1: paleta de comandos (Cmd-K). Fechada por padrão.
     palette: palette::PaletteState,
+    /// W4-2 · M3/M4: `Some((kind, buffer))` enquanto o humano DIGITA o título da nota/pasta a criar
+    /// (disparado pela paleta). Enter cria + foca; Esc cancela. `None` = fora do modo criação.
+    creating: Option<(creators::CreatorKind, String)>,
 }
 
 impl WorkspaceView {
@@ -322,6 +325,7 @@ impl WorkspaceView {
             reduce_motion: a11y::os_reduce_motion(),
             a11y_live: a11y::LiveRegion::default(),
             palette: palette::PaletteState::default(),
+            creating: None,
         }
     }
 
@@ -344,8 +348,8 @@ impl WorkspaceView {
         cmds
     }
 
-    /// W4-2 · M1: executa a ação escolhida na paleta (toca o estado do canvas — `naming`/`focus`/`brake`).
-    /// Nota/pasta são placeholder até `creators.rs` (M3/M4, outro terminal).
+    /// W4-2 · M1: executa a ação escolhida na paleta (toca o estado do canvas — `naming`/`focus`/`brake`
+    /// ou abre o modo CRIAÇÃO de nota/pasta — M3/M4).
     fn run_palette_action(&mut self, action: palette::PaletteAction, window: &Window) {
         use palette::PaletteAction as A;
         match action {
@@ -355,12 +359,9 @@ impl WorkspaceView {
                 self.reveal(node, window);
             }
             A::ToggleBrake => lock(&self.brake).toggle_requested = true,
-            A::NewNote => eprintln!(
-                "lina-gpui: M1→M3 'nova nota' — creators.rs (M3/M4) ainda nao existe (placeholder)"
-            ),
-            A::NewFolder => eprintln!(
-                "lina-gpui: M1→M4 'nova pasta' — creators.rs (M3/M4) ainda nao existe (placeholder)"
-            ),
+            // M3/M4: abre o modo CRIAÇÃO (digita o título → Enter cria + foca; ver `handle_key`).
+            A::NewNote => self.creating = Some((creators::CreatorKind::Note, String::new())),
+            A::NewFolder => self.creating = Some((creators::CreatorKind::Folder, String::new())),
         }
     }
 
@@ -619,6 +620,49 @@ impl WorkspaceView {
                             .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
                         {
                             if let Some(buf) = self.naming.as_mut() {
+                                buf.push_str(kc);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        // W4-2 · M3/M4 — MODO CRIAÇÃO de nota/pasta (disparado pela paleta): digita o título; Enter cria
+        // (semeia o nó VIVO + foca); Esc cancela; Backspace apaga. Modal leve, irmão do naming (M2).
+        if self.creating.is_some() {
+            match ks.key.as_str() {
+                "escape" => self.creating = None,
+                "enter" | "return" => {
+                    if let Some((kind, buf)) = self.creating.take() {
+                        let title = buf.trim().to_string();
+                        if !title.is_empty() {
+                            match self.nodes.create_artifact(kind, &title) {
+                                Ok(node) => {
+                                    self.focus(node);
+                                    self.reveal(node, window);
+                                }
+                                Err(e) => {
+                                    eprintln!("lina-gpui: M3/M4 criar {kind:?} '{title}': {e}")
+                                }
+                            }
+                        }
+                    }
+                }
+                "backspace" => {
+                    if let Some((_, buf)) = self.creating.as_mut() {
+                        buf.pop();
+                    }
+                }
+                _ => {
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(kc) = ks
+                            .key_char
+                            .as_ref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                        {
+                            if let Some((_, buf)) = self.creating.as_mut() {
                                 buf.push_str(kc);
                             }
                         }
@@ -987,52 +1031,85 @@ impl Render for WorkspaceView {
                         view.pointer_down(node_id, ev);
                     }),
                 );
-            // W4-2 · P0 (degradação de ociosos, red-team doc 12): SÓ o nó em FOCO desenha o grid ao
-            // vivo (grande, 120fps). Na PERIFERIA, o cartão é COMPACTO — um BADGE agregado e honesto,
-            // SEM render do grid (custo de CPU de ocioso ~0). Clicar foca → vira grande.
-            match zone {
-                canvas::Zone::Focus => {
-                    let grid = lock(&self.nodes.grids).get(&node_id).cloned();
-                    if let Some(g) = grid {
-                        let screen = lock(&g).screen();
-                        body = body.child(render_grid(&screen, z, card_sel));
+            // W4-2 · M3/M4: nós-ARTEFATO (Note/Folder) não têm PTY/grid — desenham ÍCONE + nome (não a
+            // lógica de zona/grid dos terminais). Aparecem VIVOS no canvas assim que criados (semeados
+            // no model por `create_artifact`).
+            if matches!(nv.kind, NodeKind::Note | NodeKind::Folder) {
+                let (icon, what) = if matches!(nv.kind, NodeKind::Note) {
+                    ("📝", "nota")
+                } else {
+                    ("📁", "pasta")
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .size_full()
+                        .child(div().text_size(px(40.0 * z)).child(text!(icon)))
+                        .child(
+                            div()
+                                .text_color(rgb(0xc8d3f5))
+                                .text_size(px(15.0 * z))
+                                .child(text!(nv.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(0x5b658f))
+                                .text_size(px(11.0 * z))
+                                .child(text!(what)),
+                        ),
+                );
+            } else {
+                // W4-2 · P0 (degradação de ociosos, red-team doc 12): SÓ o nó-TERMINAL em FOCO desenha o
+                // grid ao vivo (grande, 120fps). Na PERIFERIA, cartão COMPACTO — BADGE honesto, SEM grid
+                // (custo de CPU de ocioso ~0). Clicar foca → vira grande.
+                match zone {
+                    canvas::Zone::Focus => {
+                        let grid = lock(&self.nodes.grids).get(&node_id).cloned();
+                        if let Some(g) = grid {
+                            let screen = lock(&g).screen();
+                            body = body.child(render_grid(&screen, z, card_sel));
+                        }
                     }
+                    canvas::Zone::Periphery => {
+                        // "precisa de você" se há um gate humano pendente para este nó (round 5).
+                        let needs_human = lock(&self.desk)
+                            .queue
+                            .iter()
+                            .any(|p| p.requester() == nv.name);
+                        let badge = canvas::aggregate_badge(nv.status, needs_human, 0);
+                        body = body.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .size_full()
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(badge.bg()))
+                                        .text_color(rgb(0x11111b))
+                                        .text_size(px(14.0 * z))
+                                        .child(text!(badge.label())),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(rgb(0x5b658f))
+                                        .text_size(px(11.0 * z))
+                                        .child(text!("clique para focar")),
+                                ),
+                        );
+                    }
+                    // Suspenso já deu `continue` acima (culling).
+                    canvas::Zone::Suspended => {}
                 }
-                canvas::Zone::Periphery => {
-                    // "precisa de você" se há um gate humano pendente para este nó (round 5).
-                    let needs_human = lock(&self.desk)
-                        .queue
-                        .iter()
-                        .any(|p| p.requester() == nv.name);
-                    let badge = canvas::aggregate_badge(nv.status, needs_human, 0);
-                    body = body.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .size_full()
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(badge.bg()))
-                                    .text_color(rgb(0x11111b))
-                                    .text_size(px(14.0 * z))
-                                    .child(text!(badge.label())),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(0x5b658f))
-                                    .text_size(px(11.0 * z))
-                                    .child(text!("clique para focar")),
-                            ),
-                    );
-                }
-                // Suspenso já deu `continue` acima (culling).
-                canvas::Zone::Suspended => {}
             }
 
             let card = div()
@@ -1254,6 +1331,25 @@ impl Render for WorkspaceView {
                         .child(text!("✦ Novo Agente")),
                 );
             }
+        }
+
+        // W4-2 · M3/M4: modo CRIAÇÃO ativo → banner do título da nota/pasta sendo digitado.
+        if let Some((kind, buf)) = &self.creating {
+            let (icon, what) = match kind {
+                creators::CreatorKind::Note => ("📝", "Nova nota"),
+                creators::CreatorKind::Folder => ("📁", "Nova pasta"),
+            };
+            topbar = topbar.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(0x3a3f5a))
+                    .text_color(rgb(0xeef1ff))
+                    .child(text!(format!(
+                        "{icon} {what}: {buf}▌  (Enter cria · Esc cancela)"
+                    ))),
+            );
         }
 
         // 🏠 Centralizar: resgata a vista (pan/zoom → home). Sempre visível p/ o não-técnico
@@ -1599,6 +1695,7 @@ fn main() {
         2,
         cmd_factory,
         bootstrap,
+        mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
     );
     // W3-2: escreve o CLAUDE.md/estado inicial de A e B (roster = {A, B}).
     nodes.rewrite_bootstrap();

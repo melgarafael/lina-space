@@ -17,11 +17,9 @@
 //! `bridge`/`canvas`/etc. Para o nó APARECER de fato no canvas vivo (não só na projeção), a camada de
 //! canvas precisa projetar/semear o nó novo — ver o pedido de HOOK no `.entrega-m3m4.md`.
 
-// Esta API pública ainda NÃO é consumida pelo binário: a entrada de UI (palette/menu) e o render do
-// nó Note/Folder são HOOKS do dono do canvas/palette (ver AVISE no `.entrega-m3m4.md`). Até o hook
-// landar, o módulo é uma biblioteca verde+testada (mesmo padrão de `#![allow(dead_code)]` do
-// `lina-core/lib.rs`). Escopo: SÓ este módulo — não afeta a detecção de dead-code dos outros.
-#![allow(dead_code)]
+// HOOK LANDADO: a paleta (Cmd-K → "Criar Nota"/"Criar Pasta") consome `CreatorForm::commit` via
+// `NodeManager::create_artifact` (bridge), que semeia o nó no canvas vivo; o render desenha o nó
+// Note/Folder. Por isso o `#![allow(dead_code)]` foi REMOVIDO — a API agora é usada pelo binário.
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +27,10 @@ use lina_core::{DomainEvent, EventStore, NodeId, StoreError};
 use uuid::Uuid;
 
 /// Posição default de um nó recém-criado no canvas (a wiring/canvas pode reposicionar). Fora do
-/// caminho dos terminais-semente (30/740, y=96) para não sobrepor no boot.
+/// caminho dos terminais-semente (30/740, y=96) para não sobrepor no boot. **O canvas (M3/M4 hook)
+/// posiciona via `next_free_slot` (não-sobreposição), então este default fica como API/teste** —
+/// `#[allow(dead_code)]` apenas neste item (a lógica do módulo permanece intacta).
+#[allow(dead_code)]
 pub const DEFAULT_POS: (f64, f64) = (120.0, 320.0);
 
 /// Erro de criação de nota/pasta. Sem `unwrap` em produção: todo caminho falível vira uma variante.
