@@ -215,6 +215,7 @@ fn onda0_exit_gate_end_to_end() {
     store
         .append(&DomainEvent::WorkspaceCreated {
             name: "Gate Onda 0".into(),
+            focus_preset: String::new(),
         })
         .expect("append");
 

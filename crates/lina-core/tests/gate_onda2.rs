@@ -267,6 +267,7 @@ fn onda2_exit_gate_end_to_end() {
     store
         .append(&DomainEvent::WorkspaceCreated {
             name: "Gate Onda 2".into(),
+            focus_preset: String::new(),
         })
         .expect("append WorkspaceCreated");
 

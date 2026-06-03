@@ -177,6 +177,7 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
     store
         .append(&DomainEvent::WorkspaceCreated {
             name: "Gate W3-4".into(),
+            focus_preset: String::new(),
         })
         .expect("WorkspaceCreated");
 

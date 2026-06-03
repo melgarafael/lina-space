@@ -1325,6 +1325,7 @@ mod tests {
         ts.store
             .append(&DomainEvent::WorkspaceCreated {
                 name: "App X".into(),
+                focus_preset: String::new(),
             })
             .expect("workspace");
         router

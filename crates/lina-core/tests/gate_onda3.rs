@@ -88,6 +88,7 @@ fn env(tag: &str, cfg: RouterConfig) -> Env {
     store
         .append(&DomainEvent::WorkspaceCreated {
             name: format!("Gate Onda 3 — {tag}"),
+            focus_preset: String::new(),
         })
         .expect("WorkspaceCreated (preset)");
     let sup = Arc::new(Supervisor::new());

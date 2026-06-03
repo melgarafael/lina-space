@@ -94,6 +94,11 @@ pub enum FlushState {
 pub enum DomainEvent {
     WorkspaceCreated {
         name: String,
+        /// W4-5: preset de Foco escolhido na galeria (`dev_app`/`research_content`/…). Taxonomia
+        /// LIVRE aqui (a story W4-5 a define). `#[serde(default)]` + upcasting v1→v2 → logs antigos
+        /// (sem o campo) replayam com `""` (não-setado), sem quebrar o replay.
+        #[serde(default)]
+        focus_preset: String,
     },
     NodeAdded {
         node: NodeId,
@@ -333,7 +338,8 @@ impl DomainEvent {
     #[must_use]
     pub fn current_version(&self) -> u32 {
         match self {
-            DomainEvent::NodeAdded { .. } => 2,
+            // `NodeAdded` v2 (campo `kind`), `WorkspaceCreated` v2 (campo `focus_preset`, W4-5).
+            DomainEvent::NodeAdded { .. } | DomainEvent::WorkspaceCreated { .. } => 2,
             _ => 1,
         }
     }
@@ -358,6 +364,13 @@ fn upcast(kind: &str, version: u32, mut payload: serde_json::Value) -> serde_jso
         if let Some(obj) = payload.as_object_mut() {
             obj.entry("kind")
                 .or_insert_with(|| serde_json::Value::String("Terminal".into()));
+        }
+    }
+    // WorkspaceCreated v1 → v2 (W4-5): não tinha `focus_preset`. Default `""` (não-setado).
+    if kind == "WorkspaceCreated" && version < 2 {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.entry("focus_preset")
+                .or_insert_with(|| serde_json::Value::String(String::new()));
         }
     }
     payload
@@ -405,6 +418,10 @@ pub struct ProjectedState {
     /// antigos desserializam com lista vazia.
     #[serde(default)]
     pub discovered_clis: Vec<DiscoveredCli>,
+    /// W4-5: preset de Foco do workspace (de `WorkspaceCreated.focus_preset`). `None` = não-setado
+    /// (inclui logs v1 upcasted). `#[serde(default)]` → snapshots antigos desserializam como `None`.
+    #[serde(default)]
+    pub focus_preset: Option<String>,
 }
 
 impl ProjectedState {
@@ -420,10 +437,19 @@ impl ProjectedState {
 /// Reducer puro: aplica um evento ao estado projetado.
 pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
     match event {
-        DomainEvent::WorkspaceCreated { name } => {
+        DomainEvent::WorkspaceCreated {
+            name,
+            focus_preset,
+        } => {
             state.workspace_name = Some(name.clone());
             // O cabeçalho do plano espelha o nome do workspace (projeção → `# Plano — <name>`).
             state.plan.workspace = name.clone();
+            // W4-5: preset vazio (`""`, inclusive logs v1 upcasted) projeta `None`.
+            state.focus_preset = if focus_preset.is_empty() {
+                None
+            } else {
+                Some(focus_preset.clone())
+            };
         }
         DomainEvent::NodeAdded { node, kind, x, y } => {
             state.nodes.insert(
@@ -945,6 +971,7 @@ mod tests {
         store
             .append(&DomainEvent::WorkspaceCreated {
                 name: "App X".into(),
+                focus_preset: String::new(),
             })
             .unwrap();
         store
@@ -1158,6 +1185,7 @@ mod tests {
         store
             .append(&DomainEvent::WorkspaceCreated {
                 name: "App X".into(),
+                focus_preset: String::new(),
             })
             .unwrap();
         store
@@ -1167,6 +1195,37 @@ mod tests {
             .unwrap();
         let state = store.project().expect("project");
         assert_eq!(state.focused_workspace.as_deref(), Some("App X"));
+    }
+
+    /// W4-5: `WorkspaceCreated` v2 projeta `focus_preset`; um log v1 (sem o campo) passa pelo
+    /// upcaster e projeta `None` — sem quebrar o replay.
+    #[test]
+    #[serial]
+    fn workspace_focus_preset_v2_projects_and_v1_upcasts() {
+        let tmp = TempDir::new("preset");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        // v2: com focus_preset.
+        store
+            .append(&DomainEvent::WorkspaceCreated {
+                name: "App X".into(),
+                focus_preset: "dev_app".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.project().expect("project").focus_preset.as_deref(),
+            Some("dev_app")
+        );
+
+        // v1: payload legado SEM focus_preset → upcaster injeta "" → projeta None.
+        let tmp2 = TempDir::new("preset-v1");
+        let mut store2 = EventStore::open(tmp2.path()).expect("open");
+        let v1 = serde_json::json!({ "event": "WorkspaceCreated", "name": "Legacy" });
+        store2
+            .insert_raw("WorkspaceCreated", 1, v1)
+            .expect("insert v1");
+        let state = store2.project().expect("replay v1 upcasted");
+        assert_eq!(state.workspace_name.as_deref(), Some("Legacy"));
+        assert_eq!(state.focus_preset, None, "log v1 → preset não-setado");
     }
 
     /// W4-2 (P4): `CliProfileSet` projeta o `cli` do nó (idempotente, último vence).
@@ -1276,6 +1335,7 @@ mod tests {
             .append_with_flush(
                 &DomainEvent::WorkspaceCreated {
                     name: "App X".into(),
+                    focus_preset: String::new(),
                 },
                 |s| states.push(s),
             )
