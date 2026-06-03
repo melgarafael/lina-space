@@ -912,20 +912,54 @@ impl Render for WorkspaceView {
                 }),
             )
             .on_scroll_wheel(cx.listener(|view, ev: &ScrollWheelEvent, window, _cx| {
-                // ZOOM ao rolar no FUNDO; sobre um card VISÍVEL, o handler do card cuida.
+                // BUG 2 (scroll): a roda sobre um TERMINAL rola o SCROLLBACK daquele nó (ver o output
+                // que passou); no FUNDO vazio = ZOOM do canvas; ⌘/Ctrl+roda = ZOOM em qualquer lugar.
+                // TUDO aqui, no handler do ROOT (que SEMPRE dispara) — antes "o card cuidava", mas o
+                // gesto não chegava nele de forma confiável e o root caía no zoom.
                 let cursor = (f32::from(ev.position.x), f32::from(ev.position.y));
                 let v = window.viewport_size();
                 let vp = (f32::from(v.width), f32::from(v.height));
-                if hit_test(
+                if ev.modifiers.platform || ev.modifiers.control {
+                    view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
+                    return;
+                }
+                let Some(node) = hit_test(
                     &view.camera,
                     cursor,
                     &view.cards_z_asc(),
                     (CARD_W, CARD_H),
                     vp,
-                )
-                .is_none()
-                {
+                ) else {
+                    // Fundo vazio → zoom do canvas (pan/zoom de antes intactos).
                     view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
+                    return;
+                };
+                let dy: f32 = match ev.delta {
+                    ScrollDelta::Lines(p) => p.y,
+                    ScrollDelta::Pixels(p) => p.y / px(CELL_H),
+                };
+                if dy == 0.0 {
+                    return;
+                }
+                // Mouse reporting atômico: se o TUI sob o cursor CONSOME a roda, NÃO rola o scrollback.
+                let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
+                if let Some(cell) = view.screen_cell(node, cursor) {
+                    let action = if dy > 0.0 {
+                        PtrAction::WheelUp
+                    } else {
+                        PtrAction::WheelDown
+                    };
+                    if view.send_pointer(node, action, cell, mods) {
+                        return;
+                    }
+                }
+                // Rola o SCROLLBACK do terminal: `delta > 0` sobe p/ o PASSADO (lina-vt display_offset;
+                // o próximo `screen()` reflete → o usuário VÊ o histórico).
+                let lines = dy.round() as i32;
+                if lines != 0 {
+                    if let Some(g) = lock(&view.nodes.grids).get(&node).cloned() {
+                        lock(&g).scroll(lines);
+                    }
                 }
             }))
             .on_key_down(cx.listener(|view, ev: &KeyDownEvent, window, cx| {
@@ -1134,41 +1168,9 @@ impl Render for WorkspaceView {
                         view.focus(node_id);
                     }
                 }))
-                .on_scroll_wheel(cx.listener(move |view, ev: &ScrollWheelEvent, _w, _cx| {
-                    // ⌘+scroll sobre o card = zoom do canvas; scroll normal = rolar o terminal.
-                    if ev.modifiers.platform {
-                        let cursor = (f32::from(ev.position.x), f32::from(ev.position.y));
-                        view.camera.zoom_by(cursor, scroll_zoom_factor(ev.delta));
-                        return;
-                    }
-                    let dy: f32 = match ev.delta {
-                        ScrollDelta::Lines(p) => p.y,
-                        ScrollDelta::Pixels(p) => p.y / px(CELL_H),
-                    };
-                    // Mouse reporting: tenta reportar a roda (atômico); se o TUI consumiu, NÃO rola
-                    // o scrollback. Sem pré-check separado de reporting (evita a corrida).
-                    if dy != 0.0 {
-                        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
-                        let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
-                        if let Some(cell) = view.screen_cell(node_id, pos) {
-                            let action = if dy > 0.0 {
-                                PtrAction::WheelUp
-                            } else {
-                                PtrAction::WheelDown
-                            };
-                            if view.send_pointer(node_id, action, cell, mods) {
-                                return;
-                            }
-                        }
-                    }
-                    let delta = dy.round() as i32;
-                    if delta != 0 {
-                        let grid = lock(&view.nodes.grids).get(&node_id).cloned();
-                        if let Some(g) = grid {
-                            lock(&g).scroll(delta);
-                        }
-                    }
-                }))
+                // BUG 2 (scroll): o gesto de roda é tratado no handler do ROOT (que sempre dispara),
+                // roteando por `hit_test` — scrollback sobre o terminal, zoom no fundo. (Antes ficava
+                // aqui no card e não pegava o gesto de forma confiável.)
                 .child(title)
                 .child(body);
 
