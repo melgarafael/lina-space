@@ -33,8 +33,14 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
 pub use events::{
-    apply, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, ProjectedNode,
-    ProjectedState, StoreError,
+    apply, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, FlushState,
+    ProjectedNode, ProjectedState, StoreError,
+};
+
+/// W4-1: CliDiscovery — varredura do `PATH` por CLIs de IA (substrato do check-up de onboarding).
+mod cli_discovery;
+pub use cli_discovery::{
+    discover_clis, discover_clis_in, find_in_path, query_version, DiscoveredCli, KNOWN_CLIS,
 };
 
 /// Entrega A2A faseada (W0-9) + contrato de fim-de-resposta (W0-10).

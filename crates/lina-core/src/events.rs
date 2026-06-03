@@ -30,6 +30,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::cli_discovery::DiscoveredCli;
 use crate::plan::Plan;
 
 /// Erros do event store / recuperação.
@@ -70,6 +71,19 @@ pub enum AwaitReason {
     Replied,
     Timeout,
     Deadlock,
+}
+
+/// W4-4: durabilidade do último `append`, para a UI projetar **"salvando…" ↔ "Tudo salvo ✓"**
+/// (rodapé, invariante #6 "estado sempre salvo e visível"). O core emite a transição via callback
+/// (ver [`EventStore::append_with_flush`]); o shell a mapeia para seu evento de UI **sem o core
+/// importar o contrato de UI** (`lina-host`). NÃO é evento de domínio (não vai ao log) — é estado
+/// transitório de persistência.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushState {
+    /// Escrita em andamento (antes do flush no disco).
+    Saving,
+    /// Escrita durável (JSONL append-only flushed) — "Tudo salvo ✓".
+    Saved,
 }
 
 /// Catálogo canônico de eventos do domínio (subconjunto da [[20 - Arquitetura Tecnica]]
@@ -243,6 +257,31 @@ pub enum DomainEvent {
         name: String,
         hash: String,
     },
+    /// W4-1: resultado do `CliDiscovery` (varredura do `PATH` no check-up de onboarding T1).
+    /// Projeta a lista CORRENTE de CLIs disponíveis (último índice vence) — a fonte do "nenhum
+    /// CLI encontrado" / "binário com versão" da tela T1. ZERO LLM, local-first.
+    DiscoveryIndexed {
+        clis: Vec<DiscoveredCli>,
+    },
+    /// W4-2 (M3): uma nota foi criada (`sticky` → `.md`). META — o nó vem de `NodeAdded{kind:"Note"}`;
+    /// aqui registra-se o fato de criação do artefato (mesmo papel de `NoteUpdated`).
+    NoteCreated {
+        name: String,
+    },
+    /// W4-2 (M4): uma pasta foi criada. META — o nó vem de `NodeAdded{kind:"Folder"}`.
+    FolderCreated {
+        name: String,
+    },
+    /// W4-2 (P4 Inspetor): o CLI Profile de um nó foi setado/trocado. Projeta o `cli` do nó.
+    CliProfileSet {
+        node: NodeId,
+        profile: String,
+    },
+    /// W4-4 (T6 Switcher): o foco de workspace mudou. Projeta `focused_workspace`. (O event store
+    /// é por-workspace; este evento registra o foco vigente para a projeção do Switcher.)
+    WorkspaceFocusSet {
+        workspace: String,
+    },
     SnapshotTaken {
         seq: u64,
     },
@@ -280,6 +319,11 @@ impl DomainEvent {
             DomainEvent::PlanClaimed { .. } => "PlanClaimed",
             DomainEvent::PlanChecked { .. } => "PlanChecked",
             DomainEvent::NoteUpdated { .. } => "NoteUpdated",
+            DomainEvent::DiscoveryIndexed { .. } => "DiscoveryIndexed",
+            DomainEvent::NoteCreated { .. } => "NoteCreated",
+            DomainEvent::FolderCreated { .. } => "FolderCreated",
+            DomainEvent::CliProfileSet { .. } => "CliProfileSet",
+            DomainEvent::WorkspaceFocusSet { .. } => "WorkspaceFocusSet",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
         }
     }
@@ -353,6 +397,14 @@ pub struct ProjectedState {
     /// desserializam com plano vazio). É a fonte do `.lina/plan.md` (escritor único: supervisor).
     #[serde(default)]
     pub plan: Plan,
+    /// W4-4 (T6 Switcher): workspace em foco (do último `WorkspaceFocusSet`). `#[serde(default)]`
+    /// → snapshots antigos desserializam como `None` (não quebra replay/recovery dos gates).
+    #[serde(default)]
+    pub focused_workspace: Option<String>,
+    /// W4-1: CLIs de IA disponíveis (do último `DiscoveryIndexed`). `#[serde(default)]` → snapshots
+    /// antigos desserializam com lista vazia.
+    #[serde(default)]
+    pub discovered_clis: Vec<DiscoveredCli>,
 }
 
 impl ProjectedState {
@@ -434,6 +486,18 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::PlanDecisionAdded { text } => state.plan.apply_decision_added(text.clone()),
         DomainEvent::PlanClaimed { item, by, .. } => state.plan.apply_claimed(item, by),
         DomainEvent::PlanChecked { item, by, .. } => state.plan.apply_checked(item, by),
+        // W4-1: a indexação corrente substitui a anterior (último check-up vence).
+        DomainEvent::DiscoveryIndexed { clis } => state.discovered_clis = clis.clone(),
+        // W4-2 (P4): o CLI Profile do nó é projetado no campo `cli` (idempotente por nó).
+        DomainEvent::CliProfileSet { node, profile } => {
+            if let Some(n) = state.nodes.get_mut(node) {
+                n.cli = Some(profile.clone());
+            }
+        }
+        // W4-4 (T6): o foco de workspace é projetado (último vence).
+        DomainEvent::WorkspaceFocusSet { workspace } => {
+            state.focused_workspace = Some(workspace.clone());
+        }
         // Handshake/entrega/recusa/notas/snapshot são META (observabilidade no log) — sem efeito
         // na projeção do canvas; o roster vivo é do Supervisor, não da projeção.
         DomainEvent::Handshake { .. }
@@ -450,6 +514,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::CostCeilingHit { .. }
         | DomainEvent::CostCeilingResumed { .. }
         | DomainEvent::NoteUpdated { .. }
+        // W4-2 (M3/M4): criação de nota/pasta é META (o nó é criado via `NodeAdded`); registra o
+        // fato do artefato no log, sem efeito na projeção do canvas (mesmo padrão de `NoteUpdated`).
+        | DomainEvent::NoteCreated { .. }
+        | DomainEvent::FolderCreated { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
@@ -575,6 +643,22 @@ impl EventStore {
     pub fn append(&mut self, event: &DomainEvent) -> Result<u64, StoreError> {
         let payload = serde_json::to_value(event)?;
         self.insert_raw(event.kind(), event.current_version(), payload)
+    }
+
+    /// W4-4: como [`append`], mas **observa a durabilidade** para a UI: chama `on_flush(Saving)`
+    /// antes de escrever e `on_flush(Saved)` após o append durável (JSONL flushed). O shell liga
+    /// `on_flush` ao indicador "salvando…/Tudo salvo ✓" (e ao seu `HostEvent`) **sem o core importar
+    /// o contrato de UI**. NÃO reimplementa persistência — só envolve [`append`] (W0-5) com a
+    /// notificação. Devolve o `seq` atribuído.
+    pub fn append_with_flush(
+        &mut self,
+        event: &DomainEvent,
+        mut on_flush: impl FnMut(FlushState),
+    ) -> Result<u64, StoreError> {
+        on_flush(FlushState::Saving);
+        let seq = self.append(event)?;
+        on_flush(FlushState::Saved);
+        Ok(seq)
     }
 
     /// Insere um registro CRU (`kind`/`version`/`payload`) — usado por [`append`], por
@@ -1063,6 +1147,142 @@ mod tests {
             ui.events.is_empty(),
             "db saudável não deve emitir Recovering/Recovered"
         );
+    }
+
+    /// W4-4 (T6): `WorkspaceFocusSet` projeta `focused_workspace` e sobrevive ao replay.
+    #[test]
+    #[serial]
+    fn workspace_focus_set_projects_and_replays() {
+        let tmp = TempDir::new("focus");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::WorkspaceCreated {
+                name: "App X".into(),
+            })
+            .unwrap();
+        store
+            .append(&DomainEvent::WorkspaceFocusSet {
+                workspace: "App X".into(),
+            })
+            .unwrap();
+        let state = store.project().expect("project");
+        assert_eq!(state.focused_workspace.as_deref(), Some("App X"));
+    }
+
+    /// W4-2 (P4): `CliProfileSet` projeta o `cli` do nó (idempotente, último vence).
+    #[test]
+    #[serial]
+    fn cli_profile_set_projects_node_cli() {
+        let tmp = TempDir::new("cliprofile");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let node = Uuid::now_v7();
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+            })
+            .unwrap();
+        store
+            .append(&DomainEvent::CliProfileSet {
+                node,
+                profile: "claude".into(),
+            })
+            .unwrap();
+        let state = store.project().expect("project");
+        assert_eq!(
+            state.nodes.get(&node).unwrap().cli.as_deref(),
+            Some("claude")
+        );
+    }
+
+    /// W4-1: `DiscoveryIndexed` projeta a lista corrente de CLIs e o round-trip preserva os campos.
+    #[test]
+    #[serial]
+    fn discovery_indexed_projects_and_roundtrips() {
+        let tmp = TempDir::new("discovery");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let clis = vec![
+            DiscoveredCli {
+                id: "claude".into(),
+                version: Some("claude 1.2.3".into()),
+                path: "/usr/local/bin/claude".into(),
+            },
+            DiscoveredCli {
+                id: "codex".into(),
+                version: None,
+                path: "/usr/local/bin/codex".into(),
+            },
+        ];
+        store
+            .append(&DomainEvent::DiscoveryIndexed { clis: clis.clone() })
+            .unwrap();
+        let state = store.project().expect("project");
+        assert_eq!(state.discovered_clis, clis, "projeção preserva os CLIs");
+        // round-trip do payload no log (campos preservados).
+        let rec = store
+            .events()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == "DiscoveryIndexed")
+            .expect("evento no log");
+        assert_eq!(rec.payload["clis"][0]["id"], "claude");
+        assert_eq!(rec.payload["clis"][1]["version"], serde_json::Value::Null);
+    }
+
+    /// W4-2 (M3/M4): `NoteCreated`/`FolderCreated` são META — não alteram a projeção mas
+    /// constam no log e o replay não erra.
+    #[test]
+    #[serial]
+    fn note_and_folder_created_are_meta_but_logged() {
+        let tmp = TempDir::new("notefolder");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let before = store.project().expect("project").fingerprint();
+        store
+            .append(&DomainEvent::NoteCreated {
+                name: "ideia.md".into(),
+            })
+            .unwrap();
+        store
+            .append(&DomainEvent::FolderCreated {
+                name: "docs".into(),
+            })
+            .unwrap();
+        let after = store.project().expect("project");
+        assert_eq!(
+            after.fingerprint(),
+            before,
+            "Note/FolderCreated são META — projeção inalterada"
+        );
+        let kinds: Vec<String> = store
+            .events()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert!(kinds.contains(&"NoteCreated".to_string()));
+        assert!(kinds.contains(&"FolderCreated".to_string()));
+    }
+
+    /// W4-4: `append_with_flush` notifica `Saving` → `Saved` na ordem e persiste o evento.
+    #[test]
+    #[serial]
+    fn append_with_flush_signals_saving_then_saved() {
+        let tmp = TempDir::new("flush");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let mut states = Vec::new();
+        let seq = store
+            .append_with_flush(
+                &DomainEvent::WorkspaceCreated {
+                    name: "App X".into(),
+                },
+                |s| states.push(s),
+            )
+            .expect("append_with_flush");
+        assert_eq!(states, vec![FlushState::Saving, FlushState::Saved]);
+        assert_eq!(store.event_count().unwrap(), 1);
+        assert_eq!(seq, 1);
     }
 
     /// Sobrescreve um trecho contíguo no MEIO do arquivo com lixo (0xEE).
