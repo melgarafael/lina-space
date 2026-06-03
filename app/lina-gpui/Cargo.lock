@@ -3177,6 +3177,7 @@ dependencies = [
  "lina-host",
  "lina-secrets",
  "lina-vt",
+ "serde_json",
  "tokio",
  "uuid",
 ]

@@ -135,6 +135,66 @@ fn lina_do_enqueues_request_in_dedicated_broker_queue_per_node() {
     );
 }
 
+fn run_resume(home: &TempHome, extra: &[&str]) -> std::process::Output {
+    let exe = env!("CARGO_BIN_EXE_lina");
+    let mut argv = vec!["resume"];
+    argv.extend_from_slice(extra);
+    Command::new(exe)
+        .args(&argv)
+        .env("LINA_HOME", home.path())
+        .output()
+        .expect("executar o binário lina")
+}
+
+/// **ROUND 5 hole 1 (lado-agente):** `lina resume` (mesmo com `--confirm`) NÃO des-pausa por
+/// construção — o caminho do agente NEM ABRE o event store; só REGISTRA um `resume.request` na fila
+/// de broker por-nó. Logo é IMPOSSÍVEL ele apendar `CostCeilingResumed`. (A transição paused→retomada
+/// pelo gate humano é provada in-process no teste do app `broker_pump_resume_requires_human_gate_to_unpause`.)
+#[test]
+fn lina_resume_does_not_unpause_only_requests() {
+    let home = TempHome::new("resume");
+
+    let out = run_resume(&home, &["--confirm"]);
+    assert!(
+        out.status.success(),
+        "lina resume deveria registrar o pedido com sucesso; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // O contrato do agente: ele PEDE confirmação humana, NÃO des-pausa.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    assert!(
+        stdout.contains("confirmacao") || stdout.contains("nao des-pausa"),
+        "o agente deixa claro que só PEDE (gate humano); stdout={stdout}"
+    );
+
+    // PROVA FORTE: o caminho de resume do agente NÃO toca o event store (não cria events_dir) → não há
+    // como ele apendar CostCeilingResumed. (Robusto a mudanças internas de persistência do core.)
+    assert!(
+        !home.events_dir().exists(),
+        "lina resume NAO pode abrir/escrever o event store (so enfileira o pedido)"
+    );
+
+    // E o pedido foi registrado na fila de broker por-nó (origem autenticada no drain do app).
+    let node_dir = home
+        .path()
+        .join("broker")
+        .join("outbox")
+        .join("agente-desconhecido");
+    let count = std::fs::read_dir(&node_dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        count,
+        1,
+        "resume.request na fila de broker por-nó ({})",
+        node_dir.display()
+    );
+}
+
 /// Ação não custodiada via `lina do` é recusada (exit != 0) e não apenda evento.
 #[test]
 fn lina_do_unknown_action_is_rejected() {

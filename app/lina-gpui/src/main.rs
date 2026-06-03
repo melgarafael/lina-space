@@ -504,17 +504,31 @@ impl WorkspaceView {
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        // W3-6c (ADR 0004) — GATE HUMANO de custódia: ⌘⏎ APROVA o pedido custodiado pendente. É uma
-        // tecla NA JANELA do app: o PTY do agente não a sintetiza → confirmação inforjável (o broker
-        // só então busca o segredo do cofre e executa). NÃO vai para o terminal.
+        // W3-6c (ADR 0004) — GATE HUMANO na FRENTE da fila (custódia OU retomada do teto). Teclas NA
+        // JANELA do app: o PTY do agente não as sintetiza → inforjável. ⌘⏎ APROVA; ⌘⇧⏎ RECUSA/dispensa
+        // (saída p/ limpar flood/erro sem executar — hole 2). Confirma/recusa SÓ a frente. NÃO vai p/ o PTY.
         if ks.modifiers.platform && (ks.key == "enter" || ks.key == "return") {
-            let pending_id = lock(&self.desk).pending.as_ref().map(|p| p.id.clone());
-            match pending_id {
-                Some(id) => {
-                    lock(&self.desk).confirm_requested = Some(id);
-                    eprintln!("lina-gpui: GATE HUMANO — custódia confirmada na janela (⌘⏎)");
+            let front_id = lock(&self.desk).front().map(|p| p.id().to_string());
+            if ks.modifiers.shift {
+                match front_id {
+                    Some(id) => {
+                        lock(&self.desk).reject_requested = Some(id);
+                        eprintln!(
+                            "lina-gpui: GATE HUMANO — pedido da frente RECUSADO na janela (⌘⇧⏎)"
+                        );
+                    }
+                    None => eprintln!("lina-gpui: ⌘⇧⏎ sem pedido pendente (nada a recusar)"),
                 }
-                None => eprintln!("lina-gpui: ⌘⏎ sem custódia pendente (nada a confirmar)"),
+            } else {
+                match front_id {
+                    Some(id) => {
+                        lock(&self.desk).confirm_requested = Some(id);
+                        eprintln!(
+                            "lina-gpui: GATE HUMANO — pedido da frente confirmado na janela (⌘⏎)"
+                        );
+                    }
+                    None => eprintln!("lina-gpui: ⌘⏎ sem pedido pendente (nada a confirmar)"),
+                }
             }
             return;
         }
@@ -1027,11 +1041,11 @@ impl Render for WorkspaceView {
             );
         }
 
-        // W3-6c (ADR 0004) — BANNER DE CUSTÓDIA: o gate humano VISÍVEL na tela. Âmbar = pedido
-        // pendente aguardando ⌘⏎; senão, o último resultado da execução por alguns segundos.
+        // W3-6c (ADR 0004) — BANNER DO GATE HUMANO: VISÍVEL na tela. Âmbar = pedido na frente da fila
+        // aguardando ⌘⏎; senão, o último resultado da execução por alguns segundos.
         let (custody_banner, custody_pending) = {
             let d = lock(&self.desk);
-            (d.banner(), d.pending.is_some())
+            (d.banner(), d.front().is_some())
         };
         if let Some(banner) = custody_banner {
             let bg = if custody_pending { 0xe0af68 } else { 0x2c7a4b };
@@ -1162,6 +1176,8 @@ fn main() {
         let mut s = lock(&store);
         let _ = s.append(&DomainEvent::WorkspaceCreated {
             name: "walking-skeleton".into(),
+            // W4-5: o walking-skeleton não passa pela galeria de Foco → preset não-setado (`""`).
+            focus_preset: String::new(),
         });
         for (node, name, x, y) in [
             (node_a, "Terminal A", 30.0_f64, 96.0_f64),
@@ -1260,6 +1276,7 @@ fn main() {
         custody_vault,
         Arc::clone(&desk),
         Arc::clone(&model),
+        Arc::clone(&sup), // roster vivo: valida que a origem do pedido é um nó REAL (hole 3)
     )
     .spawn();
 

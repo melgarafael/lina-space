@@ -9,7 +9,7 @@
 //! (Claude Code, vim, …) aparecem corretas. O `SharedModel` só carrega metadados do nó
 //! (nome, status, posição), o pulso A2A e o contador de persistência.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,9 +24,9 @@ use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 
 use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
-    BrokerOutcome, BrokerRequest, BusEvent, CliProfile, DeliveryOutcome, DomainEvent, EventStore,
-    GridDelta, InjectPolicy, MailMessage, Mailbox, NodeStatus as CoreStatus, PtyCommand,
-    PtyManager, Recipient, RolePolicy, RouteOutcome, Router, Supervisor, VtBackend,
+    BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome, DomainEvent,
+    EventStore, GridDelta, InjectPolicy, MailMessage, Mailbox, NodeStatus as CoreStatus,
+    PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router, Supervisor, VtBackend,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
@@ -440,40 +440,116 @@ impl MailboxPump {
 // no cofre e executar. O agente NUNCA tem o token (vive só no [`SecretVault`]); sem confirmação
 // humana, não há caminho de execução — a custódia é o piso inquebrável.
 
-/// Um pedido custodiado aguardando o gate humano (projetado no banner da topbar).
+/// Um pedido aguardando o gate humano na FILA do [`CustodyDesk`]. Dois tipos passam pelo MESMO canal
+/// humano (⌘⏎ na janela): custódia de segredo (`lina do`) e retomada do teto de custo (`lina resume`).
+/// O `requester` é SEMPRE a ORIGEM AUTENTICADA (nome do dir-dono carimbado no drain por-nó), NUNCA o
+/// campo `from` do conteúdo (hole 3 — o banner não pode exibir um requester forjável).
 #[derive(Debug, Clone)]
-pub struct PendingCustody {
-    /// `id` da `MailMessage` do pedido (chave do gate).
-    pub id: String,
-    /// Ação custodiada (`deploy`/`pay`/`send`).
-    pub action: String,
-    /// Requisitante = origem AUTENTICADA (dir-dono carimbado pelo drain por-nó — A3).
-    pub requester: String,
-    /// Chave do segredo no cofre (ex.: `prod` para `deploy --env prod`).
-    pub secret_key: String,
-    /// Texto legível do banner ("🔒 … aguarda confirmação").
-    pub display: String,
+pub enum PendingGate {
+    /// `lina do <action>` — exige o segredo do cofre na execução (ADR 0004).
+    Custody {
+        id: String,
+        action: String,
+        secret_key: String,
+        requester: String,
+        display: String,
+    },
+    /// `lina resume` — o app aplica `CostCeilingResumed` SÓ após este gate (o agente não des-pausa).
+    Resume {
+        id: String,
+        requester: String,
+        display: String,
+    },
 }
 
-/// **Mesa de custódia compartilhada** entre a [`BrokerPump`] (produz o pendente + executa) e a UI
-/// (que confirma com TECLA na janela — um agente no PTY não consegue sintetizá-la). A UI nunca toca
-/// o cofre nem o broker: só sinaliza `confirm_requested`; quem executa é a pump (escritora única).
+impl PendingGate {
+    /// `id` da `MailMessage` de origem (chave do gate; casa com `confirm_requested`).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Custody { id, .. } | Self::Resume { id, .. } => id,
+        }
+    }
+    /// Texto legível do banner.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        match self {
+            Self::Custody { display, .. } | Self::Resume { display, .. } => display,
+        }
+    }
+    /// Origem AUTENTICADA (dir-dono). Exposto para teste/observabilidade do gate.
+    #[must_use]
+    pub fn requester(&self) -> &str {
+        match self {
+            Self::Custody { requester, .. } | Self::Resume { requester, .. } => requester,
+        }
+    }
+}
+
+/// **Teto de pedidos pendentes no gate humano** (hole 2 + DoS, Round 5b). Um humano tria poucos por
+/// vez; acima disto novos pedidos são RECUSADOS (sem `run_custody`, sem escrita durável) — limita
+/// memória, amplificação de log e o *burial* da fila por flood de um agente.
+pub const MAX_PENDING_GATES: usize = 32;
+
+/// **Teto de pedidos drenados por tick** da fila de broker (DoS, Round 5b — espelha o `MAX_DRAIN_BATCH`
+/// do core, que este drain por-nó não reusa). Limita syscalls/contenção de lock por tick sob flood.
+const MAX_BROKER_DRAIN: usize = 64;
+
+/// `true` se `id` é um id de mensagem SEGURO (`msg_` + `[A-Za-z0-9_-]`), espelhando o `valid_msg_id`
+/// do core (privado lá). Revalidado no drain do app porque um agente que escreve DIRETO no subdir
+/// controla o `id` do conteúdo (chave do gate/confirm) E o nome do arquivo (chave FIFO) — hole 2.
+fn valid_broker_id(id: &str) -> bool {
+    match id.strip_prefix("msg_") {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }
+        None => false,
+    }
+}
+
+/// **Mesa do gate humano compartilhada** entre a [`BrokerPump`] (enfileira o pendente + executa) e a
+/// UI (que confirma/recusa com TECLA na janela — um agente no PTY não consegue sintetizá-la). A UI
+/// nunca toca o cofre nem o broker: só sinaliza `confirm_requested`/`reject_requested`; quem executa
+/// é a pump (escritora única).
+///
+/// **Hole 2 (swap-antes-de-confirmar + flood):** os pendentes vivem numa FILA FIFO CAPEADA
+/// ([`MAX_PENDING_GATES`]) — um 2º pedido vai para o FIM, NUNCA sobrescreve a frente; acima do teto é
+/// recusado. O humano vê/confirma (⌘⏎) OU RECUSA (⌘⇧⏎) a frente; nada se perde por sobrescrita e um
+/// flood não enterra indefinidamente nem deixa o usuário sem saída (há dismiss).
 #[derive(Debug, Default)]
 pub struct CustodyDesk {
-    /// Pedido aguardando o gate humano. `None` = nada pendente.
-    pub pending: Option<PendingCustody>,
-    /// A UI sinalizou que o humano confirmou o pendente de `id`. A pump consome no próximo tick.
+    /// Fila FIFO de pedidos aguardando o gate humano (frente = o que o humano vê/confirma).
+    pub queue: VecDeque<PendingGate>,
+    /// A UI sinalizou que o humano CONFIRMOU o pedido da FRENTE (id). A pump consome no próximo tick.
     pub confirm_requested: Option<String>,
+    /// A UI sinalizou que o humano RECUSOU/dispensou o pedido da FRENTE (id) — sai da fila SEM executar.
+    pub reject_requested: Option<String>,
     /// Último resultado (banner efêmero pós-execução): texto + quando nasceu.
     pub last_result: Option<(String, Instant)>,
 }
 
 impl CustodyDesk {
-    /// Texto a exibir na topbar AGORA: o pendente (prioridade) ou o último resultado por ~6s.
+    /// O pedido na frente da fila (o que o humano vê/confirma), se houver.
+    #[must_use]
+    pub fn front(&self) -> Option<&PendingGate> {
+        self.queue.front()
+    }
+
+    /// Texto a exibir na topbar AGORA: a FRENTE da fila (com "(+N na fila)" se houver mais) ou, sem
+    /// pendentes, o último resultado por ~6s.
     #[must_use]
     pub fn banner(&self) -> Option<String> {
-        if let Some(p) = &self.pending {
-            return Some(p.display.clone());
+        if let Some(p) = self.queue.front() {
+            let extra = self.queue.len().saturating_sub(1);
+            let suffix = if extra > 0 {
+                format!("   (+{extra} na fila)")
+            } else {
+                String::new()
+            };
+            return Some(format!("{}{suffix}", p.display()));
         }
         match &self.last_result {
             Some((txt, born)) if born.elapsed() < Duration::from_secs(6) => Some(txt.clone()),
@@ -482,7 +558,7 @@ impl CustodyDesk {
     }
 }
 
-/// Handle compartilhado da mesa de custódia.
+/// Handle compartilhado da mesa do gate humano.
 pub type Desk = Arc<Mutex<CustodyDesk>>;
 
 /// Extrai a chave do segredo do payload do pedido (`--env <x>`); default `"default"` para ações
@@ -497,16 +573,53 @@ fn parse_secret_key(payload: &str) -> String {
     "default".to_string()
 }
 
+/// **Round 5c — sanitiza um valor ATACANTE-CONTROLÁVEL** (ex.: `--env <x>`) ANTES de exibi-lo no banner
+/// do gate. Achata controles/quebras de linha e os overrides de direção Unicode (RTL: LRE/RLE/PDF/LRO/
+/// RLO/LRI/RLI/FSI/PDI) + LS/PS → um agente não injeta linha falsa, texto de "aprovado" ou inversão de
+/// direção no que o humano LÊ; limita o tamanho. SÓ para exibição — o valor CRU segue sendo a chave de
+/// lookup no cofre (sanitizar a chave mudaria a busca).
+fn sanitize_for_banner(s: &str) -> String {
+    const MAX: usize = 48;
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            let bad = c.is_control()
+                || c == '\u{2028}'
+                || c == '\u{2029}'
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c);
+            if bad {
+                '·'
+            } else {
+                c
+            }
+        })
+        .take(MAX)
+        .collect();
+    if s.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
 /// **Observador da FILA DE BROKER (`<LINA_HOME>/broker/`).** Numa thread própria, drena os pedidos
-/// `broker.do`, dispara o gate humano e — só após confirmação na janela — chama [`run_custody`], que
-/// obtém o segredo do `vault` e executa. Genérico sobre o backend do cofre (`MockStore` na demo,
-/// `KeyringStore` em produção). Escritor único do estado de execução custodiada.
+/// privilegiados (`broker.do` = custódia; `resume.request` = retomada do teto), enfileira-os no gate
+/// humano e — só após confirmação na janela — executa: custódia chama [`run_custody`] (segredo do
+/// cofre), resume aplica `CostCeilingResumed`. Genérico sobre o backend do cofre. Escritor único do
+/// estado de execução do gate.
+///
+/// **Hole 3 (requester forjável):** drena SÓ os subdirs POR-NÓ ([`Self::drain_broker_authenticated`])
+/// — `from` = nome do dir-dono — E cruza essa origem com o ROSTER VIVO (`sup`): um subdir cujo nome
+/// não é um nó real (ex.: `@Admin` plantado) é REJEITADO. Arquivos FLAT no outbox também são rejeitados.
+/// Assim o banner só pode exibir o nome de um participante real, nunca um nome de autoridade inventado.
 pub struct BrokerPump<S: SecretStore> {
     mailbox: Mailbox,
     store: Arc<Mutex<EventStore>>,
     vault: SecretVault<S>,
     desk: Desk,
     model: Model,
+    /// Roster vivo — para validar que a origem autenticada (dir-dono) é um NÓ REAL (hole 3).
+    sup: Arc<Supervisor>,
 }
 
 impl<S: SecretStore + Send + 'static> BrokerPump<S> {
@@ -518,6 +631,7 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         vault: SecretVault<S>,
         desk: Desk,
         model: Model,
+        sup: Arc<Supervisor>,
     ) -> Self {
         Self {
             mailbox,
@@ -525,10 +639,11 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             vault,
             desk,
             model,
+            sup,
         }
     }
 
-    /// Sobe a thread que observa a fila de broker (gate humano + execução custodiada) a cada ~150 ms.
+    /// Sobe a thread que observa a fila de broker (gate humano + execução) a cada ~150 ms.
     pub fn spawn(mut self) -> JoinHandle<()> {
         thread::spawn(move || loop {
             self.tick();
@@ -537,33 +652,222 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
     }
 
     fn tick(&mut self) {
-        // (1) Confirmação humana sinalizada pela UI? → executa COM o segredo do cofre.
+        // (1) Recusa humana? → tira a FRENTE da fila SEM executar (dismiss; hole 2 — saída do flood).
+        let reject = lock(&self.desk).reject_requested.take();
+        if let Some(id) = reject {
+            self.reject_front(&id);
+        }
+        // (2) Confirmação humana? → executa a FRENTE da fila (se casar o id).
         let confirm = lock(&self.desk).confirm_requested.take();
         if let Some(id) = confirm {
             self.execute_confirmed(&id);
         }
-        // (2) Novos pedidos de broker (recuperável a crash via .inflight + ack).
-        let msgs = self.mailbox.drain_to_inflight().unwrap_or_else(|e| {
-            eprintln!("lina-gpui: broker pump nao drenou a fila (sera retentado): {e}");
-            Vec::new()
-        });
-        for m in msgs {
+        // (3) Novos pedidos — SÓ por-nó autenticado+roster, capeado por tick (flat/forja/flood barrados).
+        for m in self.drain_broker_authenticated() {
             self.handle_request(&m);
-            if let Err(e) = self.mailbox.ack_inflight(&m.id) {
-                eprintln!(
-                    "lina-gpui: broker pump falhou ao confirmar inflight {}: {e}",
-                    m.id
-                );
-            }
         }
     }
 
-    /// 1ª vista de um pedido `broker.do`: roda `run_custody(confirmed=false)` (ActionGated{ask} +
-    /// BrokerDenied{unconfirmed}; o cofre NEM é tocado) e SURFAÇA o banner do gate humano.
-    fn handle_request(&mut self, m: &MailMessage) {
-        if m.intent != "broker.do" {
-            return; // a fila é de broker; ignora ruído sem panicar (best-effort, VISÍVEL abaixo)
+    /// O humano RECUSOU a frente (⌘⇧⏎): tira-a da fila SEM executar (custódia não roda; resume não
+    /// des-pausa). Dá ao usuário uma saída para limpar um flood/erro sem disparar a ação (hole 2).
+    fn reject_front(&mut self, id: &str) {
+        let dismissed = {
+            let mut d = lock(&self.desk);
+            match d.queue.front() {
+                Some(p) if p.id() == id => d.queue.pop_front(),
+                _ => None,
+            }
+        };
+        let Some(pend) = dismissed else {
+            eprintln!("lina-gpui: recusa para {id} nao casa a frente da fila — ignorada");
+            return;
+        };
+        let banner = format!(
+            "🚫 pedido de {} RECUSADO no gate humano (nao executado)",
+            pend.requester()
+        );
+        eprintln!("lina-gpui: GATE — {banner}");
+        lock(&self.desk).last_result = Some((banner, Instant::now()));
+        lock(&self.model).touch();
+    }
+
+    /// **drain AUTENTICADO por-nó da fila de broker** (holes 2/3, Round 5c). Lê SÓ os `*.json` dos
+    /// subdirs por-nó (`outbox/<node>/`) e carimba `from` = nome CANÔNICO do roster (não a string crua
+    /// do dir — anti-spoof hole 3); a origem tem de RESOLVER a um nó real (roster-check). Ordena por
+    /// FAIR-SHARE round-robin ENTRE nós (anti front-running hole 2 — o id/filename é do agente), capeado
+    /// por tick ([`MAX_BROKER_DRAIN`]). Rejeita: arquivos FLAT, ids fora de `msg_<alnum>`, origens
+    /// fora do roster, não-regulares (anti-symlink), oversize. Consome (read-delete): o gate é
+    /// interativo; um crash antes da confirmação só faz o humano re-rodar (o registro do agente persiste).
+    fn drain_broker_authenticated(&self) -> Vec<MailMessage> {
+        let outbox = self.mailbox.outbox_dir();
+        let rd = match std::fs::read_dir(&outbox) {
+            Ok(rd) => rd,
+            Err(_) => return Vec::new(), // outbox ainda não existe → nada a drenar
+        };
+        let mut collected: Vec<(String, std::path::PathBuf)> = Vec::new(); // (node, json_path)
+        for entry in rd.flatten() {
+            let path = entry.path();
+            // FLAT (`*.json` no topo do outbox) NUNCA é legítimo na fila de broker (o CLI usa
+            // `enqueue_as` estrito). Só uma forja o planta → rejeita + remove + WARN, sem processar.
+            if path.is_file() {
+                if path.extension().is_some_and(|x| x == "json") {
+                    eprintln!(
+                        "lina-gpui: REJEITADO arquivo flat na fila de broker (possivel forja de origem): {}",
+                        path.display()
+                    );
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(node) = entry.file_name().to_str().map(str::to_owned) else {
+                continue; // nome não-UTF8 → não é nó legítimo
+            };
+            // Mesma validação do core (`valid_node_name`) via API pública: exclui `.inflight`/ocultos/
+            // traversal. Defense-in-depth contra um subdir com nome perigoso.
+            if self.mailbox.outbox_node_dir(&node).is_none() {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for f in files.flatten() {
+                    let fp = f.path();
+                    if fp.extension().is_some_and(|x| x == "json") {
+                        collected.push((node.clone(), fp));
+                    }
+                }
+            }
         }
+        // **Hole 2 (front-running) — Round 5c:** NÃO ordenar por nome de arquivo. O nome (`<id>.json`)
+        // é controlado pelo agente, e `valid_broker_id` aceita `msg_<alnum>` (sem exigir v7) — então um
+        // `msg_000000` plantado venceria qualquer id v7 (`msg_019…`) e enterraria o pedido legítimo de
+        // um colega. Em vez disso: FAIR-SHARE round-robin ENTRE nós (1 pedido de cada nó por rodada) —
+        // nenhum nó monopoliza a frente; o pedido de um colega nunca fica atrás do flood INTEIRO de outro.
+        // O teto MAX_BROKER_DRAIN é aplicado DURANTE o round-robin; o excedente fica no disco p/ o próximo.
+        let total = collected.len();
+        let mut by_node: BTreeMap<String, VecDeque<std::path::PathBuf>> = BTreeMap::new();
+        for (node, fp) in collected {
+            by_node.entry(node).or_default().push_back(fp);
+        }
+        // Ordem intra-nó: por nome de arquivo (um nó ordena os SEUS próprios pedidos — inofensivo).
+        for files in by_node.values_mut() {
+            let mut v: Vec<std::path::PathBuf> = files.drain(..).collect();
+            v.sort();
+            *files = v.into_iter().collect();
+        }
+        let mut collected: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let mut progressed = true;
+        while progressed && collected.len() < MAX_BROKER_DRAIN {
+            progressed = false;
+            for (node, files) in by_node.iter_mut() {
+                if collected.len() >= MAX_BROKER_DRAIN {
+                    break;
+                }
+                if let Some(fp) = files.pop_front() {
+                    collected.push((node.clone(), fp));
+                    progressed = true;
+                }
+            }
+        }
+        if total > collected.len() {
+            eprintln!(
+                "lina-gpui: broker drenando {} de {total} pedidos neste tick (teto MAX_BROKER_DRAIN, fair-share por no); o restante fica para o proximo",
+                collected.len()
+            );
+        }
+
+        let mut out = Vec::with_capacity(collected.len());
+        for (node, fp) in collected {
+            match std::fs::symlink_metadata(&fp) {
+                Ok(meta) if !meta.is_file() => {
+                    eprintln!(
+                        "lina-gpui: broker descartou entrada nao-regular (symlink?): {}",
+                        fp.display()
+                    );
+                    let _ = std::fs::remove_file(&fp);
+                    continue;
+                }
+                Ok(meta) if meta.len() > 256 * 1024 => {
+                    eprintln!(
+                        "lina-gpui: broker descartou mensagem oversize: {}",
+                        fp.display()
+                    );
+                    let _ = std::fs::remove_file(&fp);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => continue, // erro transiente: deixa p/ o próximo tick
+            }
+            let Ok(data) = std::fs::read_to_string(&fp) else {
+                continue;
+            };
+            let _ = std::fs::remove_file(&fp); // consumido (read-delete)
+            match serde_json::from_str::<MailMessage>(&data) {
+                Ok(mut msg) => {
+                    // Hole 2: revalida o `id` (chave do gate/confirm) — um agente que escreve direto no
+                    // subdir controla o conteúdo; um id fora de `msg_<alnum>` é descartado.
+                    if !valid_broker_id(&msg.id) {
+                        eprintln!(
+                            "lina-gpui: broker descartou pedido com id invalido {:?}",
+                            msg.id
+                        );
+                        continue;
+                    }
+                    // Hole 3 — ROSTER-CHECK + NOME CANÔNICO (Round 5c): a origem (dir-dono) tem de
+                    // RESOLVER a um NÓ REAL do roster vivo; um `@Admin`/`@CEO` inventado não resolve →
+                    // rejeitado. E o `from` exibido é o nome CANÔNICO do roster, NÃO a string crua do dir:
+                    // fecha o spoof por casing/espaço/`@`/Unicode (ex.: "  terminal a  " normaliza-colide
+                    // com "Terminal A" mas exibiria a string crua enganosa).
+                    let Some(node_id) = self.sup.node_by_name(&node) else {
+                        eprintln!(
+                            "lina-gpui: REJEITADO pedido de broker de origem {node:?} que NAO resolve a um no do roster (possivel forja de autoridade)"
+                        );
+                        continue;
+                    };
+                    let Some(canonical) = self.sup.get(node_id).map(|n| n.name) else {
+                        eprintln!(
+                            "lina-gpui: REJEITADO pedido de broker — no {node:?} sumiu do roster"
+                        );
+                        continue;
+                    };
+                    // ORIGEM AUTENTICADA = nome CANÔNICO do roster (vence o `from` de conteúdo E a string
+                    // crua do dir). (Residual: impersonar um nó REAL escrevendo no subdir DELE depende de
+                    // isolamento de cwd a nível de SO — fronteira do app, fora do MVP; ver entrega.)
+                    msg.from = canonical;
+                    out.push(msg);
+                }
+                Err(e) => eprintln!("lina-gpui: broker descartou mensagem ilegivel: {e}"),
+            }
+        }
+        out
+    }
+
+    /// 1ª vista de um pedido: ENFILEIRA no gate humano (FIFO, sem sobrescrever — hole 2). Custódia
+    /// também roda `run_custody(confirmed=false)` (ActionGated{ask}+BrokerDenied{unconfirmed}; o cofre
+    /// nem é tocado). O banner usa `m.from` = origem AUTENTICADA (hole 3).
+    fn handle_request(&mut self, m: &MailMessage) {
+        // DoS/hole 2: fila CHEIA → RECUSA novos pedidos SEM `run_custody` (sem escrita durável) nem
+        // push — bound de memória + amplificação de log + burial. Visível (nunca silencioso).
+        if lock(&self.desk).queue.len() >= MAX_PENDING_GATES {
+            eprintln!(
+                "lina-gpui: fila do gate humano CHEIA ({MAX_PENDING_GATES}) — pedido {} de {} RECUSADO (aprove/recuse os pendentes antes)",
+                m.id, m.from
+            );
+            return;
+        }
+        match m.intent.as_str() {
+            "broker.do" => self.enqueue_custody(m),
+            "resume.request" => self.enqueue_resume(m),
+            other => eprintln!(
+                "lina-gpui: intent {other:?} desconhecido na fila de broker (msg {}) — ignorado",
+                m.id
+            ),
+        }
+    }
+
+    /// Enfileira um pedido de custódia (`lina do`) após registrar o gate (run_custody sem confirmação).
+    fn enqueue_custody(&mut self, m: &MailMessage) {
         let Some(action) = m.ref_id.as_deref().and_then(|r| r.strip_prefix("do:")) else {
             eprintln!(
                 "lina-gpui: broker.do sem ref 'do:<action>' (msg {}) — ignorado",
@@ -579,67 +883,114 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             return;
         };
         let secret_key = parse_secret_key(&m.payload);
-        // requester = origem AUTENTICADA (o drain por-nó carimbou `from` = dir-dono).
         let req = BrokerRequest::new(custody, secret_key.clone(), m.from.clone());
 
         let outcome = {
             let mut store = lock(&self.store);
-            // O app NÃO auto-confirma: 1ª passada SEM confirmação → loga o gate e bloqueia (custódia).
             run_custody(&req, false, &self.vault, &mut store, |_| Ok(()))
         };
-
         match outcome {
             Ok(BrokerOutcome::DeniedUnconfirmed) => {
-                let pend = PendingCustody {
+                let pend = PendingGate::Custody {
                     id: m.id.clone(),
                     action: action.to_string(),
-                    requester: m.from.clone(),
-                    secret_key,
+                    // Fidelidade do gate (Round 5b): mostra o ALVO (`--env <x>`) ao humano — ele decide
+                    // vendo prod vs staging. O env é ATACANTE-CONTROLÁVEL → sanitizado p/ exibição (5c):
+                    // não injeta controle/RTL/"aprovado" no banner. A chave CRUA (vault) fica em `secret_key`.
                     display: format!(
-                        "🔒 CUSTODIA: '{}' pedido por {} — aprove com ⌘⏎ (o agente NAO tem o token)",
-                        custody.desc, m.from
+                        "🔒 CUSTODIA: '{}' [{}/{}] pedido por {} — ⌘⏎ aprova · ⌘⇧⏎ recusa (o agente NAO tem o token)",
+                        custody.desc,
+                        custody.scope,
+                        sanitize_for_banner(&secret_key),
+                        m.from
                     ),
+                    secret_key,
+                    requester: m.from.clone(), // AUTENTICADA
                 };
-                lock(&self.desk).pending = Some(pend);
+                lock(&self.desk).queue.push_back(pend);
                 lock(&self.model).touch();
                 eprintln!(
-                    "lina-gpui: CUSTODIA — '{action}' de {} aguarda gate humano (⌘⏎). msg {}",
+                    "lina-gpui: CUSTODIA — '{action}' de {} na fila do gate humano (⌘⏎). msg {}",
                     m.from, m.id
                 );
             }
             Ok(other) => {
-                eprintln!("lina-gpui: broker.do {action} 1a passada inesperada: {other:?}");
+                eprintln!("lina-gpui: broker.do {action} 1a passada inesperada: {other:?}")
             }
             Err(e) => eprintln!("lina-gpui: broker.do {action} falhou no gate: {e}"),
         }
     }
 
-    /// O humano confirmou (`id`): roda `run_custody(confirmed=true)` — o BROKER obtém o segredo do
-    /// cofre e executa (o agente nunca o teve). Marca o disco como PROVA observável e atualiza o banner.
-    fn execute_confirmed(&mut self, id: &str) {
-        let pend = lock(&self.desk).pending.clone();
-        let Some(pend) = pend.filter(|p| p.id == id) else {
-            eprintln!("lina-gpui: confirmacao para {id} sem pendente correspondente — ignorada");
-            return;
+    /// Enfileira um pedido de retomada do teto (`lina resume`). O agente NÃO des-pausa: só o gate humano
+    /// (⌘⏎) faz o app aplicar `CostCeilingResumed` (hole 1).
+    fn enqueue_resume(&mut self, m: &MailMessage) {
+        let pend = PendingGate::Resume {
+            id: m.id.clone(),
+            requester: m.from.clone(), // AUTENTICADA
+            display: format!(
+                "⏸ RETOMADA do teto pedida por {} — ⌘⏎ aprova · ⌘⇧⏎ recusa (o agente NAO des-pausa sozinho)",
+                m.from
+            ),
         };
-        let Some(custody) = lookup_action(&pend.action) else {
-            eprintln!(
-                "lina-gpui: pendente com acao invalida {:?} — abortado",
-                pend.action
-            );
-            lock(&self.desk).pending = None;
-            return;
-        };
-        let req = BrokerRequest::new(custody, pend.secret_key.clone(), pend.requester.clone());
-        let exec_root = self.mailbox.root().to_path_buf();
-        let action_name = pend.action.clone();
+        lock(&self.desk).queue.push_back(pend);
+        lock(&self.model).touch();
+        eprintln!(
+            "lina-gpui: RESUME — retomada do teto pedida por {} na fila do gate humano (⌘⏎). msg {}",
+            m.from, m.id
+        );
+    }
 
+    /// O humano confirmou (`id`): tira a FRENTE da fila (se casar o id) e executa conforme o tipo —
+    /// custódia (segredo do cofre + marcador) ou retomada (CostCeilingResumed se pausado).
+    fn execute_confirmed(&mut self, id: &str) {
+        // Só a FRENTE é confirmável (é o que o humano vê). Defensivo: confere o id.
+        let pend = {
+            let mut d = lock(&self.desk);
+            match d.queue.front() {
+                Some(p) if p.id() == id => d.queue.pop_front(),
+                _ => None,
+            }
+        };
+        let Some(pend) = pend else {
+            eprintln!("lina-gpui: confirmacao para {id} nao casa a frente da fila — ignorada");
+            return;
+        };
+        // Auditoria: registra a ORIGEM AUTENTICADA (dir-dono) do pedido confirmado — nunca um `from`
+        // de conteúdo forjável (hole 3).
+        eprintln!(
+            "lina-gpui: GATE confirmado — pedido {} de origem autenticada {}",
+            pend.id(),
+            pend.requester()
+        );
+        let banner = match pend {
+            PendingGate::Custody {
+                action,
+                secret_key,
+                requester,
+                ..
+            } => self.execute_custody(&action, &secret_key, &requester),
+            PendingGate::Resume { requester, .. } => self.execute_resume(&requester),
+        };
+        eprintln!("lina-gpui: GATE — {banner}");
+        {
+            let mut d = lock(&self.desk);
+            d.last_result = Some((banner, Instant::now()));
+        }
+        lock(&self.model).touch();
+    }
+
+    /// Executa a custódia confirmada: `run_custody(confirmed=true)` → o BROKER obtém o segredo do cofre
+    /// e age (o agente nunca o teve). Marcador no disco como PROVA observável (só o TAMANHO do segredo).
+    fn execute_custody(&self, action: &str, secret_key: &str, requester: &str) -> String {
+        let Some(custody) = lookup_action(action) else {
+            return format!("⛔ pendente com acao invalida {action:?} — abortado");
+        };
+        let req = BrokerRequest::new(custody, secret_key.to_string(), requester.to_string());
+        let exec_root = self.mailbox.root().to_path_buf();
+        let action_name = action.to_string();
         let outcome = {
             let mut store = lock(&self.store);
             run_custody(&req, true, &self.vault, &mut store, |secret| {
-                // MVP: a ação externa real (deploy a um alvo) está fora do escopo; a PROVA é que o
-                // executor recebeu o segredo DO COFRE (o agente nunca o viu). Marca o disco com o
-                // TAMANHO do segredo (nunca o valor — invariante #2: o token jamais sai do cofre/executor).
                 let marker = exec_root.join(format!("executed-{action_name}.txt"));
                 std::fs::write(
                     &marker,
@@ -651,27 +1002,35 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
                 .map_err(|e| format!("escrever marcador de execucao: {e}"))
             })
         };
-
-        let banner = match outcome {
+        match outcome {
             Ok(BrokerOutcome::Executed) => format!(
-                "✅ '{}' executado pelo broker — segredo veio do cofre; o agente nunca o viu",
-                pend.action
+                "✅ '{action}' executado pelo broker — segredo veio do cofre; o agente nunca o viu"
             ),
             Ok(BrokerOutcome::DeniedNoSecret) => format!(
-                "⛔ '{}' bloqueado — segredo AUSENTE do cofre (sem token, sem acao: custodia)",
-                pend.action
+                "⛔ '{action}' bloqueado — segredo AUSENTE do cofre (sem token, sem acao: custodia)"
             ),
-            Ok(other) => format!("'{}' resultado inesperado: {other:?}", pend.action),
-            Err(e) => format!("⛔ '{}' falhou na execucao: {e}", pend.action),
-        };
-        eprintln!("lina-gpui: CUSTODIA — {banner}");
-        {
-            let mut d = lock(&self.desk);
-            d.pending = None;
-            d.confirm_requested = None;
-            d.last_result = Some((banner, Instant::now()));
+            Ok(other) => format!("'{action}' resultado inesperado: {other:?}"),
+            Err(e) => format!("⛔ '{action}' falhou na execucao: {e}"),
         }
-        lock(&self.model).touch();
+    }
+
+    /// Executa a retomada confirmada (hole 1): reconstrói o ledger do store REAL do app e, SE pausado,
+    /// apenda `CostCeilingResumed`. O agente nunca chega aqui — só o gate humano dispara isto.
+    fn execute_resume(&self, requester: &str) -> String {
+        let mut store = lock(&self.store);
+        let ledger = match CostLedger::replay(&store, now_ms()) {
+            Ok(l) => l,
+            Err(e) => return format!("⛔ retomada falhou ao reconstruir o ledger: {e}"),
+        };
+        if !ledger.paused {
+            return format!("ℹ retomada de {requester}: o teto nao esta pausado (nada a retomar)");
+        }
+        match store.append(&DomainEvent::CostCeilingResumed { day: ledger.day }) {
+            Ok(_) => format!(
+                "✅ teto de custo RETOMADO (gate humano) a pedido de {requester} — nova janela contabil"
+            ),
+            Err(e) => format!("⛔ retomada falhou ao apendar CostCeilingResumed: {e}"),
+        }
     }
 }
 
@@ -1726,27 +2085,86 @@ mod tests {
         assert_eq!(parse_secret_key("--env"), "default"); // sem valor após a flag
     }
 
-    /// Fio 1: o banner prioriza o pendente; sem pendente, mostra o último resultado por uma janela.
+    /// Round 5c: o env exibido no banner é sanitizado — controles/quebras/RTL viram `·`; o valor cru
+    /// (usado p/ lookup no cofre) NÃO é tocado. Sem injeção de linha falsa/"aprovado" no que o humano lê.
     #[test]
-    fn custody_desk_banner_prioritizes_pending_then_shows_result() {
+    fn sanitize_for_banner_neutralizes_injection() {
+        assert_eq!(sanitize_for_banner("prod"), "prod", "valor benigno intacto");
+        // Newline + texto de "aprovado" + override RTL → achatados.
+        let evil = "prod\n✅ APROVADO\u{202e}gnirts";
+        let s = sanitize_for_banner(evil);
+        assert!(!s.contains('\n'), "sem quebra de linha");
+        assert!(!s.contains('\u{202e}'), "sem override de direcao (RTL)");
+        // Tamanho limitado (sem banner gigante).
+        let long = "x".repeat(200);
+        assert!(sanitize_for_banner(&long).chars().count() <= 49);
+    }
+
+    /// Helper de teste: um pendente de custódia mínimo com `id`/`display`.
+    fn custody_pending(id: &str, display: &str) -> PendingGate {
+        PendingGate::Custody {
+            id: id.into(),
+            action: "deploy".into(),
+            secret_key: "prod".into(),
+            requester: "@Dev".into(),
+            display: display.into(),
+        }
+    }
+
+    /// Banner: a FRENTE da fila vence o último resultado; sem fila, mostra o resultado por uma janela.
+    #[test]
+    fn custody_desk_banner_prioritizes_front_then_shows_result() {
         let mut desk = CustodyDesk::default();
         assert!(desk.banner().is_none(), "vazio → sem banner");
 
         desk.last_result = Some(("✅ deploy executado".into(), Instant::now()));
         assert_eq!(desk.banner().as_deref(), Some("✅ deploy executado"));
 
-        desk.pending = Some(PendingCustody {
-            id: "msg_1".into(),
-            action: "deploy".into(),
-            requester: "@Dev".into(),
-            secret_key: "prod".into(),
-            display: "🔒 aguarda".into(),
-        });
+        desk.queue.push_back(custody_pending("msg_1", "🔒 aguarda"));
         assert_eq!(
             desk.banner().as_deref(),
             Some("🔒 aguarda"),
-            "o pendente vence o último resultado"
+            "a frente da fila vence o último resultado"
         );
+    }
+
+    /// **Hole 2 (swap-antes-de-confirmar):** um 2º pedido vai para o FIM da fila — NUNCA apaga a frente.
+    /// O banner segue mostrando o 1º (com "+1 na fila"); ao confirmar a frente, o 2º assume.
+    #[test]
+    fn custody_desk_queue_never_overwrites_front() {
+        let mut desk = CustodyDesk::default();
+        desk.queue
+            .push_back(custody_pending("msg_1", "🔒 primeiro"));
+        desk.queue.push_back(custody_pending("msg_2", "🔒 segundo"));
+
+        assert_eq!(
+            desk.queue.len(),
+            2,
+            "ambos os pedidos coexistem (sem sobrescrita)"
+        );
+        assert_eq!(
+            desk.front().map(|p| p.id()),
+            Some("msg_1"),
+            "a frente é o 1º"
+        );
+        let banner = desk.banner().expect("banner");
+        assert!(
+            banner.contains("primeiro"),
+            "o banner mostra o 1º, não o 2º"
+        );
+        assert!(
+            banner.contains("+1 na fila"),
+            "sinaliza que há mais um pendente"
+        );
+
+        // Confirma a frente (pop) → o 2º vira a frente; nada se perdeu.
+        desk.queue.pop_front();
+        assert_eq!(
+            desk.front().map(|p| p.id()),
+            Some("msg_2"),
+            "o 2º assume após o 1º sair"
+        );
+        assert!(desk.banner().unwrap().contains("segundo"));
     }
 
     /// Fio 3: `scrub_pty_secret_env` remove do env do processo as vars portadoras de segredo (que os
@@ -1765,6 +2183,15 @@ mod tests {
             std::env::var_os("LINA_DEPLOY_TOKEN").is_none(),
             "após o scrub, nenhum PTY filho herda o token (ele vive só no cofre)"
         );
+    }
+
+    /// Roster vivo com os nós `names` registrados (writer = sink) — para o roster-check do hole 3.
+    fn sup_with_nodes(names: &[&str]) -> Arc<Supervisor> {
+        let sup = Arc::new(Supervisor::new());
+        for n in names {
+            let _ = sup.register(*n, None, Box::new(std::io::sink()));
+        }
+        sup
     }
 
     /// **Fio 1 (headless, prova de custódia VIVA no app):** com o token SÓ no cofre, um `broker.do`
@@ -1800,14 +2227,21 @@ mod tests {
             vault,
             Arc::clone(&desk),
             Arc::clone(&model),
+            sup_with_nodes(&["@Dev"]), // @Dev é um nó real → passa o roster-check
         );
 
-        // (1) 1º tick: drena → run_custody(confirmed=false) → bloqueia + banner pendente.
+        // (1) 1º tick: drena → run_custody(confirmed=false) → bloqueia + enfileira no gate.
         pump.tick();
-        let pend = lock(&desk).pending.clone().expect("pendente após o pedido");
-        assert_eq!(pend.action, "deploy");
-        assert_eq!(pend.requester, "@Dev", "origem autenticada (A3)");
-        assert_eq!(pend.secret_key, "prod");
+        let (pend_id, pend_requester) = {
+            let d = lock(&desk);
+            let p = d.front().expect("pendente na frente após o pedido");
+            assert!(
+                matches!(p, PendingGate::Custody { action, secret_key, .. } if action == "deploy" && secret_key == "prod")
+            );
+            assert_eq!(p.requester(), "@Dev", "origem autenticada (A3)");
+            (p.id().to_string(), p.requester().to_string())
+        };
+        assert_eq!(pend_requester, "@Dev");
         let kinds_after_block: Vec<String> = lock(&store)
             .events()
             .expect("eventos")
@@ -1821,8 +2255,8 @@ mod tests {
             "sem confirmação NUNCA executa"
         );
 
-        // (2) Gate humano: a UI sinaliza a confirmação → 2º tick executa com o segredo do cofre.
-        lock(&desk).confirm_requested = Some(pend.id.clone());
+        // (2) Gate humano: a UI sinaliza a confirmação da frente → 2º tick executa com o segredo do cofre.
+        lock(&desk).confirm_requested = Some(pend_id);
         pump.tick();
 
         let events = lock(&store).events().expect("eventos");
@@ -1851,11 +2285,8 @@ mod tests {
             "o marcador não expõe o token"
         );
 
-        // O pendente foi limpo e o banner agora mostra o resultado efêmero.
-        assert!(
-            lock(&desk).pending.is_none(),
-            "pendente limpo após executar"
-        );
+        // O pendente saiu da fila e o banner agora mostra o resultado efêmero.
+        assert!(lock(&desk).front().is_none(), "fila vazia após executar");
         assert!(
             lock(&desk)
                 .banner()
@@ -1863,6 +2294,377 @@ mod tests {
             "banner de resultado visível"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Hole 1 (resume sem gate):** um `resume.request` na fila de broker NÃO des-pausa sozinho —
+    /// fica pendente; o estado segue `Paused` até a confirmação humana (⌘⏎), quando o app apenda
+    /// `CostCeilingResumed`. Prova que o agente, só pela fila, jamais retoma o teto.
+    #[test]
+    fn broker_pump_resume_requires_human_gate_to_unpause() {
+        let base = std::env::temp_dir().join(format!("lina-resumegate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("abrir store"),
+        ));
+        // Semeia o estado PAUSED (último evento de teto = CostCeilingHit).
+        lock(&store)
+            .append(&DomainEvent::CostCeilingHit {
+                day: "2026-06-02".into(),
+                tokens: 100,
+            })
+            .expect("semear pause");
+        assert!(
+            CostLedger::replay(&lock(&store), now_ms())
+                .expect("ledger")
+                .paused,
+            "pré-condição: workspace pausado"
+        );
+
+        let broker_mb = Mailbox::new(&broker_root);
+        let req =
+            MailMessage::new("@Dev", "broker", "resume.request", "").with_ref("resume:ceiling");
+        broker_mb.enqueue_as("@Dev", &req).expect("enqueue_as");
+
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            model,
+            sup_with_nodes(&["@Dev"]),
+        );
+
+        // 1º tick: o pedido só ENFILEIRA — NÃO des-pausa (o agente não pode retomar).
+        pump.tick();
+        let pend_id = {
+            let d = lock(&desk);
+            let p = d.front().expect("resume pendente");
+            assert!(matches!(p, PendingGate::Resume { .. }));
+            assert_eq!(p.requester(), "@Dev", "origem autenticada");
+            p.id().to_string()
+        };
+        assert!(
+            CostLedger::replay(&lock(&store), now_ms())
+                .expect("ledger")
+                .paused,
+            "APÓS o pedido do agente, o teto SEGUE pausado (sem gate humano)"
+        );
+        assert!(
+            lock(&store)
+                .events()
+                .expect("eventos")
+                .iter()
+                .all(|r| r.kind != "CostCeilingResumed"),
+            "nenhum CostCeilingResumed antes do gate humano"
+        );
+
+        // Gate humano: confirma a frente → o app apenda CostCeilingResumed e des-pausa.
+        lock(&desk).confirm_requested = Some(pend_id);
+        pump.tick();
+        assert!(
+            !CostLedger::replay(&lock(&store), now_ms())
+                .expect("ledger")
+                .paused,
+            "após o gate humano, o teto é retomado"
+        );
+        assert!(
+            lock(&store)
+                .events()
+                .expect("eventos")
+                .iter()
+                .any(|r| r.kind == "CostCeilingResumed"),
+            "CostCeilingResumed apendado SÓ após o gate humano"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Hole 3 (requester forjável) — 3 vetores barrados:** o drain (a) carimba `from` = dir-dono,
+    /// vencendo um `from` de conteúdo forjado; (b) REJEITA um arquivo FLAT plantado; e (c) — ROUND 5b —
+    /// REJEITA um subdir POR-NÓ plantado com nome de AUTORIDADE inventado (`@Admin`) que NÃO é um nó do
+    /// roster. Só a origem real (@Dev) entra; o banner nunca mostra um requester forjado.
+    #[test]
+    fn broker_drain_authenticates_origin_roster_and_rejects_forgeries() {
+        let base = std::env::temp_dir().join(format!("lina-authorigin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let broker_mb = Mailbox::new(&broker_root);
+
+        // (a) Pedido legítimo por-nó de @Dev (nó REAL), com `from` de CONTEÚDO forjado = @Admin.
+        let forged =
+            MailMessage::new("@Admin", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        broker_mb
+            .enqueue_as("@Dev", &forged)
+            .expect("enqueue_as @Dev");
+
+        // (b) Arquivo FLAT plantado direto no outbox (bypassa o CLI) — deve ser rejeitado.
+        let flat =
+            MailMessage::new("@Admin", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        std::fs::create_dir_all(broker_mb.outbox_dir()).expect("mkdir outbox");
+        std::fs::write(
+            broker_mb.outbox_dir().join(format!("{}.json", flat.id)),
+            serde_json::to_string(&flat).expect("ser"),
+        )
+        .expect("plantar flat");
+
+        // (c) Subdir POR-NÓ plantado com nome de autoridade INVENTADO @Admin (NÃO é nó do roster).
+        let planted =
+            MailMessage::new("@Admin", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        broker_mb
+            .enqueue_as("@Admin", &planted)
+            .expect("plantar subdir @Admin");
+
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        // Só @Dev é um nó REAL; @Admin NÃO está no roster.
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            model,
+            sup_with_nodes(&["@Dev"]),
+        );
+
+        pump.tick();
+
+        let d = lock(&desk);
+        assert_eq!(
+            d.queue.len(),
+            1,
+            "só o pedido do nó REAL @Dev entra; flat e subdir-@Admin-forjado são rejeitados"
+        );
+        let p = d.front().expect("pendente");
+        assert_eq!(
+            p.requester(),
+            "@Dev",
+            "a ORIGEM autenticada (dir @Dev, nó real) vence o `from` forjado @Admin"
+        );
+        assert!(
+            p.display().contains("@Dev") && !p.display().contains("@Admin"),
+            "o banner mostra a origem real, nunca um @Admin inventado"
+        );
+        drop(d);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Hole 2 / DoS (Round 5b):** a fila do gate é CAPEADA em [`MAX_PENDING_GATES`]; um flood de
+    /// pedidos (mesmo de um nó REAL) NÃO enterra indefinidamente — acima do teto, novos são recusados
+    /// SEM enfileirar nem escrever evento durável. A frente (1º pedido) é preservada.
+    #[test]
+    fn broker_queue_is_capped_against_flood() {
+        let base = std::env::temp_dir().join(format!("lina-flood-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let broker_mb = Mailbox::new(&broker_root);
+
+        // Um nó REAL (@Dev) faz FLOOD da própria fila com muito mais que o teto.
+        let flood = MAX_PENDING_GATES + 20;
+        for _ in 0..flood {
+            let m =
+                MailMessage::new("@Dev", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+            broker_mb.enqueue_as("@Dev", &m).expect("enqueue_as");
+        }
+
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            model,
+            sup_with_nodes(&["@Dev"]),
+        );
+
+        // Vários ticks (o drain é capeado por tick) — a fila NUNCA passa do teto.
+        for _ in 0..5 {
+            pump.tick();
+            assert!(
+                lock(&desk).queue.len() <= MAX_PENDING_GATES,
+                "a fila do gate nunca excede MAX_PENDING_GATES (anti-flood)"
+            );
+        }
+        assert_eq!(
+            lock(&desk).queue.len(),
+            MAX_PENDING_GATES,
+            "a fila satura no teto; o excedente é recusado sem enfileirar"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Hole 2 (dismiss):** o humano pode RECUSAR (⌘⇧⏎ → reject_requested) a frente — sai da fila SEM
+    /// executar (sem BrokerExecuted, sem marcador), dando saída a um flood/erro. O 2º assume.
+    #[test]
+    fn broker_reject_front_dismisses_without_executing() {
+        let base = std::env::temp_dir().join(format!("lina-reject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let broker_mb = Mailbox::new(&broker_root);
+        let m1 =
+            MailMessage::new("@Dev", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        let m2 =
+            MailMessage::new("@Dev", "broker", "broker.do", "--env staging").with_ref("do:deploy");
+        broker_mb.enqueue_as("@Dev", &m1).expect("enq1");
+        broker_mb.enqueue_as("@Dev", &m2).expect("enq2");
+
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            model,
+            sup_with_nodes(&["@Dev"]),
+        );
+
+        pump.tick(); // enfileira os 2 (FIFO: m1 frente, m2 atrás)
+        let front_id = lock(&desk).front().expect("frente").id().to_string();
+
+        // RECUSA a frente.
+        lock(&desk).reject_requested = Some(front_id.clone());
+        pump.tick();
+
+        // m1 saiu SEM executar; m2 assumiu a frente; nenhum BrokerExecuted.
+        let d = lock(&desk);
+        assert_eq!(d.queue.len(), 1, "a frente recusada saiu; resta o 2º");
+        assert_ne!(d.front().unwrap().id(), front_id, "o 2º assumiu");
+        // O resultado "recusado" foi registrado (last_result); o banner agora mostra o 2º (a frente).
+        assert!(
+            d.last_result
+                .as_ref()
+                .is_some_and(|(t, _)| t.to_lowercase().contains("recusado")),
+            "o resultado da recusa foi registrado"
+        );
+        assert!(
+            d.banner().unwrap().contains("CUSTODIA"),
+            "o banner agora mostra o 2º pedido (a nova frente)"
+        );
+        drop(d);
+        assert!(
+            lock(&store)
+                .events()
+                .expect("eventos")
+                .iter()
+                .all(|r| r.kind != "BrokerExecuted"),
+            "recusar NUNCA executa"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Hole 2 (front-running) — Round 5c:** um nó @Evil enche a fila com ids BAIXOS (`msg_000000…`)
+    /// que venceriam qualquer id v7 numa ordenação por nome de arquivo; o FAIR-SHARE round-robin
+    /// garante que o pedido legítimo de @Dev NÃO fica atrás do flood inteiro — está na 1ª rodada.
+    #[test]
+    fn broker_drain_round_robin_prevents_front_run_burial() {
+        let base = std::env::temp_dir().join(format!("lina-rr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let broker_mb = Mailbox::new(&broker_root);
+
+        // @Evil planta 8 pedidos com ids baixos (venceriam por nome de arquivo um id v7).
+        for i in 0..8 {
+            let mut m =
+                MailMessage::new("x", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+            m.id = format!("msg_{i:06}"); // id baixo, válido (msg_<alnum>)
+            broker_mb.enqueue_as("@Evil", &m).expect("enqueue_as @Evil");
+        }
+        // @Dev faz 1 pedido legítimo (id v7 alto, nasce depois — perderia numa ordenação por nome).
+        let dev =
+            MailMessage::new("@Dev", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        broker_mb.enqueue_as("@Dev", &dev).expect("enqueue_as @Dev");
+
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            model,
+            sup_with_nodes(&["@Evil", "@Dev"]),
+        );
+
+        pump.tick();
+
+        let d = lock(&desk);
+        let pos = d
+            .queue
+            .iter()
+            .position(|p| p.requester() == "@Dev")
+            .expect("@Dev na fila");
+        assert!(
+            pos <= 1,
+            "fair-share: @Dev na 1a rodada (pos {pos}), nao enterrado atras do flood de 8 do @Evil"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Hole 3 (spoof por casing/espaço) — Round 5c:** um subdir cujo nome só NORMALIZA-colide com um
+    /// nó real ("  terminal a  " vs "Terminal A") resolve ao nó, mas o banner mostra o nome CANÔNICO do
+    /// roster — nunca a string crua enganosa.
+    #[test]
+    fn broker_drain_uses_canonical_roster_name_not_raw_dir() {
+        let base = std::env::temp_dir().join(format!("lina-canon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let broker_mb = Mailbox::new(&broker_root);
+
+        // Subdir com casing/espaço enganosos que normaliza-colide com "Terminal A".
+        let m = MailMessage::new("x", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        broker_mb
+            .enqueue_as("  terminal a  ", &m)
+            .expect("enqueue_as spoof");
+
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            model,
+            sup_with_nodes(&["Terminal A"]),
+        );
+
+        pump.tick();
+
+        let d = lock(&desk);
+        let p = d.front().expect("pendente");
+        assert_eq!(
+            p.requester(),
+            "Terminal A",
+            "nome CANONICO do roster, nao a string crua '  terminal a  '"
+        );
+        assert!(
+            p.display().contains("Terminal A") && !p.display().contains("terminal a"),
+            "o banner mostra o canonico, nunca a variante crua enganosa"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

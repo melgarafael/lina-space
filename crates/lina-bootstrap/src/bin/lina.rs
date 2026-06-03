@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use lina_bootstrap::{autonomy_from_env, pretooluse_output, BootstrapInput, Bootstrapper};
 use lina_core::{
-    check_action, lookup_action, now_ms, parse_autonomy, CostLedger, DomainEvent, EventStore,
-    MailMessage, Mailbox, CLASS_GATED_HARD_EXTERNAL,
+    check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, MailMessage, Mailbox,
+    CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume --confirm   (W3-7c: retoma o workspace pausado pelo teto de custo; gate humano)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume --confirm: tira do estado Paused apos teto de custo; sem --confirm, nao faz nada)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -61,9 +61,12 @@ fn broker_mailbox_root() -> PathBuf {
     mailbox_root().join("broker")
 }
 
-/// **W3-6c A3 — enfileira no outbox POR-NÓ** (`enqueue_as`): cada PTY escreve no SEU subdir e o
-/// supervisor atribui `from` = dir-dono (origem inforjável). Fallback VISÍVEL (nunca silencioso) ao
-/// outbox flat se o nome do nó não for um subdir seguro — A3 degradado, mas o A2A não quebra.
+/// **W3-6c A3 — enfileira no outbox POR-NÓ** (`enqueue_as`) para o A2A (`lina ask`): cada PTY escreve
+/// no SEU subdir e o supervisor atribui `from` = dir-dono (origem inforjável). Fallback VISÍVEL (nunca
+/// silencioso) ao outbox flat se o nome do nó não for um subdir seguro — A3 degradado, mas o A2A não
+/// quebra (o router tem seus próprios guardrails). **NÃO usar na fila de broker:** lá o `from` decide o
+/// que o humano lê no gate, então `lina do`/`lina resume` usam `enqueue_as` ESTRITO (sem fallback flat —
+/// hole 3); um fallback flat reabriria a forja do requester.
 fn enqueue_per_node(mailbox: &Mailbox, node: &str, msg: &MailMessage) -> std::io::Result<()> {
     match mailbox.enqueue_as(node, msg) {
         Ok(()) => Ok(()),
@@ -385,42 +388,36 @@ fn run_pretooluse() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `lina resume --confirm` (W3-7c, §2.2) — **GATE humano de retomada do teto de custo.** Sem
-/// `--confirm`, não faz nada (a retomada exige confirmação explícita — invariante #6: estado salvo,
-/// humano decide). Com `--confirm`: se o workspace está `Paused` (CostLedger reconstruído do log),
-/// apenda `CostCeilingResumed` (sai de Paused + abre nova janela contábil). Se não está pausado, é
-/// no-op informativo. Mesmo event store que o supervisor projeta (invariante #4).
-fn run_resume(args: &[String]) -> ExitCode {
-    if !args.iter().any(|a| a == "--confirm") {
-        eprintln!("lina: resume exige --confirm (gate humano de retomada do teto de custo)");
-        usage();
-        return ExitCode::from(2);
-    }
-    let mut store = match EventStore::open(events_dir()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("lina: falha ao abrir o event store: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let ledger = match CostLedger::replay(&store, now_ms()) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("lina: falha ao reconstruir o ledger de custo: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    if !ledger.paused {
-        println!("ok: workspace nao esta pausado (nada a retomar)");
-        return ExitCode::SUCCESS;
-    }
-    match store.append(&DomainEvent::CostCeilingResumed { day: ledger.day }) {
-        Ok(_) => {
-            println!("ok: workspace retomado (teto de custo liberado; nova janela contabil)");
+/// `lina resume` (W3-7c · ROUND 5 hole 1) — **pedido de retomada do teto; o AGENTE NÃO des-pausa.**
+///
+/// O furo anterior: o agente rodava `lina resume --confirm` e apendava `CostCeilingResumed` DIRETO no
+/// store — anulava o teto como gate (auto-retomada). FIX (igual à custódia, ADR 0004): o agente só
+/// **REGISTRA** um intent `resume.request` na FILA DE BROKER por-nó (origem autenticada); o SUPERVISOR
+/// no app aplica `CostCeilingResumed` **SÓ após confirmação no canal humano** (⌘⏎ na janela). Este bin
+/// **nunca** apenda `CostCeilingResumed`. `--confirm` é aceito por retrocompat, mas é no-op (a
+/// confirmação real é a tecla na janela — inforjável pelo PTY do agente).
+fn run_resume(_args: &[String]) -> ExitCode {
+    // Origem autenticada pela fila por-nó (não o campo `from`): o requester vem do dir-dono no drain.
+    let from = load_input()
+        .map(|i| i.terminal_name)
+        .unwrap_or_else(|_| "agente-desconhecido".to_string());
+
+    let msg = MailMessage::new(&from, "broker", "resume.request", "").with_ref("resume:ceiling");
+    let mailbox = Mailbox::new(broker_mailbox_root());
+    // ESTRITO (sem fallback flat — hole 3): pedido privilegiado só entra por origem autenticada.
+    match mailbox.enqueue_as(&from, &msg) {
+        Ok(()) => {
+            println!(
+                "pedido de retomada do teto registrado (msg {}). O agente NAO des-pausa: requer",
+                msg.id
+            );
+            println!("confirmacao HUMANA na janela do Lina (Cmd+Enter). So entao o supervisor retoma o teto.");
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("lina: falha ao apendar CostCeilingResumed: {e}");
+            eprintln!(
+                "lina: falha ao registrar o pedido de retomada (origem '{from}' precisa ser um no valido): {e}"
+            );
             ExitCode::from(1)
         }
     }
@@ -489,13 +486,17 @@ fn run_do(args: &[String]) -> ExitCode {
 
     // (4) Registra o pedido na FILA DE BROKER dedicada (`<LINA_HOME>/broker/`), NÃO no outbox A2A: é
     //     uma mensagem de controle para o supervisor (gate humano + `run_custody` com o segredo do
-    //     cofre), não uma entrega a um colega. `enqueue_as` (A3): a origem (dir-dono) autentica o
-    //     `requester`, mesmo que o campo `from` seja forjado.
+    //     cofre), não uma entrega a um colega. **`enqueue_as` ESTRITO (sem fallback flat — hole 3):** a
+    //     origem (dir-dono) autentica o `requester`; um fallback flat reabriria a forja do campo `from`
+    //     que o humano lê no gate. Nome de nó inválido → erro duro (o pedido privilegiado NÃO entra por
+    //     canal forjável).
     let msg = MailMessage::new(&requester, "broker", "broker.do", rest.join(" "))
         .with_ref(format!("do:{action}"));
     let mailbox = Mailbox::new(broker_mailbox_root());
-    if let Err(e) = enqueue_per_node(&mailbox, &requester, &msg) {
-        eprintln!("lina: falha ao registrar o pedido custodiado na fila de broker: {e}");
+    if let Err(e) = mailbox.enqueue_as(&requester, &msg) {
+        eprintln!(
+            "lina: falha ao registrar o pedido custodiado na fila de broker (origem '{requester}' precisa ser um no valido): {e}"
+        );
         return ExitCode::from(1);
     }
 
