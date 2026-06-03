@@ -258,6 +258,84 @@ fn is_gated_hard(lower: &str, tokens: &[&str]) -> bool {
     {
         return true;
     }
+    // 8) FIX #19 (backlog): destrutivos INEQUÍVOCOS sem uso legítimo comum num workspace (formatar FS,
+    //    sobrescrever block-device, secure-erase, `find -delete`). Conservador por desenho — NÃO inclui
+    //    `chmod -R`/`aws`/`docker` (têm uso legítimo → seriam falso-positivo).
+    if is_unconditional_destructive(tokens) {
+        return true;
+    }
+    false
+}
+
+/// Prefixos de BLOCK-DEVICE reais — escrever neles SOBRESCREVE o disco cru. Whitelist conservadora: o
+/// que NÃO está aqui (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/stdout`, …) é tratado como SEGURO,
+/// evitando falso-positivo nos redirects comuns (`2>/dev/null`, `dd if=/dev/zero of=img`).
+const BLOCK_DEVICE_PREFIXES: &[&str] = &[
+    "/dev/sd",
+    "/dev/hd",
+    "/dev/vd",
+    "/dev/xvd",
+    "/dev/nvme",
+    "/dev/disk",
+    "/dev/mmcblk",
+    "/dev/loop",
+];
+
+/// FIX #19: comandos destrutivos INEQUÍVOCOS (sem contraparte benigna frequente num workspace de dev) —
+/// sempre `gated-hard`. Cobre só os 4 grupos onde gatear NÃO treina o humano a clicar "sim" no
+/// automático: secure-erase (`shred`), formatar FS (`mkfs`/`mkfs.*`), varredura-deleta (`find … -delete`)
+/// e escrita em block-device (`dd of=/dev/sdX`, `> /dev/sdX`). `chmod -R`/`aws`/`docker` ficam de FORA
+/// (uso legítimo); `kubectl`/`terraform` já são tratados por [`HARD_TOOL_VERBS`].
+fn is_unconditional_destructive(tokens: &[&str]) -> bool {
+    // (a) `shred` — secure-erase/overwrite; sem uso rotineiro benigno.
+    if tokens.contains(&"shred") {
+        return true;
+    }
+    // (b) `mkfs`/`mkfs.<fs>` — cria filesystem = FORMATA (apaga tudo do alvo).
+    if tokens
+        .iter()
+        .any(|t| *t == "mkfs" || t.starts_with("mkfs."))
+    {
+        return true;
+    }
+    // (c) `find … -delete` — varre e apaga recursivamente (a ação `-delete` é o gatilho).
+    if tokens.contains(&"find") && tokens.contains(&"-delete") {
+        return true;
+    }
+    // (d) escrita em BLOCK-DEVICE real (`dd of=/dev/sdX` ou redirect `> /dev/sdX`). LER de device
+    //     (`if=/dev/sdX`, `< /dev/sdX`) NÃO conta.
+    writes_to_block_device(tokens)
+}
+
+/// `true` se algum token ESCREVE num block-device real: saída do `dd` (`of=/dev/sdX`) ou redirect de
+/// saída (`>`/`>>`/`&>`, colado ou separado) para `/dev/sdX`. Conservador: só os [`BLOCK_DEVICE_PREFIXES`]
+/// disparam — pseudo-devices (`/dev/null|zero|random|…`) e arquivos comuns seguem allow.
+fn writes_to_block_device(tokens: &[&str]) -> bool {
+    let is_block = |p: &str| BLOCK_DEVICE_PREFIXES.iter().any(|d| p.starts_with(d));
+    let mut prev_is_redirect = false;
+    for t in tokens {
+        // `of=/dev/sdX` (saída do dd). `if=` (entrada) é LEITURA → ignorado.
+        if let Some(dest) = t.strip_prefix("of=") {
+            if is_block(dest) {
+                return true;
+            }
+        }
+        // redirect COLADO: `>/dev/sdX`, `>>/dev/sdX`, `&>/dev/sdX`.
+        let glued = t
+            .strip_prefix("&>")
+            .or_else(|| t.strip_prefix(">>"))
+            .or_else(|| t.strip_prefix('>'));
+        if let Some(dest) = glued {
+            if !dest.is_empty() && is_block(dest) {
+                return true;
+            }
+        }
+        // redirect SEPARADO: o token anterior era `>`/`>>`/`&>` e este é o device.
+        if prev_is_redirect && is_block(t) {
+            return true;
+        }
+        prev_is_redirect = matches!(*t, ">" | ">>" | "&>");
+    }
     false
 }
 
@@ -813,5 +891,59 @@ mod tests {
             classify("git add . && git push --force origin main"),
             ActionClass::GatedHard
         );
+    }
+
+    // ════════════ FIX #19 (backlog): destrutivos INEQUÍVOCOS no gate ════════════
+
+    /// FIX #19 — destrutivos sem uso legítimo comum → `gated-hard` (ask em TODO nível, incl. autônomo).
+    #[test]
+    fn fix19_unconditional_destructive_is_gated_hard() {
+        for cmd in [
+            // escrita em block-device (dd / redirect)
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=backup.img of=/dev/nvme0n1 bs=4M",
+            "cat ubuntu.iso > /dev/sdb",
+            "echo x >> /dev/sdb",
+            // formatar filesystem
+            "mkfs.ext4 /dev/sdb1",
+            "mkfs -t xfs /dev/sdb",
+            // secure-erase
+            "shred -u segredo.txt",
+            "shred -n 3 -z disco",
+            // varredura-deleta
+            "find . -delete",
+            "find /tmp -name '*.log' -delete",
+        ] {
+            assert_eq!(classify(cmd), ActionClass::GatedHard, "{cmd}");
+            assert!(ask_in_autonomous(cmd), "{cmd} deve ser ask até em autônomo");
+        }
+    }
+
+    /// FIX #19 — CONSERVADOR: comandos com uso legítimo NÃO viram falso-positivo (seguem allow).
+    #[test]
+    fn fix19_legit_commands_have_no_false_positive() {
+        for cmd in [
+            "cargo test",
+            "chmod -R ./build", // a story pede EXPLICITAMENTE não gatear chmod -R
+            "chmod -R 755 dist",
+            "aws s3 ls",                                  // nem aws
+            "docker ps",                                  // nem docker
+            "find . -name '*.tmp'",                       // find SEM -delete
+            "dd if=/dev/zero of=test.img bs=1M count=10", // of= é ARQUIVO, não device
+            "echo log >> app.log",                        // redirect p/ arquivo comum
+            "cat data > /dev/null",                       // pseudo-device seguro
+            "grep -r erro 2>/dev/null",                   // 2>/dev/null comum
+        ] {
+            assert_eq!(
+                classify(cmd),
+                ActionClass::Routine,
+                "{cmd} NÃO deve ser gated (falso-positivo treina o humano a aprovar no automático)"
+            );
+            assert_eq!(
+                check_action(cmd, AutonomyLevel::Autonomous).decision,
+                Decision::Allow,
+                "{cmd}"
+            );
+        }
     }
 }
