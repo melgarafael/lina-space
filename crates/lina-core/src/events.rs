@@ -295,6 +295,26 @@ pub enum DomainEvent {
     /// W4-3 (freio do rodapé): a auto-orquestração foi RETOMADA → a fila de delegações represadas é
     /// drenada (roteada/entregue agora). META — par de [`DomainEvent::OrchestrationPaused`].
     OrchestrationResumed,
+    /// W5-4 (nó-Gatilho): um webhook foi CONFIGURADO — rota opaca (`hook_id` base32 não-enumerável)
+    /// ligada a um `target_ref` (endereço A2A do destino: nome de nó, `role:…` ou `*`). O **secret
+    /// HMAC NUNCA entra aqui**: vive no Secret Vault (W0-7) — o log é a fonte da config (rota+alvo), não
+    /// do segredo (invariante #2 "nada em claro no disco"). META — sem efeito na projeção do canvas; o
+    /// engine de webhooks reconstrói suas ligações varrendo o log (mesmo padrão do `CostLedger` §2.2).
+    WebhookConfigured {
+        hook_id: String,
+        target_ref: String,
+    },
+    /// W5-4 (nó-Gatilho): um POST externo VÁLIDO (HMAC conferido) chegou em `hook_id` e foi aceito (202).
+    /// `ts` = instante de RECEPÇÃO em millis, distinto do `ts` de persistência do `EventRecord` (o
+    /// processamento roda FORA do caminho da resposta — invariante "202 imediato, processa async"). É o
+    /// livro-razão do gatilho: prova observável de que o disparo externo entrou no sistema. META — o
+    /// efeito (mensagem ao alvo) é o `BusEvent::Message` no bus; aqui registra-se o FATO no log (fonte
+    /// da verdade, invariante #4). HMAC inválido NÃO chega a este evento (recusado com 401 sem publicar).
+    WebhookReceived {
+        hook_id: String,
+        ts: u64,
+        target_ref: String,
+    },
     SnapshotTaken {
         seq: u64,
     },
@@ -339,6 +359,8 @@ impl DomainEvent {
             DomainEvent::WorkspaceFocusSet { .. } => "WorkspaceFocusSet",
             DomainEvent::OrchestrationPaused => "OrchestrationPaused",
             DomainEvent::OrchestrationResumed => "OrchestrationResumed",
+            DomainEvent::WebhookConfigured { .. } => "WebhookConfigured",
+            DomainEvent::WebhookReceived { .. } => "WebhookReceived",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
         }
     }
@@ -558,6 +580,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // Router (escritor único), reconstruível do log — sem efeito na projeção do canvas.
         | DomainEvent::OrchestrationPaused
         | DomainEvent::OrchestrationResumed
+        // W5-4: config/recepção de webhook são META (livro-razão do nó-Gatilho); o engine de webhooks
+        // reconstrói suas ligações varrendo o log — sem efeito na projeção do canvas (padrão CostLedger).
+        | DomainEvent::WebhookConfigured { .. }
+        | DomainEvent::WebhookReceived { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }

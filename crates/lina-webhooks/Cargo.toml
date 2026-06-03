@@ -1,0 +1,27 @@
+[package]
+name = "lina-webhooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Eventos de domínio (WebhookConfigured/WebhookReceived), EventStore (fonte da verdade) e
+# Workspace Bus/Supervisor (publicação ao nó-alvo) — tudo via API pública do core.
+lina-core = { path = "../lina-core" }
+# W0-7: secret HMAC por hook vive no Secret Vault (keyring do SO) — nunca em claro no disco.
+lina-secrets = { path = "../lina-secrets" }
+thiserror.workspace = true
+tracing.workspace = true
+# Listener HTTP local do nó-Gatilho (bind SOMENTE em 127.0.0.1 — invariante #2 local-first).
+axum = "0.7"
+tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
+# Assinatura HMAC-SHA256 do corpo; `verify_slice` é comparação CONSTANT-TIME (via `subtle`).
+hmac = "0.12"
+sha2 = "0.10"
+# Entropia do SO para o `hook_id` base32 não-enumerável (mesma família que o lina-secrets).
+getrandom = "0.2"
+
+[dev-dependencies]
+# O teste de integração sobe o server numa porta efêmera e faz um POST HTTP cru pelo socket
+# (exatamente como o `curl` do critério de aceite) — sem cliente HTTP pesado.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }

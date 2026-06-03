@@ -20,6 +20,8 @@ rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 regex = "1.12.3"
+# W5-1: amostragem cross-platform de RSS do processo no benchmark de carga (bin bench_load).
+sysinfo = "0.33"
 lina-cli-profiles = { version = "0.0.1", path = "../lina-cli-profiles" }
 # W3-6c (ADR 0004): o broker `lina do` lê o segredo custodiado do SecretVault (W0-7). Sem ciclo:
 # lina-secrets depende só de thiserror/keyring/getrandom.

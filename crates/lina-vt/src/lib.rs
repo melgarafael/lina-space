@@ -211,7 +211,8 @@ impl EventListener for NullProxy {
 
 /// Dimensões do grid passadas a `Term::new`/`Term::resize`. Para o argumento de
 /// tamanho do alacritty, `total_lines == screen_lines` (o histórico de
-/// scrollback cresce internamente até `Config::scrolling_history`).
+/// scrollback cresce internamente até `Config::scrolling_history`, que o
+/// `AlacrittyBackend` fixa pelo **cap de scrollback** configurável — W5-2).
 #[derive(Clone, Copy)]
 struct GridSize {
     cols: usize,
@@ -230,6 +231,19 @@ impl Dimensions for GridSize {
     }
 }
 
+/// W5-2: cap **default provisório** de linhas de scrollback mantidas em RAM por painel.
+///
+/// É o teto do ring-buffer interno do alacritty (`Config::scrolling_history`): ao excedê-lo,
+/// as linhas mais ANTIGAS saem da RAM. O histórico além do cap NÃO se perde — é paginado em
+/// disco pelo `lina_core::scrollback` (invariante #6, "nada se perde num crash").
+///
+/// **Por que capar:** `(#painéis × scrollback)` sem teto é a classe de leak que estourou a RAM
+/// de Ghostty/Warp (~41 GB) sob output torrencial de CLI de IA. O cap fecha essa porta.
+///
+/// O valor (10_000) é **provisório**: o benchmark W5-1 calibra o número final. O entregável é o
+/// MECANISMO (cap configurável + paginação), não a constante.
+pub const DEFAULT_SCROLLBACK_CAP: usize = 10_000;
+
 /// Backend VT sobre `alacritty_terminal` 0.26 (parser `vte` 0.15 + grid + damage).
 pub struct AlacrittyBackend {
     term: Term<NullProxy>,
@@ -239,22 +253,45 @@ pub struct AlacrittyBackend {
     /// porque `Term::damage()` exige `&mut self`, enquanto a trait expõe
     /// `damaged_rows(&self)`.
     damage: BTreeSet<usize>,
+    /// W5-2: cap de linhas de scrollback mantidas em RAM (teto do ring-buffer do grid).
+    scrollback_cap: usize,
 }
 
 impl AlacrittyBackend {
-    /// Cria um backend com um grid de `cols x rows` (mínimo 1x1).
+    /// Cria um backend com um grid de `cols x rows` (mínimo 1x1) e o cap de scrollback
+    /// **default** ([`DEFAULT_SCROLLBACK_CAP`]).
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_scrollback_cap(cols, rows, DEFAULT_SCROLLBACK_CAP)
+    }
+
+    /// Como [`AlacrittyBackend::new`], mas com o **cap de scrollback** explícito (linhas/painel
+    /// mantidas em RAM — W5-2). `scrollback_cap` vira o `Config::scrolling_history` do alacritty:
+    /// o ring-buffer do grid descarta da RAM as linhas mais antigas além do cap (o excedente é
+    /// paginado em disco pelo core). Permite ao app/benchmark (W5-1) calibrar o teto por painel
+    /// sem recompilar o emulador.
+    pub fn with_scrollback_cap(cols: u16, rows: u16, scrollback_cap: usize) -> Self {
         let size = GridSize {
             cols: usize::from(cols.max(1)),
             rows: usize::from(rows.max(1)),
         };
-        let term = Term::new(Config::default(), &size, NullProxy);
+        let config = Config {
+            scrolling_history: scrollback_cap,
+            ..Config::default()
+        };
+        let term = Term::new(config, &size, NullProxy);
         Self {
             term,
             parser: Processor::new(),
             size,
             damage: BTreeSet::new(),
+            scrollback_cap,
         }
+    }
+
+    /// W5-2: cap de scrollback (linhas/painel mantidas em RAM) deste backend.
+    #[must_use]
+    pub fn scrollback_cap(&self) -> usize {
+        self.scrollback_cap
     }
 
     /// Acesso somente-leitura ao grid parseado — útil para consumidores internos
@@ -818,6 +855,47 @@ mod tests {
     fn backend_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<AlacrittyBackend>();
+    }
+
+    /// W5-2 (camada VT): o ring-buffer de scrollback do painel respeita o **cap
+    /// configurável** — despeja MUITO mais linhas que o cap e o histórico em RAM do
+    /// grid estabiliza no teto (não cresce monotonicamente). É a metade-VT do mecanismo
+    /// anti-leak: aqui o cap LIMITA a RAM; o excedente é paginado em disco pelo core.
+    #[test]
+    fn scrollback_ring_respects_configurable_cap() {
+        let cap = 100usize;
+        let mut b = AlacrittyBackend::with_scrollback_cap(20, 5, cap);
+        assert_eq!(
+            b.scrollback_cap(),
+            cap,
+            "cap exposto deve casar com o configurado"
+        );
+
+        // Despeja 5_000 linhas (50× o cap) — bem além do que cabe na janela viva.
+        for i in 0..5_000u32 {
+            b.advance(format!("linha {i}\r\n").as_bytes());
+        }
+
+        // O histórico de scrollback mantido em RAM pelo grid NUNCA passa do cap: o
+        // ring-buffer descarta as linhas mais antigas (teto de RAM respeitado).
+        let hist = b.grid().history_size();
+        assert!(
+            hist <= cap,
+            "history_size={hist} > cap={cap}: scrollback NÃO está capado em RAM"
+        );
+        // E está de fato CHEIO no cap (mantém uma janela real, não degenera p/ zero).
+        assert_eq!(
+            hist, cap,
+            "esperava o ring de scrollback cheio exatamente no cap"
+        );
+    }
+
+    /// W5-2: o construtor `new` usa o cap default documentado (provisório, calibrável
+    /// pelo benchmark W5-1) — o mecanismo é o entregável, não o número.
+    #[test]
+    fn new_uses_documented_default_scrollback_cap() {
+        let b = AlacrittyBackend::new(20, 5);
+        assert_eq!(b.scrollback_cap(), DEFAULT_SCROLLBACK_CAP);
     }
 
     // ───────────────────────────── Seleção de texto ─────────────────────────────

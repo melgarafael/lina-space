@@ -47,7 +47,7 @@ pub use cli_discovery::{
 mod a2a;
 pub use a2a::{
     build_paste, deliver_a2a, sanitize_paste, A2aError, DeliveryOutcome, EndDetector, EndOutcome,
-    EndResult, GridSense, InjectPolicy,
+    EndResult, GridSense, InjectPolicy, WorkspaceTrust,
 };
 
 /// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
@@ -80,6 +80,12 @@ pub use broker::{
     lookup_action, run_custody, BrokerError, BrokerOutcome, BrokerRequest, CustodyAction,
     CLASS_GATED_HARD_EXTERNAL, CUSTODY_ACTIONS,
 };
+
+pub mod bench;
+
+/// W5-2: scrollback com cap por painel + paginação em disco (SQLite WAL) — janela viva em RAM,
+/// histórico além do cap hidratado do disco sob demanda (anti-leak `#painéis × scrollback`).
+pub mod scrollback;
 
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///

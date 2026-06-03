@@ -154,7 +154,7 @@ pub enum DeliveryOutcome {
 /// prompt-injection agente↔agente). Default permissivo no MVP headless, mas presente.
 #[derive(Debug, Clone, Copy)]
 pub enum InjectPolicy<'a> {
-    /// Qualquer nó pode injetar em qualquer nó (default).
+    /// Qualquer nó pode injetar em qualquer nó (testes/headless; produção usa [`WorkspaceTrust`]).
     AllowAll,
     /// Só os pares `(from, target)` listados podem injetar.
     AllowOnly(&'a [(NodeId, NodeId)]),
@@ -172,9 +172,53 @@ impl InjectPolicy<'_> {
     }
 }
 
+/// Matriz de confiança de injeção A2A derivada da **topologia viva do Espaço** (invariante
+/// #5 — *pertencimento = conexão*). Segura os pares `(from, target)` confiados e produz uma
+/// [`InjectPolicy::AllowOnly`] emprestada. É o caminho de **produção** que LIGA o gancho de
+/// segurança: até W5-5 os call-sites do app passavam `InjectPolicy::AllowAll`, deixando a
+/// allow-list como dead code (qualquer agente injetava em qualquer agente).
+///
+/// **Default-deny.** Um par cujo `from` ou `target` não pertença ao Espaço (id
+/// desconhecido/forjado, ou de outro Espaço) nunca é gerado → [`InjectPolicy::allows`] o
+/// nega. O diálogo legítimo A→B→A não regride: ambos pertencem ao mesmo Espaço, logo `(A,B)`
+/// e `(B,A)` estão na lista.
+///
+/// É um tipo **owned** (segura o `Vec`) porque `InjectPolicy<'a>` *empresta* os pares;
+/// mantenha a `WorkspaceTrust` viva enquanto chama [`deliver_a2a`] com [`Self::policy`].
+#[derive(Debug, Clone)]
+pub struct WorkspaceTrust {
+    pairs: Vec<(NodeId, NodeId)>,
+}
+
+impl WorkspaceTrust {
+    /// Deriva a confiança dos `members` **vivos** do mesmo Espaço: todo par ordenado de nós
+    /// **distintos** `(from, target)` é confiado (injeção em si mesmo fica de fora). Um nó
+    /// fora de `members` não aparece em par algum → suas injeções são negadas (default-deny).
+    #[must_use]
+    pub fn from_members(members: &[NodeId]) -> Self {
+        let mut pairs = Vec::with_capacity(members.len().saturating_mul(members.len()));
+        for &from in members {
+            for &target in members {
+                if from != target {
+                    pairs.push((from, target));
+                }
+            }
+        }
+        Self { pairs }
+    }
+
+    /// A [`InjectPolicy`] emprestada para passar a [`deliver_a2a`]. `self` deve viver durante
+    /// a chamada (a política referencia os pares de dentro).
+    #[must_use]
+    pub fn policy(&self) -> InjectPolicy<'_> {
+        InjectPolicy::AllowOnly(&self.pairs)
+    }
+}
+
 /// **W0-9.** Entrega `text` de `from` ao terminal vivo `target`, faseado, pela fila
 /// serial do supervisor. `grid` é a leitura do grid do alvo (mode + prompt). `policy`
-/// é a allow-list (use `InjectPolicy::AllowAll` no MVP).
+/// é a allow-list; em produção derive-a da topologia viva com [`WorkspaceTrust`]
+/// (default-deny par fora do Espaço), reservando `InjectPolicy::AllowAll` a testes/headless.
 pub fn deliver_a2a(
     sup: &Supervisor,
     target: NodeId,
@@ -608,6 +652,101 @@ mod tests {
         );
         assert!(matches!(res, Err(A2aError::InjectionDenied { .. })));
         assert!(sup.applied_ops(target).is_empty());
+    }
+
+    // ---- W5-5: allow-list de produção (default-deny par fora do Espaço) ----
+
+    /// **W5-5 (allow-list real).** A confiança derivada da topologia viva permite o par do
+    /// MESMO Espaço (o diálogo A→B legítimo não regride) e NEGA, por construção, um `from`
+    /// que não pertence ao Espaço (id desconhecido/forjado) — default-deny.
+    #[test]
+    #[serial]
+    fn inject_policy_workspace_denies_foreign_pair() {
+        let sup = Supervisor::new();
+        let a = sup.register("@A", None, Box::new(std::io::sink()));
+        let b = sup.register("@B", None, Box::new(std::io::sink()));
+        // `outsider` existe no roster, mas NÃO pertence ao Espaço passado à confiança.
+        let outsider = sup.register("@Outsider", None, Box::new(std::io::sink()));
+        let g = grid("$ ", true);
+
+        // Matriz de confiança do Espaço {A, B} (outsider fora) — produz `AllowOnly(pares)`.
+        let trust = WorkspaceTrust::from_members(&[a, b]);
+
+        // O diálogo A↔B (mesmo Espaço) é confiado nos DOIS sentidos — o loop A→B→A não
+        // regride; o `outsider` é negado em qualquer sentido (default-deny).
+        let pol = trust.policy();
+        assert!(
+            pol.allows(a, b) && pol.allows(b, a),
+            "ambas as direções do diálogo A↔B devem ser confiadas (anti-regressão A→B→A)"
+        );
+        assert!(
+            !pol.allows(outsider, a) && !pol.allows(a, outsider),
+            "par com nó fora do Espaço é negado em qualquer sentido"
+        );
+
+        // (1) par do mesmo Espaço A→B: PASSA (anti-regressão do diálogo).
+        let ok = deliver_a2a(&sup, b, a, "oi", &idle_profile(), &g, trust.policy())
+            .expect("par do mesmo Espaço deve passar");
+        assert!(matches!(ok, DeliveryOutcome::Injected { .. }));
+
+        // (2) `from` fora do Espaço (outsider→A): NEGADO, nada escrito no master de A.
+        let denied = deliver_a2a(
+            &sup,
+            a,
+            outsider,
+            "payload",
+            &idle_profile(),
+            &g,
+            trust.policy(),
+        );
+        assert!(
+            matches!(denied, Err(A2aError::InjectionDenied { .. })),
+            "injeção de nó fora do Espaço deve ser negada (default-deny), obteve {denied:?}"
+        );
+        assert!(
+            sup.applied_ops(a).is_empty(),
+            "par negado não pode produzir nenhum write no master do alvo"
+        );
+    }
+
+    /// **W5-5 (CVE-2021-31701, regressão).** Um payload A2A contendo `ESC[201~` tem o
+    /// terminador REMOVIDO antes do write no master — o único `ESC[201~` que sobra é o do
+    /// wrapper de bracketed-paste. Trava a sanitização faseada de W0-9 contra regressão.
+    #[test]
+    #[serial]
+    fn a2a_sanitizes_bracket_terminator() {
+        let sup = Supervisor::new();
+        let a = sup.register("@A", None, Box::new(std::io::sink()));
+        let b = sup.register("@B", None, Box::new(std::io::sink()));
+        let g = grid("$ ", true); // alvo em BRACKETED_PASTE mode
+        let trust = WorkspaceTrust::from_members(&[a, b]);
+
+        // Payload hostil: tenta fechar a colagem e escapar (CVE-2021-31701).
+        let evil = "revise o diff\x1b[201~ rm -rf /";
+        deliver_a2a(&sup, b, a, evil, &idle_profile(), &g, trust.policy())
+            .expect("entrega A→B deve ocorrer");
+
+        // AgentText + Submit chegam ao master de B (a fila serial os aplica).
+        assert!(poll_until(Dur::from_secs(5), || sup.applied_ops(b).len() == 2));
+        let ops = sup.applied_ops(b);
+        let WriteOp::AgentText { bytes, .. } = &ops[0] else {
+            panic!("op[0] deveria ser AgentText, obteve {:?}", ops[0]);
+        };
+        // O `ESC[201~` do payload foi removido; só o terminador do wrapper sobra (exatamente 1).
+        let n_end = bytes
+            .windows(PASTE_END.len())
+            .filter(|w| *w == PASTE_END)
+            .count();
+        assert_eq!(
+            n_end, 1,
+            "o ESC[201~ do payload deve ser removido — só o do wrapper sobra"
+        );
+        assert!(
+            bytes.ends_with(PASTE_END),
+            "o único ESC[201~ é o terminador do wrapper, no fim"
+        );
+        // E nunca um CR no texto colado (terminal CR injection — o Enter é Submit separado).
+        assert!(!bytes.contains(&b'\r'), "o texto colado nunca carrega CR");
     }
 
     // ---- W0-10 ----

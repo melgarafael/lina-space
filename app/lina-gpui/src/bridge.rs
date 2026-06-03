@@ -27,9 +27,9 @@ use lina_role_discovery::RoleRegistry;
 use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
     BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome, DomainEvent,
-    EventStore, GridDelta, InjectPolicy, MailMessage, Mailbox, NodeStatus as CoreStatus,
-    PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor,
-    VtBackend,
+    EventStore, GridDelta, MailMessage, Mailbox, NodeStatus as CoreStatus, PtyCommand, PtyManager,
+    Recipient, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor, VtBackend,
+    WorkspaceTrust,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
@@ -44,6 +44,18 @@ pub const PULSE_MS: u64 = 1100;
 /// Recupera o guard mesmo se o mutex estiver envenenado (não propaga panic de um nó).
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// W5-5: os `NodeId` dos membros **vivos** do Espaço — a fonte de verdade dos pares de
+/// injeção confiados (invariante #5, *pertencimento = conexão*). A allow-list de produção
+/// ([`WorkspaceTrust`]) deriva daqui: um id fora deste roster vivo (desconhecido/forjado)
+/// não compõe par algum e, por construção, nunca recebe injeção (default-deny).
+fn live_member_ids(sup: &Supervisor) -> Vec<NodeId> {
+    sup.list()
+        .into_iter()
+        .filter(|n| n.status.is_alive())
+        .map(|n| n.id)
+        .collect()
 }
 
 /// Handle de grid compartilhado: a thread leitora o avança, o render lê o `screen()` e o
@@ -276,15 +288,10 @@ impl A2aTrigger {
             let env = A2aEnvelope::new(from, Recipient::Node(to), Some("a2a-demo".into()));
             let id = env.id.clone();
             let _targets = sup.route(&env, RolePolicy::All);
-            match deliver_a2a(
-                &sup,
-                to,
-                from,
-                &text,
-                &profile,
-                &grid_to,
-                InjectPolicy::AllowAll,
-            ) {
+            // W5-5: allow-list REAL — pares confiados = membros vivos do mesmo Espaço
+            // (default-deny par fora do Espaço); substitui o `InjectPolicy::AllowAll` (dead code).
+            let trust = WorkspaceTrust::from_members(&live_member_ids(&sup));
+            match deliver_a2a(&sup, to, from, &text, &profile, &grid_to, trust.policy()) {
                 Ok(DeliveryOutcome::Injected { .. } | DeliveryOutcome::SessionResume) => {}
                 Err(e) => eprintln!("lina-gpui: deliver_a2a falhou: {e}"),
             }
@@ -405,16 +412,11 @@ impl MailboxPump {
             let Some(g) = lock(&grids).get(&target).cloned() else {
                 return Err(format!("sem grid para o alvo {target}"));
             };
-            let out = deliver_a2a(
-                &sup,
-                target,
-                from,
-                text,
-                &profile,
-                &g,
-                InjectPolicy::AllowAll,
-            )
-            .map_err(|e| e.to_string())?;
+            // W5-5: allow-list REAL derivada da topologia viva a cada entrega (o roster muda);
+            // default-deny par fora do Espaço. Substitui o `InjectPolicy::AllowAll` (dead code).
+            let trust = WorkspaceTrust::from_members(&live_member_ids(&sup));
+            let out = deliver_a2a(&sup, target, from, text, &profile, &g, trust.policy())
+                .map_err(|e| e.to_string())?;
             // Pulso efêmero da entrega real (some sozinho via `Pulse::progress`).
             {
                 let mut m = lock(&model);
@@ -3106,6 +3108,8 @@ mod tests {
         let id = env.id.clone();
         let targets = sup.route(&env, RolePolicy::All);
         assert!(targets.contains(&node_b));
+        // W5-5: o gate de render exercita a allow-list REAL — A→B do mesmo Espaço passa.
+        let trust = WorkspaceTrust::from_members(&[node_a, node_b]);
         let out = deliver_a2a(
             &sup,
             node_b,
@@ -3113,7 +3117,7 @@ mod tests {
             "LINA_A2A_MARKER",
             &demo_profile(),
             &grid_b,
-            InjectPolicy::AllowAll,
+            trust.policy(),
         )
         .expect("deliver_a2a");
         assert!(matches!(out, DeliveryOutcome::Injected { .. }));
