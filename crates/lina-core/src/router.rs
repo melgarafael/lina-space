@@ -30,6 +30,14 @@ pub const FANOUT_GATE: usize = 3;
 /// W3-7b (ADR 0002): teto de tempo (ms) de um `await` sem reply antes de fechar por Timeout (sweep
 /// no `pump`). Default generoso — o reply é o caminho comum; o timeout só evita ticket órfão eterno.
 pub const AWAIT_TIMEOUT_MS: u64 = 300_000;
+/// W3-7 (§2.1, ajuste de COOPERAÇÃO): quantas vezes o MESMO salto `sender→target` pode reaparecer
+/// DENTRO de um ciclo do mesmo `root_cause_id` antes de ser cortado como loop APERTADO. O diálogo
+/// legítimo (A→B→A e algumas voltas) PASSA; só o ping-pong REPETIDO (A→B→A→B→A…) é barrado — antes
+/// o grafo bloqueava já na 1ª volta (`LoopDetected`), quebrando a resposta (cooperação só num sentido).
+/// Os backstops FINAIS do loop infinito continuam sendo `hops` (`MAX_DEPTH`) e o orçamento
+/// (`DELEGATION_BUDGET`); este corta o ciclo apertado um pouco antes. `2` = o salto pode repetir 2×
+/// num ciclo; a 3ª repetição que AINDA fecharia ciclo é `LoopDetected`.
+pub const MAX_CYCLE_REVISITS: u32 = 2;
 
 /// Nível de autonomia do workspace (espelho leve do `lina_bootstrap::Autonomy` — o core NÃO
 /// depende do bootstrap; o app traduz). Só `Manual` muda o roteamento (recusa delegação).
@@ -493,14 +501,18 @@ impl Router {
         }
 
         // ── Guardrail (§2.1): anti-loop por GRAFO DE EVENTOS handoff `from→to` filtrado pelo
-        //    `root_cause_id`. Pega A→B→A formado por mensagens NOVAS sob o mesmo root — que `hops`/
-        //    `trace` NÃO pegam (cada `MailMessage::new` zera ambos). Só ask/handoff a 1 alvo
+        //    `root_cause_id`. Pega o ping-pong A→B→A→B… formado por mensagens NOVAS sob o mesmo root —
+        //    que `hops`/`trace` NÃO pegam (cada `MailMessage::new` zera ambos). Só ask/handoff a 1 alvo
         //    (broadcast é gateado à parte). Topologia de eventos: independe do texto.
+        //    COOPERAÇÃO: o ida-e-volta do DIÁLOGO (A→B→A e algumas voltas) é legítimo e PASSA — o guard
+        //    só corta quando o MESMO salto se repete >= `MAX_CYCLE_REVISITS` vezes DENTRO de um ciclo
+        //    (ping-pong apertado/repetido). Antes bloqueava já na 1ª volta → a resposta nunca chegava.
+        //    Backstops finais do loop infinito: `hops` (`MAX_DEPTH`) + orçamento (`DELEGATION_BUDGET`).
         //    Um REPLY LEGÍTIMO (`is_legit_reply`: casou um ticket pendente) é a back-edge esperada
         //    da pergunta → pula o guard. `reply_to` forjado (sem ticket) NÃO pula (passa pelo guard).
         if is_deleg && !is_legit_reply && !matches!(recipient, Recipient::Broadcast) {
             if let Some(&target) = preview.first() {
-                match handoff_would_loop(store, &root, sender, target) {
+                match handoff_would_tight_loop(store, &root, sender, target, MAX_CYCLE_REVISITS) {
                     Ok(true) => {
                         log_block(store, msg, BlockReason::LoopDetected);
                         return RouteOutcome::LoopDetected;
@@ -952,20 +964,27 @@ fn routed_ids(store: &EventStore) -> HashSet<String> {
     ids
 }
 
-/// **§2.1: o grafo de handoffs FECHARIA UM CICLO?** Reconstrói as arestas `from→to_node` dos eventos
-/// `MessageRouted` do log com o MESMO `root_cause_id` e responde se `target` JÁ ALCANÇA `sender` —
-/// nesse caso adicionar `sender→target` fecha um ciclo (A→B→A por mensagens novas sob o mesmo turno).
-/// Identidades em `NodeId` (uniformes); independe do texto. Derivável do log (invariante #4).
+/// **§2.1 (ajuste de cooperação): o grafo de handoffs fecharia um ciclo APERTADO/REPETIDO?**
+/// Reconstrói as arestas `from→to_node` dos `MessageRouted` do log com o MESMO `root_cause_id` e
+/// responde `true` SE E SÓ SE adicionar `sender→target` (a) FECHA um ciclo (`target` JÁ ALCANÇA
+/// `sender`) **E** (b) esse MESMO salto `sender→target` já apareceu `>= max_revisits` vezes neste root
+/// (ping-pong, não diálogo). Assim o ida-e-volta legítimo (A→B→A, 1ª volta = `revisits` 0) e as
+/// cadeias que retornam UMA vez (A→B→C→A) PASSAM; só o loop repetido é cortado. O loop infinito segue
+/// barrado pelos backstops finais `hops`/`DELEGATION_BUDGET`. Identidades em `NodeId`; independe do
+/// texto. Derivável do log (invariante #4).
 ///
 /// # Errors
 /// Falha ao ler o event log.
-fn handoff_would_loop(
+fn handoff_would_tight_loop(
     store: &EventStore,
     root_cause_id: &str,
     sender: NodeId,
     target: NodeId,
+    max_revisits: u32,
 ) -> Result<bool, StoreError> {
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    // Quantas vezes o salto `sender→target` já foi roteado neste root (repetição do MESMO handoff).
+    let mut revisits: u32 = 0;
     for rec in store.events()? {
         if rec.kind != "MessageRouted" {
             continue;
@@ -989,10 +1008,15 @@ fn handoff_would_loop(
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<NodeId>().ok());
         if let (Some(f), Some(t)) = (from, to) {
+            if f == sender && t == target {
+                revisits = revisits.saturating_add(1);
+            }
             adj.entry(f).or_default().push(t);
         }
     }
-    Ok(reaches(&adj, target, sender))
+    // Loop APERTADO: o salto já se repetiu o bastante (b) E ele fecharia um ciclo (a). O diálogo
+    // (revisits < max) e o retorno único de uma cadeia mais longa passam; só o ping-pong é cortado.
+    Ok(revisits >= max_revisits && reaches(&adj, target, sender))
 }
 
 /// `true` se há um caminho `start → … → goal` no grafo dirigido `adj` (DFS, à prova de ciclos).
@@ -1020,7 +1044,7 @@ fn reaches(adj: &HashMap<NodeId, Vec<NodeId>>, start: NodeId, goal: NodeId) -> b
 
 /// **W3-7c (§2.2): teto de custo — agregador de uso por workspace/dia, EVENT-SOURCED.** Reconstrói
 /// o estado do teto varrendo o event log (invariante #4: o log é a fonte da verdade; nada de campo
-/// efêmero) — mesmo padrão do grafo anti-loop (`handoff_would_loop`). Não toca o `ProjectedState`:
+/// efêmero) — mesmo padrão do grafo anti-loop (`handoff_would_tight_loop`). Não toca o `ProjectedState`:
 /// o uso/teto são META do canvas, mas observáveis e replayáveis.
 ///
 /// **Janela contábil:** soma os `TokenUsageReported` apendados DEPOIS do último `CostCeilingResumed`
@@ -1870,9 +1894,12 @@ mod tests {
 
     // ───────────────────────── W3-7a: anti-loop de grafo / propagação / A6 ─────────────────────────
 
-    /// W1 + §2.1: A→B→A por mensagens NOVAS, CADA uma com `root_cause_id` FORJADO DISTINTO e hops=0
-    /// (o vetor que ANTES burlava o anti-loop) → o forjado é IGNORADO, o root vem do BINDING, o grafo
-    /// amarra a cadeia e o 2º salto (B→A) fecha o ciclo → `LoopDetected` + `RouteBlocked{loop_detected}`.
+    /// W1 + §2.1: ping-pong A→B→A→B… por mensagens NOVAS, CADA uma com `root_cause_id` FORJADO DISTINTO
+    /// e hops=0 (o vetor que ANTES burlava o anti-loop) → o forjado é IGNORADO, o root vem do BINDING,
+    /// o grafo amarra a cadeia sob o MESMO root real e o loop apertado é cortado no limite. Se a forja
+    /// FUNCIONASSE, cada msg viraria sua própria partição (root fresco) → nunca um ciclo → nunca
+    /// bloqueio: o corte no limite PROVA que o root forjado não deu voltas extras. (Após o ajuste de
+    /// cooperação, a 1ª volta A→B→A ENTREGA — diálogo; só a repetição além de `MAX_CYCLE_REVISITS` corta.)
     #[test]
     fn forged_root_does_not_bypass_loop_detection() {
         let (mut router, sup, dir) = router_with("loop");
@@ -1881,21 +1908,100 @@ mod tests {
         let mut ts = TmpStore::new("loop");
         let (_rec, mut deliver) = recorder();
 
-        // A→B (root forjado "fresh1", IGNORADO): origem → root real = id da msg; loga a aresta A→B.
-        let mut m1 = MailMessage::new("@A", "@B", "ask", "ida");
-        m1.root_cause_id = Some("fresh1".into());
-        assert!(matches!(
-            router.route_message(&m1, &mut ts.store, 1000, &mut deliver),
-            RouteOutcome::Delivered { .. }
-        ));
-
-        // B→A (root forjado DISTINTO "fresh2", IGNORADO): B herda o root de A (binding) → o grafo sob
-        // esse root tem A→B; adicionar B→A fecharia o ciclo → LoopDetected (forja não escapou).
-        let mut m2 = MailMessage::new("@B", "@A", "ask", "volta");
-        m2.root_cause_id = Some("fresh2".into());
+        // As voltas dentro do limite entregam — cada uma com um root FORJADO DISTINTO (todos IGNORADOS;
+        // o root real vem do binding, então o grafo NÃO fragmenta e o ciclo é amarrado).
+        let pingpong = [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")];
+        for (i, (from, to)) in pingpong.iter().enumerate() {
+            let mut m = MailMessage::new(*from, *to, "ask", "volta");
+            m.root_cause_id = Some(format!("forjado{i}")); // distinto e IGNORADO
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, 1000 + i as u64, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "volta {i} é diálogo (entrega) — forja de root não muda nada"
+            );
+        }
+        // 3ª repetição do salto A→B (root forjado mais uma vez) → o loop apertado é cortado mesmo assim.
+        let mut over = MailMessage::new("@A", "@B", "ask", "volta demais");
+        over.root_cause_id = Some("forjado_final".into());
         assert_eq!(
-            router.route_message(&m2, &mut ts.store, 1001, &mut deliver),
-            RouteOutcome::LoopDetected
+            router.route_message(&over, &mut ts.store, 1010, &mut deliver),
+            RouteOutcome::LoopDetected,
+            "root forjado não escapa do anti-loop: o limite ainda corta"
+        );
+        assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **DIFERENCIAL #1 (diálogo): a RESPOSTA chega.** A→B (root R) entrega a IDA; B→A (mesmo root R,
+    /// `lina ask` COMUM — sem `--await`/`reply_to`) ENTREGA a VOLTA. A 1ª volta do ida-e-volta NÃO é
+    /// mais tratada como loop (antes: `LoopDetected` já no 1º retorno → cooperação só num sentido). O
+    /// anti-loop por grafo passou a cortar só o ping-pong REPETIDO (ver `tight_loop_blocked_…`).
+    #[test]
+    fn dialogue_reply_delivers_not_loop_detected() {
+        let (mut router, sup, dir) = router_with("dialogue");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("dialogue");
+        let (rec, mut deliver) = recorder();
+
+        let ida = MailMessage::new("@A", "@B", "ask", "oi");
+        assert_eq!(
+            router.route_message(&ida, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { targets: vec![b] },
+            "A→B entrega (ida)"
+        );
+        // B responde A — `lina ask` comum: herda o root R de A pelo binding (root=None, sem reply_to).
+        let volta = MailMessage::new("@B", "@A", "ask", "oi de volta");
+        assert_eq!(
+            router.route_message(&volta, &mut ts.store, 1001, &mut deliver),
+            RouteOutcome::Delivered { targets: vec![a] },
+            "B→A (mesmo root R, resposta) ENTREGA — NÃO LoopDetected na 1ª volta"
+        );
+        assert_eq!(
+            rec.borrow().len(),
+            2,
+            "as DUAS pernas do diálogo entregaram"
+        );
+        assert!(
+            !blocked_reasons(&ts.store).contains(&"loop_detected".to_string()),
+            "nenhum loop_detected na 1ª volta do diálogo"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Loop APERTADO ainda barrado.** Ping-pong A→B→A→B… sob o mesmo root: as primeiras voltas são
+    /// diálogo e entregam; quando o MESMO salto (A→B) se repete pela `MAX_CYCLE_REVISITS + 1`-ésima vez
+    /// fechando o ciclo, é cortado (`LoopDetected` + `RouteBlocked{loop_detected}`). O loop infinito
+    /// segue barrado (e, no limite, `hops`/orçamento são o backstop final).
+    #[test]
+    fn tight_loop_blocked_after_revisit_limit() {
+        let (mut router, sup, dir) = router_with("tightloop");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("tightloop");
+        let (_rec, mut deliver) = recorder();
+
+        // As voltas dentro do limite entregam (diálogo). Com MAX_CYCLE_REVISITS=2, o salto A→B pode
+        // ocorrer 2× e B→A 2× antes do corte.
+        let pingpong = [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")];
+        for (i, (from, to)) in pingpong.iter().enumerate() {
+            let m = MailMessage::new(*from, *to, "ask", "ping");
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, 1000 + i as u64, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "volta {i} ({from}→{to}) ainda é diálogo (entrega)"
+            );
+        }
+        // 3ª repetição do salto A→B fechando o ciclo → loop APERTADO cortado.
+        let over = MailMessage::new("@A", "@B", "ask", "ping demais");
+        assert_eq!(
+            router.route_message(&over, &mut ts.store, 1010, &mut deliver),
+            RouteOutcome::LoopDetected,
+            "o ping-pong repetido além de MAX_CYCLE_REVISITS é cortado"
         );
         assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2272,8 +2378,11 @@ mod tests {
 
     // ───────────────────────── Hardening Round 3: regressões do roteador ─────────────────────────
 
-    /// reply_to-bypass: um `reply_to` FORJADO (sem ticket em `pending`) NÃO pula o anti-loop. Um
-    /// `reply_to` que CASA um ticket real (reply legítimo) pula (back-edge da pergunta).
+    /// reply_to-bypass: um `reply_to` FORJADO (sem ticket em `pending`) NÃO pula o anti-loop — então
+    /// NÃO ganha voltas extras. Um `reply_to` que CASA um ticket real (reply legítimo) pula o guard
+    /// (back-edge da pergunta — ver `await_lifecycle_open_reply_releases_waitgraph`). Após o ajuste de
+    /// cooperação o ping-pong é cortado por REPETIÇÃO (`MAX_CYCLE_REVISITS`), não na 1ª volta: aqui o
+    /// `reply_to` forjado em CADA salto NÃO o isenta do guard, então o loop apertado ainda fecha no limite.
     #[test]
     fn forged_reply_to_does_not_bypass_loop() {
         let (mut router, sup, dir) = router_with("replybypass");
@@ -2282,19 +2391,26 @@ mod tests {
         let mut ts = TmpStore::new("replybypass");
         let (_rec, mut deliver) = recorder();
 
-        // A→B (origem) loga a aresta A→B sob o root do binding.
-        let m1 = MailMessage::new("@A", "@B", "ask", "ida");
-        assert!(matches!(
-            router.route_message(&m1, &mut ts.store, 1000, &mut deliver),
-            RouteOutcome::Delivered { .. }
-        ));
-
-        // B→A com reply_to FORJADO (não casa ticket) → NÃO pula o anti-loop → fecha o ciclo → bloqueado.
-        let forged = MailMessage::new("@B", "@A", "ask", "volta").replying_to("msg_naoexiste");
+        // Ping-pong, cada salto com `reply_to` FORJADO (não casa ticket → NÃO pula o guard). As voltas
+        // dentro do limite entregam (diálogo); o forjado não compra rodadas extras.
+        let pingpong = [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")];
+        for (i, (from, to)) in pingpong.iter().enumerate() {
+            let m = MailMessage::new(*from, *to, "ask", "volta").replying_to("msg_naoexiste");
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, 1000 + i as u64, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "volta {i} é diálogo (entrega) — reply_to forjado não pula o guard nem muda o limite"
+            );
+        }
+        // 3ª repetição do salto A→B com reply_to FORJADO → NÃO pula o guard → loop apertado cortado.
+        let forged =
+            MailMessage::new("@A", "@B", "ask", "volta demais").replying_to("msg_naoexiste");
         assert_eq!(
-            router.route_message(&forged, &mut ts.store, 1001, &mut deliver),
+            router.route_message(&forged, &mut ts.store, 1010, &mut deliver),
             RouteOutcome::LoopDetected,
-            "reply_to forjado (sem ticket) não pode escapar do anti-loop"
+            "reply_to forjado (sem ticket) não escapa do anti-loop nem ganha voltas extras"
         );
         assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2755,7 +2871,7 @@ mod tests {
 
     /// **Round 5 #8 (binding nunca migra/poda → grafo anti-loop fragmenta).** Passada a janela (nó
     /// OCIOSO, sem await pendente), uma cadeia NOVA entregue ao nó MIGRA o binding para o root ativo
-    /// (em vez de congelar no 1º root para sempre). Sem isso, `handoff_would_loop` fragmenta por
+    /// (em vez de congelar no 1º root para sempre). Sem isso, `handoff_would_tight_loop` fragmenta por
     /// sessão. A defesa anti-forja segue: P1 (foreign root FRESCO não migra) é o teste separado.
     #[test]
     fn delivered_root_migrates_to_active_chain_after_window() {

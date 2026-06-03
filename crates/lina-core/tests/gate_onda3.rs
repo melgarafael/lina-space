@@ -317,28 +317,39 @@ fn b_gate_duro_classifica_e_loga() {
 /// B→A, numa origem fresca (root distinto, sem A→B no grafo daquele root), PASSA.
 #[test]
 fn c_anti_loop_por_turno() {
-    // (c1) LOOP: mesmo turno → bloqueado.
+    // (c1) LOOP APERTADO: ping-pong repetido sob o mesmo turno → cortado após `MAX_CYCLE_REVISITS`.
+    //      A 1ª volta (A→B→A) é DIÁLOGO legítimo e PASSA (ver router::tests::dialogue_reply_delivers_…);
+    //      aqui empurramos o ping-pong até cruzar o limite e provamos que ainda barra + loga.
     let mut e = env("c-loop", RouterConfig::default());
     e.sup.register("@A", None, sink());
     e.sup.register("@B", None, sink());
     let mut deliver = ok_deliver();
 
-    let m1 = MailMessage::new("@A", "@B", "ask", "ida"); // A é origem → root R1 = m1.id; aresta A→B.
-    assert!(matches!(
-        e.router
-            .route_message(&m1, &mut e.store, 1000, &mut deliver),
-        RouteOutcome::Delivered { .. }
-    ));
-    // B→A herda R1 do binding (hops 1 < 4, id distinto); adicionar B→A fecha o ciclo sob R1.
-    let m2 = MailMessage::new("@B", "@A", "ask", "volta");
+    // As voltas dentro do limite entregam (diálogo) — herdam o root R1 do binding (hops < 4).
+    for (i, (from, to)) in [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")]
+        .iter()
+        .enumerate()
+    {
+        let m = MailMessage::new(*from, *to, "ask", "ping");
+        assert!(
+            matches!(
+                e.router
+                    .route_message(&m, &mut e.store, 1000 + i as u64, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "as primeiras voltas são diálogo (entregam)"
+        );
+    }
+    // A repetição que cruza `MAX_CYCLE_REVISITS` fecha o ciclo apertado → LoopDetected.
+    let over = MailMessage::new("@A", "@B", "ask", "ping demais");
     assert_eq!(
         e.router
-            .route_message(&m2, &mut e.store, 1001, &mut deliver),
+            .route_message(&over, &mut e.store, 1010, &mut deliver),
         RouteOutcome::LoopDetected
     );
     assert!(
         block_reasons(&jsonl(&e.store_dir())).contains(&"loop_detected".to_string()),
-        "a recusa por ciclo está NO LOG (RouteBlocked{{loop_detected}})"
+        "a recusa por ciclo apertado está NO LOG (RouteBlocked{{loop_detected}})"
     );
 
     // (c2) TURNO DIFERENTE: a MESMA topologia B→A, numa origem fresca (sem A→B sob esse root), passa.
@@ -568,16 +579,23 @@ fn e_await_reply_autenticado() {
 fn f_blocks_logados_e_dedupe_ausente() {
     let mut deliver = ok_deliver();
 
-    // loop_detected (A→B→A mesmo turno).
+    // loop_detected (ping-pong A↔B repetido além de `MAX_CYCLE_REVISITS`; a 1ª volta é diálogo).
     {
         let mut e = env("f-loop", RouterConfig::default());
         e.sup.register("@A", None, sink());
         e.sup.register("@B", None, sink());
-        let m1 = MailMessage::new("@A", "@B", "ask", "ida");
-        e.router.route_message(&m1, &mut e.store, 1, &mut deliver);
-        let m2 = MailMessage::new("@B", "@A", "ask", "volta");
+        for (i, (from, to)) in [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")]
+            .iter()
+            .enumerate()
+        {
+            let m = MailMessage::new(*from, *to, "ask", "ping");
+            e.router
+                .route_message(&m, &mut e.store, 1 + i as u64, &mut deliver);
+        }
+        let over = MailMessage::new("@A", "@B", "ask", "ping demais");
         assert_eq!(
-            e.router.route_message(&m2, &mut e.store, 2, &mut deliver),
+            e.router
+                .route_message(&over, &mut e.store, 100, &mut deliver),
             RouteOutcome::LoopDetected
         );
         assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"loop_detected".to_string()));
