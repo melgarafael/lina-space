@@ -611,7 +611,16 @@ impl EventStore {
         let jsonl_path = dir.join(JSONL_FILE);
 
         let conn = Connection::open(&db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // FURO A (parte 1): com o store ws2/ws3 unificado, APP e bin (`lina do/guard`) escrevem no MESMO
+        // log → escritores CONCORRENTES. Sem `busy_timeout`, o 2º escritor recebe `SQLITE_BUSY` IMEDIATO
+        // ao disputar o write-lock e PERDE o evento (de segurança!). Com o timeout, ele ESPERA o lock
+        // (3s é folgado; o WAL deixa leituras passarem em paralelo). DEFINIDO ANTES de qualquer escrita:
+        // o próprio `journal_mode=WAL` e o `CREATE TABLE` (schema) pegam write-lock, então a ABERTURA
+        // concorrente já precisa do timeout (senão é a `open()` do 2º processo que estoura `BUSY`).
+        // Complementa o retry anti-colisão de `seq` (parte 2): este resolve a disputa de LOCK; aquele, a
+        // colisão de PK (dois processos calculando o mesmo `seq` cacheado).
+        conn.busy_timeout(std::time::Duration::from_millis(3000))?;
+        enable_wal(&conn)?;
         conn.execute_batch(SCHEMA)?;
         let next_seq: i64 =
             conn.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
@@ -710,14 +719,42 @@ impl EventStore {
         version: u32,
         payload: serde_json::Value,
     ) -> Result<u64, StoreError> {
-        let rec = EventRecord {
+        // Monta com o `seq` OTIMISTA (cache em-memória) — o caminho rápido do escritor único NÃO paga
+        // nada (1 tentativa, sem SELECT extra). `ts`/`payload` carimbados UMA vez: o retry reusa os
+        // mesmos (a colisão não deve alterar o conteúdo do evento, só seu `seq`).
+        let mut rec = EventRecord {
             seq: self.next_seq,
             ts: now_millis(),
             kind: kind.to_string(),
             version,
             payload,
         };
-        self.db_insert(&rec)?;
+        // FURO A (parte 2): `next_seq` é cache POR-PROCESSO (nasce de `MAX(seq)+1` no open()). Sob 2
+        // escritores, ambos podem calcular o MESMO `seq` → o 2º INSERT viola o PK e o evento de SEGURANÇA
+        // some. Em colisão, re-lê `MAX(seq)` FRESCO do banco (o que o outro processo gravou), bumpa e
+        // RE-INSERE — retry BOUNDED. Não é autoincrement (mudaria contrato/migração): é o mínimo correto.
+        const MAX_RETRIES: u32 = 8;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.db_insert(&rec) {
+                Ok(()) => break,
+                Err(e) if is_seq_conflict(&e) && attempt < MAX_RETRIES => {
+                    attempt += 1;
+                    // Re-lê o seq REALMENTE gravado e mira o próximo livre. `db_insert` (no sucesso)
+                    // re-sincroniza `self.next_seq`; aqui só corrigimos o alvo da re-tentativa.
+                    let max: i64 = self.conn.query_row(
+                        "SELECT COALESCE(MAX(seq), 0) FROM events",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let next = (max as u64).saturating_add(1);
+                    self.next_seq = next;
+                    rec.seq = next;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Espelha no JSONL com o `seq` EFETIVAMENTE gravado (não o otimista) — DB e espelho casam.
         append_jsonl(&self.jsonl_path, &rec)?;
         Ok(rec.seq)
     }
@@ -877,15 +914,61 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// `true` se `e` é uma violação de PK/UNIQUE do SQLite. O ÚNICO constraint do INSERT de evento é o PK
+/// `seq` (schema: `seq INTEGER PRIMARY KEY`), então qualquer `ConstraintViolation` aqui É a colisão de
+/// `seq` entre dois escritores — habilita o retry com re-leitura fresca (FURO A). Outros erros (I/O,
+/// serde, db corrompido) NÃO casam → propagam sem retry (não mascaramos falha real).
+fn is_seq_conflict(e: &StoreError) -> bool {
+    matches!(
+        e,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
+
+/// `true` se o erro do rusqlite é `SQLITE_BUSY` ("database is locked") — disputa de lock transitória.
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Liga `journal_mode=WAL` tolerando a CORRIDA DE SETUP entre conexões. Trocar o journal mode pede um
+/// lock exclusivo momentâneo e — ao contrário dos writes — NÃO honra o `busy_timeout` de forma
+/// confiável: sob abertura concorrente (app + bin abrindo o MESMO db), o 2º pode receber "database is
+/// locked" exatamente AQUI (não no INSERT). WAL é PERSISTENTE e idempotente entre conexões (basta UM
+/// processo setar), então re-tentamos BOUNDED com um respiro curto. Erro que NÃO seja `BUSY` propaga na
+/// hora; se esgotar as tentativas ainda em `BUSY`, propaga o último — não silencia, só absorve a corrida.
+fn enable_wal(conn: &Connection) -> Result<(), StoreError> {
+    const TRIES: u32 = 50; // ~50 × 20ms = 1s — folga p/ a corrida de setup do WAL ceder
+    let mut tries_left = TRIES;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy(&e) && tries_left > 1 => {
+                tries_left -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Anexa um registro de evento ao espelho JSONL (append-only, uma linha por evento).
 fn append_jsonl(path: &Path, rec: &EventRecord) -> Result<(), StoreError> {
-    let line = serde_json::to_string(rec)?;
+    // FURO B: UM único buffer (`linha` + `\n`) e UM único `write_all`. O espelho JSONL agora recebe
+    // append CONCORRENTE de 2 processos (app + bin); com DOIS `write_all` (a linha e depois o `\n`), as
+    // escritas O_APPEND dos dois podem INTERLEAVIAR no EOF → linha corrompida que cai na quarentena do
+    // rebuild (W0-6) e some no replay. Com um `write_all` só, o kernel mantém a escrita contígua no EOF
+    // (atomicidade do O_APPEND p/ um único write de uma linha de evento). O flush durável é mantido.
+    let mut line = serde_json::to_string(rec)?;
+    line.push('\n');
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
     file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
     file.flush()?;
     Ok(())
 }
@@ -1373,5 +1456,87 @@ mod tests {
         let garbage = vec![0xEE_u8; span as usize];
         file.write_all(&garbage).expect("escrever lixo");
         file.flush().expect("flush");
+    }
+
+    /// FUROS A+B — **append CONCORRENTE multi-conexão não perde nada**. Reproduz o cenário ATIVADO pela
+    /// unificação do store (app + bin `lina do/guard` escrevendo no MESMO log de segurança): N threads,
+    /// CADA UMA com sua PRÓPRIA `EventStore::open` apontando p/ o MESMO dir (= 2 processos/conexões).
+    /// Prova: (a) ZERO evento perdido (`COUNT == total`); (b) seqs ÚNICOS e CONTÍGUOS (PK sem colisão
+    /// perdida — FURO A); (c) o espelho JSONL tem `total` linhas TODAS desserializáveis (sem interleaving
+    /// — FURO B). Sem os fixes, (a)/(b) quebram por colisão de `seq` e (c) por linha corrompida.
+    #[test]
+    #[serial]
+    fn concurrent_appends_multi_connection_lose_nothing() {
+        use std::io::BufRead;
+
+        const WRITERS: u64 = 2; // app + bin (o caso canônico da unificação; o desenho generaliza p/ +)
+        const PER_WRITER: u64 = 50;
+        let total = WRITERS * PER_WRITER;
+
+        let dir = TempDir::new("concurrent");
+        let path = dir.path().to_path_buf();
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let dir_w = path.clone();
+                std::thread::spawn(move || {
+                    // Conexão PRÓPRIA por thread (simula app+bin = processos distintos). Aberta DENTRO
+                    // da thread → a `Connection` (não-`Send`) nunca cruza a fronteira.
+                    let mut store = EventStore::open(&dir_w).expect("open store concorrente");
+                    for i in 0..PER_WRITER {
+                        store
+                            .insert_raw("ConcTest", 1, serde_json::json!({ "writer": w, "i": i }))
+                            .expect("insert_raw concorrente NÃO pode perder evento de segurança");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+
+        let expected_seqs: Vec<u64> = (1..=total).collect();
+        let store = EventStore::open(&path).expect("reabrir store");
+
+        // (a) ZERO evento perdido.
+        assert_eq!(
+            store.event_count().unwrap(),
+            total,
+            "nenhum evento pode sumir sob escrita concorrente (FURO A: colisão de seq perderia o 2º)"
+        );
+
+        // (b) seqs ÚNICOS e CONTÍGUOS — sem buraco nem duplicata (PK retry-on-colisão).
+        let db_seqs: Vec<u64> = store.events().unwrap().into_iter().map(|r| r.seq).collect();
+        assert_eq!(
+            db_seqs, expected_seqs,
+            "seqs no SQLite devem ser únicos e contíguos 1..=total"
+        );
+
+        // (c) o espelho JSONL: `total` linhas, TODAS desserializáveis (FURO B: interleaving corromperia).
+        let jsonl = path.join(JSONL_FILE);
+        let file = std::fs::File::open(&jsonl).expect("abrir log.jsonl");
+        let lines: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .map(|l| l.expect("ler linha do jsonl"))
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(
+            lines.len() as u64,
+            total,
+            "o espelho JSONL deve ter exatamente 1 linha por evento (sem linha perdida/interleaviada)"
+        );
+        let mut jsonl_seqs: Vec<u64> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<EventRecord>(l)
+                    .expect("cada linha do JSONL deve desserializar (sem interleaving — FURO B)")
+                    .seq
+            })
+            .collect();
+        jsonl_seqs.sort_unstable();
+        assert_eq!(
+            jsonl_seqs, expected_seqs,
+            "o JSONL deve espelhar exatamente os mesmos seqs únicos/contíguos do SQLite"
+        );
     }
 }
