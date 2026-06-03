@@ -321,8 +321,9 @@ impl WorkspaceView {
             desk,
             naming: None,
             brake,
-            // W4-6: inicializa do SO/env (LINA_REDUCE_MOTION); o toggle do rodapé sobrepõe depois.
-            reduce_motion: a11y::os_reduce_motion(),
+            // W4-6 gap3: este campo é o OVERRIDE do usuário (rodapé); o SO/env entra via
+            // `a11y::reduce_motion_effective` (fonte única) no pulso/rótulo. Começa sem override.
+            reduce_motion: false,
             a11y_live: a11y::LiveRegion::default(),
             palette: palette::PaletteState::default(),
             creating: None,
@@ -1176,7 +1177,11 @@ impl Render for WorkspaceView {
 
         // PULSO efêmero A→B (a metáfora "sem fios"). W4-3: respeita REDUCE-MOTION — com ele ligado, a
         // animação é suprimida (a entrega A2A ocorre igual; o pulso é decorativo).
-        if let Some(p) = pulse.filter(|_| wiring::animate_pulse(self.reduce_motion)) {
+        // W4-6 gap3: reduce-motion lido da FONTE ÚNICA `a11y::reduce_motion_effective` (SO/env sempre
+        // respeitado + override do rodapé) — o W4-3 só inverte o bool.
+        if let Some(p) = pulse
+            .filter(|_| wiring::animate_pulse(a11y::reduce_motion_effective(self.reduce_motion)))
+        {
             if let Some(t) = p.progress() {
                 let center = |id: NodeId| -> Option<Point<Pixels>> {
                     cards.iter().find(|(n, _)| *n == id).map(|(_, nv)| {
@@ -1418,7 +1423,8 @@ impl Render for WorkspaceView {
 
         // W4-3 · RODAPÉ — o FREIO da auto-orquestração (sempre acessível) + toggle de reduce-motion.
         let paused = lock(&self.brake).paused;
-        let reduce_motion = self.reduce_motion;
+        // W4-6 gap3: o rótulo do rodapé reflete o EFETIVO (fonte única) — não o override cru.
+        let reduce_motion = a11y::reduce_motion_effective(self.reduce_motion);
         let (freio_bg, freio_txt) = if paused {
             (0x2c7a4b, "▶ Retomar orquestração")
         } else {

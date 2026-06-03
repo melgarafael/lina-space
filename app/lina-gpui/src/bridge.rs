@@ -2350,6 +2350,10 @@ pub fn spawn_pump(
             .name("lina-bridge-pump".into())
             .spawn(move || {
                 let mut meter = crate::cost::CostMeter::new();
+                // W4-6 gap2: nós atualmente em turno (produzindo). Dirige Busy↔Idle na ÁRVORE a11y SÓ na
+                // transição (não a cada delta → sem busy-loop/churn de render). Idle = "resposta pronta".
+                let mut active: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -2371,6 +2375,14 @@ pub fn spawn_pump(
                     // Mede o output de cada nó (node+bytes do GridDelta) — fonte do teto de custo.
                     while let Ok(delta) = delta_rx.try_recv() {
                         meter.record_output(delta.node, delta.bytes, now);
+                        // W4-6 gap2: 1ª saída do turno → Busy (transição) → o `aria_label` do nó e o
+                        // status refletem "rodando"; habilita o próximo →Idle a anunciar.
+                        if active.insert(delta.node) {
+                            bridge.on_event(HostEvent::NodeStatusChanged {
+                                node: delta.node,
+                                status: NodeStatus::Busy,
+                            });
+                        }
                         worked = true;
                     }
                     // Fim-de-turno por idle → apenda TokenUsageReported (estimado) no store autoritativo.
@@ -2381,6 +2393,13 @@ pub fn spawn_pump(
                         }) {
                             eprintln!("lina-gpui: falha ao apendar TokenUsageReported: {e}");
                         }
+                        // W4-6 gap2: fim-de-turno → Idle → a `LiveRegion` computa "resposta pronta"
+                        // (1×/turno) e o badge vira "💤 dormindo". Transição → sem churn.
+                        active.remove(&node);
+                        bridge.on_event(HostEvent::NodeStatusChanged {
+                            node,
+                            status: NodeStatus::Idle,
+                        });
                     }
                     if !worked {
                         thread::sleep(Duration::from_millis(2));

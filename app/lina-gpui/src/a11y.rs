@@ -195,6 +195,15 @@ pub fn os_reduce_motion() -> bool {
     reduce_motion_from(std::env::var("LINA_REDUCE_MOTION").ok().as_deref())
 }
 
+/// **Fonte ÚNICA** do reduce-motion (consolidação — gap W4-6): a detecção do SO/env
+/// ([`os_reduce_motion`]) é SEMPRE respeitada; o `user_override` do rodapé só pode ADICIONAR
+/// reduce-motion (a11y correta: uma UI não deve REABILITAR animação que o usuário desligou no SO).
+/// Canvas/pulsos (W4-3) e a11y leem DAQUI — sem duplicar a detecção.
+#[must_use]
+pub fn reduce_motion_effective(user_override: bool) -> bool {
+    os_reduce_motion() || user_override
+}
+
 // ═══════════════════════════ elemento gpui da live-region ═══════════════════════════
 
 /// Elemento da live-region: `Role::Status` + `aria_label` + texto VISÍVEL (contraste verde/painel ≥ AA).
@@ -355,5 +364,20 @@ mod tests {
         assert!(reduce_motion_from(Some("true")));
         assert!(!reduce_motion_from(Some("0")));
         assert!(!reduce_motion_from(None));
+    }
+
+    /// Fonte única: o override do usuário FORÇA reduce-motion (independe do SO); sem override, o efetivo
+    /// é exatamente a detecção do SO (consistência — sem detecção duplicada).
+    #[test]
+    fn reduce_motion_effective_honors_os_and_override() {
+        assert!(
+            reduce_motion_effective(true),
+            "override do usuário força reduce-motion qualquer que seja o SO"
+        );
+        assert_eq!(
+            reduce_motion_effective(false),
+            os_reduce_motion(),
+            "sem override, o efetivo = detecção do SO (fonte única)"
+        );
     }
 }
