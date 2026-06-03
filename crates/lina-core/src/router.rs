@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::events::{AwaitReason, BlockReason, DomainEvent, EventStore, StoreError};
+use crate::events::{AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, StoreError};
 use crate::mailbox::{parse_target, render_message_block_full, MailMessage, Mailbox, TargetSpec};
 use crate::plan::PlanError;
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, Recipient, RolePolicy, Supervisor};
@@ -119,6 +119,10 @@ pub enum RouteOutcome {
     /// W3-5: intent de plano recusado pela regra do plano (item inexistente, conflito de owner,
     /// não-owner, ou `ref` ausente) — sem corromper o `plan.md`.
     PlanRejected(String),
+    /// W4-3 (freio do rodapé): a orquestração está PAUSADA → esta delegação foi ENFILEIRADA (retida
+    /// no `.inflight`, durável), NÃO injetada. Drena ao [`Router::resume`]. É GATE humano, não kill
+    /// (inv #6): nada se perde, o estado fica salvo e visível.
+    Queued,
 }
 
 /// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
@@ -169,14 +173,21 @@ pub struct Router {
     seen: HashMap<String, u64>,
     /// `(root_cause_id, remetente)` → orçamento por turno (contagem + carimbo p/ poda temporal).
     budget: HashMap<(String, NodeId), BudgetEntry>,
-    /// W3-7 (A2): nó → `(root_cause_id, hops)` da última mensagem ENTREGUE a ele. Quando esse nó
-    /// depois submete uma msg com `root=None`, o supervisor DERIVA o root (herdado) e `hops = +1`
-    /// daqui — o enforcement de cadeia vem do binding do supervisor, não do campo que a CLI não
-    /// preenche. Bounded pelo roster (1 entrada por nó, sobrescrita) → não precisa de poda.
-    delivered_root: HashMap<NodeId, (String, u8)>,
+    /// W3-7 (A2): nó → `(root_cause_id, hops, last_ms)` da última mensagem ENTREGUE a ele. Quando
+    /// esse nó depois submete uma msg com `root=None`, o supervisor DERIVA o root (herdado) e
+    /// `hops = +1` daqui — o enforcement de cadeia vem do binding do supervisor, não do campo que a
+    /// CLI não preenche. Round 5 #8: `last_ms` habilita MIGRAÇÃO/PODA — um binding OCIOSO (stale >
+    /// janela, sem await pendente) deixa de congelar a vítima no 1º root e passa a seguir a cadeia
+    /// ATIVA (anti-loop não fragmenta por sessão longa), SEM reabrir a forja (um binding fresco de
+    /// root diferente NUNCA é sobrescrito — defesa P1).
+    delivered_root: HashMap<NodeId, (String, u8, u64)>,
     /// W3-7b (ADR 0002): `id` da pergunta → ticket do `await` aberto. Fechado pelo `reply_to` casado
     /// (`Replied`) ou pelo sweep de timeout (`Timeout`) — em ambos, `end_await` libera o wait-for-graph.
     pending: HashMap<String, AwaitTicket>,
+    /// W4-3 (freio do rodapé): `true` = orquestração pausada. Delegações novas ENFILEIRAM (retidas no
+    /// `.inflight`, duráveis) em vez de injetar, drenando ao [`Router::resume`] — GATE humano, não
+    /// kill (inv #6). Escritor único (o Router é single-thread, dono do estado de roteamento).
+    paused: bool,
 }
 
 impl Router {
@@ -197,6 +208,7 @@ impl Router {
             budget: HashMap::new(),
             delivered_root: HashMap::new(),
             pending: HashMap::new(),
+            paused: false,
         }
     }
 
@@ -204,6 +216,75 @@ impl Router {
     #[must_use]
     pub fn mailbox(&self) -> &Mailbox {
         &self.mailbox
+    }
+
+    /// `true` se a orquestração está pausada pelo freio (W4-3).
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// **W4-3 (freio do rodapé): pausa a auto-orquestração.** Enquanto pausada, delegações novas
+    /// ENFILEIRAM (ficam retidas no `.inflight`, duráveis) em vez de injetar — é GATE humano, não
+    /// kill (inv #6): nada se perde, o estado fica salvo e visível. Apenda `OrchestrationPaused` SÓ
+    /// na transição (idempotente: re-pausar não re-loga — anti-amplificação A4). Devolve `true` se
+    /// transicionou (estava ativo); `false` se já pausado.
+    ///
+    /// # Errors
+    /// Falha ao persistir `OrchestrationPaused` no event log.
+    pub fn pause(&mut self, store: &mut EventStore) -> Result<bool, StoreError> {
+        if self.paused {
+            return Ok(false);
+        }
+        store.append(&DomainEvent::OrchestrationPaused)?;
+        self.paused = true;
+        Ok(true)
+    }
+
+    /// **W4-3 (freio do rodapé): retoma a auto-orquestração e DRENA a fila.** Apenda
+    /// `OrchestrationResumed` (só na transição) e re-roda o [`Router::pump`], entregando as
+    /// delegações que ficaram represadas no `.inflight` sob o freio. `deliver` é a entrega faseada
+    /// (como em [`Router::pump`]). Devolve os resultados do dreno (observabilidade); vazio se não
+    /// estava pausado.
+    ///
+    /// # Errors
+    /// Falha ao persistir `OrchestrationResumed` no event log.
+    pub fn resume<D>(
+        &mut self,
+        store: &mut EventStore,
+        now_ms: u64,
+        deliver: D,
+    ) -> Result<Vec<(String, RouteOutcome)>, StoreError>
+    where
+        D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
+    {
+        if !self.paused {
+            return Ok(Vec::new());
+        }
+        store.append(&DomainEvent::OrchestrationResumed)?;
+        self.paused = false;
+        Ok(self.pump(store, now_ms, deliver))
+    }
+
+    /// **W4-3: reconstrói o estado do freio (`paused`) a partir do event log** — o log é a fonte da
+    /// verdade (inv #4). Chame na RECUPERAÇÃO pós-crash, antes do 1º `pump`: sem isto, um `Router`
+    /// novo nasce despausado e drenaria a fila que o humano havia represado (inv #6: estado sempre
+    /// salvo e visível). `paused` segue o ÚLTIMO evento `OrchestrationPaused`/`OrchestrationResumed`
+    /// do log (mesmo padrão event-sourced do [`CostLedger`]).
+    ///
+    /// # Errors
+    /// Falha ao ler o event log.
+    pub fn restore_orchestration_state(&mut self, store: &EventStore) -> Result<(), StoreError> {
+        let mut paused = false;
+        for rec in store.events()? {
+            match rec.kind.as_str() {
+                "OrchestrationPaused" => paused = true,
+                "OrchestrationResumed" => paused = false,
+                _ => {}
+            }
+        }
+        self.paused = paused;
+        Ok(())
     }
 
     /// **Drena a mailbox e roteia cada mensagem.** `deliver(target, from, text)` faz a entrega
@@ -250,7 +331,12 @@ impl Router {
                 // A6: só CONFIRMA (remove de `.inflight`) quando o evento durável foi persistido
                 // (`MessageRouted`/`RouteBlocked`/plan). Em `PersistFailed` o registro PERMANECE em
                 // `.inflight` para o próximo tick — nada se perde num crash entre drenar e logar.
-                if !matches!(outcome, RouteOutcome::PersistFailed(_)) {
+                // W4-3: `Queued` (freio) também NÃO dá ack — a delegação fica retida no `.inflight`
+                // (durável) até o `resume` a drenar; ackear aqui a perderia.
+                if !matches!(
+                    outcome,
+                    RouteOutcome::PersistFailed(_) | RouteOutcome::Queued
+                ) {
                     if let Err(e) = self.mailbox.ack_inflight(&m.id) {
                         eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
                     }
@@ -271,6 +357,16 @@ impl Router {
     where
         D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
     {
+        // ── W4-3 (freio do rodapé): orquestração PAUSADA → uma delegação NOVA fica ENFILEIRADA, não
+        //    injetada (inv #6: GATE, não kill; nada se perde). A msg permanece no `.inflight`
+        //    (durável); o `pump` NÃO dá ack em `Queued`, então ela é reavaliada a cada tick e DRENA
+        //    no `resume`. Checado ANTES do dedupe — marcá-la `seen` a tornaria `Duplicate` no resume
+        //    (acked sem entregar = perdida). Replies (`reply_to`) e intents de plano PASSAM: o freio
+        //    trava a auto-orquestração (delegações), não o fechamento de loops/await já abertos.
+        if self.paused && msg.reply_to.is_none() && is_delegation(&msg.intent) {
+            return RouteOutcome::Queued;
+        }
+
         // ── Guardrail: dedupe por `id` na janela (design §3). Poda `seen` E `budget` (A5).
         self.prune_expired(now_ms);
         if self.seen.contains_key(&msg.id) {
@@ -412,26 +508,26 @@ impl Router {
             }
         }
 
-        // ── Guardrail 2 / ABERTURA do await (ADR 0002): para `--await`, `begin_await` é a CHECAGEM
-        //    de deadlock E a abertura. ask/handoff (1 alvo): se Ok, a aresta FICA (liberada só no
-        //    reply/timeout) — `await_target` lembra o alvo p/ abrir o ticket após o persist, ou
-        //    rollback se a rota/persist falhar. broadcast: mantém a checagem PURA (rollback), sem
-        //    lifecycle (multi-alvo não cabe no wait-for-graph 1-por-waiter; foge ao ADR, single-target).
+        // ── Guardrail 2 / ABERTURA do await (ADR 0002): para `--await`, a checagem de deadlock e a
+        //    abertura. ask/handoff (1 alvo): `begin_await_ticket` abre a aresta (liberada só no
+        //    reply/timeout) — `await_target` lembra o alvo p/ rollback se a rota/persist falhar.
         let await_target: Option<NodeId> = if msg.await_reply {
             if matches!(recipient, Recipient::Broadcast) {
+                // Round 5 #6: broadcast-await faz a checagem de deadlock PURA (`would_await_deadlock`,
+                // não muta o grafo) — JAMAIS apaga uma aresta single-target viva do sender. Sem
+                // lifecycle (multi-alvo não cabe no wait-for-graph por-waiter; foge ao ADR).
                 for &target in &preview {
-                    match self.sup.begin_await(sender, target) {
-                        Ok(()) => self.sup.end_await(sender),
-                        Err(_) => {
-                            log_block(store, msg, BlockReason::Deadlock);
-                            return RouteOutcome::Deadlock;
-                        }
+                    if self.sup.would_await_deadlock(sender, target) {
+                        log_block(store, msg, BlockReason::Deadlock);
+                        return RouteOutcome::Deadlock;
                     }
                 }
                 None
             } else {
                 match preview.first().copied() {
-                    Some(target) => match self.sup.begin_await(sender, target) {
+                    // Round 5 #7: aresta chaveada pelo `id` do ticket (multi-aresta) — abrir este
+                    // await NÃO sobrescreve outros awaits abertos do mesmo sender.
+                    Some(target) => match self.sup.begin_await_ticket(sender, &msg.id, target) {
                         Ok(()) => Some(target), // aresta ABERTA (fica até reply/timeout)
                         Err(_) => {
                             log_block(store, msg, BlockReason::Deadlock);
@@ -453,8 +549,9 @@ impl Router {
         env.await_reply = msg.await_reply;
         let targets = self.sup.route(&env, policy);
         if targets.is_empty() {
-            if await_target.is_some() {
-                self.sup.end_await(sender); // rollback da aresta aberta acima (rota falhou)
+            if let Some(target) = await_target {
+                // rollback da aresta aberta acima (rota falhou) — só este ticket (Round 5 #7).
+                self.sup.end_await_ticket(sender, &msg.id, target);
             }
             log_block(store, msg, BlockReason::NoTarget);
             return RouteOutcome::NoTarget;
@@ -475,8 +572,9 @@ impl Router {
             hops,
             to_node,
         }) {
-            if await_target.is_some() {
-                self.sup.end_await(sender); // rollback: não abrimos await sem roteamento durável
+            if let Some(target) = await_target {
+                // rollback: não abrimos await sem roteamento durável (só este ticket — Round 5 #7).
+                self.sup.end_await_ticket(sender, &msg.id, target);
             }
             // Exceção do ADR 0003: não há como logar a falha de logar (recai em stderr/PersistFailed).
             return RouteOutcome::PersistFailed(e.to_string());
@@ -492,7 +590,8 @@ impl Router {
                 target,
                 root_cause_id: root.clone(),
             }) {
-                self.sup.end_await(sender); // rollback: não abrimos o que não conseguimos logar
+                // rollback: não abrimos o que não conseguimos logar (só este ticket — Round 5 #7).
+                self.sup.end_await_ticket(sender, &msg.id, target);
                 return RouteOutcome::PersistFailed(e.to_string());
             }
             self.pending.insert(
@@ -536,17 +635,25 @@ impl Router {
                     delivered.push(target);
                     // A2: registra que `target` recebeu esta cadeia → futuras submissões dele herdam
                     //     o root e ganham hops+1 (binding do supervisor, não confiança no campo).
-                    // P1 (anti-envenenamento): NÃO sobrescrever um binding VIVO com um root DIFERENTE
-                    //     — senão uma msg de entrada sob root fresco faria a vítima "esquecer" a
-                    //     cadeia ativa e escapar do orçamento/loop. Fixa quando ausente; dentro do
-                    //     MESMO root, atualiza os hops. (Conservador: na dúvida, mantém o root vivo.)
-                    //     Decisão computada ANTES do insert para não segurar o empréstimo do `get`.
+                    // FRONTEIRA DE SEGURANÇA (P1 vs Round 5 #8 migração):
+                    //  • A defesa anti-FORJA é que o root vem SEMPRE do binding carimbado numa ENTREGA
+                    //    real (ou de `msg.id` na origem) — JAMAIS do campo forjável `msg.root_cause_id`.
+                    //    A migração NÃO reabre essa forja: só uma entrega legítima muda o binding.
+                    //  • P1 (anti-envenenamento) protege um binding VIVO: `keep_existing` recusa
+                    //    sobrescrever um binding de root DIFERENTE — então um root fresco de entrada não
+                    //    faz a vítima "esquecer" a cadeia em curso nem escapar do orçamento/loop.
+                    //  • Round 5 #8 (migração) só vale para nó OCIOSO: bindings stale (> janela, SEM
+                    //    await pendente) já foram PODADOS no `prune_expired` no topo do tick. Aqui resta
+                    //    binding FRESCO ou protegido-por-await (P1 o mantém) OU nenhum (nó ocioso →
+                    //    re-set abaixo, migrando p/ a cadeia que o entrega). MESMO root → atualiza
+                    //    hops/last_ms (mantém vivo). (Decisão ANTES do insert p/ não segurar o `get`.)
                     let keep_existing = matches!(
                         self.delivered_root.get(&target),
-                        Some((existing, _)) if *existing != root
+                        Some((existing, _, _)) if *existing != root
                     );
                     if !keep_existing {
-                        self.delivered_root.insert(target, (root.clone(), hops));
+                        self.delivered_root
+                            .insert(target, (root.clone(), hops, now_ms));
                     }
                     if let Err(e) = store.append(&DomainEvent::MessageDelivered {
                         id: msg.id.clone(),
@@ -583,6 +690,18 @@ impl Router {
             .retain(|_, &mut t| now_ms.saturating_sub(t) < window);
         self.budget
             .retain(|_, e| now_ms.saturating_sub(e.last_ms) < window);
+        // Round 5 #8: poda bindings OCIOSOS (stale > janela), EXCETO de nós com await PENDENTE — podar
+        // mid-await deixaria um root fresco roubar a cadeia ainda viva (o `await_timeout` pode exceder
+        // a janela de dedupe). A poda + re-set na entrega é o que MIGRA o binding p/ a cadeia ativa,
+        // sem fragmentar o grafo anti-loop numa sessão longa (lição A5: estado que cresce sem poda).
+        let awaiting: HashSet<NodeId> = self
+            .pending
+            .values()
+            .flat_map(|t| [t.waiter, t.target])
+            .collect();
+        self.delivered_root.retain(|node, (_, _, last)| {
+            now_ms.saturating_sub(*last) < window || awaiting.contains(node)
+        });
     }
 
     /// **A2 + W1: deriva o `(root_cause_id, hops)` EFETIVOS** de uma mensagem de `sender`.
@@ -594,7 +713,7 @@ impl Router {
     /// bloco renderizado segue informativo p/ o agente; o ENFORCEMENT não o usa.)
     fn derive_root_hops(&self, msg: &MailMessage, sender: NodeId) -> (String, u8) {
         match self.delivered_root.get(&sender) {
-            Some((root, h)) => (root.clone(), h.saturating_add(1)),
+            Some((root, h, _)) => (root.clone(), h.saturating_add(1)),
             None => (msg.id.clone(), 0),
         }
     }
@@ -636,9 +755,11 @@ impl Router {
         if !to_is_waiter {
             return false;
         }
-        // Autenticado → AGORA consome o ticket e fecha.
+        // Autenticado → AGORA consome o ticket e fecha SÓ esta aresta (Round 5 #7: outros awaits do
+        // mesmo waiter seguem vivos).
         self.pending.remove(reply_to);
-        self.sup.end_await(ticket.waiter);
+        self.sup
+            .end_await_ticket(ticket.waiter, reply_to, ticket.target);
         if let Err(e) = store.append(&DomainEvent::AwaitClosed {
             id: reply_to.to_string(),
             reason: AwaitReason::Replied,
@@ -661,7 +782,8 @@ impl Router {
             .collect();
         for id in expired {
             if let Some(ticket) = self.pending.remove(&id) {
-                self.sup.end_await(ticket.waiter);
+                // Round 5 #7: fecha SÓ a aresta deste ticket vencido.
+                self.sup.end_await_ticket(ticket.waiter, &id, ticket.target);
                 if let Err(e) = store.append(&DomainEvent::AwaitClosed {
                     id: id.clone(),
                     reason: AwaitReason::Timeout,
@@ -912,14 +1034,29 @@ pub struct CostLedger {
 }
 
 impl CostLedger {
-    /// Reconstrói o ledger do log. `now_ms` define o rótulo `day` (UTC) do teto eventual.
+    /// Reconstrói o ledger do log. `now_ms` define o dia-UTC corrente (janela diária) E o rótulo
+    /// `day` do teto eventual.
     ///
     /// # Errors
     /// Falha ao ler o event log.
     pub fn replay(store: &EventStore, now_ms: u64) -> Result<Self, StoreError> {
+        Ok(Self::from_records(&store.events()?, now_ms))
+    }
+
+    /// **Round 5 #9: agrega uso/teto SÓ da janela do DIA-UTC corrente** (`utc_day(rec.ts) ==
+    /// utc_day(now_ms)`). Registros de outros dias NÃO contam → a janela diária zera sozinha à
+    /// meia-noite (reduz a dependência do `lina resume` humano). Puro (sem I/O) → testável com `ts`
+    /// controlado, já que `EventStore::append` carimba o `ts` com wall-clock e não há injeção de relógio.
+    fn from_records(records: &[EventRecord], now_ms: u64) -> Self {
+        let day = utc_day(now_ms);
         let mut tokens: u64 = 0;
         let mut paused = false;
-        for rec in store.events()? {
+        for rec in records {
+            // Fora do dia-UTC corrente NÃO conta (janela diária — Round 5 #9). Isto zera tanto a soma
+            // quanto o estado `paused` à meia-noite: um `CostCeilingHit` de ontem não pausa hoje.
+            if utc_day(rec.ts) != day {
+                continue;
+            }
             match rec.kind.as_str() {
                 "TokenUsageReported" => {
                     let t = rec
@@ -930,7 +1067,7 @@ impl CostLedger {
                     tokens = tokens.saturating_add(t);
                 }
                 "CostCeilingHit" => paused = true,
-                // Retomada humana: sai de Paused E zera a janela contábil (novo período).
+                // Retomada humana: sai de Paused E zera a janela contábil (novo período no mesmo dia).
                 "CostCeilingResumed" => {
                     paused = false;
                     tokens = 0;
@@ -938,11 +1075,11 @@ impl CostLedger {
                 _ => {}
             }
         }
-        Ok(Self {
-            day: utc_day(now_ms),
+        Self {
+            day,
             tokens,
             paused,
-        })
+        }
     }
 }
 
@@ -2102,7 +2239,14 @@ mod tests {
     /// orçamento de delegação (`BudgetExceeded`).
     #[test]
     fn cost_ceiling_pauses_delegation_until_resume() {
-        const NOW: u64 = 1_700_000_000_000; // ms fixos (≈2023-11-14 UTC) → `day` determinístico
+        // Round 5 #9: a janela do teto agora é DIÁRIA (`utc_day(rec.ts)==utc_day(now_ms)`). Como o
+        // `EventStore::append` carimba o `ts` com wall-clock real (não há injeção de relógio), o
+        // `now_ms` do replay precisa cair no MESMO dia-UTC dos appends → usamos o relógio real. As
+        // asserções de `day` ficam auto-consistentes via `utc_day(now)`.
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("lina-router-cost-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sup = Arc::new(Supervisor::new());
@@ -2121,7 +2265,7 @@ mod tests {
         let m1 = MailMessage::new("@A", "@B", "ask", "antes");
         assert!(
             matches!(
-                router.route_message(&m1, &mut ts.store, NOW, &mut deliver),
+                router.route_message(&m1, &mut ts.store, now, &mut deliver),
                 RouteOutcome::Delivered { .. }
             ),
             "antes do teto a delegação deve entregar normalmente"
@@ -2151,7 +2295,7 @@ mod tests {
         let before = rec.borrow().len();
         let m2 = MailMessage::new("@A", "@B", "ask", "estoura");
         assert_eq!(
-            router.route_message(&m2, &mut ts.store, NOW, &mut deliver),
+            router.route_message(&m2, &mut ts.store, now, &mut deliver),
             RouteOutcome::CostCeiling,
             "ao atingir o teto, a delegação é gateada (Paused), não entregue"
         );
@@ -2169,12 +2313,12 @@ mod tests {
         );
         assert_eq!(
             hits[0].payload.get("day").and_then(|v| v.as_str()),
-            Some(utc_day(NOW).as_str()),
+            Some(utc_day(now).as_str()),
             "o hit registra o dia-UTC derivado do relógio do roteador"
         );
         // Projeção observável do estado Paused, reconstruída do log (invariante #4).
         assert!(
-            CostLedger::replay(&ts.store, NOW).expect("ledger").paused,
+            CostLedger::replay(&ts.store, now).expect("ledger").paused,
             "o ledger reconstruído do log deve indicar Paused"
         );
 
@@ -2182,7 +2326,7 @@ mod tests {
         //    apenda um 2º CostCeilingHit.
         let m3 = MailMessage::new("@A", "@B", "ask", "ainda pausado");
         assert_eq!(
-            router.route_message(&m3, &mut ts.store, NOW, &mut deliver),
+            router.route_message(&m3, &mut ts.store, now, &mut deliver),
             RouteOutcome::CostCeiling
         );
         assert_eq!(
@@ -2194,20 +2338,354 @@ mod tests {
         // ── (3) RETOMADA: `lina resume --confirm` apenda CostCeilingResumed → sai de Paused e ZERA a
         //    janela. A delegação volta a funcionar (sem re-pausar com a soma antiga).
         ts.store
-            .append(&DomainEvent::CostCeilingResumed { day: utc_day(NOW) })
+            .append(&DomainEvent::CostCeilingResumed { day: utc_day(now) })
             .expect("resume");
         assert!(
-            !CostLedger::replay(&ts.store, NOW).expect("ledger").paused,
+            !CostLedger::replay(&ts.store, now).expect("ledger").paused,
             "após resume o workspace não está mais Paused"
         );
         let m4 = MailMessage::new("@A", "@B", "ask", "depois do resume");
         assert!(
             matches!(
-                router.route_message(&m4, &mut ts.store, NOW, &mut deliver),
+                router.route_message(&m4, &mut ts.store, now, &mut deliver),
                 RouteOutcome::Delivered { .. }
             ),
             "após resume a delegação volta a entregar"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── W4-3: freio do rodapé (orquestração pausada) ─────────────────────────
+
+    /// **W4-3 (freio), headless.** Com a orquestração PAUSADA, uma delegação nova fica ENFILEIRADA
+    /// (não injetada) e DURÁVEL no `.inflight` (não perde, não kill — inv #6); `OrchestrationPaused`
+    /// consta no log. Ao `resume`, a fila DRENA: a delegação é roteada/entregue e `OrchestrationResumed`
+    /// consta no log. (O freio trava AUTO-ORQUESTRAÇÃO; replies/plan seguem fechando loops abertos.)
+    #[test]
+    fn orchestration_pause_queues_delegation_until_resume() {
+        let (mut router, sup, dir) = router_with("freio");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("freio");
+        let (rec, mut deliver) = recorder();
+
+        // ── (1) Freio ON → OrchestrationPaused no log (idempotente: 2º pause não re-loga — A4).
+        assert!(
+            router.pause(&mut ts.store).expect("pause"),
+            "1º pause transiciona"
+        );
+        assert!(
+            !router.pause(&mut ts.store).expect("pause idem"),
+            "2º pause é no-op"
+        );
+        assert_eq!(
+            records_of_kind(&ts.store, "OrchestrationPaused").len(),
+            1,
+            "exatamente 1 OrchestrationPaused (anti-amplificação)"
+        );
+
+        // ── (2) Delegação nova sob o freio: ENFILEIRA (não injeta). Fica no `.inflight` (durável).
+        let m = MailMessage::new("@A", "@B", "ask", "espera o freio");
+        router.mailbox().enqueue(&m).expect("enqueue");
+        let r1 = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(r1.len(), 1);
+        assert!(
+            matches!(r1[0].1, RouteOutcome::Queued),
+            "pausado: a delegação é enfileirada, não entregue"
+        );
+        assert!(
+            rec.borrow().is_empty(),
+            "NADA foi injetado no PTY sob o freio"
+        );
+        assert!(
+            records_of_kind(&ts.store, "MessageRouted").is_empty(),
+            "delegação enfileirada não é roteada ainda (entrega adiada)"
+        );
+        let infl = router
+            .mailbox()
+            .inflight_dir()
+            .join(format!("{}.json", m.id));
+        assert!(
+            infl.exists(),
+            "a delegação permanece DURÁVEL no .inflight (não perde)"
+        );
+
+        // ── (3) Retomar → OrchestrationResumed + DRENA a fila: agora roteia e injeta.
+        let r2 = router
+            .resume(&mut ts.store, 1001, &mut deliver)
+            .expect("resume");
+        assert_eq!(r2.len(), 1, "o resume drenou a única delegação enfileirada");
+        assert!(
+            matches!(r2[0].1, RouteOutcome::Delivered { .. }),
+            "ao retomar, a delegação enfileirada é entregue"
+        );
+        assert_eq!(rec.borrow().len(), 1, "agora SIM injetou no PTY");
+        assert_eq!(
+            records_of_kind(&ts.store, "OrchestrationResumed").len(),
+            1,
+            "OrchestrationResumed no log"
+        );
+        assert_eq!(
+            records_of_kind(&ts.store, "MessageRouted").len(),
+            1,
+            "ao drenar, a delegação é finalmente roteada"
+        );
+        assert!(
+            !infl.exists(),
+            "drenada → .inflight limpo (ack após persistir)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **W4-3 (freio) — durabilidade do estado pós-crash (inv #4/#6).** O freio é event-sourced:
+    /// `OrchestrationPaused` vai ao log. Um `Router` novo (recuperação pós-crash) nasce despausado
+    /// (estado em memória), mas RECONSTRÓI `paused` do log via `restore_orchestration_state` → o freio
+    /// que o humano acionou NÃO é perdido pelo crash (a fila represada segue represada).
+    #[test]
+    fn orchestration_pause_state_survives_restart_via_log() {
+        let (mut router, sup, dir) = router_with("freio-restart");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("freio-restart");
+        let (_rec, mut deliver) = recorder();
+
+        router.pause(&mut ts.store).expect("pause");
+        assert!(router.is_paused());
+
+        // "Crash": descarta o Router; um novo sobre o MESMO log nasce DESPAUSADO (estado em memória).
+        drop(router);
+        let mut router2 = Router::new(Arc::clone(&sup), Mailbox::new(dir.join(".lina")));
+        assert!(
+            !router2.is_paused(),
+            "Router novo nasce despausado (paused é estado em memória)"
+        );
+
+        // Reconstrói do log (fonte da verdade, inv #4) → volta a pausado.
+        router2
+            .restore_orchestration_state(&ts.store)
+            .expect("restore");
+        assert!(router2.is_paused(), "freio reconstruído do log");
+
+        // Prova observável: uma delegação segue ENFILEIRADA (o crash NÃO drenou a fila represada).
+        router2
+            .mailbox()
+            .enqueue(&MailMessage::new("@A", "@B", "ask", "pós-crash"))
+            .expect("enqueue");
+        let r = router2.pump(&mut ts.store, 1000, &mut deliver);
+        assert!(
+            matches!(r[0].1, RouteOutcome::Queued),
+            "freio restaurado do log → delegação ainda enfileira (não drena no crash)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────── Round 5 furos #6/#7: wait-for-graph multi-aresta (ADR 0002 reforçado) ─────────────
+
+    /// **Round 5 #7 (desync pending × wait-for-graph).** Um waiter pode ter DOIS awaits abertos a
+    /// alvos distintos. O 2º NÃO pode apagar a aresta do 1º (o grafo é multi-aresta por waiter), e
+    /// fechar 1 ticket libera SÓ aquela aresta — o outro segue vivo. Antes (1 aresta/waiter) o 2º
+    /// sobrescrevia o 1º → o guard de deadlock ficava cego para a aresta perdida.
+    #[test]
+    fn second_await_does_not_erase_first_multi_edge() {
+        let (mut router, sup, dir) = router_with("multi-await");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("multi-await");
+        let (_rec, mut deliver) = recorder();
+
+        // B--await-->A (ticket1) e B--await-->C (ticket2): AMBAS as arestas devem coexistir.
+        let q1 = MailMessage::new("@B", "@A", "ask", "p1").awaiting();
+        assert!(matches!(
+            router.route_message(&q1, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let q2 = MailMessage::new("@B", "@C", "ask", "p2").awaiting();
+        assert!(matches!(
+            router.route_message(&q2, &mut ts.store, 1001, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        // Com ambas vivas, fechar o ciclo por qualquer alvo é deadlock (o guard vê AS DUAS arestas).
+        assert!(
+            sup.would_await_deadlock(a, b),
+            "B--await-->A vivo → A--await-->B é deadlock"
+        );
+        assert!(
+            sup.would_await_deadlock(c, b),
+            "B--await-->C vivo → C--await-->B é deadlock"
+        );
+
+        // Fecha SÓ o ticket1 (reply A→B casa q1): a aresta B→A sai; B→C SOBREVIVE.
+        let reply1 = MailMessage::new("@A", "@B", "ask", "r1").replying_to(q1.id.clone());
+        assert!(matches!(
+            router.route_message(&reply1, &mut ts.store, 1002, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        assert!(
+            !sup.would_await_deadlock(a, b),
+            "ticket1 fechado → A--await-->B liberado"
+        );
+        assert!(
+            sup.would_await_deadlock(c, b),
+            "ticket2 ainda vivo → fechar 1 NÃO libera o outro (C--await-->B segue deadlock)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Round 5 #6 (broadcast-await apaga aresta viva).** Com um single-target await ABERTO
+    /// (B--await-->A, ticket em pending), um broadcast-await do MESMO sender faz a checagem de
+    /// deadlock SEM mutar a aresta viva — a aresta B→A SOBREVIVE e o guard NÃO fica cego. Antes, o
+    /// ramo chamava `end_await(sender)` incondicional e apagava B→A (deixando A--await-->B passar).
+    #[test]
+    fn broadcast_await_preserves_live_single_target_edge() {
+        let (mut router, sup, dir) = router_with("bcast-await");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("bcast-await");
+        let (_rec, mut deliver) = recorder();
+
+        // B--await-->A (single-target): aresta b→a VIVA (ticket em pending).
+        let q = MailMessage::new("@B", "@A", "ask", "single").awaiting();
+        assert!(matches!(
+            router.route_message(&q, &mut ts.store, 1000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert!(
+            sup.would_await_deadlock(a, b),
+            "pré: b→a vivo → a--await-->b é deadlock"
+        );
+
+        // B faz um BROADCAST --await: a checagem de deadlock é PURA (não muta) → b→a SOBREVIVE.
+        let bc = MailMessage::new("@B", "*", "broadcast", "todos").awaiting();
+        let out = router.route_message(&bc, &mut ts.store, 1001, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "broadcast-await entregue (sem deadlock espúrio): {out:?}"
+        );
+
+        // O guard NÃO ficou cego: b→a continua vivo → a--await-->b SEGUE deadlock.
+        assert!(
+            sup.would_await_deadlock(a, b),
+            "pós-broadcast: b→a sobreviveu → a--await-->b ainda é deadlock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────── Round 5 #8: binding delivered_root migra p/ a cadeia ativa + poda ───────────────
+
+    /// **Round 5 #8 (binding nunca migra/poda → grafo anti-loop fragmenta).** Passada a janela (nó
+    /// OCIOSO, sem await pendente), uma cadeia NOVA entregue ao nó MIGRA o binding para o root ativo
+    /// (em vez de congelar no 1º root para sempre). Sem isso, `handoff_would_loop` fragmenta por
+    /// sessão. A defesa anti-forja segue: P1 (foreign root FRESCO não migra) é o teste separado.
+    #[test]
+    fn delivered_root_migrates_to_active_chain_after_window() {
+        let (mut router, sup, dir) = router_with("migrate");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("migrate");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B sob a cadeia R1: fixa o binding de B em R1.
+        let m1 = MailMessage::new("@A", "@B", "ask", "cadeia R1");
+        router.route_message(&m1, &mut ts.store, 1000, &mut deliver);
+        let r1 = m1.id.clone();
+
+        // Passada a janela (B ocioso, sem await): A→B sob a cadeia NOVA R2 → o binding de B MIGRA.
+        let later = 1000 + DEDUPE_WINDOW_MS + 1;
+        let m2 = MailMessage::new("@A", "@B", "ask", "cadeia R2");
+        router.route_message(&m2, &mut ts.store, later, &mut deliver);
+        let r2 = m2.id.clone();
+        assert_ne!(r1, r2, "cada origem A gera um root fresco por msg");
+
+        // B delega (root=None) → deriva do binding ATIVO (R2), não congela em R1.
+        let m3 = MailMessage::new("@B", "@C", "ask", "delega");
+        assert!(matches!(
+            router.route_message(&m3, &mut ts.store, later, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let routed = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "MessageRouted")
+            .find(|r| r.payload["to"].as_str() == Some("@C"))
+            .expect("MessageRouted de B→C");
+        assert_eq!(
+            routed.payload["root_cause_id"].as_str(),
+            Some(r2.as_str()),
+            "binding migrou p/ a cadeia ATIVA R2 (não congelou em R1 → anti-loop não fragmenta)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────── Round 5 #9: janela do teto de custo é DIÁRIA (zera à meia-noite) ───────────────
+
+    /// **Round 5 #9 (janela do teto não era diária).** O `CostLedger` soma SÓ o uso do dia-UTC
+    /// corrente (`utc_day(rec.ts)==utc_day(now_ms)`): uso de ONTEM não conta hoje e um `CostCeilingHit`
+    /// de ontem NÃO mantém o workspace pausado hoje → a janela zera sozinha à meia-noite, reduzindo a
+    /// dependência do `lina resume` humano. Testa o agregador PURO `from_records` com `ts` controlado
+    /// (o `append` carimba wall-clock; aqui construímos os `EventRecord` direto — campos públicos).
+    #[test]
+    fn cost_window_is_daily_yesterday_excluded() {
+        const DAY_MS: u64 = 86_400_000;
+        let today = 1_700_000_000_000_u64; // ms fixos → dia-UTC determinístico
+        let yesterday = today - DAY_MS;
+        let rec = |seq: u64, ts: u64, kind: &str, payload: serde_json::Value| EventRecord {
+            seq,
+            ts,
+            kind: kind.to_string(),
+            version: 1,
+            payload,
+        };
+        let recs = vec![
+            // ONTEM: uso alto + teto batido (deveria estar "esquecido" hoje).
+            rec(
+                1,
+                yesterday,
+                "TokenUsageReported",
+                serde_json::json!({ "node": "@B", "tokens": 999 }),
+            ),
+            rec(
+                2,
+                yesterday,
+                "CostCeilingHit",
+                serde_json::json!({ "day": utc_day(yesterday), "tokens": 999 }),
+            ),
+            // HOJE: só este uso conta.
+            rec(
+                3,
+                today,
+                "TokenUsageReported",
+                serde_json::json!({ "node": "@B", "tokens": 10 }),
+            ),
+        ];
+
+        let ledger = CostLedger::from_records(&recs, today);
+        assert_eq!(
+            ledger.day,
+            utc_day(today),
+            "o rótulo do dia vem do relógio (now_ms)"
+        );
+        assert_eq!(
+            ledger.tokens, 10,
+            "só o uso de HOJE conta na janela (o de ontem não)"
+        );
+        assert!(
+            !ledger.paused,
+            "o CostCeilingHit de ONTEM NÃO pausa hoje — a janela zera à meia-noite sem resume"
+        );
+
+        // Sanidade: o mesmo log avaliado em ONTEM enxergava o teto batido (uso 999, pausado).
+        let ledger_yest = CostLedger::from_records(&recs, yesterday);
+        assert_eq!(ledger_yest.tokens, 999, "ontem somava o uso de ontem");
+        assert!(
+            ledger_yest.paused,
+            "ontem estava pausado (CostCeilingHit do dia)"
+        );
     }
 }

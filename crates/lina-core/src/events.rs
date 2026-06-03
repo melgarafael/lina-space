@@ -287,6 +287,14 @@ pub enum DomainEvent {
     WorkspaceFocusSet {
         workspace: String,
     },
+    /// W4-3 (freio do rodapé): a auto-orquestração foi PAUSADA pelo humano. Enquanto pausada, novas
+    /// delegações ficam ENFILEIRADAS (não injetadas) — é GATE, não kill (inv #6): nada se perde, o
+    /// estado fica salvo e visível. META — o estado de pausa vive no Router (escritor único); aqui só
+    /// registra o fato no log (livro-razão do freio, par de [`DomainEvent::OrchestrationResumed`]).
+    OrchestrationPaused,
+    /// W4-3 (freio do rodapé): a auto-orquestração foi RETOMADA → a fila de delegações represadas é
+    /// drenada (roteada/entregue agora). META — par de [`DomainEvent::OrchestrationPaused`].
+    OrchestrationResumed,
     SnapshotTaken {
         seq: u64,
     },
@@ -329,6 +337,8 @@ impl DomainEvent {
             DomainEvent::FolderCreated { .. } => "FolderCreated",
             DomainEvent::CliProfileSet { .. } => "CliProfileSet",
             DomainEvent::WorkspaceFocusSet { .. } => "WorkspaceFocusSet",
+            DomainEvent::OrchestrationPaused => "OrchestrationPaused",
+            DomainEvent::OrchestrationResumed => "OrchestrationResumed",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
         }
     }
@@ -544,6 +554,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // fato do artefato no log, sem efeito na projeção do canvas (mesmo padrão de `NoteUpdated`).
         | DomainEvent::NoteCreated { .. }
         | DomainEvent::FolderCreated { .. }
+        // W4-3: pausa/retomada da orquestração são META (livro-razão do freio); o estado vive no
+        // Router (escritor único), reconstruível do log — sem efeito na projeção do canvas.
+        | DomainEvent::OrchestrationPaused
+        | DomainEvent::OrchestrationResumed
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }

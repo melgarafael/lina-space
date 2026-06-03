@@ -372,7 +372,14 @@ fn c_anti_loop_por_turno() {
 /// --confirm` apenda) zera a janela e reabre. Anti-amplificação (A4): 1 só `CostCeilingHit`.
 #[test]
 fn d_teto_de_custo_pausa_e_reabre() {
-    const NOW: u64 = 1_700_000_000_000; // ms fixos → `day` determinístico.
+    // Round 5 #9: a janela do teto agora é DIÁRIA (`utc_day(rec.ts)==utc_day(now_ms)`). O `append`
+    // carimba o `ts` com wall-clock real (sem injeção de relógio), então o `now_ms` do replay precisa
+    // cair no MESMO dia-UTC dos appends → usamos o relógio real (o intent do gate — teto pausa/reabre,
+    // anti-amplificação — é preservado; só a base de relógio muda).
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let cfg = RouterConfig {
         token_budget_day: 100,
         ..RouterConfig::default()
@@ -385,7 +392,7 @@ fn d_teto_de_custo_pausa_e_reabre() {
     // (1) ANTES do teto (uso 0 < 100): delegação normal, nenhum CostCeilingHit.
     let m1 = MailMessage::new("@A", "@B", "ask", "antes");
     assert!(matches!(
-        e.router.route_message(&m1, &mut e.store, NOW, &mut deliver),
+        e.router.route_message(&m1, &mut e.store, now, &mut deliver),
         RouteOutcome::Delivered { .. }
     ));
     assert!(
@@ -408,13 +415,13 @@ fn d_teto_de_custo_pausa_e_reabre() {
     // (2) Uso (150) ≥ teto (100): a próxima delegação é GATEADA (Paused), não entregue.
     let m2 = MailMessage::new("@A", "@B", "ask", "estoura");
     assert_eq!(
-        e.router.route_message(&m2, &mut e.store, NOW, &mut deliver),
+        e.router.route_message(&m2, &mut e.store, now, &mut deliver),
         RouteOutcome::CostCeiling
     );
     // (2b) Já pausado: ainda bloqueia, mas NÃO re-apenda (A4).
     let m3 = MailMessage::new("@A", "@B", "ask", "ainda pausado");
     assert_eq!(
-        e.router.route_message(&m3, &mut e.store, NOW, &mut deliver),
+        e.router.route_message(&m3, &mut e.store, now, &mut deliver),
         RouteOutcome::CostCeiling
     );
 
@@ -437,7 +444,7 @@ fn d_teto_de_custo_pausa_e_reabre() {
         "day é um rótulo UTC YYYY-MM-DD; veio {day:?}"
     );
     assert!(
-        CostLedger::replay(&e.store, NOW).expect("ledger").paused,
+        CostLedger::replay(&e.store, now).expect("ledger").paused,
         "o ledger reconstruído do log indica Paused (projeção observável, invariante #6)"
     );
     assert!(
@@ -452,12 +459,12 @@ fn d_teto_de_custo_pausa_e_reabre() {
         .append(&DomainEvent::CostCeilingResumed { day })
         .expect("CostCeilingResumed");
     assert!(
-        !CostLedger::replay(&e.store, NOW).expect("ledger").paused,
+        !CostLedger::replay(&e.store, now).expect("ledger").paused,
         "após resume, o workspace não está mais Paused"
     );
     let m4 = MailMessage::new("@A", "@B", "ask", "depois do resume");
     assert!(matches!(
-        e.router.route_message(&m4, &mut e.store, NOW, &mut deliver),
+        e.router.route_message(&m4, &mut e.store, now, &mut deliver),
         RouteOutcome::Delivered { .. }
     ));
     assert!(

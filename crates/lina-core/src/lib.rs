@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -791,32 +791,80 @@ impl Drop for PtyGuard {
     }
 }
 
-/// Grafo wait-for: `waiter -> target` (cada nó bloqueado em `ask` espera 1 alvo).
+/// Grafo wait-for MULTI-ARESTA: `waiter -> {(ticket_id, target)}`. Um waiter pode estar bloqueado em
+/// VÁRIOS `ask --await` ao mesmo tempo (single-targets concorrentes); cada aresta é uma pergunta
+/// pendente, chaveada pelo `id` do ticket para que fechar UMA não derrube as outras (Round 5 #6/#7).
+/// A checagem de deadlock considera TODAS as arestas (alcançabilidade no grafo).
 #[derive(Default)]
 struct WaitForGraph {
-    awaiting: HashMap<NodeId, NodeId>,
+    awaiting: HashMap<NodeId, HashSet<(String, NodeId)>>,
 }
 
 impl WaitForGraph {
-    /// Tenta registrar `waiter` esperando `target`. `Err` se fecharia um ciclo
-    /// (`target` alcança `waiter` seguindo as arestas) — NÃO insere nesse caso.
-    fn add(&mut self, waiter: NodeId, target: NodeId) -> Result<(), ()> {
-        let mut cur = target;
-        loop {
-            if cur == waiter {
-                return Err(()); // fecharia um ciclo
+    /// `true` se `from` alcança `goal` seguindo as arestas de await (DFS com `visited`). O grafo é
+    /// mantido acíclico por [`WaitForGraph::add`]; o `visited` garante terminação defensivamente.
+    fn reaches(&self, from: NodeId, goal: NodeId) -> bool {
+        let mut stack = vec![from];
+        let mut visited = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == goal {
+                return true;
             }
-            match self.awaiting.get(&cur) {
-                Some(&next) => cur = next,
-                None => break,
+            if !visited.insert(n) {
+                continue;
+            }
+            if let Some(edges) = self.awaiting.get(&n) {
+                for (_, t) in edges {
+                    stack.push(*t);
+                }
             }
         }
-        self.awaiting.insert(waiter, target);
+        false
+    }
+
+    /// `true` se abrir `waiter -> target` fecharia um ciclo (`target` já alcança `waiter`). PURO — não
+    /// muta (Round 5 #6: o broadcast-await usa isto p/ não apagar arestas vivas).
+    fn would_cycle(&self, waiter: NodeId, target: NodeId) -> bool {
+        self.reaches(target, waiter)
+    }
+
+    /// Registra a aresta `waiter --(id)--> target`. `Err` se fecharia um ciclo (NÃO insere).
+    /// Multi-aresta: NÃO sobrescreve as outras arestas do `waiter` (Round 5 #7).
+    fn add(&mut self, waiter: NodeId, id: String, target: NodeId) -> Result<(), ()> {
+        if self.would_cycle(waiter, target) {
+            return Err(());
+        }
+        self.awaiting
+            .entry(waiter)
+            .or_default()
+            .insert((id, target));
         Ok(())
     }
 
-    fn remove(&mut self, waiter: NodeId) {
+    /// Remove SÓ a aresta `(id, target)` de `waiter` (fechamento de UM ticket — Round 5 #7). Poda o
+    /// waiter se ficou sem arestas.
+    fn remove_edge(&mut self, waiter: NodeId, id: &str, target: NodeId) {
+        if let Some(edges) = self.awaiting.get_mut(&waiter) {
+            edges.retain(|(eid, t)| !(eid == id && *t == target));
+            if edges.is_empty() {
+                self.awaiting.remove(&waiter);
+            }
+        }
+    }
+
+    /// Remove TODAS as arestas de `waiter` (conveniência — fecha o await do nó como um todo).
+    fn remove_all(&mut self, waiter: NodeId) {
         self.awaiting.remove(&waiter);
+    }
+
+    /// Remove `node` do grafo por completo: como waiter (suas arestas) E como alvo (arestas que
+    /// apontam para ele) — não trava quem o esperava. Usado em `mark_dead`/`unregister`.
+    fn drop_node(&mut self, node: NodeId) {
+        self.awaiting.remove(&node);
+        for edges in self.awaiting.values_mut() {
+            edges.retain(|(_, t)| *t != node);
+        }
+        self.awaiting.retain(|_, edges| !edges.is_empty());
     }
 }
 
@@ -979,11 +1027,9 @@ impl Supervisor {
             info.status = NodeStatus::Dead;
         }
         self.stop_terminal(node);
-        {
-            let mut wf = lock(&self.waitfor);
-            wf.remove(node);
-            wf.awaiting.retain(|_, target| *target != node);
-        }
+        // Round 5 #7: limpa o nó do grafo multi-aresta — como waiter E como alvo (não trava quem
+        // o esperava).
+        lock(&self.waitfor).drop_node(node);
         self.publish(BusEvent::NodeDied { node });
         Ok(())
     }
@@ -993,11 +1039,9 @@ impl Supervisor {
         let existed = lock(&self.registry).remove(&node).is_some();
         lock(&self.order).retain(|n| *n != node);
         self.stop_terminal(node);
-        {
-            let mut wf = lock(&self.waitfor);
-            wf.remove(node);
-            wf.awaiting.retain(|_, target| *target != node);
-        }
+        // Round 5 #7: limpa o nó do grafo multi-aresta — como waiter E como alvo (não trava quem
+        // o esperava).
+        lock(&self.waitfor).drop_node(node);
         if existed {
             self.publish(BusEvent::NodeDied { node });
             Ok(())
@@ -1218,17 +1262,49 @@ impl Supervisor {
             .unwrap_or_default()
     }
 
-    /// Registra que `waiter` espera o `reply` de `target` (ask bloqueante). Retorna
-    /// `CycleDetected` na hora (sem travar) se fecharia um ciclo no wait-for-graph.
+    /// Registra que `waiter` espera o `reply` de `target` (ask bloqueante) — CONVENIÊNCIA (1 aresta
+    /// por alvo, chaveada pelo próprio alvo). Retorna `CycleDetected` na hora (sem travar) se fecharia
+    /// um ciclo. Para o lifecycle por-ticket do router (multi-aresta), use [`Supervisor::begin_await_ticket`].
+    ///
+    /// DISCIPLINA: pareie SEMPRE com [`Supervisor::end_await`] (fecha por waiter). NÃO misture com a
+    /// API de ticket no MESMO `(waiter, target)` — as chaves de aresta diferem (alvo vs `id`), e fechar
+    /// por uma não removeria a aresta aberta pela outra. (O router de produção usa SÓ a API de ticket;
+    /// esta conveniência serve a testes/probes de deadlock.)
     pub fn begin_await(&self, waiter: NodeId, target: NodeId) -> Result<(), SupervisorError> {
+        self.begin_await_ticket(waiter, &target.to_string(), target)
+    }
+
+    /// **Round 5 #7: abre a aresta de await chaveada pelo `id` do ticket** — multi-aresta por waiter
+    /// (dois `ask --await` concorrentes coexistem; abrir o 2º NÃO apaga o 1º). `CycleDetected` (sem
+    /// travar) se fecharia um ciclo no wait-for-graph.
+    pub fn begin_await_ticket(
+        &self,
+        waiter: NodeId,
+        id: &str,
+        target: NodeId,
+    ) -> Result<(), SupervisorError> {
         lock(&self.waitfor)
-            .add(waiter, target)
+            .add(waiter, id.to_string(), target)
             .map_err(|()| SupervisorError::CycleDetected { waiter, target })
     }
 
-    /// Encerra o await de `waiter` (chegou o reply ou deu timeout).
+    /// **Round 5 #6: checagem PURA de deadlock** — `true` se abrir `waiter --await--> target` fecharia
+    /// um ciclo. NÃO muta o grafo (o broadcast-await usa isto p/ não apagar a aresta viva do sender).
+    #[must_use]
+    pub fn would_await_deadlock(&self, waiter: NodeId, target: NodeId) -> bool {
+        lock(&self.waitfor).would_cycle(waiter, target)
+    }
+
+    /// Encerra TODOS os awaits de `waiter` — CONVENIÊNCIA (chegou o reply ou deu timeout). Para fechar
+    /// SÓ um ticket (multi-aresta), use [`Supervisor::end_await_ticket`].
     pub fn end_await(&self, waiter: NodeId) {
-        lock(&self.waitfor).remove(waiter);
+        lock(&self.waitfor).remove_all(waiter);
+    }
+
+    /// **Round 5 #7: fecha SÓ a aresta `(id, target)`** de `waiter` — fechar um ticket não libera os
+    /// outros awaits abertos do mesmo waiter.
+    pub fn end_await_ticket(&self, waiter: NodeId, id: &str, target: NodeId) {
+        lock(&self.waitfor).remove_edge(waiter, id, target);
     }
 
     /// Resolve os destinatários de um envelope aplicando anti-loop de mensagem
