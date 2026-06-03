@@ -26,6 +26,9 @@ lina-secrets = { path = "../../crates/lina-secrets" }
 serde_json = "1"
 # W4-1: persistência retomável do onboarding (`onboarding.json`: passo + escolhas) via derive.
 serde = { version = "1", features = ["derive"] }
+# W4-2 (M3/M4 criadores): cunhar o NodeId (UUID v7) do nó da nota/pasta em código de PRODUÇÃO
+# (antes só dev-dep). Mesma instância do core → o NodeId unifica. Sem mudança no grafo de deps.
+uuid = { version = "1", features = ["v7"] }
 # Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
 tokio = { version = "1", features = ["sync"] }
 # gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal

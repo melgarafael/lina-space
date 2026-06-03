@@ -8,6 +8,8 @@
 mod bridge;
 // W4-2: modelo de cena do canvas T4 (zonas foco/periferia/suspenso + badge) — gpui-free, testável.
 mod canvas;
+// W4-2 · M1: paleta de comandos (Cmd-K) sobre o canvas — modelo puro testável + render gpui.
+mod palette;
 // W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
 mod onboarding;
 // W4-3: chrome de conexão "sem fios" — freio (pausa de orquestração), selo por membership, reduce-motion.
@@ -20,6 +22,10 @@ mod persistence_ui;
 mod gallery;
 // W4-6: acessibilidade (AccessibleBuffer sem ANSI, live-region "resposta pronta", WCAG, reduce-motion).
 mod a11y;
+// W4-2 · P4: inspetor do nó selecionado (nome/papel/activity/perfil/status) — gpui-free, testável.
+mod inspector;
+// W4-2 · M3/M4: criadores de NOTA e PASTA (apenda Note/FolderCreated + persiste em .lina/) — gpui-free, testável.
+mod creators;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -278,6 +284,8 @@ struct WorkspaceView {
     reduce_motion: bool,
     /// W4-6: anunciador da live-region ("resposta pronta" 1×/turno na transição →Idle, não por byte).
     a11y_live: a11y::LiveRegion,
+    /// W4-2 · M1: paleta de comandos (Cmd-K). Fechada por padrão.
+    palette: palette::PaletteState,
 }
 
 impl WorkspaceView {
@@ -313,6 +321,46 @@ impl WorkspaceView {
             // W4-6: inicializa do SO/env (LINA_REDUCE_MOTION); o toggle do rodapé sobrepõe depois.
             reduce_motion: a11y::os_reduce_motion(),
             a11y_live: a11y::LiveRegion::default(),
+            palette: palette::PaletteState::default(),
+        }
+    }
+
+    /// W4-2 · M1: a lista de comandos da paleta (rebuild a cada Cmd-K — o roster muda). Comandos
+    /// estáticos + "Focar: <nó>" por nó vivo.
+    fn palette_commands(&self) -> Vec<palette::Command> {
+        use palette::{Command, PaletteAction as A};
+        let mut cmds = vec![
+            Command::new("✦ Novo agente", A::NewAgent),
+            Command::new("⏸ Pausar / retomar orquestração (freio)", A::ToggleBrake),
+            Command::new("📝 Nova nota", A::NewNote),
+            Command::new("📁 Nova pasta", A::NewFolder),
+        ];
+        for (id, nv) in self.nodes.cards() {
+            cmds.push(Command::new(
+                format!("🎯 Focar: {}", nv.name),
+                A::FocusNode(id),
+            ));
+        }
+        cmds
+    }
+
+    /// W4-2 · M1: executa a ação escolhida na paleta (toca o estado do canvas — `naming`/`focus`/`brake`).
+    /// Nota/pasta são placeholder até `creators.rs` (M3/M4, outro terminal).
+    fn run_palette_action(&mut self, action: palette::PaletteAction, window: &Window) {
+        use palette::PaletteAction as A;
+        match action {
+            A::NewAgent => self.naming = Some(String::new()), // reusa o modo nomeação do M2
+            A::FocusNode(node) => {
+                self.focus(node);
+                self.reveal(node, window);
+            }
+            A::ToggleBrake => lock(&self.brake).toggle_requested = true,
+            A::NewNote => eprintln!(
+                "lina-gpui: M1→M3 'nova nota' — creators.rs (M3/M4) ainda nao existe (placeholder)"
+            ),
+            A::NewFolder => eprintln!(
+                "lina-gpui: M1→M4 'nova pasta' — creators.rs (M3/M4) ainda nao existe (placeholder)"
+            ),
         }
     }
 
@@ -577,6 +625,27 @@ impl WorkspaceView {
                     }
                 }
             }
+            cx.notify();
+            return;
+        }
+        // W4-2 · M1 — PALETA DE COMANDOS: se aberta, as teclas a DIRIGEM (digita filtra · ↑↓ navega ·
+        // Enter executa · Esc fecha). Modificador (⌘/Ctrl) NÃO entra na query (evita ⌘V virar texto).
+        if self.palette.is_open() {
+            let ch = if ks.modifiers.platform || ks.modifiers.control {
+                None
+            } else {
+                ks.key_char.as_deref()
+            };
+            if let Some(action) = self.palette.handle_key(ks.key.as_str(), ch) {
+                self.run_palette_action(action, window);
+            }
+            cx.notify();
+            return;
+        }
+        // ⌘K abre a paleta (rebuild dos comandos com o roster do momento).
+        if ks.modifiers.platform && ks.key == "k" {
+            let cmds = self.palette_commands();
+            self.palette.open(cmds);
             cx.notify();
             return;
         }
@@ -1321,7 +1390,13 @@ impl Render for WorkspaceView {
             );
         }
 
-        root.child(topbar).child(footer)
+        let root = root.child(topbar).child(footer);
+        // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
+        if self.palette.is_open() {
+            root.child(self.palette.render())
+        } else {
+            root
+        }
     }
 }
 
