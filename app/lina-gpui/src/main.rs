@@ -429,6 +429,33 @@ impl WorkspaceView {
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // W4-3 FIX (pulso A→B do `lina ask`): o pulso nasce numa thread gpui-free (MailboxPump/
+        // `deliver_fn` e a ProjectionPump), que NÃO acorda o event loop do gpui. Sem input de UI
+        // recente, o `request_animation_frame` (que só se auto-sustenta enquanto CHEGAM frames) não
+        // roda → o pulso fica parado (`progressing=false`, provado pela instrumentação) e some
+        // invisível. Este loop de animação dirige re-renders ENQUANTO houver pulso vivo: detecta o
+        // nascimento por poll BARATO do model (sem render) e força `cx.notify()` a ~60fps até
+        // `Pulse::progress()` expirar (~1100ms). Cobre os DOIS caminhos (lina-ask e Bus) sem tocar a
+        // ponte gpui-free e sem quebrar o caminho do botão A2A.
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(alive) = this.update(cx, |view, cx| {
+                    let alive = lock(&view.nodes.model)
+                        .pulse
+                        .is_some_and(|p| p.progress().is_some());
+                    if alive {
+                        cx.notify(); // marca dirty → o frame re-renderiza e anima o dot
+                    }
+                    alive
+                }) else {
+                    break; // a view foi dropada (app fechando) → encerra o loop.
+                };
+                cx.background_executor()
+                    .timer(Duration::from_millis(if alive { 16 } else { 50 }))
+                    .await;
+            }
+        })
+        .detach();
         Self {
             nodes,
             input,
