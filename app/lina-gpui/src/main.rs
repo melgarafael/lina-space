@@ -6,6 +6,10 @@
 //! e o diferencial **A2A com pulso "sem fios"**. Tradução core↔UI em [`bridge`] (gpui-free).
 
 mod bridge;
+// W4-2: modelo de cena do canvas T4 (zonas foco/periferia/suspenso + badge) — gpui-free, testável.
+mod canvas;
+// W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
+mod onboarding;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -253,6 +257,9 @@ struct WorkspaceView {
     /// W3-6c: mesa de custódia compartilhada com a [`BrokerPump`]. O banner do gate humano é lido
     /// daqui; ⌘⏎ sinaliza a confirmação (tecla na janela = gate inforjável pelo PTY do agente).
     desk: Desk,
+    /// W4-2 · M2 "Novo Agente": `Some(buffer)` enquanto o humano DIGITA o nome do agente novo (modo
+    /// nomeação). Enter cria (papel derivado do nome), Esc cancela. `None` = fora do modo nomeação.
+    naming: Option<String>,
 }
 
 impl WorkspaceView {
@@ -281,6 +288,7 @@ impl WorkspaceView {
             dragging_sel: false,
             report_node: None,
             desk,
+            naming: None,
         }
     }
 
@@ -504,6 +512,50 @@ impl WorkspaceView {
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        // W4-2 · M2 — MODO NOMEAÇÃO: enquanto o humano digita o nome do agente novo, as teclas montam
+        // o buffer (NÃO vão para o PTY). Enter cria (papel derivado do nome); Esc cancela; Backspace
+        // apaga. Captura ANTES de tudo (é um modo modal leve).
+        if self.naming.is_some() {
+            match ks.key.as_str() {
+                "escape" => {
+                    self.naming = None;
+                }
+                "enter" | "return" => {
+                    let name = self.naming.take().unwrap_or_default();
+                    let name = name.trim().to_string();
+                    if !name.is_empty() {
+                        match self.nodes.create_agent(&name) {
+                            Ok(node) => {
+                                self.focus(node);
+                                self.reveal(node, window);
+                            }
+                            Err(e) => eprintln!("lina-gpui: M2 criar agente '{name}': {e}"),
+                        }
+                    }
+                }
+                "backspace" => {
+                    if let Some(buf) = self.naming.as_mut() {
+                        buf.pop();
+                    }
+                }
+                _ => {
+                    // Caractere imprimível → entra no nome (ignora chords com ⌘/Ctrl e teclas-controle).
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(kc) = ks
+                            .key_char
+                            .as_ref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                        {
+                            if let Some(buf) = self.naming.as_mut() {
+                                buf.push_str(kc);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         // W3-6c (ADR 0004) — GATE HUMANO na FRENTE da fila (custódia OU retomada do teto). Teclas NA
         // JANELA do app: o PTY do agente não as sintetiza → inforjável. ⌘⏎ APROVA; ⌘⇧⏎ RECUSA/dispensa
         // (saída p/ limpar flood/erro sem executar — hole 2). Confirma/recusa SÓ a frente. NÃO vai p/ o PTY.
@@ -734,8 +786,11 @@ impl Render for WorkspaceView {
             let node_id = *id;
             // ID de elemento ESTÁVEL por nó (não o idx do loop, que muda com cull/z-order).
             let card_eid = eid.get(&node_id).copied().unwrap_or(idx);
-            // CULLING: cards fora da viewport não geram trabalho de render (grid pulado).
-            if !card_visible(&cam, (nv.x, nv.y), (CARD_W, CARD_H), viewport) {
+            // W4-2: a ZONA do nó (foco/periferia/suspenso) decide COMO desenhar. Fonte do `in_viewport`
+            // é o MESMO culling (W2-3). Suspenso (fora da viewport) → 0 draw-calls (continue).
+            let in_viewport = card_visible(&cam, (nv.x, nv.y), (CARD_W, CARD_H), viewport);
+            let zone = canvas::classify_zone(node_id == focused, in_viewport);
+            if zone == canvas::Zone::Suspended {
                 continue;
             }
             let (sx, sy) = cam.world_to_screen((nv.x, nv.y));
@@ -821,10 +876,52 @@ impl Render for WorkspaceView {
                         view.pointer_down(node_id, ev);
                     }),
                 );
-            let grid = lock(&self.nodes.grids).get(&node_id).cloned();
-            if let Some(g) = grid {
-                let screen = lock(&g).screen();
-                body = body.child(render_grid(&screen, z, card_sel));
+            // W4-2 · P0 (degradação de ociosos, red-team doc 12): SÓ o nó em FOCO desenha o grid ao
+            // vivo (grande, 120fps). Na PERIFERIA, o cartão é COMPACTO — um BADGE agregado e honesto,
+            // SEM render do grid (custo de CPU de ocioso ~0). Clicar foca → vira grande.
+            match zone {
+                canvas::Zone::Focus => {
+                    let grid = lock(&self.nodes.grids).get(&node_id).cloned();
+                    if let Some(g) = grid {
+                        let screen = lock(&g).screen();
+                        body = body.child(render_grid(&screen, z, card_sel));
+                    }
+                }
+                canvas::Zone::Periphery => {
+                    // "precisa de você" se há um gate humano pendente para este nó (round 5).
+                    let needs_human = lock(&self.desk)
+                        .queue
+                        .iter()
+                        .any(|p| p.requester() == nv.name);
+                    let badge = canvas::aggregate_badge(nv.status, needs_human, 0);
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .size_full()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(rgb(badge.bg()))
+                                    .text_color(rgb(0x11111b))
+                                    .text_size(px(14.0 * z))
+                                    .child(text!(badge.label())),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(0x5b658f))
+                                    .text_size(px(11.0 * z))
+                                    .child(text!("clique para focar")),
+                            ),
+                    );
+                }
+                // Suspenso já deu `continue` acima (culling).
+                canvas::Zone::Suspended => {}
             }
 
             let card = div()
@@ -1012,6 +1109,41 @@ impl Render for WorkspaceView {
                 .child(text!("➕ Terminal")),
         );
 
+        // W4-2 · M2 "Novo Agente": entra no modo nomeação (o humano digita o nome → papel derivado).
+        // Quando ativo, mostra o buffer com cursor; senão, o botão.
+        match &self.naming {
+            Some(buf) => {
+                topbar = topbar.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x3a3f5a))
+                        .text_color(rgb(0xeef1ff))
+                        .child(text!(format!(
+                            "✦ Novo agente: {buf}▌  (Enter cria · Esc cancela)"
+                        ))),
+                );
+            }
+            None => {
+                topbar = topbar.child(
+                    div()
+                        .id("new-agent-btn")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x6c4ad1))
+                        .text_color(rgb(0xeef1ff))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
+                            // Abre o modo nomeação; o `handle_key` monta o buffer e cria no Enter.
+                            view.naming = Some(String::new());
+                        }))
+                        .child(text!("✦ Novo Agente")),
+                );
+            }
+        }
+
         // 🏠 Centralizar: resgata a vista (pan/zoom → home). Sempre visível p/ o não-técnico
         // nunca ficar perdido no canvas (mesmo efeito do ⌘0).
         topbar = topbar.child(
@@ -1149,6 +1281,7 @@ fn main() {
             &delta_tx,
             "A",
             "Terminal A",
+            "terminal",
             cmd_a,
             cols,
             rows,
@@ -1163,6 +1296,7 @@ fn main() {
             &delta_tx,
             "B",
             "Terminal B",
+            "terminal",
             cmd_b,
             cols,
             rows,
@@ -1316,6 +1450,13 @@ fn main() {
     }
 
     application().run(move |cx: &mut App| {
+        // W4-1: onboarding turno-0 (T0→T3). Env-gated (LINA_ONBOARDING) p/ não perturbar a demo do
+        // canvas durante o dev paralelo; fundador valida com `LINA_ONBOARDING=1 cargo run`.
+        if onboarding::should_show() {
+            onboarding::open_window(cx);
+            cx.activate(true);
+            return;
+        }
         let bounds = Bounds::centered(None, size(px(1450.0), px(640.0)), cx);
         cx.open_window(
             WindowOptions {

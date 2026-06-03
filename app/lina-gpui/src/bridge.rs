@@ -15,12 +15,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 // W3-2: motor de bootstrap turno-0 (gera o `<workspace>/CLAUDE.md` por terminal).
 use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
+// W4-2 (M2): deriva o papel do agente pelo nome ("Revisor" -> reviewer).
+use lina_role_discovery::RoleRegistry;
 
 use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
@@ -1080,13 +1082,15 @@ pub fn wire_terminal(
     delta_tx: &Sender<GridDelta>,
     key: &str,
     name: &str,
+    role: &str,
     cmd: PtyCommand,
     cols: u16,
     rows: u16,
 ) -> Result<(NodeId, Grid), String> {
     pty.spawn(key, cmd, cols, rows).map_err(|e| e.to_string())?;
     let writer = pty.take_writer(key).map_err(|e| e.to_string())?;
-    let node = sup.register(name, Some("terminal".into()), writer);
+    // W4-2 (M2): o nó nasce com o PAPEL no roster do Supervisor → flui para `agents.json` (lina list).
+    let node = sup.register(name, Some(role.to_string()), writer);
     let mut reader = pty.clone_reader(key).map_err(|e| e.to_string())?;
 
     let grid: Grid = Arc::new(Mutex::new(Box::new(AlacrittyBackend::new(cols, rows))));
@@ -1355,6 +1359,47 @@ pub fn scrub_pty_secret_env() -> Vec<&'static str> {
 /// Fábrica injetável de comando por nome: o app passa [`shell_cmd`] (shell real); os testes
 /// passam um comando leve (`cat`) p/ serem determinísticos e headless.
 pub type CmdFactory = Arc<dyn Fn(&str) -> PtyCommand + Send + Sync>;
+
+/// Registry de papéis (W3-1), construído UMA vez (regexes compiladas) e cacheado. `None` se o YAML
+/// embutido falhar (não deve ocorrer) → o caller cai num papel genérico, nunca panica.
+///
+/// **W4-2:** aplica um OVERLAY app-side adicionando o papel `reviewer` (o `default-roles.yaml` da crate
+/// role-discovery não o tem) — assim "Revisor" deriva `reviewer` (critério de aceite) SEM tocar aquela
+/// crate. Falha de overlay é best-effort (segue com o default).
+fn role_registry() -> Option<&'static RoleRegistry> {
+    /// Papéis que o registry default (lina-role-discovery) não cobre, mas o canvas T4 precisa.
+    const APP_ROLE_OVERLAY: &str = "\
+roles:
+  - role: reviewer
+    patterns: [revisor, reviewer, review, revisao]
+    skills: [pr-review-toolkit:review-pr]
+";
+    static REG: OnceLock<Option<RoleRegistry>> = OnceLock::new();
+    REG.get_or_init(|| {
+        let mut reg = RoleRegistry::with_defaults()
+            .map_err(|e| {
+                eprintln!("lina-gpui: role-registry default inválido ({e}); papel genérico")
+            })
+            .ok()?;
+        if let Err(e) = reg.overlay_yaml_str(APP_ROLE_OVERLAY, "<app-role-overlay>") {
+            eprintln!(
+                "lina-gpui: overlay de papel 'reviewer' falhou ({e}); seguindo com o default"
+            );
+        }
+        Some(reg)
+    })
+    .as_ref()
+}
+
+/// **W4-2 (M2) — deriva o PAPEL canônico pelo nome do agente** ("Revisor" → `reviewer`, "@Dev" →
+/// backend, …) via role-discovery (W3-1). Determinístico e infalível: nome desconhecido cai no
+/// fallback do registry; registry indisponível → `"generalist"`.
+fn infer_agent_role(name: &str) -> String {
+    match role_registry() {
+        Some(reg) => reg.infer_role(name).role,
+        None => "generalist".to_string(),
+    }
+}
 
 /// Rótulo amigável do `seq`-ésimo terminal: A, B, C… Z, depois `#27`, `#28`, …
 fn node_label(seq: u32) -> String {
@@ -1889,6 +1934,7 @@ impl NodeManager {
                 &self.delta_tx,
                 &key,
                 &name,
+                "terminal",
                 cmd,
                 self.cols,
                 self.rows,
@@ -1940,6 +1986,115 @@ impl NodeManager {
         lock(&self.keys).insert(node, key);
         // W3-2: roster mudou → reescreve os CLAUDE.md (o novo nó + os existentes ganham o colega).
         self.rewrite_bootstrap();
+        Ok(node)
+    }
+
+    /// **W4-2 · M2 "Novo Agente" — cria um agente PELO NOME.** Deriva o PAPEL do nome (role-discovery
+    /// W3-1: "Revisor" → `reviewer`), spawna um terminal com CLI REAL **com `VIBE_ROLE` no env**, e
+    /// **grava o papel** no roster (Supervisor) + no log (`NodeRoleAssigned`) → visível em
+    /// `lina list --json` e no Inspetor (P4). Mesma disciplina do [`Self::add_node`]: persiste ANTES de
+    /// projetar; se a persistência falhar, desfaz o PTY (`retire_pty`). Devolve o `NodeId` (p/ focar).
+    pub fn create_agent(&self, name: &str) -> Result<NodeId, String> {
+        let name = name.trim();
+        if name.is_empty()
+            || name.chars().any(char::is_control)
+            || name.contains("{{")
+            || name.contains("}}")
+        {
+            return Err(format!("nome de agente inválido: {name:?}"));
+        }
+        let role = infer_agent_role(name);
+
+        let seq = {
+            let mut s = lock(&self.seq);
+            let v = *s;
+            *s = s.wrapping_add(1);
+            v
+        };
+        let key = format!("t{seq}");
+        // CLI real + cwd próprio (CLAUDE.md) + **VIBE_ROLE no env do PTY** (o agente sabe seu papel).
+        let mut cmd = (*self.cmd_factory)(name).env("VIBE_ROLE", &role);
+        if let Some(dir) = self.ensure_cwd(&key) {
+            cmd = cmd.cwd(dir);
+            if let Some(bw) = &self.bootstrap {
+                let mut roster: Vec<String> = self
+                    .terminals_snapshot()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .collect();
+                roster.push(name.to_string());
+                bw.write_one(&key, name, &roster);
+            }
+        }
+
+        let (x, y) = next_free_slot(&lock(&self.model));
+        let (node, grid) = {
+            let mut p = lock(&self.pty);
+            wire_terminal(
+                &mut p,
+                &self.sup,
+                &self.delta_tx,
+                &key,
+                name,
+                &role, // ← o papel derivado entra no roster do Supervisor
+                cmd,
+                self.cols,
+                self.rows,
+            )?
+        };
+
+        // PERSISTE (log = fonte da verdade) ANTES de projetar: NodeAdded + TerminalSpawned + o PAPEL.
+        let count = {
+            let mut s = lock(&self.store);
+            if let Err(e) = s.append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: f64::from(x),
+                y: f64::from(y),
+            }) {
+                drop(s);
+                self.retire_pty(node, key);
+                return Err(e.to_string());
+            }
+            if let Err(e) = s.append(&DomainEvent::TerminalSpawned {
+                node,
+                cli: name.to_string(),
+            }) {
+                drop(s);
+                self.retire_pty(node, key);
+                return Err(e.to_string());
+            }
+            // O PAPEL gravado no log (projeção `ProjectedNode.role`; sobrevive a replay/crash).
+            if let Err(e) = s.append(&DomainEvent::NodeRoleAssigned {
+                node,
+                role: role.clone(),
+            }) {
+                drop(s);
+                self.retire_pty(node, key);
+                return Err(e.to_string());
+            }
+            s.event_count().ok()
+        };
+
+        {
+            let mut m = lock(&self.model);
+            m.nodes
+                .insert(node, NodeView::new(name, NodeKind::Terminal, x, y));
+            if !m.order.contains(&node) {
+                m.order.push(node);
+            }
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+        let _ = self.sup.set_status(node, CoreStatus::Running);
+        lock(&self.grids).insert(node, grid);
+        lock(&self.keys).insert(node, key);
+        self.rewrite_bootstrap();
+        eprintln!(
+            "lina-gpui: M2 — agente '{name}' criado (papel {role}, VIBE_ROLE no env). node {node}"
+        );
         Ok(node)
     }
 
@@ -2698,6 +2853,7 @@ mod tests {
             &delta_tx,
             "A",
             "Terminal A",
+            "terminal",
             PtyCommand::new("cat"),
             80,
             24,
@@ -2709,6 +2865,7 @@ mod tests {
             &delta_tx,
             "B",
             "Terminal B",
+            "terminal",
             PtyCommand::new("cat"),
             80,
             24,
@@ -2882,6 +3039,7 @@ mod tests {
                     &delta_tx,
                     k,
                     name,
+                    "terminal",
                     (*cmd_factory)(name),
                     80,
                     24,
@@ -2944,6 +3102,61 @@ mod tests {
             projected.nodes.contains_key(&id),
             "o event log reconstrói o novo nó (fonte da verdade)"
         );
+    }
+
+    /// **W4-2 (M2) — papel derivado pelo nome.** `infer_agent_role` mapeia "Revisor" → `reviewer`
+    /// (via overlay app-side), nomes que casam o registry default → seu papel, e desconhecidos → o
+    /// fallback `DEVELOPER`. Infalível (nunca panica).
+    #[test]
+    fn infer_agent_role_derives_from_name() {
+        assert_eq!(infer_agent_role("Revisor"), "reviewer", "overlay app-side");
+        assert_eq!(infer_agent_role("reviewer"), "reviewer");
+        assert_eq!(infer_agent_role("Backend"), "BACKEND", "registry default");
+        assert_eq!(infer_agent_role("QA do time"), "QA");
+        assert_eq!(infer_agent_role("xyzzy-sem-papel"), "DEVELOPER", "fallback");
+    }
+
+    /// **W4-2 (M2) — GATE headless de "Novo Agente":** `create_agent("Revisor")` cria um nó-terminal
+    /// (CLI real spawned via `cat` no teste), DERIVA o papel `reviewer`, GRAVA `NodeRoleAssigned` no
+    /// log (→ projeção `ProjectedNode.role` = reviewer; sobrevive a replay), e projeta no model com o
+    /// nome. Nome inválido é recusado sem efeito.
+    #[test]
+    fn create_agent_derives_role_records_and_projects() {
+        let (nm, store, model) = test_manager("m2", None);
+        assert_eq!(lock(&model).order.len(), 2, "começa com 2 nós");
+
+        let id = nm.create_agent("Revisor").expect("M2 cria o agente");
+        assert_eq!(lock(&model).order.len(), 3, "o agente entra no canvas");
+        assert!(
+            lock(&model)
+                .nodes
+                .get(&id)
+                .is_some_and(|v| v.name == "Revisor"),
+            "o nó tem o nome dado"
+        );
+
+        // O papel foi GRAVADO no log → reconstrói na projeção (fonte da verdade).
+        let events = lock(&store).events().expect("eventos");
+        assert!(
+            events
+                .iter()
+                .any(|r| r.kind == "NodeRoleAssigned" && r.payload["role"] == "reviewer"),
+            "NodeRoleAssigned{{role:reviewer}} apendado"
+        );
+        let projected = lock(&store).project().expect("project");
+        assert_eq!(
+            projected.nodes.get(&id).and_then(|n| n.role.clone()),
+            Some("reviewer".to_string()),
+            "a projeção tem o papel reviewer (sobrevive a replay)"
+        );
+
+        // Nome inválido → recusado, canvas inalterado.
+        assert!(nm.create_agent("  ").is_err(), "nome vazio recusado");
+        assert!(
+            nm.create_agent("a{{b}}").is_err(),
+            "nome com sentinela recusado"
+        );
+        assert_eq!(lock(&model).order.len(), 3, "recusas não criam nó");
     }
 
     /// **GATE de REMOVE (headless, determinístico):** após add (3 nós), `remove_node` desce a

@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         Some("guard") => run_guard(&args[1..]),
         Some("resume") => run_resume(&args[1..]),
         Some("do") => run_do(&args[1..]),
+        Some("list") => run_list(args.iter().any(|a| a == "--json")),
         _ => {
             usage();
             ExitCode::from(2)
@@ -41,7 +42,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -561,4 +562,45 @@ fn run_handshake() -> ExitCode {
     println!("(NAO responda — handshake e informativo, nao interrogativo)");
     println!("=== FIM HANDSHAKE ===");
     ExitCode::SUCCESS
+}
+
+/// `lina list [--json]` (W4-2) — lista os agentes do workspace (NOME · PAPEL · STATUS), lido do
+/// `agents.json` que o supervisor (app) escreve a cada mudança de roster. `--json` emite JSON — é o
+/// que VERIFICA o M2: o agente criado pelo nome aparece aqui com o PAPEL derivado (ex.: reviewer).
+/// Read-only (qualquer processo pode); roster vazio → lista vazia, nunca erro.
+fn run_list(json: bool) -> ExitCode {
+    let mailbox = Mailbox::new(mailbox_root());
+    let agents = match mailbox.read_agents() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("lina: falha ao ler o roster (agents.json): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if json {
+        match serde_json::to_string_pretty(&agents) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("lina: falha ao serializar o roster: {e}");
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        if agents.is_empty() {
+            println!("(nenhum agente no workspace ainda)");
+        } else {
+            for a in &agents {
+                println!(
+                    "{} · {} · {}",
+                    a.name,
+                    a.role.as_deref().unwrap_or("—"),
+                    a.status
+                );
+            }
+        }
+        ExitCode::SUCCESS
+    }
 }

@@ -1,0 +1,210 @@
+//! **W4-2 — modelo de cena do CANVAS T4 (gpui-free).** O TRONCO da Onda 4: classificação de ZONAS
+//! (foco / periferia / suspenso) e BADGE agregado por nó. É o **lar do P0** (degradação de ociosos,
+//! red-team doc 12 §6.3 / §0 do design): **poucos em foco, muitos em fila** — 1-4 terminais GRANDES no
+//! foco (120fps), o resto em PERIFERIA como cartão COMPACTO com badge honesto, e tudo fora da viewport
+//! vira SUSPENSO (0 draw-calls — **reusa o culling W2-3**, não reimplementa).
+//!
+//! Puro e testável: o render gpui (em `main`) CONSOME este modelo. Manter aqui (e não no `main`) é a
+//! modularização P0 do shell (design §5) que libera o leque paralelo W4-3/W4-4/W4-5.
+
+use lina_host::NodeStatus;
+
+/// Teto de nós GRANDES no foco. Red-team doc 12: atenção humana sustenta ~2-6; produto mira **1-4
+/// legíveis**. Acima disto a leitura degrada — o excedente vai para a periferia (fila). HOJE o canvas
+/// usa FOCO ÚNICO (o nó focado); reservado para o multi-foco (pin de até MAX_FOCUS) das próximas stories.
+#[allow(dead_code)]
+pub const MAX_FOCUS: usize = 4;
+
+/// A zona de um nó no canvas T4 — decide COMO ele é desenhado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    /// Em foco: terminal GRANDE, alta frequência. 1-4 nós (o que o humano realmente opera).
+    Focus,
+    /// Periferia: cartão COMPACTO com badge agregado — visível e honesto, mas barato.
+    Periphery,
+    /// Fora da viewport: SUSPENSO (0 draw-calls). Reusa o culling W2-3.
+    Suspended,
+}
+
+/// Classe do badge agregado de um nó na periferia — **estado honesto e sem jargão** (invariante #6).
+/// Ordem de prioridade do enum = ordem de urgência (NeedsYou primeiro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeKind {
+    /// "precisa de você" — bloqueado aguardando uma decisão humana (ex.: gate de custódia pendente).
+    NeedsYou,
+    /// "rodando" — vivo e produzindo saída.
+    Running,
+    /// "💤 dormindo" — ocioso (prompt pronto, sem atividade). Reativa ao focar, sem fingir vivo.
+    Sleeping,
+    /// "encerrado" — o processo do CLI morreu (Dead) ou o painel quebrou (Crashed).
+    Stopped,
+}
+
+/// Badge agregado de um nó: a classe + quantas linhas novas o humano ainda não viu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Badge {
+    pub kind: BadgeKind,
+    /// Linhas de saída novas desde a última vez que o humano olhou o nó (0 = nada novo).
+    pub unseen: u32,
+}
+
+impl Badge {
+    /// Texto curto, honesto e sem jargão do badge (o que o leigo lê no cartão da periferia).
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self.kind {
+            BadgeKind::NeedsYou => "precisa de você".to_string(),
+            BadgeKind::Running => {
+                if self.unseen > 0 {
+                    format!("rodando · {} novas", self.unseen)
+                } else {
+                    "rodando".to_string()
+                }
+            }
+            BadgeKind::Sleeping => {
+                if self.unseen > 0 {
+                    format!("💤 dormindo · {} novas", self.unseen)
+                } else {
+                    "💤 dormindo".to_string()
+                }
+            }
+            BadgeKind::Stopped => "encerrado".to_string(),
+        }
+    }
+
+    /// Cor de fundo do badge (RGB) — verde=rodando, âmbar=precisa de você, cinza=dormindo/encerrado.
+    /// O render usa; isolar aqui mantém o esquema honesto numa fonte só.
+    #[must_use]
+    pub fn bg(&self) -> u32 {
+        match self.kind {
+            BadgeKind::NeedsYou => 0xe0af68, // âmbar (o mesmo do gate de custódia)
+            BadgeKind::Running => 0x2c7a4b,  // verde
+            BadgeKind::Sleeping => 0x3a3f5a, // cinza-azulado fosco
+            BadgeKind::Stopped => 0x6b2b3a,  // bordô apagado
+        }
+    }
+}
+
+/// **Classifica a zona de um nó.** O culling (W2-3) é a fonte de `in_viewport` (mesmo `card_visible`
+/// do render) → fora da viewport SEMPRE suspende (0 draw-calls), independente de foco. Dentro da
+/// viewport, `focused` decide foco vs periferia. Determinístico, sem efeito colateral.
+#[must_use]
+pub fn classify_zone(focused: bool, in_viewport: bool) -> Zone {
+    if !in_viewport {
+        Zone::Suspended
+    } else if focused {
+        Zone::Focus
+    } else {
+        Zone::Periphery
+    }
+}
+
+/// **Agrega o badge de um nó** a partir dos sinais disponíveis: `status` (projeção do nó), `needs_human`
+/// (ex.: há um gate de custódia pendente para este nó — "precisa de você" vence tudo) e `unseen`
+/// (linhas novas não-vistas). Determinístico. ZERO interpretação semântica de conteúdo (invariante #1).
+#[must_use]
+pub fn aggregate_badge(status: NodeStatus, needs_human: bool, unseen: u32) -> Badge {
+    let kind = if needs_human {
+        BadgeKind::NeedsYou
+    } else {
+        match status {
+            NodeStatus::Busy | NodeStatus::Running | NodeStatus::Starting => BadgeKind::Running,
+            NodeStatus::Idle => BadgeKind::Sleeping,
+            NodeStatus::Crashed | NodeStatus::Dead => BadgeKind::Stopped,
+            // `NodeStatus` é `#[non_exhaustive]`: um estado FUTURO do core cai aqui → assume "rodando"
+            // (vivo, neutro) em vez de fingir encerrado/dormindo.
+            _ => BadgeKind::Running,
+        }
+    };
+    Badge { kind, unseen }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// O teto de foco é pequeno (atenção humana ~2-6, red-team doc 12 §6.3) — "poucos em foco".
+    #[test]
+    fn max_focus_matches_human_attention_budget() {
+        assert!(
+            (1..=6).contains(&MAX_FOCUS),
+            "1-4 grandes no foco; nunca dezenas vivas"
+        );
+    }
+
+    /// Fora da viewport SEMPRE suspende (culling), mesmo "focado"; dentro, foco vs periferia.
+    #[test]
+    fn classify_zone_prioritizes_viewport_then_focus() {
+        assert_eq!(
+            classify_zone(true, false),
+            Zone::Suspended,
+            "off-viewport = suspenso"
+        );
+        assert_eq!(classify_zone(false, false), Zone::Suspended);
+        assert_eq!(
+            classify_zone(true, true),
+            Zone::Focus,
+            "focado + visível = foco"
+        );
+        assert_eq!(
+            classify_zone(false, true),
+            Zone::Periphery,
+            "sem foco + visível = periferia"
+        );
+    }
+
+    /// O badge é honesto: needs_human vence; Busy/Running/Starting=rodando; Idle=💤; Dead/Crashed=encerrado.
+    #[test]
+    fn aggregate_badge_maps_status_with_needs_human_priority() {
+        assert_eq!(
+            aggregate_badge(NodeStatus::Idle, true, 0).kind,
+            BadgeKind::NeedsYou,
+            "needs_human vence o status"
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Busy, false, 0).kind,
+            BadgeKind::Running
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Running, false, 0).kind,
+            BadgeKind::Running
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Starting, false, 0).kind,
+            BadgeKind::Running
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Idle, false, 0).kind,
+            BadgeKind::Sleeping
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Dead, false, 0).kind,
+            BadgeKind::Stopped
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Crashed, false, 0).kind,
+            BadgeKind::Stopped
+        );
+    }
+
+    /// O label inclui "N novas" quando há não-vistas e é sem jargão.
+    #[test]
+    fn badge_label_is_honest_and_counts_unseen() {
+        assert_eq!(
+            aggregate_badge(NodeStatus::Idle, false, 3).label(),
+            "💤 dormindo · 3 novas"
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Idle, false, 0).label(),
+            "💤 dormindo"
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Busy, false, 0).label(),
+            "rodando"
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Busy, true, 9).label(),
+            "precisa de você"
+        );
+    }
+}
