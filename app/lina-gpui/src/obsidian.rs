@@ -1055,8 +1055,12 @@ impl SecondBrainModel {
             } else {
                 format!("✓ Confirmar {count} pastas para a Lina")
             };
+            // Confirmar GRAVA (vault.json + índice) E AVANÇA o passo — sem isto o usuário confirmava e
+            // ficava "preso" tendo que achar o "Continuar →" no rodapé (que ficava cortado). O rodapé
+            // segue existindo p/ quem quer pular sem confirmar.
             col = col.child(action_button("sb-confirm", &label, 0x2c7a4b, cx, |onb, _w, cx| {
                 onb.second_brain.confirm();
+                onb.nav_continue();
                 cx.notify();
             }));
         }

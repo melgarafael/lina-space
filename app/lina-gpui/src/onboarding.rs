@@ -1168,51 +1168,55 @@ impl Render for OnboardingView {
             Step::Done => self.render_done(cx),
         };
 
+        // SCROLL — estrutura IDÊNTICA ao exemplo canônico `scrollable.rs` do gpui: root BLOCO
+        // (NÃO-flex) `size_full().overflow_y_scroll()` cujo filho transborda a janela. A v1 punha
+        // `.flex().flex_col().items_center()` NO root de scroll — e flex no root de scroll NÃO engatava
+        // o `content_size > bounds`: o conteúdo só transbordava a JANELA (cortado), nunca virava
+        // viewport rolável (por isso só "esticar a janela" mostrava tudo). Bloco + overflow + filho de
+        // altura natural maior que a janela → scroll_max>0 → rola de verdade, em TODAS as telas.
         div()
             .id("onboarding")
             .track_focus(&self.focus)
             .size_full()
-            // Conteúdo do check-up (heading + banner + N CLIs + rodapé) passa da altura da janela:
-            // sem isto o excesso é só CLIPADO (rodapé "Continuar →" inalcançável). `size_full` dá a
-            // altura limitada e o `.id("onboarding")` persiste o offset → o scroll engata.
             .overflow_y_scroll()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .flex()
-            .flex_col()
-            .items_center()
             .child(
-                // Painel central com largura confortável de leitura.
+                // O flex (centralização) fica AQUI, num wrapper INTERNO — NUNCA no root de scroll.
+                // `items_start` não estica o painel na vertical (deixa ele com a altura natural).
                 div()
                     .flex()
-                    .flex_col()
-                    // `div()` tem `flex_shrink: 1.0` por padrão: dentro do root (coluna de altura
-                    // LIMITADA = janela), o taffy ENCOLHERIA este painel até a altura da janela →
-                    // `content_size == bounds` → nada a rolar (era por isso que o scroll não engatava;
-                    // só esticar a janela revelava os botões). `flex_shrink_0` mantém a altura NATURAL
-                    // do conteúdo, que transborda e o `overflow_y_scroll` do root rola. (Idioma do
-                    // Zed: context_menu/modal usam flex_shrink_0 + overflow_y_scroll.)
-                    .flex_shrink_0()
-                    .gap_8()
-                    .w(px(680.0))
-                    .mt(px(72.0))
-                    .pb(px(40.0)) // respiro no fim do scroll: o último botão não cola na borda
+                    .flex_row()
+                    .justify_center()
+                    .items_start()
+                    .w_full()
                     .child(
+                        // Painel central com largura confortável de leitura.
                         div()
                             .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_4()
+                            .flex_col()
+                            .flex_shrink_0()
+                            .gap_8()
+                            .w(px(680.0))
+                            .mt(px(72.0))
+                            .pb(px(40.0)) // respiro no fim do scroll: o último botão não cola na borda
                             .child(
                                 div()
-                                    .text_color(rgb(ACCENT))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(text!("Lina Space")),
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(ACCENT))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(text!("Lina Space")),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(self.step_dots()),
                             )
-                            .child(div().flex_1())
-                            .child(self.step_dots()),
-                    )
-                    .child(content),
+                            .child(content),
+                    ),
             )
     }
 }
