@@ -1,0 +1,97 @@
+name: CI
+
+# Esteira de qualidade do Lina Space (Fase 0 — Mac-first).
+#
+# O loop central da Fase 0 está PROVADO e validado na tela no macOS. Esta esteira
+# trava a qualidade do core a cada push e faz o backup remoto do código.
+#
+# Estado dos gates (2026-06-03, HEAD da Onda 5):
+#   * core-macos      — gate PRINCIPAL (espelha o canal limpo do Maestro): test + clippy + fmt.
+#   * core-linux      — bônus barato; o core é Mac/Linux-verde (W0). Confirma portabilidade do core.
+#   * license-security — W5-5 wire-CI: cargo-deny (licenças) + cargo-audit (RustSec). Verdes localmente.
+#   * app-macos       — build/clippy/fmt do shell gpui (standalone, fora do workspace).
+#
+# PENDENTE (bloco de INFRA do §7 — precisa hardware/certificados do fundador, NÃO ligado aqui):
+#   * Windows ConPTY (W5-3) + matriz GPU Linux (NVIDIA/AMD/Intel × X11/Wayland) — ver épico W5-3.
+#   * E2E visual golden-render 3-SO + assinatura/notarização (W5-6) → conta Apple + Authenticode.
+# Ao primeiro push: confirme que os 4 jobs abaixo ficam verdes (foram validados localmente,
+# mas o ambiente do runner pode exigir ajuste de toolchain — em especial o app gpui).
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  core-macos:
+    name: Core (macOS) — gate principal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (workspace, serializado — o store/recovery exige --test-threads=1)
+        run: cargo test --workspace -- --test-threads=1
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Fmt (por-pacote — fmt --check no nível workspace mascara o exit; ver lição do projeto)
+        run: |
+          for c in lina-pty lina-vt lina-core lina-host lina-secrets lina-cli-profiles lina-role-discovery lina-bootstrap lina-webhooks; do
+            cargo fmt -p "$c" -- --check
+          done
+
+  core-linux:
+    name: Core (Linux) — portabilidade do core headless
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (workspace, serializado)
+        run: cargo test --workspace -- --test-threads=1
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  license-security:
+    name: Licença + Segurança (W5-5 wire-CI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-deny (licenças + bans + sources — usa deny.toml do repo)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: cargo-audit (RustSec — vulnerabilidades conhecidas)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  app-macos:
+    name: App gpui (macOS) — shell standalone
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app/lina-gpui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/lina-gpui
+      - name: Build (gpui — pin de SHA + runtime_shaders no macOS)
+        run: cargo build
+      - name: Clippy (-D warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Fmt
+        run: cargo fmt -- --check
