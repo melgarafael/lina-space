@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist do bundle Lina.app (macOS).
+  Distribuição SEM assinatura (decisão do fundador 2026-06-04): o app abre via bypass
+  do Gatekeeper (ver INSTALAR-LINA.md). NÃO há codesign/notarização nesta fase.
+  Layout do bundle (montado por make-app.sh):
+    Lina.app/Contents/MacOS/lina-gpui ← binário do app GUI (release). NOME != "lina" de propósito:
+                                         APFS é case-insensitive, então "Lina" colidiria com "lina".
+    Lina.app/Contents/MacOS/lina      ← CLI lina (release), achada "ao lado" pelo resolver do app
+    Lina.app/Contents/MacOS/assets/   ← doutrina + skill, achadas via ancestrais do exe (zero código)
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Lina</string>
+    <key>CFBundleDisplayName</key>
+    <string>Lina Space</string>
+    <key>CFBundleIdentifier</key>
+    <string>space.lina.app</string>
+    <key>CFBundleExecutable</key>
+    <string>lina-gpui</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Lina Space</string>
+</dict>
+</plist>
