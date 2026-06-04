@@ -768,6 +768,115 @@ fn f_blocks_logados_e_dedupe_ausente() {
     }
 }
 
+/// **(B2 — defesa em profundidade do fan-out, ADR 0007) Forjar `hops`/`root_cause_id` no outbox NÃO
+/// compra privilégio de ORIGEM.** O outbox é canal NÃO-autenticado: `msg.hops` e `msg.root_cause_id`
+/// são campos que o remetente escreve livremente. A classificação ORIGEM-vs-CASCATA vem SEMPRE do
+/// binding interno (`delivered_root`, carimbado numa ENTREGA real — `derive_root_hops`/W1), nunca
+/// desses campos. Este gate TRAVA o invariante: um agente em CASCATA que forja `hops=0` (e um
+/// `root_cause_id` fresco) continua tratado como cascata — gate de fan-out e orçamento aplicados —
+/// enquanto a ORIGEM real (sem binding) com o MESMO `hops=0` no campo passa livre. (Hoje já é
+/// garantido ESTRUTURALMENTE — `derive_root_hops` ignora ambos os campos; este teste impede regressão
+/// se alguém voltar a confiar no outbox. NÃO muda comportamento do router — só adiciona cobertura.)
+///
+/// **Por que NÃO é vácuo.** Em (1) e (3) o atacante força `msg.hops=0`; em (2) a origem honesta TAMBÉM
+/// tem `msg.hops=0` — o campo é idêntico nos dois lados, só o binding difere. Se o roteador voltasse a
+/// LER `msg.hops` (em vez do hops EFETIVO do binding), (1) entregaria a todos e o `assert FanoutGated`
+/// QUEBRARIA; se LESSE `msg.root_cause_id` (fresco a cada volta), (3) jamais acumularia `(root, sender)`
+/// e o `assert BudgetExceeded` QUEBRARIA. Inverter a fonte de verdade do root/hops faz este teste
+/// falhar — ele não passa trivialmente. (Asserts derivam do `log.jsonl`, invariante #4.)
+#[test]
+fn b2_forja_de_hops_e_root_nao_compra_privilegio_de_origem() {
+    let mut deliver = ok_deliver();
+
+    // (1) CASCATA forjando `hops=0` → AINDA gateada no fan-out (não vira origem livre).
+    {
+        let mut e = env("b2-cascata-fanout", RouterConfig::default());
+        e.sup.register("@A", None, sink());
+        e.sup.register("@Relay", None, sink());
+        for n in ["@B1", "@B2", "@B3", "@B4"] {
+            e.sup.register(n, None, sink());
+        }
+        // Entrega REAL @A→@Relay carimba o binding de @Relay → seu próximo envio tem hops efetivo >= 1.
+        let seed = MailMessage::new("@A", "@Relay", "ask", "espalha isto");
+        e.router.route_message(&seed, &mut e.store, 1, &mut deliver);
+        // ATAQUE: @Relay re-broadcasta a 5 alvos (> FANOUT_GATE=3) FORJANDO credencial de origem.
+        let mut forjada = MailMessage::new("@Relay", "*", "broadcast", "todos");
+        forjada.hops = 0; // forja: "sou origem, hops 0"
+        forjada.root_cause_id = Some("forjado-raiz-fresca".to_string()); // forja: root novo
+        assert_eq!(
+            e.router
+                .route_message(&forjada, &mut e.store, 2, &mut deliver),
+            RouteOutcome::FanoutGated { count: 5 },
+            "cascata forjando hops=0 NÃO compra fan-out de origem — segue gateada"
+        );
+        assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"fanout_gated".to_string()));
+    }
+
+    // (2) CONTRASTE — MESMO `hops=0` no campo, mas ORIGEM REAL (sem binding) → fan-out LIVRE.
+    //     A ÚNICA diferença para (1) é a AUSÊNCIA de binding; o valor de `msg.hops` é idêntico (0).
+    //     Resultados opostos com o mesmo campo ⇒ o campo é irrelevante; o binding é quem decide.
+    {
+        let mut e = env("b2-origem-livre", RouterConfig::default());
+        e.sup.register("@A", None, sink());
+        for n in ["@B1", "@B2", "@B3", "@B4"] {
+            e.sup.register(n, None, sink());
+        }
+        let mut origem = MailMessage::new("@A", "*", "broadcast", "oi a todos");
+        origem.hops = 0; // mesmo valor de (1) — aqui é HONESTO (sem binding ⇒ origem de fato)
+        assert!(
+            matches!(
+                e.router
+                    .route_message(&origem, &mut e.store, 1, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "origem real entrega a todos os 5 vivos mesmo > FANOUT_GATE (ADR 0007)"
+        );
+        assert!(
+            !block_reasons(&jsonl(&e.store_dir())).contains(&"fanout_gated".to_string()),
+            "origem real NÃO é gateada — o gate depende do binding, não de msg.hops"
+        );
+    }
+
+    // (3) CASCATA forjando `root_cause_id` FRESCO a cada volta NÃO zera o orçamento por-cadeia.
+    //     O contador é chaveado pelo root EFETIVO (do binding), não pelo campo forjado; e a CHECK só
+    //     roda em cascata (hops efetivo >= 1), que o forge `hops=0` também não consegue escapar.
+    {
+        let mut e = env("b2-cascata-budget", RouterConfig::default());
+        e.sup.register("@A", None, sink());
+        e.sup.register("@B", None, sink());
+        e.sup.register("@C", None, sink());
+        // Binding de @B via entrega REAL @A→@B (root R carimbado pelo supervisor).
+        let seed = MailMessage::new("@A", "@B", "ask", "inicia");
+        e.router.route_message(&seed, &mut e.store, 1, &mut deliver);
+        // DELEGATION_BUDGET delegações @B→@C, cada uma FORJANDO root novo + hops=0 → todas entregam
+        // (acumulam contra (R, @B) — o root do binding —, não contra o root forjado).
+        for i in 0..DELEGATION_BUDGET {
+            let mut atq = MailMessage::new("@B", "@C", "ask", format!("forja{i}"));
+            atq.hops = 0;
+            atq.root_cause_id = Some(format!("forjado-fresco-{i}"));
+            assert!(
+                matches!(
+                    e.router
+                        .route_message(&atq, &mut e.store, 10 + i as u64, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "delegação {i} dentro do orçamento entrega mesmo forjando root fresco"
+            );
+        }
+        // A (n+1)-ésima, AINDA forjando root fresco + hops=0, ESTOURA — o root REAL do binding acumulou.
+        let mut over = MailMessage::new("@B", "@C", "ask", "estoura");
+        over.hops = 0;
+        over.root_cause_id = Some("forjado-fresco-final".to_string());
+        assert_eq!(
+            e.router
+                .route_message(&over, &mut e.store, 999, &mut deliver),
+            RouteOutcome::BudgetExceeded,
+            "forjar root fresco NÃO reinicia o contador — orçamento por-cadeia segue valendo"
+        );
+        assert!(block_reasons(&jsonl(&e.store_dir())).contains(&"budget_exceeded".to_string()));
+    }
+}
+
 /// **(g) Contrato congelado (envelope + terminador).** `MailMessage` (`lina/msg@1`) roundtripa por
 /// JSON preservando TODOS os campos; `render_message_block[_full]` emite `[LINA::MSG]…[/LINA::MSG]`
 /// e NUNCA contém `ESTUDIO` (pegadinha do doc 21).
