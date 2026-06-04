@@ -235,6 +235,15 @@ struct MetricsInner {
     batches: AtomicU64,
 }
 
+/// W5-2 FIAÇÃO: destino do cabo `append-on-scroll` de um terminal. Cada linha que o motor VT
+/// solta do viewport (`VtBackend::take_scrollback`) é persistida no `ScrollbackStore` do workspace
+/// sob a chave `panel` (o `NodeId` do terminal). O Store é compartilhado entre os terminais
+/// (conexão SQLite single-thread, serializada pelo `Mutex`).
+struct ScrollbackSink {
+    store: Arc<Mutex<scrollback::ScrollbackStore>>,
+    panel: String,
+}
+
 /// Estado compartilhado entre o pty-host e a thread de leitura de um terminal.
 struct TermShared {
     vt: Mutex<Box<dyn VtBackend>>,
@@ -244,6 +253,8 @@ struct TermShared {
     panic_inject: AtomicBool,
     state: Mutex<TerminalState>,
     metrics: MetricsInner,
+    /// W5-2 FIAÇÃO: cabo do scrollback (None = sem persistência; caminho legado intacto).
+    scrollback: Option<ScrollbackSink>,
 }
 
 struct Terminal {
@@ -263,6 +274,9 @@ pub struct PtyHost {
     delta_tx: Sender<GridDelta>,
     delta_rx: Option<Receiver<GridDelta>>,
     seq: Arc<AtomicU64>,
+    /// W5-2 FIAÇÃO: Store de scrollback do workspace. Quando presente, todo terminal aberto a
+    /// partir daí nasce **capturando** (cap = `store.cap()`) e tem o cabo `append-on-scroll` ligado.
+    scrollback: Option<Arc<Mutex<scrollback::ScrollbackStore>>>,
 }
 
 impl Default for PtyHost {
@@ -289,7 +303,17 @@ impl PtyHost {
             delta_tx,
             delta_rx: Some(delta_rx),
             seq: Arc::new(AtomicU64::new(0)),
+            scrollback: None,
         }
+    }
+
+    /// W5-2 FIAÇÃO: liga o `ScrollbackStore` do workspace. Terminais abertos **a partir daqui**
+    /// nascem capturando o scrollback (cabo `append-on-scroll`): cada linha que sai do viewport é
+    /// persistida no Store sob a chave do `NodeId`, com o ring do motor VT fixado no `store.cap()`
+    /// — fecha o anti-leak da W5-1 (RAM no cap, histórico completo no disco). Idempotente: chame
+    /// antes de `spawn`.
+    pub fn set_scrollback_store(&mut self, store: Arc<Mutex<scrollback::ScrollbackStore>>) {
+        self.scrollback = Some(store);
     }
 
     /// Toma o receptor de `GridDelta` (uma vez). O consumidor o drena e dá `ack`.
@@ -307,7 +331,21 @@ impl PtyHost {
         let writer = self.manager.take_writer(pty_key.clone())?;
         let reader = self.manager.clone_reader(pty_key.clone())?;
 
-        let backend: Box<dyn VtBackend> = Box::new(AlacrittyBackend::new(cols, rows));
+        // W5-2 FIAÇÃO: com Store ligado, o backend nasce CAPTURANDO (cap = cap do Store, fonte
+        // única do teto da janela viva) e ganha o cabo `append-on-scroll`; senão, caminho legado.
+        let (backend, sink): (Box<dyn VtBackend>, Option<ScrollbackSink>) = match &self.scrollback {
+            Some(store) => {
+                let cap = lock(store).cap();
+                (
+                    Box::new(AlacrittyBackend::with_scrollback_capture(cols, rows, cap)),
+                    Some(ScrollbackSink {
+                        store: Arc::clone(store),
+                        panel: node.to_string(),
+                    }),
+                )
+            }
+            None => (Box::new(AlacrittyBackend::new(cols, rows)), None),
+        };
         let shared = Arc::new(TermShared {
             vt: Mutex::new(backend),
             inflight: AtomicU64::new(0),
@@ -315,6 +353,7 @@ impl PtyHost {
             panic_inject: AtomicBool::new(false),
             state: Mutex::new(TerminalState::Running),
             metrics: MetricsInner::default(),
+            scrollback: sink,
         });
 
         let join = {
@@ -596,14 +635,35 @@ fn flush(
     }
     let bytes = batch.len();
 
-    let rows = {
+    let (rows, scrolled) = {
         let mut vt = lock(&shared.vt);
         vt.advance(batch.as_slice());
         let dirty = vt.damaged_rows();
         vt.reset_damage();
-        dirty
+        // W5-2 FIAÇÃO: drena as linhas que saíram do viewport (vazio se o backend não captura).
+        // Sempre drena para não deixar o buffer interno crescer.
+        let scrolled = vt.take_scrollback();
+        (dirty, scrolled)
     };
     batch.clear();
+
+    // W5-2 FIAÇÃO: persiste o scrollback colhido FORA do lock do vt (não aninha vt↔store). Cada
+    // linha é gravada uma vez; o Store cuida do cache da cauda + paginação em disco. Em erro de
+    // disco a linha permanece no cache da cauda do Store e o próximo push re-tenta (nada some).
+    if let Some(sink) = &shared.scrollback {
+        if !scrolled.is_empty() {
+            let mut store = lock(&sink.store);
+            for line in scrolled {
+                if let Err(e) = store.push_line(&sink.panel, line) {
+                    tracing::warn!(
+                        panel = %sink.panel,
+                        error = %e,
+                        "scrollback push falhou; linha fica no cache da cauda, re-tenta no próximo flush"
+                    );
+                }
+            }
+        }
+    }
 
     shared.inflight.fetch_add(bytes as u64, Ordering::Relaxed);
     shared.metrics.batches.fetch_add(1, Ordering::Relaxed);

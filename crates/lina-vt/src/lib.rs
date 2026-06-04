@@ -195,6 +195,23 @@ pub trait VtBackend: Send {
     /// (ex.: movimento em `ReportClick`). TUIs que não pedem mouse **nunca**
     /// recebem bytes.
     fn encode_mouse(&self, event: MouseEvent) -> Option<Vec<u8>>;
+
+    // ── Scrollback `append-on-scroll` (W5-2 FIAÇÃO) ──
+
+    /// Drena as linhas de scrollback **colhidas** desde a última chamada — as que rolaram para
+    /// fora do viewport (cabo `append-on-scroll`), em ordem cronológica e byte-idênticas ao grid
+    /// parseado. O pty-host as persiste no `lina_core::scrollback` (`ScrollbackStore`), fechando o
+    /// anti-leak: o ring fica no `cap`, o histórico completo vai ao disco. Backends sem captura
+    /// devolvem vazio. **Chame após cada `advance`** para manter o buffer interno limitado.
+    fn take_scrollback(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Profundidade ATUAL do scrollback mantido em RAM pelo motor VT (linhas no ring) — para
+    /// asseverar o teto de RAM (== `cap` em regime estável). `0` quando não aplicável.
+    fn scrollback_len(&self) -> usize {
+        0
+    }
 }
 
 // ───────────────────────── AlacrittyBackend (impl da Onda 0) ─────────────────────────
@@ -244,6 +261,27 @@ impl Dimensions for GridSize {
 /// MECANISMO (cap configurável + paginação), não a constante.
 pub const DEFAULT_SCROLLBACK_CAP: usize = 10_000;
 
+/// W5-2 FIAÇÃO — tamanho do **sub-chunk** com que o `advance` capturador alimenta o parser.
+///
+/// O parser `vte` é uma máquina de estado por byte: fatiar a entrada é semanticamente
+/// transparente (mesmo resultado de um `advance` único). Fatiamos para **colher as linhas que
+/// rolaram para o histórico ANTES que a próxima rolagem as eviccione** — o cabo `append-on-scroll`
+/// que [`AlacrittyBackend::take_scrollback`] entrega ao `lina_core::scrollback`.
+pub const SCROLLBACK_HARVEST_STEP: usize = 512;
+
+/// W5-2 FIAÇÃO — **headroom** (linhas) que o ring interno do alacritty ganha além do `cap` durante
+/// a captura. Mantido `2× STEP`: como uma rolagem por `LF` move ≤1 linha/byte, um sub-chunk de
+/// `STEP` bytes empurra ≤ `STEP` linhas — `slack = 2×STEP` garante que o histórico **nunca satura**
+/// (logo nunca evicciona) dentro de um sub-chunk de output normal, e o crescimento medido
+/// (`history_size` após − antes) é o nº EXATO de linhas a colher. Após colher, o ring é **trimado
+/// de volta ao `cap`** (estado estável = `cap`; pico transitório = `cap + slack`).
+///
+/// Bound conhecido: `CSI Ps S` (scroll-up explícito) move até `rows` linhas com poucos bytes, então
+/// um firehose de `SU` no *primary screen* poderia exceder o slack — caso **adversarial e irreal**
+/// (TUIs que usam scroll-region vivem no *alt-screen*, onde `scrolling_history=0` e nada é
+/// capturado). O cabo é à prova de perda para output via `LF` (o caso real de scrollback).
+pub const SCROLLBACK_HARVEST_SLACK: usize = 2 * SCROLLBACK_HARVEST_STEP;
+
 /// Backend VT sobre `alacritty_terminal` 0.26 (parser `vte` 0.15 + grid + damage).
 pub struct AlacrittyBackend {
     term: Term<NullProxy>,
@@ -255,11 +293,21 @@ pub struct AlacrittyBackend {
     damage: BTreeSet<usize>,
     /// W5-2: cap de linhas de scrollback mantidas em RAM (teto do ring-buffer do grid).
     scrollback_cap: usize,
+    /// W5-2 FIAÇÃO: se `true`, o `advance` colhe as linhas que rolam para o histórico (cabo
+    /// `append-on-scroll`) em [`Self::captured`]. `false` = caminho legado, sem custo.
+    capture: bool,
+    /// W5-2 FIAÇÃO: headroom do ring durante a captura (0 quando `capture` desligada). Com captura,
+    /// `Config::scrolling_history == scrollback_cap + slack`; o ring é trimado de volta ao cap a
+    /// cada sub-chunk (ver [`SCROLLBACK_HARVEST_SLACK`]).
+    slack: usize,
+    /// W5-2 FIAÇÃO: linhas colhidas (saídas do viewport) ainda não drenadas por
+    /// [`Self::take_scrollback`]. Ordem cronológica (mais antiga primeiro).
+    captured: Vec<String>,
 }
 
 impl AlacrittyBackend {
     /// Cria um backend com um grid de `cols x rows` (mínimo 1x1) e o cap de scrollback
-    /// **default** ([`DEFAULT_SCROLLBACK_CAP`]).
+    /// **default** ([`DEFAULT_SCROLLBACK_CAP`]). Sem captura de scrollback (caminho legado).
     pub fn new(cols: u16, rows: u16) -> Self {
         Self::with_scrollback_cap(cols, rows, DEFAULT_SCROLLBACK_CAP)
     }
@@ -268,14 +316,32 @@ impl AlacrittyBackend {
     /// mantidas em RAM — W5-2). `scrollback_cap` vira o `Config::scrolling_history` do alacritty:
     /// o ring-buffer do grid descarta da RAM as linhas mais antigas além do cap (o excedente é
     /// paginado em disco pelo core). Permite ao app/benchmark (W5-1) calibrar o teto por painel
-    /// sem recompilar o emulador.
+    /// sem recompilar o emulador. Sem captura de scrollback (caminho legado).
     pub fn with_scrollback_cap(cols: u16, rows: u16, scrollback_cap: usize) -> Self {
+        Self::build(cols, rows, scrollback_cap, false)
+    }
+
+    /// W5-2 FIAÇÃO: backend com **captura `append-on-scroll`** ligada. Toda linha que rola para
+    /// fora do viewport é colhida (byte-idêntica, em ordem) e fica disponível em
+    /// [`Self::take_scrollback`] — o pty-host as persiste no `lina_core::scrollback` (o cabo que
+    /// fecha o anti-leak da W5-1: o ring fica no `cap`, o histórico completo vai ao disco).
+    ///
+    /// O ring interno ganha [`SCROLLBACK_HARVEST_SLACK`] de headroom durante a captura, mas é
+    /// **trimado de volta ao `cap`** a cada sub-chunk — o estado estável (`scrollback_len`) é `cap`.
+    pub fn with_scrollback_capture(cols: u16, rows: u16, scrollback_cap: usize) -> Self {
+        Self::build(cols, rows, scrollback_cap, true)
+    }
+
+    /// Builder compartilhado dos construtores. Com `capture`, o ring do alacritty é provisionado
+    /// em `cap + slack` (headroom de colheita); sem captura, exatamente `cap` (legado).
+    fn build(cols: u16, rows: u16, scrollback_cap: usize, capture: bool) -> Self {
         let size = GridSize {
             cols: usize::from(cols.max(1)),
             rows: usize::from(rows.max(1)),
         };
+        let slack = if capture { SCROLLBACK_HARVEST_SLACK } else { 0 };
         let config = Config {
-            scrolling_history: scrollback_cap,
+            scrolling_history: scrollback_cap.saturating_add(slack),
             ..Config::default()
         };
         let term = Term::new(config, &size, NullProxy);
@@ -285,10 +351,14 @@ impl AlacrittyBackend {
             size,
             damage: BTreeSet::new(),
             scrollback_cap,
+            capture,
+            slack,
+            captured: Vec::new(),
         }
     }
 
-    /// W5-2: cap de scrollback (linhas/painel mantidas em RAM) deste backend.
+    /// W5-2: cap de scrollback (linhas/painel mantidas em RAM) deste backend. Com captura ligada,
+    /// é o teto ESTÁVEL do ring (o headroom transitório de colheita não conta).
     #[must_use]
     pub fn scrollback_cap(&self) -> usize {
         self.scrollback_cap
@@ -298,6 +368,54 @@ impl AlacrittyBackend {
     /// (render, testes célula-a-célula).
     fn grid(&self) -> &alacritty_terminal::Grid<alacritty_terminal::term::cell::Cell> {
         self.term.grid()
+    }
+
+    /// Lineariza a linha de índice ABSOLUTO `line` do grid (negativo = histórico/scrollback) para
+    /// texto puro (sem ANSI), pulando os espaçadores de caractere largo — mesma regra de
+    /// [`VtBackend::row_text`], mas sobre o histórico também. Base da **colheita de scrollback**
+    /// (W5-2): ler a linha que rolou para o histórico, byte-fiel ao grid parseado.
+    fn line_text_at(&self, line: i32) -> String {
+        let row = &self.grid()[Line(line)];
+        (0..self.size.cols)
+            .map(|col| &row[Column(col)])
+            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .map(|cell| cell.c)
+            .collect()
+    }
+
+    /// W5-2 FIAÇÃO — `advance` com **captura `append-on-scroll`**. Alimenta o parser em sub-chunks
+    /// de [`SCROLLBACK_HARVEST_STEP`] bytes; após cada um, colhe as linhas que entraram no histórico
+    /// (ordem cronológica, byte-idêntica) ANTES de qualquer eviccão e trima o ring de volta ao cap.
+    ///
+    /// **Invariante (zero perda p/ output via `LF`):** o histórico nunca satura dentro de um
+    /// sub-chunk (headroom `slack ≥ 2×STEP` > crescimento máximo `STEP`), então
+    /// `s = history_size_depois − history_size_antes` é o nº EXATO de linhas que rolaram, e as `s`
+    /// mais novas (Line `-s..=-1`) são exatamente elas — nenhuma se perde entre rolar e colher.
+    fn advance_capturing(&mut self, bytes: &[u8]) {
+        let cap = self.scrollback_cap;
+        let ceiling = cap.saturating_add(self.slack); // == Config::scrolling_history do ring
+        for step in bytes.chunks(SCROLLBACK_HARVEST_STEP.max(1)) {
+            let before = self.grid().history_size();
+            self.parser.advance(&mut self.term, step);
+            let after = self.grid().history_size();
+            if after > before {
+                // Colhe as `s` linhas mais NOVAS (as que acabaram de entrar no histórico), em
+                // ordem cronológica: a mais antiga das novas está em Line(-s); a mais nova em Line(-1).
+                let s = after - before;
+                for k in (1..=s).rev() {
+                    let text = self.line_text_at(-(k as i32));
+                    self.captured.push(text.trim_end().to_string());
+                }
+            }
+            // Trima o ring de volta ao cap (remove os mais antigos — JÁ colhidos) e restaura o
+            // headroom de captura para o próximo sub-chunk. O 2º `update_history` devolve o
+            // `max_scroll_limit` ao teto sem reintroduzir linhas (só encolhe quando atual > alvo).
+            if after > cap {
+                let g = self.term.grid_mut();
+                g.update_history(cap);
+                g.update_history(ceiling);
+            }
+        }
     }
 
     /// Marca todas as linhas do viewport como danificadas (usado em resize).
@@ -319,7 +437,13 @@ impl AlacrittyBackend {
 
 impl VtBackend for AlacrittyBackend {
     fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        if self.capture {
+            // Captura `append-on-scroll`: sub-chunk + colheita + trim (W5-2 FIAÇÃO).
+            self.advance_capturing(bytes);
+        } else {
+            // Caminho legado: um único passo, sem colheita (custo zero).
+            self.parser.advance(&mut self.term, bytes);
+        }
 
         // Acumula as linhas danificadas por este `advance`. `Term::damage()`
         // devolve o dano acumulado desde o último `Term::reset_damage`; só
@@ -365,12 +489,7 @@ impl VtBackend for AlacrittyBackend {
         if viewport_line >= self.size.rows {
             return String::new();
         }
-        let row = &self.grid()[Line(viewport_line as i32)];
-        (0..self.size.cols)
-            .map(|col| &row[Column(col)])
-            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            .map(|cell| cell.c)
-            .collect()
+        self.line_text_at(viewport_line as i32)
     }
 
     fn screen(&self) -> VtScreen {
@@ -529,6 +648,14 @@ impl VtBackend for AlacrittyBackend {
             return None;
         }
         encode_sgr_mouse(event, protocol)
+    }
+
+    fn take_scrollback(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.captured)
+    }
+
+    fn scrollback_len(&self) -> usize {
+        self.grid().history_size()
     }
 }
 
@@ -896,6 +1023,101 @@ mod tests {
     fn new_uses_documented_default_scrollback_cap() {
         let b = AlacrittyBackend::new(20, 5);
         assert_eq!(b.scrollback_cap(), DEFAULT_SCROLLBACK_CAP);
+    }
+
+    // ───────── W5-2 FIAÇÃO: captura append-on-scroll (cabo p/ o ScrollbackStore) ─────────
+
+    /// As linhas capturadas devem ser o PREFIXO exato da sequência emitida: ordem
+    /// cronológica + byte-idêntico + ZERO gap. (`make(i)` = a i-ésima linha emitida.)
+    fn assert_prefix(captured: &[String], make: impl Fn(usize) -> String) {
+        let expected: Vec<String> = (0..captured.len()).map(make).collect();
+        assert_eq!(
+            captured,
+            expected.as_slice(),
+            "linhas capturadas não são o prefixo exato (gap/ordem/conteúdo divergiu)"
+        );
+    }
+
+    /// FIAÇÃO W5-2: cada linha que rola para fora do viewport é capturada (append-on-scroll),
+    /// em ordem e byte-idêntica — base do cabo que o pty-host liga ao `ScrollbackStore`.
+    #[test]
+    fn scrollback_capture_harvests_each_scrolled_line_in_order() {
+        let cap = 8usize;
+        let rows = 4u16;
+        let mut b = AlacrittyBackend::with_scrollback_capture(20, rows, cap);
+
+        const N: usize = 50;
+        for i in 0..N {
+            b.advance(format!("L{i}\r\n").as_bytes());
+        }
+        let captured = b.take_scrollback();
+
+        // Prefixo exato L0..L{len-1}: zero gap, ordem cronológica, byte-idêntico.
+        assert_prefix(&captured, |i| format!("L{i}"));
+        // No máximo `rows` linhas ficam visíveis → pelo menos N - rows saíram do viewport.
+        assert!(
+            captured.len() >= N - rows as usize,
+            "esperava ≥ {} capturadas, veio {}",
+            N - rows as usize,
+            captured.len()
+        );
+        assert!(captured.len() <= N);
+        // O ring em RAM estabiliza NO cap (linhas em RAM == cap).
+        assert_eq!(
+            b.scrollback_len(),
+            cap,
+            "ring de scrollback deve ficar exatamente no cap"
+        );
+        // Drenou: segunda chamada vem vazia.
+        assert!(
+            b.take_scrollback().is_empty(),
+            "take_scrollback deve drenar o buffer"
+        );
+    }
+
+    /// FIAÇÃO W5-2 (CRUX inv#4): output TORRENCIAL num ÚNICO `advance` (>> cap linhas) — o caso
+    /// que a leitura-do-histórico-pós-advance perderia (eviccão dentro do mesmo advance). O
+    /// sub-chunk + harvest captura TODAS sem gap. É a diferença entre "nada se perde" e perder
+    /// a janela inteira sob firehose.
+    #[test]
+    fn scrollback_capture_survives_torrential_single_advance() {
+        let cap = 8usize;
+        let rows = 4u16;
+        let mut b = AlacrittyBackend::with_scrollback_capture(20, rows, cap);
+
+        const N: usize = 5_000; // 625× o cap, num único advance
+        let mut blast = String::with_capacity(N * 8);
+        for i in 0..N {
+            blast.push_str(&format!("L{i}\r\n"));
+        }
+        b.advance(blast.as_bytes());
+        let captured = b.take_scrollback();
+
+        // ZERO PERDA: prefixo exato, sem buracos, apesar de >> cap linhas num advance só.
+        assert_prefix(&captured, |i| format!("L{i}"));
+        assert!(
+            captured.len() >= N - rows as usize,
+            "perdeu linhas sob firehose: {} de {}",
+            captured.len(),
+            N
+        );
+        assert_eq!(b.scrollback_len(), cap, "ring trimado ao cap pós-firehose");
+    }
+
+    /// FIAÇÃO W5-2: sem captura (construtores `new`/`with_scrollback_cap`), `take_scrollback`
+    /// é inerte (vazio) — o caminho legado não paga custo nem muda de comportamento.
+    #[test]
+    fn no_capture_means_empty_scrollback() {
+        let mut b = AlacrittyBackend::with_scrollback_cap(20, 4, 8);
+        for i in 0..50u32 {
+            b.advance(format!("L{i}\r\n").as_bytes());
+        }
+        assert!(
+            b.take_scrollback().is_empty(),
+            "backend sem captura não deve acumular scrollback"
+        );
+        // E o ring continua respeitando o cap (comportamento legado intacto).
+        assert_eq!(b.grid().history_size(), 8);
     }
 
     // ───────────────────────────── Seleção de texto ─────────────────────────────
