@@ -8,14 +8,20 @@ name: CI
 # Estado dos gates (2026-06-03, HEAD da Onda 5):
 #   * core-macos      — gate PRINCIPAL (espelha o canal limpo do Maestro): test + clippy + fmt.
 #   * core-linux      — bônus barato; o core é Mac/Linux-verde (W0). Confirma portabilidade do core.
+#   * core-windows    — portabilidade do core no Windows (x86_64-msvc). INFORMATIVO (continue-on-error)
+#                       enquanto o caminho Windows do core nunca rodou num runner; depois do bring-up
+#                       (W5-3) que liga o ConPTY, REMOVA o continue-on-error → vira gate de verdade.
 #   * license-security — W5-5 wire-CI: cargo-deny (licenças) + cargo-audit (RustSec). Verdes localmente.
 #   * app-macos       — build/clippy/fmt do shell gpui (standalone, fora do workspace).
 #
 # PENDENTE (bloco de INFRA do §7 — precisa hardware/certificados do fundador, NÃO ligado aqui):
-#   * Windows ConPTY (W5-3) + matriz GPU Linux (NVIDIA/AMD/Intel × X11/Wayland) — ver épico W5-3.
+#   * App gpui no Windows + ConPTY real (W5-3): bring-up nativo validado NA TELA — ver WINDOWS-BRINGUP.md.
+#     (o core-windows acima cobre só o core headless; a tela do gpui não roda em CI — exige olho humano.)
+#   * Matriz GPU Linux (NVIDIA/AMD/Intel × X11/Wayland) — ver épico W5-3.
 #   * E2E visual golden-render 3-SO + assinatura/notarização (W5-6) → conta Apple + Authenticode.
-# Ao primeiro push: confirme que os 4 jobs abaixo ficam verdes (foram validados localmente,
-# mas o ambiente do runner pode exigir ajuste de toolchain — em especial o app gpui).
+# Ao primeiro push: confirme que os gates obrigatórios (core-macos, core-linux, license-security,
+# app-macos) ficam verdes. O core-windows é informativo e NÃO bloqueia merge enquanto for continue-on-error
+# (foram validados localmente, mas o ambiente do runner pode exigir ajuste de toolchain — em especial o gpui).
 
 on:
   push:
@@ -57,6 +63,27 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Test (workspace, serializado)
+        run: cargo test --workspace -- --test-threads=1
+      - name: Clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  core-windows:
+    name: Core (Windows) — portabilidade do core (x86_64-msvc)
+    runs-on: windows-latest
+    # INFORMATIVO até o bring-up ligar o ConPTY (ver WINDOWS-BRINGUP.md). O caminho Windows do core
+    # (cli_discovery / lina-pty / mailbox / scrollback) nunca foi compilado num runner, então clippy
+    # pode acusar lint latente do ramo cfg(windows)/cfg(not(unix)). Não bloqueia merge enquanto for
+    # `true`. PÓS-BRING-UP: remova esta linha para o Windows virar gate obrigatório.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      # windows-latest do GitHub é x86_64 → toolchain stable resolve x86_64-pc-windows-msvc
+      # (exatamente a arquitetura exigida no bring-up). Não há fmt aqui: espelha core-linux.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (workspace, serializado — testes #![cfg(unix)] são pulados nesta plataforma)
         run: cargo test --workspace -- --test-threads=1
       - name: Clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
