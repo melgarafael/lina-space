@@ -2,6 +2,10 @@
 
 > **Leia isto antes de tocar em qualquer código.** Este arquivo é carregado automaticamente em toda sessão. Ele garante que você — humano ou IA — nunca construa uma parte do MVP sem ter em contexto **onde queremos chegar**.
 
+> 🪟 **VOCÊ ESTÁ NUMA MÁQUINA WINDOWS?** Então sua missão é o **bring-up do Windows**: leia
+> **`WINDOWS-BRINGUP.md`** (raiz) e invoque a skill **`/windows-bringup`**. NÃO use WSL (decidido);
+> NÃO re-arquitete os terminais; fallback é Slint. Tudo está naquele doc + na skill.
+
 ## O que é o Lina Space
 
 App **desktop Rust-nativo, GPU-first** (Windows/Mac/Linux): um **canvas para múltiplos terminais de IA** voltado a empreendedores **não-técnicos**. Cada agente é um terminal vivo rodando um CLI de IA (Claude Code, Codex…); todos cooperam **automaticamente e sem fios**, com tudo estruturado e nada se perdendo num crash. **Sem LLM/harness/chat próprios** — a inteligência vem do CLI de terceiro; o "chat" é sempre o terminal.

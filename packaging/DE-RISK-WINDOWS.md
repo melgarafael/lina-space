@@ -1,4 +1,9 @@
-# De-risk do Windows nativo (gpui + ConPTY) — guia turnkey p/ a VM
+# De-risk do Windows nativo (gpui + ConPTY)
+
+> ⚠️ **DOC MESTRE = `WINDOWS-BRINGUP.md` (raiz) + a skill `/windows-bringup`.** Este aqui é a
+> investigação/justificativa ("por que NATIVO e não WSL") + notas de de-risk pensadas originalmente
+> p/ uma VM Parallels. Numa **máquina Windows x86_64 real** (o caso atual), siga o `WINDOWS-BRINGUP.md`
+> e a skill — eles têm o fluxo completo (build → de-risk → ConPTY → empacotar `.exe` → PR).
 
 > **Decisão (2026-06-04):** Windows é prioridade (80% dos alunos). Caminho escolhido = **nativo**
 > (gpui-Windows DirectX + ConPTY), NÃO WSL (Vulkan não acelera sob WSLg + atrito de instalação para
