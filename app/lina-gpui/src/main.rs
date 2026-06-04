@@ -979,7 +979,7 @@ impl WorkspaceView {
         }
         // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona (foca+revela); ⌘⌫ fecha o focado;
         // ⌘+ / ⌘- dão zoom in/out no centro da viewport.
-        if ks.modifiers.platform && ks.key == "t" {
+        if shortcut_modifier(ks) && ks.key == "t" {
             match self.nodes.add_node() {
                 Ok(node) => {
                     self.focus(node);
@@ -1009,8 +1009,39 @@ impl WorkspaceView {
         let bytes = keystroke_to_bytes(ks, app_cursor);
         if !bytes.is_empty() {
             self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
+            return;
+        }
+        if let Some(bytes) = printable_key_fallback(ks) {
+            self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
         }
     }
+}
+
+#[cfg(windows)]
+fn shortcut_modifier(ks: &Keystroke) -> bool {
+    ks.modifiers.control || ks.modifiers.platform
+}
+
+#[cfg(not(windows))]
+fn shortcut_modifier(ks: &Keystroke) -> bool {
+    ks.modifiers.platform
+}
+
+#[cfg(windows)]
+fn printable_key_fallback(ks: &Keystroke) -> Option<Vec<u8>> {
+    if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.alt {
+        return None;
+    }
+    let ch = ks
+        .key_char
+        .as_deref()
+        .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))?;
+    Some(ch.as_bytes().to_vec())
+}
+
+#[cfg(not(windows))]
+fn printable_key_fallback(_ks: &Keystroke) -> Option<Vec<u8>> {
+    None
 }
 
 impl Render for WorkspaceView {

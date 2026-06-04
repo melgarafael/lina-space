@@ -1424,19 +1424,29 @@ fn install_agent_bus_skill(cwd: &Path) {
 /// Prepõe o diretório do `lina` ao `PATH` do filho para o A2A funcionar sem setup manual.
 #[must_use]
 pub fn shell_cmd(name: &str) -> PtyCommand {
-    let cmd = PtyCommand::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
-             exec \"${{SHELL:-/bin/sh}}\" -i"
-        ))
-        .env("TERM", "xterm-256color");
+    let cmd = platform_shell_cmd(name).env("TERM", "xterm-256color");
     // Garante o `lina` no PATH do shell filho (A2A sem setup manual): prepõe o dir do binário
     // `lina` ao PATH herdado. Best-effort — sem resolução, o shell ainda herda o PATH do pai.
     match lina_path_value() {
         Some(path) => cmd.env("PATH", path),
         None => cmd,
     }
+}
+
+#[cfg(windows)]
+fn platform_shell_cmd(name: &str) -> PtyCommand {
+    let safe_name = name.replace('&', "^&").replace('|', "^|");
+    PtyCommand::new("cmd.exe").arg("/K").arg(format!(
+        "echo {safe_name} - shell interativo (digite comandos; rode claude/codex/vim/...)"
+    ))
+}
+
+#[cfg(not(windows))]
+fn platform_shell_cmd(name: &str) -> PtyCommand {
+    PtyCommand::new("sh").arg("-c").arg(format!(
+        "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
+             exec \"${{SHELL:-/bin/sh}}\" -i"
+    ))
 }
 
 /// **W3-6c fio 3 — env limpo do PTY do agente.** Nomes de variáveis de ambiente portadoras de
