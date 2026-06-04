@@ -30,7 +30,7 @@ mod creators;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, ClipboardItem, Context,
@@ -362,6 +362,36 @@ struct Sel {
     head: (usize, usize),
 }
 
+// === W5-1 (instrumentação de FPS de render) ===========================================
+// O gpui NÃO roda headless, então o FPS de render só sai NA TELA, com o app vivo. Instrumentamos o
+// caminho de render do `WorkspaceView` no MESMO canal (stderr) das demais sondas (cards/pulso): mede
+// o FRAMETIME como o intervalo entre dois `render` consecutivos — a cadência REAL na tela (incl. a
+// espera de vsync), não o custo-de-CPU de montar a cena (que subestima: layout/paint/present do gpui
+// vêm DEPOIS que `render` retorna). Custo desprezível: 1 subtração + 1 push por frame.
+
+/// Janela de amostragem do frametime, em FRAMES. ~120 frames ≈ 1s a 120fps / ~2s a 60fps. Loga uma
+/// linha `[FPS]` por janela cheia (ou ao atingir [`FPS_WINDOW_MS`] de render ativo — o que vier antes).
+const FPS_WINDOW: usize = 120;
+/// Teto de TEMPO ATIVO (ms) por janela. A soma do ring É o tempo de parede dos frames medidos (as
+/// lacunas ociosas já foram descartadas), então logamos ao acumular ~2s de render ATIVO mesmo abaixo
+/// de [`FPS_WINDOW`] frames — cobre o caso de FPS baixo sem segurar o relatório.
+const FPS_WINDOW_MS: f64 = 2000.0;
+/// Teto de intervalo entre frames. Acima disto NÃO é "frame lento": é OCIOSIDADE — o loop de animação
+/// quiesce quando nada muda (`request_animation_frame` só se auto-sustenta enquanto chegam frames),
+/// então o "intervalo" vira a duração da quietude. Descartado p/ não envenenar p50/p95/p99 (medimos
+/// FPS *enquanto desenha*). 250ms = 4fps; abaixo disto é desenho contínuo real.
+const IDLE_GAP_MS: f64 = 250.0;
+
+/// Percentil (nearest-rank) de um slice **já ordenado** de ms. `p` em `[0.0, 100.0]`; slice vazio →
+/// `0.0`. Barato e sem alocar: índice = `round(p/100 · (n-1))`, saturado em `[0, n-1]` (sem panic).
+fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (p / 100.0 * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
 /// O canvas gpui — a ÚNICA parte que conhece o toolkit. O estado dos nós (add/remove, model,
 /// grids) vive no [`NodeManager`] gpui-free; a view só renderiza, roteia input e foca.
 struct WorkspaceView {
@@ -413,6 +443,14 @@ struct WorkspaceView {
     /// a dead-key e a vogal. Rastreado só p/ o protocolo `NSTextInputClient` (o SO pergunta a faixa
     /// marcada); NÃO é renderizado inline (a TUI não tem onde mostrá-lo). `None` = fora de composição.
     ime_marked: Option<String>,
+    /// W5-1 (instrumentação de FPS): instante do ÚLTIMO `render`. O FRAMETIME é o intervalo até o
+    /// próximo frame — a cadência REAL na tela. `Instant` monotônico (NUNCA `SystemTime`). `None` no
+    /// 1º frame (ainda sem intervalo a medir).
+    last_frame_at: Option<Instant>,
+    /// W5-1: ring das últimas amostras de frametime (ms) p/ os percentis. Esvazia a cada janela
+    /// (~[`FPS_WINDOW`] frames OU ~[`FPS_WINDOW_MS`] de render ativo). Lacunas de OCIOSIDADE (intervalo
+    /// > [`IDLE_GAP_MS`], sem redraw) são descartadas p/ não envenenar p50/p95/p99.
+    frametime_ms: Vec<f64>,
 }
 
 impl WorkspaceView {
@@ -481,6 +519,8 @@ impl WorkspaceView {
             diag_last_frame: String::new(),
             diag_last_pulse: String::new(),
             ime_marked: None,
+            last_frame_at: None,
+            frametime_ms: Vec::with_capacity(FPS_WINDOW),
         }
     }
 
@@ -975,6 +1015,20 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
 
+        // W5-1 (instrumentação de FPS): amostra o FRAMETIME = intervalo desde o frame anterior. O loop
+        // de animação (`request_animation_frame` + a tarefa `cx.spawn` do pulso) só dirige frames
+        // ENQUANTO há atividade (pan/zoom/pulso vivo), então o intervalo é a cadência REAL de desenho.
+        // Intervalo > IDLE_GAP_MS = janela ociosa (sem redraw pedido), NÃO frame lento: descarta p/ os
+        // percentis medirem FPS *enquanto desenha*. `Instant` monotônico (lição: NUNCA `SystemTime`).
+        let frame_now = Instant::now();
+        if let Some(prev) = self.last_frame_at {
+            let dt_ms = frame_now.saturating_duration_since(prev).as_secs_f64() * 1000.0;
+            if dt_ms <= IDLE_GAP_MS {
+                self.frametime_ms.push(dt_ms);
+            }
+        }
+        self.last_frame_at = Some(frame_now);
+
         // Os cards desenhados DERIVAM do NodeManager (não de 2 fixos) — add/remove refletem aqui.
         let mut cards = self.nodes.cards();
         let (pulse, event_count, recovering, cost_paused) = {
@@ -1184,6 +1238,9 @@ impl Render for WorkspaceView {
         // BUG A/B (instrumentação): acumula 1 linha por card (rows/zona/dim) e loga após o loop SÓ se
         // mudou (sem spammar a 60fps). O Maestro confirma por DADOS que as rows batem + zona/dim ok.
         let mut frame_diag = String::new();
+        // W5-1 (instrumentação de FPS): paineis DESENHADOS = os não-suspensos (mesma classificação de
+        // zona da sonda de cards). Conta no loop; `cards.len()` dá os VIVOS.
+        let mut panels_drawn = 0usize;
         for (idx, (id, nv)) in cards.iter().enumerate() {
             let node_id = *id;
             // ID de elemento ESTÁVEL por nó (não o idx do loop, que muda com cull/z-order).
@@ -1212,6 +1269,7 @@ impl Render for WorkspaceView {
             if zone == canvas::Zone::Suspended {
                 continue;
             }
+            panels_drawn += 1; // W5-1: passou da guarda de suspenso → este painel é DESENHADO.
             let (sx, sy) = cam.world_to_screen((nv.x, nv.y));
             let z = cam.zoom;
             let card_border = if node_id == focused {
@@ -1388,6 +1446,29 @@ impl Render for WorkspaceView {
         if !frame_diag.is_empty() && frame_diag != self.diag_last_frame {
             eprintln!("lina-gpui: cards · {frame_diag}");
             self.diag_last_frame = frame_diag;
+        }
+
+        // W5-1 (instrumentação de FPS): fecha a janela a cada ~FPS_WINDOW frames OU ~FPS_WINDOW_MS de
+        // render ATIVO (a soma do ring É o tempo de parede dos frames medidos — lacunas ociosas já
+        // foram descartadas). Loga paineis VIVOS/DESENHADOS + p50/p95/p99 do frametime + FPS estimado
+        // (= 1000/média). O fundador faz grep por `[FPS]`. Esvazia o ring p/ a próxima janela.
+        let active_ms: f64 = self.frametime_ms.iter().sum();
+        if self.frametime_ms.len() >= FPS_WINDOW || active_ms >= FPS_WINDOW_MS {
+            if !self.frametime_ms.is_empty() {
+                let mut sorted = self.frametime_ms.clone();
+                sorted.sort_by(f64::total_cmp);
+                let n = sorted.len() as f64;
+                let mean = active_ms / n;
+                let p50 = percentile_sorted(&sorted, 50.0);
+                let p95 = percentile_sorted(&sorted, 95.0);
+                let p99 = percentile_sorted(&sorted, 99.0);
+                let fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
+                let panels_live = cards.len();
+                eprintln!(
+                    "lina-gpui: [FPS] panels_live={panels_live} panels_drawn={panels_drawn} p50={p50:.1}ms p95={p95:.1}ms p99={p99:.1}ms fps={fps:.0}"
+                );
+            }
+            self.frametime_ms.clear();
         }
 
         // PULSO efêmero A→B (a metáfora "sem fios"). W4-3: respeita REDUCE-MOTION — com ele ligado, a
