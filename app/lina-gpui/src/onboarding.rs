@@ -8,7 +8,7 @@
 //! O progresso é **retomável** (persistido em disco): fechar no meio e reabrir cai no passo onde parou.
 //!
 //! ## Split (igual ao resto do shell: lógica gpui-free + view fina)
-//! - [`OnboardingModel`] + helpers (`install_command`, `run_install`, `Progress`) são **gpui-free e
+//! - [`OnboardingModel`] + helpers (`install_recipe`, `run_install`, `Progress`) são **gpui-free e
 //!   testáveis** — toda a lógica vive aqui.
 //! - [`OnboardingView`] só renderiza o modelo e roteia cliques.
 //!
@@ -24,9 +24,11 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+
+use lina_cli_profiles::{InstallRecipe, Installers};
 
 use gpui::{
     div, prelude::*, px, rgb, size, text, AnyElement, App, Bounds, ClickEvent, Context,
@@ -154,12 +156,36 @@ pub fn save_progress(dir: &Path, p: &Progress) {
 
 // ═══════════════════════════════ "Instalar para mim" (gpui-free) ═══════════════════════════════
 
-/// Comando de instalação resolvido (programa + args). O comando real do CLI vive numa tabela
-/// app-local por SO (o `CliProfile` TOML de W0-8 ainda não tem campo de install — ver `.entrega`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallCmd {
-    pub program: String,
-    pub args: Vec<String>,
+/// Receitas de instalação por SO embutidas (config TOML, NÃO hardcoded em Rust — inv#3). Um dir
+/// externo opcional `LINA_INSTALLERS` pode adicionar/sobrescrever CLIs sem recompilar (porta aberta).
+const INSTALLERS_TOML: &str = include_str!("../../../profiles/installers/recipes.toml");
+
+/// Tabela de receitas parseada uma única vez. TOML inválido → tabela vazia (o botão vira fallback
+/// "instale manualmente"); nunca derruba o app.
+fn installers() -> &'static Installers {
+    static INSTALLERS: OnceLock<Installers> = OnceLock::new();
+    INSTALLERS.get_or_init(|| {
+        let mut table = Installers::from_toml_str(INSTALLERS_TOML, "profiles/installers/recipes.toml")
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "onboarding: installers/recipes.toml inválido ({e}); 'Instalar para mim' indisponível"
+                );
+                Installers::default()
+            });
+        // Override externo OPCIONAL (sem recompilar — inv#3): `LINA_INSTALLERS=/caminho/recipes.toml`
+        // adiciona/sobrescreve receitas por id. Best-effort: arquivo ausente/inválido é só logado.
+        if let Some(path) = std::env::var_os("LINA_INSTALLERS") {
+            match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|src| {
+                    Installers::from_toml_str(&src, &path.to_string_lossy()).map_err(|e| e.to_string())
+                }) {
+                Ok(ext) => table.0.extend(ext.0), // entradas externas vencem as embutidas (mesmo id)
+                Err(e) => eprintln!("onboarding: LINA_INSTALLERS ignorado ({e})"),
+            }
+        }
+        table
+    })
 }
 
 /// Estado do trabalho de instalação (mapeia os estados do design: detectando → instalando → ok →
@@ -178,49 +204,35 @@ pub enum InstallState {
     Failed { reason: String },
 }
 
-/// Tabela default de instalação por CLI (best-effort; nomes oficiais dos pacotes npm). `None` = sem
-/// comando conhecido (o usuário instala manualmente).
-fn default_install(cli_id: &str) -> Option<(&'static str, Vec<&'static str>)> {
-    match cli_id {
-        "claude" => Some(("npm", vec!["install", "-g", "@anthropic-ai/claude-code"])),
-        "codex" => Some(("npm", vec!["install", "-g", "@openai/codex"])),
-        "gemini" => Some(("npm", vec!["install", "-g", "@google/gemini-cli"])),
-        "opencode" => Some(("npm", vec!["install", "-g", "opencode-ai"])),
-        // O binário do pacote tem de se chamar EXATAMENTE como o id que a re-detecção procura, senão
-        // a instalação "termina mas o programa não aparece". `@github/copilot` expõe `copilot` (verificado
-        // via `npm view @github/copilot bin`); o antigo `@githubnext/github-copilot-cli` está DEPRECADO e
-        // expõe `github-copilot-cli` (≠ `copilot`) — instalava com sucesso e mesmo assim falhava a verificação.
-        "copilot" => Some(("npm", vec!["install", "-g", "@github/copilot"])),
-        _ => None,
-    }
-}
-
-/// Resolve o comando de install, dado o valor de override do ambiente (puro — testável sem mexer no
-/// `env` do processo). Override (`LINA_INSTALL_<ID>`) roda via `sh -c "<string>"` (flexível p/ o
-/// fundador apontar `brew`/script oficial e p/ testes injetarem um instalador falso).
+/// Resolve a RECEITA de instalação do CLI p/ o SO atual (puro — testável sem mexer no `env`/TOML
+/// reais). Override `LINA_INSTALL_<ID>` (string de shell via `sh -c`) tem prioridade — flexível p/ o
+/// fundador apontar um instalador alternativo e p/ os testes injetarem um instalador falso. Sem
+/// override, vem da tabela `installers`. `None` = sem receita p/ este CLI/SO → fallback manual.
 #[must_use]
-pub fn install_command_with(cli_id: &str, env_override: Option<&str>) -> Option<InstallCmd> {
+pub fn install_recipe_with(
+    cli_id: &str,
+    env_override: Option<&str>,
+    installers: &Installers,
+) -> Option<InstallRecipe> {
     if let Some(s) = env_override {
         let s = s.trim();
         if !s.is_empty() {
-            return Some(InstallCmd {
+            return Some(InstallRecipe {
                 program: "sh".into(),
                 args: vec!["-c".into(), s.to_string()],
+                env: Default::default(),
+                verify_paths: Vec::new(),
             });
         }
     }
-    let (program, args) = default_install(cli_id)?;
-    Some(InstallCmd {
-        program: program.to_string(),
-        args: args.into_iter().map(String::from).collect(),
-    })
+    installers.recipe_for(cli_id).cloned()
 }
 
-/// Resolve o comando de install do CLI (lê o override de `LINA_INSTALL_<ID>` no ambiente).
+/// Receita do CLI lendo o override `LINA_INSTALL_<ID>` do ambiente + a tabela embutida.
 #[must_use]
-pub fn install_command(cli_id: &str) -> Option<InstallCmd> {
+pub fn install_recipe(cli_id: &str) -> Option<InstallRecipe> {
     let key = format!("LINA_INSTALL_{}", cli_id.to_ascii_uppercase());
-    install_command_with(cli_id, std::env::var(&key).ok().as_deref())
+    install_recipe_with(cli_id, std::env::var(&key).ok().as_deref(), installers())
 }
 
 /// Atualiza o estado compartilhado de instalação (best-effort sob poison).
@@ -235,7 +247,7 @@ fn set_install(state: &Arc<Mutex<InstallState>>, s: InstallState) {
 /// `PATH`) — a fonte da verdade do sucesso é o CLI **aparecer** depois (não o exit code do npm).
 /// `verify` é injetável: produção passa `discover_clis().find(id)`; testes injetam `discover_clis_in`.
 pub fn run_install(
-    cmd: InstallCmd,
+    recipe: InstallRecipe,
     state: Arc<Mutex<InstallState>>,
     verify: impl Fn() -> Option<DiscoveredCli> + Send + 'static,
 ) -> thread::JoinHandle<()> {
@@ -249,7 +261,11 @@ pub fn run_install(
 
         let mut pty = PtyManager::new();
         const KEY: &str = "onboarding-install";
-        let pcmd = PtyCommand::new(cmd.program).args(cmd.args);
+        let mut pcmd = PtyCommand::new(recipe.program).args(recipe.args);
+        // `env` da receita garante não-interatividade (ex.: CODEX_NON_INTERACTIVE=1).
+        for (k, v) in &recipe.env {
+            pcmd = pcmd.env(k, v);
+        }
         if let Err(e) = pty.spawn(KEY, pcmd, 100, 30) {
             set_install(
                 &state,
@@ -480,13 +496,13 @@ impl OnboardingModel {
         ) {
             return;
         }
-        let Some(cmd) = install_command(cli_id) else {
+        let Some(recipe) = install_recipe(cli_id) else {
             set_install(
                 &self.install,
                 InstallState::Failed {
                     reason: format!(
-                        "ainda não sei instalar '{cli_id}' automaticamente — instale manualmente e \
-                         clique em Verificar"
+                        "ainda não sei instalar '{cli_id}' neste sistema automaticamente — instale \
+                         manualmente e clique em Verificar"
                     ),
                 },
             );
@@ -505,10 +521,15 @@ impl OnboardingModel {
             },
         );
         let id = cli_id.to_string();
-        // `verify` reusa a MESMA descoberta injetada (consistente em teste/produção); roda na thread
-        // de instalação (não na de UI).
+        let verify_paths = recipe.verify_paths.clone();
+        // `verify` reusa a descoberta injetada (consistente em teste/produção); roda na thread de
+        // instalação. ANTES de descobrir, RE-HIDRATA o PATH: o instalador acabou de escrever seu dir
+        // no rc do shell (um login shell novo já o enxerga) e unimos os `verify_paths` fixos da receita
+        // (ex.: ~/.opencode/bin). Grava o PATH no processo → a verificação acha o binário recém-instalado
+        // E o canvas já consegue spawná-lo sem reabrir o app. (Era o furo do "instalou mas não apareceu".)
         let discover = Arc::clone(&self.discover);
-        let handle = run_install(cmd, Arc::clone(&self.install), move || {
+        let handle = run_install(recipe, Arc::clone(&self.install), move || {
+            crate::refresh_path_after_install(&verify_paths);
             discover().into_iter().find(|c| c.id == id)
         });
         self.install_handle = Some(handle);
@@ -1226,36 +1247,31 @@ mod tests {
         assert_eq!(load_progress(tmp.path()), p);
     }
 
-    /// Comando de install: default por id + override de ambiente (puro, sem mexer no env).
+    /// Resolução de receita (puro): override `sh -c` tem prioridade; a tabela embutida resolve os CLIs
+    /// conhecidos p/ o SO atual; CLI desconhecido → None (fallback manual). Regressão do copilot:
+    /// usa `@github/copilot` (binário `copilot`), NUNCA o deprecado `github-copilot-cli`.
     #[test]
-    fn install_command_default_and_override() {
-        let claude = install_command_with("claude", None).expect("claude tem default");
-        assert_eq!(claude.program, "npm");
-        assert!(claude.args.iter().any(|a| a.contains("claude-code")));
-        assert!(install_command_with("desconhecido", None).is_none());
-
-        // Regressão: o copilot DEVE usar `@github/copilot` (binário `copilot`), NÃO o deprecado
-        // `@githubnext/github-copilot-cli` (binário `github-copilot-cli`), que instalava com sucesso
-        // mas falhava a re-detecção de `copilot` ("a instalação terminou, mas o programa não apareceu").
-        let copilot = install_command_with("copilot", None).expect("copilot tem default");
-        assert!(
-            copilot.args.iter().any(|a| a == "@github/copilot"),
-            "copilot deve instalar @github/copilot (binário `copilot`), veio {:?}",
-            copilot.args
-        );
-        assert!(
-            !copilot.args.iter().any(|a| a.contains("githubnext")),
-            "não pode voltar ao pacote deprecado @githubnext/github-copilot-cli"
-        );
-
-        let over = install_command_with("claude", Some("echo oi")).expect("override");
+    fn install_recipe_resolution_and_override() {
+        let inst = installers();
+        // Override vence tudo e roda via `sh -c`.
+        let over = install_recipe_with("claude", Some("echo oi"), inst).expect("override");
         assert_eq!(over.program, "sh");
         assert_eq!(over.args, vec!["-c".to_string(), "echo oi".to_string()]);
-        // override vazio cai no default.
+        // Override vazio cai na tabela.
         assert_eq!(
-            install_command_with("claude", Some("   ")),
-            install_command_with("claude", None)
+            install_recipe_with("claude", Some("   "), inst),
+            install_recipe_with("claude", None, inst)
         );
+        // CLI conhecido → receita do SO atual com programa não-vazio.
+        let claude = install_recipe_with("claude", None, inst).expect("claude tem receita");
+        assert!(!claude.program.trim().is_empty());
+        // CLI desconhecido → None (fallback manual).
+        assert!(install_recipe_with("desconhecido", None, inst).is_none());
+        // Regressão copilot: `@github/copilot`, nunca o pacote deprecado.
+        let copilot = install_recipe_with("copilot", None, inst).expect("copilot tem receita");
+        let joined = copilot.args.join(" ");
+        assert!(joined.contains("@github/copilot"), "veio {joined:?}");
+        assert!(!joined.contains("githubnext"));
     }
 
     /// O LOOP do critério, headless: "instalar" (fake) põe o binário no PATH e a re-detecção
@@ -1275,7 +1291,7 @@ mod tests {
             bin_path.display(),
             bin_path.display()
         );
-        let cmd = install_command_with("claude", Some(&script)).expect("override install");
+        let cmd = install_recipe_with("claude", Some(&script), installers()).expect("override install");
 
         let state = Arc::new(Mutex::new(InstallState::Idle));
         let verify_dir = bin_path.clone();
@@ -1304,7 +1320,7 @@ mod tests {
         use lina_core::discover_clis_in;
         let empty = TempDir::new("empty");
         let dir = empty.path().to_path_buf();
-        let cmd = install_command_with("claude", Some("true")).expect("noop install");
+        let cmd = install_recipe_with("claude", Some("true"), installers()).expect("noop install");
         let state = Arc::new(Mutex::new(InstallState::Idle));
         let handle = run_install(cmd, Arc::clone(&state), move || {
             discover_clis_in(&dir.display().to_string())

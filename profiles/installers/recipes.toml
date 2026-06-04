@@ -1,0 +1,93 @@
+# installers.toml — receitas de instalação NÃO-INTERATIVAS dos assistentes de IA, por SO.
+# Consumido pelo onboarding ("Instalar para mim"). A chave é o **id de descoberta** que a varredura
+# do PATH procura (claude/codex/gemini/opencode/copilot) — pode diferir do `id` do CliProfile de
+# orquestração (ex.: claude-code.toml tem id="claude-code").
+#
+# Princípios:
+#  - SILENCIOSO: nenhuma receita faz pergunta Y/N (scripts curl|bash não perguntam; codex usa
+#    CODEX_NON_INTERACTIVE=1; npm -g é silencioso). Nada de responder prompt no escuro.
+#  - `verify_paths`: diretórios FIXOS onde o instalador põe o binário, possivelmente FORA do PATH
+#    atual (o onboarding ainda re-hidrata o PATH do login shell e o $(npm prefix -g)/bin).
+#  - Comandos verificados nas docs oficiais (2026-06). macOS é o único VERIFICADO em runtime aqui;
+#    Linux/Windows vêm das docs + fallback "rode no terminal" se a verificação falhar.
+
+# ───────────────────────────── claude (Claude Code) ─────────────────────────────
+# Instalador nativo → ~/.local/bin/claude (mexe no rc; binário fixo nesse dir).
+[claude.macos]
+program = "bash"
+args = ["-c", "curl -fsSL https://claude.ai/install.sh | bash"]
+verify_paths = ["~/.local/bin"]
+
+[claude.linux]
+program = "bash"
+args = ["-c", "curl -fsSL https://claude.ai/install.sh | bash"]
+verify_paths = ["~/.local/bin"]
+
+[claude.windows]
+program = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://claude.ai/install.ps1 | iex"]
+verify_paths = ["~\\.local\\bin"]
+
+# ───────────────────────────── codex (OpenAI Codex) ─────────────────────────────
+# Script oficial → ~/.local/bin/codex ; CODEX_NON_INTERACTIVE=1 suprime os prompts.
+[codex.macos]
+program = "bash"
+args = ["-c", "sh -c \"$(curl -fsSL https://chatgpt.com/codex/install.sh)\""]
+verify_paths = ["~/.local/bin"]
+env = { CODEX_NON_INTERACTIVE = "1" }
+
+[codex.linux]
+program = "bash"
+args = ["-c", "sh -c \"$(curl -fsSL https://chatgpt.com/codex/install.sh)\""]
+verify_paths = ["~/.local/bin"]
+env = { CODEX_NON_INTERACTIVE = "1" }
+
+[codex.windows]
+program = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "$env:CODEX_NON_INTERACTIVE='1'; irm https://chatgpt.com/codex/install.ps1 | iex"]
+verify_paths = ["~\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin"]
+
+# ───────────────────────────── gemini (Gemini CLI) ─────────────────────────────
+# Só npm (sem script oficial). Binário no $(npm prefix -g)/bin. Requer Node >= 20.
+[gemini.macos]
+program = "bash"
+args = ["-c", "npm install -g @google/gemini-cli --no-fund --no-audit"]
+
+[gemini.linux]
+program = "bash"
+args = ["-c", "npm install -g @google/gemini-cli --no-fund --no-audit"]
+
+[gemini.windows]
+program = "npm"
+args = ["install", "-g", "@google/gemini-cli", "--no-fund", "--no-audit"]
+
+# ───────────────────────────── opencode (SST) ─────────────────────────────
+# curl installer → ~/.opencode/bin (mexe no rc). No Windows não há script nativo → npm.
+[opencode.macos]
+program = "bash"
+args = ["-c", "curl -fsSL https://opencode.ai/install | bash"]
+verify_paths = ["~/.opencode/bin"]
+
+[opencode.linux]
+program = "bash"
+args = ["-c", "curl -fsSL https://opencode.ai/install | bash"]
+verify_paths = ["~/.opencode/bin"]
+
+[opencode.windows]
+program = "npm"
+args = ["install", "-g", "opencode-ai"]
+
+# ───────────────────────────── copilot (GitHub Copilot CLI) ─────────────────────────────
+# Pacote MODERNO @github/copilot (binário `copilot`). Requer Node >= 22. NÃO o deprecado
+# @githubnext/github-copilot-cli (binário github-copilot-cli ≠ copilot).
+[copilot.macos]
+program = "bash"
+args = ["-c", "npm install -g @github/copilot"]
+
+[copilot.linux]
+program = "bash"
+args = ["-c", "npm install -g @github/copilot"]
+
+[copilot.windows]
+program = "npm"
+args = ["install", "-g", "@github/copilot"]

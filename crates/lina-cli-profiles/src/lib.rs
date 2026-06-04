@@ -166,6 +166,94 @@ impl CliProfile {
     }
 }
 
+// ═══════════════════════════ instaladores ("Instalar para mim") ═══════════════════════════
+
+/// Nome canônico do SO atual (compile-time) usado como chave de SO nas receitas de instalação.
+#[cfg(target_os = "macos")]
+pub const CURRENT_OS: &str = "macos";
+#[cfg(target_os = "windows")]
+pub const CURRENT_OS: &str = "windows";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const CURRENT_OS: &str = "linux";
+
+/// Receita de instalação **não-interativa** de um CLI para UM sistema operacional. Roda num PTY
+/// oculto (onboarding T1). `env` injeta variáveis que garantem não-interatividade (ex.:
+/// `CODEX_NON_INTERACTIVE=1`). `verify_paths` lista diretórios EXTRA a conferir após instalar —
+/// vários instaladores põem o binário FORA do `PATH` atual (ex.: `~/.opencode/bin`, `~/.local/bin`)
+/// e/ou só editam o rc do shell, então a verificação tem de olhar nesses lugares também.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallRecipe {
+    /// Programa a lançar (ex.: `"bash"`, `"npm"`, `"powershell"`).
+    pub program: String,
+    /// Argumentos (ex.: `["-c", "curl -fsSL https://opencode.ai/install | bash"]`).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Variáveis de ambiente da instalação (não-interatividade, etc.).
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Diretórios extra a conferir após instalar (suportam `~`). O onboarding ainda re-hidrata o
+    /// `PATH` do shell de login e o `$(npm prefix -g)/bin`; estes cobrem os instaladores que põem
+    /// o binário num lugar fixo fora do `PATH`.
+    #[serde(default)]
+    pub verify_paths: Vec<String>,
+}
+
+/// Receitas de instalação de UM CLI, por sistema operacional (chaves `macos`/`linux`/`windows`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallProfile {
+    #[serde(default)]
+    pub macos: Option<InstallRecipe>,
+    #[serde(default)]
+    pub linux: Option<InstallRecipe>,
+    #[serde(default)]
+    pub windows: Option<InstallRecipe>,
+}
+
+impl InstallProfile {
+    /// Receita para um SO nomeado (`"macos"`/`"linux"`/`"windows"`); `None` se ausente.
+    #[must_use]
+    pub fn for_os(&self, os: &str) -> Option<&InstallRecipe> {
+        match os {
+            "macos" => self.macos.as_ref(),
+            "windows" => self.windows.as_ref(),
+            "linux" => self.linux.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Receita para o SO de compilação atual ([`CURRENT_OS`]).
+    #[must_use]
+    pub fn for_current_os(&self) -> Option<&InstallRecipe> {
+        self.for_os(CURRENT_OS)
+    }
+}
+
+/// Tabela de instaladores indexada pelo **id de descoberta** do CLI (`claude`/`codex`/`gemini`/
+/// `opencode`/`copilot`) — NOTE que é o id que a varredura do `PATH` procura, que pode diferir do
+/// `id` do [`CliProfile`] (ex.: o profile de orquestração tem `id = "claude-code"`). Parseada de um
+/// TOML com seções `[<id>.<os>]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Installers(pub std::collections::BTreeMap<String, InstallProfile>);
+
+impl Installers {
+    /// Parseia a tabela de instaladores de uma string TOML (erro acionável, sem panic).
+    pub fn from_toml_str(toml_src: &str, label: &str) -> Result<Self, ProfileError> {
+        toml::from_str(toml_src).map_err(|source| ProfileError::Parse {
+            path: label.to_owned(),
+            source: Box::new(source),
+        })
+    }
+
+    /// Receita do CLI `id` para o SO atual (`None` se o CLI ou o SO não tiver receita).
+    #[must_use]
+    pub fn recipe_for(&self, id: &str) -> Option<&InstallRecipe> {
+        self.0.get(id).and_then(InstallProfile::for_current_os)
+    }
+}
+
 /// Registry de profiles carregados, indexado por `id`.
 ///
 /// Um profile de mesmo `id` carregado depois **sobrescreve** o anterior — é assim
@@ -450,5 +538,61 @@ mod tests {
         let err = ProfileRegistry::load_dir(profiles_dir().join("does-not-exist"))
             .expect_err("diretório inexistente deve falhar");
         assert!(matches!(err, ProfileError::Io { .. }));
+    }
+
+    // ── instaladores ──
+
+    const SAMPLE_INSTALLERS: &str = r#"
+        [opencode.macos]
+        program = "bash"
+        args = ["-c", "curl -fsSL https://opencode.ai/install | bash"]
+        verify_paths = ["~/.opencode/bin"]
+        [opencode.windows]
+        program = "npm"
+        args = ["install", "-g", "opencode-ai"]
+        [codex.macos]
+        program = "bash"
+        args = ["-c", "sh"]
+        env = { CODEX_NON_INTERACTIVE = "1" }
+    "#;
+
+    #[test]
+    fn installers_parse_recipe_env_and_verify_paths() {
+        let inst = Installers::from_toml_str(SAMPLE_INSTALLERS, "<inline>").expect("parseia");
+        let oc = inst.0["opencode"].for_os("macos").expect("opencode macos");
+        assert_eq!(oc.program, "bash");
+        assert_eq!(oc.args, vec!["-c", "curl -fsSL https://opencode.ai/install | bash"]);
+        assert_eq!(oc.verify_paths, vec!["~/.opencode/bin".to_string()]);
+        // SO ausente → None (não inventa receita).
+        assert!(inst.0["opencode"].for_os("linux").is_none());
+        // env vira parte da receita (não-interatividade do codex).
+        let cx = inst.0["codex"].for_os("macos").expect("codex macos");
+        assert_eq!(cx.env.get("CODEX_NON_INTERACTIVE").map(String::as_str), Some("1"));
+        // recipe_for() resolve pelo SO de compilação corrente.
+        assert!(inst.recipe_for("inexistente").is_none());
+    }
+
+    /// O `installers.toml` REAL do repo parseia e cobre os 5 ids com receita p/ os 3 SOs, e o
+    /// copilot NÃO usa o pacote deprecado (regressão do bug do binário `github-copilot-cli`).
+    #[test]
+    fn real_installers_toml_is_valid_and_complete() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/installers/recipes.toml");
+        let src = std::fs::read_to_string(&path).expect("ler installers.toml");
+        let inst = Installers::from_toml_str(&src, &path.display().to_string())
+            .expect("installers.toml deve parsear");
+        for id in ["claude", "codex", "gemini", "opencode", "copilot"] {
+            let p = inst.0.get(id).unwrap_or_else(|| panic!("falta receita p/ {id}"));
+            for os in ["macos", "linux", "windows"] {
+                let r = p
+                    .for_os(os)
+                    .unwrap_or_else(|| panic!("falta {id}.{os}"));
+                assert!(!r.program.trim().is_empty(), "{id}.{os} sem program");
+            }
+        }
+        // copilot moderno (binário `copilot`), nunca o deprecado.
+        let cp = format!("{:?}", inst.0["copilot"]);
+        assert!(cp.contains("@github/copilot"), "copilot deve usar @github/copilot");
+        assert!(!cp.contains("githubnext"), "copilot não pode usar o pacote deprecado");
     }
 }

@@ -1998,71 +1998,73 @@ fn parse_marked_path<'a>(stdout: &'a str, marker: &str) -> Option<&'a str> {
         .filter(|p| !p.is_empty())
 }
 
-/// macOS/Linux: um app aberto pelo **Finder/Dock** herda só o PATH mínimo do `launchd`
-/// (`/usr/bin:/bin:/usr/sbin:/sbin`) — SEM Homebrew, nvm, volta, `~/.local/bin` nem o bin global do
-/// npm. Resultado: a varredura de CLIs (lê `PATH` do env) não acha `claude`/`codex` mesmo instalados,
-/// e o "Instalar para mim" falha com *"No viable candidates found in PATH"* (o `npm` é invisível).
-/// Aqui resolvemos o PATH REAL do **shell de login** do usuário e o injetamos no processo: a descoberta
-/// e os PTYs filhos (portable-pty semeia o env de `std::env::vars_os()`) passam a enxergar tudo.
-/// **Best-effort e BOUNDED** (~2s): falha/timeout/rc pendurado → mantém o PATH atual, nunca trava o boot.
+/// Resolve o PATH REAL do **shell de login** do usuário (sourceia `.zprofile`/`.zshrc` etc.), onde
+/// Homebrew/nvm/volta exportam o PATH. **BOUNDED** (~2.5s) e best-effort: um rc pendurado/erro → `None`.
+/// É a base de duas coisas: hidratar o PATH no boot ([`hydrate_path_from_login_shell`]) e RE-resolver
+/// após "Instalar para mim" (o instalador acabou de escrever o seu dir no rc → um shell de login novo
+/// já o enxerga). Não toca o `env` — só devolve a string; o caller decide.
 #[cfg(unix)]
-fn hydrate_path_from_login_shell() {
+pub(crate) fn resolve_login_shell_path() -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
-    let current = std::env::var("PATH").unwrap_or_default();
-    if path_looks_hydrated(&current) {
-        return; // já rico (terminal ou já hidratado) → não mexe.
-    }
-
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    // Login + interactive: sourceia `.zprofile`/`.zshrc` (`.bash_profile`/`.bashrc`), onde Homebrew/
-    // nvm/volta exportam o PATH. A sentinela isola o PATH do ruído impresso por rc interativo.
+    // A sentinela isola o PATH do ruído impresso por rc interativo.
     const MARK: &str = "__LINA_PATH__=";
     let script = format!("printf '%s%s\\n' '{MARK}' \"$PATH\"");
-    let mut child = match Command::new(&shell)
+    let mut child = Command::new(&shell)
         .args(["-lic", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("lina-gpui: não resolvi o PATH do shell de login ({shell}): {e}");
-            return;
-        }
-    };
+        .map_err(|e| eprintln!("lina-gpui: não resolvi o PATH do shell de login ({shell}): {e}"))
+        .ok()?;
 
-    // Espera com TETO: um rc que pendure não pode travar o boot. Lê em thread; desiste em 2s.
-    let Some(mut out) = child.stdout.take() else {
-        return;
-    };
+    let mut out = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = out.read_to_end(&mut buf);
         let _ = tx.send(buf); // canal pode ter sido abandonado (timeout) → ignore.
     });
-    let buf = match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(b) => {
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(buf) => {
             let _ = child.wait();
-            b
+            parse_marked_path(&String::from_utf8_lossy(&buf), MARK).map(str::to_string)
         }
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
             eprintln!("lina-gpui: PATH do shell de login demorou demais — sigo com o PATH atual");
-            return;
+            None
         }
-    };
+    }
+}
 
-    let stdout = String::from_utf8_lossy(&buf);
-    if let Some(resolved) = parse_marked_path(&stdout, MARK) {
+/// No-op fora de unix (Windows não tem o problema do PATH de `launchd`).
+#[cfg(not(unix))]
+pub(crate) fn resolve_login_shell_path() -> Option<String> {
+    None
+}
+
+/// macOS/Linux: um app aberto pelo **Finder/Dock** herda só o PATH mínimo do `launchd`
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) — SEM Homebrew, nvm, volta, `~/.local/bin` nem o bin global do
+/// npm. Resultado: a varredura de CLIs (lê `PATH` do env) não acha `claude`/`codex` mesmo instalados,
+/// e o "Instalar para mim" falha com *"No viable candidates found in PATH"* (o `npm` é invisível).
+/// Aqui resolvemos o PATH REAL do shell de login e o injetamos no processo: a descoberta e os PTYs
+/// filhos (portable-pty semeia o env de `std::env::vars_os()`) passam a enxergar tudo. Best-effort.
+#[cfg(unix)]
+fn hydrate_path_from_login_shell() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if path_looks_hydrated(&current) {
+        return; // já rico (terminal ou já hidratado) → não mexe.
+    }
+    if let Some(resolved) = resolve_login_shell_path() {
         if resolved != current {
             // edition 2021: `set_var` é seguro (e rodamos antes de qualquer thread/janela subir).
-            std::env::set_var("PATH", resolved);
+            std::env::set_var("PATH", resolved.as_str());
             eprintln!(
                 "lina-gpui: PATH hidratado do shell de login ({} entradas) — CLIs/npm agora visíveis",
                 resolved.split(':').count()
@@ -2074,6 +2076,64 @@ fn hydrate_path_from_login_shell() {
 /// No-op fora de unix (Windows não tem o problema do PATH de `launchd`; o de-risk do ConPTY é à parte).
 #[cfg(not(unix))]
 fn hydrate_path_from_login_shell() {}
+
+/// Expande `~`/`~/...` (e `~\...` no Windows) para o diretório do usuário (`HOME`/`USERPROFILE`).
+/// **Puro** (depende só do env de home). Usado p/ os `verify_paths` das receitas (ex.: `~/.opencode/bin`).
+#[must_use]
+pub(crate) fn expand_tilde(p: &str) -> String {
+    let home = || std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if p == "~" {
+        if let Some(h) = home() {
+            return h.to_string_lossy().into_owned();
+        }
+    } else if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
+        if let Some(h) = home() {
+            return std::path::Path::new(&h)
+                .join(rest)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    p.to_string()
+}
+
+/// Une `extra_dirs` (com prioridade, já que o binário recém-instalado pode estar lá) ao `base` PATH,
+/// removendo duplicatas e vazios, respeitando o separador do SO (`:`/`;`). **Puro/determinístico**
+/// (usa `std::env::{split_paths,join_paths}`). É o PATH ampliado sobre o qual a verificação pós-install
+/// roda a descoberta.
+#[must_use]
+pub(crate) fn augmented_verify_path(base: &str, extra_dirs: &[String]) -> String {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && seen.insert(p.clone()) {
+            out.push(p);
+        }
+    };
+    for d in extra_dirs {
+        push(PathBuf::from(expand_tilde(d)));
+    }
+    for p in std::env::split_paths(base) {
+        push(p);
+    }
+    std::env::join_paths(&out)
+        .map(|os| os.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| base.to_string())
+}
+
+/// Após "Instalar para mim": RE-resolve o PATH do shell de login (o instalador acabou de escrever seu
+/// dir no rc → um login shell novo já o vê) e une os `verify_paths` fixos da receita, gravando no
+/// processo. Assim a verificação acha o binário recém-instalado E o canvas já consegue spawná-lo sem
+/// reabrir o app. Best-effort: se a re-resolução falhar, parte do PATH atual. Roda na thread de
+/// instalação, logo após o instalador sair (set_var pontual, sem leitores concorrentes nesse instante).
+pub(crate) fn refresh_path_after_install(verify_paths: &[String]) {
+    let base = resolve_login_shell_path()
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let augmented = augmented_verify_path(&base, verify_paths);
+    std::env::set_var("PATH", augmented);
+}
 
 fn main() {
     // PRIMEIRA coisa: hidrata o PATH ANTES de qualquer varredura de CLI ou spawn de PTY (ver doc da
@@ -2500,5 +2560,34 @@ mod path_tests {
         assert_eq!(parse_marked_path("só ruído de rc\n", marker), None);
         // sentinela com PATH vazio → None (não sobrescreve com nada).
         assert_eq!(parse_marked_path("__LINA_PATH__=\n", marker), None);
+    }
+
+    /// `expand_tilde`: `~`/`~/…` → home (lê o HOME ambiente, sem mutá-lo); sem `~` → inalterado.
+    #[test]
+    fn expand_tilde_resolves_home() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().into_owned();
+            assert_eq!(expand_tilde("~/.opencode/bin"), format!("{home}/.opencode/bin"));
+            assert_eq!(expand_tilde("~"), home);
+        }
+        assert_eq!(expand_tilde("/opt/homebrew/bin"), "/opt/homebrew/bin");
+    }
+
+    /// `augmented_verify_path`: extras vêm na FRENTE (binário recém-instalado tem prioridade), sem
+    /// duplicatas, vazios ignorados, base preservado. (separador `:` no unix do teste)
+    #[cfg(unix)]
+    #[test]
+    fn augmented_verify_path_prepends_and_dedups() {
+        let base = "/usr/bin:/opt/homebrew/bin";
+        let got = augmented_verify_path(base, &["/opt/homebrew/bin".into(), "/x/bin".into()]);
+        let parts: Vec<&str> = got.split(':').collect();
+        assert_eq!(parts.first(), Some(&"/opt/homebrew/bin"), "extra na frente");
+        assert!(parts.contains(&"/x/bin"), "novo dir presente");
+        assert!(parts.contains(&"/usr/bin"), "base preservado");
+        assert_eq!(
+            parts.iter().filter(|p| **p == "/opt/homebrew/bin").count(),
+            1,
+            "dedup do dir repetido"
+        );
     }
 }
