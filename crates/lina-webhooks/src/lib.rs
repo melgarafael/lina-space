@@ -1,17 +1,27 @@
 //! `lina-webhooks` — Engine de Webhooks do nó-Gatilho (story **W5-4**).
 //!
 //! O mínimo do **nó-Gatilho**: um servidor `axum` local que recebe um `POST` externo, valida
-//! **HMAC**, responde **202** e publica o evento no **Workspace Bus** como mais um produtor — sem
-//! abrir nenhuma porta do produto de 5 anos.
+//! **HMAC** e publica o evento no **Workspace Bus** como mais um produtor — sem abrir nenhuma porta
+//! do produto de 5 anos.
 //!
 //! ## Invariantes honrados (`CLAUDE.md`)
 //! - **#2 Local-first.** O listener faz bind SOMENTE em `127.0.0.1` (o chamador cria o
 //!   [`tokio::net::TcpListener`]; recomenda-se `127.0.0.1:0`). Nunca `0.0.0.0`.
 //! - **#4 O event log é a fonte da verdade.** Cada disparo válido vira um
-//!   [`DomainEvent::WebhookReceived`] no [`EventStore`] ANTES de qualquer efeito no bus; a
-//!   config de cada hook é um [`DomainEvent::WebhookConfigured`] (event-sourcing).
+//!   [`DomainEvent::WebhookReceived`] no [`EventStore`] — apendado de forma **SÍNCRONA ANTES do
+//!   `202`** (durabilidade primeiro: se o append falha, respondemos `5xx`, nunca `202`). Só o efeito
+//!   NÃO-durável (publicar no bus) roda fora do caminho da resposta. A config de cada hook é um
+//!   [`DomainEvent::WebhookConfigured`] (event-sourcing).
 //! - **Secret fora do disco.** O secret HMAC vive no Secret Vault (W0-7,
 //!   [`SecretVault::ensure_webhook_secret`]) — nunca no log nem em claro.
+//!
+//! ## Defesa de taxa em DUAS camadas (W5-4-MED-a — ver [`RateLimitConfig`])
+//! Como o `hook_id` viaja na URL (capability, não segredo), um gate que gaste um recurso escasso
+//! ANTES do HMAC é manipulável por quem só conhece a rota. Por isso:
+//! 1. **Teto bruto por IP** ANTES de tudo — protege a CPU contra flood (inclusive contra forçar o
+//!    cálculo caro de HMAC em massa).
+//! 2. **Budget por hook** SÓ DEPOIS do HMAC passar — protege o budget do dono legítimo; corpo-lixo
+//!    sem o secret toma `401` e nunca consome o budget do hook.
 //!
 //! ## Segurança (gate humano — campos controláveis pelo atacante)
 //! O POST externo só controla: o `hook_id` da URL, o header `X-Signature` e o corpo. NENHUM
@@ -21,12 +31,13 @@
 //! a divergência → **401 sem publicar**. `verify_slice` compara em tempo constante (`subtle`).
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::post,
     Router,
@@ -67,20 +78,47 @@ pub enum WebhookError {
     NotLocal(String),
 }
 
-/// Política de rate-limit por hook (janela fixa). Default: 120 req / 60s por `hook_id`.
+/// Limite de janela fixa: no máximo `max_requests` requisições por `window`.
 #[derive(Debug, Clone, Copy)]
-pub struct RateLimitConfig {
+pub struct WindowLimit {
     /// Máximo de requisições aceitas dentro de uma janela.
     pub max_requests: u32,
     /// Duração da janela.
     pub window: Duration,
 }
 
+/// Rate-limit em **DUAS camadas** (defesa em profundidade — W5-4-MED-a):
+/// - **`ip_burst`** — teto BRUTO por IP de origem, checado ANTES do HMAC. Protege a CPU contra
+///   flood (inclusive contra forçar o cálculo caro de HMAC). Generoso: só barra abuso massivo.
+/// - **`per_hook`** — budget POR `hook_id`, checado SÓ DEPOIS do HMAC passar. Protege o budget do
+///   dono legítimo: como o `hook_id` viaja na URL (não é segredo), corpo-lixo sem o secret toma
+///   `401` e **nunca** consome este budget — caso contrário o vazamento da rota viraria DoS do
+///   budget alheio.
+///
+/// Por construção `ip_burst.max_requests >= per_hook.max_requests` (o teto de CPU é mais largo que
+/// o budget de um hook), mas a corretude não depende disso — as camadas são independentes.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitConfig {
+    /// Camada 1 (CPU): teto bruto por IP de origem, ANTES do HMAC.
+    pub ip_burst: WindowLimit,
+    /// Camada 2 (budget): teto por hook, DEPOIS do HMAC.
+    pub per_hook: WindowLimit,
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            max_requests: 120,
-            window: Duration::from_secs(60),
+            // ~20 req/s por IP: largo para uso local legítimo (vários hooks compartilham o IP de
+            // loopback), estreito o bastante para conter um flood de cálculo de HMAC.
+            ip_burst: WindowLimit {
+                max_requests: 1200,
+                window: Duration::from_secs(60),
+            },
+            // Budget por hook do dono — preservado mesmo sob flood de corpo-lixo na mesma rota.
+            per_hook: WindowLimit {
+                max_requests: 120,
+                window: Duration::from_secs(60),
+            },
         }
     }
 }
@@ -105,20 +143,44 @@ struct HookBinding {
     target_ref: String,
 }
 
-/// Janela de rate-limit de um hook.
+/// Janela de rate-limit (janela fixa).
 #[derive(Debug)]
 struct RateWindow {
     start: Instant,
     count: u32,
 }
 
+/// Fronteira de durabilidade: o que o engine precisa de um log de eventos durável. Abstrair o
+/// [`EventStore`] concreto aqui mantém o append do caminho da resposta **síncrono e falível** (o
+/// handler decide `202` vs `5xx` pelo `Result`) e permite, nos testes, um log que falha de propósito
+/// (prova observável do caminho `5xx` sem socket). Produção usa [`EventStoreLog`].
+trait DurableLog: Send + Sync {
+    /// Apende um evento de domínio de forma durável e SÍNCRONA. `Err` aborta o efeito (sem `202`).
+    fn append(&self, event: &DomainEvent) -> Result<(), WebhookError>;
+}
+
+/// Ligação de produção: o [`EventStore`] real (escritor único do log, serializado pelo `Mutex`).
+struct EventStoreLog(Arc<Mutex<EventStore>>);
+
+impl DurableLog for EventStoreLog {
+    fn append(&self, event: &DomainEvent) -> Result<(), WebhookError> {
+        lock(&self.0)
+            .append(event)
+            .map(|_seq| ())
+            .map_err(|e| WebhookError::Store(e.to_string()))
+    }
+}
+
 /// Estado compartilhado do servidor (clonado para dentro do router axum — tudo `Arc`).
 #[derive(Clone)]
 struct AppState {
     hooks: Arc<RwLock<HashMap<String, HookBinding>>>,
-    store: Arc<Mutex<EventStore>>,
+    store: Arc<dyn DurableLog>,
     supervisor: Arc<Supervisor>,
-    rate: Arc<Mutex<HashMap<String, RateWindow>>>,
+    /// Camada 1: contador bruto por IP de origem (protege CPU, antes do HMAC).
+    rate_ip: Arc<Mutex<HashMap<IpAddr, RateWindow>>>,
+    /// Camada 2: budget por `hook_id` (protege o dono, depois do HMAC).
+    rate_hook: Arc<Mutex<HashMap<String, RateWindow>>>,
     rate_cfg: RateLimitConfig,
 }
 
@@ -135,7 +197,7 @@ impl WebhookEngine {
         Self::with_config(store, supervisor, RateLimitConfig::default())
     }
 
-    /// Novo engine com rate-limit customizado.
+    /// Novo engine com rate-limit customizado (ver [`RateLimitConfig`] — duas camadas).
     #[must_use]
     pub fn with_config(
         store: Arc<Mutex<EventStore>>,
@@ -145,9 +207,10 @@ impl WebhookEngine {
         Self {
             state: AppState {
                 hooks: Arc::new(RwLock::new(HashMap::new())),
-                store,
+                store: Arc::new(EventStoreLog(store)),
                 supervisor,
-                rate: Arc::new(Mutex::new(HashMap::new())),
+                rate_ip: Arc::new(Mutex::new(HashMap::new())),
+                rate_hook: Arc::new(Mutex::new(HashMap::new())),
                 rate_cfg,
             },
         }
@@ -169,12 +232,10 @@ impl WebhookEngine {
             .map_err(|e| WebhookError::Secret(e.to_string()))?;
 
         // Event-sourcing: a config (rota + alvo) é um fato do log. O secret NÃO entra aqui (#2).
-        lock(&self.state.store)
-            .append(&DomainEvent::WebhookConfigured {
-                hook_id: hook_id.clone(),
-                target_ref: target_ref.to_string(),
-            })
-            .map_err(|e| WebhookError::Store(e.to_string()))?;
+        self.state.store.append(&DomainEvent::WebhookConfigured {
+            hook_id: hook_id.clone(),
+            target_ref: target_ref.to_string(),
+        })?;
 
         wlock(&self.state.hooks).insert(
             hook_id.clone(),
@@ -189,6 +250,10 @@ impl WebhookEngine {
     }
 
     /// Router axum do engine (rota `POST /hook/:hook_id` + teto de corpo defensivo de 64 KiB).
+    ///
+    /// **Sirva via [`WebhookEngine::serve`]** (ou `into_make_service_with_connect_info::<SocketAddr>()`):
+    /// o handler extrai [`ConnectInfo`] para o teto bruto por IP (camada 1). Sem o connect-info o
+    /// extractor falha — por isso o `serve` é o caminho suportado.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/hook/:hook_id", post(handle_hook))
@@ -198,15 +263,19 @@ impl WebhookEngine {
 
     /// Atende o `listener` (criado pelo chamador). Consome o engine. **Enforce do invariante #2**
     /// (local-first): recusa servir se o listener não estiver numa interface loopback — a lib não
-    /// confia cegamente no chamador para nunca expor `0.0.0.0`.
+    /// confia cegamente no chamador para nunca expor `0.0.0.0`. Injeta o [`ConnectInfo`] do peer
+    /// (IP de origem) para a camada 1 do rate-limit.
     pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<(), WebhookError> {
         if let Ok(addr) = listener.local_addr() {
             ensure_local(addr)?;
         }
         let app = self.router();
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| WebhookError::Serve(e.to_string()))
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| WebhookError::Serve(e.to_string()))
     }
 }
 
@@ -219,26 +288,35 @@ fn ensure_local(addr: std::net::SocketAddr) -> Result<(), WebhookError> {
     }
 }
 
-/// Handler do webhook (`POST /hook/:hook_id`). Ordem das checagens é deliberada:
-/// `404` hook desconhecido → `429` rate-limit → `401` HMAC ausente/inválido → `202` aceito.
-/// O **202 é imediato**; o processamento (log + bus) roda FORA do caminho da resposta.
+/// Handler do webhook (`POST /hook/:hook_id`). Ordem das checagens é deliberada (W5-4-MED-a — duas
+/// camadas de rate-limit; ver [`RateLimitConfig`]):
+/// 1. `429` **teto bruto por IP** (camada 1) — ANTES de tudo; protege a CPU contra flood (inclusive
+///    contra forçar o cálculo caro de HMAC em massa).
+/// 2. `404` hook desconhecido — rota opaca (capability base32 não-enumerável).
+/// 3. `401` HMAC ausente/inválido — prova posse do secret; sem ela, NÃO se publica nada.
+/// 4. `429` **budget por hook** (camada 2) — SÓ APÓS o HMAC; corpo-lixo sem o secret (que toma 401)
+///    nunca consome o budget do dono, então o vazamento do `hook_id` na URL não vira DoS de budget.
+/// 5. **Append SÍNCRONO** do `WebhookReceived` (W5-4-MED-b — durabilidade primeiro, invariante #4):
+///    se falha → `5xx` sem publicar; só com o fato durável é que respondemos `202` e disparamos o
+///    efeito NÃO-durável (publicar no bus) fora do caminho da resposta.
 async fn handle_hook(
     State(state): State<AppState>,
     Path(hook_id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    // 1. Hook conhecido? 404 opaco — a rota é uma capability base32 não-enumerável.
+    // 1. Camada 1 (CPU): teto BRUTO por IP de origem, ANTES de qualquer trabalho caro (lookup,
+    //    cópia do binding, HMAC). É a barreira mais externa contra flood.
+    if !state.allow_ip_burst(peer.ip()) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
+    // 2. Hook conhecido? 404 opaco — a rota é uma capability base32 não-enumerável.
     let binding = match rlock(&state.hooks).get(&hook_id) {
         Some(b) => b.clone(),
         None => return StatusCode::NOT_FOUND,
     };
-
-    // 2. Rate-limit POR hook (só hooks conhecidos entram no mapa → ele fica limitado às rotas
-    //    configuradas; um atacante batendo em rotas aleatórias toma 404 e não cria entrada).
-    if !state.allow_rate(&hook_id) {
-        return StatusCode::TOO_MANY_REQUESTS;
-    }
 
     // 3. HMAC OBRIGATÓRIO. Ausência OU divergência → 401 SEM publicar nada (gate de publicação).
     let Some(sig) = headers.get("x-signature").and_then(|v| v.to_str().ok()) else {
@@ -248,30 +326,39 @@ async fn handle_hook(
         return StatusCode::UNAUTHORIZED;
     }
 
-    // 4. 202 IMEDIATO; processa o disparo fora do caminho da resposta (invariante async).
+    // 4. Camada 2 (budget): SÓ APÓS o HMAC provar posse do secret. Assim um flood de corpo-lixo sem
+    //    o secret (barrado no passo 3) NUNCA consome o budget do hook do dono legítimo.
+    if !state.allow_hook_budget(&hook_id) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
+    // 5. DURABILIDADE PRIMEIRO (#4): apende o FATO de forma SÍNCRONA, ANTES de responder. O disco é
+    //    local; segurar o request até o append durável é o preço da promessa do 202. Se o append
+    //    falha, respondemos 5xx (NUNCA 202) e nada é publicado — sem perda silenciosa.
     let ts = now_millis();
+    let ev = DomainEvent::WebhookReceived {
+        hook_id: hook_id.clone(),
+        ts,
+        target_ref: binding.target_ref.clone(),
+    };
+    if let Err(e) = state.store.append(&ev) {
+        tracing::error!(hook_id = %hook_id, error = %e, "append de WebhookReceived falhou; respondendo 5xx, nada publicado");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    // 6. Só o efeito NÃO-durável (publicar no bus) corre fora do caminho da resposta. Se ELE se
+    //    perder num crash, o replay do log (fonte da verdade, #4) reconstrói — por isso pode ser
+    //    assíncrono; a durabilidade já foi garantida no passo 5.
     tokio::spawn(async move {
-        state.process(&hook_id, ts, &binding);
+        state.publish(&binding);
     });
     StatusCode::ACCEPTED
 }
 
 impl AppState {
-    /// Processa um disparo VÁLIDO fora do caminho da resposta: registra `WebhookReceived` no log
-    /// (fonte da verdade, #4) e, SÓ ENTÃO, publica a mensagem ao alvo no Workspace Bus — o efeito no
-    /// bus deriva do fato persistido; se o append falha, nada é publicado.
-    fn process(&self, hook_id: &str, ts: u64, binding: &HookBinding) {
-        let ev = DomainEvent::WebhookReceived {
-            hook_id: hook_id.to_string(),
-            ts,
-            target_ref: binding.target_ref.clone(),
-        };
-        if let Err(e) = lock(&self.store).append(&ev) {
-            tracing::error!(hook_id, error = %e, "falha ao apendar WebhookReceived; não publica no bus");
-            return;
-        }
-        // Mensagem do nó-Gatilho (`from`, fixado na config) endereçada ao `target_ref`. `from`/alvo
-        // NUNCA vêm do request — só o servidor os define (sem impersonação via campo controlável).
+    /// Efeito NÃO-durável: publica a mensagem do nó-Gatilho ao alvo no Workspace Bus. `from`/alvo
+    /// vêm da config (nunca do request) — sem impersonação via campo controlável.
+    fn publish(&self, binding: &HookBinding) {
         match resolve_recipient(&self.supervisor, &binding.target_ref) {
             Some(to) => {
                 let env = A2aEnvelope::new(binding.from, to, Some("webhook".to_string()));
@@ -289,21 +376,36 @@ impl AppState {
         }
     }
 
-    /// Rate-limit de janela fixa por hook. `true` se a requisição cabe na janela corrente.
-    fn allow_rate(&self, hook_id: &str) -> bool {
-        let now = Instant::now();
-        let mut map = lock(&self.rate);
-        let w = map.entry(hook_id.to_string()).or_insert(RateWindow {
-            start: now,
-            count: 0,
-        });
-        if now.duration_since(w.start) > self.rate_cfg.window {
-            w.start = now;
-            w.count = 0;
-        }
-        w.count += 1;
-        w.count <= self.rate_cfg.max_requests
+    /// Camada 1 (CPU): teto BRUTO por IP de origem. `true` se cabe na janela.
+    fn allow_ip_burst(&self, ip: IpAddr) -> bool {
+        allow_window(&self.rate_ip, ip, self.rate_cfg.ip_burst)
     }
+
+    /// Camada 2 (budget): teto por hook. `true` se cabe na janela.
+    fn allow_hook_budget(&self, hook_id: &str) -> bool {
+        allow_window(&self.rate_hook, hook_id.to_string(), self.rate_cfg.per_hook)
+    }
+}
+
+/// Rate-limit de janela fixa sobre um mapa `chave → janela`. `true` se a requisição cabe na janela
+/// corrente. Genérico sobre a chave para servir as duas camadas (IP e `hook_id`) com uma só lógica.
+fn allow_window<K: Eq + std::hash::Hash>(
+    map: &Mutex<HashMap<K, RateWindow>>,
+    key: K,
+    limit: WindowLimit,
+) -> bool {
+    let now = Instant::now();
+    let mut m = lock(map);
+    let w = m.entry(key).or_insert(RateWindow {
+        start: now,
+        count: 0,
+    });
+    if now.duration_since(w.start) > limit.window {
+        w.start = now;
+        w.count = 0;
+    }
+    w.count += 1;
+    w.count <= limit.max_requests
 }
 
 /// Resolve o `target_ref` (endereço A2A) em um [`Recipient`], reusando o parser canônico do core
@@ -526,6 +628,81 @@ mod tests {
                 Err(WebhookError::NotLocal(_))
             ),
             "IP de rede deve ser recusado"
+        );
+    }
+
+    /// W5-4-MED-b (caminho de falha): se o append durável do `WebhookReceived` FALHA, o handler
+    /// responde `5xx` (NUNCA `202`) e NADA é publicado no bus — durabilidade vem antes da resposta
+    /// (invariante #4). Injeta um [`DurableLog`] que sempre falha (determinístico, sem socket).
+    #[tokio::test]
+    async fn append_falho_responde_5xx_e_nao_publica() {
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        /// Log durável que sempre falha — simula disco cheio/erro de IO no append.
+        struct FailingLog;
+        impl DurableLog for FailingLog {
+            fn append(&self, _event: &DomainEvent) -> Result<(), WebhookError> {
+                Err(WebhookError::Store("falha simulada de IO no append".into()))
+            }
+        }
+
+        let sup = Arc::new(Supervisor::new());
+        let from = sup.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+        let mut rx = sup.subscribe();
+
+        // Hook registrado em memória com um secret conhecido (o request abaixo passa o HMAC → chega
+        // ao append, que então falha).
+        let secret = "secret-de-teste";
+        let hook_id = "TESTHOOKID".to_string();
+        let mut hooks = HashMap::new();
+        hooks.insert(
+            hook_id.clone(),
+            HookBinding {
+                secret: secret.to_string(),
+                from,
+                target_ref: "@Dev".to_string(),
+            },
+        );
+
+        let state = AppState {
+            hooks: Arc::new(RwLock::new(hooks)),
+            store: Arc::new(FailingLog),
+            supervisor: sup.clone(),
+            rate_ip: Arc::new(Mutex::new(HashMap::new())),
+            rate_hook: Arc::new(Mutex::new(HashMap::new())),
+            rate_cfg: RateLimitConfig::default(),
+        };
+
+        let body = Bytes::from_static(br#"{"order":42}"#);
+        let sig = sign_hex(secret, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-signature", sig.parse().expect("sig vira HeaderValue"));
+
+        let code = handle_hook(
+            State(state),
+            Path(hook_id),
+            ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 40000))),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "append falho → 5xx (NUNCA 202): o fato não ficou durável, então não prometemos recepção"
+        );
+
+        // O efeito no bus só pode ocorrer APÓS o append durável — que falhou. Nada pode ter saído.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "append falho não pode publicar mensagem no bus (sem 202, sem efeito)"
         );
     }
 }
