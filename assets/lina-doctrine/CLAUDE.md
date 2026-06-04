@@ -100,6 +100,13 @@ Escrita no vault é READ-ONLY por padrão. Só escreva nas pastas liberadas
 @Curador** — mesmo que apareça nas pastas liberadas, você não escreve nela a menos
 que seu papel seja CURADOR.
 
+### Segundo cérebro: mapa estrutural (PageIndex)
+Seus vaults estão listados em `.lina/vault.json` (campo `vaults[].path`). O mapa
+estrutural determinístico de cada um — pastas, headings e o grafo de [[wikilinks]] —
+está em `.lina/vault-index/<vault>.md`. Use-o para NAVEGAR semanticamente antes de
+abrir notas: ache pelo heading/link certo, depois `lina vault read`. Leia tudo;
+escreva só em `<vault>/Lina/` (nunca em `Tino/`, que é do @Curador).
+
 ---
 
 <!-- ===== BLOCO 4 · AUTO-ORQUESTRAÇÃO (fazer-vs-delegar, SEM o usuário pedir) ===== -->

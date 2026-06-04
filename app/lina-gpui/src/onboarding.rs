@@ -31,6 +31,7 @@ use std::time::Duration;
 use lina_cli_profiles::{InstallRecipe, Installers};
 
 use crate::dev_tools::DevToolsModel;
+use crate::obsidian::SecondBrainModel;
 
 use gpui::{
     div, prelude::*, px, rgb, size, text, AnyElement, App, Bounds, ClickEvent, Context,
@@ -65,6 +66,8 @@ pub enum Step {
     Checkup,
     /// T1.5 — ferramentas de desenvolvimento (git, GitHub CLI, Vercel, Node.js, Python). Passe-through.
     DevTools,
+    /// T1.6 — "Seu segundo cérebro" (Obsidian): detecta/instala, escolhe vault(s), gera o PageIndex.
+    SecondBrain,
     /// T2 — provedor/conta (passe-through).
     Provider,
     /// T3 — criar o 1º Espaço.
@@ -74,16 +77,17 @@ pub enum Step {
 }
 
 impl Step {
-    const ORDER: [Step; 6] = [
+    const ORDER: [Step; 7] = [
         Step::Welcome,
         Step::Checkup,
         Step::DevTools,
+        Step::SecondBrain,
         Step::Provider,
         Step::CreateSpace,
         Step::Done,
     ];
 
-    /// Índice 0..=4 (ordem de progresso) — base da persistência retomável e dos "dots".
+    /// Índice 0..=5 (ordem de progresso) — base da persistência retomável e dos "dots".
     #[must_use]
     pub fn index(self) -> u8 {
         Self::ORDER.iter().position(|s| *s == self).unwrap_or(0) as u8
@@ -101,7 +105,7 @@ impl Step {
     /// Próximo passo (satura em `Done`).
     #[must_use]
     pub fn next(self) -> Step {
-        Self::from_index((self.index() + 1).min(5))
+        Self::from_index((self.index() + 1).min(Step::Done.index()))
     }
 
     /// Passo anterior (satura em `Welcome`).
@@ -653,8 +657,9 @@ pub fn should_show(dir: &Path, demo: bool) -> bool {
 
 /// Abre a janela do onboarding (chamada de dentro do `application().run` de `main.rs`). `dir` é o
 /// diretório PERSISTENTE de estado do onboarding (progresso + log próprio) — em produção mora no
-/// Application Support do usuário (ver `main.rs`), nunca em `temp`.
-pub fn open_window(cx: &mut App, dir: PathBuf) {
+/// Application Support do usuário (ver `main.rs`), nunca em `temp`. `lina_dir` é o `<ws_root>/.lina`
+/// onde a etapa do segundo cérebro grava `vault.json` + `vault-index/` (integração com a doutrina).
+pub fn open_window(cx: &mut App, dir: PathBuf, lina_dir: PathBuf) {
     let bounds = Bounds::centered(None, size(px(920.0), px(640.0)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -665,7 +670,7 @@ pub fn open_window(cx: &mut App, dir: PathBuf) {
             }),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| OnboardingView::new(dir, window, cx)),
+        |window, cx| cx.new(|cx| OnboardingView::new(dir, lina_dir, window, cx)),
     );
     if let Err(e) = opened {
         eprintln!("onboarding: não abri a janela: {e}");
@@ -680,6 +685,9 @@ pub struct OnboardingView {
     /// Tela "Ferramentas de desenvolvimento" (passo após o check-up). Lógica gpui-free em `dev_tools`;
     /// `pub(crate)` p/ a render dela rotear cliques (instalar/verificar) pela view-pai.
     pub(crate) dev_tools: DevToolsModel,
+    /// Tela "Seu segundo cérebro" (Obsidian). Lógica gpui-free em `obsidian`; `pub(crate)` p/ a render
+    /// dela rotear cliques (instalar/marcar/confirmar/adicionar pasta) pela view-pai.
+    pub(crate) second_brain: SecondBrainModel,
     focus: FocusHandle,
 }
 
@@ -696,7 +704,9 @@ impl OnboardingView {
 }
 
 impl OnboardingView {
-    fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `dir` = estado persistente do onboarding (`onboarding/`); `lina_dir` = `<ws_root>/.lina` (onde a
+    /// tela do segundo cérebro grava `vault.json` + `vault-index/`).
+    fn new(dir: PathBuf, lina_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
 
@@ -715,8 +725,9 @@ impl OnboardingView {
                 let Ok(busy) = this.update(cx, |view, cx| {
                     view.model.poll_install();
                     view.dev_tools.poll_install();
-                    // O mesmo pulso dirige a tela de ferramentas (mesma natureza assíncrona: descoberta +
-                    // "Instalar para mim" mudam o estado a partir de uma thread gpui-free).
+                    // O mesmo pulso dirige as telas de ferramentas E do segundo cérebro (mesma natureza
+                    // assíncrona: descoberta + "Instalar para mim" mudam o estado de uma thread gpui-free).
+                    view.second_brain.poll();
                     let busy = matches!(
                         view.model.install_state(),
                         InstallState::Installing { .. } | InstallState::Verifying
@@ -725,7 +736,12 @@ impl OnboardingView {
                             view.dev_tools.install_state(),
                             InstallState::Installing { .. } | InstallState::Verifying
                         )
-                        || view.dev_tools.is_discovering();
+                        || view.dev_tools.is_discovering()
+                        || matches!(
+                            view.second_brain.install_state(),
+                            InstallState::Installing { .. } | InstallState::Verifying
+                        )
+                        || view.second_brain.is_discovering();
                     // `busy || was_busy`: redesenha durante o trabalho E no 1º frame após ele terminar,
                     // p/ que o estado final (Ok ✓ / Failed ⚠ / lista re-detectada) realmente apareça.
                     if busy || was_busy {
@@ -746,6 +762,7 @@ impl OnboardingView {
         Self {
             model: OnboardingModel::load(dir),
             dev_tools: DevToolsModel::new(),
+            second_brain: SecondBrainModel::new(lina_dir),
             focus,
         }
     }
@@ -803,10 +820,10 @@ impl OnboardingView {
     fn step_dots(&self) -> AnyElement {
         let cur = self.model.step().index();
         let mut row = div().flex().flex_row().gap_2().items_center();
-        // 5 dots p/ os 5 passos antes do `Done` (Welcome..CreateSpace, índices 0..=4); `Done` (5) acende
-        // todos. `cur.min(4)` clampa o último dot aceso no fim do fluxo.
-        for i in 0..5u8 {
-            let on = i <= cur.min(4);
+        // 6 dots p/ os 6 passos antes do `Done` (Welcome..CreateSpace, índices 0..=5); `Done` (6) acende
+        // todos. `cur.min(5)` clampa o último dot aceso no fim do fluxo.
+        for i in 0..6u8 {
+            let on = i <= cur.min(5);
             row = row.child(
                 div()
                     .w(px(if i == cur { 26.0 } else { 12.0 }))
@@ -1145,6 +1162,7 @@ impl Render for OnboardingView {
             Step::Welcome => self.render_welcome(cx),
             Step::Checkup => self.render_checkup(cx),
             Step::DevTools => self.dev_tools.render(window, cx),
+            Step::SecondBrain => self.second_brain.render(window, cx),
             Step::Provider => self.render_provider(cx),
             Step::CreateSpace => self.render_create(cx),
             Step::Done => self.render_done(cx),
@@ -1243,13 +1261,15 @@ mod tests {
     #[test]
     fn step_machine_orders_and_saturates() {
         assert_eq!(Step::Welcome.index(), 0);
-        assert_eq!(Step::Done.index(), 5); // +1 passo (DevTools) entre Checkup e Provider
+        assert_eq!(Step::Done.index(), 6); // +2 passos (DevTools, SecondBrain) entre Checkup e Provider
         assert_eq!(Step::Welcome.prev(), Step::Welcome); // satura
         assert_eq!(Step::Done.next(), Step::Done); // satura
         assert_eq!(Step::Welcome.next(), Step::Checkup);
-        // DevTools entra após o check-up: Checkup → DevTools → Provider.
+        // DevTools e SecondBrain entram após o check-up: Checkup → DevTools → SecondBrain → Provider.
         assert_eq!(Step::Checkup.next(), Step::DevTools);
-        assert_eq!(Step::DevTools.next(), Step::Provider);
+        assert_eq!(Step::DevTools.next(), Step::SecondBrain);
+        assert_eq!(Step::SecondBrain.next(), Step::Provider);
+        assert_eq!(Step::SecondBrain.prev(), Step::DevTools);
         assert_eq!(Step::DevTools.prev(), Step::Checkup);
         assert_eq!(Step::CreateSpace.next(), Step::Done);
         for s in Step::ORDER {
@@ -1455,7 +1475,8 @@ mod tests {
             model.block_on_discovery();
             model.advance(); // Welcome → Checkup
             model.advance(); // Checkup → DevTools
-            model.advance(); // DevTools → Provider
+            model.advance(); // DevTools → SecondBrain
+            model.advance(); // SecondBrain → Provider
             model.advance(); // Provider → CreateSpace
             assert_eq!(model.step(), Step::CreateSpace);
             model.back(); // CreateSpace → Provider (usuário recuou antes de fechar)

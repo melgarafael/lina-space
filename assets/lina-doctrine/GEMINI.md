@@ -72,6 +72,9 @@ Cite a origem para o leigo: > "Vi nas suas notas ([[nome-da-nota]]) que <fato>. 
 
 Escrita no vault é READ-ONLY por padrão. Só escreva em {{vault_writable_paths}}. **A pasta `Tino/` é escrita SÓ pelo @Curador.**
 
+### Segundo cérebro: mapa estrutural (PageIndex)
+Seus vaults estão listados em `.lina/vault.json` (campo `vaults[].path`). O mapa estrutural determinístico de cada um — pastas, headings e o grafo de [[wikilinks]] — está em `.lina/vault-index/<vault>.md`. Use-o para NAVEGAR semanticamente antes de abrir notas: ache pelo heading/link certo, depois `lina vault read`. Leia tudo; escreva só em `<vault>/Lina/` (nunca em `Tino/`, que é do @Curador).
+
 ---
 
 <!-- ===== BLOCO 4 · AUTO-ORQUESTRAÇÃO ===== -->

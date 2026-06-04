@@ -15,6 +15,9 @@ mod onboarding;
 // Tela "Ferramentas de desenvolvimento" do onboarding (git/gh/vercel/node/python): reusa o instalador
 // dos assistentes (PTY oculto + re-hidratação de PATH). Lógica gpui-free; render fina sobre OnboardingView.
 mod dev_tools;
+// Tela "Seu segundo cérebro" (Obsidian) do onboarding: detecta/instala o app, escolhe vault(s),
+// gera o PageIndex determinístico e persiste em `.lina/vault.json`. Lógica gpui-free; render fina.
+mod obsidian;
 // W4-3: chrome de conexão "sem fios" — freio (pausa de orquestração), selo por membership, reduce-motion.
 mod wiring;
 // W3-7c · TETO DE CUSTO REAL: mede o output dos PTYs e emite TokenUsageReported (alimenta o CostLedger).
@@ -2232,8 +2235,13 @@ fn main() {
         );
     }
     std::env::set_var("LINA_HOME", &mailbox_dir);
-    let vault_path =
-        std::env::var("LINA_VAULT").unwrap_or_else(|_| ws_root.join("vault").display().to_string());
+    // O segundo cérebro (onboarding) grava o vault escolhido em `.lina/vault.json`. Se houver um
+    // `primary`, ele tem prioridade — reflete a escolha REAL do usuário e faz `{{vault_writable_paths}}`/
+    // `{{vault_tino_path}}` apontarem pro vault linkado na próxima reescrita do bootstrap. Senão, cai no
+    // override de dev `LINA_VAULT` e, por fim, no default `<ws_root>/vault`.
+    let vault_path = obsidian::read_primary_vault(&mailbox_dir)
+        .or_else(|| std::env::var("LINA_VAULT").ok())
+        .unwrap_or_else(|| ws_root.join("vault").display().to_string());
     let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
     let bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
         .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
@@ -2499,7 +2507,9 @@ fn main() {
         // Onboarding turno-0 por cima (1ª execução / progresso < Done). Demo pula por padrão; dev força
         // com `LINA_ONBOARDING=1|0`. Aberto por ÚLTIMO → fica em foco sobre o canvas.
         if onboarding::should_show(&onboarding_dir, demo) {
-            onboarding::open_window(cx, onboarding_dir.clone());
+            // `mailbox_dir` = `<ws_root>/.lina`: a etapa do segundo cérebro grava `vault.json` +
+            // `vault-index/` aqui (integração com a doutrina via arquivos, sem handles do canvas).
+            onboarding::open_window(cx, onboarding_dir.clone(), mailbox_dir.clone());
         }
         cx.activate(true);
     });
