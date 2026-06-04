@@ -581,7 +581,7 @@ mod tests {
         let src = std::fs::read_to_string(&path).expect("ler installers.toml");
         let inst = Installers::from_toml_str(&src, &path.display().to_string())
             .expect("installers.toml deve parsear");
-        for id in ["claude", "codex", "gemini", "opencode", "copilot"] {
+        for id in ["claude", "codex", "gemini", "opencode", "copilot", "agy"] {
             let p = inst.0.get(id).unwrap_or_else(|| panic!("falta receita p/ {id}"));
             for os in ["macos", "linux", "windows"] {
                 let r = p

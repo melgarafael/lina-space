@@ -91,3 +91,21 @@ args = ["-c", "npm install -g @github/copilot"]
 [copilot.windows]
 program = "npm"
 args = ["install", "-g", "@github/copilot"]
+
+# ───────────────────────────── agy (Antigravity CLI — sucessor do gemini) ─────────────────────────────
+# Binário Go standalone `agy` (SEM Node). Instalador oficial → ~/.local/bin/agy (mexe no rc via `agy
+# install`). No Windows → %LOCALAPPDATA%\agy\bin\agy.exe. (https://antigravity.google/cli/install.sh)
+[agy.macos]
+program = "bash"
+args = ["-c", "curl -fsSL https://antigravity.google/cli/install.sh | bash"]
+verify_paths = ["~/.local/bin"]
+
+[agy.linux]
+program = "bash"
+args = ["-c", "curl -fsSL https://antigravity.google/cli/install.sh | bash"]
+verify_paths = ["~/.local/bin"]
+
+[agy.windows]
+program = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://antigravity.google/cli/install.ps1 | iex"]
+verify_paths = ["~\\AppData\\Local\\agy\\bin"]

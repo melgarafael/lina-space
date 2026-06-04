@@ -235,6 +235,17 @@ pub fn install_recipe(cli_id: &str) -> Option<InstallRecipe> {
     install_recipe_with(cli_id, std::env::var(&key).ok().as_deref(), installers())
 }
 
+/// Rótulo amigável (sem jargão, inv#6) a partir do id de descoberta (= nome do binário no PATH). Só
+/// `agy` precisa de tradução — é o binário do Antigravity, que o usuário conhece como "antigravity";
+/// o resto (claude/codex/…) já é o nome conhecido.
+#[must_use]
+pub fn display_name(id: &str) -> String {
+    match id {
+        "agy" => "antigravity".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Atualiza o estado compartilhado de instalação (best-effort sob poison).
 fn set_install(state: &Arc<Mutex<InstallState>>, s: InstallState) {
     if let Ok(mut g) = state.lock() {
@@ -890,7 +901,7 @@ impl OnboardingView {
                         .w(px(120.0))
                         .text_color(rgb(TEXT))
                         .font_weight(FontWeight::BOLD)
-                        .child(text!(id.to_string())),
+                        .child(text!(display_name(id))),
                 );
 
             if present {
@@ -1272,6 +1283,21 @@ mod tests {
         let joined = copilot.args.join(" ");
         assert!(joined.contains("@github/copilot"), "veio {joined:?}");
         assert!(!joined.contains("githubnext"));
+    }
+
+    /// Antigravity: o id de descoberta é `agy` (o nome do binário no PATH), o rótulo amigável é
+    /// "antigravity", e há receita p/ o SO atual apontando o instalador OFICIAL.
+    #[test]
+    fn antigravity_agy_recipe_and_label() {
+        assert_eq!(display_name("agy"), "antigravity");
+        assert_eq!(display_name("claude"), "claude"); // os demais não mudam
+        assert!(KNOWN_CLIS.contains(&"agy"), "agy deve estar nos CLIs conhecidos");
+        let agy = install_recipe_with("agy", None, installers()).expect("agy tem receita");
+        let joined = agy.args.join(" ");
+        assert!(
+            joined.contains("antigravity.google"),
+            "deve usar o instalador oficial, veio {joined:?}"
+        );
     }
 
     /// O LOOP do critério, headless: "instalar" (fake) põe o binário no PATH e a re-detecção

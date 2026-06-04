@@ -16,7 +16,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// CLIs de IA que o check-up (T1) procura no `PATH` (ids canônicos). Estender = uma linha.
-pub const KNOWN_CLIS: &[&str] = &["claude", "codex", "gemini", "opencode", "copilot"];
+// `agy` = Antigravity CLI (Google) — sucessor do `gemini` (que o Google aposenta em 2026-06-18); é um
+// BINÁRIO distinto (`agy`, não `gemini`), então é uma entrada própria. O id É o nome do binário no
+// PATH (a descoberta procura por ele); o rótulo amigável "antigravity" vive na UI (ver `display_name`).
+pub const KNOWN_CLIS: &[&str] = &["claude", "codex", "gemini", "opencode", "copilot", "agy"];
 
 /// Um CLI de IA encontrado no `PATH`. É o item do payload de `DiscoveryIndexed`.
 /// `version: None` quando o binário existe mas `--version` falhou (não engole o achado).
