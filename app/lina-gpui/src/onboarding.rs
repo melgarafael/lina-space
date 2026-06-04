@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use lina_cli_profiles::{InstallRecipe, Installers};
 
+use crate::dev_tools::DevToolsModel;
+
 use gpui::{
     div, prelude::*, px, rgb, size, text, AnyElement, App, Bounds, ClickEvent, Context,
     FocusHandle, FontWeight, Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
@@ -61,6 +63,8 @@ pub enum Step {
     Welcome,
     /// T1 — check-up de CLIs + "Instalar para mim".
     Checkup,
+    /// T1.5 — ferramentas de desenvolvimento (git, GitHub CLI, Vercel, Node.js, Python). Passe-through.
+    DevTools,
     /// T2 — provedor/conta (passe-through).
     Provider,
     /// T3 — criar o 1º Espaço.
@@ -70,9 +74,10 @@ pub enum Step {
 }
 
 impl Step {
-    const ORDER: [Step; 5] = [
+    const ORDER: [Step; 6] = [
         Step::Welcome,
         Step::Checkup,
+        Step::DevTools,
         Step::Provider,
         Step::CreateSpace,
         Step::Done,
@@ -96,7 +101,7 @@ impl Step {
     /// Próximo passo (satura em `Done`).
     #[must_use]
     pub fn next(self) -> Step {
-        Self::from_index((self.index() + 1).min(4))
+        Self::from_index((self.index() + 1).min(5))
     }
 
     /// Passo anterior (satura em `Welcome`).
@@ -672,7 +677,22 @@ pub fn open_window(cx: &mut App, dir: PathBuf) {
 /// View gpui do onboarding — só renderiza o [`OnboardingModel`] e roteia cliques.
 pub struct OnboardingView {
     model: OnboardingModel,
+    /// Tela "Ferramentas de desenvolvimento" (passo após o check-up). Lógica gpui-free em `dev_tools`;
+    /// `pub(crate)` p/ a render dela rotear cliques (instalar/verificar) pela view-pai.
+    pub(crate) dev_tools: DevToolsModel,
     focus: FocusHandle,
+}
+
+impl OnboardingView {
+    /// Avança o passo (chamado pelo "Continuar →" da tela de ferramentas). `pub(crate)` p/ `dev_tools`.
+    pub(crate) fn nav_continue(&mut self) {
+        self.model.advance();
+    }
+
+    /// Volta um passo (chamado pelo "← Voltar" da tela de ferramentas). `pub(crate)` p/ `dev_tools`.
+    pub(crate) fn nav_back(&mut self) {
+        self.model.back();
+    }
 }
 
 impl OnboardingView {
@@ -694,10 +714,18 @@ impl OnboardingView {
             loop {
                 let Ok(busy) = this.update(cx, |view, cx| {
                     view.model.poll_install();
+                    view.dev_tools.poll_install();
+                    // O mesmo pulso dirige a tela de ferramentas (mesma natureza assíncrona: descoberta +
+                    // "Instalar para mim" mudam o estado a partir de uma thread gpui-free).
                     let busy = matches!(
                         view.model.install_state(),
                         InstallState::Installing { .. } | InstallState::Verifying
-                    ) || view.model.is_discovering();
+                    ) || view.model.is_discovering()
+                        || matches!(
+                            view.dev_tools.install_state(),
+                            InstallState::Installing { .. } | InstallState::Verifying
+                        )
+                        || view.dev_tools.is_discovering();
                     // `busy || was_busy`: redesenha durante o trabalho E no 1º frame após ele terminar,
                     // p/ que o estado final (Ok ✓ / Failed ⚠ / lista re-detectada) realmente apareça.
                     if busy || was_busy {
@@ -717,6 +745,7 @@ impl OnboardingView {
 
         Self {
             model: OnboardingModel::load(dir),
+            dev_tools: DevToolsModel::new(),
             focus,
         }
     }
@@ -774,8 +803,10 @@ impl OnboardingView {
     fn step_dots(&self) -> AnyElement {
         let cur = self.model.step().index();
         let mut row = div().flex().flex_row().gap_2().items_center();
-        for i in 0..4u8 {
-            let on = i <= cur.min(3);
+        // 5 dots p/ os 5 passos antes do `Done` (Welcome..CreateSpace, índices 0..=4); `Done` (5) acende
+        // todos. `cur.min(4)` clampa o último dot aceso no fim do fluxo.
+        for i in 0..5u8 {
+            let on = i <= cur.min(4);
             row = row.child(
                 div()
                     .w(px(if i == cur { 26.0 } else { 12.0 }))
@@ -1113,6 +1144,7 @@ impl Render for OnboardingView {
         let content = match self.model.step() {
             Step::Welcome => self.render_welcome(cx),
             Step::Checkup => self.render_checkup(cx),
+            Step::DevTools => self.dev_tools.render(window, cx),
             Step::Provider => self.render_provider(cx),
             Step::CreateSpace => self.render_create(cx),
             Step::Done => self.render_done(cx),
@@ -1211,10 +1243,14 @@ mod tests {
     #[test]
     fn step_machine_orders_and_saturates() {
         assert_eq!(Step::Welcome.index(), 0);
-        assert_eq!(Step::Done.index(), 4);
+        assert_eq!(Step::Done.index(), 5); // +1 passo (DevTools) entre Checkup e Provider
         assert_eq!(Step::Welcome.prev(), Step::Welcome); // satura
         assert_eq!(Step::Done.next(), Step::Done); // satura
         assert_eq!(Step::Welcome.next(), Step::Checkup);
+        // DevTools entra após o check-up: Checkup → DevTools → Provider.
+        assert_eq!(Step::Checkup.next(), Step::DevTools);
+        assert_eq!(Step::DevTools.next(), Step::Provider);
+        assert_eq!(Step::DevTools.prev(), Step::Checkup);
         assert_eq!(Step::CreateSpace.next(), Step::Done);
         for s in Step::ORDER {
             assert_eq!(Step::from_index(s.index()), s);
@@ -1371,7 +1407,8 @@ mod tests {
         save_progress(
             tmp.path(),
             &Progress {
-                step: 2,
+                // Índice simbólico (robusto à reordenação dos passos — DevTools entrou no meio).
+                step: Step::Provider.index(),
                 provider_ready: false,
                 chosen_cli: None,
             },
@@ -1417,7 +1454,8 @@ mod tests {
             let mut model = OnboardingModel::load_with(tmp.path().to_path_buf(), empty_discover());
             model.block_on_discovery();
             model.advance(); // Welcome → Checkup
-            model.advance(); // Checkup → Provider
+            model.advance(); // Checkup → DevTools
+            model.advance(); // DevTools → Provider
             model.advance(); // Provider → CreateSpace
             assert_eq!(model.step(), Step::CreateSpace);
             model.back(); // CreateSpace → Provider (usuário recuou antes de fechar)

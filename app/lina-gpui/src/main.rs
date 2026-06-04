@@ -12,6 +12,9 @@ mod canvas;
 mod palette;
 // W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
 mod onboarding;
+// Tela "Ferramentas de desenvolvimento" do onboarding (git/gh/vercel/node/python): reusa o instalador
+// dos assistentes (PTY oculto + re-hidratação de PATH). Lógica gpui-free; render fina sobre OnboardingView.
+mod dev_tools;
 // W4-3: chrome de conexão "sem fios" — freio (pausa de orquestração), selo por membership, reduce-motion.
 mod wiring;
 // W3-7c · TETO DE CUSTO REAL: mede o output dos PTYs e emite TokenUsageReported (alimenta o CostLedger).
