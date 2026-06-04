@@ -28,6 +28,7 @@ mod inspector;
 mod creators;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -397,7 +398,8 @@ fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
 struct WorkspaceView {
     nodes: NodeManager,
     input: Arc<dyn InputSink>,
-    a2a: Arc<A2aTrigger>,
+    // `None` em produção (sem A/B semeados) → o botão ⚡ A2A nem renderiza. `Some` no demo (A→B).
+    a2a: Option<Arc<A2aTrigger>>,
     focused: NodeId,
     focus: FocusHandle,
     /// Câmera 2D do canvas (pan + zoom). Transform world↔screen, culling e hit-test usam ela.
@@ -458,7 +460,7 @@ impl WorkspaceView {
     fn new(
         nodes: NodeManager,
         input: Arc<dyn InputSink>,
-        a2a: Arc<A2aTrigger>,
+        a2a: Option<Arc<A2aTrigger>>,
         focused: NodeId,
         desk: Desk,
         brake: wiring::Brake,
@@ -1440,6 +1442,13 @@ impl Render for WorkspaceView {
             root = root.child(card);
         }
 
+        // inv#6 (nunca tela em branco): workspace SEM terminais (produção fresca, ou o raro spawn que
+        // falhou) → guia centralizada (⌘T) em vez de canvas vazio. Adicionada ANTES do topbar (que vem
+        // depois), então os botões do topo continuam clicáveis por cima. Some sozinho ao surgir o 1º card.
+        if cards.is_empty() {
+            root = root.child(empty_canvas_hint());
+        }
+
         // BUG A/B (instrumentação): loga a linha de diagnóstico SÓ quando muda (rows/zona/dim) — o
         // Maestro lê o stderr e confirma, SEM ver a tela, que as rows do PTY batem com o desenhado e
         // que a zona/dim estão certas (periferia NÃO escurece por falta de foco).
@@ -1575,9 +1584,9 @@ impl Render for WorkspaceView {
                 .child(text!(format!("log: {event_count} eventos"))),
         );
 
-        // O ⚡ A2A (A→B) só aparece com AMBOS os alvos vivos: se o fundador fechar A ou B,
-        // escondemos o botão em vez de deixá-lo falhar em silêncio.
-        if self.a2a.ready() {
+        // O ⚡ A2A (A→B) é demo-only e só aparece com AMBOS os alvos vivos: em produção `a2a` é `None`
+        // (sem A/B) e o botão nem existe; no demo, se o fundador fechar A ou B, `ready()` o esconde.
+        if self.a2a.as_ref().is_some_and(|a| a.ready()) {
             topbar = topbar.child(
                 div()
                     .id("a2a-btn")
@@ -1589,10 +1598,12 @@ impl Render for WorkspaceView {
                     .cursor_pointer()
                     .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
                         // O B é um shell real: injeta um COMANDO válido (roda limpo nele).
-                        view.a2a.fire(
-                            "echo '📨 A2A recebido de Terminal A · cooperacao sem fios'"
-                                .to_string(),
-                        );
+                        if let Some(a) = &view.a2a {
+                            a.fire(
+                                "echo '📨 A2A recebido de Terminal A · cooperacao sem fios'"
+                                    .to_string(),
+                            );
+                        }
                     }))
                     .child(text!("⚡ Enviar A2A (A→B)")),
             );
@@ -1890,6 +1901,75 @@ fn naming_overlay(buf: &str) -> impl IntoElement {
         )
 }
 
+/// PRODUÇÃO vs DEMO. `LINA_DEMO` (1/true/on/yes) liga o modo demo do fundador: semeia Terminal A/B,
+/// arma o botão ⚡ A2A A→B e grava o workspace em `temp`. Sem a env → PRODUÇÃO (default do aluno).
+fn lina_demo_enabled() -> bool {
+    matches!(
+        std::env::var("LINA_DEMO").ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+/// Base PERSISTENTE por-usuário (macOS: `~/Library/Application Support`). Sem `$HOME` (raríssimo): cai
+/// no `temp` como degradação VISÍVEL — a alternativa (panic) violaria inv#6 ("app NUNCA quebrar").
+fn app_support_dir() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join("Library")
+            .join("Application Support"),
+        None => {
+            eprintln!(
+                "lina-gpui: HOME ausente — usando diretório temporário (o estado NÃO persistirá)"
+            );
+            std::env::temp_dir()
+        }
+    }
+}
+
+/// Onde o workspace do aluno é GRAVADO. Prioridade: `LINA_WS_ROOT` (override de dev) > DEMO (`temp`,
+/// caminho histórico do fundador) > PRODUÇÃO (Application Support persistente). NUNCA `temp` em
+/// produção: o SO o limpa no reboot = perda do trabalho do aluno, viola inv#6.
+fn resolve_ws_root(demo: bool) -> PathBuf {
+    if let Ok(p) = std::env::var("LINA_WS_ROOT") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if demo {
+        return std::env::temp_dir().join("lina-space-ws3");
+    }
+    app_support_dir().join("Lina").join("walking-skeleton")
+}
+
+/// inv#6 (nunca tela em branco): quando o canvas não tem nenhum terminal (workspace fresco/produção, ou
+/// o raro caso de spawn que falhou), uma guia centralizada substitui o vazio — o aluno sabe o próximo
+/// passo (⌘T). Some sozinho assim que o 1º card existe.
+fn empty_canvas_hint() -> impl IntoElement {
+    div()
+        .absolute()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_3()
+        .child(div().text_size(px(44.0)).child(text!("✨")))
+        .child(
+            div()
+                .text_size(px(20.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(0xc8d3f5))
+                .child(text!("Seu Espaço está pronto")),
+        )
+        .child(
+            div()
+                .text_size(px(15.0))
+                .text_color(rgb(0x8a93b8))
+                .child(text!("Pressione ⌘T para criar seu primeiro agente")),
+        )
+}
+
 fn main() {
     let (cols, rows) = fit_dims();
     // BUG A (instrumentação de boot): o PTY é spawnado com EXATAMENTE estas `rows`, e o render trava a
@@ -1906,12 +1986,54 @@ fn main() {
     // forense ficava partida em dois logs (ActionGated/BrokerDenied do bin vs. eventos do supervisor),
     // violando o invariante "o event log é a fonte da verdade". `ws_root`/`mailbox_dir` precisam
     // existir antes desta abertura; `EventStore::open` faz `create_dir_all` do diretório.
-    let ws_root = std::env::temp_dir().join("lina-space-ws3");
+    // PRODUÇÃO vs DEMO + onde o workspace mora (item 6 / addendum): produção grava num diretório
+    // PERSISTENTE por-usuário (Application Support), nunca em `temp` (que o reboot limpa = perda de
+    // dados, viola inv#6). Demo/override mantêm o caminho histórico em `temp`.
+    let demo = lina_demo_enabled();
+    let ws_root = resolve_ws_root(demo);
     let mailbox_dir = ws_root.join(".lina");
     let dir = mailbox_dir.join("events");
-    let store = Arc::new(Mutex::new(
-        EventStore::open(&dir).expect("abrir EventStore"),
-    ));
+    // Estado PERSISTENTE do onboarding (progresso + log próprio), co-locado no workspace (subdir, não
+    // colide com `.lina/events` do canvas). Sobrevive ao reboot em produção → o onboarding só aparece
+    // na 1ª execução de verdade.
+    let onboarding_dir = ws_root.join("onboarding");
+    eprintln!(
+        "lina-gpui: workspace em {} ({})",
+        ws_root.display(),
+        if demo {
+            "DEMO/temp"
+        } else {
+            "produção/persistente"
+        }
+    );
+    // inv#6 (app NUNCA quebrar): um `.db` corrompido NÃO panica o boot. Tenta o store persistente; se
+    // falhar, loga ALTO sem destruir o arquivo (recuperação in-UI é W0-6, fora de escopo) e cai num
+    // store temporário só nesta sessão — garante que o app abre. Instalação nova abre limpo, sem cair
+    // aqui. (`.expect` antigo virava backtrace na cara do aluno.)
+    let store = Arc::new(Mutex::new(match EventStore::open(&dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "lina-gpui: não abri seus dados em {} ({e}). Eles estão preservados; abrindo um \
+                 espaço temporário só nesta sessão.",
+                dir.display()
+            );
+            let tmp = std::env::temp_dir()
+                .join("lina-space-fallback")
+                .join(".lina")
+                .join("events");
+            match EventStore::open(&tmp) {
+                Ok(s) => s,
+                Err(e2) => {
+                    eprintln!(
+                        "lina-gpui: o store de fallback também falhou em {} ({e2}) — encerrando.",
+                        tmp.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }));
 
     let pty = Arc::new(Mutex::new(PtyManager::new()));
     let sup = Arc::new(Supervisor::new());
@@ -1971,99 +2093,107 @@ fn main() {
     // W4-3: FREIO compartilhado — a UI pede pausa/retoma; a MailboxPump aplica no Router e espelha.
     let brake: wiring::Brake = wiring::new_brake();
 
-    // Cada terminal spawna no SEU cwd (<ws_root>/<key>), onde fica o CLAUDE.md dele.
-    let (mut cmd_a, mut cmd_b) = ((*cmd_factory)("Terminal A"), (*cmd_factory)("Terminal B"));
-    if let Some(bw) = &bootstrap {
-        let da = bw.dir_for("A");
-        let _ = std::fs::create_dir_all(&da);
-        cmd_a = cmd_a.cwd(da);
-        let db = bw.dir_for("B");
-        let _ = std::fs::create_dir_all(&db);
-        cmd_b = cmd_b.cwd(db);
-    }
+    // ── SEED dos nós iniciais. PRODUÇÃO (default do aluno): NENHUM. O workspace nasce limpo e o aluno
+    // cria o 1º agente com ⌘T (guiado pelo empty-state) — sem "Terminal A/B fantasma" poluindo o log.
+    // DEMO (`LINA_DEMO=1`): semeia Terminal A + B (shells reais, idênticos) e arma o botão ⚡ A2A A→B.
+    // Em QUALQUER caso, um spawn que falhe DEGRADA (loga e segue) — nunca panica (inv#6, antes `.expect`).
+    let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+    let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
-    // Os 2 nós iniciais (A, B), pela MESMA fiação dos nós adicionados em runtime.
-    let (node_a, grid_a) = {
-        let mut p = lock(&pty);
-        wire_terminal(
-            &mut p,
-            &sup,
-            &delta_tx,
-            "A",
-            "Terminal A",
-            "terminal",
-            cmd_a,
-            cols,
-            rows,
-        )
-    }
-    .expect("wire A");
-    let (node_b, grid_b) = {
-        let mut p = lock(&pty);
-        wire_terminal(
-            &mut p,
-            &sup,
-            &delta_tx,
-            "B",
-            "Terminal B",
-            "terminal",
-            cmd_b,
-            cols,
-            rows,
-        )
-    }
-    .expect("wire B");
-    let _ = sup.set_status(node_a, CoreStatus::Running);
-    let _ = sup.set_status(node_b, CoreStatus::Running);
-
-    {
-        let mut s = lock(&store);
-        let _ = s.append(&DomainEvent::WorkspaceCreated {
+    #[allow(clippy::type_complexity)]
+    let (focused, a2a, seq_start, keys): (
+        NodeId,
+        Option<Arc<A2aTrigger>>,
+        u32,
+        BTreeMap<NodeId, String>,
+    ) = if demo {
+        let _ = lock(&store).append(&DomainEvent::WorkspaceCreated {
             name: "walking-skeleton".into(),
             // W4-5: o walking-skeleton não passa pela galeria de Foco → preset não-setado (`""`).
             focus_preset: String::new(),
         });
-        for (node, name, x, y) in [
-            (node_a, "Terminal A", 30.0_f64, 96.0_f64),
-            (node_b, "Terminal B", 740.0, 96.0),
-        ] {
-            let _ = s.append(&DomainEvent::NodeAdded {
-                node,
-                kind: "Terminal".into(),
-                x,
-                y,
-            });
-            let _ = s.append(&DomainEvent::TerminalSpawned {
-                node,
-                cli: name.into(),
-            });
+        // Spawna+fia um terminal demo; em SUCESSO persiste NodeAdded+TerminalSpawned, projeta no model e
+        // registra o grid. Devolve `(NodeId, Grid)` ou `None` (spawn falhou → degrada, sem panic).
+        let seed_one = |key: &str, name: &str, x: f64, y: f64| -> Option<(NodeId, Grid)> {
+            let mut cmd = (*cmd_factory)(name);
+            if let Some(bw) = &bootstrap {
+                let d = bw.dir_for(key);
+                let _ = std::fs::create_dir_all(&d);
+                cmd = cmd.cwd(d);
+            }
+            let wired = {
+                let mut p = lock(&pty);
+                wire_terminal(
+                    &mut p, &sup, &delta_tx, key, name, "terminal", cmd, cols, rows,
+                )
+            };
+            match wired {
+                Ok((node, grid)) => {
+                    let _ = sup.set_status(node, CoreStatus::Running);
+                    {
+                        let mut s = lock(&store);
+                        let _ = s.append(&DomainEvent::NodeAdded {
+                            node,
+                            kind: "Terminal".into(),
+                            x,
+                            y,
+                        });
+                        let _ = s.append(&DomainEvent::TerminalSpawned {
+                            node,
+                            cli: name.into(),
+                        });
+                    }
+                    lock(&model).seed_node(
+                        node,
+                        NodeView::new(name, NodeKind::Terminal, x as f32, y as f32),
+                    );
+                    lock(&grids).insert(node, Arc::clone(&grid));
+                    Some((node, grid))
+                }
+                Err(e) => {
+                    eprintln!("lina-gpui: DEMO — spawn de '{name}' falhou ({e}); seguindo sem ele");
+                    None
+                }
+            }
+        };
+        let a = seed_one("A", "Terminal A", 30.0, 96.0);
+        let b = seed_one("B", "Terminal B", 740.0, 96.0);
+        let mut keys: BTreeMap<NodeId, String> = BTreeMap::new();
+        if let Some((na, _)) = &a {
+            keys.insert(*na, "A".to_string());
         }
-    }
+        if let Some((nb, _)) = &b {
+            keys.insert(*nb, "B".to_string());
+        }
+        let seq = keys.len() as u32;
+        // O ⚡ A2A A→B só faz sentido com AMBOS vivos; senão fica `None` (o botão some via `ready()`).
+        let a2a = match (&a, &b) {
+            (Some((na, _)), Some((nb, grid_b))) => Some(Arc::new(A2aTrigger::new(
+                Arc::clone(&sup),
+                *na,
+                *nb,
+                Arc::clone(grid_b),
+                demo_profile(),
+                Arc::clone(&store),
+                Arc::clone(&model),
+            ))),
+            _ => None,
+        };
+        // O foco arranca no 1º terminal vivo (A, ou B se A falhou); o render reaponta sozinho depois.
+        let focused = a
+            .as_ref()
+            .or(b.as_ref())
+            .map(|(n, _)| *n)
+            .unwrap_or_default();
+        (focused, a2a, seq, keys)
+    } else {
+        // PRODUÇÃO: sem nós. `focused` é a sentinela nil (`NodeId::default()`); o render reaponta ao 1º
+        // card assim que o aluno cria um com ⌘T. `a2a = None` → o botão ⚡ nem aparece (gate `ready()`).
+        (NodeId::default(), None, 0u32, BTreeMap::new())
+    };
+
     let event_count = lock(&store).event_count().unwrap_or(0);
-
-    let model: Model = Arc::new(Mutex::new(SharedModel::default()));
-    {
-        let mut m = lock(&model);
-        m.seed_node(
-            node_a,
-            NodeView::new("Terminal A", NodeKind::Terminal, 30.0, 96.0),
-        );
-        m.seed_node(
-            node_b,
-            NodeView::new("Terminal B", NodeKind::Terminal, 740.0, 96.0),
-        );
-        m.event_count = event_count;
-    }
-
-    let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
-    {
-        let mut g = lock(&grids);
-        g.insert(node_a, Arc::clone(&grid_a));
-        g.insert(node_b, Arc::clone(&grid_b));
-    }
-    let mut keys: BTreeMap<NodeId, String> = BTreeMap::new();
-    keys.insert(node_a, "A".to_string());
-    keys.insert(node_b, "B".to_string());
+    lock(&model).event_count = event_count;
 
     // W3-7c · TETO DE CUSTO REAL. `LINA_TOKEN_BUDGET_DAY` (tokens/dia ESTIMADOS ≈ bytes/4 de output;
     // ver cost.rs) ARMA o teto; 0/ausente = desligado (default, sem regressão). A bomba mede o output
@@ -2075,22 +2205,20 @@ fn main() {
         .unwrap_or(0);
     let idle_ms = demo_profile().idle_ms.unwrap_or(200);
     let bridge = GpuiBridgeHost::new(Arc::clone(&model));
-    let mut pump = spawn_pump(bridge, delta_rx, bus_rx, Arc::clone(&store), idle_ms)
-        .expect("subir a ponte core→UI");
+    // inv#6/no-panic: sem a ponte core→UI o app não renderiza terminais — encerra com mensagem clara
+    // em vez de backtrace. (Falha só em condição catastrófica de sistema; instalação nova não cai aqui.)
+    let mut pump = match spawn_pump(bridge, delta_rx, bus_rx, Arc::clone(&store), idle_ms) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("lina-gpui: não subi a ponte core→UI ({e}); o app não consegue renderizar — encerrando.");
+            std::process::exit(1);
+        }
+    };
 
     let input: Arc<dyn InputSink> = Arc::new(CoreInput::new(Arc::clone(&sup)));
-    let a2a = Arc::new(A2aTrigger::new(
-        Arc::clone(&sup),
-        node_a,
-        node_b,
-        Arc::clone(&grid_b),
-        demo_profile(),
-        Arc::clone(&store),
-        Arc::clone(&model),
-    ));
 
-    // O dono dos nós em runtime (add/remove): reusa pty/sup/store/model/grids. O `seq` inicia
-    // em 2 porque A=0 e B=1 já consumiram os rótulos A/B.
+    // O dono dos nós em runtime (add/remove): reusa pty/sup/store/model/grids. `seq_start` é o nº de nós
+    // semeados (2 no demo A/B; 0 em produção) → o 1º ⌘T do aluno em produção nasce como "Terminal A".
     let nodes = NodeManager::new(
         Arc::clone(&pty),
         Arc::clone(&sup),
@@ -2101,12 +2229,12 @@ fn main() {
         delta_tx,
         cols,
         rows,
-        2,
+        seq_start,
         cmd_factory,
         bootstrap,
         mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
     );
-    // W3-2: escreve o CLAUDE.md/estado inicial de A e B (roster = {A, B}).
+    // W3-2: escreve o CLAUDE.md/estado inicial do roster semeado (vazio em produção — best-effort).
     nodes.rewrite_bootstrap();
 
     // W3-4: sobe o SUPERVISOR que observa a mailbox (`<ws_root>/.lina/outbox/`). A partir daqui,
@@ -2142,34 +2270,22 @@ fn main() {
         dir.display()
     );
 
-    // DEMO: timer de auto-quit da janela. Antes ele só existia quando a env
-    // LINA_AUTOQUIT_MS estava setada (caminho de smoke/CI: dispara um A2A no meio e
-    // fecha); sem a env, a janela ficava aberta indefinidamente. Para o fundador
-    // (não-técnico) validar o Terminal B COM CALMA, agora há um auto-quit PADRÃO de
-    // 5 min quando a env não é dada — sem A2A surpresa.
-    // DEMO: reverter para sem-auto-quit-padrão (timer só via env) após validação.
-    const DEMO_AUTOQUIT_MS: u64 = 1_800_000; // 30 min (demo do fundador — reverter p/ 300_000 ou só-env após validar)
-    match std::env::var("LINA_AUTOQUIT_MS")
+    // Auto-quit: SÓ quando `LINA_AUTOQUIT_MS` está setada (smoke/CI — dispara um A2A no meio, se houver,
+    // e fecha). SEM a env, a janela fica aberta INDEFINIDAMENTE: um app de aluno NUNCA se fecha sozinho
+    // (o antigo default de 30 min era um demo-ism crítico — removido).
+    if let Some(ms) = std::env::var("LINA_AUTOQUIT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
     {
-        // Smoke/CI: a env (curta) dispara um A2A no meio e fecha — comportamento de teste.
-        Some(ms) => {
-            let a2a_auto = Arc::clone(&a2a);
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(ms / 2));
-                a2a_auto.fire("echo '📨 A2A automatico (smoke)'".to_string());
-                thread::sleep(Duration::from_millis(ms / 2));
-                std::process::exit(0);
-            });
-        }
-        // DEMO: sem env → auto-quit calmo de 5 min (sem A2A surpresa) p/ validação visual.
-        None => {
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(DEMO_AUTOQUIT_MS));
-                std::process::exit(0);
-            });
-        }
+        let a2a_auto = a2a.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(ms / 2));
+            if let Some(a) = &a2a_auto {
+                a.fire("echo '📨 A2A automatico (smoke)'".to_string());
+            }
+            thread::sleep(Duration::from_millis(ms / 2));
+            std::process::exit(0);
+        });
     }
 
     // W4-4: handles compartilhados p/ o painel de persistência (lê event_count/recovering do model;
@@ -2178,15 +2294,11 @@ fn main() {
     let panel_store = Arc::clone(&store);
     let panel_dir = dir.clone();
     application().run(move |cx: &mut App| {
-        // W4-1: onboarding turno-0 (T0→T3). Env-gated (LINA_ONBOARDING) p/ não perturbar a demo do
-        // canvas durante o dev paralelo; fundador valida com `LINA_ONBOARDING=1 cargo run`.
-        if onboarding::should_show() {
-            onboarding::open_window(cx);
-            cx.activate(true);
-            return;
-        }
+        // inv#6: o CANVAS é a base e abre SEMPRE (nunca tela em branco). O onboarding entra como janela
+        // SOBREPOSTA na 1ª execução (W4-1) e se fecha sozinho no fim ("Abrir meu Espaço →"), revelando o
+        // canvas por baixo — sem precisar passar os handles do canvas pro onboarding.
         let bounds = Bounds::centered(None, size(px(1450.0), px(640.0)), cx);
-        cx.open_window(
+        let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -2196,10 +2308,14 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| WorkspaceView::new(nodes, input, a2a, node_a, desk, brake, window, cx))
+                cx.new(|cx| WorkspaceView::new(nodes, input, a2a, focused, desk, brake, window, cx))
             },
-        )
-        .expect("abrir a janela gpui");
+        );
+        // no-panic: se a janela não abrir (gpui/SO catastrófico) encerra com mensagem, não com backtrace.
+        if let Err(e) = opened {
+            eprintln!("lina-gpui: não abri a janela do canvas ({e}); encerrando.");
+            std::process::exit(1);
+        }
         // W4-4: painel de persistência (env-gated LINA_PERSIST_PANEL; não perturba a demo do canvas).
         if persistence_ui::should_show() {
             persistence_ui::open_window(
@@ -2209,11 +2325,15 @@ fn main() {
                 panel_dir.clone(),
             );
         }
+        // Onboarding turno-0 por cima (1ª execução / progresso < Done). Demo pula por padrão; dev força
+        // com `LINA_ONBOARDING=1|0`. Aberto por ÚLTIMO → fica em foco sobre o canvas.
+        if onboarding::should_show(&onboarding_dir, demo) {
+            onboarding::open_window(cx, onboarding_dir.clone());
+        }
         cx.activate(true);
     });
 
     pump.stop();
-    let _ = grid_a;
     drop(sup);
     drop(pty);
 }

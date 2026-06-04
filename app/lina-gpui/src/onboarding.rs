@@ -580,25 +580,35 @@ impl OnboardingModel {
 
 // ═══════════════════════════════ entrada (main.rs) ═══════════════════════════════
 
-/// Diretório de estado do onboarding (separado do canvas; não colide com o walking-skeleton).
-fn onboarding_dir() -> PathBuf {
-    std::env::temp_dir().join("lina-space-onboarding")
+/// Decide (PURO — testável sem env nem disco) se o onboarding deve aparecer, dado o passo persistido,
+/// o override de ambiente e o modo demo. **PRODUÇÃO:** aparece na **1ª execução** (o usuário ainda não
+/// concluiu, `step < Done`) e some depois — sem env nenhuma. **Override de dev:**
+/// `LINA_ONBOARDING=1|force|true` força mostrar; `=0|false|off` força pular (útil pra testar o canvas).
+/// **Demo** (canvas do fundador) pula por padrão (não estorva a apresentação).
+#[must_use]
+pub fn decide_show(progress_step: u8, env_override: Option<&str>, demo: bool) -> bool {
+    match env_override.map(str::trim) {
+        Some("1") | Some("force") | Some("true") => true,
+        Some("0") | Some("false") | Some("off") => false,
+        _ => !demo && progress_step < Step::Done.index(),
+    }
 }
 
-/// Decide se o onboarding deve aparecer. **Env-gated** (`LINA_ONBOARDING=1|force|true`) para NÃO
-/// perturbar a demo do canvas (W2/W3) durante o desenvolvimento paralelo — o fundador valida com
-/// `LINA_ONBOARDING=1 cargo run`. (Virar "auto no 1º run" é 1 linha quando o hand-off→canvas existir.)
+/// Decide se o onboarding deve aparecer lendo o progresso persistido em `dir` + o env `LINA_ONBOARDING`.
+/// Wrapper fino sobre [`decide_show`] (puro e testado): o boot só vê esta função.
 #[must_use]
-pub fn should_show() -> bool {
-    matches!(
+pub fn should_show(dir: &Path, demo: bool) -> bool {
+    decide_show(
+        load_progress(dir).step,
         std::env::var("LINA_ONBOARDING").ok().as_deref(),
-        Some("1") | Some("force") | Some("true")
+        demo,
     )
 }
 
-/// Abre a janela do onboarding (chamada de dentro do `application().run` de `main.rs`).
-pub fn open_window(cx: &mut App) {
-    let dir = onboarding_dir();
+/// Abre a janela do onboarding (chamada de dentro do `application().run` de `main.rs`). `dir` é o
+/// diretório PERSISTENTE de estado do onboarding (progresso + log próprio) — em produção mora no
+/// Application Support do usuário (ver `main.rs`), nunca em `temp`.
+pub fn open_window(cx: &mut App, dir: PathBuf) {
     let bounds = Bounds::centered(None, size(px(920.0), px(640.0)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -981,17 +991,13 @@ impl OnboardingView {
             .into_any_element()
     }
 
-    fn render_done(&self, _cx: &mut Context<Self>) -> AnyElement {
+    fn render_done(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .flex_col()
             .gap_4()
             .items_center()
-            .child(
-                div()
-                    .text_size(px(40.0))
-                    .child(text!("✓")),
-            )
+            .child(div().text_size(px(40.0)).child(text!("✓")))
             .child(
                 div()
                     .text_size(px(26.0))
@@ -1004,9 +1010,17 @@ impl OnboardingView {
                     .text_size(px(15.0))
                     .text_color(rgb(MUTED))
                     .child(text!(
-                        "Tudo pronto. Seu Espaço foi salvo — você pode abrir o canvas para começar a trabalhar."
-                    )),
+                    "Tudo pronto. Seu Espaço foi salvo — abra o canvas para começar a trabalhar."
+                )),
             )
+            // Handoff (inv#6 — sem becos sem saída): fechar esta janela revela o canvas, que já está
+            // aberto por baixo. `window.remove_window()` encerra só a janela do onboarding, não o app.
+            .child(self.primary_button(
+                "open-canvas",
+                "Abrir meu Espaço →",
+                cx,
+                |_v, window, _cx| window.remove_window(),
+            ))
             .into_any_element()
     }
 }
@@ -1116,6 +1130,28 @@ mod tests {
             assert_eq!(Step::from_index(s.index()), s);
         }
         assert_eq!(Step::from_index(99), Step::Welcome); // clamp inválido
+    }
+
+    /// `decide_show` (puro): PRODUÇÃO mostra na 1ª execução (passo < Done) e some ao concluir; demo pula
+    /// por padrão; o override de dev força mostrar/pular ignorando progresso e demo. É a lógica nova de
+    /// "should_show por progresso, não por env" — testada sem tocar o `env` real (determinístico).
+    #[test]
+    fn decide_show_first_run_then_hidden() {
+        let done = Step::Done.index();
+        // 1ª execução: passo antes de Done, sem override, fora do demo → MOSTRA.
+        assert!(decide_show(Step::Welcome.index(), None, false));
+        assert!(decide_show(Step::CreateSpace.index(), None, false));
+        // Concluído (Done persistido) → SOME (returning user cai direto no canvas).
+        assert!(!decide_show(done, None, false));
+        // Demo pula por padrão, mesmo na 1ª execução (não estorva o canvas do fundador).
+        assert!(!decide_show(Step::Welcome.index(), None, true));
+        // Override de dev vence tudo: força mostrar (mesmo concluído/demo) ou pular (mesmo 1ª execução).
+        assert!(decide_show(done, Some("1"), true));
+        assert!(decide_show(done, Some("force"), false));
+        assert!(!decide_show(Step::Welcome.index(), Some("0"), false));
+        assert!(!decide_show(Step::Welcome.index(), Some("false"), false));
+        // Override desconhecido → ignora e cai na regra de progresso.
+        assert!(decide_show(Step::Welcome.index(), Some("talvez"), false));
     }
 
     /// Progresso é retomável: grava e relê o passo/escolhas.
