@@ -22,7 +22,8 @@
 //! (local-first — só lê o vault na máquina, nada sai), #6 (não-técnico-first: zero jargão na UI,
 //! nunca beco sem saída — "Pular esta etapa" sempre disponível; estado salvo e visível).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,59 +65,103 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-/// Acha o **bundle do app** `name` no SO (substitui `find_in_path` — um `.app`/`.exe` não está no
-/// PATH; a armadilha do blueprint §6). macOS: `/Applications/<name>.app` + `~/Applications/…`.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn find_app_bundle(name: &str) -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from(format!("/Applications/{name}.app"))];
-    if let Some(h) = home_dir() {
-        candidates.push(h.join("Applications").join(format!("{name}.app")));
-    }
-    candidates.into_iter().find(|p| p.is_dir())
-}
-
-/// Fora do macOS (Windows/Linux das docs + fallback): checa os caminhos de instalação conhecidos.
-/// Windows: `%LOCALAPPDATA%\<name>\<name>.exe` / `%ProgramFiles%`. Linux: flatpak/usr/local.
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn find_app_bundle(name: &str) -> Option<PathBuf> {
+/// PURO (injetável): candidatos do app `name` por SO. macOS: `/Applications` + `~/Applications`
+/// (`.app`). Windows: `%LOCALAPPDATA%\Programs\<name>` (per-user, SEM UAC — corrige a armadilha do
+/// blueprint que omitia `Programs`) + `%ProgramFiles%` (all-users). Linux: Flatpak exports + pacote
+/// nativo (`/usr/bin`, `/usr/local/bin`) + Snap (`/snap/bin`) + user-local.
+fn app_bundle_candidates_for(
+    os: &str,
+    name: &str,
+    home: Option<&Path>,
+    get_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
     let lname = name.to_ascii_lowercase();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    // Windows.
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local).join(name).join(format!("{name}.exe")));
+    let mut out: Vec<PathBuf> = Vec::new();
+    match os {
+        "macos" => {
+            out.push(PathBuf::from(format!("/Applications/{name}.app")));
+            if let Some(h) = home {
+                out.push(h.join("Applications").join(format!("{name}.app")));
+            }
+        }
+        "windows" => {
+            if let Some(local) = get_env("LOCALAPPDATA") {
+                out.push(
+                    PathBuf::from(local).join("Programs").join(name).join(format!("{name}.exe")),
+                );
+            }
+            if let Some(pf) = get_env("ProgramFiles") {
+                out.push(PathBuf::from(pf).join(name).join(format!("{name}.exe")));
+            }
+        }
+        _ => {
+            out.push(PathBuf::from("/var/lib/flatpak/exports/bin/md.obsidian.Obsidian"));
+            out.push(PathBuf::from(format!("/usr/bin/{lname}")));
+            out.push(PathBuf::from(format!("/usr/local/bin/{lname}")));
+            out.push(PathBuf::from(format!("/snap/bin/{lname}")));
+            if let Some(h) = home {
+                out.push(h.join(".local/share/flatpak/exports/bin/md.obsidian.Obsidian"));
+                out.push(h.join(".local/bin").join(&lname));
+            }
+        }
     }
-    if let Some(pf) = std::env::var_os("ProgramFiles") {
-        candidates.push(PathBuf::from(pf).join(name).join(format!("{name}.exe")));
-    }
-    // Linux (flatpak oficial + pacotes).
-    candidates.push(PathBuf::from("/var/lib/flatpak/exports/bin/md.obsidian.Obsidian"));
-    candidates.push(PathBuf::from(format!("/usr/bin/{lname}")));
-    candidates.push(PathBuf::from(format!("/usr/local/bin/{lname}")));
-    if let Some(h) = home_dir() {
-        candidates.push(h.join(".local/share/flatpak/exports/bin/md.obsidian.Obsidian"));
-        candidates.push(h.join(".local/bin").join(&lname));
-    }
-    candidates.into_iter().find(|p| p.exists())
+    out
 }
 
-/// Caminho do registro de vaults do Obsidian (`obsidian.json`). macOS: Application Support.
-#[cfg(target_os = "macos")]
-fn obsidian_config_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join("Library/Application Support/obsidian/obsidian.json"))
+/// Acha o **bundle/binário do app** `name` no SO atual — 1º candidato existente (substitui
+/// `find_in_path`: um `.app`/`.exe` não está no PATH; a armadilha do blueprint §6). macOS `.app` é
+/// diretório; demais são arquivos — `exists()` cobre os dois.
+#[must_use]
+pub fn find_app_bundle(name: &str) -> Option<PathBuf> {
+    app_bundle_candidates_for(std::env::consts::OS, name, home_dir().as_deref(), &|k| {
+        std::env::var_os(k)
+    })
+    .into_iter()
+    .find(|p| p.exists())
 }
 
-/// Fora do macOS: `%APPDATA%\obsidian\` (Windows) ou `$XDG_CONFIG_HOME`/`~/.config/obsidian/` (Linux).
-#[cfg(not(target_os = "macos"))]
-fn obsidian_config_path() -> Option<PathBuf> {
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return Some(PathBuf::from(appdata).join("obsidian").join("obsidian.json"));
+/// PURO (injetável): caminhos do registro `obsidian.json` por SO. macOS: Application Support. Windows:
+/// `%APPDATA%\obsidian\`. Linux: **MERGE** de `$XDG_CONFIG_HOME`/`~/.config` (nativo) + Flatpak
+/// (sandbox `~/.var/app/md.obsidian.Obsidian/config/obsidian`) + Snap (confinado
+/// `~/snap/obsidian/current/.config/obsidian`) — o usuário pode ter o Obsidian por qualquer canal.
+fn obsidian_config_paths_for(
+    os: &str,
+    home: Option<&Path>,
+    get_env: &dyn Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    match os {
+        "macos" => {
+            if let Some(h) = home {
+                out.push(h.join("Library/Application Support/obsidian/obsidian.json"));
+            }
+        }
+        "windows" => {
+            if let Some(appdata) = get_env("APPDATA") {
+                out.push(PathBuf::from(appdata).join("obsidian").join("obsidian.json"));
+            }
+        }
+        _ => {
+            let xdg = get_env("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| home.map(|h| h.join(".config")));
+            if let Some(cfg) = xdg {
+                out.push(cfg.join("obsidian").join("obsidian.json"));
+            }
+            if let Some(h) = home {
+                out.push(h.join(".var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json"));
+                out.push(h.join("snap/obsidian/current/.config/obsidian/obsidian.json"));
+            }
+        }
     }
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home_dir().map(|h| h.join(".config")))?;
-    Some(config.join("obsidian").join("obsidian.json"))
+    out
+}
+
+/// Caminhos de `obsidian.json` no SO atual (produção: env + home reais).
+fn obsidian_config_paths() -> Vec<PathBuf> {
+    obsidian_config_paths_for(std::env::consts::OS, home_dir().as_deref(), &|k| {
+        std::env::var_os(k)
+    })
 }
 
 /// Uma pasta de anotações ("vault") detectada ou adicionada manualmente. `open` = "aberta agora" no
@@ -178,26 +223,43 @@ pub struct ObsidianScan {
 #[must_use]
 pub fn discover_obsidian() -> ObsidianScan {
     let app_present = find_app_bundle(OBSIDIAN_APP).is_some();
-    // Valida pelo marcador `<path>/.obsidian/` (blueprint §1): vault real e ainda no disco. Descarta
-    // entradas obsoletas do registro (pasta movida/apagada) sem all-or-nothing — as demais seguem.
-    let vaults = obsidian_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| parse_vaults_from_json(&s))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|v| is_vault_dir(&v.path))
-        .collect();
+    // MERGE dos vaults de TODOS os `obsidian.json` do SO (no Linux: nativo + Flatpak + Snap; 1 nos
+    // demais), dedup por caminho canônico. Valida pelo marcador `<path>/.obsidian/` (blueprint §1):
+    // descarta entradas obsoletas (pasta movida/apagada) sem all-or-nothing — as demais seguem.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut vaults: Vec<VaultLink> = Vec::new();
+    for cfg in obsidian_config_paths() {
+        let Ok(contents) = std::fs::read_to_string(&cfg) else {
+            continue;
+        };
+        for v in parse_vaults_from_json(&contents) {
+            if is_vault_dir(&v.path) && seen.insert(canonical(&v.path)) {
+                vaults.push(v);
+            }
+        }
+    }
+    vaults.sort_by(|a, b| a.path.cmp(&b.path));
     ObsidianScan { app_present, vaults }
 }
 
 // ═══════════════════════════ PageIndex — mapa estrutural determinístico (inv#1) ═══════════════════════════
 
-/// Uma nota do índice: caminho relativo + headings + alvos de wikilink (saída do grafo).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Uma nota do índice: caminho relativo + headings + alvos de wikilink (saída do grafo) + embeds e
+/// tags (inline + frontmatter, merged). Tudo extraído com os blocos de código JÁ removidos (inv#1: o
+/// parser nunca captura `[[…]]`/`#tag` que aparecem em exemplos de código).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NoteEntry {
     pub rel_path: String,
     pub headings: Vec<String>,
+    /// Alvos distintos de `[[wikilink]]` (sem `![[embed]]`), na ordem — arestas de saída do grafo.
     pub links: Vec<String>,
+    /// Alvos distintos de `![[embed]]` (notas E anexos), na ordem — metadado informativo.
+    pub embeds: Vec<String>,
+    /// Tags distintas (sem o `#`), inline + frontmatter `tags:`, na ordem de 1ª aparição.
+    pub tags: Vec<String>,
+    /// Alvo de `[[wikilink]]` (limpo: sem alias/âncora) → nº de ocorrências — peso das arestas no
+    /// sidecar JSON (preserva a multiplicidade que `links` perde ao deduplicar).
+    pub link_counts: Vec<(String, usize)>,
 }
 
 /// O índice de um vault: pastas + notas (ambos ordenados — determinístico).
@@ -224,31 +286,263 @@ pub fn extract_headings(content: &str) -> Vec<String> {
         .collect()
 }
 
-/// PURO: extrai os alvos de `[[wikilink]]` (sem alias `|` nem âncora `#`), na ordem, sem repetir.
-#[must_use]
-pub fn extract_wikilinks(content: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut rest = content;
-    while let Some(start) = rest.find("[[") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("]]") else {
+/// Alvo limpo de um wikilink interno: corta no 1º `|` (alias), `#` (heading) ou `^` (bloco); trim.
+fn link_target(inner: &str) -> &str {
+    let cut = inner.find(['|', '#', '^']).unwrap_or(inner.len());
+    inner[..cut].trim()
+}
+
+/// PURO: ocorrências de `[[…]]`/`![[…]]` na ordem (COM repetição): `(alvo_limpo, is_embed)`. Varre por
+/// índice absoluto p/ enxergar o `!` que precede um embed mesmo na fronteira de uma ocorrência anterior.
+fn bracket_occurrences(content: &str) -> Vec<(String, bool)> {
+    let bytes = content.as_bytes();
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = content[i..].find("[[") {
+        let start = i + rel;
+        let inner_start = start + 2;
+        let Some(rel_end) = content[inner_start..].find("]]") else {
             break;
         };
-        let inner = &after[..end];
-        let target = inner
-            .split('|')
-            .next()
-            .unwrap_or(inner)
-            .split('#')
-            .next()
-            .unwrap_or(inner)
-            .trim();
-        if !target.is_empty() && !out.iter().any(|t| t == target) {
-            out.push(target.to_string());
+        let inner = &content[inner_start..inner_start + rel_end];
+        let is_embed = start > 0 && bytes[start - 1] == b'!';
+        let target = link_target(inner);
+        if !target.is_empty() {
+            out.push((target.to_string(), is_embed));
         }
-        rest = &after[end + 2..];
+        i = inner_start + rel_end + 2;
     }
     out
+}
+
+/// Preserva a ordem, descarta repetições (1ª aparição vence).
+fn dedup_ordered(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for x in items {
+        if !out.contains(&x) {
+            out.push(x);
+        }
+    }
+    out
+}
+
+/// PURO: alvos de `[[wikilink]]` (sem `![[embed]]`), sem alias/âncora, na ordem, sem repetir.
+#[must_use]
+pub fn extract_wikilinks(content: &str) -> Vec<String> {
+    dedup_ordered(
+        bracket_occurrences(content).into_iter().filter(|(_, e)| !e).map(|(t, _)| t),
+    )
+}
+
+/// PURO: alvos de `![[embed]]` (notas E anexos), na ordem, sem repetir.
+#[must_use]
+pub fn extract_embeds(content: &str) -> Vec<String> {
+    dedup_ordered(
+        bracket_occurrences(content).into_iter().filter(|(_, e)| *e).map(|(t, _)| t),
+    )
+}
+
+/// Alvo de `[[wikilink]]` (não-embed) → nº de ocorrências, na ordem da 1ª aparição. Peso das arestas.
+fn link_count_pairs(content: &str) -> Vec<(String, usize)> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (target, is_embed) in bracket_occurrences(content) {
+        if is_embed {
+            continue;
+        }
+        if let Some(slot) = counts.iter_mut().find(|(k, _)| *k == target) {
+            slot.1 += 1;
+        } else {
+            counts.push((target, 1));
+        }
+    }
+    counts
+}
+
+/// Se `trimmed` abre/fecha uma cerca de código: `(char, comprimento, info_string_vazia)`. Cerca = ≥3
+/// `` ` `` ou `~` no início (após trim de indentação). `bare` (sem info string) é exigido p/ FECHAR.
+fn fence_marker(trimmed: &str) -> Option<(u8, usize, bool)> {
+    let b = trimmed.as_bytes();
+    let ch = *b.first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = b.iter().take_while(|&&c| c == ch).count();
+    if len < 3 {
+        return None;
+    }
+    let bare = trimmed[len..].trim().is_empty();
+    Some((ch, len, bare))
+}
+
+/// PURO (inv#1, CRÍTICO): zera as linhas DENTRO de cercas de código (` ``` ` / `~~~`), inclusive as de
+/// abertura/fechamento — impede capturar `[[…]]`/`#tag` em EXEMPLOS de código. Não fecha ` ``` ` com
+/// `~~~`; uma cerca de fechamento precisa ser "bare" (sem info string). Cerca não-fechada = resto do
+/// arquivo tratado como código. Preserva a contagem de linhas (linhas removidas viram vazias).
+#[must_use]
+fn strip_code(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut fence: Option<(u8, usize)> = None;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        match (fence, fence_marker(trimmed)) {
+            (None, Some((ch, len, _))) => fence = Some((ch, len)), // abre (zera a linha)
+            (Some((ch, len)), Some((mch, mlen, true))) if mch == ch && mlen >= len => fence = None, // fecha
+            (Some(_), _) => {}                          // dentro do bloco: zera
+            (None, None) => out.push_str(line),         // fora: preserva
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Separa o frontmatter YAML (`---` … `---`/`...` no TOPO do arquivo) do corpo. Sem frontmatter →
+/// `("", content)`. Tolerante a BOM e CRLF.
+fn split_frontmatter(content: &str) -> (&str, &str) {
+    let s = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let after_open = match s.strip_prefix("---\n").or_else(|| s.strip_prefix("---\r\n")) {
+        Some(r) => r,
+        None => return ("", content),
+    };
+    let mut offset = 0;
+    for line in after_open.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed == "---" || trimmed == "..." {
+            return (&after_open[..offset], &after_open[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    ("", content) // frontmatter sem fechamento → trata tudo como corpo
+}
+
+/// Acrescenta uma tag normalizada (sem aspas, sem `#`, sem `/` nas pontas), sem repetir.
+fn push_tag(out: &mut Vec<String>, raw: &str) {
+    let t = raw
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_start_matches('#')
+        .trim_matches('/')
+        .trim();
+    if !t.is_empty() && t.chars().any(char::is_alphanumeric) && !out.iter().any(|x| x == t) {
+        out.push(t.to_string());
+    }
+}
+
+/// PURO: tags do frontmatter `tags:`/`tag:` — escalar (`tags: a, b`), lista flow (`[a, b]`) ou bloco
+/// YAML (`- item` indentado). Merge/dedup. (Os valores entre aspas são desencapados.)
+fn extract_frontmatter_tags(content: &str) -> Vec<String> {
+    let (fm, _) = split_frontmatter(content);
+    if fm.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut lines = fm.lines().peekable();
+    while let Some(line) = lines.next() {
+        let key_line = line.trim_start();
+        if line.len() != key_line.len() {
+            continue; // só chaves de nível raiz (sem indentação)
+        }
+        let Some(rest) = key_line.strip_prefix("tags:").or_else(|| key_line.strip_prefix("tag:"))
+        else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() {
+            // bloco YAML: linhas seguintes `- item` (indentadas) até a próxima chave raiz.
+            while let Some(peek) = lines.peek() {
+                let pt = peek.trim();
+                if let Some(item) = pt.strip_prefix("- ") {
+                    push_tag(&mut out, item);
+                    lines.next();
+                } else if pt.is_empty() || peek.starts_with(' ') || peek.starts_with('\t') {
+                    lines.next(); // em branco / continuação indentada: ignora
+                } else {
+                    break; // próxima chave de nível raiz
+                }
+            }
+        } else if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            for part in inner.split(',') {
+                push_tag(&mut out, part);
+            }
+        } else {
+            for part in rest.split([',', ' ']) {
+                push_tag(&mut out, part);
+            }
+        }
+    }
+    out
+}
+
+/// Char válido em nome de tag (Unicode-aware): alfanumérico, `_`, `-`, `/` (nested).
+fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-' || c == '/'
+}
+
+/// Remove inline code spans (`` `…` ``) de uma linha, trocando por espaço (preserva fronteiras).
+fn strip_inline_code(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_code = false;
+    for c in line.chars() {
+        if c == '`' {
+            in_code = !in_code;
+            out.push(' ');
+        } else {
+            out.push(if in_code { ' ' } else { c });
+        }
+    }
+    out
+}
+
+/// PURO: tags inline `#tag` do corpo (já sem frontmatter/fenced). Exige `#` no início da linha ou após
+/// espaço (exclui `url#frag` e `#` no meio de palavra), ignora inline code, aceita nested `#a/b`, e
+/// rejeita puramente numérico (`#123`). Na ordem, sem repetir.
+fn extract_inline_tags(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let chars: Vec<char> = strip_inline_code(line).chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '#' && (i == 0 || chars[i - 1].is_whitespace()) {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && is_tag_char(chars[j]) {
+                    j += 1;
+                }
+                let name: String = chars[start..j].iter().collect();
+                let trimmed = name.trim_end_matches('/');
+                if !trimmed.is_empty()
+                    && trimmed.chars().any(char::is_alphabetic)
+                    && !out.iter().any(|x| x == trimmed)
+                {
+                    out.push(trimmed.to_string());
+                }
+                i = j.max(start);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// PURO: a `NoteEntry` de um arquivo. Remove frontmatter + fenced code ANTES de extrair links/embeds/
+/// tags inline (inv#1); funde as tags do frontmatter com as inline.
+fn parse_note(rel_path: String, content: &str) -> NoteEntry {
+    let (_, body_raw) = split_frontmatter(content);
+    let body = strip_code(body_raw);
+    let mut tags = extract_frontmatter_tags(content);
+    for t in extract_inline_tags(&body) {
+        if !tags.contains(&t) {
+            tags.push(t);
+        }
+    }
+    NoteEntry {
+        rel_path,
+        headings: extract_headings(&body),
+        links: extract_wikilinks(&body),
+        embeds: extract_embeds(&body),
+        tags,
+        link_counts: link_count_pairs(&body),
+    }
 }
 
 /// Varre o vault (recursivo, READ-ONLY, sem rede, sem LLM): coleta pastas e notas `*.md`, ignorando
@@ -291,24 +585,244 @@ fn walk_dir(root: &Path, dir: &Path, folders: &mut Vec<String>, notes: &mut Vec<
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            notes.push(NoteEntry {
-                rel_path: rel,
-                headings: extract_headings(&content),
-                links: extract_wikilinks(&content),
-            });
+            notes.push(parse_note(rel, &content));
         }
     }
 }
 
-/// PURO: renderiza o índice como markdown determinístico (regenerado a cada link). Formato do
-/// blueprint §3: cabeçalho "NÃO editar", pastas, notas+headings, grafo de [[wikilinks]].
+// ───────────────────────── grafo resolvido (métricas determinísticas, inv#1) ─────────────────────────
+
+/// Limiar de "hub" (in-degree) — heurístico, ajustável por vault (ver caveats da pesquisa).
+const HUB_MIN_INDEGREE: usize = 15;
+/// Limiar de "ponto de entrada" (out-degree) — heurístico: nota que "leva a muitos lugares".
+const ENTRY_POINT_MIN_OUTDEGREE: usize = 5;
+
+/// Por que um link de saída NÃO virou aresta (sinalizado, nunca adivinhado — regra do PageIndex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkIssue {
+    /// O alvo casa >1 nota e o caminho não desambigua (Obsidian usaria shortest-path; nós sinalizamos).
+    Ambiguous,
+    /// O alvo não casa nenhuma nota (link pendente: nota ainda não criada — comum e legítimo).
+    Unresolved,
+}
+
+/// Uma aresta resolvida do grafo (origem→destino por `rel_path`) com a multiplicidade das citações.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub count: usize,
+}
+
+/// Um link de saída que não virou aresta (ambíguo/pendente) — sinalizado p/ o assistente resolver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkProblem {
+    pub from: String,
+    pub target: String,
+    pub issue: LinkIssue,
+}
+
+/// Métrica + classificação de uma nota no grafo resolvido (graus distintos, não soma de citações).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteMetrics {
+    pub rel_path: String,
+    pub out_degree: usize,
+    pub in_degree: usize,
+    pub is_hub: bool,
+    pub is_moc: bool,
+    pub is_orphan: bool,
+    pub is_entry_point: bool,
+}
+
+/// O grafo resolvido de um vault (PURO, determinístico): métricas por nota + arestas + problemas.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultGraph {
+    pub metrics: Vec<NoteMetrics>,
+    pub edges: Vec<GraphEdge>,
+    pub problems: Vec<LinkProblem>,
+}
+
+/// Chave de resolução/identidade: basename (último segmento após `/`), sem `.md`, lowercased.
+fn basename_key(s: &str) -> String {
+    let base = s.rsplit('/').next().unwrap_or(s);
+    base.strip_suffix(".md").unwrap_or(base).to_ascii_lowercase()
+}
+
+/// Resolução de um alvo de wikilink contra o índice `basename → [rel_path]`.
+enum Resolved {
+    One(String),
+    None,
+    Many,
+}
+
+/// Resolve por basename lowercased; se ambíguo, tenta o caminho parcial do alvo (`Pasta/Nota`); senão
+/// sinaliza ambíguo (não adivinha — regra do PageIndex). `.md` é opcional no alvo.
+fn resolve_target(target: &str, by_base: &BTreeMap<String, Vec<String>>) -> Resolved {
+    match by_base.get(&basename_key(target)) {
+        None => Resolved::None,
+        Some(paths) if paths.len() == 1 => Resolved::One(paths[0].clone()),
+        Some(paths) => {
+            let want = target.trim_start_matches('/').to_ascii_lowercase();
+            let want_md = if want.ends_with(".md") { want } else { format!("{want}.md") };
+            let suffix = format!("/{want_md}");
+            let mut hit = None;
+            let mut hits = 0usize;
+            for p in paths {
+                let pl = p.to_ascii_lowercase();
+                if pl == want_md || pl.ends_with(&suffix) {
+                    hits += 1;
+                    hit = Some(p.clone());
+                }
+            }
+            match (hits, hit) {
+                (1, Some(p)) => Resolved::One(p),
+                _ => Resolved::Many,
+            }
+        }
+    }
+}
+
+/// `true` se `needle` aparece em `haystack` como TOKEN delimitado (fronteiras não-alfanuméricas) — não
+/// embutido numa palavra maior. Evita falso-positivo de `moc` em "democracia"/"mockup".
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let i = start + rel;
+        let before_ok = haystack[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after = i + needle.len();
+        let after_ok = haystack[after..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + 1;
+    }
+    false
+}
+
+/// `true` se a nota é um "Map of Content": basename casa `moc` (como token, p/ não pegar "democracia")
+/// ou `maps? of content` (espaços flexíveis) OU tem a tag `#moc`. Case-insensitive. Heurístico
+/// (ajustável) — ver caveats da pesquisa.
+fn is_moc(rel_path: &str, tags: &[String]) -> bool {
+    let base = basename_key(rel_path); // já lowercased
+    if contains_word(&base, "moc") {
+        return true;
+    }
+    let collapsed: String = base.chars().filter(|c| !c.is_whitespace()).collect();
+    collapsed.contains("mapofcontent")
+        || collapsed.contains("mapsofcontent")
+        || tags.iter().any(|t| t.eq_ignore_ascii_case("moc"))
+}
+
+/// Agrega arestas com mesmo `(from, to)` somando `count` (ordena por `from`, depois `to`).
+fn merge_edges(mut edges: Vec<GraphEdge>) -> Vec<GraphEdge> {
+    edges.sort_by(|a, b| a.from.cmp(&b.from).then_with(|| a.to.cmp(&b.to)));
+    let mut out: Vec<GraphEdge> = Vec::new();
+    for e in edges {
+        match out.last_mut() {
+            Some(last) if last.from == e.from && last.to == e.to => last.count += e.count,
+            _ => out.push(e),
+        }
+    }
+    out
+}
+
+/// PURO (inv#1, ZERO LLM): resolve o grafo do vault. Constrói o índice por basename, resolve cada link
+/// de saída (com peso) em aresta ou problema, e deriva graus + classificação (hub/MOC/órfão/entry).
+/// Tudo ordenado (determinístico). Backlinks = transposta implícita (in-degree = origens distintas).
 #[must_use]
-pub fn render_vault_index(name: &str, root: &Path, data: &VaultIndexData) -> String {
+pub fn analyze_graph(data: &VaultIndexData) -> VaultGraph {
+    let mut by_base: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for note in &data.notes {
+        by_base.entry(basename_key(&note.rel_path)).or_default().push(note.rel_path.clone());
+    }
+
+    let mut raw_edges: Vec<GraphEdge> = Vec::new();
+    let mut problems: Vec<LinkProblem> = Vec::new();
+    for note in &data.notes {
+        for (target, count) in &note.link_counts {
+            match resolve_target(target, &by_base) {
+                Resolved::One(to) if to == note.rel_path => {} // ignora auto-link
+                Resolved::One(to) => {
+                    raw_edges.push(GraphEdge { from: note.rel_path.clone(), to, count: *count });
+                }
+                Resolved::None => problems.push(LinkProblem {
+                    from: note.rel_path.clone(),
+                    target: target.clone(),
+                    issue: LinkIssue::Unresolved,
+                }),
+                Resolved::Many => problems.push(LinkProblem {
+                    from: note.rel_path.clone(),
+                    target: target.clone(),
+                    issue: LinkIssue::Ambiguous,
+                }),
+            }
+        }
+    }
+
+    let edges = merge_edges(raw_edges);
+    // Após o merge cada (from,to) é único → contar arestas por nó = graus distintos.
+    let mut out_deg: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut in_deg: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in &edges {
+        *out_deg.entry(e.from.as_str()).or_default() += 1;
+        *in_deg.entry(e.to.as_str()).or_default() += 1;
+    }
+
+    let mut metrics: Vec<NoteMetrics> = data
+        .notes
+        .iter()
+        .map(|note| {
+            let od = out_deg.get(note.rel_path.as_str()).copied().unwrap_or(0);
+            let id = in_deg.get(note.rel_path.as_str()).copied().unwrap_or(0);
+            NoteMetrics {
+                rel_path: note.rel_path.clone(),
+                out_degree: od,
+                in_degree: id,
+                is_hub: id >= HUB_MIN_INDEGREE,
+                is_moc: is_moc(&note.rel_path, &note.tags),
+                is_orphan: od == 0 && id == 0,
+                is_entry_point: od >= ENTRY_POINT_MIN_OUTDEGREE,
+            }
+        })
+        .collect();
+    metrics.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    problems.sort_by(|a, b| {
+        a.from.cmp(&b.from).then_with(|| a.target.cmp(&b.target)).then_with(|| (a.issue as u8).cmp(&(b.issue as u8)))
+    });
+    problems.dedup();
+
+    VaultGraph { metrics, edges, problems }
+}
+
+/// `rel_path`s das notas que casam `pred`, na ordem de `metrics` (já ordenado por `rel_path`).
+fn rel_paths_where(metrics: &[NoteMetrics], pred: impl Fn(&NoteMetrics) -> bool) -> Vec<String> {
+    metrics.iter().filter(|m| pred(m)).map(|m| m.rel_path.clone()).collect()
+}
+
+/// `node` do grafo = `rel_path` sem `.md` (rótulo curto, navegável).
+fn node_label(rel_path: &str) -> &str {
+    rel_path.strip_suffix(".md").unwrap_or(rel_path)
+}
+
+/// PURO: o markdown-árvore HÍBRIDO (blueprint §3) com o grafo JÁ resolvido. Mantém intactas as seções
+/// Pastas / Notas / "Grafo de [[wikilinks]]" e ACRESCENTA navegação (entry-points, hubs, MOCs, órfãos,
+/// backlinks) + grau/tags/embeds por nota + links pendentes/ambíguos. Token-eficiente e navegável.
+#[must_use]
+fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph: &VaultGraph) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Vault Index — {name}  (gerado pelo Lina · determinístico · sem IA · NÃO editar)\n"
     ));
-    out.push_str(&format!("> Origem: {}\n\n", root.display()));
+    out.push_str(&format!("> Origem: {}\n", root.display()));
+    let hubs = graph.metrics.iter().filter(|m| m.is_hub).count();
+    let mocs = graph.metrics.iter().filter(|m| m.is_moc).count();
+    let orphans = graph.metrics.iter().filter(|m| m.is_orphan).count();
+    out.push_str(&format!(
+        "> {} notas · {} conexões · {hubs} hubs · {mocs} MOCs · {orphans} órfãos\n\n",
+        data.notes.len(),
+        graph.edges.len()
+    ));
 
     out.push_str("## Pastas\n");
     if data.folders.is_empty() {
@@ -319,12 +833,87 @@ pub fn render_vault_index(name: &str, root: &Path, data: &VaultIndexData) -> Str
         }
     }
 
+    // Pontos de entrada (por out-degree desc) e hubs (por in-degree desc) — "por onde começar".
+    let mut entry: Vec<&NoteMetrics> = graph.metrics.iter().filter(|m| m.is_entry_point).collect();
+    entry.sort_by(|a, b| b.out_degree.cmp(&a.out_degree).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    out.push_str("\n## Pontos de entrada (por onde começar)\n");
+    if entry.is_empty() {
+        out.push_str("- (nenhum)\n");
+    } else {
+        for m in &entry {
+            out.push_str(&format!("- {} (saída: {})\n", node_label(&m.rel_path), m.out_degree));
+        }
+    }
+
+    let mut hub_list: Vec<&NoteMetrics> = graph.metrics.iter().filter(|m| m.is_hub).collect();
+    hub_list.sort_by(|a, b| b.in_degree.cmp(&a.in_degree).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    out.push_str("\n## Hubs (muito referenciados · entrada ≥ 15)\n");
+    if hub_list.is_empty() {
+        out.push_str("- (nenhum)\n");
+    } else {
+        for m in &hub_list {
+            out.push_str(&format!("- {} (entrada: {})\n", node_label(&m.rel_path), m.in_degree));
+        }
+    }
+
+    out.push_str("\n## MOCs (mapas de conteúdo)\n");
+    let mocs_list = rel_paths_where(&graph.metrics, |m| m.is_moc);
+    if mocs_list.is_empty() {
+        out.push_str("- (nenhum)\n");
+    } else {
+        for p in &mocs_list {
+            out.push_str(&format!("- {}\n", node_label(p)));
+        }
+    }
+
+    out.push_str("\n## Órfãos (sem conexões)\n");
+    let orphan_list = rel_paths_where(&graph.metrics, |m| m.is_orphan);
+    if orphan_list.is_empty() {
+        out.push_str("- (nenhum)\n");
+    } else {
+        for p in &orphan_list {
+            out.push_str(&format!("- {}\n", node_label(p)));
+        }
+    }
+
+    // Notas + headings, enriquecidas com grau/flags/tags/embeds (sem alterar as linhas de heading).
+    let metrics_by_path: BTreeMap<&str, &NoteMetrics> =
+        graph.metrics.iter().map(|m| (m.rel_path.as_str(), m)).collect();
     out.push_str("\n## Notas (headings)\n");
     if data.notes.is_empty() {
         out.push_str("- (nenhuma nota)\n");
     } else {
         for note in &data.notes {
             out.push_str(&format!("### {}\n", note.rel_path));
+            if let Some(m) = metrics_by_path.get(note.rel_path.as_str()) {
+                let mut flags: Vec<&str> = Vec::new();
+                if m.is_entry_point {
+                    flags.push("entrada");
+                }
+                if m.is_hub {
+                    flags.push("hub");
+                }
+                if m.is_moc {
+                    flags.push("MOC");
+                }
+                if m.is_orphan {
+                    flags.push("órfão");
+                }
+                let tail = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", flags.join(", "))
+                };
+                out.push_str(&format!("- _saída: {} · entrada: {}{}_\n", m.out_degree, m.in_degree, tail));
+            }
+            if !note.tags.is_empty() {
+                let ts: Vec<String> = note.tags.iter().map(|t| format!("#{t}")).collect();
+                out.push_str(&format!("- _tags: {}_\n", ts.join(" ")));
+            }
+            if !note.embeds.is_empty() {
+                let es: Vec<String> = note.embeds.iter().map(|e| format!("![[{e}]]")).collect();
+                out.push_str(&format!("- _embeds: {}_\n", es.join(", ")));
+            }
             if note.headings.is_empty() {
                 out.push_str("- (sem headings)\n");
             } else {
@@ -335,12 +924,13 @@ pub fn render_vault_index(name: &str, root: &Path, data: &VaultIndexData) -> Str
         }
     }
 
+    // Grafo de saída — formato INALTERADO (contrato dos consumidores + testes).
     out.push_str("\n## Grafo de [[wikilinks]]\n");
     if data.notes.is_empty() {
         out.push_str("- (nenhuma nota)\n");
     } else {
         for note in &data.notes {
-            let node = note.rel_path.strip_suffix(".md").unwrap_or(&note.rel_path);
+            let node = node_label(&note.rel_path);
             if note.links.is_empty() {
                 out.push_str(&format!("- {node} → (folha)\n"));
             } else {
@@ -349,7 +939,140 @@ pub fn render_vault_index(name: &str, root: &Path, data: &VaultIndexData) -> Str
             }
         }
     }
+
+    // Backlinks (transposta do grafo) — quem aponta pra cada nota.
+    out.push_str("\n## Backlinks (quem aponta pra cá)\n");
+    let mut any_back = false;
+    for note in &data.notes {
+        let origins: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.to == note.rel_path)
+            .map(|e| format!("[[{}]]", node_label(&e.from)))
+            .collect();
+        if !origins.is_empty() {
+            any_back = true;
+            out.push_str(&format!("- {} ← {}\n", node_label(&note.rel_path), origins.join(", ")));
+        }
+    }
+    if !any_back {
+        out.push_str("- (nenhum backlink ainda)\n");
+    }
+
+    // Links que NÃO viraram aresta (sinalizados, nunca adivinhados).
+    out.push_str("\n## Links pendentes/ambíguos\n");
+    if graph.problems.is_empty() {
+        out.push_str("- (nenhum)\n");
+    } else {
+        for p in &graph.problems {
+            let kind = match p.issue {
+                LinkIssue::Unresolved => "pendente (nota ainda não existe)",
+                LinkIssue::Ambiguous => "ambíguo (casa >1 nota — não adivinho)",
+            };
+            out.push_str(&format!("- {} → [[{}]] — {kind}\n", node_label(&p.from), p.target));
+        }
+    }
+
     out
+}
+
+// ───────────────────────── sidecar JSON (arestas exatas p/ hops programáticos) ─────────────────────────
+
+/// Aresta no sidecar JSON (origem→destino por `rel_path`, com a multiplicidade).
+#[derive(Serialize)]
+struct EdgeJson {
+    from: String,
+    to: String,
+    count: usize,
+}
+
+/// Link pendente/ambíguo no sidecar JSON.
+#[derive(Serialize)]
+struct ProblemJson {
+    from: String,
+    target: String,
+    issue: &'static str,
+}
+
+/// Métrica por nota no sidecar JSON.
+#[derive(Serialize)]
+struct NoteJson {
+    path: String,
+    out_degree: usize,
+    in_degree: usize,
+    tags: Vec<String>,
+    embeds: Vec<String>,
+}
+
+/// O documento JSON inteiro (campos em ordem fixa → saída determinística).
+#[derive(Serialize)]
+struct IndexJson {
+    vault: String,
+    root: String,
+    generated_by: &'static str,
+    deterministic: bool,
+    note_count: usize,
+    edge_count: usize,
+    hubs: Vec<String>,
+    mocs: Vec<String>,
+    orphans: Vec<String>,
+    entry_points: Vec<String>,
+    edges: Vec<EdgeJson>,
+    problems: Vec<ProblemJson>,
+    notes: Vec<NoteJson>,
+}
+
+/// PURO: sidecar JSON com as ARESTAS EXATAS (origem→destino, contagem) + categorias + grau/tags/embeds
+/// por nota — para hops programáticos depois que o assistente escolhe a região no markdown. Determinístico.
+#[must_use]
+fn render_vault_index_json(name: &str, root: &Path, data: &VaultIndexData, graph: &VaultGraph) -> String {
+    let metrics_by_path: BTreeMap<&str, &NoteMetrics> =
+        graph.metrics.iter().map(|m| (m.rel_path.as_str(), m)).collect();
+    let notes = data
+        .notes
+        .iter()
+        .map(|n| {
+            let m = metrics_by_path.get(n.rel_path.as_str());
+            NoteJson {
+                path: n.rel_path.clone(),
+                out_degree: m.map_or(0, |x| x.out_degree),
+                in_degree: m.map_or(0, |x| x.in_degree),
+                tags: n.tags.clone(),
+                embeds: n.embeds.clone(),
+            }
+        })
+        .collect();
+    let doc = IndexJson {
+        vault: name.to_string(),
+        root: root.display().to_string(),
+        generated_by: "lina-pageindex",
+        deterministic: true,
+        note_count: data.notes.len(),
+        edge_count: graph.edges.len(),
+        hubs: rel_paths_where(&graph.metrics, |m| m.is_hub),
+        mocs: rel_paths_where(&graph.metrics, |m| m.is_moc),
+        orphans: rel_paths_where(&graph.metrics, |m| m.is_orphan),
+        entry_points: rel_paths_where(&graph.metrics, |m| m.is_entry_point),
+        edges: graph
+            .edges
+            .iter()
+            .map(|e| EdgeJson { from: e.from.clone(), to: e.to.clone(), count: e.count })
+            .collect(),
+        problems: graph
+            .problems
+            .iter()
+            .map(|p| ProblemJson {
+                from: p.from.clone(),
+                target: p.target.clone(),
+                issue: match p.issue {
+                    LinkIssue::Ambiguous => "ambiguous",
+                    LinkIssue::Unresolved => "unresolved",
+                },
+            })
+            .collect(),
+        notes,
+    };
+    serde_json::to_string_pretty(&doc).unwrap_or_default()
 }
 
 /// Slug ASCII do nome do vault (minúsculo, não-alfanumérico → `-`, sem `-` repetido/nas pontas).
@@ -369,24 +1092,28 @@ fn slugify(name: &str) -> String {
     }
 }
 
-/// Nome do arquivo de índice: `<slug>-<hash do caminho>.md` — o hash desambigua vaults de mesmo nome
-/// em pastas diferentes (determinístico: `DefaultHasher` tem semente fixa).
-fn index_filename(name: &str, path: &Path) -> String {
+/// Base do nome dos arquivos de índice: `<slug>-<hash do caminho>` (sem extensão) — o hash desambigua
+/// vaults de mesmo nome em pastas diferentes (determinístico: `DefaultHasher` tem semente fixa). O
+/// markdown vira `<base>.md` e o sidecar de arestas `<base>.json`.
+fn index_filename_base(name: &str, path: &Path) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
-    format!("{}-{:08x}.md", slugify(name), (h.finish() & 0xffff_ffff) as u32)
+    format!("{}-{:08x}", slugify(name), (h.finish() & 0xffff_ffff) as u32)
 }
 
-/// Gera e grava o índice de `vault` em `<lina_dir>/vault-index/<slug>-<hash>.md` (FORA do vault do
-/// usuário — respeita "leitura por padrão"). Escrita atômica. Devolve o caminho gravado.
+/// Gera e grava o índice HÍBRIDO de `vault` em `<lina_dir>/vault-index/` (FORA do vault do usuário —
+/// respeita "leitura por padrão"): `<base>.md` (markdown-árvore navegável) + `<base>.json` (arestas
+/// exatas p/ hops programáticos). Escrita atômica de cada um. Devolve o caminho do markdown.
 pub fn write_vault_index(lina_dir: &Path, vault: &VaultLink) -> std::io::Result<PathBuf> {
     let data = scan_vault(&vault.path);
-    let md = render_vault_index(&vault.name, &vault.path, &data);
-    let path = lina_dir
-        .join("vault-index")
-        .join(index_filename(&vault.name, &vault.path));
-    write_atomic(&path, &md)?;
-    Ok(path)
+    let graph = analyze_graph(&data);
+    let base = index_filename_base(&vault.name, &vault.path);
+    let dir = lina_dir.join("vault-index");
+    let md_path = dir.join(format!("{base}.md"));
+    let json_path = dir.join(format!("{base}.json"));
+    write_atomic(&md_path, &render_vault_index_with(&vault.name, &vault.path, &data, &graph))?;
+    write_atomic(&json_path, &render_vault_index_json(&vault.name, &vault.path, &data, &graph))?;
+    Ok(md_path)
 }
 
 // ═══════════════════════════ persistência — `.lina/vault.json` (config, não evento) ═══════════════════════════
@@ -1446,6 +2173,334 @@ mod tests {
         assert_eq!(extract_wikilinks(md), vec!["Nota A", "Nota B", "Nota C"]);
         // colchete não fechado não quebra.
         assert_eq!(extract_wikilinks("[[aberto"), Vec::<String>::new());
+        // âncora de bloco `^` também é cortada.
+        assert_eq!(extract_wikilinks("[[Nota^bloco]]"), vec!["Nota"]);
+    }
+
+    /// inv#1 CRÍTICO: `[[…]]`/`#tag`/`![[…]]` DENTRO de cercas de código (``` e `~~~`) são ignorados;
+    /// só os de FORA contam. (Sem isto, exemplos de código viram arestas/tags fantasmas.)
+    #[test]
+    fn parser_excludes_fenced_code_blocks() {
+        let md = "real [[Alvo]] e #tagreal\n\
+                  ```rust\n\
+                  let x = [[FakeLink]]; // #faketag\n\
+                  ```\n\
+                  ~~~\n\
+                  [[OutroFake]] #outrofake ![[fake.png]]\n\
+                  ~~~\n\
+                  fim [[Fim]] ![[real.png]]\n";
+        let note = parse_note("n.md".into(), md);
+        assert_eq!(note.links, vec!["Alvo", "Fim"]);
+        assert_eq!(note.embeds, vec!["real.png"]);
+        assert!(note.tags.contains(&"tagreal".to_string()));
+        assert!(
+            !note.tags.iter().any(|t| t == "faketag" || t == "outrofake"),
+            "tags em código não contam: {:?}",
+            note.tags
+        );
+        assert!(!note.links.iter().any(|l| l == "FakeLink" || l == "OutroFake"));
+        assert!(!note.embeds.iter().any(|e| e == "fake.png"));
+    }
+
+    /// `![[embed]]` é embed, `[[link]]` é link — nunca se confundem (o `!` precedente decide).
+    #[test]
+    fn embeds_separate_from_links() {
+        let md = "veja [[NotaA]] e ![[NotaB]] e ![[img.png]] e [[NotaA]]";
+        assert_eq!(extract_wikilinks(md), vec!["NotaA"]);
+        assert_eq!(extract_embeds(md), vec!["NotaB", "img.png"]);
+    }
+
+    /// `link_count_pairs`: multiplicidade por alvo (peso da aresta); embed NÃO conta.
+    #[test]
+    fn link_counts_track_multiplicity() {
+        let md = "[[B]] e [[B]] e [[C]] e ![[B]]";
+        assert_eq!(link_count_pairs(md), vec![("B".to_string(), 2), ("C".to_string(), 1)]);
+    }
+
+    /// `extract_frontmatter_tags`: bloco YAML, lista flow e escalar; aspas desencapadas; sem fm → vazio.
+    #[test]
+    fn frontmatter_tags_parse_block_flow_and_scalar() {
+        let block = "---\ntags:\n  - alpha\n  - beta\ntitle: x\n---\ncorpo #naoconta-aqui? não\n";
+        assert_eq!(extract_frontmatter_tags(block), vec!["alpha", "beta"]);
+        let flow = "---\ntags: [um, \"dois\", tres]\n---\n";
+        assert_eq!(extract_frontmatter_tags(flow), vec!["um", "dois", "tres"]);
+        let scalar = "---\ntags: solo, duo\n---\n";
+        assert_eq!(extract_frontmatter_tags(scalar), vec!["solo", "duo"]);
+        // `tags:` fora de frontmatter (não no topo) → não conta.
+        assert!(extract_frontmatter_tags("# corpo\ntags: nao-conta\n").is_empty());
+    }
+
+    /// `extract_inline_tags`: fronteira (espaço/início), nested `#a/b`, ignora inline code e URL frag,
+    /// rejeita puramente numérico.
+    #[test]
+    fn inline_tags_respect_boundaries_code_and_nesting() {
+        let body =
+            "tenho #projeto/lina e #ok mas https://x.com/#frag não, nem `#emcodigo`, nem #123 fim";
+        let tags = extract_inline_tags(body);
+        assert!(tags.contains(&"projeto/lina".to_string()), "nested: {tags:?}");
+        assert!(tags.contains(&"ok".to_string()));
+        assert!(!tags.iter().any(|t| t == "frag"), "url frag não é tag");
+        assert!(!tags.iter().any(|t| t == "emcodigo"), "inline code não é tag");
+        assert!(!tags.iter().any(|t| t == "123"), "numérico puro não é tag");
+    }
+
+    /// `split_frontmatter`: tolera BOM; sem frontmatter devolve o conteúdo intacto como corpo.
+    #[test]
+    fn split_frontmatter_handles_bom_and_absence() {
+        let (fm, body) = split_frontmatter("\u{feff}---\ntags: a\n---\nCorpo\n");
+        assert_eq!(fm.trim(), "tags: a");
+        assert_eq!(body, "Corpo\n");
+        let (fm2, body2) = split_frontmatter("Sem fm\n[[x]]\n");
+        assert_eq!(fm2, "");
+        assert_eq!(body2, "Sem fm\n[[x]]\n");
+    }
+
+    /// `parse_note`: funde tags do frontmatter com as inline (frontmatter primeiro), e o frontmatter NÃO
+    /// vira heading nem link.
+    #[test]
+    fn parse_note_merges_fm_and_inline_tags() {
+        let md = "---\ntags: [fromfm]\n---\nCorpo com #inline e [[Link]]\n";
+        let note = parse_note("p.md".into(), md);
+        assert_eq!(note.tags, vec!["fromfm", "inline"]);
+        assert_eq!(note.links, vec!["Link"]);
+        assert!(note.headings.is_empty(), "o `---` do frontmatter não é heading");
+    }
+
+    /// Helper de teste: uma `NoteEntry` com `rel_path` + links (deriva `link_counts` p/ o peso).
+    fn note(rel: &str, links: &[&str]) -> NoteEntry {
+        let mut lc: Vec<(String, usize)> = Vec::new();
+        for l in links {
+            if let Some(slot) = lc.iter_mut().find(|(k, _)| k == l) {
+                slot.1 += 1;
+            } else {
+                lc.push((l.to_string(), 1));
+            }
+        }
+        NoteEntry {
+            rel_path: rel.to_string(),
+            links: dedup_ordered(links.iter().map(|s| s.to_string())),
+            link_counts: lc,
+            ..Default::default()
+        }
+    }
+
+    /// `analyze_graph`: resolve arestas com peso, calcula in/out-degree DISTINTOS e detecta órfãos.
+    #[test]
+    fn graph_resolves_links_counts_degrees_and_orphans() {
+        let data = VaultIndexData {
+            folders: vec![],
+            notes: vec![
+                note("A.md", &["B", "B", "C"]), // A→B (x2), A→C
+                note("B.md", &["C"]),
+                note("C.md", &[]),
+                note("Solo.md", &[]),
+            ],
+        };
+        let g = analyze_graph(&data);
+        assert_eq!(
+            g.edges,
+            vec![
+                GraphEdge { from: "A.md".into(), to: "B.md".into(), count: 2 },
+                GraphEdge { from: "A.md".into(), to: "C.md".into(), count: 1 },
+                GraphEdge { from: "B.md".into(), to: "C.md".into(), count: 1 },
+            ]
+        );
+        let m = |p: &str| g.metrics.iter().find(|x| x.rel_path == p).unwrap().clone();
+        assert_eq!((m("A.md").out_degree, m("A.md").in_degree), (2, 0));
+        assert_eq!((m("C.md").out_degree, m("C.md").in_degree), (0, 2));
+        assert!(m("Solo.md").is_orphan);
+        assert!(!m("A.md").is_orphan, "tem saída");
+        assert!(!m("C.md").is_orphan, "tem entrada");
+    }
+
+    /// `analyze_graph`: alvo inexistente → pendente; basename duplicado sem caminho → ambíguo; com
+    /// caminho parcial → desambigua (vira aresta). Nunca adivinha.
+    #[test]
+    fn graph_flags_ambiguous_and_unresolved() {
+        let data = VaultIndexData {
+            folders: vec![],
+            notes: vec![
+                note("Start.md", &["Dup", "Area/Dup", "Pendente"]),
+                note("X/Dup.md", &[]),
+                note("Area/Dup.md", &[]),
+            ],
+        };
+        let g = analyze_graph(&data);
+        assert!(
+            g.edges.iter().any(|e| e.from == "Start.md" && e.to == "Area/Dup.md"),
+            "caminho parcial desambigua: {:?}",
+            g.edges
+        );
+        assert!(g.problems.iter().any(|p| p.target == "Dup" && p.issue == LinkIssue::Ambiguous));
+        assert!(g.problems.iter().any(|p| p.target == "Pendente" && p.issue == LinkIssue::Unresolved));
+    }
+
+    /// `analyze_graph`: hub (in-degree ≥ 15), MOC (nome OU tag), órfão e ponto de entrada (out ≥ 5).
+    #[test]
+    fn graph_detects_hub_moc_orphan_and_entry_point() {
+        let mut notes = vec![note("Central.md", &[])];
+        for i in 0..15 {
+            notes.push(note(&format!("ref{i}.md"), &["Central"]));
+        }
+        notes.push(NoteEntry { rel_path: "Projetos MOC.md".into(), ..Default::default() });
+        notes.push(NoteEntry {
+            rel_path: "Indice.md".into(),
+            tags: vec!["moc".into()],
+            ..Default::default()
+        });
+        notes.push(note("Porta.md", &["ref0", "ref1", "ref2", "ref3", "ref4"]));
+        let data = VaultIndexData { folders: vec![], notes };
+        let g = analyze_graph(&data);
+        let m = |p: &str| g.metrics.iter().find(|x| x.rel_path == p).unwrap().clone();
+        assert_eq!(m("Central.md").in_degree, 15);
+        assert!(m("Central.md").is_hub);
+        assert!(m("Projetos MOC.md").is_moc, "MOC por nome");
+        assert!(m("Indice.md").is_moc, "MOC por tag #moc");
+        assert!(m("Porta.md").is_entry_point, "out_degree {}", m("Porta.md").out_degree);
+        assert!(m("Projetos MOC.md").is_orphan, "MOC pode ser órfão (categorias independentes)");
+    }
+
+    /// `is_moc`: casa `moc` como TOKEN (não substring) — evita "democracia"/"mockup"; + tag e "map of
+    /// content".
+    #[test]
+    fn moc_detection_uses_word_boundary() {
+        assert!(is_moc("Saúde MOC.md", &[]));
+        assert!(is_moc("MOC.md", &[]));
+        assert!(is_moc("projetos-moc.md", &[]));
+        assert!(is_moc("Maps of Content.md", &[]));
+        assert!(is_moc("Qualquer.md", &["moc".to_string()]), "tag #moc");
+        assert!(!is_moc("democracia.md", &[]), "substring no meio não conta");
+        assert!(!is_moc("mockup.md", &[]), "substring no início de palavra não conta");
+    }
+
+    /// `render_vault_index_with`: as seções de navegação existem, o ponto de entrada e os backlinks são
+    /// listados, e os links pendentes aparecem na seção correta.
+    #[test]
+    fn render_index_has_navigation_sections_and_backlinks() {
+        let data = VaultIndexData {
+            folders: vec![],
+            notes: vec![
+                note("Hub.md", &["a", "b", "c", "d", "e"]), // out 5 → ponto de entrada
+                note("a.md", &[]),
+                note("b.md", &[]),
+                note("c.md", &[]),
+                note("d.md", &[]),
+                note("e.md", &[]),
+                note("Pendura.md", &["NaoExiste"]),
+            ],
+        };
+        let g = analyze_graph(&data);
+        let md = render_vault_index_with("V", Path::new("/tmp/v"), &data, &g);
+        for sec in [
+            "## Pontos de entrada",
+            "## Hubs",
+            "## MOCs",
+            "## Órfãos",
+            "## Backlinks",
+            "## Links pendentes/ambíguos",
+        ] {
+            assert!(md.contains(sec), "falta seção {sec}");
+        }
+        assert!(md.contains("Hub (saída: 5)"), "ponto de entrada listado:\n{md}");
+        assert!(md.contains("a ← [[Hub]]"), "backlink listado:\n{md}");
+        assert!(md.contains("NaoExiste") && md.contains("pendente"), "link pendente:\n{md}");
+        // o grafo de saída mantém o formato legado.
+        assert!(md.contains("Hub → [[a]], [[b]], [[c]], [[d]], [[e]]"));
+    }
+
+    /// `render_vault_index_json`: sidecar válido com arestas exatas (peso) e categorias.
+    #[test]
+    fn json_sidecar_serializes_edges_and_categories() {
+        let data = VaultIndexData {
+            folders: vec![],
+            notes: vec![note("A.md", &["B", "B"]), note("B.md", &[])],
+        };
+        let g = analyze_graph(&data);
+        let js = render_vault_index_json("V", Path::new("/tmp/v"), &data, &g);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("json válido");
+        assert_eq!(v["vault"], "V");
+        assert_eq!(v["note_count"], 2);
+        assert_eq!(v["edge_count"], 1);
+        assert_eq!(v["edges"][0]["from"], "A.md");
+        assert_eq!(v["edges"][0]["to"], "B.md");
+        assert_eq!(v["edges"][0]["count"], 2);
+        // determinístico: re-render = idêntico.
+        assert_eq!(js, render_vault_index_json("V", Path::new("/tmp/v"), &data, &g));
+    }
+
+    /// `obsidian_config_paths_for`: 1 caminho no macOS/Windows; no Linux MERGE de nativo+Flatpak+Snap;
+    /// `$XDG_CONFIG_HOME` respeitado quando setado. (Lógica pura → testável p/ os 3 SOs num Mac.)
+    #[test]
+    fn config_paths_resolve_per_os() {
+        let home = PathBuf::from("/home/u");
+        let env_win = |k: &str| -> Option<OsString> {
+            (k == "APPDATA").then(|| OsString::from("C:\\Users\\u\\AppData\\Roaming"))
+        };
+        let none = |_: &str| -> Option<OsString> { None };
+
+        assert_eq!(
+            obsidian_config_paths_for("macos", Some(&home), &none),
+            vec![home.join("Library/Application Support/obsidian/obsidian.json")]
+        );
+        assert_eq!(
+            obsidian_config_paths_for("windows", Some(&home), &env_win),
+            vec![PathBuf::from("C:\\Users\\u\\AppData\\Roaming")
+                .join("obsidian")
+                .join("obsidian.json")]
+        );
+        // Linux: nativo (.config) + Flatpak sandbox + Snap confinado — todos juntos.
+        assert_eq!(
+            obsidian_config_paths_for("linux", Some(&home), &none),
+            vec![
+                home.join(".config/obsidian/obsidian.json"),
+                home.join(".var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json"),
+                home.join("snap/obsidian/current/.config/obsidian/obsidian.json"),
+            ]
+        );
+        // XDG_CONFIG_HOME sobrepõe o ~/.config.
+        let env_xdg =
+            |k: &str| -> Option<OsString> { (k == "XDG_CONFIG_HOME").then(|| OsString::from("/cfg")) };
+        let lin = obsidian_config_paths_for("linux", Some(&home), &env_xdg);
+        assert_eq!(lin[0], PathBuf::from("/cfg/obsidian/obsidian.json"));
+    }
+
+    /// `app_bundle_candidates_for`: macOS `.app`; Windows per-user em `Programs\` (corrige a armadilha)
+    /// + all-users em `Program Files`; Linux Flatpak/usr/Snap/user-local.
+    #[test]
+    fn app_bundle_candidates_per_os() {
+        let home = PathBuf::from("/home/u");
+        let env_win = |k: &str| -> Option<OsString> {
+            match k {
+                "LOCALAPPDATA" => Some(OsString::from("C:\\Users\\u\\AppData\\Local")),
+                "ProgramFiles" => Some(OsString::from("C:\\Program Files")),
+                _ => None,
+            }
+        };
+        let none = |_: &str| -> Option<OsString> { None };
+
+        let mac = app_bundle_candidates_for("macos", "Obsidian", Some(&home), &none);
+        assert_eq!(mac[0], PathBuf::from("/Applications/Obsidian.app"));
+        assert!(mac.contains(&home.join("Applications").join("Obsidian.app")));
+
+        let win = app_bundle_candidates_for("windows", "Obsidian", Some(&home), &env_win);
+        assert!(
+            win.contains(
+                &PathBuf::from("C:\\Users\\u\\AppData\\Local")
+                    .join("Programs")
+                    .join("Obsidian")
+                    .join("Obsidian.exe")
+            ),
+            "per-user em Programs\\: {win:?}"
+        );
+        assert!(win.contains(
+            &PathBuf::from("C:\\Program Files").join("Obsidian").join("Obsidian.exe")
+        ));
+
+        let lin = app_bundle_candidates_for("linux", "Obsidian", Some(&home), &none);
+        assert!(lin.contains(&PathBuf::from("/var/lib/flatpak/exports/bin/md.obsidian.Obsidian")));
+        assert!(lin.contains(&PathBuf::from("/usr/bin/obsidian")));
+        assert!(lin.contains(&PathBuf::from("/snap/bin/obsidian")));
+        assert!(lin.contains(&home.join(".local/share/flatpak/exports/bin/md.obsidian.Obsidian")));
     }
 
     /// `parse_vaults_from_json`: lê o mapa `vaults{id:{path,open}}`, deriva o nome, ordena por path.
@@ -1495,7 +2550,7 @@ mod tests {
         let paths: Vec<&str> = data.notes.iter().map(|n| n.rel_path.as_str()).collect();
         assert_eq!(paths, vec!["Area/b.md", "a.md"]);
 
-        let md = render_vault_index("Meu Vault", vault.path(), &data);
+        let md = render_vault_index_with("Meu Vault", vault.path(), &data, &analyze_graph(&data));
         assert!(md.contains("# Vault Index — Meu Vault"));
         assert!(md.contains("NÃO editar"));
         assert!(md.contains("- Area/"));
@@ -1505,7 +2560,8 @@ mod tests {
         assert!(md.contains("a → [[b]]")); // grafo: a aponta b
         assert!(md.contains("Area/b → (folha)")); // b é folha
         // determinístico: re-scan + re-render = idêntico.
-        let md2 = render_vault_index("Meu Vault", vault.path(), &scan_vault(vault.path()));
+        let data2 = scan_vault(vault.path());
+        let md2 = render_vault_index_with("Meu Vault", vault.path(), &data2, &analyze_graph(&data2));
         assert_eq!(md, md2);
     }
 
@@ -1680,14 +2736,24 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.vaults[0].writable, vpath.join("Lina").display().to_string());
         // índice gerado em .lina/vault-index/ (agora em BACKGROUND ao confirmar — não trava a UI;
-        // o teste espera a thread terminar p/ ser determinístico).
+        // o teste espera a thread terminar p/ ser determinístico). HÍBRIDO: markdown + sidecar JSON.
         m.block_on_index();
         let idx_dir = lina.path().join("vault-index");
         let files: Vec<_> = std::fs::read_dir(&idx_dir).unwrap().flatten().collect();
-        assert_eq!(files.len(), 1, "um índice por vault marcado");
-        let idx = std::fs::read_to_string(files[0].path()).unwrap();
+        let ext = |f: &std::fs::DirEntry| f.path().extension().map(|e| e.to_string_lossy().into_owned());
+        assert_eq!(files.len(), 2, "markdown + json por vault marcado");
+        assert_eq!(files.iter().filter(|f| ext(f).as_deref() == Some("md")).count(), 1);
+        assert_eq!(files.iter().filter(|f| ext(f).as_deref() == Some("json")).count(), 1);
+        let md_file = files.iter().find(|f| ext(f).as_deref() == Some("md")).unwrap();
+        let idx = std::fs::read_to_string(md_file.path()).unwrap();
         assert!(idx.contains("# Vault Index — Notas"));
         assert!(idx.contains("nota → [[outra]]"));
+        // o sidecar JSON é válido e carrega as arestas exatas.
+        let json_file = files.iter().find(|f| ext(f).as_deref() == Some("json")).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(json_file.path()).unwrap()).unwrap();
+        assert_eq!(v["vault"], "Notas");
+        assert!(v["edges"].is_array());
     }
 
     /// `confirm` com 0 marcadas NÃO grava config (vira "pular" — UX §5) e não cria vault.json.
@@ -1719,13 +2785,14 @@ mod tests {
         assert_eq!(m.all_vaults().len(), 1);
     }
 
-    /// `slugify`/`index_filename`: ASCII estável; vaults de mesmo nome em pastas distintas NÃO colidem.
+    /// `slugify`/`index_filename_base`: ASCII estável; vaults de mesmo nome em pastas distintas NÃO
+    /// colidem (a base é compartilhada por `<base>.md` e `<base>.json`).
     #[test]
     fn index_filename_disambiguates_same_name() {
         assert_eq!(slugify("Minhas Anotações!!"), "minhas-anota-es");
-        let a = index_filename("Notas", Path::new("/a/Notas"));
-        let b = index_filename("Notas", Path::new("/b/Notas"));
+        let a = index_filename_base("Notas", Path::new("/a/Notas"));
+        let b = index_filename_base("Notas", Path::new("/b/Notas"));
         assert_ne!(a, b, "mesmo nome, pastas diferentes → arquivos diferentes");
-        assert!(a.ends_with(".md") && a.starts_with("notas-"));
+        assert!(a.starts_with("notas-") && !a.ends_with(".md"));
     }
 }
