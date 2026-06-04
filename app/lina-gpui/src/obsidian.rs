@@ -551,6 +551,9 @@ pub struct SecondBrainModel {
     initialized: bool,
     /// `true` após o usuário confirmar (mostra o estado 5 / sucesso).
     confirmed: bool,
+    /// Handle da thread que gera o índice (PageIndex) em background ao confirmar. **Test-only** join
+    /// via [`SecondBrainModel::block_on_index`] (a produção nunca bloqueia a UI).
+    index_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl SecondBrainModel {
@@ -575,6 +578,7 @@ impl SecondBrainModel {
             manual: Vec::new(),
             initialized: false,
             confirmed: false,
+            index_handle: None,
         };
         model.redetect();
         model
@@ -702,6 +706,15 @@ impl SecondBrainModel {
         }
     }
 
+    /// Bloqueia até a geração do índice (background, disparada por [`confirm`]) terminar. **Test-only**
+    /// (a produção nunca bloqueia — o índice fica pronto quando ficar; o assistente lê depois).
+    #[allow(dead_code)]
+    pub fn block_on_index(&mut self) {
+        if let Some(h) = self.index_handle.take() {
+            let _ = h.join();
+        }
+    }
+
     /// Re-detecção manual (botão "Verificar"/"Já instalei"). Limpa o aviso (o usuário agiu).
     pub fn verify_now(&mut self) {
         self.notice = None;
@@ -812,14 +825,22 @@ impl SecondBrainModel {
             })
             .collect();
         let config = VaultConfig { primary, vaults: entries };
+        // `vault.json` é pequeno → grava já (rápido na thread de UI).
         if let Err(e) = write_vault_config(&self.lina_dir, &config) {
             eprintln!("obsidian: não gravei .lina/vault.json: {e}");
         }
-        for v in &chosen {
-            if let Err(e) = write_vault_index(&self.lina_dir, v) {
-                eprintln!("obsidian: não gerei o índice de {}: {e}", v.name);
+        // O ÍNDICE (PageIndex) faz scan RECURSIVO lendo TODO `.md` do vault — um segundo cérebro real
+        // tem milhares de notas, então rodar isso na thread de UI CONGELA o app (beachball / "app não
+        // responde"). Roda FORA da thread de UI (detached); o índice não é necessário na hora (o
+        // assistente lê depois). Best-effort: se o app fechar antes, re-confirmar regenera.
+        let lina_dir = self.lina_dir.clone();
+        self.index_handle = Some(thread::spawn(move || {
+            for v in &chosen {
+                if let Err(e) = write_vault_index(&lina_dir, v) {
+                    eprintln!("obsidian: não gerei o índice de {}: {e}", v.name);
+                }
             }
-        }
+        }));
         self.confirmed = true;
     }
 
@@ -1658,7 +1679,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.vaults[0].writable, vpath.join("Lina").display().to_string());
-        // índice gerado em .lina/vault-index/.
+        // índice gerado em .lina/vault-index/ (agora em BACKGROUND ao confirmar — não trava a UI;
+        // o teste espera a thread terminar p/ ser determinístico).
+        m.block_on_index();
         let idx_dir = lina.path().join("vault-index");
         let files: Vec<_> = std::fs::read_dir(&idx_dir).unwrap().flatten().collect();
         assert_eq!(files.len(), 1, "um índice por vault marcado");
