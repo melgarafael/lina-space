@@ -1970,7 +1970,115 @@ fn empty_canvas_hint() -> impl IntoElement {
         )
 }
 
+/// `true` se o `PATH` já contém alguma localização "de usuário/dev" (Homebrew, nvm, volta, cargo,
+/// `~/.local/bin`, `/usr/local/bin`) — sinal de que foi aberto via terminal OU já hidratado. **Puro**
+/// (testável sem env). Quando falso, estamos no PATH mínimo do `launchd` e precisamos hidratar.
+#[must_use]
+fn path_looks_hydrated(path: &str) -> bool {
+    path.split(':').any(|p| {
+        p.contains("/homebrew/")
+            || p == "/usr/local/bin"
+            || p.contains("/.nvm/")
+            || p.ends_with("/.local/bin")
+            || p.contains("/.volta/")
+            || p.contains("/.cargo/")
+            || p.contains("/.bun/")
+            || p.contains("/.deno/")
+    })
+}
+
+/// Extrai o PATH carimbado pela sentinela `marker` no stdout do shell de login (ignora ruído de rc).
+/// **Puro** (testável sem subprocesso).
+#[must_use]
+fn parse_marked_path<'a>(stdout: &'a str, marker: &str) -> Option<&'a str> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(marker))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+}
+
+/// macOS/Linux: um app aberto pelo **Finder/Dock** herda só o PATH mínimo do `launchd`
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`) — SEM Homebrew, nvm, volta, `~/.local/bin` nem o bin global do
+/// npm. Resultado: a varredura de CLIs (lê `PATH` do env) não acha `claude`/`codex` mesmo instalados,
+/// e o "Instalar para mim" falha com *"No viable candidates found in PATH"* (o `npm` é invisível).
+/// Aqui resolvemos o PATH REAL do **shell de login** do usuário e o injetamos no processo: a descoberta
+/// e os PTYs filhos (portable-pty semeia o env de `std::env::vars_os()`) passam a enxergar tudo.
+/// **Best-effort e BOUNDED** (~2s): falha/timeout/rc pendurado → mantém o PATH atual, nunca trava o boot.
+#[cfg(unix)]
+fn hydrate_path_from_login_shell() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    let current = std::env::var("PATH").unwrap_or_default();
+    if path_looks_hydrated(&current) {
+        return; // já rico (terminal ou já hidratado) → não mexe.
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    // Login + interactive: sourceia `.zprofile`/`.zshrc` (`.bash_profile`/`.bashrc`), onde Homebrew/
+    // nvm/volta exportam o PATH. A sentinela isola o PATH do ruído impresso por rc interativo.
+    const MARK: &str = "__LINA_PATH__=";
+    let script = format!("printf '%s%s\\n' '{MARK}' \"$PATH\"");
+    let mut child = match Command::new(&shell)
+        .args(["-lic", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina-gpui: não resolvi o PATH do shell de login ({shell}): {e}");
+            return;
+        }
+    };
+
+    // Espera com TETO: um rc que pendure não pode travar o boot. Lê em thread; desiste em 2s.
+    let Some(mut out) = child.stdout.take() else {
+        return;
+    };
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf);
+        let _ = tx.send(buf); // canal pode ter sido abandonado (timeout) → ignore.
+    });
+    let buf = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(b) => {
+            let _ = child.wait();
+            b
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("lina-gpui: PATH do shell de login demorou demais — sigo com o PATH atual");
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&buf);
+    if let Some(resolved) = parse_marked_path(&stdout, MARK) {
+        if resolved != current {
+            // edition 2021: `set_var` é seguro (e rodamos antes de qualquer thread/janela subir).
+            std::env::set_var("PATH", resolved);
+            eprintln!(
+                "lina-gpui: PATH hidratado do shell de login ({} entradas) — CLIs/npm agora visíveis",
+                resolved.split(':').count()
+            );
+        }
+    }
+}
+
+/// No-op fora de unix (Windows não tem o problema do PATH de `launchd`; o de-risk do ConPTY é à parte).
+#[cfg(not(unix))]
+fn hydrate_path_from_login_shell() {}
+
 fn main() {
+    // PRIMEIRA coisa: hidrata o PATH ANTES de qualquer varredura de CLI ou spawn de PTY (ver doc da
+    // função). Sem isto, um app aberto pelo Finder não acha `claude`/`codex`/`npm` instalados.
+    hydrate_path_from_login_shell();
     let (cols, rows) = fit_dims();
     // BUG A (instrumentação de boot): o PTY é spawnado com EXATAMENTE estas `rows`, e o render trava a
     // line-height em CELL_H → as `rows` cabem inteiras no card (a ÚLTIMA = barra de input da TUI). O
@@ -2357,5 +2465,40 @@ mod ime_tests {
         assert_eq!(composed_text_to_pty_bytes("a"), vec![b'a']);
         // Vazio → nada a enviar (o chamador NÃO submete WriteOp).
         assert!(composed_text_to_pty_bytes("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// `path_looks_hydrated`: PATH mínimo do `launchd` (Finder) → falso (precisa hidratar); PATH com
+    /// Homebrew/nvm/etc. (terminal) → verdadeiro (não mexe). Determinístico, sem env.
+    #[test]
+    fn detects_minimal_launchd_path_vs_rich() {
+        assert!(!path_looks_hydrated("/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(!path_looks_hydrated(""));
+        assert!(path_looks_hydrated("/opt/homebrew/bin:/usr/bin:/bin"));
+        assert!(path_looks_hydrated("/usr/local/bin:/usr/bin"));
+        assert!(path_looks_hydrated(
+            "/Users/x/.nvm/versions/node/v22.0.0/bin:/usr/bin"
+        ));
+        assert!(path_looks_hydrated("/Users/x/.local/bin:/usr/bin"));
+    }
+
+    /// `parse_marked_path`: extrai o PATH carimbado pela sentinela, ignorando ruído de rc antes/depois,
+    /// e descarta linha vazia. É o que blinda a hidratação contra `.zshrc` falante.
+    #[test]
+    fn parses_path_behind_sentinel_ignoring_rc_noise() {
+        let marker = "__LINA_PATH__=";
+        let out = "Welcome to zsh!\nsome rc banner\n__LINA_PATH__=/opt/homebrew/bin:/usr/bin\n";
+        assert_eq!(
+            parse_marked_path(out, marker),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        // sem sentinela → None.
+        assert_eq!(parse_marked_path("só ruído de rc\n", marker), None);
+        // sentinela com PATH vazio → None (não sobrescreve com nada).
+        assert_eq!(parse_marked_path("__LINA_PATH__=\n", marker), None);
     }
 }

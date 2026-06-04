@@ -186,10 +186,11 @@ fn default_install(cli_id: &str) -> Option<(&'static str, Vec<&'static str>)> {
         "codex" => Some(("npm", vec!["install", "-g", "@openai/codex"])),
         "gemini" => Some(("npm", vec!["install", "-g", "@google/gemini-cli"])),
         "opencode" => Some(("npm", vec!["install", "-g", "opencode-ai"])),
-        "copilot" => Some((
-            "npm",
-            vec!["install", "-g", "@githubnext/github-copilot-cli"],
-        )),
+        // O binário do pacote tem de se chamar EXATAMENTE como o id que a re-detecção procura, senão
+        // a instalação "termina mas o programa não aparece". `@github/copilot` expõe `copilot` (verificado
+        // via `npm view @github/copilot bin`); o antigo `@githubnext/github-copilot-cli` está DEPRECADO e
+        // expõe `github-copilot-cli` (≠ `copilot`) — instalava com sucesso e mesmo assim falhava a verificação.
+        "copilot" => Some(("npm", vec!["install", "-g", "@github/copilot"])),
         _ => None,
     }
 }
@@ -494,7 +495,15 @@ impl OnboardingModel {
         self.install_target = Some(cli_id.to_string());
         self.install_consumed = false;
         self.save();
-        set_install(&self.install, InstallState::Idle);
+        // Feedback OTIMISTA: marca Installing já (a thread confirma em seguida) para que o 1º frame
+        // após o clique mostre "⟳ iniciando…" no lugar do botão — sem isto há uma janela em que o
+        // estado segue Idle e o usuário acha que "nada aconteceu".
+        set_install(
+            &self.install,
+            InstallState::Installing {
+                line: "iniciando…".into(),
+            },
+        );
         let id = cli_id.to_string();
         // `verify` reusa a MESMA descoberta injetada (consistente em teste/produção); roda na thread
         // de instalação (não na de UI).
@@ -638,6 +647,42 @@ impl OnboardingView {
     fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+
+        // PULSO DE ANIMAÇÃO (mesmo mecanismo do canvas — ver `main.rs`). O gpui só redesenha quando a
+        // view está "dirty"; o `request_animation_frame` do `render` SÓ se auto-sustenta enquanto
+        // CHEGAM frames do SO, e o trabalho assíncrono do onboarding (varredura de CLIs + "Instalar
+        // para mim") muda o estado a partir de uma thread GPUI-FREE — que NÃO acorda o event loop.
+        // Sem este loop, o clique dispara a instalação (o `npm` roda no PTY oculto), mas a tela
+        // CONGELA no frame do clique e o usuário vê "nada acontece". Aqui forçamos `cx.notify()`
+        // enquanto há varredura/instalação em voo (mais o frame de assentamento, p/ desenhar o ✓/⚠
+        // final), dormindo barato quando ocioso. Encerra sozinho quando a view é dropada (janela
+        // fechada → `this.update` devolve `Err`).
+        cx.spawn(async move |this, cx| {
+            let mut was_busy = false;
+            loop {
+                let Ok(busy) = this.update(cx, |view, cx| {
+                    view.model.poll_install();
+                    let busy = matches!(
+                        view.model.install_state(),
+                        InstallState::Installing { .. } | InstallState::Verifying
+                    ) || view.model.is_discovering();
+                    // `busy || was_busy`: redesenha durante o trabalho E no 1º frame após ele terminar,
+                    // p/ que o estado final (Ok ✓ / Failed ⚠ / lista re-detectada) realmente apareça.
+                    if busy || was_busy {
+                        cx.notify();
+                    }
+                    busy
+                }) else {
+                    break; // view dropada (app/janela fechando) → encerra o pulso.
+                };
+                was_busy = busy;
+                cx.background_executor()
+                    .timer(Duration::from_millis(if busy { 16 } else { 120 }))
+                    .await;
+            }
+        })
+        .detach();
+
         Self {
             model: OnboardingModel::load(dir),
             focus,
@@ -915,8 +960,9 @@ impl OnboardingView {
             .bg(rgb(0x3d59c9))
             .text_color(rgb(0xeef1ff))
             .cursor_pointer()
-            .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, _cx| {
+            .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
                 view.model.start_install(id);
+                cx.notify(); // desenha o feedback NA HORA; o pulso assume a animação do progresso
             }))
             .child(text!("Instalar para mim"))
             .into_any_element()
@@ -1044,6 +1090,10 @@ impl Render for OnboardingView {
             .id("onboarding")
             .track_focus(&self.focus)
             .size_full()
+            // Conteúdo do check-up (heading + banner + N CLIs + rodapé) passa da altura da janela:
+            // sem isto o excesso é só CLIPADO (rodapé "Continuar →" inalcançável). `size_full` dá a
+            // altura limitada e o `.id("onboarding")` persiste o offset → o scroll engata.
+            .overflow_y_scroll()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .flex()
@@ -1054,9 +1104,17 @@ impl Render for OnboardingView {
                 div()
                     .flex()
                     .flex_col()
+                    // `div()` tem `flex_shrink: 1.0` por padrão: dentro do root (coluna de altura
+                    // LIMITADA = janela), o taffy ENCOLHERIA este painel até a altura da janela →
+                    // `content_size == bounds` → nada a rolar (era por isso que o scroll não engatava;
+                    // só esticar a janela revelava os botões). `flex_shrink_0` mantém a altura NATURAL
+                    // do conteúdo, que transborda e o `overflow_y_scroll` do root rola. (Idioma do
+                    // Zed: context_menu/modal usam flex_shrink_0 + overflow_y_scroll.)
+                    .flex_shrink_0()
                     .gap_8()
                     .w(px(680.0))
                     .mt(px(72.0))
+                    .pb(px(40.0)) // respiro no fim do scroll: o último botão não cola na borda
                     .child(
                         div()
                             .flex()
@@ -1175,6 +1233,20 @@ mod tests {
         assert_eq!(claude.program, "npm");
         assert!(claude.args.iter().any(|a| a.contains("claude-code")));
         assert!(install_command_with("desconhecido", None).is_none());
+
+        // Regressão: o copilot DEVE usar `@github/copilot` (binário `copilot`), NÃO o deprecado
+        // `@githubnext/github-copilot-cli` (binário `github-copilot-cli`), que instalava com sucesso
+        // mas falhava a re-detecção de `copilot` ("a instalação terminou, mas o programa não apareceu").
+        let copilot = install_command_with("copilot", None).expect("copilot tem default");
+        assert!(
+            copilot.args.iter().any(|a| a == "@github/copilot"),
+            "copilot deve instalar @github/copilot (binário `copilot`), veio {:?}",
+            copilot.args
+        );
+        assert!(
+            !copilot.args.iter().any(|a| a.contains("githubnext")),
+            "não pode voltar ao pacote deprecado @githubnext/github-copilot-cli"
+        );
 
         let over = install_command_with("claude", Some("echo oi")).expect("override");
         assert_eq!(over.program, "sh");
