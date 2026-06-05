@@ -191,21 +191,139 @@ fn run_ask(args: &[String]) -> ExitCode {
     // W3-6c A3: outbox POR-NÓ — `from` é autenticado pela origem (dir-dono), não pelo campo forjável.
     match enqueue_per_node(&mailbox, &from, &msg) {
         Ok(()) => {
-            // Feedback HONESTO (#22): a entrega é ASSÍNCRONA — quem decide o destino final é o
-            // supervisor (guardrails anti-loop/teto de custo podem barrar DEPOIS). Não prometer
-            // "entregue"; dizer que foi enviada e que, se um limite barrar, fica no log do Espaço.
-            // (Sem o jargão "enfileirada", que confundiu o fundador não-técnico.)
-            println!(
-                "ok: enviada a {} (id {}). A entrega é automática e pode levar um instante; se um \
-                 limite de segurança (anti-loop ou teto de custo) barrar, fica registrado no log do Espaço.",
-                msg.to, msg.id
-            );
-            ExitCode::SUCCESS
+            // CONFIRMAÇÃO REAL (fix do "envio nada acontece"): a entrega é assíncrona (o supervisor
+            // roteia DEPOIS), mas o resultado é registrado no event log. Antes, imprimíamos um
+            // "ok: enviada" CEGO mesmo quando o roteador BLOQUEAVA a msg (unknown_sender/no_target) —
+            // o agente não sabia que falhou e concluía que o colega era um "stub mudo". Agora aguardamos
+            // (poll bounded no espelho `log.jsonl`) o desfecho REAL e o reportamos.
+            match poll_route_outcome(&msg.id) {
+                RouteConfirm::Delivered { to_node } => {
+                    let dst = if to_node.is_empty() { msg.to.clone() } else { to_node };
+                    println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
+                    ExitCode::SUCCESS
+                }
+                RouteConfirm::Blocked { reason } => {
+                    eprintln!(
+                        "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
+                        msg.to,
+                        explain_block(&reason),
+                        block_hint(&reason)
+                    );
+                    ExitCode::from(1)
+                }
+                RouteConfirm::Pending => {
+                    println!(
+                        "ok: enviada a {} (id {}); ainda SEM confirmacao de entrega apos a espera (o \
+                         Espaco pode estar ocupado). Confirme com `lina list` se o destino esta vivo e \
+                         tente de novo — NAO conclua que o colega e um stub.",
+                        msg.to, msg.id
+                    );
+                    ExitCode::SUCCESS
+                }
+            }
         }
         Err(e) => {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Desfecho REAL do roteamento de uma `lina ask`, lido do espelho `log.jsonl`.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteConfirm {
+    /// O Espaço entregou/roteou a mensagem ao destino.
+    Delivered { to_node: String },
+    /// O roteador bloqueou a mensagem (`reason` = `unknown_sender`/`no_target`/`hop_limit`/…).
+    Blocked { reason: String },
+    /// Sem evento de desfecho no tempo de espera (o app pode estar ocupado/lento).
+    Pending,
+}
+
+/// Caminho do espelho append-only do event log (`<LINA_HOME>/events/log.jsonl`). Lemos ESTE (não o
+/// SQLite) p/ não abrir uma conexão concorrente ao banco do app (evita lock na troca de WAL).
+fn event_log_path() -> PathBuf {
+    mailbox_root().join("events").join("log.jsonl")
+}
+
+/// **PURO** (testável, sem I/O/timing): varre o conteúdo do `log.jsonl` pelo desfecho de `msg_id`.
+/// `Delivered` vence `Blocked` (se a msg foi entregue em alguma tentativa, chegou); `None` se ainda não
+/// há desfecho. Tolera linhas parciais/inválidas (arquivo sob append).
+fn scan_log_outcome(content: &str, msg_id: &str) -> Option<RouteConfirm> {
+    let mut last_block: Option<String> = None;
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        if p.get("id").and_then(serde_json::Value::as_str) != Some(msg_id) {
+            continue;
+        }
+        match v.get("kind").and_then(serde_json::Value::as_str) {
+            Some("MessageDelivered" | "MessageRouted") => {
+                let to = p
+                    .get("to_node")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| p.get("to").and_then(serde_json::Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                return Some(RouteConfirm::Delivered { to_node: to }); // sucesso vence bloqueio
+            }
+            Some("RouteBlocked") => {
+                last_block = p
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    last_block.map(|reason| RouteConfirm::Blocked { reason })
+}
+
+/// Aguarda (poll bounded ~3s) o desfecho do roteamento de `msg_id` no `log.jsonl`. Retorna `Delivered`
+/// assim que a msg é roteada/entregue; no fim do prazo, `Blocked` (se houve) ou `Pending`. Tolerante a
+/// log ausente. A lógica de parse vive em [`scan_log_outcome`] (pura/testada).
+fn poll_route_outcome(msg_id: &str) -> RouteConfirm {
+    use std::time::{Duration, Instant};
+    let path = event_log_path();
+    let deadline = Instant::now() + Duration::from_millis(3000);
+    loop {
+        let outcome =
+            std::fs::read_to_string(&path).ok().and_then(|c| scan_log_outcome(&c, msg_id));
+        match outcome {
+            // Entregue → conclui já. Bloqueado → só conclui no prazo (pode ser re-tentado e entregar).
+            Some(o @ RouteConfirm::Delivered { .. }) => return o,
+            Some(o @ RouteConfirm::Blocked { .. }) if Instant::now() >= deadline => return o,
+            _ if Instant::now() >= deadline => return RouteConfirm::Pending,
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+}
+
+/// Tradução acionável do motivo de bloqueio (o leitor é um agente de IA — texto claro, sem jargão de log).
+fn explain_block(reason: &str) -> String {
+    match reason {
+        "unknown_sender" => "o Espaco nao reconheceu voce como remetente vivo (seu terminal pode nao \
+             estar no roster ainda, ou houve uma corrida de registro)"
+            .to_string(),
+        "no_target" => "o destino nao foi encontrado entre os agentes vivos do Espaco".to_string(),
+        "hop_limit" => "o limite de encaminhamento (anti-loop) foi atingido".to_string(),
+        "self_message" => "voce tentou enviar para si mesmo".to_string(),
+        other => format!("motivo tecnico: {other}"),
+    }
+}
+
+/// Dica de recuperação por motivo. Para `unknown_sender`/`no_target` instrui EXPLICITAMENTE a NÃO
+/// concluir que o colega é um "stub" (foi o que enganou o agente: o roteamento falhou, o colega vive).
+fn block_hint(reason: &str) -> &'static str {
+    match reason {
+        "unknown_sender" | "no_target" => {
+            "→ Tente de novo em alguns segundos (o roster pode estar sincronizando) e confira os nomes \
+             vivos com `lina list`. NAO conclua que o colega e um \"stub\"/mudo: ele pode estar vivo — \
+             foi o ROTEAMENTO que falhou, nao o colega."
+        }
+        _ => "→ Veja o estado do Espaco com `lina list`.",
     }
 }
 
@@ -883,5 +1001,37 @@ mod vault_tests {
         // inexistente → None.
         assert!(resolve_note(&cfg, "Area/fantasma.md").is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `scan_log_outcome` (núcleo da confirmação de `lina ask`): lê o desfecho real do `log.jsonl`.
+    /// Formato verbatim do espelho (`kind` + `payload.id`/`reason`/`to_node`).
+    #[test]
+    fn scan_log_outcome_reads_real_route_events() {
+        let blocked = r#"{"seq":3,"ts":1,"kind":"RouteBlocked","version":1,"payload":{"event":"RouteBlocked","id":"msg_X","reason":"unknown_sender","from":"Terminal B","to":"@Terminal C"}}"#;
+        let delivered = r#"{"seq":4,"ts":2,"kind":"MessageRouted","version":1,"payload":{"event":"MessageRouted","id":"msg_Y","from":"Terminal B","to":"@Terminal C","to_node":"019e-uuid","intent":"ask","hops":0,"root_cause_id":"msg_Y"}}"#;
+
+        // Bloqueada → reporta o motivo.
+        assert_eq!(
+            scan_log_outcome(blocked, "msg_X"),
+            Some(RouteConfirm::Blocked { reason: "unknown_sender".into() })
+        );
+        // Entregue → reporta o nó destino.
+        assert_eq!(
+            scan_log_outcome(delivered, "msg_Y"),
+            Some(RouteConfirm::Delivered { to_node: "019e-uuid".into() })
+        );
+        // Entrega VENCE bloqueio quando a mesma msg tem os dois (re-tentada e entregue).
+        let both = format!(
+            "{}\n{}",
+            blocked.replace("msg_X", "msg_Z"),
+            delivered.replace("msg_Y", "msg_Z")
+        );
+        assert_eq!(
+            scan_log_outcome(&both, "msg_Z"),
+            Some(RouteConfirm::Delivered { to_node: "019e-uuid".into() })
+        );
+        // id ausente → None (ainda sem desfecho); linha parcial/lixo é tolerada.
+        assert_eq!(scan_log_outcome(blocked, "msg_INEXISTENTE"), None);
+        assert_eq!(scan_log_outcome("{lixo parcial\n", "msg_X"), None);
     }
 }
