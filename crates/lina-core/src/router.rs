@@ -202,7 +202,19 @@ pub struct Router {
     /// `.inflight`, duráveis) em vez de injetar, drenando ao [`Router::resume`] — GATE humano, não
     /// kill (inv #6). Escritor único (o Router é single-thread, dono do estado de roteamento).
     paused: bool,
+    /// **RETRY de bloqueio TRANSIENTE** (race de inicialização): `id` → nº de ticks que a msg ficou
+    /// retida por `UnknownSender`/`NoTarget`. Na criação de terminais, um agente pode mandar `lina ask`
+    /// ANTES de o remetente/destino entrar no roster vivo (o PTY sobe e roda o hook antes/junto do
+    /// `register`); a msg era ACKEADA e PERDIDA. Agora é RETIDA no `.inflight` e re-tentada por até
+    /// [`MAX_TRANSIENT_RETRIES`] ticks — quando o nó aparece, ENTREGA. Esgotado o teto, descarta (não
+    /// fica para sempre se o destino realmente não existe). NÃO afrouxa segurança: o `from` segue
+    /// autenticado pela origem (subdir) e o `route_message` é idêntico — só a decisão de ack/reter muda.
+    transient_retries: HashMap<String, u32>,
 }
+
+/// Teto de re-tentativas de um bloqueio TRANSIENTE (`UnknownSender`/`NoTarget`) antes de desistir.
+/// Cobre a janela de registro na criação de nós; após isso, um destino ausente é descartado (anti-loop).
+const MAX_TRANSIENT_RETRIES: u32 = 50;
 
 impl Router {
     /// Roteador com a configuração padrão.
@@ -223,6 +235,7 @@ impl Router {
             delivered_root: HashMap::new(),
             pending: HashMap::new(),
             paused: false,
+            transient_retries: HashMap::new(),
         }
     }
 
@@ -347,10 +360,32 @@ impl Router {
                 // `.inflight` para o próximo tick — nada se perde num crash entre drenar e logar.
                 // W4-3: `Queued` (freio) também NÃO dá ack — a delegação fica retida no `.inflight`
                 // (durável) até o `resume` a drenar; ackear aqui a perderia.
-                if !matches!(
+                //
+                // RETRY TRANSIENTE: `UnknownSender`/`NoTarget` na CRIAÇÃO costumam ser uma RACE (o nó
+                // ainda não entrou no roster vivo). Em vez de ackear+perder, RETÉM a msg no `.inflight`
+                // por até `MAX_TRANSIENT_RETRIES` ticks — quando o nó aparece, o próximo tick ENTREGA.
+                // Esgotado o teto, ackeia (destino realmente ausente → não retém para sempre).
+                let retain_transient = matches!(
                     outcome,
-                    RouteOutcome::PersistFailed(_) | RouteOutcome::Queued
-                ) {
+                    RouteOutcome::UnknownSender(_) | RouteOutcome::NoTarget
+                ) && {
+                    let n = self.transient_retries.entry(m.id.clone()).or_insert(0);
+                    *n += 1;
+                    *n < MAX_TRANSIENT_RETRIES
+                };
+                if retain_transient {
+                    // O `route_message` já marcou esta msg em `seen` (dedupe). Desmarca para que o
+                    // PRÓXIMO tick a RE-PROCESSE (senão viraria `Duplicate` e seria ackeada+perdida). O
+                    // dedupe DURÁVEL (`routed_ids` no log) segue protegendo contra re-ENTREGA — só a
+                    // re-ROTA da msg ainda-não-entregue é reaberta. Seguro: a origem (`from`) continua
+                    // autenticada pelo subdir; nada de roteamento muda, só a re-tentativa.
+                    self.seen.remove(&m.id);
+                }
+                let hold = matches!(outcome, RouteOutcome::PersistFailed(_) | RouteOutcome::Queued);
+                if !hold && !retain_transient {
+                    // Desfecho definitivo (entregue, duplicado, hop-limit, ou transiente esgotado):
+                    // confirma e limpa o contador (anti-vazamento do mapa).
+                    self.transient_retries.remove(&m.id);
                     if let Err(e) = self.mailbox.ack_inflight(&m.id) {
                         eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
                     }
@@ -1567,6 +1602,73 @@ mod tests {
         let reasons = blocked_reasons(&ts.store);
         assert!(reasons.contains(&"unknown_sender".to_string()));
         assert!(reasons.contains(&"no_target".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **RETRY TRANSIENTE — a race de inicialização ENTREGA quando o nó chega.** O remetente manda
+    /// `lina ask` para um colega que AINDA não entrou no roster (criação concorrente). Antes a msg era
+    /// ackeada e PERDIDA (`NoTarget`); agora é RETIDA no `.inflight` e o tick seguinte — após o destino
+    /// registrar — ENTREGA. Reproduz o cenário REAL do fundador (bloqueios só no início, depois flui).
+    #[test]
+    fn transient_no_target_is_retained_and_delivers_when_node_arrives() {
+        let (mut router, sup, dir) = router_with("retry-arrives");
+        sup.register("Terminal A", None, sink()); // só o REMETENTE existe no início
+        let mut ts = TmpStore::new("retry-arrives");
+        let (rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("", "@Terminal B", "ask", "oi");
+        router.mailbox().enqueue_as("Terminal A", &m).expect("enqueue A");
+
+        // 1º tick: B ainda não existe → NoTarget, mas a msg é RETIDA (não ackeada).
+        let r1 = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(r1[0].1, RouteOutcome::NoTarget, "B ausente → NoTarget transiente");
+        assert!(rec.borrow().is_empty(), "nada entregue ainda");
+
+        // B chega (registro tardio — a race).
+        let b = sup.register("Terminal B", None, sink());
+
+        // 2º tick: a msg RETIDA é re-processada e ENTREGA (sem o remetente re-enviar).
+        let r2 = router.pump(&mut ts.store, 1001, &mut deliver);
+        assert_eq!(
+            r2[0].1,
+            RouteOutcome::Delivered { targets: vec![b] },
+            "o tick seguinte entrega à B recém-chegada — a msg não foi perdida"
+        );
+        assert_eq!(rec.borrow().len(), 1, "entregue exatamente uma vez (sem duplicar)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **TETO do retry — destino REALMENTE inexistente NÃO retém para sempre.** Após
+    /// `MAX_TRANSIENT_RETRIES` ticks sem o destino aparecer, a msg é finalmente ackeada (descartada);
+    /// ticks posteriores não a re-processam (anti-loop). Sem isto, um typo de nome ficaria no `.inflight`
+    /// e seria re-roteado eternamente.
+    #[test]
+    fn transient_retry_gives_up_after_cap() {
+        let (mut router, sup, dir) = router_with("retry-cap");
+        sup.register("Terminal A", None, sink());
+        let mut ts = TmpStore::new("retry-cap");
+        let (_rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("", "@Fantasma", "ask", "oi"); // destino que nunca existe
+        router.mailbox().enqueue_as("Terminal A", &m).expect("enqueue A");
+
+        // Bombeia além do teto: cada tick re-tenta enquanto < teto; no teto, ackeia.
+        for t in 0..(MAX_TRANSIENT_RETRIES + 3) {
+            router.pump(&mut ts.store, 1000 + u64::from(t), &mut deliver);
+        }
+        // A msg parou de ser re-processada: o nº de RouteBlocked{no_target} é LIMITADO pelo teto,
+        // não cresce sem fim. (Sem o teto, seriam `MAX+3`.)
+        let blocks = blocked_reasons(&ts.store)
+            .into_iter()
+            .filter(|r| r == "no_target")
+            .count();
+        assert!(
+            blocks as u32 <= MAX_TRANSIENT_RETRIES,
+            "as re-tentativas param no teto ({MAX_TRANSIENT_RETRIES}); vieram {blocks}"
+        );
+        // Após desistir, um novo tick não tem mais nada a processar (inflight vazio).
+        let extra = router.pump(&mut ts.store, 9999, &mut deliver);
+        assert!(extra.is_empty(), "msg já descartada — nada a re-rotear");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
