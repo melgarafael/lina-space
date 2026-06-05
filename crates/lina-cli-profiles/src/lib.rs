@@ -561,13 +561,19 @@ mod tests {
         let inst = Installers::from_toml_str(SAMPLE_INSTALLERS, "<inline>").expect("parseia");
         let oc = inst.0["opencode"].for_os("macos").expect("opencode macos");
         assert_eq!(oc.program, "bash");
-        assert_eq!(oc.args, vec!["-c", "curl -fsSL https://opencode.ai/install | bash"]);
+        assert_eq!(
+            oc.args,
+            vec!["-c", "curl -fsSL https://opencode.ai/install | bash"]
+        );
         assert_eq!(oc.verify_paths, vec!["~/.opencode/bin".to_string()]);
         // SO ausente → None (não inventa receita).
         assert!(inst.0["opencode"].for_os("linux").is_none());
         // env vira parte da receita (não-interatividade do codex).
         let cx = inst.0["codex"].for_os("macos").expect("codex macos");
-        assert_eq!(cx.env.get("CODEX_NON_INTERACTIVE").map(String::as_str), Some("1"));
+        assert_eq!(
+            cx.env.get("CODEX_NON_INTERACTIVE").map(String::as_str),
+            Some("1")
+        );
         // recipe_for() resolve pelo SO de compilação corrente.
         assert!(inst.recipe_for("inexistente").is_none());
     }
@@ -582,17 +588,24 @@ mod tests {
         let inst = Installers::from_toml_str(&src, &path.display().to_string())
             .expect("installers.toml deve parsear");
         for id in ["claude", "codex", "gemini", "opencode", "copilot", "agy"] {
-            let p = inst.0.get(id).unwrap_or_else(|| panic!("falta receita p/ {id}"));
+            let p = inst
+                .0
+                .get(id)
+                .unwrap_or_else(|| panic!("falta receita p/ {id}"));
             for os in ["macos", "linux", "windows"] {
-                let r = p
-                    .for_os(os)
-                    .unwrap_or_else(|| panic!("falta {id}.{os}"));
+                let r = p.for_os(os).unwrap_or_else(|| panic!("falta {id}.{os}"));
                 assert!(!r.program.trim().is_empty(), "{id}.{os} sem program");
             }
         }
         // copilot moderno (binário `copilot`), nunca o deprecado.
         let cp = format!("{:?}", inst.0["copilot"]);
-        assert!(cp.contains("@github/copilot"), "copilot deve usar @github/copilot");
-        assert!(!cp.contains("githubnext"), "copilot não pode usar o pacote deprecado");
+        assert!(
+            cp.contains("@github/copilot"),
+            "copilot deve usar @github/copilot"
+        );
+        assert!(
+            !cp.contains("githubnext"),
+            "copilot não pode usar o pacote deprecado"
+        );
     }
 }

@@ -87,7 +87,10 @@ fn app_bundle_candidates_for(
         "windows" => {
             if let Some(local) = get_env("LOCALAPPDATA") {
                 out.push(
-                    PathBuf::from(local).join("Programs").join(name).join(format!("{name}.exe")),
+                    PathBuf::from(local)
+                        .join("Programs")
+                        .join(name)
+                        .join(format!("{name}.exe")),
                 );
             }
             if let Some(pf) = get_env("ProgramFiles") {
@@ -95,7 +98,9 @@ fn app_bundle_candidates_for(
             }
         }
         _ => {
-            out.push(PathBuf::from("/var/lib/flatpak/exports/bin/md.obsidian.Obsidian"));
+            out.push(PathBuf::from(
+                "/var/lib/flatpak/exports/bin/md.obsidian.Obsidian",
+            ));
             out.push(PathBuf::from(format!("/usr/bin/{lname}")));
             out.push(PathBuf::from(format!("/usr/local/bin/{lname}")));
             out.push(PathBuf::from(format!("/snap/bin/{lname}")));
@@ -138,7 +143,11 @@ fn obsidian_config_paths_for(
         }
         "windows" => {
             if let Some(appdata) = get_env("APPDATA") {
-                out.push(PathBuf::from(appdata).join("obsidian").join("obsidian.json"));
+                out.push(
+                    PathBuf::from(appdata)
+                        .join("obsidian")
+                        .join("obsidian.json"),
+                );
             }
         }
         _ => {
@@ -188,10 +197,18 @@ pub fn parse_vaults_from_json(json: &str) -> Vec<VaultLink> {
         .values()
         .filter_map(|entry| {
             let path = entry.get("path").and_then(|p| p.as_str())?;
-            let open = entry.get("open").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let open = entry
+                .get("open")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let path = PathBuf::from(path);
             let name = vault_name(&path);
-            Some(VaultLink { name, path, open, added_manually: false })
+            Some(VaultLink {
+                name,
+                path,
+                open,
+                added_manually: false,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -239,7 +256,10 @@ pub fn discover_obsidian() -> ObsidianScan {
         }
     }
     vaults.sort_by(|a, b| a.path.cmp(&b.path));
-    ObsidianScan { app_present, vaults }
+    ObsidianScan {
+        app_present,
+        vaults,
+    }
 }
 
 // ═══════════════════════════ PageIndex — mapa estrutural determinístico (inv#1) ═══════════════════════════
@@ -330,7 +350,10 @@ fn dedup_ordered(items: impl IntoIterator<Item = String>) -> Vec<String> {
 #[must_use]
 pub fn extract_wikilinks(content: &str) -> Vec<String> {
     dedup_ordered(
-        bracket_occurrences(content).into_iter().filter(|(_, e)| !e).map(|(t, _)| t),
+        bracket_occurrences(content)
+            .into_iter()
+            .filter(|(_, e)| !e)
+            .map(|(t, _)| t),
     )
 }
 
@@ -338,7 +361,10 @@ pub fn extract_wikilinks(content: &str) -> Vec<String> {
 #[must_use]
 pub fn extract_embeds(content: &str) -> Vec<String> {
     dedup_ordered(
-        bracket_occurrences(content).into_iter().filter(|(_, e)| *e).map(|(t, _)| t),
+        bracket_occurrences(content)
+            .into_iter()
+            .filter(|(_, e)| *e)
+            .map(|(t, _)| t),
     )
 }
 
@@ -387,8 +413,8 @@ fn strip_code(content: &str) -> String {
         match (fence, fence_marker(trimmed)) {
             (None, Some((ch, len, _))) => fence = Some((ch, len)), // abre (zera a linha)
             (Some((ch, len)), Some((mch, mlen, true))) if mch == ch && mlen >= len => fence = None, // fecha
-            (Some(_), _) => {}                          // dentro do bloco: zera
-            (None, None) => out.push_str(line),         // fora: preserva
+            (Some(_), _) => {}                  // dentro do bloco: zera
+            (None, None) => out.push_str(line), // fora: preserva
         }
         out.push('\n');
     }
@@ -399,7 +425,10 @@ fn strip_code(content: &str) -> String {
 /// `("", content)`. Tolerante a BOM e CRLF.
 fn split_frontmatter(content: &str) -> (&str, &str) {
     let s = content.strip_prefix('\u{feff}').unwrap_or(content);
-    let after_open = match s.strip_prefix("---\n").or_else(|| s.strip_prefix("---\r\n")) {
+    let after_open = match s
+        .strip_prefix("---\n")
+        .or_else(|| s.strip_prefix("---\r\n"))
+    {
         Some(r) => r,
         None => return ("", content),
     };
@@ -441,7 +470,9 @@ fn extract_frontmatter_tags(content: &str) -> Vec<String> {
         if line.len() != key_line.len() {
             continue; // só chaves de nível raiz (sem indentação)
         }
-        let Some(rest) = key_line.strip_prefix("tags:").or_else(|| key_line.strip_prefix("tag:"))
+        let Some(rest) = key_line
+            .strip_prefix("tags:")
+            .or_else(|| key_line.strip_prefix("tag:"))
         else {
             continue;
         };
@@ -568,7 +599,12 @@ pub fn scan_vault(root: &Path) -> VaultIndexData {
 
 /// Walk recursivo de METADADOS: coleta pastas + caminhos dos `.md` (sem ler conteúdo). Ignora
 /// `.obsidian/`, `.trash/` e qualquer dir oculto. A leitura pesada é paralelizada em [`scan_vault`].
-fn walk_collect(root: &Path, dir: &Path, folders: &mut Vec<String>, md: &mut Vec<(String, PathBuf)>) {
+fn walk_collect(
+    root: &Path,
+    dir: &Path,
+    folders: &mut Vec<String>,
+    md: &mut Vec<(String, PathBuf)>,
+) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -687,7 +723,9 @@ pub struct VaultGraph {
 /// Chave de resolução/identidade: basename (último segmento após `/`), sem `.md`, lowercased.
 fn basename_key(s: &str) -> String {
     let base = s.rsplit('/').next().unwrap_or(s);
-    base.strip_suffix(".md").unwrap_or(base).to_ascii_lowercase()
+    base.strip_suffix(".md")
+        .unwrap_or(base)
+        .to_ascii_lowercase()
 }
 
 /// Resolução de um alvo de wikilink contra o índice `basename → [rel_path]`.
@@ -705,7 +743,11 @@ fn resolve_target(target: &str, by_base: &BTreeMap<String, Vec<String>>) -> Reso
         Some(paths) if paths.len() == 1 => Resolved::One(paths[0].clone()),
         Some(paths) => {
             let want = target.trim_start_matches('/').to_ascii_lowercase();
-            let want_md = if want.ends_with(".md") { want } else { format!("{want}.md") };
+            let want_md = if want.ends_with(".md") {
+                want
+            } else {
+                format!("{want}.md")
+            };
             let suffix = format!("/{want_md}");
             let mut hit = None;
             let mut hits = 0usize;
@@ -730,9 +772,15 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
     let mut start = 0;
     while let Some(rel) = haystack[start..].find(needle) {
         let i = start + rel;
-        let before_ok = haystack[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let before_ok = haystack[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
         let after = i + needle.len();
-        let after_ok = haystack[after..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = haystack[after..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
@@ -775,7 +823,10 @@ fn merge_edges(mut edges: Vec<GraphEdge>) -> Vec<GraphEdge> {
 pub fn analyze_graph(data: &VaultIndexData) -> VaultGraph {
     let mut by_base: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for note in &data.notes {
-        by_base.entry(basename_key(&note.rel_path)).or_default().push(note.rel_path.clone());
+        by_base
+            .entry(basename_key(&note.rel_path))
+            .or_default()
+            .push(note.rel_path.clone());
     }
 
     let mut raw_edges: Vec<GraphEdge> = Vec::new();
@@ -785,7 +836,11 @@ pub fn analyze_graph(data: &VaultIndexData) -> VaultGraph {
             match resolve_target(target, &by_base) {
                 Resolved::One(to) if to == note.rel_path => {} // ignora auto-link
                 Resolved::One(to) => {
-                    raw_edges.push(GraphEdge { from: note.rel_path.clone(), to, count: *count });
+                    raw_edges.push(GraphEdge {
+                        from: note.rel_path.clone(),
+                        to,
+                        count: *count,
+                    });
                 }
                 Resolved::None => problems.push(LinkProblem {
                     from: note.rel_path.clone(),
@@ -830,16 +885,27 @@ pub fn analyze_graph(data: &VaultIndexData) -> VaultGraph {
     metrics.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     problems.sort_by(|a, b| {
-        a.from.cmp(&b.from).then_with(|| a.target.cmp(&b.target)).then_with(|| (a.issue as u8).cmp(&(b.issue as u8)))
+        a.from
+            .cmp(&b.from)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| (a.issue as u8).cmp(&(b.issue as u8)))
     });
     problems.dedup();
 
-    VaultGraph { metrics, edges, problems }
+    VaultGraph {
+        metrics,
+        edges,
+        problems,
+    }
 }
 
 /// `rel_path`s das notas que casam `pred`, na ordem de `metrics` (já ordenado por `rel_path`).
 fn rel_paths_where(metrics: &[NoteMetrics], pred: impl Fn(&NoteMetrics) -> bool) -> Vec<String> {
-    metrics.iter().filter(|m| pred(m)).map(|m| m.rel_path.clone()).collect()
+    metrics
+        .iter()
+        .filter(|m| pred(m))
+        .map(|m| m.rel_path.clone())
+        .collect()
 }
 
 /// `node` do grafo = `rel_path` sem `.md` (rótulo curto, navegável).
@@ -851,7 +917,12 @@ fn node_label(rel_path: &str) -> &str {
 /// Pastas / Notas / "Grafo de [[wikilinks]]" e ACRESCENTA navegação (entry-points, hubs, MOCs, órfãos,
 /// backlinks) + grau/tags/embeds por nota + links pendentes/ambíguos. Token-eficiente e navegável.
 #[must_use]
-fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph: &VaultGraph) -> String {
+fn render_vault_index_with(
+    name: &str,
+    root: &Path,
+    data: &VaultIndexData,
+    graph: &VaultGraph,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Vault Index — {name}  (gerado pelo Lina · determinístico · sem IA · NÃO editar)\n"
@@ -877,24 +948,40 @@ fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph
 
     // Pontos de entrada (por out-degree desc) e hubs (por in-degree desc) — "por onde começar".
     let mut entry: Vec<&NoteMetrics> = graph.metrics.iter().filter(|m| m.is_entry_point).collect();
-    entry.sort_by(|a, b| b.out_degree.cmp(&a.out_degree).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    entry.sort_by(|a, b| {
+        b.out_degree
+            .cmp(&a.out_degree)
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
     out.push_str("\n## Pontos de entrada (por onde começar)\n");
     if entry.is_empty() {
         out.push_str("- (nenhum)\n");
     } else {
         for m in &entry {
-            out.push_str(&format!("- {} (saída: {})\n", node_label(&m.rel_path), m.out_degree));
+            out.push_str(&format!(
+                "- {} (saída: {})\n",
+                node_label(&m.rel_path),
+                m.out_degree
+            ));
         }
     }
 
     let mut hub_list: Vec<&NoteMetrics> = graph.metrics.iter().filter(|m| m.is_hub).collect();
-    hub_list.sort_by(|a, b| b.in_degree.cmp(&a.in_degree).then_with(|| a.rel_path.cmp(&b.rel_path)));
+    hub_list.sort_by(|a, b| {
+        b.in_degree
+            .cmp(&a.in_degree)
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
     out.push_str("\n## Hubs (muito referenciados · entrada ≥ 15)\n");
     if hub_list.is_empty() {
         out.push_str("- (nenhum)\n");
     } else {
         for m in &hub_list {
-            out.push_str(&format!("- {} (entrada: {})\n", node_label(&m.rel_path), m.in_degree));
+            out.push_str(&format!(
+                "- {} (entrada: {})\n",
+                node_label(&m.rel_path),
+                m.in_degree
+            ));
         }
     }
 
@@ -919,8 +1006,11 @@ fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph
     }
 
     // Notas + headings, enriquecidas com grau/flags/tags/embeds (sem alterar as linhas de heading).
-    let metrics_by_path: BTreeMap<&str, &NoteMetrics> =
-        graph.metrics.iter().map(|m| (m.rel_path.as_str(), m)).collect();
+    let metrics_by_path: BTreeMap<&str, &NoteMetrics> = graph
+        .metrics
+        .iter()
+        .map(|m| (m.rel_path.as_str(), m))
+        .collect();
     out.push_str("\n## Notas (headings)\n");
     if data.notes.is_empty() {
         out.push_str("- (nenhuma nota)\n");
@@ -946,7 +1036,10 @@ fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph
                 } else {
                     format!(" · {}", flags.join(", "))
                 };
-                out.push_str(&format!("- _saída: {} · entrada: {}{}_\n", m.out_degree, m.in_degree, tail));
+                out.push_str(&format!(
+                    "- _saída: {} · entrada: {}{}_\n",
+                    m.out_degree, m.in_degree, tail
+                ));
             }
             if !note.tags.is_empty() {
                 let ts: Vec<String> = note.tags.iter().map(|t| format!("#{t}")).collect();
@@ -989,7 +1082,10 @@ fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph
     out.push_str("\n## Backlinks (quem aponta pra cá)\n");
     let mut backlinks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for e in &graph.edges {
-        backlinks.entry(e.to.as_str()).or_default().push(e.from.as_str());
+        backlinks
+            .entry(e.to.as_str())
+            .or_default()
+            .push(e.from.as_str());
     }
     let mut any_back = false;
     for note in &data.notes {
@@ -1017,7 +1113,11 @@ fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph
                 LinkIssue::Unresolved => "pendente (nota ainda não existe)",
                 LinkIssue::Ambiguous => "ambíguo (casa >1 nota — não adivinho)",
             };
-            out.push_str(&format!("- {} → [[{}]] — {kind}\n", node_label(&p.from), p.target));
+            out.push_str(&format!(
+                "- {} → [[{}]] — {kind}\n",
+                node_label(&p.from),
+                p.target
+            ));
         }
     }
 
@@ -1073,9 +1173,17 @@ struct IndexJson {
 /// PURO: sidecar JSON com as ARESTAS EXATAS (origem→destino, contagem) + categorias + grau/tags/embeds
 /// por nota — para hops programáticos depois que o assistente escolhe a região no markdown. Determinístico.
 #[must_use]
-fn render_vault_index_json(name: &str, root: &Path, data: &VaultIndexData, graph: &VaultGraph) -> String {
-    let metrics_by_path: BTreeMap<&str, &NoteMetrics> =
-        graph.metrics.iter().map(|m| (m.rel_path.as_str(), m)).collect();
+fn render_vault_index_json(
+    name: &str,
+    root: &Path,
+    data: &VaultIndexData,
+    graph: &VaultGraph,
+) -> String {
+    let metrics_by_path: BTreeMap<&str, &NoteMetrics> = graph
+        .metrics
+        .iter()
+        .map(|m| (m.rel_path.as_str(), m))
+        .collect();
     let notes = data
         .notes
         .iter()
@@ -1104,7 +1212,11 @@ fn render_vault_index_json(name: &str, root: &Path, data: &VaultIndexData, graph
         edges: graph
             .edges
             .iter()
-            .map(|e| EdgeJson { from: e.from.clone(), to: e.to.clone(), count: e.count })
+            .map(|e| EdgeJson {
+                from: e.from.clone(),
+                to: e.to.clone(),
+                count: e.count,
+            })
             .collect(),
         problems: graph
             .problems
@@ -1127,7 +1239,13 @@ fn render_vault_index_json(name: &str, root: &Path, data: &VaultIndexData, graph
 fn slugify(name: &str) -> String {
     let mut s: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     while s.contains("--") {
         s = s.replace("--", "-");
@@ -1146,7 +1264,11 @@ fn slugify(name: &str) -> String {
 fn index_filename_base(name: &str, path: &Path) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
-    format!("{}-{:08x}", slugify(name), (h.finish() & 0xffff_ffff) as u32)
+    format!(
+        "{}-{:08x}",
+        slugify(name),
+        (h.finish() & 0xffff_ffff) as u32
+    )
 }
 
 /// Gera e grava o índice HÍBRIDO de `vault` em `<lina_dir>/vault-index/` (FORA do vault do usuário —
@@ -1159,8 +1281,14 @@ pub fn write_vault_index(lina_dir: &Path, vault: &VaultLink) -> std::io::Result<
     let dir = lina_dir.join("vault-index");
     let md_path = dir.join(format!("{base}.md"));
     let json_path = dir.join(format!("{base}.json"));
-    write_atomic(&md_path, &render_vault_index_with(&vault.name, &vault.path, &data, &graph))?;
-    write_atomic(&json_path, &render_vault_index_json(&vault.name, &vault.path, &data, &graph))?;
+    write_atomic(
+        &md_path,
+        &render_vault_index_with(&vault.name, &vault.path, &data, &graph),
+    )?;
+    write_atomic(
+        &json_path,
+        &render_vault_index_json(&vault.name, &vault.path, &data, &graph),
+    )?;
     Ok(md_path)
 }
 
@@ -1379,7 +1507,10 @@ impl SecondBrainModel {
     /// Estado atual da instalação (clone do compartilhado).
     #[must_use]
     pub fn install_state(&self) -> InstallState {
-        self.install.lock().map(|g| g.clone()).unwrap_or(InstallState::Idle)
+        self.install
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(InstallState::Idle)
     }
 
     /// Aviso corrente do caminho interativo (terminal aberto / use o site).
@@ -1394,7 +1525,12 @@ impl SecondBrainModel {
     pub fn all_vaults(&self) -> Vec<VaultLink> {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        for v in self.scan().vaults.into_iter().chain(self.manual.iter().cloned()) {
+        for v in self
+            .scan()
+            .vaults
+            .into_iter()
+            .chain(self.manual.iter().cloned())
+        {
             if seen.insert(canonical(&v.path)) {
                 out.push(v);
             }
@@ -1411,7 +1547,10 @@ impl SecondBrainModel {
     /// Quantos vaults conhecidos estão marcados.
     #[must_use]
     pub fn selected_count(&self) -> usize {
-        self.all_vaults().iter().filter(|v| self.is_selected(&v.path)).count()
+        self.all_vaults()
+            .iter()
+            .filter(|v| self.is_selected(&v.path))
+            .count()
     }
 
     /// Estado da tela (UX §3) — fonte única do banner e do rodapé.
@@ -1546,7 +1685,12 @@ impl SecondBrainModel {
     /// (Obsidian é app, não binário no PATH) — devolve um `DiscoveredCli` sintético p/ o `run_install`.
     fn start_silent(&mut self, recipe: InstallRecipe) {
         self.install_consumed = false;
-        set_install(&self.install, InstallState::Installing { line: "iniciando…".into() });
+        set_install(
+            &self.install,
+            InstallState::Installing {
+                line: "iniciando…".into(),
+            },
+        );
         let handle = run_install(recipe, Arc::clone(&self.install), move || {
             find_app_bundle(OBSIDIAN_APP).map(|p| DiscoveredCli {
                 id: OBSIDIAN_ID.to_string(),
@@ -1579,8 +1723,11 @@ impl SecondBrainModel {
     /// integração com a doutrina é via os arquivos `.lina/` (o onboarding NÃO tem handles do canvas —
     /// não chama `rewrite_bootstrap`; a próxima reescrita natural do bootstrap pega o `primary`).
     pub fn confirm(&mut self) {
-        let chosen: Vec<VaultLink> =
-            self.all_vaults().into_iter().filter(|v| self.is_selected(&v.path)).collect();
+        let chosen: Vec<VaultLink> = self
+            .all_vaults()
+            .into_iter()
+            .filter(|v| self.is_selected(&v.path))
+            .collect();
         if chosen.is_empty() {
             self.skip();
             return;
@@ -1599,7 +1746,10 @@ impl SecondBrainModel {
                 writable: v.path.join("Lina").display().to_string(),
             })
             .collect();
-        let config = VaultConfig { primary, vaults: entries };
+        let config = VaultConfig {
+            primary,
+            vaults: entries,
+        };
         // `vault.json` é pequeno → grava já (rápido na thread de UI).
         if let Err(e) = write_vault_config(&self.lina_dir, &config) {
             eprintln!("obsidian: não gravei .lina/vault.json: {e}");
@@ -1679,11 +1829,9 @@ impl SecondBrainModel {
             "🛡️ A Lina nunca apaga nem altera suas anotações. Ela só escreve numa pastinha nova \
              chamada \"Lina\", que cria dentro da pasta que você escolher. No resto, NUNCA mexe.",
         ));
-        col = col.child(
-            div().text_color(rgb(MUTED)).child(text!(
-                "💾 Salvo automaticamente. Pode fechar e voltar quando quiser — nada se perde."
-            )),
-        );
+        col = col.child(div().text_color(rgb(MUTED)).child(text!(
+            "💾 Salvo automaticamente. Pode fechar e voltar quando quiser — nada se perde."
+        )));
 
         // Rodapé (UX §5): Voltar · Verificar · slot primário (rótulo concordante com o banner).
         col = col.child(self.footer(screen, count, cx));
@@ -1750,7 +1898,11 @@ impl SecondBrainModel {
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_color(rgb(MUTED)).child(text!("⟳ Procurando o app Obsidian … aguarde")))
+            .child(
+                div()
+                    .text_color(rgb(MUTED))
+                    .child(text!("⟳ Procurando o app Obsidian … aguarde")),
+            )
             .child(
                 div()
                     .text_color(rgb(MUTED))
@@ -1766,19 +1918,25 @@ impl SecondBrainModel {
             install,
             InstallState::Installing { .. } | InstallState::Verifying
         );
-        let mut col = div().flex().flex_col().gap_3().child(
-            div().text_color(rgb(TEXT)).child(text!(
-                "Seu caderno de anotações vira a memória da Lina — ela aprende com o que você escreve \
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_color(rgb(TEXT)).child(text!(
+            "Seu caderno de anotações vira a memória da Lina — ela aprende com o que você escreve \
                  e te ajuda melhor."
-            )),
-        );
+        )));
 
         if installing {
             let line = match &install {
                 InstallState::Installing { line } => line.clone(),
                 _ => "verificando…".to_string(),
             };
-            col = col.child(banner(PANEL, AMBER, &format!("⟳ Instalando o Obsidian: {line}")));
+            col = col.child(banner(
+                PANEL,
+                AMBER,
+                &format!("⟳ Instalando o Obsidian: {line}"),
+            ));
         } else {
             col = col.child(
                 div()
@@ -1854,11 +2012,17 @@ impl SecondBrainModel {
             // Confirmar GRAVA (vault.json + índice) E AVANÇA o passo — sem isto o usuário confirmava e
             // ficava "preso" tendo que achar o "Continuar →" no rodapé (que ficava cortado). O rodapé
             // segue existindo p/ quem quer pular sem confirmar.
-            col = col.child(action_button("sb-confirm", &label, 0x2c7a4b, cx, |onb, _w, cx| {
-                onb.second_brain.confirm();
-                onb.nav_continue();
-                cx.notify();
-            }));
+            col = col.child(action_button(
+                "sb-confirm",
+                &label,
+                0x2c7a4b,
+                cx,
+                |onb, _w, cx| {
+                    onb.second_brain.confirm();
+                    onb.nav_continue();
+                    cx.notify();
+                },
+            ));
         }
         col.into_any_element()
     }
@@ -1911,9 +2075,17 @@ impl SecondBrainModel {
                             .font_weight(FontWeight::BOLD)
                             .child(text!(name_line)),
                     )
-                    .child(div().text_color(rgb(if selected { GREEN } else { MUTED })).child(text!(status))),
+                    .child(
+                        div()
+                            .text_color(rgb(if selected { GREEN } else { MUTED }))
+                            .child(text!(status)),
+                    ),
             )
-            .child(div().text_color(rgb(MUTED)).child(text!(v.path.display().to_string())))
+            .child(
+                div()
+                    .text_color(rgb(MUTED))
+                    .child(text!(v.path.display().to_string())),
+            )
             .into_any_element()
     }
 
@@ -1923,8 +2095,16 @@ impl SecondBrainModel {
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().text_color(rgb(GREEN)).child(text!("● Obsidian (seu caderno de anotações) … encontrado")))
-            .child(div().text_color(rgb(AMBER)).child(text!("● Pastas de anotações … nenhuma ainda")))
+            .child(
+                div()
+                    .text_color(rgb(GREEN))
+                    .child(text!("● Obsidian (seu caderno de anotações) … encontrado")),
+            )
+            .child(
+                div()
+                    .text_color(rgb(AMBER))
+                    .child(text!("● Pastas de anotações … nenhuma ainda")),
+            )
             .child(div().text_color(rgb(TEXT)).child(text!(
                 "① Apontar uma pasta que você já tem — se você já guarda anotações numa pasta do \
                  computador, é só mostrar ela pra Lina."
@@ -1939,15 +2119,25 @@ impl SecondBrainModel {
                     .flex()
                     .flex_row()
                     .gap_3()
-                    .child(ghost_button("sb-open-app", "↗ Abrir o Obsidian", cx, |_onb, _w, cx| {
-                        if let Some(p) = find_app_bundle(OBSIDIAN_APP) {
-                            cx.open_with_system(&p);
-                        }
-                    }))
-                    .child(ghost_button("sb-recheck", "⟳ Já criei — procurar de novo", cx, |onb, _w, cx| {
-                        onb.second_brain.verify_now();
-                        cx.notify();
-                    })),
+                    .child(ghost_button(
+                        "sb-open-app",
+                        "↗ Abrir o Obsidian",
+                        cx,
+                        |_onb, _w, cx| {
+                            if let Some(p) = find_app_bundle(OBSIDIAN_APP) {
+                                cx.open_with_system(&p);
+                            }
+                        },
+                    ))
+                    .child(ghost_button(
+                        "sb-recheck",
+                        "⟳ Já criei — procurar de novo",
+                        cx,
+                        |onb, _w, cx| {
+                            onb.second_brain.verify_now();
+                            cx.notify();
+                        },
+                    )),
             )
             .into_any_element()
     }
@@ -1955,7 +2145,12 @@ impl SecondBrainModel {
     /// Estado 5 — confirmado: recap das pastas + limite reafirmado + reversibilidade.
     fn body_confirmed(&self, cx: &mut Context<OnboardingView>) -> AnyElement {
         let mut list = div().flex().flex_col().gap_2();
-        for (i, v) in self.all_vaults().into_iter().filter(|v| self.is_selected(&v.path)).enumerate() {
+        for (i, v) in self
+            .all_vaults()
+            .into_iter()
+            .filter(|v| self.is_selected(&v.path))
+            .enumerate()
+        {
             list = list.child(
                 div()
                     .id(("sb-recap", i))
@@ -1972,7 +2167,11 @@ impl SecondBrainModel {
                             .font_weight(FontWeight::BOLD)
                             .child(text!(format!("✓ {}", v.name))),
                     )
-                    .child(div().text_color(rgb(MUTED)).child(text!(format!("{}  ·  Vai ser usada", v.path.display())))),
+                    .child(
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child(text!(format!("{}  ·  Vai ser usada", v.path.display()))),
+                    ),
             );
         }
         div()
@@ -2027,28 +2226,41 @@ impl SecondBrainModel {
             .flex_row()
             .items_center()
             .gap_3()
-            .child(ghost_button("sb-back", "← Voltar", cx, |onb, _w, _cx| onb.nav_back()));
+            .child(ghost_button("sb-back", "← Voltar", cx, |onb, _w, _cx| {
+                onb.nav_back()
+            }));
 
         // [Verificar]: oculto no estado 5; ativo nos demais (re-roda a detecção preservando marcações).
         if screen != Screen::Confirmed {
-            row = row.child(ghost_button("sb-verify", "⟳ Verificar", cx, |onb, _w, cx| {
-                onb.second_brain.verify_now();
-                cx.notify();
-            }));
+            row = row.child(ghost_button(
+                "sb-verify",
+                "⟳ Verificar",
+                cx,
+                |onb, _w, cx| {
+                    onb.second_brain.verify_now();
+                    cx.notify();
+                },
+            ));
         }
         row = row.child(div().flex_1());
 
         // Slot primário: rótulo derivado do estado (footer_label) — concorda com o banner.
         let label = footer_label(screen, count);
         let confirm_and_advance = screen == Screen::WithVaults && count > 0;
-        row = row.child(action_button("sb-primary", &label, 0x2c7a4b, cx, move |onb, _w, _cx| {
-            if confirm_and_advance {
-                onb.second_brain.confirm();
-            } else if screen != Screen::Confirmed {
-                onb.second_brain.skip();
-            }
-            onb.nav_continue();
-        }));
+        row = row.child(action_button(
+            "sb-primary",
+            &label,
+            0x2c7a4b,
+            cx,
+            move |onb, _w, _cx| {
+                if confirm_and_advance {
+                    onb.second_brain.confirm();
+                } else if screen != Screen::Confirmed {
+                    onb.second_brain.skip();
+                }
+                onb.nav_continue();
+            },
+        ));
         row.into_any_element()
     }
 }
@@ -2075,7 +2287,12 @@ fn heading(title: &str, subtitle: &str) -> AnyElement {
                 .text_color(rgb(TEXT))
                 .child(text!(title.to_string())),
         )
-        .child(div().text_size(px(15.0)).text_color(rgb(MUTED)).child(text!(subtitle.to_string())))
+        .child(
+            div()
+                .text_size(px(15.0))
+                .text_color(rgb(MUTED))
+                .child(text!(subtitle.to_string())),
+        )
         .into_any_element()
 }
 
@@ -2136,7 +2353,11 @@ fn ghost_button(
 /// Botão "Adicionar/Escolher pasta": abre o **seletor nativo** (só-pastas) FORA da thread de UI
 /// (async via `cx.spawn`), valida pelo caminho canônico (dedup) e adiciona marcada. Erro = silencioso
 /// (cancelar é legítimo); o estado nunca se perde.
-fn add_folder_button(id: &'static str, label: &str, cx: &mut Context<OnboardingView>) -> AnyElement {
+fn add_folder_button(
+    id: &'static str,
+    label: &str,
+    cx: &mut Context<OnboardingView>,
+) -> AnyElement {
     div()
         .id(id)
         .px_4()
@@ -2209,7 +2430,8 @@ mod tests {
     /// `extract_headings`: só `#{1,6} ` no início da linha; ignora `#` indentado e `#sem-espaço`.
     #[test]
     fn headings_match_only_real_markdown_headings() {
-        let md = "# Título\ntexto\n## Seção\n   # indentado\n#semsespaco\n###### Seis\n####### Sete";
+        let md =
+            "# Título\ntexto\n## Seção\n   # indentado\n#semsespaco\n###### Seis\n####### Sete";
         let hs = extract_headings(md);
         assert_eq!(hs, vec!["# Título", "## Seção", "###### Seis"]);
     }
@@ -2246,7 +2468,10 @@ mod tests {
             "tags em código não contam: {:?}",
             note.tags
         );
-        assert!(!note.links.iter().any(|l| l == "FakeLink" || l == "OutroFake"));
+        assert!(!note
+            .links
+            .iter()
+            .any(|l| l == "FakeLink" || l == "OutroFake"));
         assert!(!note.embeds.iter().any(|e| e == "fake.png"));
     }
 
@@ -2262,7 +2487,10 @@ mod tests {
     #[test]
     fn link_counts_track_multiplicity() {
         let md = "[[B]] e [[B]] e [[C]] e ![[B]]";
-        assert_eq!(link_count_pairs(md), vec![("B".to_string(), 2), ("C".to_string(), 1)]);
+        assert_eq!(
+            link_count_pairs(md),
+            vec![("B".to_string(), 2), ("C".to_string(), 1)]
+        );
     }
 
     /// `extract_frontmatter_tags`: bloco YAML, lista flow e escalar; aspas desencapadas; sem fm → vazio.
@@ -2285,10 +2513,16 @@ mod tests {
         let body =
             "tenho #projeto/lina e #ok mas https://x.com/#frag não, nem `#emcodigo`, nem #123 fim";
         let tags = extract_inline_tags(body);
-        assert!(tags.contains(&"projeto/lina".to_string()), "nested: {tags:?}");
+        assert!(
+            tags.contains(&"projeto/lina".to_string()),
+            "nested: {tags:?}"
+        );
         assert!(tags.contains(&"ok".to_string()));
         assert!(!tags.iter().any(|t| t == "frag"), "url frag não é tag");
-        assert!(!tags.iter().any(|t| t == "emcodigo"), "inline code não é tag");
+        assert!(
+            !tags.iter().any(|t| t == "emcodigo"),
+            "inline code não é tag"
+        );
         assert!(!tags.iter().any(|t| t == "123"), "numérico puro não é tag");
     }
 
@@ -2311,7 +2545,10 @@ mod tests {
         let note = parse_note("p.md".into(), md);
         assert_eq!(note.tags, vec!["fromfm", "inline"]);
         assert_eq!(note.links, vec!["Link"]);
-        assert!(note.headings.is_empty(), "o `---` do frontmatter não é heading");
+        assert!(
+            note.headings.is_empty(),
+            "o `---` do frontmatter não é heading"
+        );
     }
 
     /// Helper de teste: uma `NoteEntry` com `rel_path` + links (deriva `link_counts` p/ o peso).
@@ -2348,9 +2585,21 @@ mod tests {
         assert_eq!(
             g.edges,
             vec![
-                GraphEdge { from: "A.md".into(), to: "B.md".into(), count: 2 },
-                GraphEdge { from: "A.md".into(), to: "C.md".into(), count: 1 },
-                GraphEdge { from: "B.md".into(), to: "C.md".into(), count: 1 },
+                GraphEdge {
+                    from: "A.md".into(),
+                    to: "B.md".into(),
+                    count: 2
+                },
+                GraphEdge {
+                    from: "A.md".into(),
+                    to: "C.md".into(),
+                    count: 1
+                },
+                GraphEdge {
+                    from: "B.md".into(),
+                    to: "C.md".into(),
+                    count: 1
+                },
             ]
         );
         let m = |p: &str| g.metrics.iter().find(|x| x.rel_path == p).unwrap().clone();
@@ -2375,12 +2624,20 @@ mod tests {
         };
         let g = analyze_graph(&data);
         assert!(
-            g.edges.iter().any(|e| e.from == "Start.md" && e.to == "Area/Dup.md"),
+            g.edges
+                .iter()
+                .any(|e| e.from == "Start.md" && e.to == "Area/Dup.md"),
             "caminho parcial desambigua: {:?}",
             g.edges
         );
-        assert!(g.problems.iter().any(|p| p.target == "Dup" && p.issue == LinkIssue::Ambiguous));
-        assert!(g.problems.iter().any(|p| p.target == "Pendente" && p.issue == LinkIssue::Unresolved));
+        assert!(g
+            .problems
+            .iter()
+            .any(|p| p.target == "Dup" && p.issue == LinkIssue::Ambiguous));
+        assert!(g
+            .problems
+            .iter()
+            .any(|p| p.target == "Pendente" && p.issue == LinkIssue::Unresolved));
     }
 
     /// `analyze_graph`: hub (in-degree ≥ 15), MOC (nome OU tag), órfão e ponto de entrada (out ≥ 5).
@@ -2390,22 +2647,35 @@ mod tests {
         for i in 0..15 {
             notes.push(note(&format!("ref{i}.md"), &["Central"]));
         }
-        notes.push(NoteEntry { rel_path: "Projetos MOC.md".into(), ..Default::default() });
+        notes.push(NoteEntry {
+            rel_path: "Projetos MOC.md".into(),
+            ..Default::default()
+        });
         notes.push(NoteEntry {
             rel_path: "Indice.md".into(),
             tags: vec!["moc".into()],
             ..Default::default()
         });
         notes.push(note("Porta.md", &["ref0", "ref1", "ref2", "ref3", "ref4"]));
-        let data = VaultIndexData { folders: vec![], notes };
+        let data = VaultIndexData {
+            folders: vec![],
+            notes,
+        };
         let g = analyze_graph(&data);
         let m = |p: &str| g.metrics.iter().find(|x| x.rel_path == p).unwrap().clone();
         assert_eq!(m("Central.md").in_degree, 15);
         assert!(m("Central.md").is_hub);
         assert!(m("Projetos MOC.md").is_moc, "MOC por nome");
         assert!(m("Indice.md").is_moc, "MOC por tag #moc");
-        assert!(m("Porta.md").is_entry_point, "out_degree {}", m("Porta.md").out_degree);
-        assert!(m("Projetos MOC.md").is_orphan, "MOC pode ser órfão (categorias independentes)");
+        assert!(
+            m("Porta.md").is_entry_point,
+            "out_degree {}",
+            m("Porta.md").out_degree
+        );
+        assert!(
+            m("Projetos MOC.md").is_orphan,
+            "MOC pode ser órfão (categorias independentes)"
+        );
     }
 
     /// `is_moc`: casa `moc` como TOKEN (não substring) — evita "democracia"/"mockup"; + tag e "map of
@@ -2418,7 +2688,10 @@ mod tests {
         assert!(is_moc("Maps of Content.md", &[]));
         assert!(is_moc("Qualquer.md", &["moc".to_string()]), "tag #moc");
         assert!(!is_moc("democracia.md", &[]), "substring no meio não conta");
-        assert!(!is_moc("mockup.md", &[]), "substring no início de palavra não conta");
+        assert!(
+            !is_moc("mockup.md", &[]),
+            "substring no início de palavra não conta"
+        );
     }
 
     /// `render_vault_index_with`: as seções de navegação existem, o ponto de entrada e os backlinks são
@@ -2449,9 +2722,15 @@ mod tests {
         ] {
             assert!(md.contains(sec), "falta seção {sec}");
         }
-        assert!(md.contains("Hub (saída: 5)"), "ponto de entrada listado:\n{md}");
+        assert!(
+            md.contains("Hub (saída: 5)"),
+            "ponto de entrada listado:\n{md}"
+        );
         assert!(md.contains("a ← [[Hub]]"), "backlink listado:\n{md}");
-        assert!(md.contains("NaoExiste") && md.contains("pendente"), "link pendente:\n{md}");
+        assert!(
+            md.contains("NaoExiste") && md.contains("pendente"),
+            "link pendente:\n{md}"
+        );
         // o grafo de saída mantém o formato legado.
         assert!(md.contains("Hub → [[a]], [[b]], [[c]], [[d]], [[e]]"));
     }
@@ -2473,7 +2752,10 @@ mod tests {
         assert_eq!(v["edges"][0]["to"], "B.md");
         assert_eq!(v["edges"][0]["count"], 2);
         // determinístico: re-render = idêntico.
-        assert_eq!(js, render_vault_index_json("V", Path::new("/tmp/v"), &data, &g));
+        assert_eq!(
+            js,
+            render_vault_index_json("V", Path::new("/tmp/v"), &data, &g)
+        );
     }
 
     /// `obsidian_config_paths_for`: 1 caminho no macOS/Windows; no Linux MERGE de nativo+Flatpak+Snap;
@@ -2506,8 +2788,9 @@ mod tests {
             ]
         );
         // XDG_CONFIG_HOME sobrepõe o ~/.config.
-        let env_xdg =
-            |k: &str| -> Option<OsString> { (k == "XDG_CONFIG_HOME").then(|| OsString::from("/cfg")) };
+        let env_xdg = |k: &str| -> Option<OsString> {
+            (k == "XDG_CONFIG_HOME").then(|| OsString::from("/cfg"))
+        };
         let lin = obsidian_config_paths_for("linux", Some(&home), &env_xdg);
         assert_eq!(lin[0], PathBuf::from("/cfg/obsidian/obsidian.json"));
     }
@@ -2541,11 +2824,15 @@ mod tests {
             "per-user em Programs\\: {win:?}"
         );
         assert!(win.contains(
-            &PathBuf::from("C:\\Program Files").join("Obsidian").join("Obsidian.exe")
+            &PathBuf::from("C:\\Program Files")
+                .join("Obsidian")
+                .join("Obsidian.exe")
         ));
 
         let lin = app_bundle_candidates_for("linux", "Obsidian", Some(&home), &none);
-        assert!(lin.contains(&PathBuf::from("/var/lib/flatpak/exports/bin/md.obsidian.Obsidian")));
+        assert!(lin.contains(&PathBuf::from(
+            "/var/lib/flatpak/exports/bin/md.obsidian.Obsidian"
+        )));
         assert!(lin.contains(&PathBuf::from("/usr/bin/obsidian")));
         assert!(lin.contains(&PathBuf::from("/snap/bin/obsidian")));
         assert!(lin.contains(&home.join(".local/share/flatpak/exports/bin/md.obsidian.Obsidian")));
@@ -2576,8 +2863,14 @@ mod tests {
         assert_eq!(footer_label(Screen::NotInstalled, 0), "Pular esta etapa →");
         assert_eq!(footer_label(Screen::NoVaults, 0), "Pular esta etapa →");
         assert_eq!(footer_label(Screen::WithVaults, 0), "Pular esta etapa →");
-        assert_eq!(footer_label(Screen::WithVaults, 1), "Continuar com 1 pasta →");
-        assert_eq!(footer_label(Screen::WithVaults, 3), "Continuar com 3 pastas →");
+        assert_eq!(
+            footer_label(Screen::WithVaults, 1),
+            "Continuar com 1 pasta →"
+        );
+        assert_eq!(
+            footer_label(Screen::WithVaults, 3),
+            "Continuar com 3 pastas →"
+        );
         assert_eq!(footer_label(Screen::Confirmed, 2), "Continuar →");
     }
 
@@ -2607,9 +2900,10 @@ mod tests {
         assert!(md.contains("- ## Sub"));
         assert!(md.contains("a → [[b]]")); // grafo: a aponta b
         assert!(md.contains("Area/b → (folha)")); // b é folha
-        // determinístico: re-scan + re-render = idêntico.
+                                                  // determinístico: re-scan + re-render = idêntico.
         let data2 = scan_vault(vault.path());
-        let md2 = render_vault_index_with("Meu Vault", vault.path(), &data2, &analyze_graph(&data2));
+        let md2 =
+            render_vault_index_with("Meu Vault", vault.path(), &data2, &analyze_graph(&data2));
         assert_eq!(md, md2);
     }
 
@@ -2626,9 +2920,14 @@ mod tests {
             added_manually: false,
         };
         let out = write_vault_index(lina.path(), &v).expect("escreveu índice");
-        assert!(out.starts_with(lina.path()), "índice mora em .lina, não no vault");
+        assert!(
+            out.starts_with(lina.path()),
+            "índice mora em .lina, não no vault"
+        );
         assert!(out.exists());
-        assert!(std::fs::read_to_string(&out).unwrap().contains("# Vault Index — Notas"));
+        assert!(std::fs::read_to_string(&out)
+            .unwrap()
+            .contains("# Vault Index — Notas"));
         // não vazou pra dentro do vault.
         assert!(!vault.path().join("vault-index").exists());
     }
@@ -2647,7 +2946,10 @@ mod tests {
             }],
         };
         write_vault_config(lina.path(), &cfg).expect("gravou vault.json");
-        assert_eq!(read_primary_vault(lina.path()).as_deref(), Some("/Users/voce/Notas"));
+        assert_eq!(
+            read_primary_vault(lina.path()).as_deref(),
+            Some("/Users/voce/Notas")
+        );
         // releitura completa = igual.
         let back: VaultConfig =
             serde_json::from_str(&std::fs::read_to_string(lina.path().join("vault.json")).unwrap())
@@ -2661,7 +2963,9 @@ mod tests {
         let inst = second_brain_installers();
         let prof = inst.0.get("obsidian").expect("falta receita obsidian");
         for os in ["macos", "linux", "windows"] {
-            let r = prof.for_os(os).unwrap_or_else(|| panic!("falta obsidian.{os}"));
+            let r = prof
+                .for_os(os)
+                .unwrap_or_else(|| panic!("falta obsidian.{os}"));
             assert!(!r.program.trim().is_empty(), "obsidian.{os} sem program");
         }
         // macOS usa cask do brew (verificado por bundle, não PATH).
@@ -2677,15 +2981,24 @@ mod tests {
         let inst = second_brain_installers();
         let prof = &inst.0["obsidian"];
         let mac = prof.for_os("macos").cloned();
-        assert_eq!(decide_plan("obsidian", "macos", mac.as_ref(), |_| true), InstallPlan::Silent);
+        assert_eq!(
+            decide_plan("obsidian", "macos", mac.as_ref(), |_| true),
+            InstallPlan::Silent
+        );
         assert_eq!(
             decide_plan("obsidian", "macos", mac.as_ref(), |_| false),
             InstallPlan::Interactive
         );
         let win = prof.for_os("windows").cloned();
-        assert_eq!(decide_plan("obsidian", "windows", win.as_ref(), |_| true), InstallPlan::Interactive);
+        assert_eq!(
+            decide_plan("obsidian", "windows", win.as_ref(), |_| true),
+            InstallPlan::Interactive
+        );
         let lin = prof.for_os("linux").cloned();
-        assert_eq!(decide_plan("obsidian", "linux", lin.as_ref(), |_| true), InstallPlan::Silent);
+        assert_eq!(
+            decide_plan("obsidian", "linux", lin.as_ref(), |_| true),
+            InstallPlan::Silent
+        );
     }
 
     /// Snapshot INJETADO: o modelo reflete app+vaults, deriva o estado (screen) e roda fora da thread.
@@ -2723,8 +3036,10 @@ mod tests {
         m.poll();
         assert_eq!(m.screen(), Screen::NotInstalled);
 
-        let app_only: ScanFn =
-            Arc::new(|| ObsidianScan { app_present: true, vaults: vec![] });
+        let app_only: ScanFn = Arc::new(|| ObsidianScan {
+            app_present: true,
+            vaults: vec![],
+        });
         let mut m2 = SecondBrainModel::new_with(lina.path().to_path_buf(), app_only);
         m2.block_on_discovery();
         m2.poll();
@@ -2735,7 +3050,10 @@ mod tests {
     #[test]
     fn toggle_selects_and_deselects() {
         let lina = TempDir::new("toggle");
-        let app_only: ScanFn = Arc::new(|| ObsidianScan { app_present: true, vaults: vec![] });
+        let app_only: ScanFn = Arc::new(|| ObsidianScan {
+            app_present: true,
+            vaults: vec![],
+        });
         let mut m = SecondBrainModel::new_with(lina.path().to_path_buf(), app_only);
         m.block_on_discovery();
         m.poll();
@@ -2778,26 +3096,50 @@ mod tests {
             Some(vpath.display().to_string().as_str())
         );
         // writable = <path>/Lina.
-        let cfg: VaultConfig = serde_json::from_str(
-            &std::fs::read_to_string(lina.path().join("vault.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(cfg.vaults[0].writable, vpath.join("Lina").display().to_string());
+        let cfg: VaultConfig =
+            serde_json::from_str(&std::fs::read_to_string(lina.path().join("vault.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cfg.vaults[0].writable,
+            vpath.join("Lina").display().to_string()
+        );
         // índice gerado em .lina/vault-index/ (agora em BACKGROUND ao confirmar — não trava a UI;
         // o teste espera a thread terminar p/ ser determinístico). HÍBRIDO: markdown + sidecar JSON.
         m.block_on_index();
         let idx_dir = lina.path().join("vault-index");
         let files: Vec<_> = std::fs::read_dir(&idx_dir).unwrap().flatten().collect();
-        let ext = |f: &std::fs::DirEntry| f.path().extension().map(|e| e.to_string_lossy().into_owned());
+        let ext = |f: &std::fs::DirEntry| {
+            f.path()
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+        };
         assert_eq!(files.len(), 2, "markdown + json por vault marcado");
-        assert_eq!(files.iter().filter(|f| ext(f).as_deref() == Some("md")).count(), 1);
-        assert_eq!(files.iter().filter(|f| ext(f).as_deref() == Some("json")).count(), 1);
-        let md_file = files.iter().find(|f| ext(f).as_deref() == Some("md")).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|f| ext(f).as_deref() == Some("md"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|f| ext(f).as_deref() == Some("json"))
+                .count(),
+            1
+        );
+        let md_file = files
+            .iter()
+            .find(|f| ext(f).as_deref() == Some("md"))
+            .unwrap();
         let idx = std::fs::read_to_string(md_file.path()).unwrap();
         assert!(idx.contains("# Vault Index — Notas"));
         assert!(idx.contains("nota → [[outra]]"));
         // o sidecar JSON é válido e carrega as arestas exatas.
-        let json_file = files.iter().find(|f| ext(f).as_deref() == Some("json")).unwrap();
+        let json_file = files
+            .iter()
+            .find(|f| ext(f).as_deref() == Some("json"))
+            .unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(json_file.path()).unwrap()).unwrap();
         assert_eq!(v["vault"], "Notas");
@@ -2808,7 +3150,10 @@ mod tests {
     #[test]
     fn confirm_with_zero_selected_does_not_write_config() {
         let lina = TempDir::new("conf-zero");
-        let app_only: ScanFn = Arc::new(|| ObsidianScan { app_present: true, vaults: vec![] });
+        let app_only: ScanFn = Arc::new(|| ObsidianScan {
+            app_present: true,
+            vaults: vec![],
+        });
         let mut m = SecondBrainModel::new_with(lina.path().to_path_buf(), app_only);
         m.block_on_discovery();
         m.poll();
@@ -2821,15 +3166,24 @@ mod tests {
     fn add_manual_vault_dedups_and_selects() {
         let folder = TempDir::new("manual");
         let lina = TempDir::new("manual-lina");
-        let app_only: ScanFn = Arc::new(|| ObsidianScan { app_present: true, vaults: vec![] });
+        let app_only: ScanFn = Arc::new(|| ObsidianScan {
+            app_present: true,
+            vaults: vec![],
+        });
         let mut m = SecondBrainModel::new_with(lina.path().to_path_buf(), app_only);
         m.block_on_discovery();
         m.poll();
-        assert_eq!(m.add_manual_vault(folder.path().to_path_buf()), AddResult::Added);
+        assert_eq!(
+            m.add_manual_vault(folder.path().to_path_buf()),
+            AddResult::Added
+        );
         assert_eq!(m.all_vaults().len(), 1);
         assert!(m.is_selected(folder.path()));
         // mesma pasta de novo → não duplica.
-        assert_eq!(m.add_manual_vault(folder.path().to_path_buf()), AddResult::AlreadyPresent);
+        assert_eq!(
+            m.add_manual_vault(folder.path().to_path_buf()),
+            AddResult::AlreadyPresent
+        );
         assert_eq!(m.all_vaults().len(), 1);
     }
 

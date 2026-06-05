@@ -381,7 +381,10 @@ impl Router {
                     // autenticada pelo subdir; nada de roteamento muda, só a re-tentativa.
                     self.seen.remove(&m.id);
                 }
-                let hold = matches!(outcome, RouteOutcome::PersistFailed(_) | RouteOutcome::Queued);
+                let hold = matches!(
+                    outcome,
+                    RouteOutcome::PersistFailed(_) | RouteOutcome::Queued
+                );
                 if !hold && !retain_transient {
                     // Desfecho definitivo (entregue, duplicado, hop-limit, ou transiente esgotado):
                     // confirma e limpa o contador (anti-vazamento do mapa).
@@ -1617,11 +1620,18 @@ mod tests {
         let (rec, mut deliver) = recorder();
 
         let m = MailMessage::new("", "@Terminal B", "ask", "oi");
-        router.mailbox().enqueue_as("Terminal A", &m).expect("enqueue A");
+        router
+            .mailbox()
+            .enqueue_as("Terminal A", &m)
+            .expect("enqueue A");
 
         // 1º tick: B ainda não existe → NoTarget, mas a msg é RETIDA (não ackeada).
         let r1 = router.pump(&mut ts.store, 1000, &mut deliver);
-        assert_eq!(r1[0].1, RouteOutcome::NoTarget, "B ausente → NoTarget transiente");
+        assert_eq!(
+            r1[0].1,
+            RouteOutcome::NoTarget,
+            "B ausente → NoTarget transiente"
+        );
         assert!(rec.borrow().is_empty(), "nada entregue ainda");
 
         // B chega (registro tardio — a race).
@@ -1634,7 +1644,11 @@ mod tests {
             RouteOutcome::Delivered { targets: vec![b] },
             "o tick seguinte entrega à B recém-chegada — a msg não foi perdida"
         );
-        assert_eq!(rec.borrow().len(), 1, "entregue exatamente uma vez (sem duplicar)");
+        assert_eq!(
+            rec.borrow().len(),
+            1,
+            "entregue exatamente uma vez (sem duplicar)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1650,7 +1664,10 @@ mod tests {
         let (_rec, mut deliver) = recorder();
 
         let m = MailMessage::new("", "@Fantasma", "ask", "oi"); // destino que nunca existe
-        router.mailbox().enqueue_as("Terminal A", &m).expect("enqueue A");
+        router
+            .mailbox()
+            .enqueue_as("Terminal A", &m)
+            .expect("enqueue A");
 
         // Bombeia além do teto: cada tick re-tenta enquanto < teto; no teto, ackeia.
         for t in 0..(MAX_TRANSIENT_RETRIES + 3) {

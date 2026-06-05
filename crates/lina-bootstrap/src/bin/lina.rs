@@ -198,7 +198,11 @@ fn run_ask(args: &[String]) -> ExitCode {
             // (poll bounded no espelho `log.jsonl`) o desfecho REAL e o reportamos.
             match poll_route_outcome(&msg.id) {
                 RouteConfirm::Delivered { to_node } => {
-                    let dst = if to_node.is_empty() { msg.to.clone() } else { to_node };
+                    let dst = if to_node.is_empty() {
+                        msg.to.clone()
+                    } else {
+                        to_node
+                    };
                     println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
                     ExitCode::SUCCESS
                 }
@@ -289,8 +293,9 @@ fn poll_route_outcome(msg_id: &str) -> RouteConfirm {
     let path = event_log_path();
     let deadline = Instant::now() + Duration::from_millis(3000);
     loop {
-        let outcome =
-            std::fs::read_to_string(&path).ok().and_then(|c| scan_log_outcome(&c, msg_id));
+        let outcome = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| scan_log_outcome(&c, msg_id));
         match outcome {
             // Entregue → conclui já. Bloqueado → só conclui no prazo (pode ser re-tentado e entregar).
             Some(o @ RouteConfirm::Delivered { .. }) => return o,
@@ -304,9 +309,11 @@ fn poll_route_outcome(msg_id: &str) -> RouteConfirm {
 /// Tradução acionável do motivo de bloqueio (o leitor é um agente de IA — texto claro, sem jargão de log).
 fn explain_block(reason: &str) -> String {
     match reason {
-        "unknown_sender" => "o Espaco nao reconheceu voce como remetente vivo (seu terminal pode nao \
+        "unknown_sender" => {
+            "o Espaco nao reconheceu voce como remetente vivo (seu terminal pode nao \
              estar no roster ainda, ou houve uma corrida de registro)"
-            .to_string(),
+                .to_string()
+        }
         "no_target" => "o destino nao foi encontrado entre os agentes vivos do Espaco".to_string(),
         "hop_limit" => "o limite de encaminhamento (anti-loop) foi atingido".to_string(),
         "self_message" => "voce tentou enviar para si mesmo".to_string(),
@@ -856,8 +863,10 @@ fn vault_index() -> ExitCode {
 fn resolve_note(cfg: &VaultConfigJson, nota: &str) -> Option<PathBuf> {
     let rel = nota.trim_start_matches('/');
     for v in &cfg.vaults {
-        for cand in [PathBuf::from(&v.path).join(rel), PathBuf::from(&v.path).join(format!("{rel}.md"))]
-        {
+        for cand in [
+            PathBuf::from(&v.path).join(rel),
+            PathBuf::from(&v.path).join(format!("{rel}.md")),
+        ] {
             if cand.is_file() {
                 return Some(cand);
             }
@@ -940,7 +949,11 @@ fn vault_search(termo: Option<&str>) -> ExitCode {
                     let Ok(content) = std::fs::read_to_string(&p) else {
                         continue;
                     };
-                    let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    let rel = p
+                        .strip_prefix(&root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     for (n, line) in content.lines().enumerate() {
                         if line.to_lowercase().contains(&needle) {
                             println!("{rel}:{}: {}", n + 1, line.trim());
@@ -955,7 +968,9 @@ fn vault_search(termo: Option<&str>) -> ExitCode {
         }
     }
     if hits == 0 {
-        println!("(sem resultados para \"{termo}\" — tente `lina vault index` para ver a estrutura)");
+        println!(
+            "(sem resultados para \"{termo}\" — tente `lina vault index` para ver a estrutura)"
+        );
     }
     ExitCode::SUCCESS
 }
@@ -991,7 +1006,10 @@ mod vault_tests {
         std::fs::write(vault.join("Area").join("nota.md"), "# Oi\nconteúdo").expect("nota");
         let cfg = VaultConfigJson {
             primary: vault.display().to_string(),
-            vaults: vec![VaultLinkJson { name: "Vault".into(), path: vault.display().to_string() }],
+            vaults: vec![VaultLinkJson {
+                name: "Vault".into(),
+                path: vault.display().to_string(),
+            }],
         };
         // com .md explícito e sem (o resolver tenta `<rel>` e `<rel>.md`).
         assert!(resolve_note(&cfg, "Area/nota.md").is_some());
@@ -1013,12 +1031,16 @@ mod vault_tests {
         // Bloqueada → reporta o motivo.
         assert_eq!(
             scan_log_outcome(blocked, "msg_X"),
-            Some(RouteConfirm::Blocked { reason: "unknown_sender".into() })
+            Some(RouteConfirm::Blocked {
+                reason: "unknown_sender".into()
+            })
         );
         // Entregue → reporta o nó destino.
         assert_eq!(
             scan_log_outcome(delivered, "msg_Y"),
-            Some(RouteConfirm::Delivered { to_node: "019e-uuid".into() })
+            Some(RouteConfirm::Delivered {
+                to_node: "019e-uuid".into()
+            })
         );
         // Entrega VENCE bloqueio quando a mesma msg tem os dois (re-tentada e entregue).
         let both = format!(
@@ -1028,7 +1050,9 @@ mod vault_tests {
         );
         assert_eq!(
             scan_log_outcome(&both, "msg_Z"),
-            Some(RouteConfirm::Delivered { to_node: "019e-uuid".into() })
+            Some(RouteConfirm::Delivered {
+                to_node: "019e-uuid".into()
+            })
         );
         // id ausente → None (ainda sem desfecho); linha parcial/lixo é tolerada.
         assert_eq!(scan_log_outcome(blocked, "msg_INEXISTENTE"), None);

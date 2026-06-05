@@ -2135,8 +2135,8 @@ pub(crate) fn augmented_verify_path(base: &str, extra_dirs: &[String]) -> String
 /// reabrir o app. Best-effort: se a re-resolução falhar, parte do PATH atual. Roda na thread de
 /// instalação, logo após o instalador sair (set_var pontual, sem leitores concorrentes nesse instante).
 pub(crate) fn refresh_path_after_install(verify_paths: &[String]) {
-    let base = resolve_login_shell_path()
-        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let base =
+        resolve_login_shell_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     let augmented = augmented_verify_path(&base, verify_paths);
     std::env::set_var("PATH", augmented);
 }
@@ -2580,7 +2580,10 @@ mod path_tests {
     fn expand_tilde_resolves_home() {
         if let Some(home) = std::env::var_os("HOME") {
             let home = home.to_string_lossy().into_owned();
-            assert_eq!(expand_tilde("~/.opencode/bin"), format!("{home}/.opencode/bin"));
+            assert_eq!(
+                expand_tilde("~/.opencode/bin"),
+                format!("{home}/.opencode/bin")
+            );
             assert_eq!(expand_tilde("~"), home);
         }
         assert_eq!(expand_tilde("/opt/homebrew/bin"), "/opt/homebrew/bin");

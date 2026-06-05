@@ -25,9 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use gpui::{
-    div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, FontWeight, Window,
-};
+use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, FontWeight, Window};
 
 use lina_cli_profiles::{InstallRecipe, Installers, CURRENT_OS};
 use lina_core::{find_in_path, query_version, DiscoveredCli};
@@ -58,11 +56,31 @@ pub struct DevTool {
 
 /// As 5 ferramentas, em ordem amigável a dependências (Node antes de Vercel, que precisa dele).
 pub const DEV_TOOLS: &[DevTool] = &[
-    DevTool { id: "git", bin: "git", label: "Git" },
-    DevTool { id: "gh", bin: "gh", label: "GitHub CLI" },
-    DevTool { id: "node", bin: "node", label: "Node.js" },
-    DevTool { id: "vercel", bin: "vercel", label: "Vercel CLI" },
-    DevTool { id: "python", bin: "python3", label: "Python" },
+    DevTool {
+        id: "git",
+        bin: "git",
+        label: "Git",
+    },
+    DevTool {
+        id: "gh",
+        bin: "gh",
+        label: "GitHub CLI",
+    },
+    DevTool {
+        id: "node",
+        bin: "node",
+        label: "Node.js",
+    },
+    DevTool {
+        id: "vercel",
+        bin: "vercel",
+        label: "Vercel CLI",
+    },
+    DevTool {
+        id: "python",
+        bin: "python3",
+        label: "Python",
+    },
 ];
 
 /// A ferramenta de id lógico `id` (`None` se desconhecido).
@@ -74,7 +92,9 @@ pub fn dev_tool(id: &str) -> Option<&'static DevTool> {
 /// Rótulo amigável do id lógico (fallback: o próprio id, p/ nunca mostrar vazio).
 #[must_use]
 pub fn label_for(id: &str) -> String {
-    dev_tool(id).map(|t| t.label.to_string()).unwrap_or_else(|| id.to_string())
+    dev_tool(id)
+        .map(|t| t.label.to_string())
+        .unwrap_or_else(|| id.to_string())
 }
 
 // ═══════════════════════════ receitas (TOML embutido, mesmo loader do onboarding) ═══════════════════════════
@@ -88,14 +108,13 @@ const DEV_TOOLS_TOML: &str = include_str!("../../../profiles/installers/dev-tool
 pub fn dev_installers() -> &'static Installers {
     static INSTALLERS: OnceLock<Installers> = OnceLock::new();
     INSTALLERS.get_or_init(|| {
-        Installers::from_toml_str(DEV_TOOLS_TOML, "profiles/installers/dev-tools.toml").unwrap_or_else(
-            |e| {
+        Installers::from_toml_str(DEV_TOOLS_TOML, "profiles/installers/dev-tools.toml")
+            .unwrap_or_else(|e| {
                 eprintln!(
                     "dev_tools: dev-tools.toml inválido ({e}); 'Instalar para mim' indisponível"
                 );
                 Installers::default()
-            },
-        )
+            })
     })
 }
 
@@ -210,7 +229,10 @@ pub fn open_in_terminal(recipe: &InstallRecipe) -> std::io::Result<PathBuf> {
         "\necho\necho 'Pronto! Pode fechar esta janela e voltar ao Lina — clique em \"Verificar de novo\".'\n",
     );
 
-    let path = std::env::temp_dir().join(format!("lina-devtool-install-{}.command", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "lina-devtool-install-{}.command",
+        std::process::id()
+    ));
     {
         let mut f = std::fs::File::create(&path)?;
         f.write_all(script.as_bytes())?;
@@ -340,7 +362,10 @@ impl DevToolsModel {
     /// Estado atual da instalação (clone do compartilhado).
     #[must_use]
     pub fn install_state(&self) -> InstallState {
-        self.install.lock().map(|g| g.clone()).unwrap_or(InstallState::Idle)
+        self.install
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(InstallState::Idle)
     }
 
     /// O id lógico alvo da instalação corrente (p/ a view destacar a linha certa).
@@ -363,7 +388,10 @@ impl DevToolsModel {
     /// Versão detectada de uma ferramenta (ou `None` se ausente).
     #[must_use]
     pub fn version_of(&self, id: &str) -> Option<String> {
-        self.detected().into_iter().find(|c| c.id == id).and_then(|c| c.version)
+        self.detected()
+            .into_iter()
+            .find(|c| c.id == id)
+            .and_then(|c| c.version)
     }
 
     /// `true` se a ferramenta está presente no PATH.
@@ -477,7 +505,9 @@ impl DevToolsModel {
             }
             InstallPlan::Interactive => match open_in_terminal(&recipe) {
                 Ok(_) => {
-                    self.notice = Some(DevNotice::TerminalOpened { tool: label_for(id) });
+                    self.notice = Some(DevNotice::TerminalOpened {
+                        tool: label_for(id),
+                    });
                 }
                 Err(_) => {
                     self.notice = Some(DevNotice::RunManually {
@@ -499,7 +529,9 @@ impl DevToolsModel {
         // Feedback OTIMISTA: o 1º frame após o clique já mostra "⟳ iniciando…" (a thread confirma logo).
         set_install(
             &self.install,
-            InstallState::Installing { line: "iniciando…".into() },
+            InstallState::Installing {
+                line: "iniciando…".into(),
+            },
         );
         let id = id.to_string();
         let verify_paths = recipe.verify_paths.clone();
@@ -537,7 +569,11 @@ impl DevToolsModel {
 
         // Banner de estado da varredura (procurando / tudo pronto / nenhuma) — sem falso "nenhuma" durante a busca.
         if self.is_discovering() {
-            col = col.child(banner(PANEL, ACCENT, "Procurando as ferramentas no seu computador…"));
+            col = col.child(banner(
+                PANEL,
+                ACCENT,
+                "Procurando as ferramentas no seu computador…",
+            ));
         } else if self.all_present() {
             col = col.child(banner(
                 0x18301f,
@@ -558,7 +594,10 @@ impl DevToolsModel {
             let id = t.id;
             let present = self.is_present(id);
             let installing_this = self.install_target() == Some(id)
-                && matches!(install, InstallState::Installing { .. } | InstallState::Verifying);
+                && matches!(
+                    install,
+                    InstallState::Installing { .. } | InstallState::Verifying
+                );
 
             // `.id(id)` (único por ferramenta) é OBRIGATÓRIO p/ a11y: o `text!` gera o ElementId por
             // LOCALIZAÇÃO no fonte; `text!` repetidos no MESMO ponto do laço colidiriam no nó AccessKit
@@ -574,12 +613,11 @@ impl DevToolsModel {
                 .py_3()
                 .rounded_md()
                 .bg(rgb(PANEL))
-                .child(
-                    div()
-                        .size(px(9.0))
-                        .rounded_full()
-                        .bg(rgb(if present { GREEN } else { 0x3a4566 })),
-                )
+                .child(div().size(px(9.0)).rounded_full().bg(rgb(if present {
+                    GREEN
+                } else {
+                    0x3a4566
+                })))
                 .child(
                     div()
                         .w(px(150.0))
@@ -589,18 +627,35 @@ impl DevToolsModel {
                 );
 
             if present {
-                let ver = self.version_of(id).unwrap_or_else(|| "instalado".to_string());
-                row = row.child(div().flex_1().text_color(rgb(GREEN)).child(text!(format!("✓ {ver}"))));
+                let ver = self
+                    .version_of(id)
+                    .unwrap_or_else(|| "instalado".to_string());
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .text_color(rgb(GREEN))
+                        .child(text!(format!("✓ {ver}"))),
+                );
             } else if installing_this {
                 let line = match &install {
                     InstallState::Installing { line } => line.clone(),
                     InstallState::Verifying => "verificando…".to_string(),
                     _ => "instalando…".to_string(),
                 };
-                row = row.child(div().flex_1().text_color(rgb(AMBER)).child(text!(format!("⟳ {line}"))));
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .text_color(rgb(AMBER))
+                        .child(text!(format!("⟳ {line}"))),
+                );
             } else {
                 row = row
-                    .child(div().flex_1().text_color(rgb(MUTED)).child(text!("não encontrado")))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(MUTED))
+                            .child(text!("não encontrado")),
+                    )
                     .child(install_button(id, cx));
             }
             list = list.child(row);
@@ -633,7 +688,13 @@ impl DevToolsModel {
 
         // Falha acionável da instalação silenciosa (sem jargão; nunca trava "Continuar").
         if let InstallState::Failed { reason } = &install {
-            col = col.child(banner(0x33202c, RED, &format!("⚠ {reason}  ·  Nada quebrou — você pode tentar de novo ou seguir sem isso.")));
+            col = col.child(banner(
+                0x33202c,
+                RED,
+                &format!(
+                    "⚠ {reason}  ·  Nada quebrou — você pode tentar de novo ou seguir sem isso."
+                ),
+            ));
         }
 
         // Rodapé: Voltar · Verificar de novo · Continuar (sempre pode seguir — nunca um beco, inv#6).
@@ -643,13 +704,28 @@ impl DevToolsModel {
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(ghost_button("devtools-back", "← Voltar", cx, |onb, _w, _cx| onb.nav_back()))
-                .child(ghost_button("devtools-verify", "↻ Verificar de novo", cx, |onb, _w, cx| {
-                    onb.dev_tools.verify_now();
-                    cx.notify();
-                }))
+                .child(ghost_button(
+                    "devtools-back",
+                    "← Voltar",
+                    cx,
+                    |onb, _w, _cx| onb.nav_back(),
+                ))
+                .child(ghost_button(
+                    "devtools-verify",
+                    "↻ Verificar de novo",
+                    cx,
+                    |onb, _w, cx| {
+                        onb.dev_tools.verify_now();
+                        cx.notify();
+                    },
+                ))
                 .child(div().flex_1())
-                .child(primary_button("devtools-next", "Continuar →", cx, |onb, _w, _cx| onb.nav_continue())),
+                .child(primary_button(
+                    "devtools-next",
+                    "Continuar →",
+                    cx,
+                    |onb, _w, _cx| onb.nav_continue(),
+                )),
         );
 
         col.into_any_element()
@@ -677,7 +753,12 @@ fn heading(title: &str, subtitle: &str) -> AnyElement {
                 .text_color(rgb(TEXT))
                 .child(text!(title.to_string())),
         )
-        .child(div().text_size(px(15.0)).text_color(rgb(MUTED)).child(text!(subtitle.to_string())))
+        .child(
+            div()
+                .text_size(px(15.0))
+                .text_color(rgb(MUTED))
+                .child(text!(subtitle.to_string())),
+        )
         .into_any_element()
 }
 
@@ -811,7 +892,10 @@ mod tests {
     fn real_dev_tools_toml_is_valid_and_complete() {
         let inst = dev_installers();
         for id in ["git", "gh", "node", "vercel", "python"] {
-            let p = inst.0.get(id).unwrap_or_else(|| panic!("falta receita p/ {id}"));
+            let p = inst
+                .0
+                .get(id)
+                .unwrap_or_else(|| panic!("falta receita p/ {id}"));
             for os in ["macos", "linux", "windows"] {
                 let r = p.for_os(os).unwrap_or_else(|| panic!("falta {id}.{os}"));
                 assert!(!r.program.trim().is_empty(), "{id}.{os} sem program");
@@ -839,7 +923,10 @@ mod tests {
         let git_lin = inst.0["git"].for_os("linux").expect("git linux");
         assert!(git_lin.args.iter().any(|a| a.contains("sudo")));
         // Windows: git via winget.
-        assert_eq!(inst.0["git"].for_os("windows").expect("git win").program, "winget");
+        assert_eq!(
+            inst.0["git"].for_os("windows").expect("git win").program,
+            "winget"
+        );
         // id desconhecido → None (fallback manual).
         assert!(install_recipe_with("zzz", None, inst).is_none());
     }
@@ -858,27 +945,48 @@ mod tests {
             InstallPlan::NeedsFirst { needs: "node" }
         );
         // Vercel COM Node (macOS, npm, sem sudo) → silencioso.
-        assert_eq!(decide_plan("vercel", "macos", vercel.as_ref(), all_present), InstallPlan::Silent);
+        assert_eq!(
+            decide_plan("vercel", "macos", vercel.as_ref(), all_present),
+            InstallPlan::Silent
+        );
 
         // git macOS com brew presente → silencioso; sem brew → interativo (terminal real).
         let git_mac = inst.0["git"].for_os("macos").cloned();
-        assert_eq!(decide_plan("git", "macos", git_mac.as_ref(), all_present), InstallPlan::Silent);
-        assert_eq!(decide_plan("git", "macos", git_mac.as_ref(), none_present), InstallPlan::Interactive);
+        assert_eq!(
+            decide_plan("git", "macos", git_mac.as_ref(), all_present),
+            InstallPlan::Silent
+        );
+        assert_eq!(
+            decide_plan("git", "macos", git_mac.as_ref(), none_present),
+            InstallPlan::Interactive
+        );
 
         // git Linux (sudo no apt) → interativo, mesmo com tudo "presente".
         let git_lin = inst.0["git"].for_os("linux").cloned();
-        assert_eq!(decide_plan("git", "linux", git_lin.as_ref(), all_present), InstallPlan::Interactive);
+        assert_eq!(
+            decide_plan("git", "linux", git_lin.as_ref(), all_present),
+            InstallPlan::Interactive
+        );
 
         // node Linux (tarball, SEM sudo) → silencioso (não pede senha).
         let node_lin = inst.0["node"].for_os("linux").cloned();
-        assert_eq!(decide_plan("node", "linux", node_lin.as_ref(), all_present), InstallPlan::Silent);
+        assert_eq!(
+            decide_plan("node", "linux", node_lin.as_ref(), all_present),
+            InstallPlan::Silent
+        );
 
         // node Windows (winget → UAC) → interativo.
         let node_win = inst.0["node"].for_os("windows").cloned();
-        assert_eq!(decide_plan("node", "windows", node_win.as_ref(), all_present), InstallPlan::Interactive);
+        assert_eq!(
+            decide_plan("node", "windows", node_win.as_ref(), all_present),
+            InstallPlan::Interactive
+        );
 
         // Sem receita → Manual.
-        assert_eq!(decide_plan("git", "plan9", None, all_present), InstallPlan::Manual);
+        assert_eq!(
+            decide_plan("git", "plan9", None, all_present),
+            InstallPlan::Manual
+        );
     }
 
     /// Descoberta genérica: acha pelo BINÁRIO (python3) e carrega o ID LÓGICO (python) com a versão.
@@ -890,7 +998,10 @@ mod tests {
         write_fake_cli(dir.path(), "git", "git version 2.44.0");
         let found = discover_dev_tools_in(&dir.path().display().to_string());
         // python achado pelo binário python3, mas carregado com o id lógico "python".
-        let py = found.iter().find(|c| c.id == "python").expect("python detectado");
+        let py = found
+            .iter()
+            .find(|c| c.id == "python")
+            .expect("python detectado");
         assert_eq!(py.version.as_deref(), Some("Python 3.12.7"));
         assert!(py.path.ends_with("python3"));
         // git presente; node/vercel/gh ausentes.
@@ -912,7 +1023,10 @@ mod tests {
         let mut model = DevToolsModel::new_with(disc);
         model.block_on_discovery();
         assert!(model.is_present("git"));
-        assert_eq!(model.version_of("git").as_deref(), Some("git version 2.44.0"));
+        assert_eq!(
+            model.version_of("git").as_deref(),
+            Some("git version 2.44.0")
+        );
         assert!(!model.is_present("node"));
         assert!(!model.all_present());
         assert!(!model.nothing_found());

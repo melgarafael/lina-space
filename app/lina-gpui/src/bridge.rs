@@ -4098,8 +4098,14 @@ mod tests {
         bw.write_one("X", "Terminal X", &["Terminal X".to_string()]);
         let x_md = ws.join("X").join("CLAUDE.md");
         let before = std::fs::read_to_string(&x_md).expect("CLAUDE.md de X");
-        assert!(before.contains(&fallback), "antes de linkar: usa o fallback");
-        assert!(!before.contains(real_vault), "antes de linkar: não conhece o vault real");
+        assert!(
+            before.contains(&fallback),
+            "antes de linkar: usa o fallback"
+        );
+        assert!(
+            !before.contains(real_vault),
+            "antes de linkar: não conhece o vault real"
+        );
 
         // Usuário linka o vault no onboarding → grava .lina/vault.json (escrita do obsidian.rs).
         let cfg = crate::obsidian::VaultConfig {
@@ -4115,8 +4121,14 @@ mod tests {
         // DEPOIS de linkar: a MESMA regeneração passa a apontar pro vault REAL (re-lê o vault.json).
         bw.write_one("X", "Terminal X", &["Terminal X".to_string()]);
         let after = std::fs::read_to_string(&x_md).expect("re-read X");
-        assert!(after.contains(real_vault), "depois de linkar: usa o vault REAL");
-        assert!(!after.contains(&fallback), "depois de linkar: não usa mais o fallback inexistente");
+        assert!(
+            after.contains(real_vault),
+            "depois de linkar: usa o vault REAL"
+        );
+        assert!(
+            !after.contains(&fallback),
+            "depois de linkar: não usa mais o fallback inexistente"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

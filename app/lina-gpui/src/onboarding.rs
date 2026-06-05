@@ -1351,7 +1351,10 @@ mod tests {
     fn antigravity_agy_recipe_and_label() {
         assert_eq!(display_name("agy"), "antigravity");
         assert_eq!(display_name("claude"), "claude"); // os demais não mudam
-        assert!(KNOWN_CLIS.contains(&"agy"), "agy deve estar nos CLIs conhecidos");
+        assert!(
+            KNOWN_CLIS.contains(&"agy"),
+            "agy deve estar nos CLIs conhecidos"
+        );
         let agy = install_recipe_with("agy", None, installers()).expect("agy tem receita");
         let joined = agy.args.join(" ");
         assert!(
@@ -1377,7 +1380,8 @@ mod tests {
             bin_path.display(),
             bin_path.display()
         );
-        let cmd = install_recipe_with("claude", Some(&script), installers()).expect("override install");
+        let cmd =
+            install_recipe_with("claude", Some(&script), installers()).expect("override install");
 
         let state = Arc::new(Mutex::new(InstallState::Idle));
         let verify_dir = bin_path.clone();
