@@ -74,11 +74,14 @@ jobs:
   core-windows:
     name: Core (Windows) — portabilidade do core (x86_64-msvc)
     runs-on: windows-latest
-    # INFORMATIVO até o bring-up ligar o ConPTY (ver WINDOWS-BRINGUP.md). O caminho Windows do core
-    # (cli_discovery / lina-pty / mailbox / scrollback) nunca foi compilado num runner, então clippy
-    # pode acusar lint latente do ramo cfg(windows)/cfg(not(unix)). Não bloqueia merge enquanto for
-    # `true`. PÓS-BRING-UP: remova esta linha para o Windows virar gate obrigatório.
+    # INFORMATIVO até o bring-up ligar o ConPTY (ver WINDOWS-BRINGUP.md). PRÉ-bring-up este job só
+    # COMPILA (não executa): vários testes de PTY-host spawnam comandos Unix (`yes`/`sh`) em terminais
+    # reais e PENDURAM no Windows enquanto o ConPTY não está ligado (visto em CI: hang de ~70min no
+    # teste flow_control_caps_memory_under_flood). `--no-run` valida o que dá pra provar hoje: que o
+    # core (e os test binaries) COMPILA no Windows + clippy. PÓS-BRING-UP: troque `--no-run` por
+    # `-- --test-threads=1` (passa a executar) e remova o `continue-on-error` → vira gate obrigatório.
     continue-on-error: true
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       # windows-latest do GitHub é x86_64 → toolchain stable resolve x86_64-pc-windows-msvc
@@ -87,8 +90,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Test (workspace, serializado — testes #![cfg(unix)] são pulados nesta plataforma)
-        run: cargo test --workspace -- --test-threads=1
+      - name: Build de testes (compila workspace + test binaries; NÃO executa — testes de PTY penduram pré-ConPTY)
+        run: cargo test --workspace --no-run
       - name: Clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
