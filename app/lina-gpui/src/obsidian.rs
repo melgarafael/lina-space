@@ -940,19 +940,25 @@ fn render_vault_index_with(name: &str, root: &Path, data: &VaultIndexData, graph
         }
     }
 
-    // Backlinks (transposta do grafo) — quem aponta pra cada nota.
+    // Backlinks (transposta do grafo) — quem aponta pra cada nota. Invertemos o grafo UMA vez (O(e))
+    // em vez de varrer TODAS as arestas por nota — antes era O(notas × arestas), que explodia em vaults
+    // grandes (2.5k notas × 3k arestas ≈ 8M comparações de path por render). `edges` já vem ordenado
+    // por (from,to), então a ordem de origens por destino é determinística.
     out.push_str("\n## Backlinks (quem aponta pra cá)\n");
+    let mut backlinks: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for e in &graph.edges {
+        backlinks.entry(e.to.as_str()).or_default().push(e.from.as_str());
+    }
     let mut any_back = false;
     for note in &data.notes {
-        let origins: Vec<String> = graph
-            .edges
-            .iter()
-            .filter(|e| e.to == note.rel_path)
-            .map(|e| format!("[[{}]]", node_label(&e.from)))
-            .collect();
-        if !origins.is_empty() {
+        if let Some(origins) = backlinks.get(note.rel_path.as_str()) {
             any_back = true;
-            out.push_str(&format!("- {} ← {}\n", node_label(&note.rel_path), origins.join(", ")));
+            let joined = origins
+                .iter()
+                .map(|f| format!("[[{}]]", node_label(f)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("- {} ← {}\n", node_label(&note.rel_path), joined));
         }
     }
     if !any_back {
