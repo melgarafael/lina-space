@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -550,15 +550,25 @@ fn parse_note(rel_path: String, content: &str) -> NoteEntry {
 #[must_use]
 pub fn scan_vault(root: &Path) -> VaultIndexData {
     let mut folders = Vec::new();
-    let mut notes = Vec::new();
-    walk_dir(root, root, &mut folders, &mut notes);
+    let mut md_paths: Vec<(String, PathBuf)> = Vec::new();
+    // 1) Walk só de METADADOS (listar diretório fica local/rápido mesmo em iCloud) — coleta pastas e os
+    //    caminhos dos `.md`, SEM ler conteúdo.
+    walk_collect(root, root, &mut folders, &mut md_paths);
     folders.sort();
     folders.dedup();
+    // 2) Lê+parseia os `.md` em PARALELO: o gargalo é I/O POR ARQUIVO — em vaults na nuvem (iCloud/
+    //    OneDrive), cada `read_to_string` pode disparar um DOWNLOAD do arquivo evicted (~1s). Em série
+    //    isso vira N×latência (um vault de 2.5k notas em iCloud levou ~50min!); com leituras concorrentes
+    //    os downloads se sobrepõem e o tempo cai ~ordens de grandeza. É I/O-bound (espera de rede, não
+    //    CPU) → usamos MAIS threads que cores. Determinístico: ordena por `rel_path` no fim.
+    let mut notes = parse_notes_parallel(md_paths);
     notes.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     VaultIndexData { folders, notes }
 }
 
-fn walk_dir(root: &Path, dir: &Path, folders: &mut Vec<String>, notes: &mut Vec<NoteEntry>) {
+/// Walk recursivo de METADADOS: coleta pastas + caminhos dos `.md` (sem ler conteúdo). Ignora
+/// `.obsidian/`, `.trash/` e qualquer dir oculto. A leitura pesada é paralelizada em [`scan_vault`].
+fn walk_collect(root: &Path, dir: &Path, folders: &mut Vec<String>, md: &mut Vec<(String, PathBuf)>) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -577,17 +587,49 @@ fn walk_dir(root: &Path, dir: &Path, folders: &mut Vec<String>, notes: &mut Vec<
             if let Ok(rel) = path.strip_prefix(root) {
                 folders.push(format!("{}/", rel.to_string_lossy().replace('\\', "/")));
             }
-            walk_dir(root, &path, folders, notes);
+            walk_collect(root, &path, folders, md);
         } else if path.extension().and_then(|x| x.to_str()) == Some("md") {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            notes.push(parse_note(rel, &content));
+            md.push((rel, path));
         }
     }
+}
+
+/// Teto de threads de leitura. I/O-bound (cada thread fica PARADA esperando o download do iCloud), então
+/// vale ter MUITO mais threads que cores — 64 sobrepõe bem os downloads sem custo real de CPU/RAM.
+const SCAN_READ_THREADS: usize = 64;
+
+/// Lê+parseia os `.md` em PARALELO (read+parse fora do lock; só o `push` do resultado é sincronizado).
+/// Os workers puxam índices de um cursor atômico (work-stealing → balanceia mesmo com downloads de
+/// duração desigual). Preserva o conteúdo de [`parse_note`]; a ORDEM é restaurada por `sort` no caller.
+fn parse_notes_parallel(md: Vec<(String, PathBuf)>) -> Vec<NoteEntry> {
+    if md.is_empty() {
+        return Vec::new();
+    }
+    // `md` não é vazio (checado acima) → `len() >= 1`, então `min` já garante `workers >= 1`.
+    let workers = md.len().min(SCAN_READ_THREADS);
+    let cursor = AtomicUsize::new(0);
+    let out: Mutex<Vec<NoteEntry>> = Mutex::new(Vec::with_capacity(md.len()));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some((rel, path)) = md.get(i) else {
+                    break; // cursor passou do fim → este worker terminou
+                };
+                let content = std::fs::read_to_string(path).unwrap_or_default();
+                let note = parse_note(rel.clone(), &content);
+                if let Ok(mut g) = out.lock() {
+                    g.push(note); // lock breve; o read+parse caro ficou fora dele
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap_or_default()
 }
 
 // ───────────────────────── grafo resolvido (métricas determinísticas, inv#1) ─────────────────────────
