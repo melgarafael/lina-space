@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         Some("resume") => run_resume(&args[1..]),
         Some("do") => run_do(&args[1..]),
         Some("list") => run_list(args.iter().any(|a| a == "--json")),
+        Some("vault") => run_vault(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -43,7 +44,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -620,5 +621,267 @@ fn run_list(json: bool) -> ExitCode {
             }
         }
         ExitCode::SUCCESS
+    }
+}
+
+// ════════════════════════ `lina vault` — acesso ao "segundo cérebro" (Obsidian) ════════════════════════
+//
+// A doutrina (BLOCO 3) promete ao agente os verbos `lina vault path|read|search` para acionar os vaults
+// linkados no onboarding SEM explorar o filesystem na mão — mas o comando não existia (o agente batia em
+// "vault não implementado" e caía pro `cat`/`grep` direto, frágil). Aqui implementamos sobre o contrato
+// JÁ escrito pelo app: `<LINA_HOME>/vault.json` (vaults linkados) + `<LINA_HOME>/vault-index/*.md` (o
+// mapa estrutural PageIndex, determinístico). O bin NÃO importa o app: parseia o JSON simples localmente.
+
+/// Um vault linkado, lido de `vault.json` (formato escrito por `obsidian.rs::write_vault_config`).
+#[derive(serde::Deserialize)]
+struct VaultLinkJson {
+    #[serde(default)]
+    name: String,
+    path: String,
+}
+
+/// Conteúdo de `<LINA_HOME>/vault.json`. Campos extras (ex.: `writable`) são ignorados.
+#[derive(serde::Deserialize)]
+struct VaultConfigJson {
+    #[serde(default)]
+    primary: String,
+    #[serde(default)]
+    vaults: Vec<VaultLinkJson>,
+}
+
+/// Lê os vaults linkados de `<LINA_HOME>/vault.json`. `Err` acionável se não houver vault linkado (o
+/// agente é orientado a pedir ao usuário que rode o passo "Segundo cérebro" do onboarding).
+fn load_vault_config() -> Result<VaultConfigJson, String> {
+    let path = mailbox_root().join("vault.json");
+    let data = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "nenhum vault Obsidian linkado ainda ({}): {e}\n\
+             → peça ao usuário para concluir o passo \"Segundo cérebro\" do onboarding do Lina.",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&data).map_err(|e| format!("vault.json inválido: {e}"))
+}
+
+/// `lina vault <sub>` — roteia os subcomandos.
+fn run_vault(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("path") => vault_path(),
+        Some("index") => vault_index(),
+        Some("read") => vault_read(args.get(1).map(String::as_str)),
+        Some("search") => vault_search(args.get(1).map(String::as_str)),
+        _ => {
+            eprintln!(
+                "uso: lina vault path | index | read <nota> | search <termo>\n  \
+                 (index = mapa estrutural PageIndex; comece por ele para navegar antes de abrir notas)"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina vault path` — raiz do vault primário + lista de todos os vaults linkados.
+fn vault_path() -> ExitCode {
+    let cfg = match load_vault_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("{}", cfg.primary);
+    if cfg.vaults.len() > 1 {
+        eprintln!("(vaults linkados:)");
+        for v in &cfg.vaults {
+            eprintln!("  - {} · {}", v.name, v.path);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lina vault index` — imprime o(s) mapa(s) estrutural(is) PageIndex (`<LINA_HOME>/vault-index/*.md`),
+/// determinísticos e LOCAIS (não re-baixa o vault). É a "porta de entrada": o agente navega o grafo de
+/// pastas/headings/links/hubs aqui e SÓ ENTÃO abre as notas certas com `read`.
+fn vault_index() -> ExitCode {
+    let dir = mailbox_root().join("vault-index");
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => {
+            eprintln!(
+                "lina: índice ainda não gerado ({}). O Lina o cria em segundo plano ao linkar o vault; \
+                 tente de novo em instantes, ou use `lina vault search`.",
+                dir.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let mut mds: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+        .collect();
+    mds.sort();
+    if mds.is_empty() {
+        eprintln!("lina: nenhum índice .md em {}", dir.display());
+        return ExitCode::from(1);
+    }
+    for p in mds {
+        match std::fs::read_to_string(&p) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("lina: não li {}: {e}", p.display()),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Resolve uma `nota` (caminho relativo, com ou sem `.md`) contra os vaults linkados. 1º match vence.
+fn resolve_note(cfg: &VaultConfigJson, nota: &str) -> Option<PathBuf> {
+    let rel = nota.trim_start_matches('/');
+    for v in &cfg.vaults {
+        for cand in [PathBuf::from(&v.path).join(rel), PathBuf::from(&v.path).join(format!("{rel}.md"))]
+        {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// `lina vault read <nota>` — lê uma nota inteira (resolve em qualquer vault linkado).
+fn vault_read(nota: Option<&str>) -> ExitCode {
+    let Some(nota) = nota else {
+        eprintln!("uso: lina vault read <caminho/da/nota.md>");
+        return ExitCode::from(2);
+    };
+    let cfg = match load_vault_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match resolve_note(&cfg, nota) {
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("lina: não consegui ler '{nota}': {e}");
+                ExitCode::from(1)
+            }
+        },
+        None => {
+            eprintln!("lina: nota '{nota}' não encontrada nos vaults linkados (use `lina vault index` para achar o caminho).");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Teto de resultados do `search` — evita varredura sem fim e flood na saída do agente.
+const VAULT_SEARCH_MAX_HITS: usize = 40;
+
+/// `lina vault search <termo>` — busca case-insensitive de uma substring no CONTEÚDO das notas `.md`
+/// (read-only, ignora `.obsidian/`/`.trash/`/ocultos). Para com teto de resultados. Para NAVEGAR a
+/// estrutura (mais barato que ler tudo) o agente deve preferir `lina vault index`.
+fn vault_search(termo: Option<&str>) -> ExitCode {
+    let Some(termo) = termo.map(str::trim).filter(|t| !t.is_empty()) else {
+        eprintln!("uso: lina vault search <termo>");
+        return ExitCode::from(2);
+    };
+    let cfg = match load_vault_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let needle = termo.to_lowercase();
+    let mut hits = 0usize;
+    for v in &cfg.vaults {
+        let root = PathBuf::from(&v.path);
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                if hits >= VAULT_SEARCH_MAX_HITS {
+                    println!("… (parei em {VAULT_SEARCH_MAX_HITS} resultados — refine o termo)");
+                    return ExitCode::SUCCESS;
+                }
+                let p = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if p.is_dir() {
+                    if !name.starts_with('.') && name != ".trash" {
+                        stack.push(p);
+                    }
+                } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                    let Ok(content) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
+                    let rel = p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    for (n, line) in content.lines().enumerate() {
+                        if line.to_lowercase().contains(&needle) {
+                            println!("{rel}:{}: {}", n + 1, line.trim());
+                            hits += 1;
+                            if hits >= VAULT_SEARCH_MAX_HITS {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if hits == 0 {
+        println!("(sem resultados para \"{termo}\" — tente `lina vault index` para ver a estrutura)");
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+
+    /// O `vault.json` que o app escreve (formato de `obsidian.rs::write_vault_config`) desserializa,
+    /// expondo o `primary` e os caminhos — campos extras (`writable`) são ignorados sem quebrar.
+    #[test]
+    fn parses_app_vault_json() {
+        let json = r#"{
+          "primary": "/Users/x/Documents/Vault A",
+          "vaults": [
+            { "name": "Vault A", "path": "/Users/x/Documents/Vault A", "writable": "/Users/x/Documents/Vault A/Lina" },
+            { "name": "Vault B", "path": "/Users/x/Documents/Vault B", "writable": "/Users/x/Documents/Vault B/Lina" }
+          ]
+        }"#;
+        let cfg: VaultConfigJson = serde_json::from_str(json).expect("parseia o vault.json do app");
+        assert_eq!(cfg.primary, "/Users/x/Documents/Vault A");
+        assert_eq!(cfg.vaults.len(), 2);
+        assert_eq!(cfg.vaults[1].name, "Vault B");
+        assert_eq!(cfg.vaults[1].path, "/Users/x/Documents/Vault B");
+    }
+
+    /// `resolve_note` acha a nota em qualquer vault linkado, com ou sem `.md`, e devolve `None` p/ ausente.
+    #[test]
+    fn resolve_note_finds_with_and_without_md() {
+        let tmp = std::env::temp_dir().join(format!("lina-vault-test-{}", std::process::id()));
+        let vault = tmp.join("Vault");
+        std::fs::create_dir_all(vault.join("Area")).expect("mkdir");
+        std::fs::write(vault.join("Area").join("nota.md"), "# Oi\nconteúdo").expect("nota");
+        let cfg = VaultConfigJson {
+            primary: vault.display().to_string(),
+            vaults: vec![VaultLinkJson { name: "Vault".into(), path: vault.display().to_string() }],
+        };
+        // com .md explícito e sem (o resolver tenta `<rel>` e `<rel>.md`).
+        assert!(resolve_note(&cfg, "Area/nota.md").is_some());
+        assert!(resolve_note(&cfg, "Area/nota").is_some());
+        // barra inicial é tolerada.
+        assert!(resolve_note(&cfg, "/Area/nota.md").is_some());
+        // inexistente → None.
+        assert!(resolve_note(&cfg, "Area/fantasma.md").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
