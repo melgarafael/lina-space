@@ -61,6 +61,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # keyring (lina-secrets) no Linux usa secret-service -> libdbus-sys (FFI), cujo build.rs aborta
+      # sem as libs de sistema do D-Bus. macOS/Windows usam apple-native/windows-native (sem dbus).
+      - name: Deps de sistema (D-Bus para o keyring/secret-service no Linux)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
       - name: Test (workspace, serializado)
         run: cargo test --workspace -- --test-threads=1
