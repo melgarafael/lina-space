@@ -7,9 +7,12 @@ $ErrorActionPreference = "Stop"
 $repo   = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $ver    = "0.1.0"
 $dist   = Join-Path $repo "dist\Lina-win"
-$gpui   = Join-Path $repo "app\lina-gpui\target\release\lina-gpui.exe"
-$lina   = Join-Path $repo "target\release\lina.exe"
+$rootTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo "target" }
+$appTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repo "app\lina-gpui\target" }
+$gpui   = Join-Path $appTarget "release\lina-gpui.exe"
+$lina   = Join-Path $rootTarget "release\lina.exe"
 $assets = Join-Path $repo "assets"
+$conpty = Join-Path $repo "vendor\conpty\win10-x64"
 
 Write-Host "=== [1/3] build release dos 2 binarios ===" -ForegroundColor Cyan
 Set-Location $repo
@@ -30,9 +33,12 @@ Copy-Item $lina (Join-Path $dist "lina.exe")
 Copy-Item -Recurse $assets (Join-Path $dist "assets")
 if (Test-Path (Join-Path $dist "assets\.git")) { Remove-Item -Recurse -Force (Join-Path $dist "assets\.git") }
 
-# Se voce vendorizou o ConPTY (Fase 3), copie as DLLs p/ o lado do exe (descomente + ajuste o caminho):
-# Copy-Item (Join-Path $repo "vendor\conpty\conpty.dll") $dist
-# Copy-Item (Join-Path $repo "vendor\conpty\OpenConsole.exe") $dist
+if (Test-Path (Join-Path $conpty "conpty.dll")) {
+  Copy-Item (Join-Path $conpty "conpty.dll") $dist
+}
+if (Test-Path (Join-Path $conpty "OpenConsole.exe")) {
+  Copy-Item (Join-Path $conpty "OpenConsole.exe") $dist
+}
 
 # Copia o guia do aluno junto
 Copy-Item (Join-Path $repo "packaging\windows\INSTALAR-LINA-WINDOWS.md") (Join-Path $dist "LEIA-ME - Instalar.md") -ErrorAction SilentlyContinue

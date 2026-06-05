@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use portable_pty::{
     native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize, PtySystem,

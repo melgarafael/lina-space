@@ -1011,9 +1011,6 @@ impl WorkspaceView {
             self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
             return;
         }
-        if let Some(bytes) = printable_key_fallback(ks) {
-            self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
-        }
     }
 }
 
@@ -1025,23 +1022,6 @@ fn shortcut_modifier(ks: &Keystroke) -> bool {
 #[cfg(not(windows))]
 fn shortcut_modifier(ks: &Keystroke) -> bool {
     ks.modifiers.platform
-}
-
-#[cfg(windows)]
-fn printable_key_fallback(ks: &Keystroke) -> Option<Vec<u8>> {
-    if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.alt {
-        return None;
-    }
-    let ch = ks
-        .key_char
-        .as_deref()
-        .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))?;
-    Some(ch.as_bytes().to_vec())
-}
-
-#[cfg(not(windows))]
-fn printable_key_fallback(_ks: &Keystroke) -> Option<Vec<u8>> {
-    None
 }
 
 impl Render for WorkspaceView {

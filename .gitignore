@@ -19,3 +19,10 @@ spikes/*/target/
 
 # artefatos de empacotamento (Lina.app, .dmg) — gerados por packaging/make-app.sh
 /dist/
+
+# artefatos locais de bring-up/teste no Windows
+.codex/
+*.log
+*.exit
+/OpenConsole.exe
+/conpty.dll
