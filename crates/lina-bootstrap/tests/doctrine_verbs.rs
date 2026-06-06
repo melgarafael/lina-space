@@ -137,6 +137,57 @@ fn doctrine_plan_subverbs_exist_in_bin() {
     }
 }
 
+/// SKILL.md instalados em `assets/lina-skills/` (varre o diretório — skills futuras da
+/// F1-3 entram na trava automaticamente).
+fn skills() -> Vec<(String, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/lina-skills");
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in rd.filter_map(Result::ok) {
+        let p = entry.path().join("SKILL.md");
+        if p.is_file() {
+            let name = format!("{}/SKILL.md", entry.file_name().to_string_lossy());
+            let text = std::fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("ler skill {}: {e}", p.display()));
+            out.push((name, text));
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "esperava >=1 SKILL.md em assets/lina-skills (lina-agent-bus)"
+    );
+    out
+}
+
+/// **Mini-lane pré-gate F1-0:** a trava de verbo fantasma vale para TODA promessa de
+/// verbo no repo — também nos SKILL.md (a skill ensina os mesmos verbos da doutrina;
+/// um fantasma aqui produz o MESMO contorno de campo que o critério 3 fecha).
+#[test]
+fn skills_promise_only_verbs_that_exist() {
+    let bin: BTreeSet<&str> = BIN_VERBS.iter().copied().collect();
+    let subs: BTreeSet<&str> = PLAN_SUBVERBS.iter().copied().collect();
+    for (name, text) in skills() {
+        let ghosts: Vec<String> = promised_verbs(&text)
+            .into_iter()
+            .filter(|v| !bin.contains(v.as_str()))
+            .collect();
+        assert!(
+            ghosts.is_empty(),
+            "{name} promete verbos que o binário NÃO tem (fantasmas): {ghosts:?}"
+        );
+        let sub_ghosts: Vec<String> = promised_plan_subverbs(&text)
+            .into_iter()
+            .filter(|v| !subs.contains(v.as_str()))
+            .collect();
+        assert!(
+            sub_ghosts.is_empty(),
+            "{name} promete sub-verbos de `lina plan` inexistentes: {sub_ghosts:?}"
+        );
+    }
+}
+
 /// **F1-0-9 critério 1:** os 3 templates contêm a instrução claim-ANTES-de-ask e ≥2
 /// exemplos concretos de fluxo `lina plan claim` (a doutrina que empurra a coordenação
 /// para o plano — baseline 14h: 0% de adoção).

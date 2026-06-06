@@ -64,7 +64,7 @@ payload: |
 **Como responder:**
 1. Leia `from`, `intent` e `payload`. Se houver `context`/`ref`, abra-os (`lina vault read`, ler arquivo, `lina plan read <ID>`).
 2. **Entregue exatamente o que `[EXPECTED]` pede** — no formato pedido (ex.: "PASS ou FAIL + lista de falhas"). Resposta acionável evita uma segunda rodada.
-3. Se `intent: handoff` e a tarefa virou sua, dê `lina plan claim <ID>` (se houver `ref`), trabalhe, e ao terminar reporte: `lina status DONE "..."` + `lina plan review <ID>` quando aplicável.
+3. Se `intent: handoff` e a tarefa virou sua, dê `lina plan claim <ID>` (se houver `ref`), trabalhe, e ao terminar reporte ao orquestrador: `lina ask "@Maestro" "terminei <ID>: <resumo>" --intent status` + `lina plan check <ID>` quando o item for seu.
 4. Se `await: true`, o colega está bloqueado te esperando — responda assim que tiver o resultado. Se `await: false`, é fire-and-forget; você responde quando puder.
 
 > O terminador do bloco é `[/LINA::MSG]` (namespace **LINA**). Se você vir um terminador
@@ -122,10 +122,10 @@ de cada colega. Tabela mental "preciso de X → papel Y → verbo Z":
 | Caçar um bug | BUG_FIXER | `lina handoff` |
 | Copy / landing / venda | WRITER | `lina handoff` |
 | Webhook / gatilho / automação | AUTOMATOR | `lina handoff` |
-| Novidade de IA / skill nova | CURADOR | `lina news` |
+| Novidade de IA / skill nova | CURADOR | `lina ask "@Curador"` |
 | Decisão fora do plano / conflito | MAESTRO | `lina ask "@Maestro"` |
 
-Regra de 3 passos (do system message): **está no meu papel → faço eu; precisa de outro papel → delego; ninguém tem o papel → faço o possível e marco no plano (`lina plan write`).**
+Regra de 3 passos (do system message): **está no meu papel → faço eu; precisa de outro papel → delego; ninguém tem o papel → faço o possível e aviso o orquestrador (`lina ask "@Maestro" "faltou o papel X" --intent status`).**
 
 ---
 
@@ -166,7 +166,7 @@ Esta é a metade que realiza o critério do fundador: o usuário fala em portugu
 - `lina handoff "@Nome" "tarefa" [--context arq|note] [--ref plan:ID] [--await]` — delega COM cadeia de responsabilidade; **fire-and-forget por padrão**, `--await` só p/ folhas.
 - `lina broadcast "*" "msg"` — avisa **TODOS** os terminais vivos (fan-out de 1 comando). `--role PAPEL[,PAPEL...]` restringe a um(ns) papel(is). A 1ª onda que o humano pede entrega a todos **sem gate**; **re-espalhar** (cascata) é que pede ok.
 - `lina check "@Nome"` — lê o progresso do colega SEM mandar prompt (não interrompe).
-- `lina status RUNNING|DONE|BLOCKED "..."` — reporta seu estado ao board.
+- `lina ask "@Maestro" "<status>" --intent status` — reporta seu estado ao orquestrador (começou/terminou/travou); vira evento auditável sem interromper ninguém.
 - `lina handshake` — apresenta-se ao time (1x, turno 0).
 - `lina list` — roster vivo (quem está, papel, status, claims).
 
