@@ -1,3 +1,5 @@
+// PATCH LINA: vendorizado — não lintamos código de upstream (ver src/lib.rs).
+#![allow(clippy::all)]
 use anyhow::anyhow;
 use futures::prelude::*;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};

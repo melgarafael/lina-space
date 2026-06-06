@@ -1,3 +1,7 @@
+// PATCH LINA: crate vendorizado (wezterm/portable-pty) — não lintamos código de upstream.
+// Sem isto, `clippy -D warnings` do CI quebra em estilo de terceiro (path deps não recebem
+// --cap-lints allow). Manter o diff vs upstream mínimo: só os patches de ConPTY + esta linha.
+#![allow(clippy::all)]
 //! This crate provides a cross platform API for working with the
 //! psuedo terminal (pty) interfaces provided by the system.
 //! Unlike other crates in this space, this crate provides a set

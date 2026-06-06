@@ -71,6 +71,7 @@ fn line(s: &str) -> Vec<u8> {
     format!("{s}\n").into_bytes()
 }
 
+#[cfg(windows)] // só o caminho Windows lê via read_until; no unix vira dead_code
 fn read_until(mut reader: Box<dyn Read + Send>, needle: &str) -> Option<String> {
     let mut acc = String::new();
     let mut buf = [0u8; 4096];

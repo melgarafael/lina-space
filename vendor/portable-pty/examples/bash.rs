@@ -1,3 +1,5 @@
+// PATCH LINA: vendorizado — não lintamos código de upstream (ver src/lib.rs).
+#![allow(clippy::all)]
 //! This example demonstrates how to spawn a Bash shell using the `portable_pty` crate.
 //! based on pty/examples/whoami.rs
 

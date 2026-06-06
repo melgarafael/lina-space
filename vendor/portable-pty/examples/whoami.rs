@@ -1,3 +1,5 @@
+// PATCH LINA: vendorizado — não lintamos código de upstream (ver src/lib.rs).
+#![allow(clippy::all)]
 //! This is a conceptually simple example that spawns the `whoami` program
 //! to print your username.  It is made more complex because there are multiple
 //! pipes involved and it is easy to get blocked/deadlocked if care and attention

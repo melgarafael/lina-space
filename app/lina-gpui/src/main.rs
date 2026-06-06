@@ -1015,7 +1015,6 @@ impl WorkspaceView {
         let bytes = keystroke_to_bytes(ks, app_cursor);
         if !bytes.is_empty() {
             self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
-            return;
         }
     }
 }

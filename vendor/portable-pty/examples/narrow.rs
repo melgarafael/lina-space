@@ -1,3 +1,5 @@
+// PATCH LINA: vendorizado — não lintamos código de upstream (ver src/lib.rs).
+#![allow(clippy::all)]
 //! Runs a command with a fixed terminal size.
 //! This is used by wezterm's doc building automation to keep
 //! the --help output within a reasonable width
