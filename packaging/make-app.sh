@@ -7,7 +7,7 @@
 # Layout do bundle (o resolver do app acha `lina` e `assets/` SEM mudança de código —
 # `lina` ao lado do executável; `assets/` por ancestral do executável):
 #   Lina.app/Contents/Info.plist
-#   Lina.app/Contents/MacOS/{Lina, lina, assets/}
+#   Lina.app/Contents/MacOS/{Lina, lina, assets/, profiles/}
 #   Lina.app/Contents/Resources/AppIcon.icns   (opcional, se packaging/AppIcon.icns existir)
 #
 # Uso:
@@ -28,6 +28,7 @@ APP="$DIST/$APP_NAME.app"
 GPUI_BIN="$REPO_ROOT/app/lina-gpui/target/release/lina-gpui"
 LINA_BIN="$REPO_ROOT/target/release/lina"
 ASSETS_SRC="$REPO_ROOT/assets"
+PROFILES_SRC="$REPO_ROOT/profiles"
 
 SKIP_BUILD=0
 MAKE_DMG=1
@@ -50,6 +51,8 @@ for b in "$GPUI_BIN" "$LINA_BIN"; do
   [[ -f "$b" ]] || { echo "ERRO: binário ausente: $b (rode sem --skip-build)" >&2; exit 1; }
 done
 [[ -d "$ASSETS_SRC" ]] || { echo "ERRO: assets/ ausente em $ASSETS_SRC" >&2; exit 1; }
+# F1-0-2 critério 5: o app de produção carrega o claude-code.toml REAL — o bundle PRECISA dele.
+[[ -f "$PROFILES_SRC/claude-code.toml" ]] || { echo "ERRO: profiles/claude-code.toml ausente em $PROFILES_SRC" >&2; exit 1; }
 
 echo "==> [2/4] montando $APP"
 rm -rf "$APP"
@@ -66,6 +69,11 @@ fi
 # assets/ (doutrina + skill) ao lado do executável → o resolver acha por ancestral. Sem .git/target.
 cp -R "$ASSETS_SRC" "$APP/Contents/MacOS/assets"
 rm -rf "$APP/Contents/MacOS/assets/.git" 2>/dev/null || true
+
+# profiles/ (CLI Profiles TOML — F1-0-2: ready_timeout/busy_markers calibrados) ao lado do
+# executável → `injection_profile_candidates` acha por ancestral do exe (bundle auto-contido,
+# ANTES do caminho do repo). Mesmo padrão do assets/.
+cp -R "$PROFILES_SRC" "$APP/Contents/MacOS/profiles"
 
 # Info.plist (substitui a versão, caso queira bumpar via env VERSION).
 sed "s|<string>0\.1\.0</string>|<string>$VERSION</string>|g" \

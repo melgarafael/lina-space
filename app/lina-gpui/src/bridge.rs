@@ -338,6 +338,93 @@ pub fn demo_profile() -> CliProfile {
     CliProfile::from_toml_str(src, "<demo>").expect("profile da demo deve parsear")
 }
 
+/// Candidatos ao `claude-code.toml` REAL, em ordem de preferência (F1-0-2 critério 5 — a
+/// produção colhe o fix de prontidão calibrado):
+/// 1. `$LINA_PROFILES/claude-code.toml` (override de dev — mesmo env do modal M6);
+/// 2. `<lina_home>/profiles/claude-code.toml` (o dir que o modal semeia e o USUÁRIO edita —
+///    coerência com o critério 7 da F1-2-2: o TOML do usuário governa);
+/// 3. `profiles/claude-code.toml` ao lado do EXECUTÁVEL e ancestrais (bundle .app
+///    auto-contido — ANTES do caminho do repo, p/ o bundle valer fora da máquina de dev);
+/// 4. `<repo>/profiles/claude-code.toml` (dev, via `CARGO_MANIFEST_DIR`).
+fn injection_profile_candidates(lina_home: Option<&Path>) -> Vec<PathBuf> {
+    const REL: &str = "claude-code.toml";
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("LINA_PROFILES") {
+        out.push(PathBuf::from(dir).join(REL));
+    }
+    if let Some(home) = lina_home {
+        out.push(home.join("profiles").join(REL));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        out.extend(
+            exe.ancestors()
+                .skip(1) // o próprio arquivo do exe não tem `profiles/`
+                .map(|a| a.join("profiles").join(REL)),
+        );
+    }
+    if let Some(repo) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+    {
+        out.push(repo.join("profiles").join(REL));
+    }
+    out
+}
+
+/// Resolve o 1º candidato que EXISTE e PARSEIA. TOML inválido ganha warning legível e cai
+/// para o próximo (nunca panic). Puro sobre a lista — testável.
+fn resolve_profile(candidates: &[PathBuf]) -> Option<(CliProfile, PathBuf)> {
+    candidates.iter().find_map(|p| {
+        if !p.is_file() {
+            return None;
+        }
+        match CliProfile::load_file(p) {
+            Ok(prof) => Some((prof, p.clone())),
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: AVISO — profile inválido em {} ({e}); tentando o próximo",
+                    p.display()
+                );
+                None
+            }
+        }
+    })
+}
+
+/// Carrega o perfil sobre `candidates`, com **fallback-com-warning** para o demo embutido
+/// (nunca panic — inv #6). Loga o perfil carregado NO BOOT (caminho + os campos do fix
+/// F1-0-2) para inspeção. Separado de [`load_injection_profile`] p/ o fallback ser testável.
+fn injection_profile_from(candidates: &[PathBuf]) -> CliProfile {
+    match resolve_profile(candidates) {
+        Some((prof, path)) => {
+            eprintln!(
+                "lina-gpui: CLI Profile de injeção CARREGADO: id={} de {} · ready_timeout_ms={:?} · busy_markers={:?} · submit_delay_ms={}",
+                prof.id,
+                path.display(),
+                prof.ready_timeout_ms,
+                prof.busy_markers,
+                prof.submit_delay_ms,
+            );
+            prof
+        }
+        None => {
+            eprintln!(
+                "lina-gpui: AVISO — nenhum profiles/claude-code.toml carregável ({} candidato(s) tentados);                  usando o perfil DEMO embutido: timings genéricos, SEM o fix de prontidão calibrado da F1-0-2",
+                candidates.len()
+            );
+            demo_profile()
+        }
+    }
+}
+
+/// **F1-0-2 critério 5 — o app de PRODUÇÃO usa o CLI Profile real** (`ready_timeout_ms`/
+/// `busy_markers` calibrados), não mais o `demo_profile()` hardcoded. Resolução em
+/// [`injection_profile_candidates`]; fallback-com-warning em [`injection_profile_from`].
+#[must_use]
+pub fn load_injection_profile(lina_home: Option<&Path>) -> CliProfile {
+    injection_profile_from(&injection_profile_candidates(lina_home))
+}
+
 /// **W3-4 · O supervisor OBSERVA a mailbox.** Numa thread de fundo, drena o `.lina/outbox/`
 /// (onde a CLI `lina ask` deposita), roteia pelos guardrails do [`Router`] e ENTREGA ao PTY do
 /// alvo via `deliver_a2a` (faseado) usando o grid+perfil de cada terminal. É o **escritor único**
@@ -373,6 +460,9 @@ impl MailboxPump {
         model: Model,
         brake: crate::wiring::Brake,
         token_budget_day: u64,
+        // F1-0-2 critério 5: o perfil de INJEÇÃO vem de fora (produção = `load_injection_profile`,
+        // o claude-code.toml real; testes = demo/fixture) — fim do `demo_profile()` hardcoded.
+        profile: CliProfile,
     ) -> Self {
         // W3-7c (TETO DE CUSTO): `token_budget_day > 0` ARMA o teto no Router (0 = desligado). O
         // `CostLedger` soma os `TokenUsageReported` (emitidos pela bomba) e PAUSA na transição.
@@ -391,7 +481,7 @@ impl MailboxPump {
             sup,
             store,
             grids,
-            profile: demo_profile(),
+            profile,
             model,
             brake,
             last_roster: Vec::new(),
@@ -3328,7 +3418,8 @@ mod tests {
             Mailbox::new(&mailbox_root),
             Arc::clone(&model),
             Arc::clone(&brake),
-            0, // teto de custo desligado neste teste (freio/pulso)
+            0,              // teto de custo desligado neste teste (freio/pulso)
+            demo_profile(), // perfil demo: os grids de teste já têm linha-prompt semeada
         );
         let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -3355,6 +3446,15 @@ mod tests {
                 .is_some_and(|p| p.from == node_a && p.to == node_b),
             "a entrega real do ask acende o pulso A→B"
         );
+
+        // F1-0-4 (CONTRATO NOVO — entrega ciente de estado): a entrega de "oi 1" marcou B
+        // `Busy` (`NodeStatusChanged{a2a_delivery}`); em PRODUÇÃO o lifecycle devolve B a
+        // `Idle` no fim-de-resposta (meter de idle — outra pump). Aqui B é um `cat`
+        // sintético sem fim-de-turno e este teste só roda a `MailboxPump`, então simulamos
+        // o término do turno de "oi 1" — senão "oi 2" seria corretamente RETIDA (alvo Busy)
+        // em vez de entregue, e o teste do FREIO mediria o efeito errado. Mesmo padrão do
+        // helper `turn_done()` dos testes do router (lina-core).
+        let _ = sup.set_status(node_b, CoreStatus::Idle);
 
         // (2) FREIO: pausa.
         lock(&brake).toggle_requested = true;
@@ -3450,6 +3550,7 @@ mod tests {
             Arc::clone(&model),
             Arc::clone(&brake),
             100,
+            demo_profile(),
         );
         let outbox = Mailbox::new(&mailbox_root);
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -3675,6 +3776,93 @@ mod tests {
         assert_eq!(infer_agent_role("Backend"), "BACKEND", "registry default");
         assert_eq!(infer_agent_role("QA do time"), "QA");
         assert_eq!(infer_agent_role("xyzzy-sem-papel"), "DEVELOPER", "fallback");
+    }
+
+    /// **F1-0-2 critério 5 (fiação)** — o resolver de perfil carrega o 1º candidato VÁLIDO:
+    /// TOML inválido ganha warning e cai pro próximo; ausente é pulado; o claude-code.toml real
+    /// parseia com os campos do fix (`ready_timeout_ms`/`busy_markers`) vivos.
+    #[test]
+    fn injection_profile_resolves_first_valid_candidate() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-e3-prof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let invalid = dir.join("quebrado.toml");
+        std::fs::write(&invalid, "isto nao é um profile").expect("write");
+        let missing = dir.join("nao-existe.toml");
+        // O claude-code.toml REAL do repo (o mesmo que o bundle embarca).
+        let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repo root")
+            .join("profiles")
+            .join("claude-code.toml");
+
+        let (prof, from) = resolve_profile(&[missing.clone(), invalid.clone(), real.clone()])
+            .expect("resolve no candidato válido");
+        assert_eq!(from, real, "pulou ausente + inválido, achou o real");
+        assert_eq!(prof.id, "claude-code");
+        // Os campos do fix F1-0-2 estão VIVOS (não defaults): timeout calibrado + busy markers.
+        assert_eq!(prof.ready_timeout_ms, Some(30_000));
+        assert!(
+            prof.busy_markers
+                .iter()
+                .any(|m| m.contains("esc to interrupt")),
+            "busy_markers do fix presentes: {:?}",
+            prof.busy_markers
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Fallback-com-warning (critério 2 da rodada)** — nenhum candidato carregável → o perfil
+    /// DEMO embutido entra no lugar (id `lina-demo`), sem panic. O warning é o `eprintln` do
+    /// caminho (inspecionável no boot).
+    #[test]
+    fn injection_profile_falls_back_to_demo_with_warning() {
+        let dir = std::env::temp_dir().join(format!("lina-e3-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let invalid = dir.join("ruim.toml");
+        std::fs::write(&invalid, "[broken").expect("write");
+        let prof = injection_profile_from(&[dir.join("ausente.toml"), invalid]);
+        assert_eq!(
+            prof.id, "lina-demo",
+            "fallback = demo embutido, nunca panic"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ordem dos candidatos honra a doutrina: override de env → dir do usuário (`<.lina>/
+    /// profiles`, que o modal semeia) → bundle (ancestrais do exe) → repo (dev). O bundle vir
+    /// ANTES do repo é o que torna o .app auto-contido PROVÁVEL sem esconder o repo.
+    #[test]
+    fn injection_candidates_order_user_dir_before_repo() {
+        let home = std::path::Path::new("/tmp/fake-lina-home");
+        let cands = injection_profile_candidates(Some(home));
+        let user_pos = cands
+            .iter()
+            .position(|p| p.starts_with(home))
+            .expect("dir do usuário está na lista");
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("repo root")
+            .join("profiles")
+            .join("claude-code.toml");
+        let repo_pos = cands
+            .iter()
+            .position(|p| *p == repo)
+            .expect("repo está na lista (dev)");
+        assert!(
+            user_pos < repo_pos,
+            "usuário ({user_pos}) vence o repo ({repo_pos}): {cands:?}"
+        );
+        // todo candidato termina no arquivo certo.
+        assert!(cands.iter().all(|p| p.ends_with("claude-code.toml")));
     }
 
     /// **W4-2 (M2) — GATE headless de "Novo Agente":** `create_agent("Revisor")` cria um nó-terminal

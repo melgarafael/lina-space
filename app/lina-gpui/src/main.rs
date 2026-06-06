@@ -64,11 +64,11 @@ use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 use lina_bootstrap::Autonomy;
 
 use bridge::{
-    card_visible, cell_in_selection, demo_profile, encode_pointer, hit_test, lock, normalize_sel,
-    screen_to_cell, scrub_pty_secret_env, shell_cmd, spawn_pump, wire_terminal, A2aTrigger,
-    BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost,
-    Grid, MailboxPump, Model, NodeManager, NodeView, PtrAction, SharedModel, CARD_H, CARD_W,
-    CELL_H, CELL_W,
+    card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
+    normalize_sel, screen_to_cell, scrub_pty_secret_env, shell_cmd, spawn_pump, wire_terminal,
+    A2aTrigger, BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk,
+    GpuiBridgeHost, Grid, MailboxPump, Model, NodeManager, NodeView, PtrAction, SharedModel,
+    CARD_H, CARD_W, CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -2410,6 +2410,10 @@ fn main() {
         let s = persistence_ui::load_settings(&dir);
         theme::apply(s.theme_mode(), &s.accent);
     }
+    // F1-0-2 critério 5: o perfil de injeção REAL (claude-code.toml — ready_timeout/busy_markers
+    // calibrados) substitui o demo hardcoded; fallback-com-warning no loader (nunca panic). O
+    // caminho carregado + os campos do fix saem AQUI no log de boot, p/ inspeção.
+    let injection_profile = load_injection_profile(Some(&mailbox_dir));
     // Estado PERSISTENTE do onboarding (progresso + log próprio), co-locado no workspace (subdir, não
     // colide com `.lina/events` do canvas). Sobrevive ao reboot em produção → o onboarding só aparece
     // na 1ª execução de verdade.
@@ -2595,7 +2599,8 @@ fn main() {
                 *na,
                 *nb,
                 Arc::clone(grid_b),
-                demo_profile(),
+                // F1-0-2: o ⚡ demo usa o MESMO perfil real carregado no boot (sem demo hardcoded).
+                injection_profile.clone(),
                 Arc::clone(&store),
                 Arc::clone(&model),
             ))),
@@ -2625,7 +2630,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let idle_ms = demo_profile().idle_ms.unwrap_or(200);
+    let idle_ms = injection_profile.idle_ms.unwrap_or(200);
     let bridge = GpuiBridgeHost::new(Arc::clone(&model));
     // inv#6/no-panic: sem a ponte core→UI o app não renderiza terminais — encerra com mensagem clara
     // em vez de backtrace. (Falha só em condição catastrófica de sistema; instalação nova não cai aqui.)
@@ -2671,6 +2676,7 @@ fn main() {
         Arc::clone(&model),
         Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
         token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)
+        injection_profile,  // F1-0-2: o claude-code.toml real (fallback-com-warning no loader)
     )
     .spawn();
 
