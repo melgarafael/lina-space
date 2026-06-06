@@ -2456,6 +2456,21 @@ fn main() {
         }
     }));
 
+    // F1-0-8 (costura coordenada — mecanismo do Dev 02): fecha a GERAÇÃO ANTERIOR no log logo
+    // após abrir o store e ANTES de registrar os nós da sessão nova — sem esta linha o mecanismo
+    // existe mas não roda no caminho real (mesmo padrão da fiação W5-2). Nós da sessão passada
+    // sem morte registrada viram `dead` póstumo (replay = roster vivo, 0 fantasmas — gate F1-0
+    // (e)). Best-effort: falha loga ALTO e o boot segue (inv#6 — o app nunca morre no boot).
+    match lina_core::lifecycle::close_previous_generation(&mut lock(&store)) {
+        Ok(ghosts) => eprintln!(
+            "lina-gpui: F1-0-8 — geração anterior fechada no boot: {} fantasma(s)",
+            ghosts.len()
+        ),
+        Err(e) => eprintln!(
+            "lina-gpui: F1-0-8 — não fechei a geração anterior ({e}); seguindo (replay pode mostrar fantasmas)"
+        ),
+    }
+
     let pty = Arc::new(Mutex::new(PtyManager::new()));
     let sup = Arc::new(Supervisor::new());
     let bus_rx = sup.subscribe();
