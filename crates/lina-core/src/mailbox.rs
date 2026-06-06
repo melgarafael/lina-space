@@ -388,6 +388,60 @@ impl Mailbox {
         self.root.join("plan.md")
     }
 
+    /// **F1-0-7 — diretório da dead-letter queue** (`<.lina>/dead-letter`). Projeção
+    /// VISÍVEL e durável das mensagens não-entregáveis (estouro de retenção, N falhas de
+    /// entrega, destino inexistente persistente). Retry é **MANUAL**: re-enfileirar =
+    /// mover o arquivo de volta ao outbox por-nó do remetente — nunca automático.
+    #[must_use]
+    pub fn dead_letter_dir(&self) -> PathBuf {
+        self.root.join("dead-letter")
+    }
+
+    /// **F1-0-7 — deposita na DLQ de forma ATÔMICA.** O caller só confirma (`ack`) o
+    /// `.inflight` DEPOIS deste sucesso — a mensagem nunca some: ou está no `.inflight`
+    /// ou na DLQ.
+    ///
+    /// # Errors
+    /// `InvalidInput` se `msg.id` é inválido; I/O ao criar o diretório/escrever/renomear.
+    pub fn dead_letter(&self, msg: &MailMessage) -> std::io::Result<()> {
+        if !valid_msg_id(&msg.id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("id de mensagem invalido para DLQ: {:?}", msg.id),
+            ));
+        }
+        write_msg_atomic(&self.dead_letter_dir(), msg)
+    }
+
+    /// **F1-0-7 — lê UMA mensagem do `.inflight`** (sem consumir) — usada pelo motor de
+    /// retry para mover a mensagem ORIGINAL à DLQ quando as tentativas esgotam.
+    #[must_use]
+    pub fn inflight_message(&self, id: &str) -> Option<MailMessage> {
+        if !valid_msg_id(id) {
+            return None;
+        }
+        let path = self.inflight_dir().join(format!("{id}.json"));
+        match inspect_file(&path) {
+            FileVerdict::Valid(msg) => Some(*msg),
+            _ => None,
+        }
+    }
+
+    /// **F1-0-7 — lê a DLQ** (sem consumir): a projeção que a UI/`lina` exibe ao Maestro.
+    /// Ordem de `id` (UUID v7 → temporal).
+    ///
+    /// # Errors
+    /// Falha ao listar o diretório (ausente = vazio).
+    pub fn dead_letters(&self) -> std::io::Result<Vec<MailMessage>> {
+        let mut out = Vec::new();
+        for path in collect_sorted_json(&self.dead_letter_dir(), false)? {
+            if let FileVerdict::Valid(msg) = inspect_file(&path) {
+                out.push(*msg);
+            }
+        }
+        Ok(out)
+    }
+
     /// **Deposita** uma mensagem no `outbox` de forma ATÔMICA: escreve `<id>.json.tmp` e renomeia
     /// para `<id>.json` (rename é atômico no mesmo FS → o `drain` nunca vê um arquivo parcial).
     ///

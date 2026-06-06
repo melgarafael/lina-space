@@ -195,6 +195,36 @@ pub enum DomainEvent {
         to: NodeId,
         reason: String,
     },
+    /// F1-0-7 (ADR 0020): uma TENTATIVA de entrega ao PTY falhou. `attempt` é 1-based;
+    /// `next_retry_ms` é o agendamento (backoff exponencial + jitter determinístico por
+    /// id) — a série destes eventos no log PROVA o backoff por timestamps E torna o
+    /// estado de retry DURÁVEL (um restart retoma do attempt seguinte, não do zero).
+    /// Bounded por `delivery_max_attempts` (anti-amplificação A4). META.
+    MessageDeliveryFailed {
+        id: String,
+        to: NodeId,
+        attempt: u32,
+        error: String,
+        next_retry_ms: u64,
+    },
+    /// F1-0-7 (ADR 0020): a mensagem foi movida à **dead-letter queue** durável
+    /// (`<.lina>/dead-letter/<id>.json`) com motivo legível — estouro da retenção,
+    /// esgotamento das tentativas de entrega, ou destino inexistente persistente.
+    /// NADA some, NADA loopa: o retry é MANUAL (humano re-enfileira o arquivo). `to` é
+    /// NOME (cobre destino que nunca resolveu a `NodeId`). META.
+    MessageDeadLettered {
+        id: String,
+        to: String,
+        reason: String,
+    },
+    /// F1-0-7 (ADR 0020): circuit breaker — `failures` falhas CONSECUTIVAS de entrega no
+    /// nó → `Blocked` (`NodeStatusChanged{reason:"circuit_breaker"}`) e novas mensagens
+    /// retêm/vão à DLQ SEM tentar (anti retry-storm), até reset externo (lifecycle/humano
+    /// tirar o nó de `Blocked`). META.
+    CircuitOpened {
+        node: NodeId,
+        failures: u32,
+    },
     /// W3-7 (ADR 0003): recusa de guardrail no roteamento — o log é o livro-razão das recusas.
     /// `from`/`to` são NOMES (cobre `unknown_sender`, em que `from` não resolve a `NodeId`).
     /// `duplicate` NÃO é apendado (anti-amplificação A4 — ver `Router::route_message`).
@@ -387,6 +417,9 @@ impl DomainEvent {
             DomainEvent::MessageRouted { .. } => "MessageRouted",
             DomainEvent::MessageDelivered { .. } => "MessageDelivered",
             DomainEvent::MessageRetained { .. } => "MessageRetained",
+            DomainEvent::MessageDeliveryFailed { .. } => "MessageDeliveryFailed",
+            DomainEvent::MessageDeadLettered { .. } => "MessageDeadLettered",
+            DomainEvent::CircuitOpened { .. } => "CircuitOpened",
             DomainEvent::RouteBlocked { .. } => "RouteBlocked",
             DomainEvent::AwaitOpened { .. } => "AwaitOpened",
             DomainEvent::AwaitClosed { .. } => "AwaitClosed",
@@ -630,6 +663,11 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // F1-0-4: retenção é META (livro-razão da espera; a fila retida VIVE no `.inflight`
         // durável e é re-derivada pelo pump — mesmo padrão dos demais eventos de roteamento).
         | DomainEvent::MessageRetained { .. }
+        // F1-0-7: retry/DLQ/breaker são META (livro-razão da entrega; a DLQ visível vive
+        // em `<.lina>/dead-letter/` e o estado de retry é re-derivado destes eventos).
+        | DomainEvent::MessageDeliveryFailed { .. }
+        | DomainEvent::MessageDeadLettered { .. }
+        | DomainEvent::CircuitOpened { .. }
         | DomainEvent::RouteBlocked { .. }
         | DomainEvent::AwaitOpened { .. }
         | DomainEvent::AwaitClosed { .. }

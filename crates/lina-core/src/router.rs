@@ -83,15 +83,29 @@ pub struct RouterConfig {
     /// F1-0-3 (ADR 0019 §3): amostras até o circuit breaker (pausa-com-gate; a AÇÃO é F1-0-7 —
     /// compare com `LifecycleEngine::stall_samples`).
     pub stall_breaker_samples: u32,
-    /// F1-0-4 (P1): teto da RETENÇÃO por alvo `Busy`, em ms. Estourou → a mensagem é
-    /// ENTREGUE mesmo assim (semântica do `READY_TIMEOUT` do W0-9; o desvio para DLQ é
-    /// F1-0-7). 13.11 §P0: timeout explícito, nunca espera infinita — é também o que
-    /// garante que retenção jamais cria espera circular (o timeout dispara antes).
+    /// F1-0-4 (P1): teto da RETENÇÃO por alvo `Busy`, em ms. F1-0-7 (ADR 0020): estourou
+    /// → a mensagem vai à **DLQ** com motivo (antes ia "entrega mesmo assim"; o desvio
+    /// prometido aterrissou). 13.11 §P0: timeout explícito, nunca espera infinita — é
+    /// também o que garante que retenção jamais cria espera circular.
     pub retention_timeout_ms: u64,
+    /// F1-0-7: tentativas de ENTREGA (PTY) por mensagem antes da DLQ. 1-based.
+    pub delivery_max_attempts: u32,
+    /// F1-0-7: base do backoff exponencial entre tentativas (ms): base·2^(attempt-1) +
+    /// jitter determinístico por id (anti thundering-herd, reprodutível em teste).
+    pub delivery_backoff_base_ms: u64,
+    /// F1-0-7: falhas CONSECUTIVAS de entrega num nó até abrir o circuit breaker
+    /// (`CircuitOpened` + `Blocked`). Anti retry-storm (13.11: "MANDATÓRIO").
+    pub breaker_threshold: u32,
 }
 
 /// F1-0-4: default do teto de retenção por alvo ocupado (30 s).
 pub const RETENTION_TIMEOUT_MS: u64 = 30_000;
+/// F1-0-7: default de tentativas de entrega antes da DLQ.
+pub const DELIVERY_MAX_ATTEMPTS: u32 = 5;
+/// F1-0-7: default da base do backoff exponencial (1 s → 1,2,4,8,16 s + jitter).
+pub const DELIVERY_BACKOFF_BASE_MS: u64 = 1_000;
+/// F1-0-7: default do limiar do circuit breaker (falhas consecutivas por nó).
+pub const BREAKER_THRESHOLD: u32 = 5;
 
 impl Default for RouterConfig {
     fn default() -> Self {
@@ -107,6 +121,9 @@ impl Default for RouterConfig {
             stall_warn_samples: crate::lifecycle::STALL_WARN_SAMPLES,
             stall_breaker_samples: crate::lifecycle::STALL_BREAKER_SAMPLES,
             retention_timeout_ms: RETENTION_TIMEOUT_MS,
+            delivery_max_attempts: DELIVERY_MAX_ATTEMPTS,
+            delivery_backoff_base_ms: DELIVERY_BACKOFF_BASE_MS,
+            breaker_threshold: BREAKER_THRESHOLD,
         }
     }
 }
@@ -167,10 +184,19 @@ pub enum RouteOutcome {
     ContractRejected(String),
     /// F1-0-4 (P1 — entrega ciente de estado): o alvo está `Busy` → a mensagem foi RETIDA
     /// no `.inflight` (durável; o pump NÃO ackeia) e será re-tentada a cada tick até o
-    /// alvo voltar a Idle/Ready, até o teto `retention_timeout_ms` (estourou → entrega
-    /// mesmo assim; DLQ é F1-0-7). NÃO é erro: é o fix do atropelamento (baseline F1-0:
-    /// 15/15 retornos <2s ao mesmo alvo).
+    /// alvo voltar a Idle/Ready, até o teto `retention_timeout_ms` (F1-0-7: estourou →
+    /// DLQ). NÃO é erro: é o fix do atropelamento (baseline F1-0: 15/15 retornos <2s ao
+    /// mesmo alvo).
     Retained { to: NodeId },
+    /// F1-0-7 (ADR 0020): a tentativa de entrega FALHOU e a mensagem está agendada para
+    /// retry com backoff exponencial+jitter (`MessageDeliveryFailed{next_retry_ms}` no
+    /// log). Segue durável no `.inflight` (o pump NÃO ackeia); esgotadas
+    /// `delivery_max_attempts` → DLQ.
+    RetryBackoff { to: NodeId, attempt: u32 },
+    /// F1-0-7 (ADR 0020): a mensagem foi movida à **DLQ** (`<.lina>/dead-letter/`) com o
+    /// motivo legível — desfecho DEFINITIVO (o pump ackeia o `.inflight`; o arquivo da
+    /// DLQ persiste para retry MANUAL). Nada some em silêncio.
+    DeadLettered { reason: String },
 }
 
 /// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
@@ -246,8 +272,66 @@ pub struct Router {
     transient_retries: HashMap<String, u32>,
     /// F1-0-4 (P1): `id` → carimbo (ms) da PRIMEIRA retenção por alvo ocupado. Dupla função:
     /// emite o `MessageRetained` só 1× (anti-amplificação A4) e cronometra o teto
-    /// (`retention_timeout_ms`) — estourou, a msg deixa de ser retida e ENTREGA.
+    /// (`retention_timeout_ms`) — estourou, F1-0-7 manda à DLQ.
     retained_since: HashMap<String, u64>,
+    /// F1-0-7: `id` → estado de retry de ENTREGA (pós-falha de PTY). Hot-path em memória;
+    /// a DURABILIDADE vem dos eventos `MessageDeliveryFailed` no log (um restart re-deriva
+    /// attempt/next_retry de lá — ver o ledger no `pump`).
+    retries: HashMap<String, RetryState>,
+    /// F1-0-7: falhas CONSECUTIVAS de entrega por nó (zera no sucesso). Ao cruzar
+    /// `breaker_threshold` → `CircuitOpened` + `Blocked` + entra em `breaker_open`.
+    node_failures: HashMap<NodeId, u32>,
+    /// F1-0-7: nós com circuit breaker ABERTO (distinto de `Blocked` por custódia/W3-6 —
+    /// não conflamos as semânticas). Reset: ator externo tira o nó de `Blocked`
+    /// (lifecycle/humano) → detectado e limpo no veredito.
+    breaker_open: HashSet<NodeId>,
+}
+
+/// **F1-0-7 — backoff exponencial com jitter DETERMINÍSTICO** por (id, attempt):
+/// `base·2^(attempt-1)` (cap em 2^6) + `hash(id,attempt) % (exp/4 + 1)`. Determinístico =
+/// reprodutível em teste E ainda anti-thundering-herd (mensagens distintas têm fases
+/// distintas). Sem relógio/aleatoriedade de SO — coerente com replay (invariante #4).
+fn backoff_with_jitter(base_ms: u64, attempt: u32, id: &str) -> u64 {
+    let exp = base_ms.saturating_mul(1u64 << attempt.saturating_sub(1).min(6));
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a
+    for b in id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^= u64::from(attempt);
+    h = h.wrapping_mul(0x0100_0000_01b3);
+    exp + (h % (exp / 4 + 1))
+}
+
+/// F1-0-7: fallback p/ DLQ quando o arquivo original do `.inflight` não está legível
+/// (nunca perder o REGISTRO do descarte por falta do corpo).
+fn minimal_msg_for_dlq(id: &str, to: &str) -> MailMessage {
+    let mut msg = MailMessage::new("", to, "ask", "(corpo original ilegivel no .inflight)");
+    msg.id = id.to_string();
+    msg
+}
+
+/// F1-0-4/F1-0-7: decisão do veredito de retenção para um destino single-node.
+enum Verdict {
+    /// Sem retenção — o pipeline segue para os guardrails/entrega.
+    Pass,
+    /// NÃO injete agora: alvo `Busy` (`target_busy`) ou breaker aberto (`circuit_open`).
+    Hold(NodeId, &'static str),
+    /// A retenção estourou o teto → mover à DLQ (F1-0-7/ADR 0020).
+    DeadLetter(NodeId),
+}
+
+/// F1-0-7: estado de uma mensagem aguardando retry de entrega (backoff).
+struct RetryState {
+    from: NodeId,
+    target: NodeId,
+    /// Bloco `[LINA::MSG]` já renderizado na rota original (root/hops idênticos).
+    block: String,
+    /// Para o binding A2 na entrega bem-sucedida (mesma semântica da rota original).
+    root: String,
+    hops: u8,
+    attempts: u32,
+    next_ms: u64,
 }
 
 /// Teto de re-tentativas de um bloqueio TRANSIENTE (`UnknownSender`/`NoTarget`) antes de desistir.
@@ -275,6 +359,9 @@ impl Router {
             paused: false,
             transient_retries: HashMap::new(),
             retained_since: HashMap::new(),
+            retries: HashMap::new(),
+            node_failures: HashMap::new(),
+            breaker_open: HashSet::new(),
         }
     }
 
@@ -377,21 +464,103 @@ impl Router {
         // D1: dedupe DURÁVEL (à prova de restart E de ack-falho). O `seen` em memória zera no restart
         // e é podado por tempo; sem isso, um órfão em `.inflight` (crash entre `MessageRouted`+entrega
         // ao PTY e o `ack`) seria RE-ENTREGUE (2ª injeção irreversível). Antes de (re)processar,
-        // consulta o LOG: um id que JÁ tem `MessageRouted` foi roteado+entregue antes → confirma e
-        // PULA. Uma varredura por tick, só quando há o que processar (custo da classe W2, diferido).
-        let already_routed: HashSet<String> = if msgs.is_empty() {
-            HashSet::new()
+        // F1-0-7: retries de ENTREGA devidos rodam ANTES do drain (não re-rodam o
+        // pipeline — guardrails/persist já aconteceram na rota original).
+        self.process_due_retries(store, now_ms, &mut deliver);
+
+        // F1-0-7 (ADR 0020): o dedupe DURÁVEL virou um LEDGER de entrega derivado do log —
+        // distingue "roteada+entregue/DLQ" (no-op com resultado conhecido) de "roteada com
+        // entrega FALHA pendente" (retoma o retry do agendamento DURÁVEL — um restart não
+        // re-injeta nem dropa). Uma varredura por tick, só quando há o que processar.
+        let ledger: HashMap<String, LedgerEntry> = if msgs.is_empty() {
+            HashMap::new()
         } else {
-            routed_ids(store)
+            delivery_ledger(store)
         };
         msgs.into_iter()
             .map(|m| {
-                if already_routed.contains(&m.id) {
-                    // Órfão já roteado/entregue antes do crash → NÃO re-entrega; confirma e segue.
-                    if let Err(e) = self.mailbox.ack_inflight(&m.id) {
-                        eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
+                // F1-0-7: msg com retry em curso NESTE processo → segura (o motor de retry
+                // é quem entrega; o arquivo segue durável no `.inflight`).
+                if let Some(r) = self.retries.get(&m.id) {
+                    return (
+                        m.id,
+                        RouteOutcome::RetryBackoff {
+                            to: r.target,
+                            attempt: r.attempts,
+                        },
+                    );
+                }
+                match ledger.get(&m.id) {
+                    // Entregue ou já na DLQ → no-op com resultado conhecido (ack).
+                    Some(l) if l.delivered || l.dead => {
+                        if let Err(e) = self.mailbox.ack_inflight(&m.id) {
+                            eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
+                        }
+                        return (m.id, RouteOutcome::Duplicate);
                     }
-                    return (m.id, RouteOutcome::Duplicate);
+                    // Roteada com FALHA de entrega pendente (restart no meio do backoff):
+                    // re-deriva o retry do log — attempt e agendamento DURÁVEIS.
+                    Some(l) if l.failed.is_some() => {
+                        let (attempt, next_ms) = l.failed.unwrap_or((0, now_ms));
+                        let Some(target) = l.to_node else {
+                            // Sem alvo single-node reconstruível → conservador (D1): ack.
+                            let _ = self.mailbox.ack_inflight(&m.id);
+                            return (m.id, RouteOutcome::Duplicate);
+                        };
+                        let Some(from) = self.sup.node_by_name(&m.from) else {
+                            // Remetente saiu do roster — não dá para re-entregar com
+                            // atribuição correta: DLQ com motivo legível (nada some).
+                            let out = self.dead_letter_now(
+                                &m,
+                                store,
+                                "remetente fora do roster ao retomar o retry pos-restart"
+                                    .to_string(),
+                            );
+                            if matches!(out, RouteOutcome::DeadLettered { .. }) {
+                                let _ = self.mailbox.ack_inflight(&m.id);
+                            }
+                            return (m.id, out);
+                        };
+                        let block = render_message_block_v2(
+                            &m.id,
+                            &m.from,
+                            &m.to,
+                            &m.intent,
+                            &m.payload,
+                            &l.root,
+                            l.hops,
+                            m.contract.as_ref(),
+                        );
+                        self.retries.insert(
+                            m.id.clone(),
+                            RetryState {
+                                from,
+                                target,
+                                block,
+                                root: l.root.clone(),
+                                hops: l.hops,
+                                attempts: attempt,
+                                next_ms,
+                            },
+                        );
+                        return (
+                            m.id,
+                            RouteOutcome::RetryBackoff {
+                                to: target,
+                                attempt,
+                            },
+                        );
+                    }
+                    // Roteada SEM evento de entrega/falha (a janela A6 original: crash
+                    // entre rotear e o desfecho da injeção) → CONSERVADOR como o D1
+                    // histórico: assume entregue (re-injetar é irreversível; documentado).
+                    Some(_) => {
+                        if let Err(e) = self.mailbox.ack_inflight(&m.id) {
+                            eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
+                        }
+                        return (m.id, RouteOutcome::Duplicate);
+                    }
+                    None => {}
                 }
                 let outcome = self.route_message(&m, store, now_ms, &mut deliver);
                 // A6: só CONFIRMA (remove de `.inflight`) quando o evento durável foi persistido
@@ -404,10 +573,11 @@ impl Router {
                 // ainda não entrou no roster vivo). Em vez de ackear+perder, RETÉM a msg no `.inflight`
                 // por até `MAX_TRANSIENT_RETRIES` ticks — quando o nó aparece, o próximo tick ENTREGA.
                 // Esgotado o teto, ackeia (destino realmente ausente → não retém para sempre).
-                let retain_transient = matches!(
+                let transient = matches!(
                     outcome,
                     RouteOutcome::UnknownSender(_) | RouteOutcome::NoTarget
-                ) && {
+                );
+                let retain_transient = transient && {
                     let n = self.transient_retries.entry(m.id.clone()).or_insert(0);
                     *n += 1;
                     *n < MAX_TRANSIENT_RETRIES
@@ -415,23 +585,37 @@ impl Router {
                 if retain_transient {
                     // O `route_message` já marcou esta msg em `seen` (dedupe). Desmarca para que o
                     // PRÓXIMO tick a RE-PROCESSE (senão viraria `Duplicate` e seria ackeada+perdida). O
-                    // dedupe DURÁVEL (`routed_ids` no log) segue protegendo contra re-ENTREGA — só a
+                    // dedupe DURÁVEL (ledger no log) segue protegendo contra re-ENTREGA — só a
                     // re-ROTA da msg ainda-não-entregue é reaberta. Seguro: a origem (`from`) continua
                     // autenticada pelo subdir; nada de roteamento muda, só a re-tentativa.
                     self.seen.remove(&m.id);
                 }
-                // F1-0-4: `Retained` também NÃO dá ack — a msg fica no `.inflight` (durável)
-                // e é re-avaliada no próximo tick (o `route_message` já desmarcou o dedupe).
-                // O relógio é por TEMPO (`retained_since`/`retention_timeout_ms`), não por
-                // ticks como o transiente.
+                // F1-0-7 (ADR 0020): transiente ESGOTADO → DLQ com motivo legível (antes:
+                // ack+drop silencioso — "destino realmente ausente" agora é VISÍVEL e
+                // recuperável manualmente; critério 2 da story, metade alvo-Dead).
+                let outcome = if transient && !retain_transient {
+                    self.dead_letter_now(
+                        &m,
+                        store,
+                        format!(
+                            "destino indisponivel ({outcome:?}) apos {MAX_TRANSIENT_RETRIES} \
+                             re-tentativas"
+                        ),
+                    )
+                } else {
+                    outcome
+                };
+                // F1-0-4: `Retained` NÃO dá ack (re-avaliada no próximo tick; relógio por
+                // TEMPO). F1-0-7: `RetryBackoff` idem — o motor de retry é quem fecha.
                 let hold = matches!(
                     outcome,
                     RouteOutcome::PersistFailed(_)
                         | RouteOutcome::Queued
                         | RouteOutcome::Retained { .. }
+                        | RouteOutcome::RetryBackoff { .. }
                 );
                 if !hold && !retain_transient {
-                    // Desfecho definitivo (entregue, duplicado, hop-limit, ou transiente esgotado):
+                    // Desfecho definitivo (entregue, duplicado, hop-limit, dead-lettered):
                     // confirma e limpa os contadores (anti-vazamento dos mapas).
                     self.transient_retries.remove(&m.id);
                     self.retained_since.remove(&m.id);
@@ -543,24 +727,39 @@ impl Router {
         //    id (UUID v7 temporal); como CADA entrega marca o alvo `Busy`
         //    (`mark_busy_after_delivery`), a próxima da fila retém até o alvo completar o
         //    turno (Idle pelo lifecycle/EndDetector) — serialização "uma aguardando a outra".
-        if let Some((target, reason)) = self.retention_verdict(msg, sender, now_ms) {
-            if !self.retained_since.contains_key(&msg.id) {
-                self.retained_since.insert(msg.id.clone(), now_ms);
-                // Livro-razão da espera (1× por msg — A4). Falha de append NÃO solta a
-                // injeção (reter é o estado seguro; a msg segue durável no `.inflight`).
-                if let Err(e) = store.append(&DomainEvent::MessageRetained {
-                    id: msg.id.clone(),
-                    to: target,
-                    reason: reason.to_string(),
-                }) {
-                    eprintln!("lina-core: falha ao logar MessageRetained({}): {e}", msg.id);
+        match self.retention_verdict(msg, sender, now_ms) {
+            Verdict::Pass => {}
+            Verdict::Hold(target, reason) => {
+                if !self.retained_since.contains_key(&msg.id) {
+                    self.retained_since.insert(msg.id.clone(), now_ms);
+                    // Livro-razão da espera (1× por msg — A4). Falha de append NÃO solta a
+                    // injeção (reter é o estado seguro; a msg segue durável no `.inflight`).
+                    if let Err(e) = store.append(&DomainEvent::MessageRetained {
+                        id: msg.id.clone(),
+                        to: target,
+                        reason: reason.to_string(),
+                    }) {
+                        eprintln!("lina-core: falha ao logar MessageRetained({}): {e}", msg.id);
+                    }
                 }
+                // Espelho do retry transiente: desmarca o dedupe para o PRÓXIMO tick
+                // re-processar (senão viraria `Duplicate` e seria ackeada+perdida). O
+                // dedupe DURÁVEL (ledger no log) segue protegendo contra re-ENTREGA.
+                self.seen.remove(&msg.id);
+                return RouteOutcome::Retained { to: target };
             }
-            // Espelho do retry transiente: desmarca o dedupe para o PRÓXIMO tick re-processar
-            // (senão viraria `Duplicate` e seria ackeada+perdida). O dedupe DURÁVEL
-            // (`routed_ids` no log) segue protegendo contra re-ENTREGA.
-            self.seen.remove(&msg.id);
-            return RouteOutcome::Retained { to: target };
+            // F1-0-7 (ADR 0020): retenção estourou o teto → DLQ com motivo legível (nada
+            // some, nada espera para sempre; retry MANUAL re-enfileirando o arquivo).
+            Verdict::DeadLetter(_target) => {
+                return self.dead_letter_now(
+                    msg,
+                    store,
+                    format!(
+                        "retencao estourou o teto ({} ms) com o alvo ainda ocupado/bloqueado",
+                        self.config.retention_timeout_ms
+                    ),
+                );
+            }
         }
 
         // ── W3-7b (ADR 0002) + Round 4 (confused-deputy): se ESTA msg é um REPLY que CASA um await
@@ -870,6 +1069,15 @@ impl Router {
                 }
                 Err(e) => {
                     eprintln!("lina-core: entrega faseada falhou (alvo {target}): {e}");
+                    // F1-0-7 (ADR 0020): rota 1-a-1 → entra no motor de retry (backoff →
+                    // DLQ) em vez do antigo ack+drop silencioso. Broadcast mantém a
+                    // semântica existente (re-entrega parcial re-injetaria nos que já
+                    // receberam; tem gate próprio — ADR 0007).
+                    if single_target {
+                        return self.on_delivery_failure(
+                            msg, store, target, sender, &block, &root, hops, now_ms, &e,
+                        );
+                    }
                 }
             }
         }
@@ -881,53 +1089,53 @@ impl Router {
         }
     }
 
-    /// **F1-0-4 — o veredito de retenção** (P1). `Some((alvo, motivo))` = NÃO injete agora.
+    /// **F1-0-4/F1-0-7 — o veredito de retenção** (P1 + DLQ + breaker).
     /// Resolução do destino SEM efeito colateral (mesma do guardrail 0b); só retém destino
     /// que resolve a EXATAMENTE 1 nó vivo (broadcast/multi tem gate próprio — ADR 0007).
-    /// Motivo `target_busy` = estado `Busy` na state-machine F1-0-3, lido do roster (inclui
-    /// o `Busy` que a entrega ANTERIOR carimbou via `mark_busy_after_delivery` — é o que
-    /// serializa rajadas ao mesmo alvo). O teto `retention_timeout_ms` corta QUALQUER espera
-    /// (inclusive circular): estourou → `None` (a entrega segue, semântica do
-    /// `READY_TIMEOUT`/W0-9; o desvio a DLQ é F1-0-7).
-    fn retention_verdict(
-        &mut self,
-        msg: &MailMessage,
-        sender: NodeId,
-        now_ms: u64,
-    ) -> Option<(NodeId, &'static str)> {
+    /// `Hold(target_busy)` = estado `Busy` na state-machine F1-0-3 (inclui o `Busy` que a
+    /// entrega anterior carimbou — serialização); `Hold(circuit_open)` = breaker do nó
+    /// aberto (novas msgs NEM tentam — anti retry-storm); `DeadLetter` = a retenção
+    /// estourou `retention_timeout_ms` (nunca espera infinita/circular — 13.11 §P0; o
+    /// destino prometido da F1-0-4 aterrissou aqui, ADR 0020).
+    fn retention_verdict(&mut self, msg: &MailMessage, sender: NodeId, now_ms: u64) -> Verdict {
         // Resolução sem efeito colateral; só single-node.
         let (recipient, policy) = match parse_target(&msg.to) {
-            TargetSpec::Broadcast => return None,
+            TargetSpec::Broadcast => return Verdict::Pass,
             TargetSpec::Role(r) => (Recipient::Role(r), RolePolicy::FirstIdle),
             TargetSpec::Name(n) => match self.sup.node_by_name(&n) {
                 Some(id) => (Recipient::Node(id), RolePolicy::FirstIdle),
-                None => return None, // NoTarget → pipeline normal (retry transiente cobre)
+                None => return Verdict::Pass, // NoTarget → pipeline normal (transiente cobre)
             },
         };
         let preview = self.sup.resolve(&recipient, policy, Some(sender));
-        let [target] = preview[..] else { return None };
+        let [target] = preview[..] else {
+            return Verdict::Pass;
+        };
 
-        // Teto da retenção: estourou → entrega mesmo assim (nunca espera infinita/circular).
+        // Teto da retenção: estourou → DLQ (F1-0-7; nunca espera infinita/circular).
         if let Some(&first) = self.retained_since.get(&msg.id) {
             if now_ms.saturating_sub(first) >= self.config.retention_timeout_ms {
-                eprintln!(
-                    "lina-core: retenção de {} estourou o teto ({} ms) — entregando mesmo \
-                     assim (DLQ é F1-0-7)",
-                    msg.id, self.config.retention_timeout_ms
-                );
-                self.retained_since.remove(&msg.id);
-                return None;
+                return Verdict::DeadLetter(target);
             }
         }
 
-        // Retenção é PURAMENTE por estado: a serialização "uma aguardando a outra"
-        // emerge da própria state-machine, porque o router marca o alvo `Busy` no
-        // instante de cada entrega (ver o loop de entrega) e só o ciclo real do alvo
-        // (EndDetector/lifecycle → Idle) o libera.
-        if self.sup.get(target)?.status == NodeStatus::Busy {
-            Some((target, "target_busy"))
-        } else {
-            None
+        // F1-0-7: breaker do nó. Reset EXTERNO detectado aqui: se alguém (lifecycle/
+        // humano) tirou o nó de `Blocked`, o breaker fecha e as falhas zeram.
+        if self.breaker_open.contains(&target) {
+            let status = self.sup.get(target).map(|i| i.status);
+            if status == Some(NodeStatus::Blocked) {
+                return Verdict::Hold(target, "circuit_open");
+            }
+            self.breaker_open.remove(&target);
+            self.node_failures.remove(&target);
+        }
+
+        // Retenção PURAMENTE por estado: a serialização "uma aguardando a outra" emerge
+        // da state-machine (cada entrega marca o alvo `Busy`; só o ciclo real — lifecycle/
+        // EndDetector → Idle — libera).
+        match self.sup.get(target) {
+            Some(info) if info.status == NodeStatus::Busy => Verdict::Hold(target, "target_busy"),
+            _ => Verdict::Pass,
         }
     }
 
@@ -954,6 +1162,224 @@ impl Router {
         }
         if let Err(e) = self.sup.set_status(target, NodeStatus::Busy) {
             eprintln!("lina-core: falha ao marcar {target} Busy pós-entrega: {e}");
+        }
+    }
+
+    /// **F1-0-7 (ADR 0020) — move a mensagem à DLQ AGORA.** Ordem durável: escreve o
+    /// arquivo em `<.lina>/dead-letter/` ANTES de devolver o desfecho (o pump só ackeia o
+    /// `.inflight` depois — a mensagem nunca fica sem casa). Falha de I/O na DLQ → NÃO
+    /// descarta: devolve `PersistFailed` e a msg segue retida no `.inflight`.
+    fn dead_letter_now(
+        &mut self,
+        msg: &MailMessage,
+        store: &mut EventStore,
+        reason: String,
+    ) -> RouteOutcome {
+        if let Err(e) = self.mailbox.dead_letter(msg) {
+            eprintln!(
+                "lina-core: falha ao escrever DLQ de {} (retida): {e}",
+                msg.id
+            );
+            return RouteOutcome::PersistFailed(format!("dlq: {e}"));
+        }
+        if let Err(e) = store.append(&DomainEvent::MessageDeadLettered {
+            id: msg.id.clone(),
+            to: msg.to.clone(),
+            reason: reason.clone(),
+        }) {
+            // Arquivo da DLQ já existe (durável); o evento falhou — visível, nunca silencioso.
+            eprintln!(
+                "lina-core: CRÍTICO — DLQ gravada mas não logada ({}): {e}",
+                msg.id
+            );
+        }
+        // NOTIFICAÇÃO ao Maestro (critério da story): stderr legível; a projeção visível
+        // é o próprio diretório `dead-letter/` (+ o evento no log para a UI/F1-1).
+        eprintln!(
+            "lina-core: ☠ DLQ ← {} (para {}): {reason} — retry MANUAL: mova \
+             dead-letter/{}.json de volta ao outbox",
+            msg.id, msg.to, msg.id
+        );
+        self.retained_since.remove(&msg.id);
+        self.retries.remove(&msg.id);
+        self.transient_retries.remove(&msg.id);
+        RouteOutcome::DeadLettered { reason }
+    }
+
+    /// **F1-0-7 — uma tentativa de entrega FALHOU.** Registra `MessageDeliveryFailed`
+    /// (timestamps no log = prova do backoff), agenda o retry com backoff exponencial +
+    /// jitter determinístico, alimenta o circuit breaker do nó, e — esgotadas as
+    /// tentativas — manda à DLQ.
+    #[allow(clippy::too_many_arguments)]
+    fn on_delivery_failure(
+        &mut self,
+        msg: &MailMessage,
+        store: &mut EventStore,
+        target: NodeId,
+        sender: NodeId,
+        block: &str,
+        root: &str,
+        hops: u8,
+        now_ms: u64,
+        error: &str,
+    ) -> RouteOutcome {
+        // Breaker: falhas CONSECUTIVAS por nó (zeradas em qualquer sucesso).
+        let fails = self.node_failures.entry(target).or_insert(0);
+        *fails += 1;
+        let fails = *fails;
+        if fails >= self.config.breaker_threshold && !self.breaker_open.contains(&target) {
+            self.breaker_open.insert(target);
+            if let Err(e) = store.append(&DomainEvent::CircuitOpened {
+                node: target,
+                failures: fails,
+            }) {
+                eprintln!("lina-core: falha ao logar CircuitOpened({target}): {e}");
+            }
+            // Estado canônico: Blocked com motivo no log (consultável via roster/
+            // agents.json/`lina list`; o verbo `lina check` é F1-0-6).
+            if let Some(info) = self.sup.get(target) {
+                if info.status != NodeStatus::Blocked && info.status != NodeStatus::Dead {
+                    if let Err(e) = store.append(&DomainEvent::NodeStatusChanged {
+                        node: target,
+                        status: NodeStatus::Blocked.as_str().to_string(),
+                        from: info.status.as_str().to_string(),
+                        reason: "circuit_breaker".to_string(),
+                    }) {
+                        eprintln!("lina-core: falha ao logar Blocked(circuit_breaker): {e}");
+                    }
+                    if let Err(e) = self.sup.set_status(target, NodeStatus::Blocked) {
+                        eprintln!("lina-core: falha ao bloquear {target} (breaker): {e}");
+                    }
+                }
+            }
+            eprintln!(
+                "lina-core: ⛔ circuit breaker ABERTO para {target} ({fails} falhas \
+                 consecutivas) — novas mensagens retêm/DLQ até reset externo"
+            );
+        }
+
+        let attempt = self.retries.get(&msg.id).map_or(0, |r| r.attempts) + 1;
+        if attempt >= self.config.delivery_max_attempts {
+            return self.dead_letter_now(
+                msg,
+                store,
+                format!("entrega falhou {attempt}x (ultimo erro: {error}) — tentativas esgotadas"),
+            );
+        }
+        let next_ms =
+            now_ms + backoff_with_jitter(self.config.delivery_backoff_base_ms, attempt, &msg.id);
+        if let Err(e) = store.append(&DomainEvent::MessageDeliveryFailed {
+            id: msg.id.clone(),
+            to: target,
+            attempt,
+            error: error.to_string(),
+            next_retry_ms: next_ms,
+        }) {
+            eprintln!(
+                "lina-core: falha ao logar MessageDeliveryFailed({}): {e}",
+                msg.id
+            );
+        }
+        self.retries.insert(
+            msg.id.clone(),
+            RetryState {
+                from: sender,
+                target,
+                block: block.to_string(),
+                root: root.to_string(),
+                hops,
+                attempts: attempt,
+                next_ms,
+            },
+        );
+        // Como na retenção: o próximo processamento é do motor de retry (pump), não do
+        // pipeline — mas desmarcamos o dedupe por simetria/segurança de re-apresentação.
+        self.seen.remove(&msg.id);
+        RouteOutcome::RetryBackoff {
+            to: target,
+            attempt,
+        }
+    }
+
+    /// **F1-0-7 — processa os retries DEVIDOS** (chamado no topo de cada `pump` tick).
+    /// Não re-roda o pipeline (guardrails/persist já aconteceram na rota original): tenta
+    /// a ENTREGA direto com o bloco original. Sucesso → `MessageDelivered` + binding A2 +
+    /// busy-mark + ack. Falha → próxima tentativa/DLQ. Breaker aberto → segura sem queimar
+    /// tentativa.
+    fn process_due_retries<D>(&mut self, store: &mut EventStore, now_ms: u64, deliver: &mut D)
+    where
+        D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
+    {
+        let due: Vec<String> = self
+            .retries
+            .iter()
+            .filter(|(_, r)| r.next_ms <= now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let Some(state) = self.retries.get(&id) else {
+                continue;
+            };
+            let (target, from, attempts) = (state.target, state.from, state.attempts);
+            // Breaker aberto (ainda Blocked) → não queima tentativa; reset externo
+            // detectado libera (mesma regra do veredito).
+            if self.breaker_open.contains(&target) {
+                if self.sup.get(target).map(|i| i.status) == Some(NodeStatus::Blocked) {
+                    continue;
+                }
+                self.breaker_open.remove(&target);
+                self.node_failures.remove(&target);
+            }
+            // Alvo ocupado no momento do retry → espera o próximo tick (sem queimar
+            // tentativa; a retenção por estado vale também aqui).
+            if self.sup.get(target).map(|i| i.status) == Some(NodeStatus::Busy) {
+                continue;
+            }
+            let (block, root, hops) = {
+                let s = &self.retries[&id];
+                (s.block.clone(), s.root.clone(), s.hops)
+            };
+            match deliver(target, from, &block) {
+                Ok(_) => {
+                    self.node_failures.insert(target, 0);
+                    self.retries.remove(&id);
+                    if let Err(e) = store.append(&DomainEvent::MessageDelivered {
+                        id: id.clone(),
+                        to: target,
+                    }) {
+                        eprintln!("lina-core: CRÍTICO — retry entregue mas NÃO logado ({id}): {e}");
+                    }
+                    // Mesmos efeitos da entrega original: binding A2 + busy-mark.
+                    let keep_existing = matches!(
+                        self.delivered_root.get(&target),
+                        Some((existing, _, _)) if *existing != root
+                    );
+                    if !keep_existing {
+                        self.delivered_root.insert(target, (root, hops, now_ms));
+                    }
+                    self.mark_busy_after_delivery(store, target);
+                    if let Err(e) = self.mailbox.ack_inflight(&id) {
+                        eprintln!("lina-core: retry entregue mas ack falhou ({id}): {e}");
+                    }
+                }
+                Err(e) => {
+                    // Reconstrói uma MailMessage mínima p/ o caminho de falha/DLQ (o
+                    // arquivo ORIGINAL segue no `.inflight` — a DLQ relê de lá se preciso).
+                    let msg = self
+                        .mailbox
+                        .inflight_message(&id)
+                        .unwrap_or_else(|| minimal_msg_for_dlq(&id, &target.to_string()));
+                    let _ = attempts; // attempts re-lido em on_delivery_failure via self.retries
+                    let out = self.on_delivery_failure(
+                        &msg, store, target, from, &block, &root, hops, now_ms, &e,
+                    );
+                    if let RouteOutcome::DeadLettered { .. } = out {
+                        if let Err(e) = self.mailbox.ack_inflight(&id) {
+                            eprintln!("lina-core: DLQ ok mas ack do inflight falhou ({id}): {e}");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1228,19 +1654,99 @@ fn log_block(store: &mut EventStore, msg: &MailMessage, reason: BlockReason) {
 /// `seen` em memória zera) e ao ack-falho. Best-effort: erro de leitura → conjunto vazio (a pior
 /// hipótese recai no `seen` em memória + no `inspect_file`; nunca pior que antes). Custo da classe
 /// W2 (varredura do log), diferido para o round de performance.
-fn routed_ids(store: &EventStore) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    if let Ok(recs) = store.events() {
-        for rec in recs {
-            if rec.kind == "MessageRouted" {
-                if let Some(id) = rec.payload.get("id").and_then(|v| v.as_str()) {
-                    ids.insert(id.to_string());
+/// **F1-0-7 (ADR 0020) — ledger de ENTREGA derivado do log** (a idempotência durável da
+/// story): por `id`, o estado consolidado de `MessageRouted`/`MessageDelivered`/
+/// `MessageDeliveryFailed`/`MessageDeadLettered`. É o que permite ao pump, pós-restart,
+/// distinguir "roteada e entregue" (no-op com resultado conhecido) de "roteada com
+/// entrega FALHA pendente" (retoma o retry do attempt/agendamento corretos — nada é
+/// re-injetado nem dropado).
+struct LedgerEntry {
+    to_node: Option<NodeId>,
+    root: String,
+    hops: u8,
+    delivered: bool,
+    dead: bool,
+    /// Última falha: (attempt, next_retry_ms) — o agendamento sobrevive ao restart.
+    failed: Option<(u32, u64)>,
+}
+
+fn delivery_ledger(store: &EventStore) -> HashMap<String, LedgerEntry> {
+    let mut out: HashMap<String, LedgerEntry> = HashMap::new();
+    let Ok(recs) = store.events() else {
+        return out;
+    };
+    for rec in recs {
+        let id = rec
+            .payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        match rec.kind.as_str() {
+            "MessageRouted" => {
+                let to_node = rec
+                    .payload
+                    .get("to_node")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok());
+                let root = rec
+                    .payload
+                    .get("root_cause_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let hops = rec
+                    .payload
+                    .get("hops")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u8;
+                out.entry(id).or_insert(LedgerEntry {
+                    to_node,
+                    root,
+                    hops,
+                    delivered: false,
+                    dead: false,
+                    failed: None,
+                });
+            }
+            "MessageDelivered" => {
+                if let Some(e) = out.get_mut(&id) {
+                    e.delivered = true;
                 }
             }
+            "MessageDeliveryFailed" => {
+                if let Some(e) = out.get_mut(&id) {
+                    let attempt = rec
+                        .payload
+                        .get("attempt")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as u32;
+                    let next = rec
+                        .payload
+                        .get("next_retry_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    e.failed = Some((attempt, next));
+                }
+            }
+            "MessageDeadLettered" => {
+                if let Some(e) = out.get_mut(&id) {
+                    e.dead = true;
+                }
+            }
+            _ => {}
         }
     }
-    ids
+    out
 }
+
+// F1-0-7: o antigo `routed_ids` (D1, "roteado ⇒ entregue") foi SUBSTITUÍDO pelo
+// `delivery_ledger` acima — que distingue entregue/falha-pendente/DLQ e torna o estado
+// de retry durável (ADR 0020). A semântica conservadora do D1 sobrevive como o braço
+// "roteada sem desfecho de entrega" do pump.
 
 /// **§2.1 (ajuste de cooperação): o grafo de handoffs fecharia um ciclo APERTADO/REPETIDO?**
 /// Reconstrói as arestas `from→to_node` dos `MessageRouted` do log com o MESMO `root_cause_id` e
@@ -2839,7 +3345,7 @@ mod tests {
     /// qualquer espera circular — alvo PERPETUAMENTE Busy não retém para sempre: estourou
     /// o teto, ENTREGA mesmo assim (DLQ é F1-0-7).
     #[test]
-    fn retencao_estoura_teto_e_entrega_mesmo_busy() {
+    fn retencao_estoura_teto_e_vai_para_dlq() {
         let (mut router, sup, dir) = router_with("ret-teto");
         let _a = sup.register("@A", None, sink());
         let b = sup.register("@B", None, sink());
@@ -2863,15 +3369,27 @@ mod tests {
             RouteOutcome::Retained { to: b },
             "dentro do teto segue retida"
         );
-        // t=11_001 (>= 10_000 + 1_000): o teto corta a espera — entrega com B ainda Busy.
+        // t=11_001 (>= 10_000 + 1_000): F1-0-7 (ADR 0020) — o teto corta a espera, e a
+        // mensagem vai à DLQ com motivo (NUNCA injeta em alvo ocupado; nada some, nada
+        // espera para sempre — 13.11 §P0; retry é manual).
+        match router.route_message(&msg, &mut ts.store, 11_001, &mut deliver) {
+            RouteOutcome::DeadLettered { reason } => {
+                assert!(reason.contains("teto"), "motivo legível; veio: {reason}");
+            }
+            other => panic!("esperava DeadLettered no estouro do teto; veio {other:?}"),
+        }
+        assert!(rec.borrow().is_empty(), "NADA é injetado em alvo ocupado");
         assert!(
-            matches!(
-                router.route_message(&msg, &mut ts.store, 11_001, &mut deliver),
-                RouteOutcome::Delivered { .. }
-            ),
-            "timeout de retenção dispara antes de qualquer ciclo (13.11 §P0)"
+            dir.join(".lina/dead-letter")
+                .join(format!("{}.json", msg.id))
+                .exists(),
+            "a mensagem está DURÁVEL na DLQ (projeção visível, retry manual)"
         );
-        assert_eq!(rec.borrow().len(), 1, "1 entrega (pós-teto), nunca antes");
+        assert_eq!(
+            events_of(&ts.store, "MessageDeadLettered").len(),
+            1,
+            "MessageDeadLettered no log (livro-razão)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
