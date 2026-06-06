@@ -130,17 +130,71 @@ fn main() -> Result<()> {
     let store = Arc::new(Mutex::new(
         EventStore::open(ws.join(".lina/events")).map_err(|e| anyhow!("abrir EventStore: {e}"))?,
     ));
+
+    // RÉPLICA do boot de produção (F1-0-8, `app/lina-gpui/src/main.rs:2464`): ao abrir o
+    // workspace, fecha o ciclo de vida da geração ANTERIOR no log (`NodeStatusChanged{
+    // Dead, reason:app_reopened}`) — em ws fresco é no-op. O cenário `reopen-check`
+    // mede as projeções antes/depois (gate (e): replay = roster vivo, 0 nós-fantasma).
+    let reopen_pre = if cfg.scenario == Scenario::ReopenCheck {
+        Some(project_alive(&mut lock(&store))?)
+    } else {
+        None
+    };
+    let closed_prev = lina_core::lifecycle::close_previous_generation(&mut lock(&store))
+        .map_err(|e| anyhow!("close_previous_generation: {e}"))?;
+    eprintln!(
+        "[baseline] boot F1-0-8 (réplica main.rs:2464): {} nó(s) da geração anterior fechados",
+        closed_prev.len()
+    );
+    let reopen_post = if cfg.scenario == Scenario::ReopenCheck {
+        Some(project_alive(&mut lock(&store))?)
+    } else {
+        None
+    };
+
     let mut harness = LoadHarness::new(COLS, ROWS);
     let names = agent_names(cfg.claudes);
     let mut grids: BTreeMap<NodeId, Grid> = BTreeMap::new();
     let mut nodes: BTreeMap<String, NodeId> = BTreeMap::new();
 
+    // Cenário `handoff`: identidade + permissão ANTES do spawn — espelha o onboarding
+    // de produção (`write_terminal_files`, bridge.rs:1939) no MÍNIMO necessário ao
+    // transcript: `.lina/bootstrap.json` (whoami/roster — contrato serde estável do
+    // lina-bootstrap; o runner não pode depender da lib: ciclo bootstrap→core) e
+    // `.claude/settings.json` com allow de `Bash(lina*)` (sem ele o claude REAL trava
+    // no prompt de permissão ao responder — o toast de permissão é gate da F1-1, não
+    // deste). Registrado como condição do transcript no artefato.
+    let lina_bin_abs = if cfg.scenario == Scenario::Handoff {
+        let p = cfg
+            .lina_bin
+            .canonicalize()
+            .map_err(|e| anyhow!("--lina-bin {} inacessível: {e}", cfg.lina_bin.display()))?;
+        Some(p)
+    } else {
+        None
+    };
+
     for (i, name) in names.iter().enumerate() {
         let cwd = ws.join("agents").join(name);
         fs::create_dir_all(&cwd).with_context(|| format!("criar cwd de {name}"))?;
-        let cmd = PtyCommand::new(&cfg.claude_bin)
+        let mut cmd = PtyCommand::new(&cfg.claude_bin)
             .cwd(&cwd)
             .env("TERM", "xterm-256color");
+        if let Some(lina_bin) = &lina_bin_abs {
+            write_handoff_agent_files(&cwd, name, &names)?;
+            let path_env = format!(
+                "{}:{}",
+                lina_bin
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default()
+                    .display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            cmd = cmd
+                .env("LINA_HOME", ws.join(".lina").display().to_string())
+                .env("PATH", path_env);
+        }
         let role = if i == 0 { "maestro" } else { "worker" };
         let node = harness
             .spawn_terminal(name, role, cmd)
@@ -222,6 +276,7 @@ fn main() -> Result<()> {
             &grids,
             &target_name,
             cfg.attempts,
+            cfg.busy_count,
             &artifacts,
         )?;
         eprintln!(
@@ -253,12 +308,50 @@ fn main() -> Result<()> {
         collision_report = Some(r);
     }
 
+    // ── Cenários do gate DEPOIS (F1-0) ──
+    if cfg.scenario == Scenario::Dlq {
+        eprintln!("\n[baseline] ━━ CENÁRIO DLQ (gate d): não-entregável → dead-letter visível ━━");
+        run_dlq_scenario(
+            &sup,
+            &cli_mailbox,
+            &log_path,
+            &ws,
+            &nodes,
+            &names,
+            &artifacts,
+        )?;
+    }
+    if cfg.scenario == Scenario::ReopenCheck {
+        eprintln!("\n[baseline] ━━ CENÁRIO REOPEN (gate e): replay = roster vivo ━━");
+        run_reopen_check(
+            &sup,
+            &store,
+            &log_path,
+            reopen_pre.unwrap_or_default(),
+            &closed_prev,
+            reopen_post.unwrap_or_default(),
+            &artifacts,
+        )?;
+    }
+    if cfg.scenario == Scenario::Handoff {
+        eprintln!("\n[baseline] ━━ CENÁRIO HANDOFF (F1-0-6 critério 1): golden transcript ━━");
+        let lina_bin = lina_bin_abs.as_deref().expect("setado no scenario Handoff");
+        run_handoff_scenario(&ws, lina_bin, &log_path, &nodes, &grids, &names, &artifacts)?;
+    }
+
     // ── Relatório agregado (JSON) ──
     let summary = Summary {
         ws: ws.display().to_string(),
         claudes: cfg.claudes,
-        delivery_profile: "demo_profile() réplica — regex='.', submit_delay=150ms (bridge.rs:327)"
-            .into(),
+        delivery_profile: if cfg.legacy_demo_delivery {
+            "demo_profile() réplica — regex='.', submit_delay=150ms (ANTES, ex-bridge.rs:327)"
+                .into()
+        } else {
+            format!(
+                "produção F1-0-2 — claude-code.toml real (regex={:?}, submit_delay_ms={}, ready_timeout_ms={:?}, busy_markers={:?})",
+                detect.prompt_ready_regex, detect.submit_delay_ms, detect.ready_timeout_ms, detect.busy_markers
+            )
+        },
         claude_toml_idle_ms: detect.idle_ms,
         claude_toml_ask_timeout_ms: detect.ask_timeout_ms,
         stuck: stuck_report,
@@ -356,14 +449,15 @@ fn spawn_pump(
                 let mut st = lock(&store);
                 router.pump(&mut st, now_ms(), &mut deliver)
             };
+            // Narração = PRODUÇÃO (bridge.rs `tick`): só Queued/Presence são silenciosos;
+            // Retained/RetryBackoff/DeadLettered são narrados no stderr — é o "alerta
+            // visível" do gate (d), além do "☠ DLQ" que o próprio core emite.
             for (id, outcome) in &results {
                 match outcome {
                     RouteOutcome::Delivered { .. }
                     | RouteOutcome::Duplicate
                     | RouteOutcome::Queued
                     | RouteOutcome::Presence => {}
-                    // F1-0-4: retenção é o caminho ESPERADO sob alvo Busy (sem ruído).
-                    RouteOutcome::Retained { .. } => {}
                     other => eprintln!("[pump] mensagem {id} não roteada: {other:?}"),
                 }
             }
@@ -408,6 +502,7 @@ fn run_stuck_scenario(
     grids: &BTreeMap<NodeId, Grid>,
     target_name: &str,
     attempts: usize,
+    busy_count: u32,
     artifacts: &Path,
 ) -> Result<StuckReport> {
     let target = *nodes
@@ -420,7 +515,7 @@ fn run_stuck_scenario(
 
     for k in 1..=attempts {
         // Garante o alvo OCUPADO (streaming) — condição do bug (DIRECIONAMENTO §4.4).
-        let busy = ensure_busy(sup, target, grid)?;
+        let busy = ensure_busy(sup, target, grid, busy_count)?;
 
         let marker = format!("PROBE-{k}-{nonce}");
         let msg = MailMessage::new(
@@ -435,19 +530,36 @@ fn run_stuck_scenario(
             .context("enqueue_as no outbox por-nó (mesmo canal do lina ask)")?;
 
         // Espera o desfecho do roteamento no PRÓPRIO log (fonte da verdade).
-        let evt = tail.wait_for(Duration::from_secs(25), |rec| {
+        // DEPOIS (F1-0-4/7): a entrega pode RETER (alvo Busy) e re-tentar com backoff —
+        // o desfecho final demora até o alvo aquietar; 25s (ANTES) → 240s, e a DLQ
+        // também é desfecho terminal (nada some em silêncio).
+        let evt = tail.wait_for(Duration::from_secs(240), |rec| {
             let id = rec.payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            id == msg_id && (rec.kind == "MessageDelivered" || rec.kind == "RouteBlocked")
+            id == msg_id
+                && (rec.kind == "MessageDelivered"
+                    || rec.kind == "RouteBlocked"
+                    || rec.kind == "MessageDeadLettered")
         })?;
 
         let (outcome, seq, ts, s1_rows, s2_rows) = match evt {
             Some(rec) if rec.kind == "MessageDelivered" => {
+                // RECALIBRAÇÃO DO DEPOIS (ressalva 3 da baseline, prevista): no ANTES o
+                // texto preso ficava no INPUT VIVO com o terminal ocioso. No DEPOIS a
+                // mensagem é SUBMETIDA de verdade — enquanto o claude processa o turno,
+                // o ECO `❯ [LINA::MSG]…` é a última linha-prompt do grid e a amostra
+                // fixa t+3/t+8 confundia eco-em-processamento com preso (falso positivo
+                // visto no smoke de 2026-06-06: grid final limpo + turno respondido).
+                // Regra equivalente nas duas eras: espera o terminal AQUIETAR (prompt
+                // presente, sem "esc to interrupt"; teto 90s — o estado preso do ANTES
+                // já nasce quieto) e SÓ ENTÃO faz as 2 amostras (gap 3s) do marcador na
+                // região de input vivo.
+                wait_terminal_quiet(grid, Duration::from_secs(90));
                 thread::sleep(STUCK_SAMPLE_1);
                 let rows1 = grid_rows(grid);
-                let s1 = marker_in_input_region(&rows1, &marker);
+                let s1 = marker_in_input_region(&rows1, &marker) || stuck_chip_signature(&rows1);
                 thread::sleep(STUCK_SAMPLE_2);
                 let rows2 = grid_rows(grid);
-                let s2 = marker_in_input_region(&rows2, &marker);
+                let s2 = marker_in_input_region(&rows2, &marker) || stuck_chip_signature(&rows2);
                 let outcome = match (s1, s2) {
                     (true, true) => "stuck",
                     (true, false) => "late_clear",
@@ -468,8 +580,13 @@ fn run_stuck_scenario(
                     .get("reason")
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "?".into());
+                let label = if rec.kind == "MessageDeadLettered" {
+                    "dead_lettered"
+                } else {
+                    "blocked"
+                };
                 (
-                    format!("blocked:{reason}"),
+                    format!("{label}:{reason}"),
                     Some(rec.seq),
                     Some(rec.ts),
                     vec![],
@@ -528,14 +645,24 @@ fn run_stuck_scenario(
 
 /// Alvo ocupado = grid mudando (claude streamando). Se ocioso, injeta (como HUMANO,
 /// pela mesma fila serial) uma tarefa longa de baixo custo e espera streamar.
-fn ensure_busy(sup: &Arc<Supervisor>, target: NodeId, grid: &Grid) -> Result<bool> {
+/// `busy_count` parametriza a duração do streaming: 2500 = protocolo do ANTES;
+/// o DEPOIS usa janela menor (a entrega agora ESPERA prontidão — busy infinito
+/// estouraria o orçamento de retry por design, virando DLQ e não medição de P0).
+fn ensure_busy(
+    sup: &Arc<Supervisor>,
+    target: NodeId,
+    grid: &Grid,
+    busy_count: u32,
+) -> Result<bool> {
     if grid_changing(grid, Duration::from_millis(900)) {
         return Ok(true);
     }
     type_line(
         sup,
         target,
-        "Conte de 1 até 2500 imprimindo um número por linha, sem usar nenhuma ferramenta e sem comentários.",
+        &format!(
+            "Conte de 1 até {busy_count} imprimindo um número por linha, sem usar nenhuma ferramenta e sem comentários."
+        ),
     )?;
     let deadline = Instant::now() + Duration::from_secs(45);
     while Instant::now() < deadline {
@@ -763,8 +890,15 @@ fn input_region(rows: &[String]) -> Vec<String> {
 
 /// Linha de prompt vivo da TUI: `> ` ou `❯ ` no início (opcionalmente atrás da
 /// borda `│` nas versões que desenham caixa em volta do input).
+/// RECALIBRAÇÃO 2026-06-06 (gate DEPOIS, evidência de bytes do smoke): o prompt VIVO
+/// do Claude Code v2.1.166 desenha `❯` + **NBSP (U+00A0)**, enquanto o ECO de
+/// mensagem submetida usa `❯` + espaço comum — sem normalizar, o prompt vivo nunca
+/// casava e a região caía no eco (falso "stuck" em mensagem JÁ submetida). No ANTES
+/// isso nunca apareceu: mensagem presa não gera eco, e o fallback das últimas 8
+/// linhas dava o veredito certo.
 fn is_prompt_row(row: &str) -> bool {
-    let mut t = row.trim_start();
+    let norm = row.replace('\u{a0}', " ");
+    let mut t = norm.trim_start();
     if let Some(rest) = t.strip_prefix('│') {
         t = rest.trim_start();
     }
@@ -773,6 +907,77 @@ fn is_prompt_row(row: &str) -> bool {
 
 fn marker_in_input_region(rows: &[String], marker: &str) -> bool {
     input_region(rows).iter().any(|r| r.contains(marker))
+}
+
+/// Assinatura do estado PRESO-EM-CHIP (controle legacy 2026-06-06, evidência de grid):
+/// no caminho do ANTES o paste colapsa em chip — o CONTEÚDO (e o marcador) ficam
+/// INVISÍVEIS no grid e a detecção por marcador é cega. O que o grid mostra é o
+/// rodapé "paste again to expand" (chip aguardando) ou "Press up to edit queued
+/// messages" (mensagem enfileirada sem turno limpo). Qualquer um presente na amostra
+/// pós-quiet = texto NÃO submetido de forma limpa → conta como preso (conservador:
+/// joga CONTRA o DEPOIS, nunca a favor).
+fn stuck_chip_signature(rows: &[String]) -> bool {
+    rows.iter().any(|r| {
+        r.contains("paste again to expand") || r.contains("Press up to edit queued messages")
+    })
+}
+
+/// Linha de prompt VIVO E VAZIO: `>`/`❯` sem conteúdo após o glifo (a TUI desenha o
+/// prompt vazio quando está pronta para input novo). Distingue o prompt vivo do ECO
+/// de mensagem submetida (`❯ [LINA::MSG]…`), que também começa com o glifo.
+/// (NBSP normalizado — ver `is_prompt_row`.)
+fn is_empty_prompt_row(row: &str) -> bool {
+    let norm = row.replace('\u{a0}', " ");
+    let mut t = norm.trim_start();
+    if let Some(rest) = t.strip_prefix('│') {
+        t = rest.trim_start();
+    }
+    let t = t.trim_end_matches(['│', ' ']);
+    t == ">" || t == "❯"
+}
+
+/// Espera o TURNO TERMINAR pós-entrega: sem "esc to interrupt" (turno em curso) E a
+/// ÚLTIMA linha-prompt do grid é um prompt VAZIO (input novo pronto). Os dois juntos
+/// fecham as duas janelas de falso-stuck do DEPOIS (smoke 2026-06-06): (1) eco
+/// `❯ [LINA::MSG]` durante o processamento; (2) a janela pós-Enter antes de o
+/// "esc to interrupt" aparecer, em que o eco é a única prompt-row.
+/// O 2º busy_marker ("Press up to edit queued messages") NÃO entra aqui de propósito:
+/// ele é a assinatura do estado PRESO do ANTES — esperar por ele mascararia o bug.
+/// O estado PRESO nunca satisfaz (a última prompt-row contém o texto preso, não-vazia)
+/// → timeout → amostra acha o marcador → `stuck`, como no protocolo original.
+fn wait_terminal_quiet(grid: &Grid, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let rows = grid_rows(grid);
+        let busy = rows.iter().any(|r| r.contains("esc to interrupt"));
+        let last_prompt_is_empty = rows
+            .iter()
+            .rposition(|r| is_prompt_row(r))
+            .is_some_and(|i| is_empty_prompt_row(&rows[i]));
+        if last_prompt_is_empty && !busy {
+            // Vão pós-Enter (smoke5): a TUI pode exibir "Press up to edit queued
+            // messages" por instantes ANTES de consumir a fila e abrir o turno —
+            // dá até 20s para a fila consumir. Chip PRESO de verdade não consome
+            // (segue "paste again to expand") e cai nas amostras como stuck.
+            let extra = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < extra && Instant::now() < deadline {
+                let rows = grid_rows(grid);
+                if !stuck_chip_signature(&rows) {
+                    if rows.iter().any(|r| r.contains("esc to interrupt")) {
+                        break; // fila consumida → turno novo abriu → volta ao laço externo
+                    }
+                    return; // limpo de verdade
+                }
+                thread::sleep(Duration::from_millis(400));
+            }
+            if Instant::now() >= extra {
+                return; // assinatura persistiu 20s — amostras decidem (stuck real)
+            }
+            continue;
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+    eprintln!("[stuck] aviso: terminal não aquietou em {timeout:?} — amostrando mesmo assim");
 }
 
 // ───────────────────────────── claude: boot + input humano ─────────────────────────────
@@ -920,6 +1125,396 @@ impl LogTail {
     }
 }
 
+// ───────────────────────────── cenários do gate DEPOIS (F1-0) ─────────────────────────────
+
+/// Projeção de roster do log (replay): nós COM ciclo de vida cujo último status ≠ Dead.
+/// Espelha a regra do `close_previous_generation` (nós sem status não são fantasmas).
+fn project_alive(store: &mut EventStore) -> Result<Vec<(String, String)>> {
+    let state = store
+        .project()
+        .map_err(|e| anyhow!("project() do event store: {e}"))?;
+    let mut out = Vec::new();
+    for (node, projected) in &state.nodes {
+        let Some(status) = projected.status.as_deref() else {
+            continue;
+        };
+        if status != "Dead" {
+            out.push((node.to_string(), status.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Identidade + permissão mínimas p/ o transcript de handoff (cenário `handoff`):
+/// `.lina/bootstrap.json` (contrato serde do lina-bootstrap, escrito à mão — o runner
+/// não pode depender da lib: ciclo de dependência) e `.claude/settings.json` com
+/// allow de `Bash(lina*)` (sem ele o claude trava no prompt de permissão ao usar o
+/// verbo; o toast de permissão é gate da F1-1, não deste).
+fn write_handoff_agent_files(cwd: &Path, name: &str, roster: &[String]) -> Result<()> {
+    let lina_dir = cwd.join(".lina");
+    let claude_dir = cwd.join(".claude");
+    fs::create_dir_all(&lina_dir)?;
+    fs::create_dir_all(&claude_dir)?;
+    let bootstrap = serde_json::json!({
+        "terminal_name": name,
+        "roster": roster,
+        "vault_path": "",
+        "autonomy": "autonomous",
+    });
+    fs::write(
+        lina_dir.join("bootstrap.json"),
+        serde_json::to_string_pretty(&bootstrap)?,
+    )?;
+    let settings = serde_json::json!({
+        "permissions": { "allow": ["Bash(lina:*)", "Bash(lina)"] }
+    });
+    fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::to_string_pretty(&settings)?,
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct DlqCase {
+    target: String,
+    mode: String, // "alvo_inexistente" | "alvo_derrubado_mark_dead"
+    msg_id: String,
+    outcome: String, // dead_lettered:<reason> | delivered (FALHA do gate) | timeout
+    seq: Option<u64>,
+    ts: Option<u64>,
+}
+
+/// Gate (d): mensagem não-entregável → DLQ com motivo + alerta visível. Dois modos,
+/// ambos pelo caminho de PRODUÇÃO do router (retry transiente → `dead_letter_now`):
+/// (A) alvo que nunca existiu; (B) destino REAL derrubado (`Supervisor::mark_dead` —
+/// o caminho canônico que o lifecycle usa; a resolução passa a ignorá-lo).
+#[allow(clippy::too_many_arguments)]
+fn run_dlq_scenario(
+    sup: &Arc<Supervisor>,
+    mailbox: &Mailbox,
+    log_path: &Path,
+    ws: &Path,
+    nodes: &BTreeMap<String, NodeId>,
+    names: &[String],
+    artifacts: &Path,
+) -> Result<()> {
+    let mut tail = LogTail::new(log_path)?;
+    let mut cases = Vec::new();
+
+    let run_case = |tail: &mut LogTail, target: &str, mode: &str| -> Result<DlqCase> {
+        let msg = MailMessage::new(
+            "Maestro",
+            format!("@{target}"),
+            "ask",
+            format!("PROBE-DLQ para {target} — não-entregável de propósito (gate d)."),
+        );
+        let msg_id = msg.id.clone();
+        mailbox.enqueue_as("Maestro", &msg).context("enqueue dlq")?;
+        // Teto transiente = 50 ticks de pump (~6s a 120ms) + folga.
+        let evt = tail.wait_for(Duration::from_secs(45), |rec| {
+            let id = rec.payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            id == msg_id && (rec.kind == "MessageDeadLettered" || rec.kind == "MessageDelivered")
+        })?;
+        let (outcome, seq, ts) = match evt {
+            Some(rec) if rec.kind == "MessageDeadLettered" => {
+                let reason = rec
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                (
+                    format!("dead_lettered:{reason}"),
+                    Some(rec.seq),
+                    Some(rec.ts),
+                )
+            }
+            Some(rec) => ("delivered".to_string(), Some(rec.seq), Some(rec.ts)),
+            None => ("timeout".to_string(), None, None),
+        };
+        eprintln!("[dlq] {mode} (@{target}): {outcome}");
+        Ok(DlqCase {
+            target: target.to_string(),
+            mode: mode.to_string(),
+            msg_id,
+            outcome,
+            seq,
+            ts,
+        })
+    };
+
+    // (A) alvo inexistente.
+    cases.push(run_case(&mut tail, "Fantasma", "alvo_inexistente")?);
+
+    // (B) destino real derrubado: o ÚLTIMO worker morre (mark_dead — para a fila de
+    // escrita e publica NodeDied; o processo claude é colhido no teardown).
+    let victim = names.last().cloned().unwrap_or_else(|| "W1".into());
+    let victim_node = nodes[&victim];
+    sup.mark_dead(victim_node)
+        .map_err(|e| anyhow!("mark_dead({victim}): {e}"))?;
+    eprintln!("[dlq] destino @{victim} derrubado (mark_dead — caminho canônico do lifecycle)");
+    cases.push(run_case(&mut tail, &victim, "alvo_derrubado_mark_dead")?);
+
+    // Projeção visível da DLQ (o que o Maestro/UI consultam) + o evento no log.
+    let letters = Mailbox::new(ws.join(".lina"))
+        .dead_letters()
+        .map_err(|e| anyhow!("ler dead-letter/: {e}"))?;
+    let letter_ids: Vec<String> = letters.iter().map(|m| m.id.clone()).collect();
+    eprintln!(
+        "[dlq] projeção dead-letter/ contém {} carta(s): {:?}",
+        letters.len(),
+        letter_ids
+    );
+    let report = serde_json::json!({
+        "cases": cases,
+        "dead_letter_dir_ids": letter_ids,
+    });
+    fs::write(
+        artifacts.join("dlq.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
+    Ok(())
+}
+
+/// Gate (e): após `kill -9` externo em corrida(s) anterior(es) NESTE ws, o boot
+/// (réplica F1-0-8) fechou a geração anterior; aqui provamos replay = roster vivo
+/// e a aritmética `NodeAdded − mortes == vivos` sobre o próprio log.
+fn run_reopen_check(
+    sup: &Arc<Supervisor>,
+    store: &Arc<Mutex<EventStore>>,
+    log_path: &Path,
+    pre: Vec<(String, String)>,
+    closed: &[NodeId],
+    post: Vec<(String, String)>,
+    artifacts: &Path,
+) -> Result<()> {
+    // Projeção FINAL (inclui a geração nova spawnada nesta corrida).
+    let fin = project_alive(&mut lock(store))?;
+    let live: Vec<(String, String)> = sup
+        .list()
+        .into_iter()
+        .filter(|n| n.status.is_alive())
+        .map(|n| (n.id.to_string(), n.name))
+        .collect();
+
+    // Aritmética por evento sobre o log inteiro (mesmo grep que revelou o bug P4).
+    let mut added = 0u64;
+    let mut deaths = 0u64;
+    let mut tail = LogTail::new(log_path)?;
+    for rec in tail.poll()? {
+        match rec.kind.as_str() {
+            "NodeAdded" => added += 1,
+            "NodeStatusChanged"
+                if rec.payload.get("status").and_then(|v| v.as_str()) == Some("Dead") =>
+            {
+                deaths += 1;
+            }
+            "NodeRemoved" => deaths += 1,
+            _ => {}
+        }
+    }
+    let replay_equals_live = fin.len() == live.len();
+    let arithmetic_ok = added.saturating_sub(deaths) == live.len() as u64;
+    eprintln!(
+        "[reopen] pré-close: {} vivos no replay · fechados no boot: {} · pós-close: {} · final (replay): {} · roster vivo: {} · NodeAdded={} mortes={} → {}−{}={} {}",
+        pre.len(),
+        closed.len(),
+        post.len(),
+        fin.len(),
+        live.len(),
+        added,
+        deaths,
+        added,
+        deaths,
+        added.saturating_sub(deaths),
+        if replay_equals_live && arithmetic_ok { "✓" } else { "✗ DIVERGÊNCIA" }
+    );
+    let report = serde_json::json!({
+        "replay_alive_pre_close": pre,
+        "closed_on_boot": closed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "replay_alive_post_close": post,
+        "replay_alive_final": fin,
+        "live_roster": live,
+        "node_added_total": added,
+        "deaths_total": deaths,
+        "replay_equals_live": replay_equals_live,
+        "arithmetic_ok": arithmetic_ok,
+    });
+    fs::write(
+        artifacts.join("reopen.json"),
+        serde_json::to_string_pretty(&report)?,
+    )?;
+    Ok(())
+}
+
+/// F1-0-6 critério 1 — golden transcript: `lina handoff --context` REAL (CLI → outbox →
+/// pump → router contrato @2 → entrega faseada) para um claude REAL, e a resposta no
+/// formato voltando pelo bus. O transcript integral vai a `handoff-transcript.md`.
+#[allow(clippy::too_many_arguments)]
+fn run_handoff_scenario(
+    ws: &Path,
+    lina_bin: &Path,
+    log_path: &Path,
+    nodes: &BTreeMap<String, NodeId>,
+    grids: &BTreeMap<NodeId, Grid>,
+    names: &[String],
+    artifacts: &Path,
+) -> Result<()> {
+    let maestro = &names[0];
+    let target = names.get(1).cloned().unwrap_or_else(|| "W1".into());
+    let maestro_grid = &grids[&nodes[maestro]];
+    let target_grid = &grids[&nodes[&target]];
+    let nonce = std::process::id();
+
+    // Contexto anexável com marcador único — a prova do `--context` no payload.
+    let ctx_marker = format!("PLANO-CTX-{nonce}");
+    let plano = ws.join("plano.md");
+    fs::write(
+        &plano,
+        format!("# Plano de teste do gate F1-0\n\nMarcador: {ctx_marker}\n\n1. Validar o verbo handoff.\n2. Responder ao Maestro.\n"),
+    )?;
+
+    let reply_marker = format!("HANDOFF-OK-{nonce}");
+    let task = format!(
+        "Tarefa de teste do gate F1-0 (responda JÁ, sem perguntar): execute no Bash o comando \
+         lina ask \"@{maestro}\" \"{reply_marker} plano recebido\" --reply-to <ID>, substituindo \
+         <ID> pelo valor do campo id do bloco LINA::MSG desta mensagem. Depois pare."
+    );
+
+    let mut tail = LogTail::new(log_path)?;
+    let out = std::process::Command::new(lina_bin)
+        .args(["handoff", &format!("@{target}"), &task, "--context"])
+        .arg(&plano)
+        .current_dir(ws.join("agents").join(maestro))
+        .env("LINA_HOME", ws.join(".lina"))
+        .output()
+        .with_context(|| format!("executar {} handoff", lina_bin.display()))?;
+    let cli_stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let cli_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    eprintln!(
+        "[handoff] CLI exit={:?}\n[handoff] stdout: {}\n[handoff] stderr: {}",
+        out.status.code(),
+        cli_stdout.trim(),
+        cli_stderr.trim()
+    );
+
+    // 1) roteado com intent=handoff (contrato @2 validado pelo router).
+    let routed = tail.wait_for(Duration::from_secs(30), |rec| {
+        rec.kind == "MessageRouted"
+            && rec.payload.get("intent").and_then(|v| v.as_str()) == Some("handoff")
+    })?;
+    let handoff_id = routed
+        .as_ref()
+        .and_then(|r| r.payload.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    // 2) entregue ao alvo (pode reter se Busy — espera generosa).
+    let delivered = tail.wait_for(Duration::from_secs(120), |rec| {
+        rec.kind == "MessageDelivered"
+            && rec.payload.get("id").and_then(|v| v.as_str()) == Some(handoff_id.as_str())
+    })?;
+    // O paste é grande (contrato @2 + plano) e a TUI leva segundos para processar e
+    // redesenhar — 8s antes do snapshot cedo; um snapshot TARDIO (pós-espera do reply)
+    // captura o que o destino de fato fez com a mensagem (diagnóstico do transcript).
+    thread::sleep(Duration::from_secs(8));
+    let target_grid_rows = grid_rows(target_grid);
+    let mut ctx_in_target = target_grid_rows.iter().any(|r| r.contains(&ctx_marker));
+
+    // 3) resposta no formato voltando pelo bus (claude real decide e digita — espera
+    // longa). O `lina ask --reply-to` roteia como intent=ask HERDANDO a cadeia: a
+    // assinatura do reply é `root_cause_id == id do handoff` num id NOVO (provado na
+    // corrida diagnóstica de 2026-06-06: seq 10 do log, hops=1).
+    let reply_routed = tail.wait_for(Duration::from_secs(300), |rec| {
+        rec.kind == "MessageRouted"
+            && rec.payload.get("root_cause_id").and_then(|v| v.as_str())
+                == Some(handoff_id.as_str())
+            && rec.payload.get("id").and_then(|v| v.as_str()) != Some(handoff_id.as_str())
+    })?;
+    let reply_id = reply_routed
+        .as_ref()
+        .and_then(|r| r.payload.get("id").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let reply_delivered = if reply_id.is_empty() {
+        None
+    } else {
+        tail.wait_for(Duration::from_secs(120), |rec| {
+            rec.kind == "MessageDelivered"
+                && rec.payload.get("id").and_then(|v| v.as_str()) == Some(reply_id.as_str())
+        })?
+    };
+    thread::sleep(Duration::from_secs(3));
+    let maestro_rows = grid_rows(maestro_grid);
+    let reply_in_maestro = maestro_rows.iter().any(|r| r.contains(&reply_marker));
+    // Snapshot TARDIO do destino — o que o W1 fez com a mensagem durante a espera.
+    let target_grid_late = grid_rows(target_grid);
+    ctx_in_target = ctx_in_target || target_grid_late.iter().any(|r| r.contains(&ctx_marker));
+
+    let verdict = routed.is_some()
+        && delivered.is_some()
+        && ctx_in_target
+        && reply_routed.is_some()
+        && reply_delivered.is_some()
+        && reply_in_maestro;
+    eprintln!(
+        "[handoff] routed={} delivered={} ctx_no_alvo={} reply_routed={} reply_delivered={} reply_no_maestro={} → {}",
+        routed.is_some(),
+        delivered.is_some(),
+        ctx_in_target,
+        reply_routed.is_some(),
+        reply_delivered.is_some(),
+        reply_in_maestro,
+        if verdict { "✓ TRANSCRIPT OK" } else { "✗ INCOMPLETO (registrado)" }
+    );
+
+    let fmt_rec = |r: &Option<LogRec>| match r {
+        Some(rec) => format!(
+            "seq={} ts={} kind={} payload={}",
+            rec.seq, rec.ts, rec.kind, rec.payload
+        ),
+        None => "—(timeout)".into(),
+    };
+    let transcript = format!(
+        "# Golden transcript — `lina handoff --context` (gate F1-0 · F1-0-6 critério 1)\n\n\
+         Workspace isolado: `{ws_d}` · claudes reais: {maestro} (origem) → {target} (destino).\n\
+         Condições registradas: `.lina/bootstrap.json` por agente (identidade) + allow `Bash(lina:*)`\n\
+         no settings do claude (o toast de permissão é gate da F1-1); autonomia=autonomous.\n\n\
+         ## Comando (cwd=agents/{maestro}, LINA_HOME=<ws>/.lina)\n\n\
+         ```\nlina handoff \"@{target}\" \"<tarefa com instrução de reply>\" --context {plano_d}\n```\n\n\
+         exit: {exit:?}\n\nstdout:\n```\n{cli_stdout}\n```\n\nstderr:\n```\n{cli_stderr}\n```\n\n\
+         ## Eventos no log.jsonl (fonte da verdade)\n\n\
+         - MessageRouted(intent=handoff): {routed}\n\
+         - MessageDelivered(handoff): {delivered}\n\
+         - MessageRouted(intent=reply): {reply_routed}\n\
+         - MessageDelivered(reply): {reply_delivered}\n\n\
+         ## Grid do destino ({target}) — snapshot CEDO, entrega+8s (marcador de contexto: {ctx_marker} → {ctx_in_target})\n\n\
+         ```\n{target_rows}\n```\n\n\
+         ## Grid do destino ({target}) — snapshot TARDIO, pós-espera do reply\n\n\
+         ```\n{target_rows_late}\n```\n\n\
+         ## Grid da origem ({maestro}) — resposta no formato (marcador: {reply_marker} → {reply_in_maestro})\n\n\
+         ```\n{maestro_rows}\n```\n\n\
+         ## Veredito do transcript: {verdict}\n",
+        ws_d = ws.display(),
+        plano_d = plano.display(),
+        exit = out.status.code(),
+        routed = fmt_rec(&routed),
+        delivered = fmt_rec(&delivered),
+        reply_routed = fmt_rec(&reply_routed),
+        reply_delivered = fmt_rec(&reply_delivered),
+        target_rows = target_grid_rows.join("\n"),
+        target_rows_late = target_grid_late.join("\n"),
+        maestro_rows = maestro_rows.join("\n"),
+        verdict = if verdict { "✓ OK" } else { "✗ INCOMPLETO" },
+    );
+    fs::write(artifacts.join("handoff-transcript.md"), transcript)?;
+    eprintln!(
+        "[handoff] transcript: {}",
+        artifacts.join("handoff-transcript.md").display()
+    );
+    Ok(())
+}
+
 // ───────────────────────────── config / util ─────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -927,6 +1522,14 @@ enum Scenario {
     Stuck,
     Collision,
     All,
+    /// Gate F1-0 (d): mensagem não-entregável → DLQ com motivo + alerta visível.
+    Dlq,
+    /// Gate F1-0 (e): reabre um ws morto por `kill -9`, fecha a geração anterior
+    /// (réplica da fiação de produção, `main.rs:2464`) e compara replay × roster vivo.
+    ReopenCheck,
+    /// Gate F1-0 / F1-0-6 critério 1: golden transcript do `lina handoff --context`
+    /// para um claude REAL, com a resposta no formato voltando pelo bus.
+    Handoff,
 }
 
 impl Scenario {
@@ -948,6 +1551,13 @@ struct Config {
     claude_profile: PathBuf,
     /// Reproduz o ANTES (entrega com demo_profile, pré-F1-0-2). Default: produção atual.
     legacy_demo_delivery: bool,
+    /// Gate DEPOIS: teto da tarefa que arma o force-busy (`ensure_busy`). Default 2500
+    /// (protocolo do ANTES intacto). No DEPOIS a entrega espera a prontidão REAL
+    /// (`wait_ready` + retry/retenção), então a janela de busy precisa ser FINITA e
+    /// menor que o orçamento de retries — senão toda tentativa vira DLQ por design.
+    busy_count: u32,
+    /// Caminho do bin `lina` (cenário `handoff`). Default: `target/release/lina`.
+    lina_bin: PathBuf,
 }
 
 fn parse_args() -> Result<Config> {
@@ -959,6 +1569,8 @@ fn parse_args() -> Result<Config> {
     let mut claude_bin = "claude".to_string();
     let mut claude_profile = PathBuf::from("profiles/claude-code.toml");
     let mut legacy_demo_delivery = false;
+    let mut busy_count = 2500u32;
+    let mut lina_bin = PathBuf::from("target/release/lina");
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -967,7 +1579,9 @@ fn parse_args() -> Result<Config> {
             "--claudes" => claudes = next(&mut args, "--claudes")?.parse()?,
             "--attempts" => attempts = next(&mut args, "--attempts")?.parse()?,
             "--rounds" => rounds = next(&mut args, "--rounds")?.parse()?,
+            "--busy-count" => busy_count = next(&mut args, "--busy-count")?.parse()?,
             "--claude-bin" => claude_bin = next(&mut args, "--claude-bin")?,
+            "--lina-bin" => lina_bin = PathBuf::from(next(&mut args, "--lina-bin")?),
             "--claude-profile" => {
                 claude_profile = PathBuf::from(next(&mut args, "--claude-profile")?)
             }
@@ -976,23 +1590,31 @@ fn parse_args() -> Result<Config> {
                     "stuck" => Scenario::Stuck,
                     "collision" => Scenario::Collision,
                     "all" => Scenario::All,
+                    "dlq" => Scenario::Dlq,
+                    "reopen-check" => Scenario::ReopenCheck,
+                    "handoff" => Scenario::Handoff,
                     other => return Err(anyhow!("--scenario inválido: {other}")),
                 }
             }
             "-h" | "--help" => {
                 eprintln!(
                     "uso: baseline_f1_0 --ws DIR [--claudes 6] [--attempts 22] [--rounds 6] \
-[--scenario all|stuck|collision] [--claude-bin claude] [--claude-profile profiles/claude-code.toml]"
+[--scenario all|stuck|collision|dlq|reopen-check|handoff] [--busy-count 2500] \
+[--claude-bin claude] [--lina-bin target/release/lina] [--claude-profile profiles/claude-code.toml]"
                 );
                 std::process::exit(0);
             }
             other => return Err(anyhow!("flag desconhecida: {other}")),
         }
     }
-    if !(5..=8).contains(&claudes) {
+    let scenario_principal = matches!(
+        scenario,
+        Scenario::Stuck | Scenario::Collision | Scenario::All
+    );
+    if scenario_principal && !(5..=8).contains(&claudes) {
         eprintln!("[baseline] aviso: o protocolo do gate pede 5–8 claudes (pedido: {claudes})");
     }
-    if attempts < 20 {
+    if scenario_principal && attempts < 20 {
         eprintln!("[baseline] aviso: o critério (2) pede ≥20 tentativas (pedido: {attempts})");
     }
     let ws = ws.ok_or_else(|| {
@@ -1007,6 +1629,8 @@ fn parse_args() -> Result<Config> {
         claude_bin,
         claude_profile,
         legacy_demo_delivery,
+        busy_count,
+        lina_bin,
     })
 }
 
@@ -1123,6 +1747,22 @@ mod tests {
         assert_eq!(region.len(), 8);
         assert_eq!(region[0], "r32");
         assert_eq!(region[7], "r39");
+    }
+
+    /// Recalibração do DEPOIS (smoke 2026-06-06): o prompt VIVO E VAZIO (`❯ `) é
+    /// distinto do ECO de mensagem submetida (`❯ [LINA::MSG]…`) e do texto preso
+    /// (`> PROBE…`) — só ele autoriza a amostra do veredito stuck/submitted.
+    #[test]
+    fn empty_prompt_row_discriminates_echo_and_stuck() {
+        assert!(is_empty_prompt_row("❯ "));
+        assert!(is_empty_prompt_row("> "));
+        assert!(is_empty_prompt_row("│ > │"));
+        // Bytes REAIS do grid v2.1.166 (smoke 2026-06-06): prompt vivo = ❯ + NBSP.
+        assert!(is_empty_prompt_row("❯\u{a0}                  "));
+        assert!(is_prompt_row("❯\u{a0}                  "));
+        assert!(!is_empty_prompt_row("❯ [LINA::MSG]")); // eco de submissão
+        assert!(!is_empty_prompt_row("> PROBE-1-99 texto preso")); // preso do ANTES
+        assert!(!is_empty_prompt_row("linha qualquer"));
     }
 
     /// Δt entre entregas consecutivas ao mesmo alvo: <2000 ms = colisão; pares de

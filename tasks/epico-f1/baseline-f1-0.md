@@ -169,3 +169,69 @@ Cobertura headless (determinística, no crate — `cargo test -p lina-core`): `r
 ---
 
 PRONTO desta story (resumo na resposta ao Maestro). Artefatos versionados: `tools/lina_watch.py`, `crates/lina-core/src/bin/baseline_f1_0.rs` (+ testes), este `baseline-f1-0.md`. Dados crus das corridas: `<ws>/baseline-artifacts/` (não versionados; em `/tmp`).
+
+---
+
+# DEPOIS FORMAL (gate) — medição independente · 2026-06-06
+
+> **Medidor:** Analista (construtor≠validador — não construiu nenhum fix da onda). **HEAD medido:** `51649c0` (F1-0-2/3/4/5/6/7/8/9 mergeados). **Workspaces ISOLADOS** em `/tmp/lina-gate-f1-0/{main,dlq,reopen,handoff}` — o canvas Maestri vivo nunca foi tocado. **Timing-base idêntico ao ANTES:** `profiles/claude-code.toml` vigente impresso pelo harness em cada corrida (`regex='(?m)^\s*[>❯]\s'`, `submit_delay_ms=400`, `ready_timeout_ms=30000`, `busy_markers=["esc to interrupt","Press up to edit queued messages"]`, `idle_ms=1500`). Claude Code v2.1.166→167 nas corridas. Exit code de TODAS as corridas: 0 (direto, sem pipe).
+
+## Re-sincronização da réplica (ressalva 2 — deltas reportados)
+
+O runner `baseline_f1_0` foi re-sincronizado com o core de HEAD (fronteira: bin do harness apenas; zero mudança em `src/` de produção):
+
+| Delta réplica × produção | Ação |
+|---|---|
+| Pump narra `Retained/RetryBackoff/DeadLettered` no stderr (produção narra `other` em bridge.rs `tick`) | réplica igualada à produção |
+| Boot do app chama `close_previous_generation` (F1-0-8, `main.rs:2464`) | replicado no boot do harness (no-op em ws fresco; medido no cenário reopen) |
+| `Summary.delivery_profile` dizia "demo_profile" mesmo em modo produção | corrigido (string dinâmica) |
+| Cenários novos: `dlq`, `reopen-check`, `handoff` + flags `--busy-count`/`--lina-bin` | adicionados p/ o roteiro do gate |
+| **⚠ Sincronizador grid-quiet→roster-Idle do harness NÃO tem equivalente em produção** | ver ACHADO 1 — é a divergência que importa |
+
+## ⚠ ACHADOS DE GATE (divergências — reportadas, não consertadas)
+
+1. **[ALTO — gap de integração no app] Produção não devolve o roster a `Idle`.** O router marca o alvo `Busy` na entrega (`router.rs:1163`, reason `a2a_delivery`) e a retenção lê o ROSTER (`router.rs:1137`). Mas **nenhum call-site de produção** faz `sup.set_status(_, Idle)`: o medidor de turno do app (bridge.rs:2598-2615) emite Busy/Idle **só para o host de UI** (`bridge.on_event`), nunca para o roster; o `LifecycleEngine` do core não é instanciado pelo app (único uso: `close_previous_generation` em `main.rs:2464`); os testes do core simulam o retorno com `turn_done()` ("como o lifecycle real faria" — router.rs:1953-1957). **Consequência em produção real:** após a 1ª entrega A2A a um nó, toda mensagem seguinte ao mesmo alvo retém até o teto (30s) e cai na DLQ. **As taxas DEPOIS abaixo foram medidas com o sincronizador do harness fazendo o papel da peça que falta no app** (grid quieto por `idle_ms` → roster `Idle`, espelhando a intenção do EndDetector). O core está pronto; falta a fiação no app.
+2. **[MÉDIO — calibração] O teto de retenção default (30s) dead-letterou 1 retorno legítimo sob rajada.** Na rodada 5 do cenário P1 (alvo saturado processando 3 turnos), a 20ª mensagem estourou a retenção → `MessageDeadLettered{reason:"retencao estourou o teto (30000 ms)…"}` (seq 188) + carta em `dead-letter/` + alerta ☠ no stderr. **Nada se perdeu em silêncio — é o comportamento do ADR 0020** — mas o default pode ser apertado para turnos reais de rajada; decidir calibração (`retention_timeout_ms`) com o time.
+3. **[BAIXO — medição] A regra de "preso" do ANTES tinha 3 cegueiras no DEPOIS**, todas corrigidas no harness com evidência de bytes (recalibração prevista na ressalva 3 da baseline): (i) o ECO `❯ [LINA::MSG]` de mensagem JÁ submetida lia como "presa" durante o turno; (ii) o prompt vivo da TUI usa `❯`+**NBSP (U+00A0)** — sem normalizar, o prompt vivo nunca casava e a região caía no eco; (iii) o texto preso REAL do caminho legado colapsa em **chip** ("paste again to expand") com o marcador INVISÍVEL — detecção por marcador é cega; a assinatura do chip entrou na regra (conservadora: conta contra o DEPOIS). **Anti-vácuo provado:** corrida-controle com `--legacy-demo-delivery` detectou o chip (late_clear/1ª tentativa) + teste unitário `empty_prompt_row_discriminates_echo_and_stuck` com os bytes reais.
+4. **[BAIXO] Regra do DEPOIS:** veredito por tentativa amostrado **após o turno aquietar** (prompt vivo vazio, sem "esc to interrupt", fila consumida ≤20s) — equivalente ao protocolo do ANTES (o preso nunca aquieta: timeout 90s → amostra acha chip/marcador). `--busy-count 300` no DEPOIS (vs 2500 do ANTES): com a entrega agora ESPERANDO prontidão, busy infinito estouraria o orçamento de retry por design — a condição do bug (alvo ocupado NO INSTANTE do envio) foi garantida em 20/20 (`busy_no_envio=true`).
+
+## Taxas lado a lado — ANTES × DEPOIS (mesmo roteiro: 5 claudes reais, 20 tentativas, 5 rodadas)
+
+| Métrica | ANTES (baseline 12:53) | DEPOIS (gate, ws `main`) | Critério |
+|---|---|---|---|
+| **Texto-colado (P0)** | **18/20 presos (90%)**, alvo ocupado 20/20 | **0/20 presos** (20 submetidos limpos), alvo ocupado 20/20 | (a) **PASS** |
+| **Atropelamento (P1)** — pares <2s ao mesmo alvo | **15/15** (Δ min 155 ms, med 160 ms) | **0/14** (Δ min **3158 ms**, med **9539 ms**) | (b) **PASS** |
+| Entregas da rajada | 20/20 | 19/20 entregues + **1 na DLQ com motivo** (retenção 30s estourada — ACHADO 2; nada sumiu) | (b) nota |
+| `MessageRetained{target_busy}` | n/a (sem retenção) | **17** (serialização visível no log) | (b) prova |
+| `RouteBlocked` | 0 (40 rotas) | **0** (39 rotas legítimas; ws `dlq` tem 100 **por design** — livro-razão do retry transiente de alvos órfãos, ADR 0003) | (c) **PASS** |
+| `MessageDeliveryFailed` / `CircuitOpened` | n/a | 0 / 0 | — |
+
+## Cenários novos da onda
+
+- **(d) DLQ visível — PASS** (ws `dlq`, 2 modos): (i) alvo inexistente `@Fantasma` → `MessageDeadLettered{reason:"destino indisponivel (NoTarget) apos 50 re-tentativas"}`; (ii) **destino real derrubado** (`Supervisor::mark_dead` — caminho canônico; resolução passa a ignorá-lo) → mesma DLQ com motivo. Ambos: alerta `☠ DLQ ← <id> … retry MANUAL` no stderr + projeção `dead-letter/` com as 2 cartas (`Mailbox::dead_letters()`). Somado ao caso de retenção da rajada (ACHADO 2): 3 caminhos à DLQ exercitados ao vivo, 0 mensagens sumidas em silêncio.
+- **(e) Replay sem nós-fantasma pós `kill -9` — PASS** (ws `reopen`): 2 gerações de runner mortas com **`kill -9` real** no meio da corrida (PIDs 36893/37059); cada boot seguinte fechou a geração anterior (réplica de `main.rs:2464`); corrida final: pré-close 2 fantasmas → pós-close **0** → spawna geração nova → **replay do log == roster vivo (2 nós, IDs idênticos)** e aritmética por evento `NodeAdded(6) − mortes(4) = 2 vivos ✓` (`reopen.json`).
+- **(f) Telemetria de adoção do plano — APURADA (métrica, não critério):** `plan_adoption` sobre o log do teste: `{plan_claims: 0, plan_checks: 0, ask_chains: 39, rate: 0,0%}`. Esperado para este roteiro: o harness coordena por enqueue direto (probes), não por plano — o número de referência segue a baseline de 14h (0%) e passa a ser acompanhado nos workspaces reais.
+
+## Golden transcript — `lina handoff --context` (F1-0-6 critério 1) — ✓ TRANSCRIPT OK
+
+Corrida ws `handoff` (2 claudes reais; identidade `.lina/bootstrap.json` por agente + allow `Bash(lina:*)`; `LINA_HOME` apontado ao ws): `lina handoff "@W1" "<tarefa>" --context plano.md` rodado do cwd do Maestro →
+1. CLI exit 0: `ok: <NodeId do W1> recebeu a mensagem (id msg_…8aeb)`.
+2. Log: `MessageRouted{intent=handoff}` (seq 7) → `MessageDelivered{to=W1}` (seq 9) — contrato `lina/msg@2` validado pelo router.
+3. **Grid do W1**: bloco `[LINA::MSG]` com o payload + `--- contexto anexado (plano.md) ---` (marcador `PLANO-CTX` visível) + **contrato legível** (`contract.input_schema/output_schema/error_codes/timeout_sec/retry_policy`, `constraint.autonomy`) + `[EXPECTED]`.
+4. O W1 (claude real) executou `lina ask "@Maestro" "HANDOFF-OK-… plano recebido" --reply-to msg_…8aeb` e narrou `PRONTO: handoff F1-0 validado…` em pt-br, sem vazar o bloco técnico.
+5. Log: reply roteado **herdando a cadeia** (`intent=ask`, `hops=1`, `root_cause_id = id do handoff`) → `MessageDelivered{to=Maestro}` → marcador `HANDOFF-OK` visível no grid do Maestro.
+Transcript integral (grids + eventos + comando): `/tmp/lina-gate-f1-0/handoff/baseline-artifacts/handoff-transcript.md`.
+
+## Veredito por critério do GATE F1-0 (metade DEPOIS)
+
+| Critério | Veredito | Evidência |
+|---|---|---|
+| (a) texto-colado 0/N nas mesmas N tentativas | ✅ **PASS** (0/20; antes 18/20) | `main/baseline-artifacts/stuck.json` + grids |
+| (b) 0 injeção concorrente, serialização por estado | ✅ **PASS** (0/14 <2s; Δmin 3158ms; 17 retenções) | `main/baseline-artifacts/collision.json` + log |
+| (c) RouteBlocked ≈ 0 mantido | ✅ **PASS** (0 em 39 rotas legítimas) | `main/.lina/events/log.jsonl` |
+| (d) DLQ com motivo + alerta visível | ✅ **PASS** (3 caminhos: órfão, derrubado, retenção) | `dlq/baseline-artifacts/dlq.json` + ☠ stderr |
+| (e) replay = roster vivo (0 fantasmas) | ✅ **PASS** (2× kill -9; 6−4=2; IDs idênticos) | `reopen/baseline-artifacts/reopen.json` |
+| (f) telemetria plan-vs-ask reportada | ✅ **APURADA** (0,0% — métrica acompanhada) | `plan_adoption --json` |
+| F1-0-6 crit. 1 — golden transcript handoff | ✅ **PASS** (ciclo completo com reply no formato) | `handoff/baseline-artifacts/handoff-transcript.md` |
+
+**GATE DEPOIS: PASS COM RESSALVA** — as taxas foram medidas com o harness suprindo a peça de roster-Idle que **falta no app de produção** (ACHADO 1, ALTO). Recomendação ao Maestro: fiar o retorno a `Idle` no roster do app (EndDetector/meter → `set_status`) **antes de declarar o gate da onda fechado em produção**, e decidir a calibração do `retention_timeout_ms` (ACHADO 2). Reproduzir: comandos das 5 fases registrados nos stderr `/tmp/gate-{main,dlq,reopen-*,handoff*}.err`.
