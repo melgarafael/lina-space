@@ -24,6 +24,21 @@ O Lina **não** adota um motor de *durable execution* completo (estilo Temporal/
 - A janela A6 residual aceita **perda-com-registro** (conservador anti-duplicação); o humano recupera pela DLQ/log.
 - Revisitar ESTE ADR se: (a) surgirem efeitos multi-passo que precisem de saga/compensação; (b) o Lina ganhar execução distribuída (multi-máquina); (c) a taxa real de janela-A6 observada em produção justificar journaling por atividade.
 
+## Calibração do teto de retenção (`retention_timeout_ms`) — 2026-06-06
+
+**Achado (MÉDIO, medidor do gate):** o default original de **30 s** dead-letterou 1 retorno LEGÍTIMO sob rajada saturada. Análise de produto (Maestro, validada pelos dados): reter atrás de um turno real é o comportamento **desejado** ("entrega quando o alvo ficar livre") — e um turno de claude leva **minutos**, não segundos.
+
+**Dados que ancoram a faixa:**
+- Turnos REAIS (observação de 14h, DIRECIONAMENTO §P1): retornos espaçados em **200–600 s**.
+- Turnos TRIVIAIS (probes "não responda", corrida DEPOIS da F1-0-4): **3,2–15,9 s** (mediano 9,6 s).
+- Com 30 s, qualquer espera atrás de um turno real (≥ ~3 min) estouraria o teto → mensagem legítima na DLQ → o propósito da retenção morre.
+
+**Decisão:** default = **600 000 ms (10 min)** — cobre o teto observado dos turnos reais, fica ~40× acima do turno trivial mediano, e **mantém o papel anti-deadlock** (finito; estouro → DLQ **visível** com retry manual, nunca espera infinita — 13.11 §P0). Tunável por workspace (`RouterConfig::retention_timeout_ms`). Trava anti-drift: teste `retention_default_e_da_ordem_de_minutos` (banda [600 s, 1 h]).
+
+**Limitações conhecidas (aceitas):** (a) cauda de turnos >10 min ainda dead-lettera — aceitável porque é VISÍVEL e recuperável; (b) sob fila profunda, o relógio conta desde a PRIMEIRA retenção da mensagem — profundidade k × turno médio pode exceder o teto antes de chegar a vez dela.
+
+**Gatilho de revisita:** quando o dashboard F1-1-5 der **tempos reais de resposta por agente** em produção, re-medir a distribuição (p50/p95/p99 de turno + profundidade típica de fila) e re-calibrar — idealmente p95(turno) × profundidade típica + margem.
+
 ## Verificação
 
-`crates/lina-core/tests/gate_f1_0_7.rs` (exactly-once sob crash; backoff+jitter por timestamps do log; DLQ com motivo + projeção visível; breaker abre/bloqueia/reseta; backoff durável a restart; append concorrente de 2 escritores) + suíte do router + bench N=50.
+`crates/lina-core/tests/gate_f1_0_7.rs` (exactly-once sob crash; backoff+jitter por timestamps do log; DLQ com motivo + projeção visível; breaker abre/bloqueia/reseta; backoff durável a restart; append concorrente de 2 escritores) + `retention_default_e_da_ordem_de_minutos` (calibração) + suíte do router + bench N=50.

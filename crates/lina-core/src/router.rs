@@ -98,8 +98,16 @@ pub struct RouterConfig {
     pub breaker_threshold: u32,
 }
 
-/// F1-0-4: default do teto de retenção por alvo ocupado (30 s).
-pub const RETENTION_TIMEOUT_MS: u64 = 30_000;
+/// Default do teto de retenção por alvo ocupado: **10 min** (CALIBRADO — ADR 0020
+/// §Calibração). Reter atrás de um turno real é o comportamento DESEJADO ("entrega
+/// quando ficar livre"), e um turno de claude leva MINUTOS: a observação de 14h mediu
+/// retornos espaçados em **200–600 s** (DIRECIONAMENTO §P1); probes triviais, 3–16 s.
+/// O default original (30 s) dead-letterava espera LEGÍTIMA sob rajada (achado MÉDIO do
+/// medidor) — matava o propósito da retenção. 600 s cobre o teto observado dos turnos
+/// reais e MANTÉM o papel anti-deadlock (finito; estourou → DLQ visível, retry manual).
+/// Tunável por workspace via `RouterConfig::retention_timeout_ms`. Revisitar quando o
+/// dashboard (F1-1-5) der tempos REAIS de resposta por agente.
+pub const RETENTION_TIMEOUT_MS: u64 = 600_000;
 /// F1-0-7: default de tentativas de entrega antes da DLQ.
 pub const DELIVERY_MAX_ATTEMPTS: u32 = 5;
 /// F1-0-7: default da base do backoff exponencial (1 s → 1,2,4,8,16 s + jitter).
@@ -3219,6 +3227,26 @@ mod tests {
             .into_iter()
             .filter(|r| r.kind == kind)
             .collect()
+    }
+
+    /// **Calibração do teto de retenção (ADR 0020 §Calibração — achado MÉDIO do gate):**
+    /// o default é da ordem de MINUTOS, nunca de segundos. Um turno real de claude leva
+    /// minutos (retornos observados em 200–600 s na observação de 14h); um teto de
+    /// segundos dead-letteraria espera LEGÍTIMA ("entrega quando ficar livre" é o
+    /// produto). Trava anti-drift: cobrir o teto observado (600 s) e ficar MUITO acima
+    /// dos turnos triviais (3–16 s medidos), mantendo-se finito (anti-deadlock).
+    #[test]
+    fn retention_default_e_da_ordem_de_minutos() {
+        let d = RouterConfig::default().retention_timeout_ms;
+        assert_eq!(d, RETENTION_TIMEOUT_MS);
+        assert!(
+            d >= 600_000,
+            "default ({d} ms) deve cobrir o teto observado de turnos reais (600 s)"
+        );
+        assert!(
+            d <= 3_600_000,
+            "default ({d} ms) segue FINITO e na ordem de minutos (anti-deadlock + DLQ visível)"
+        );
     }
 
     /// **Critério 1 da story:** alvo `Busy` → NÃO injeta (Retained + `MessageRetained` 1×);
