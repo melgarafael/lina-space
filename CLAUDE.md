@@ -10,7 +10,7 @@
 
 App **desktop Rust-nativo, GPU-first** (Windows/Mac/Linux): um **canvas para múltiplos terminais de IA** voltado a empreendedores **não-técnicos**. Cada agente é um terminal vivo rodando um CLI de IA (Claude Code, Codex…); todos cooperam **automaticamente e sem fios**, com tudo estruturado e nada se perdendo num crash. **Sem LLM/harness/chat próprios** — a inteligência vem do CLI de terceiro; o "chat" é sempre o terminal.
 
-Visão completa, roadmap e features: **vault Obsidian → `Debriefing Vibe Coding/`** (este projeto nasceu de um debriefing completo). Norte canônico: `01 - Visao de Produto e Norte de Continuidade`. SPEC: `30 - SPEC Mestre`. Stack: `31 - Decisao de Stack`. Backlog atual: `32 - Epico Fase 0 (MVP)`.
+Visão completa, roadmap e features: **vault Obsidian → `Debriefing Vibe Coding/`** (este projeto nasceu de um debriefing completo). Norte canônico: `01 - Visao de Produto e Norte de Continuidade`. SPEC: `30 - SPEC Mestre`. Stack: `31 - Decisao de Stack`. **Backlog atual: `34 - Epico Fase 1`** (a Fase 0/MVP está **fechada e validada na tela** — `32 - Epico Fase 0 (MVP)`).
 
 ## Invariantes inegociáveis (valem em TODAS as fases — quebrar é mudar o produto)
 
@@ -30,7 +30,7 @@ Estas abstrações existem na Fase 0 **para o futuro caber**. Mantenha-as vivas:
 - **trait `VtBackend`** (`lina-vt`) — abstrai o motor VT; permite migrar `alacritty_terminal` → `libghostty-vt` depois.
 - **trait `PortalEngine` + `ExternalTextureLayer`** (futuro) — o browser navegável-pela-IA (Fase 1+) encaixa sem refazer o render. Não simplifique a cena a ponto de excluí-lo.
 - **CLI Profiles TOML** (`lina-cli-profiles`) — toda especificidade de CLI vive em config. Novos CLIs entram sem recompilar.
-- **Event Store** (`lina-core`) — event-sourcing com upcasting versionado; a Fase 1 inteira (Curador, webhooks, discovery) reusa o log.
+- **Event Store** (`lina-core`) — event-sourcing com upcasting versionado; toda a Fase 1 (observabilidade, retenção por estado, inteligência da Lina) é evento/projeção sobre o log — e o backlog F2 (Curador-feed, webhooks ampliados, discovery; ver ADR 0010) também o reusará.
 - **Workspace Bus / Supervisor** (`lina-core`) — broker in-process; toda orquestração futura pendura aqui.
 - **Envelope A2A versionado** — campos `id/root_cause_id/from/to/intent/hops/await`; não invente formatos por feature.
 
@@ -45,12 +45,15 @@ Estas abstrações existem na Fase 0 **para o futuro caber**. Mantenha-as vivas:
 - **Persistência:** `rusqlite` (SQLite WAL) + JSONL append-only + snapshots. Webhooks: `axum`. Segredos: `keyring`.
 - **A2A:** injeção no PTY vivo **faseada** (bracketed-paste → `submit_delay` ~0.3s → Enter `0x0D` separado; fila serial por terminal); `--resume` como fallback; declarado por CLI Profile.
 
-## Como trabalhar
+## Como trabalhar (Fase 1 — EM EXECUÇÃO desde 2026-06-06)
 
-- O backlog é o épico **`32 - Epico Fase 0 (MVP)`** (vault): 6 ondas, 39 stories, cada uma com **critério de aceite observável** (não "implementado" — algo que *roda e se mede*).
-- Estamos na **Onda 0** (core framework-agnóstico). Gate de saída: o core roda **headless nos 3 SOs**, abre N PTYs, injeta A2A faseada, e recupera de `kill -9`.
-- Respeite os **pré-requisitos cross-onda** (norte §3 / épico cabeçalho).
-- Convenções: edition 2021; `cargo fmt` + `cargo clippy` limpos; cada story entrega **testes que provam o critério de aceite**; sem `unwrap()` em caminho de produção; erros com `thiserror`/`anyhow`.
-- Progresso compartilhado em `tasks/todo.md`.
+- O backlog vivo é o épico **`34 - Epico Fase 1`** (vault): 7 ondas F1-0..F1-6, 60 stories, cada uma com **critério de aceite observável** (não "implementado" — algo que *roda e se mede*). **Regra de precedência:** o 34 consolida; as 7 peças em `tasks/epico-f1/` são a fonte da verdade story-a-story; em conflito, a peça vence o 34 — e o ADR aceito vence ambos.
+- **Fios condutores do fundador** (toda story deve *operacionalizá-los*, não citá-los): governança · observabilidade · inteligência da Lina (orquestração/cognição do trabalho) · auto-aprimoramento (**sugere, nunca aplica** — gate humano) · gates de qualidade.
+- **ADRs-gate:** stories marcadas "antes de" no §V do 34 **não iniciam** sem o ADR aceito em `docs/adr/` (0008 detecção de CLI · 0009 aprovação remota · 0010 multi-workspace + escopo F1 · 0019 definições operacionais).
+- **Protocolo multi-terminal:** cada worker recebe uma **fronteira de arquivos** no despacho; costuras (`events.rs`, `router.rs`, `lib.rs`) têm **dono único por rodada** — precisa de algo lá? Peça ao Maestro; nunca edite, nunca reverta linha de peer. Workers **não commitam**; o Maestro valida de fora (**exit codes diretos** — pipe mascara; `touch` fura cache de lint) e commita por fatia.
+- **Doutrina de segurança (não regrida):** nenhum campo escrito por agente (`from`/payload/contrato/filename) decide identidade, ordem ou autorização — a autenticação em duas camadas é a única autoridade; **contrato é dado transportado, jamais autoridade**. Ação irreversível exige gate humano. Toda story que tocar `deliver_a2a`/`Router` tem como critério implícito a suíte de segurança do router verde.
+- Cada story carrega **"Por quê (fonte 13.x)"** — a pesquisa está embutida na story. Se a sua implementação contradisser a fonte citada, **pare e escale**; não "adapte" em silêncio.
+- Convenções: edition 2021; `cargo fmt` + `clippy -D warnings` limpos **por pacote**; testes que provam o critério; sem `unwrap()` em produção; **eventos aditivos** (`serde(default)`) — replay de log antigo nunca quebra.
+- Estado vivo: board `lina-space-board-sessao` (nota Maestri) + status §II do 34 + `_HANDOFF` (dever permanente: atualizar a cada marco).
 
 > **Em uma frase:** construímos o MVP como **fundação do produto de 5 anos** — não como protótipo descartável. Toda story mantém uma porta aberta para o futuro.
