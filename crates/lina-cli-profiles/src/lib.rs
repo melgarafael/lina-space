@@ -78,6 +78,24 @@ pub enum EndSignal {
     Idle,
 }
 
+/// Capability flags declarativas de um CLI (F1-1-1, pesquisa 13.9): o que ESTE CLI
+/// emite/suporta (`hooks`, `handoff_support`, `permission_detection`, `otel`, …).
+/// Mapa **aberto por design** (invariante #3): uma capability nova entra por TOML,
+/// sem recompilar — consumidores perguntam por nome e tratam ausência como `false`
+/// ("nenhum consumidor espera evento que o CLI não emite" — F1-1-3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Capabilities(BTreeMap<String, bool>);
+
+impl Capabilities {
+    /// `true` somente se a capability foi declarada `true` no TOML.
+    /// Ausente ou declarada `false` → `false` (nunca panica).
+    #[must_use]
+    pub fn has(&self, name: &str) -> bool {
+        self.0.get(name).copied().unwrap_or(false)
+    }
+}
+
 /// Profile declarativo de um CLI de IA. **Toda** especificidade do CLI vive aqui
 /// (TOML), nunca no core — é a âncora de neutralidade multi-CLI do `CLAUDE.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -109,6 +127,24 @@ pub struct CliProfile {
     /// Timeout (ms) para um `ask` A2A aguardar a resposta do destinatário (W0-9).
     #[serde(default)]
     pub ask_timeout_ms: Option<u64>,
+    /// Padrão (glob; suporta `~`) dos session-files deste CLI em disco
+    /// (ex.: `~/.claude/projects/*/*.jsonl`). Consumido pelo watch da camada 3
+    /// (F1-1-2). `None` = CLI sem session-files (ex.: shell puro).
+    #[serde(default)]
+    pub session_dir_pattern: Option<String>,
+    /// Assinaturas deste CLI observáveis no output do grid — telemetria da
+    /// camada 4 do ADR de detecção (13.9): **nunca decisória**, só validação
+    /// cruzada de confiança. Vazio = sem marcadores conhecidos.
+    #[serde(default)]
+    pub output_markers: Vec<String>,
+    /// Variáveis de ambiente do **spawn** deste CLI (paralelo ao `env` do
+    /// [`InstallRecipe`], que vale só para a instalação).
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Capability flags deste CLI (ver [`Capabilities`]) — alimentam F1-1-2/3/6/9
+    /// e os guards por CLI (decision table no TOML, 13.9 item 5).
+    #[serde(default)]
+    pub capabilities: Capabilities,
 }
 
 impl CliProfile {
@@ -161,6 +197,15 @@ impl CliProfile {
                 field: "prompt_ready_regex",
                 path: label.to_owned(),
             });
+        }
+        // Presente porém vazio é typo de config — erro claro, não `Some("")` silencioso.
+        if let Some(pattern) = &self.session_dir_pattern {
+            if pattern.trim().is_empty() {
+                return Err(ProfileError::EmptyField {
+                    field: "session_dir_pattern",
+                    path: label.to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -326,6 +371,87 @@ impl ProfileRegistry {
     }
 }
 
+// ═══════════════════ CliDetector — camada 1 (F1-1-1 / ADR de detecção) ═══════════════════
+
+/// Confiança da camada 1: o spawn É a evidência — determinística por construção.
+pub const LAYER1_CONFIDENCE: f32 = 1.0;
+
+/// Evidência canônica da camada 1 (campo `evidence` do `CliDetected`).
+pub const LAYER1_EVIDENCE: &str = "spawn-profile";
+
+/// Resultado tipado de uma detecção de CLI — o espelho 1:1 do evento canônico
+/// `CliDetected{node, cli, confidence, evidence}` do ADR de detecção.
+///
+/// **Emissão desacoplada (fronteira de crates):** este crate NÃO conhece o event
+/// store; o supervisor (`lina-core`) converte esta struct em `DomainEvent::CliDetected`
+/// e apende ao log. `node_id` é `String` aqui pelo mesmo motivo (o `NodeId` real é
+/// tipo do core — a autoridade de cunhagem continua lá).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CliDetection {
+    /// Nó (terminal) em que o CLI foi detectado.
+    pub node_id: String,
+    /// `id` do [`CliProfile`] detectado (ex.: `"claude-code"`).
+    pub cli: String,
+    /// Confiança agregada da detecção (camada 1 = [`LAYER1_CONFIDENCE`]).
+    pub confidence: f32,
+    /// Qual evidência sustenta a detecção (camada 1 = [`LAYER1_EVIDENCE`]).
+    pub evidence: &'static str,
+}
+
+/// Detector de CLI — **camada 1 (spawn-time)**, a única determinística e a primária
+/// (ADR de detecção; pesquisa 13.9).
+///
+/// Os CLIs "conhecidos" são EXATAMENTE os ids dos perfis TOML carregados no boot
+/// ([`ProfileRegistry`]) — **nenhuma lista compilada** (resolve a tensão `KNOWN_CLIS`
+/// hardcoded × invariante #3: novos CLIs entram sem recompilar). A camada 2 (inspeção
+/// de processo externo) foi **refutada** pela pesquisa (env var falseável, `proc_pidinfo`
+/// self-bound, sem caso de uso) — não existe e não deve ser construída; terminal externo,
+/// se um dia virar requisito, entra por registro autorizado (`lina register-self`),
+/// nunca por introspecção. Camadas 3/4 só AGREGAM confiança a jusante, nunca decidem.
+#[derive(Debug, Clone, Copy)]
+pub struct CliDetector<'r> {
+    registry: &'r ProfileRegistry,
+}
+
+impl<'r> CliDetector<'r> {
+    /// Detector sobre os perfis carregados no boot.
+    #[must_use]
+    pub fn new(registry: &'r ProfileRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// Camada 1, síncrona no spawn: o supervisor spawnou `node_id` com o profile
+    /// `profile_id` → se o profile está carregado, a detecção é determinística
+    /// (`confidence 1.0`, `evidence "spawn-profile"`). Profile desconhecido é erro
+    /// estruturado e acionável (cita os ids carregados), nunca panic.
+    pub fn detect_spawn(
+        &self,
+        node_id: impl Into<String>,
+        profile_id: &str,
+    ) -> Result<CliDetection, DetectError> {
+        let Some(profile) = self.registry.get(profile_id) else {
+            return Err(DetectError::UnknownProfile {
+                id: profile_id.to_owned(),
+                known: self.registry.ids().map(str::to_owned).collect::<Vec<_>>(),
+            });
+        };
+        Ok(CliDetection {
+            node_id: node_id.into(),
+            cli: profile.id.clone(),
+            confidence: LAYER1_CONFIDENCE,
+            evidence: LAYER1_EVIDENCE,
+        })
+    }
+}
+
+/// Erros do detector — estruturados e acionáveis, nunca panic.
+#[derive(Debug, Error)]
+pub enum DetectError {
+    /// O spawn referenciou um profile que não está no registry do boot.
+    #[error("profile de CLI desconhecido '{id}' (carregados: {})", known.join(", "))]
+    UnknownProfile { id: String, known: Vec<String> },
+}
+
 /// Erros do carregamento de CLI Profiles. Sempre acionáveis (carregam o caminho),
 /// nunca um panic — o caller decide como reagir.
 #[derive(Debug, Error)]
@@ -388,6 +514,116 @@ mod tests {
                 event_type: "result".to_string()
             }
         );
+
+        // F1-1-1 (regressão do bug de posicionamento): idle_ms/ask_timeout_ms são
+        // top-level; escritos APÓS [end_signal] eram engolidos silenciosamente
+        // (viravam chaves de end_signal, ignoradas) → profile.idle_ms dava None.
+        assert_eq!(
+            profile.idle_ms,
+            Some(1500),
+            "idle_ms deve chegar ao profile"
+        );
+        assert_eq!(profile.ask_timeout_ms, Some(120_000));
+
+        // F1-1-1: o profile real declara os campos estendidos (13.9 item 1).
+        assert_eq!(
+            profile.session_dir_pattern.as_deref(),
+            Some("~/.claude/projects/*/*.jsonl"),
+            "session_dir_pattern do claude-code (consumido por F1-1-2)"
+        );
+        assert!(
+            !profile.output_markers.is_empty(),
+            "output_markers do claude-code (telemetria camada 4 — nunca decisória)"
+        );
+        assert!(profile.capabilities.has("hooks"), "claude-code tem hooks");
+        assert!(profile.capabilities.has("otel"), "claude-code exporta OTel");
+        assert!(
+            profile.capabilities.has("permission_detection"),
+            "claude-code sinaliza permissão via hook Notification"
+        );
+        assert!(
+            profile.capabilities.has("handoff_support"),
+            "claude-code suporta handoff A2A completo (13.9 item 5)"
+        );
+    }
+
+    // ── F1-1-1: campos estendidos do CliProfile (13.9 item 1 — "o trabalho real") ──
+
+    #[test]
+    fn extended_fields_parse_from_toml() {
+        let toml_src = r#"
+            id = "fake"
+            program = "fake"
+            delivery = "pty_inject"
+            prompt_ready_regex = "> "
+            session_dir_pattern = "~/.fake/sessions/*/*.jsonl"
+            output_markers = ["FAKE BANNER v", "fake> "]
+            [env]
+            FAKE_NON_INTERACTIVE = "1"
+            [capabilities]
+            hooks = true
+            otel = false
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(toml_src, "<inline>").expect("deve parsear");
+        assert_eq!(
+            p.session_dir_pattern.as_deref(),
+            Some("~/.fake/sessions/*/*.jsonl")
+        );
+        assert_eq!(p.output_markers, vec!["FAKE BANNER v", "fake> "]);
+        assert_eq!(
+            p.env.get("FAKE_NON_INTERACTIVE").map(String::as_str),
+            Some("1")
+        );
+        // Capability declarada true / declarada false / ausente — ausente NUNCA panica.
+        assert!(p.capabilities.has("hooks"));
+        assert!(!p.capabilities.has("otel"));
+        assert!(!p.capabilities.has("nunca-declarada"));
+    }
+
+    #[test]
+    fn extended_fields_default_when_absent() {
+        // TOML antigo (pré-F1-1-1) segue válido: campos novos têm default vazio.
+        let minimal = r#"
+            id = "shell"
+            program = "bash"
+            delivery = "pty_inject"
+            prompt_ready_regex = '\$\s$'
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(minimal, "<inline>").expect("deve parsear");
+        assert_eq!(p.session_dir_pattern, None);
+        assert!(p.output_markers.is_empty());
+        assert!(p.env.is_empty());
+        assert!(
+            !p.capabilities.has("hooks"),
+            "sem declaração = sem capability"
+        );
+    }
+
+    #[test]
+    fn empty_session_dir_pattern_is_rejected_semantically() {
+        // Presente porém vazio é typo/erro de config — falha clara, não None silencioso.
+        let bad = r#"
+            id = "x"
+            program = "x"
+            delivery = "pty_inject"
+            prompt_ready_regex = "> "
+            session_dir_pattern = "   "
+            [end_signal]
+            kind = "idle"
+        "#;
+        let err =
+            CliProfile::from_toml_str(bad, "<inline>").expect_err("pattern vazio deve falhar");
+        assert!(matches!(
+            err,
+            ProfileError::EmptyField {
+                field: "session_dir_pattern",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -538,6 +774,71 @@ mod tests {
         let err = ProfileRegistry::load_dir(profiles_dir().join("does-not-exist"))
             .expect_err("diretório inexistente deve falhar");
         assert!(matches!(err, ProfileError::Io { .. }));
+    }
+
+    // ── F1-1-1: CliDetector camada 1 (ADR de detecção: spawn-time, determinística, primária) ──
+
+    #[test]
+    fn detector_layer1_detects_from_spawn_profile() {
+        let registry = ProfileRegistry::load_dir(profiles_dir()).expect("profiles/ carrega");
+        let detector = CliDetector::new(&registry);
+        let d = detector
+            .detect_spawn("node-abc", "claude-code")
+            .expect("spawn com profile carregado detecta");
+        assert_eq!(d.node_id, "node-abc");
+        assert_eq!(d.cli, "claude-code");
+        assert!(
+            (d.confidence - 1.0).abs() < f32::EPSILON,
+            "camada 1 é determinística: confidence 1.0"
+        );
+        assert_eq!(d.evidence, "spawn-profile");
+    }
+
+    #[test]
+    fn detector_unknown_profile_is_structured_actionable_error() {
+        let registry = ProfileRegistry::load_dir(profiles_dir()).expect("profiles/ carrega");
+        let detector = CliDetector::new(&registry);
+        let err = detector
+            .detect_spawn("node-abc", "cli-que-nao-existe")
+            .expect_err("profile desconhecido deve falhar estruturado");
+        assert!(matches!(err, DetectError::UnknownProfile { .. }));
+        // Acionável: cita o id pedido E os ids realmente carregados.
+        let msg = err.to_string();
+        assert!(msg.contains("cli-que-nao-existe"));
+        assert!(msg.contains("claude-code"));
+    }
+
+    /// Critério 3 da story (anti-hardcode × invariante #3): um TOML novo no diretório
+    /// é SUFICIENTE para o detector conhecer o CLI — zero lista compilada, sem recompilar.
+    #[test]
+    fn detector_derives_known_clis_from_loaded_tomls_not_hardcode() {
+        // Tempdir manual (sem dev-dep): nome único por processo + teste.
+        let dir =
+            std::env::temp_dir().join(format!("lina-clip-antihardcode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("criar tempdir");
+        let fake = r#"
+            id = "fake-cli"
+            program = "fakecli"
+            delivery = "pty_inject"
+            prompt_ready_regex = "> "
+            session_dir_pattern = "~/.fake/sessions/*.jsonl"
+            [capabilities]
+            hooks = true
+            [end_signal]
+            kind = "idle"
+        "#;
+        std::fs::write(dir.join("fake-cli.toml"), fake).expect("escrever fake-cli.toml");
+
+        let registry = ProfileRegistry::load_dir(&dir).expect("dir com fake carrega");
+        let detector = CliDetector::new(&registry);
+        let d = detector
+            .detect_spawn("node-x", "fake-cli")
+            .expect("CLI novo descoberto só pelo TOML");
+        assert_eq!(d.cli, "fake-cli");
+        assert!((d.confidence - 1.0).abs() < f32::EPSILON);
+        assert_eq!(d.evidence, "spawn-profile");
+
+        let _ = std::fs::remove_dir_all(&dir); // cleanup best-effort
     }
 
     // ── instaladores ──

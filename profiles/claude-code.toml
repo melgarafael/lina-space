@@ -22,12 +22,31 @@ submit_delay_ms = 300
 # regex. Compilação/validação do regex no load é incremento de W0-9.
 prompt_ready_regex = '(?m)^\s*[>❯]\s'
 
+# Janela de quietude (ms) p/ heurística de idle e timeout do `ask` A2A (W0-9/W0-10).
+# NOTA (F1-1-1): estas chaves são TOP-LEVEL e por isso vivem ANTES de [end_signal] —
+# depois da tabela elas viram chaves DE end_signal e são ignoradas silenciosamente
+# (bug de posicionamento corrigido nesta story).
+idle_ms = 1500
+ask_timeout_ms = 120000
+
+# ── F1-1-1 (pesquisa 13.9 item 1): assinatura completa do CLI ──
+
+# Onde este CLI grava session-files (camada 3 de detecção/observabilidade — F1-1-2).
+session_dir_pattern = "~/.claude/projects/*/*.jsonl"
+
+# Assinaturas no output do grid (telemetria camada 4 — NUNCA decisória; ADR de detecção).
+output_markers = ['"type":"result"', "✻ Welcome to Claude"]
+
+# O que este CLI emite/suporta (consumido por F1-1-2/3/6/9 e guards por CLI).
+# Mapa aberto: capability nova entra por TOML, sem recompilar (invariante #3).
+[capabilities]
+hooks = true                # settings.json hooks (PreToolUse, Notification, …)
+otel = true                 # exporta OTel (F1-1-4)
+permission_detection = true # prompt de permissão detectável (hook Notification)
+handoff_support = true      # aceita envelope A2A completo c/ --await (13.9 item 5)
+
 # Fim-de-resposta (consumido por W0-10): no modo stream-json o Claude Code encerra
 # a resposta com uma linha JSON de tipo "result" ({"type":"result","subtype":...}).
 [end_signal]
 kind = "stream_json"
 event_type = "result"
-
-# Janela de quietude (ms) p/ heurística de idle e timeout do `ask` A2A (W0-9/W0-10).
-idle_ms = 1500
-ask_timeout_ms = 120000
