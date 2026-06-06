@@ -406,15 +406,17 @@ fn spawn_pump(
                 } else if entry.1.elapsed() >= Duration::from_millis(idle_ms)
                     && sup.get(*node).map(|i| i.status) == Some(lina_core::NodeStatus::Busy)
                 {
+                    // PARIDADE COM O APP (fix de gate F1-0, bridge.rs `spawn_pump`):
+                    // produção agora chama `on_end_of_response` no fim-de-turno do
+                    // medidor (reason `end_of_response`, event-sourced no roster) —
+                    // a réplica usa a MESMA API. Delta residual e aceito: o SINAL no
+                    // app é o silêncio do CostMeter sobre `GridDelta.bytes`; aqui é o
+                    // hash do grid estável — ambos "sem output novo por idle_ms do
+                    // perfil". O guard `status == Busy` espelha o active-set do app
+                    // (só nós em turno chegam ao `poll_finished_turns`).
                     let mut st = lock(&store);
-                    if let Err(e) = engine.transition(
-                        &sup,
-                        &mut st,
-                        *node,
-                        lina_core::NodeStatus::Idle,
-                        "idle_grid",
-                    ) {
-                        eprintln!("[pump] transição →Idle falhou: {e}");
+                    if let Err(e) = engine.on_end_of_response(&sup, &mut st, *node) {
+                        eprintln!("[pump] fim-de-resposta →Idle falhou: {e}");
                     }
                 }
             }

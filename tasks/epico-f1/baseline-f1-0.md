@@ -190,8 +190,10 @@ O runner `baseline_f1_0` foi re-sincronizado com o core de HEAD (fronteira: bin 
 
 ## ⚠ ACHADOS DE GATE (divergências — reportadas, não consertadas)
 
-1. **[ALTO — gap de integração no app] Produção não devolve o roster a `Idle`.** O router marca o alvo `Busy` na entrega (`router.rs:1163`, reason `a2a_delivery`) e a retenção lê o ROSTER (`router.rs:1137`). Mas **nenhum call-site de produção** faz `sup.set_status(_, Idle)`: o medidor de turno do app (bridge.rs:2598-2615) emite Busy/Idle **só para o host de UI** (`bridge.on_event`), nunca para o roster; o `LifecycleEngine` do core não é instanciado pelo app (único uso: `close_previous_generation` em `main.rs:2464`); os testes do core simulam o retorno com `turn_done()` ("como o lifecycle real faria" — router.rs:1953-1957). **Consequência em produção real:** após a 1ª entrega A2A a um nó, toda mensagem seguinte ao mesmo alvo retém até o teto (30s) e cai na DLQ. **As taxas DEPOIS abaixo foram medidas com o sincronizador do harness fazendo o papel da peça que falta no app** (grid quieto por `idle_ms` → roster `Idle`, espelhando a intenção do EndDetector). O core está pronto; falta a fiação no app.
-2. **[MÉDIO — calibração] O teto de retenção default (30s) dead-letterou 1 retorno legítimo sob rajada.** Na rodada 5 do cenário P1 (alvo saturado processando 3 turnos), a 20ª mensagem estourou a retenção → `MessageDeadLettered{reason:"retencao estourou o teto (30000 ms)…"}` (seq 188) + carta em `dead-letter/` + alerta ☠ no stderr. **Nada se perdeu em silêncio — é o comportamento do ADR 0020** — mas o default pode ser apertado para turnos reais de rajada; decidir calibração (`retention_timeout_ms`) com o time.
+> **Atualização 2026-06-06 (Tarefa S — re-medição direcionada):** os achados 1 e 2 foram **CORRIGIDOS** na tree e re-medidos — ver §"RE-MEDIÇÃO DIRECIONADA" ao fim. Mantidos abaixo no texto original para a trilha de auditoria.
+
+1. **[ALTO — gap de integração no app] ✅ CORRIGIDO (Dev 03, re-medido)** Produção não devolve o roster a `Idle`. O router marca o alvo `Busy` na entrega (`router.rs:1163`, reason `a2a_delivery`) e a retenção lê o ROSTER (`router.rs:1137`). Mas **nenhum call-site de produção** faz `sup.set_status(_, Idle)`: o medidor de turno do app (bridge.rs:2598-2615) emite Busy/Idle **só para o host de UI** (`bridge.on_event`), nunca para o roster; o `LifecycleEngine` do core não é instanciado pelo app (único uso: `close_previous_generation` em `main.rs:2464`); os testes do core simulam o retorno com `turn_done()` ("como o lifecycle real faria" — router.rs:1953-1957). **Consequência em produção real:** após a 1ª entrega A2A a um nó, toda mensagem seguinte ao mesmo alvo retém até o teto (30s) e cai na DLQ. **As taxas DEPOIS abaixo foram medidas com o sincronizador do harness fazendo o papel da peça que falta no app** (grid quieto por `idle_ms` → roster `Idle`, espelhando a intenção do EndDetector). O core está pronto; falta a fiação no app.
+2. **[MÉDIO — calibração] ✅ CORRIGIDO (Dev 01, re-medido)** O teto de retenção default (30s) dead-letterou 1 retorno legítimo sob rajada. Na rodada 5 do cenário P1 (alvo saturado processando 3 turnos), a 20ª mensagem estourou a retenção → `MessageDeadLettered{reason:"retencao estourou o teto (30000 ms)…"}` (seq 188) + carta em `dead-letter/` + alerta ☠ no stderr. **Nada se perdeu em silêncio — é o comportamento do ADR 0020** — mas o default pode ser apertado para turnos reais de rajada; decidir calibração (`retention_timeout_ms`) com o time.
 3. **[BAIXO — medição] A regra de "preso" do ANTES tinha 3 cegueiras no DEPOIS**, todas corrigidas no harness com evidência de bytes (recalibração prevista na ressalva 3 da baseline): (i) o ECO `❯ [LINA::MSG]` de mensagem JÁ submetida lia como "presa" durante o turno; (ii) o prompt vivo da TUI usa `❯`+**NBSP (U+00A0)** — sem normalizar, o prompt vivo nunca casava e a região caía no eco; (iii) o texto preso REAL do caminho legado colapsa em **chip** ("paste again to expand") com o marcador INVISÍVEL — detecção por marcador é cega; a assinatura do chip entrou na regra (conservadora: conta contra o DEPOIS). **Anti-vácuo provado:** corrida-controle com `--legacy-demo-delivery` detectou o chip (late_clear/1ª tentativa) + teste unitário `empty_prompt_row_discriminates_echo_and_stuck` com os bytes reais.
 4. **[BAIXO] Regra do DEPOIS:** veredito por tentativa amostrado **após o turno aquietar** (prompt vivo vazio, sem "esc to interrupt", fila consumida ≤20s) — equivalente ao protocolo do ANTES (o preso nunca aquieta: timeout 90s → amostra acha chip/marcador). `--busy-count 300` no DEPOIS (vs 2500 do ANTES): com a entrega agora ESPERANDO prontidão, busy infinito estouraria o orçamento de retry por design — a condição do bug (alvo ocupado NO INSTANTE do envio) foi garantida em 20/20 (`busy_no_envio=true`).
 
@@ -234,4 +236,43 @@ Transcript integral (grids + eventos + comando): `/tmp/lina-gate-f1-0/handoff/ba
 | (f) telemetria plan-vs-ask reportada | ✅ **APURADA** (0,0% — métrica acompanhada) | `plan_adoption --json` |
 | F1-0-6 crit. 1 — golden transcript handoff | ✅ **PASS** (ciclo completo com reply no formato) | `handoff/baseline-artifacts/handoff-transcript.md` |
 
-**GATE DEPOIS: PASS COM RESSALVA** — as taxas foram medidas com o harness suprindo a peça de roster-Idle que **falta no app de produção** (ACHADO 1, ALTO). Recomendação ao Maestro: fiar o retorno a `Idle` no roster do app (EndDetector/meter → `set_status`) **antes de declarar o gate da onda fechado em produção**, e decidir a calibração do `retention_timeout_ms` (ACHADO 2). Reproduzir: comandos das 5 fases registrados nos stderr `/tmp/gate-{main,dlq,reopen-*,handoff*}.err`.
+**GATE DEPOIS: PASS COM RESSALVA** — as taxas foram medidas com o harness suprindo a peça de roster-Idle que **faltava no app de produção** (ACHADO 1, ALTO). Recomendação ao Maestro: fiar o retorno a `Idle` no roster do app (EndDetector/meter → `set_status`) **antes de declarar o gate da onda fechado em produção**, e decidir a calibração do `retention_timeout_ms` (ACHADO 2). Reproduzir: comandos das 5 fases registrados nos stderr `/tmp/gate-{main,dlq,reopen-*,handoff*}.err`.
+
+> **⤷ Ressalva RESOLVIDA na re-medição abaixo (Tarefa S):** com os 2 fixes na tree, a ressalva do PASS cai — ver §"RE-MEDIÇÃO DIRECIONADA".
+
+---
+
+# RE-MEDIÇÃO DIRECIONADA (Tarefa S) — achados 1 e 2 CORRIGIDOS · 2026-06-06
+
+> **Escopo (ordem do Maestro):** re-medir APENAS (a) a rajada do critério (b) com o teto novo e (b) a paridade da réplica com a fiação real do app. Demais critérios: já PASS, não re-medidos. **Fixes medidos (não-commitados na tree):** fiação roster-Idle no app (Dev 03) + `RETENTION_TIMEOUT_MS` 30s→600s com trava anti-drift (Dev 01). Workspace isolado `/tmp/lina-gate-f1-0/remed`; mesmo timing-base; exit codes diretos (todos 0).
+
+## (b) Paridade da réplica × fiação real do app — CONFIRMADA (com 2 deltas residuais aceitos)
+
+**O caminho real do app (lido no diff do Dev 03):** `spawn_pump` (bridge.rs) agora recebe `Arc<Supervisor>` (main.rs:2649+ passa na construção) e instancia `LifecycleEngine`; no fim-de-turno do medidor (`CostMeter::poll_finished_turns` — silêncio de output por `idle_ms`), chama **`lifecycle.on_end_of_response(&sup, &mut store, node)`** → transição event-sourced para `Idle` no SUPERVISOR (`NodeStatusChanged{reason:"end_of_response"}` no log + roster) — exatamente a peça que o ACHADO 1 apontou ausente. **Teste guardião do app observado verde por este medidor:** `bridge::tests::end_of_response_returns_node_to_idle_and_unblocks_second_delivery ... ok` (exercita o `spawn_pump` real; exit 0). **Trava do teto observada verde:** `router::tests::retention_default_e_da_ordem_de_minutos ... ok` (default ≥600s e ≤1h; ADR 0020 §Calibração).
+
+**Réplica atualizada para a MESMA API:** o pump do harness agora chama `on_end_of_response` (antes: `transition(Idle, "idle_grid")` — reason divergente). Prova no log da re-medição: **19 `NodeStatusChanged{end_of_response}`** (o reason de produção). Deltas residuais, reportados e aceitos como equivalentes:
+1. **Sinal de fim-de-turno:** app = silêncio do `CostMeter` sobre `GridDelta.bytes` por `idle_ms`; harness = hash do grid estável por `idle_ms`. Mesmo contrato ("sem output novo pela janela do perfil"); fontes de medição distintas.
+2. **Seleção de nós:** app usa o active-set do medidor (só nós que produziram output no turno); harness usa guard `status == Busy`. Equivalentes para o caminho da retenção (só alvos Busy retêm).
+
+## (a) Rajada re-medida com o teto novo (600s) — 20/20 ENTREGUES, 0 DLQ ✅
+
+Mesmo roteiro do cenário de colisão (5 claudes reais, 5 rodadas, fan-out simultâneo ao Maestro), ws `remed`:
+
+| Métrica | DEPOIS original (teto 30s) | RE-MEDIÇÃO (teto 600s + fiação app) | Esperado |
+|---|---|---|---|
+| `MessageDelivered` (log, fonte da verdade) | 19/20 | **20/20** | 20/20 ✅ |
+| `MessageDeadLettered` por retenção | **1** (seq 188, 30s estourados) | **0** | 0 ✅ |
+| Pares <2s ao mesmo alvo | 0/14 | **0/14** (Δmin 3203ms, med 7495ms) | 0 ✅ |
+| `MessageRetained{target_busy}` | 17 | 18 (serialização intacta) | >0 ✅ |
+| `RouteBlocked` / `MessageDeliveryFailed` | 0 / 0 | **0 / 0** | ≈0 ✅ |
+| `NodeStatusChanged{end_of_response}` | n/a (reason antigo `idle_grid`) | **19** (reason do caminho real do app) | >0 ✅ |
+
+*Nota de estatística do coletor:* o `collision.json` registrou 19 das 20 entregas na janela por-rodada (a 4ª entrega da rodada 1 saiu da retenção durante a janela de coleta da rodada 2 — **entregue no log**, fora da estatística de pares). A fonte da verdade (`log.jsonl`) é inequívoca: 20 roteadas → 20 entregues → 0 DLQ.
+
+## Veredito da re-medição
+
+| Item | Veredito |
+|---|---|
+| ACHADO 1 (roster-Idle no app) | ✅ **CORRIGIDO** — fiação real lida e comparada; teste guardião do app verde (observado); réplica usa a mesma API (`on_end_of_response`); paridade confirmada com 2 deltas residuais equivalentes |
+| ACHADO 2 (teto de retenção 30s) | ✅ **CORRIGIDO** — default 600s + trava anti-drift [600s, 1h] verde; rajada re-medida: **20/20 entregues, 0 DLQ por retenção**, serialização intacta (0 pares <2s) |
+| Ressalva do "PASS COM RESSALVA" | **CAI** — com os 2 fixes, o gate F1-0 (metade DEPOIS) é **PASS** sem ressalva de produção. Os fixes foram commitados durante a medição (`4321e04` teto + `1b6f573` fiação) — verificado no disco ao fechar: teto 600s e `on_end_of_response` presentes em HEAD |
