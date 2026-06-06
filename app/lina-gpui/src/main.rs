@@ -2649,7 +2649,16 @@ fn main() {
     let bridge = GpuiBridgeHost::new(Arc::clone(&model));
     // inv#6/no-panic: sem a ponte core→UI o app não renderiza terminais — encerra com mensagem clara
     // em vez de backtrace. (Falha só em condição catastrófica de sistema; instalação nova não cai aqui.)
-    let mut pump = match spawn_pump(bridge, delta_rx, bus_rx, Arc::clone(&store), idle_ms) {
+    // FIX DE GATE F1-0: o pump precisa do Supervisor p/ devolver o nó a Idle no fim-de-resposta
+    // (transição event-sourced — destrava a retenção F1-0-4 na 2ª mensagem ao mesmo alvo).
+    let mut pump = match spawn_pump(
+        bridge,
+        delta_rx,
+        bus_rx,
+        Arc::clone(&store),
+        idle_ms,
+        Arc::clone(&sup),
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("lina-gpui: não subi a ponte core→UI ({e}); o app não consegue renderizar — encerrando.");

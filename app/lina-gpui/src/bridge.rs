@@ -2551,6 +2551,10 @@ pub fn spawn_pump(
     mut bus_rx: broadcast::Receiver<BusEvent>,
     store: Arc<Mutex<EventStore>>,
     idle_ms: u64,
+    // FIX DE GATE F1-0 (fiação final): o fim-de-resposta precisa DEVOLVER o nó a Idle no
+    // SUPERVISOR (transição event-sourced do lifecycle F1-0-3) — sem isto o router marca Busy
+    // na entrega (F1-0-4) e nada o desfaz em produção: a 2ª msg ao mesmo alvo reteria até a DLQ.
+    sup: Arc<Supervisor>,
 ) -> std::io::Result<Pump> {
     let stop = Arc::new(AtomicBool::new(false));
     let join = {
@@ -2559,6 +2563,10 @@ pub fn spawn_pump(
             .name("lina-bridge-pump".into())
             .spawn(move || {
                 let mut meter = crate::cost::CostMeter::new();
+                // Engine do lifecycle (F1-0-3): transição Idle event-sourced no fim-de-resposta.
+                // Engine local do pump: `transition` lê o roster vivo e apenda no store — o estado
+                // interno (stall) não é usado neste caminho.
+                let mut lifecycle = lina_core::lifecycle::LifecycleEngine::new();
                 // W4-6 gap2: nós atualmente em turno (produzindo). Dirige Busy↔Idle na ÁRVORE a11y SÓ na
                 // transição (não a cada delta → sem busy-loop/churn de render). Idle = "resposta pronta".
                 let mut active: std::collections::HashSet<NodeId> =
@@ -2601,6 +2609,18 @@ pub fn spawn_pump(
                             tokens,
                         }) {
                             eprintln!("lina-gpui: falha ao apendar TokenUsageReported: {e}");
+                        }
+                        // FIX DE GATE F1-0: fim-de-resposta REAL (o MESMO sinal do medidor W0-10 —
+                        // idle do perfil fecha o turno; nunca um flush qualquer) → transição
+                        // event-sourced p/ Idle no SUPERVISOR (`NodeStatusChanged{end_of_response}`
+                        // no log + roster). É o que destrava a retenção F1-0-4: a próxima msg ao
+                        // mesmo alvo ENTREGA em vez de reter até a DLQ. Best-effort com erro ALTO
+                        // (nó morto entre o turno e o tick é corrida legítima — Dead é terminal).
+                        if let Err(e) = lifecycle.on_end_of_response(&sup, &mut lock(&store), node)
+                        {
+                            eprintln!(
+                                "lina-gpui: fim-de-resposta de {node} não virou Idle no roster: {e}"
+                            );
                         }
                         // W4-6 gap2: fim-de-turno → Idle → a `LiveRegion` computa "resposta pronta"
                         // (1×/turno) e o badge vira "💤 dormindo". Transição → sem churn.
@@ -3776,6 +3796,115 @@ mod tests {
         assert_eq!(infer_agent_role("Backend"), "BACKEND", "registry default");
         assert_eq!(infer_agent_role("QA do time"), "QA");
         assert_eq!(infer_agent_role("xyzzy-sem-papel"), "DEVELOPER", "fallback");
+    }
+
+    /// **FIX DE GATE F1-0 (fiação final do lifecycle)** — o ciclo que faltava em produção:
+    /// entrega marca o alvo `Busy` (F1-0-4, no router) → o FIM-DE-RESPOSTA do terminal (o mesmo
+    /// sinal do medidor W0-10: idle do perfil fecha o turno — nunca um flush qualquer) devolve o
+    /// nó a `Idle` no SUPERVISOR via transição event-sourced (`NodeStatusChanged{end_of_response}`
+    /// no log) → a 2ª mensagem ao MESMO alvo **ENTREGA** (não retém até a DLQ). Exercita o
+    /// `spawn_pump` REAL (thread + meter), não um atalho: é a fiação que o achado apontou ausente.
+    #[test]
+    fn end_of_response_returns_node_to_idle_and_unblocks_second_delivery() {
+        let dir = std::env::temp_dir().join(format!("lina-fix-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lina = dir.join(".lina");
+        let store = Arc::new(Mutex::new(
+            EventStore::open(lina.join("events")).expect("store"),
+        ));
+        let sup = Arc::new(Supervisor::new());
+        let mut router = Router::with_config(
+            Arc::clone(&sup),
+            Mailbox::new(&lina),
+            RouterConfig::default(),
+        );
+
+        let _node_a = sup.register("@A", Some("dev".into()), Box::new(std::io::sink()));
+        let node_b = sup.register("@B", Some("dev".into()), Box::new(std::io::sink()));
+
+        // O pump REAL (idle_ms curto p/ o teste): é nele que mora a fiação do fix.
+        let (delta_tx, delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let bus_rx = sup.subscribe();
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let mut pump = spawn_pump(
+            GpuiBridgeHost::new(Arc::clone(&model)),
+            delta_rx,
+            bus_rx,
+            Arc::clone(&store),
+            50, // idle do perfil: 50ms fecha o turno (sinal de fim-de-resposta do medidor)
+            Arc::clone(&sup),
+        )
+        .expect("pump");
+
+        let mut deliver = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true,
+            })
+        };
+
+        // (1) 1ª entrega @A→@B → o ROUTER marca @B Busy (F1-0-4).
+        let m1 = MailMessage::new("@A", "@B", "ask", "tarefa 1");
+        let out = {
+            let mut s = lock(&store);
+            router.route_message(&m1, &mut s, 1_000, &mut deliver)
+        };
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "1ª msg entrega: {out:?}"
+        );
+        assert_eq!(
+            sup.get(node_b).expect("@B").status,
+            CoreStatus::Busy,
+            "entrega marcou o alvo Busy (F1-0-4)"
+        );
+
+        // (2) FIM-DE-RESPOSTA real: @B produz output (GridDelta) e fica quieto ≥ idle_ms — o
+        //     medidor fecha o turno e a fiação NOVA devolve @B a Idle no supervisor.
+        delta_tx
+            .send(GridDelta {
+                node: node_b,
+                rows: vec![0],
+                bytes: 64,
+                seq: 1,
+            })
+            .expect("delta");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if sup.get(node_b).map(|i| i.status) == Some(CoreStatus::Idle) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fim-de-resposta não devolveu @B a Idle em 3s (status: {:?})",
+                sup.get(node_b).map(|i| i.status)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // (2b) A transição é EVENT-SOURCED: `NodeStatusChanged{Idle, end_of_response}` no log.
+        let recs = lock(&store).events().expect("events");
+        assert!(
+            recs.iter().any(|r| r.kind == "NodeStatusChanged"
+                && r.payload.get("status").and_then(|v| v.as_str()) == Some("Idle")
+                && r.payload.get("reason").and_then(|v| v.as_str()) == Some("end_of_response")),
+            "NodeStatusChanged(end_of_response → Idle) no log; kinds: {:?}",
+            recs.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>()
+        );
+
+        // (3) 2ª mensagem ao MESMO alvo → ENTREGA (sem o fix: Retained até o teto → DLQ).
+        let m2 = MailMessage::new("@A", "@B", "ask", "tarefa 2");
+        let out = {
+            let mut s = lock(&store);
+            router.route_message(&m2, &mut s, 2_000, &mut deliver)
+        };
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "2ª msg ao mesmo alvo ENTREGA após o fim-de-resposta (não retém): {out:?}"
+        );
+
+        pump.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **F1-0-2 critério 5 (fiação)** — o resolver de perfil carrega o 1º candidato VÁLIDO:
