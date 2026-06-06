@@ -182,6 +182,19 @@ pub enum DomainEvent {
         id: String,
         to: NodeId,
     },
+    /// F1-0-4 (P1 — entrega ciente de estado): a mensagem `id` foi RETIDA (não injetada)
+    /// porque o alvo `to` estava `Busy` na state-machine F1-0-3 (`reason: target_busy` —
+    /// inclui o Busy carimbado pelo próprio router na entrega anterior, que é o que
+    /// serializa rajadas ao mesmo alvo). Apendado **1× por mensagem** (anti-
+    /// amplificação A4) — a entrega posterior aparece como `MessageRouted`/
+    /// `MessageDelivered` normais; o intervalo entre este evento e eles é a ESPERA
+    /// auditável. META — sem efeito na projeção (livro-razão da espera, não estado de
+    /// canvas); aditivo: logs antigos não o contêm (replay/fingerprint intactos).
+    MessageRetained {
+        id: String,
+        to: NodeId,
+        reason: String,
+    },
     /// W3-7 (ADR 0003): recusa de guardrail no roteamento — o log é o livro-razão das recusas.
     /// `from`/`to` são NOMES (cobre `unknown_sender`, em que `from` não resolve a `NodeId`).
     /// `duplicate` NÃO é apendado (anti-amplificação A4 — ver `Router::route_message`).
@@ -373,6 +386,7 @@ impl DomainEvent {
             DomainEvent::Handshake { .. } => "Handshake",
             DomainEvent::MessageRouted { .. } => "MessageRouted",
             DomainEvent::MessageDelivered { .. } => "MessageDelivered",
+            DomainEvent::MessageRetained { .. } => "MessageRetained",
             DomainEvent::RouteBlocked { .. } => "RouteBlocked",
             DomainEvent::AwaitOpened { .. } => "AwaitOpened",
             DomainEvent::AwaitClosed { .. } => "AwaitClosed",
@@ -613,6 +627,9 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // na projeção do canvas; o roster vivo é do Supervisor, não da projeção.
         DomainEvent::Handshake { .. }
         | DomainEvent::MessageDelivered { .. }
+        // F1-0-4: retenção é META (livro-razão da espera; a fila retida VIVE no `.inflight`
+        // durável e é re-derivada pelo pump — mesmo padrão dos demais eventos de roteamento).
+        | DomainEvent::MessageRetained { .. }
         | DomainEvent::RouteBlocked { .. }
         | DomainEvent::AwaitOpened { .. }
         | DomainEvent::AwaitClosed { .. }

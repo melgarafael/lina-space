@@ -20,7 +20,7 @@ use crate::mailbox::{
     Mailbox, TargetSpec,
 };
 use crate::plan::PlanError;
-use crate::{A2aEnvelope, DeliveryOutcome, NodeId, Recipient, RolePolicy, Supervisor};
+use crate::{A2aEnvelope, DeliveryOutcome, NodeId, NodeStatus, Recipient, RolePolicy, Supervisor};
 
 /// Janela de dedupe por `id` (design §3: dedupe em 60s).
 pub const DEDUPE_WINDOW_MS: u64 = 60_000;
@@ -83,7 +83,15 @@ pub struct RouterConfig {
     /// F1-0-3 (ADR 0019 §3): amostras até o circuit breaker (pausa-com-gate; a AÇÃO é F1-0-7 —
     /// compare com `LifecycleEngine::stall_samples`).
     pub stall_breaker_samples: u32,
+    /// F1-0-4 (P1): teto da RETENÇÃO por alvo `Busy`, em ms. Estourou → a mensagem é
+    /// ENTREGUE mesmo assim (semântica do `READY_TIMEOUT` do W0-9; o desvio para DLQ é
+    /// F1-0-7). 13.11 §P0: timeout explícito, nunca espera infinita — é também o que
+    /// garante que retenção jamais cria espera circular (o timeout dispara antes).
+    pub retention_timeout_ms: u64,
 }
+
+/// F1-0-4: default do teto de retenção por alvo ocupado (30 s).
+pub const RETENTION_TIMEOUT_MS: u64 = 30_000;
 
 impl Default for RouterConfig {
     fn default() -> Self {
@@ -98,6 +106,7 @@ impl Default for RouterConfig {
             heartbeat_sample_ms: crate::lifecycle::HEARTBEAT_SAMPLE_MS,
             stall_warn_samples: crate::lifecycle::STALL_WARN_SAMPLES,
             stall_breaker_samples: crate::lifecycle::STALL_BREAKER_SAMPLES,
+            retention_timeout_ms: RETENTION_TIMEOUT_MS,
         }
     }
 }
@@ -156,6 +165,12 @@ pub enum RouteOutcome {
     /// corrigir e reenviar (a recusa também vai ao log: `RouteBlocked{invalid_intent|
     /// invalid_contract}` — ADR 0003, o log é o livro-razão das recusas).
     ContractRejected(String),
+    /// F1-0-4 (P1 — entrega ciente de estado): o alvo está `Busy` → a mensagem foi RETIDA
+    /// no `.inflight` (durável; o pump NÃO ackeia) e será re-tentada a cada tick até o
+    /// alvo voltar a Idle/Ready, até o teto `retention_timeout_ms` (estourou → entrega
+    /// mesmo assim; DLQ é F1-0-7). NÃO é erro: é o fix do atropelamento (baseline F1-0:
+    /// 15/15 retornos <2s ao mesmo alvo).
+    Retained { to: NodeId },
 }
 
 /// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
@@ -229,6 +244,10 @@ pub struct Router {
     /// fica para sempre se o destino realmente não existe). NÃO afrouxa segurança: o `from` segue
     /// autenticado pela origem (subdir) e o `route_message` é idêntico — só a decisão de ack/reter muda.
     transient_retries: HashMap<String, u32>,
+    /// F1-0-4 (P1): `id` → carimbo (ms) da PRIMEIRA retenção por alvo ocupado. Dupla função:
+    /// emite o `MessageRetained` só 1× (anti-amplificação A4) e cronometra o teto
+    /// (`retention_timeout_ms`) — estourou, a msg deixa de ser retida e ENTREGA.
+    retained_since: HashMap<String, u64>,
 }
 
 /// Teto de re-tentativas de um bloqueio TRANSIENTE (`UnknownSender`/`NoTarget`) antes de desistir.
@@ -255,6 +274,7 @@ impl Router {
             pending: HashMap::new(),
             paused: false,
             transient_retries: HashMap::new(),
+            retained_since: HashMap::new(),
         }
     }
 
@@ -400,14 +420,21 @@ impl Router {
                     // autenticada pelo subdir; nada de roteamento muda, só a re-tentativa.
                     self.seen.remove(&m.id);
                 }
+                // F1-0-4: `Retained` também NÃO dá ack — a msg fica no `.inflight` (durável)
+                // e é re-avaliada no próximo tick (o `route_message` já desmarcou o dedupe).
+                // O relógio é por TEMPO (`retained_since`/`retention_timeout_ms`), não por
+                // ticks como o transiente.
                 let hold = matches!(
                     outcome,
-                    RouteOutcome::PersistFailed(_) | RouteOutcome::Queued
+                    RouteOutcome::PersistFailed(_)
+                        | RouteOutcome::Queued
+                        | RouteOutcome::Retained { .. }
                 );
                 if !hold && !retain_transient {
                     // Desfecho definitivo (entregue, duplicado, hop-limit, ou transiente esgotado):
-                    // confirma e limpa o contador (anti-vazamento do mapa).
+                    // confirma e limpa os contadores (anti-vazamento dos mapas).
                     self.transient_retries.remove(&m.id);
+                    self.retained_since.remove(&m.id);
                     if let Err(e) = self.mailbox.ack_inflight(&m.id) {
                         eprintln!("lina-core: pump falhou ao confirmar inflight {}: {e}", m.id);
                     }
@@ -490,6 +517,50 @@ impl Router {
         //    (Round 4: intent de plano nunca fecha await — o desvio precede o lifecycle do reply.)
         if is_plan_intent(&msg.intent) {
             return self.handle_plan(msg, store);
+        }
+
+        // ── F1-0-4 (P1 — o fix do atropelamento): ENTREGA CIENTE DE ESTADO. Alvo single-node
+        //    `Busy` (state-machine F1-0-3, consultada no roster — inclui o Busy carimbado
+        //    pelo próprio router na entrega anterior) → NÃO injeta: a msg fica RETIDA no
+        //    `.inflight` (durável) e é re-avaliada INTEIRA a cada tick, até o alvo voltar
+        //    a Idle/Ready ou estourar `retention_timeout_ms` (→ entrega mesmo assim; DLQ é
+        //    F1-0-7).
+        //
+        //    BRAINSTORM REGISTRADO (opções do DIRECIONAMENTO §P1): **(a) adiar ✔ escolhida**
+        //    (estende o mecanismo de retenção do `.inflight` que o retry transiente já usa —
+        //    é o fix real do atropelamento); (b) agregar N respostas em 1 bloco — anotada
+        //    como melhoria futura (possível over-engineering agora, nas palavras do próprio
+        //    doc); (c) lock — o `lock_pty` já serializa BYTES, mas o problema é injetar em
+        //    cima do TURNO do Claude (semântico), não interleave de bytes.
+        //
+        //    POSIÇÃO NO PIPELINE (deliberada): ANTES do `close_await_on_reply` — uma reply
+        //    retida NÃO pode fechar o ticket antes de ser entregue (na re-avaliação ela
+        //    perderia a isenção anti-loop e viraria `LoopDetected`); e antes de qualquer
+        //    efeito (await/budget/persist), para a re-avaliação ser limpa. Trade-off
+        //    consciente: rejeições permanentes (autonomia/fanout/budget) ficam adiadas
+        //    enquanto o alvo está Busy — bounded pelo timeout. Broadcast NÃO retém (tem
+        //    gate próprio — ADR 0007). FIFO por alvo: o `.inflight` re-drena em ordem de
+        //    id (UUID v7 temporal); como CADA entrega marca o alvo `Busy`
+        //    (`mark_busy_after_delivery`), a próxima da fila retém até o alvo completar o
+        //    turno (Idle pelo lifecycle/EndDetector) — serialização "uma aguardando a outra".
+        if let Some((target, reason)) = self.retention_verdict(msg, sender, now_ms) {
+            if !self.retained_since.contains_key(&msg.id) {
+                self.retained_since.insert(msg.id.clone(), now_ms);
+                // Livro-razão da espera (1× por msg — A4). Falha de append NÃO solta a
+                // injeção (reter é o estado seguro; a msg segue durável no `.inflight`).
+                if let Err(e) = store.append(&DomainEvent::MessageRetained {
+                    id: msg.id.clone(),
+                    to: target,
+                    reason: reason.to_string(),
+                }) {
+                    eprintln!("lina-core: falha ao logar MessageRetained({}): {e}", msg.id);
+                }
+            }
+            // Espelho do retry transiente: desmarca o dedupe para o PRÓXIMO tick re-processar
+            // (senão viraria `Duplicate` e seria ackeada+perdida). O dedupe DURÁVEL
+            // (`routed_ids` no log) segue protegendo contra re-ENTREGA.
+            self.seen.remove(&msg.id);
+            return RouteOutcome::Retained { to: target };
         }
 
         // ── W3-7b (ADR 0002) + Round 4 (confused-deputy): se ESTA msg é um REPLY que CASA um await
@@ -750,10 +821,18 @@ impl Router {
             msg.contract.as_ref(),
         );
         let mut delivered = Vec::with_capacity(targets.len());
+        let single_target = targets.len() == 1; // F1-0-4: gate pós-entrega só em rota 1-a-1
         for target in targets {
             match deliver(target, sender, &block) {
                 Ok(_) => {
                     delivered.push(target);
+                    // F1-0-4: o alvo recebeu um turno → está `Busy` AGORA (transição feita
+                    // pelo router, determinística — é o que serializa a próxima entrega ao
+                    // mesmo alvo). E encerra o relógio de retenção desta msg.
+                    if single_target {
+                        self.mark_busy_after_delivery(store, target);
+                    }
+                    self.retained_since.remove(&msg.id);
                     // A2: registra que `target` recebeu esta cadeia → futuras submissões dele herdam
                     //     o root e ganham hops+1 (binding do supervisor, não confiança no campo).
                     // FRONTEIRA DE SEGURANÇA (P1 vs Round 5 #8 migração):
@@ -802,15 +881,100 @@ impl Router {
         }
     }
 
+    /// **F1-0-4 — o veredito de retenção** (P1). `Some((alvo, motivo))` = NÃO injete agora.
+    /// Resolução do destino SEM efeito colateral (mesma do guardrail 0b); só retém destino
+    /// que resolve a EXATAMENTE 1 nó vivo (broadcast/multi tem gate próprio — ADR 0007).
+    /// Motivo `target_busy` = estado `Busy` na state-machine F1-0-3, lido do roster (inclui
+    /// o `Busy` que a entrega ANTERIOR carimbou via `mark_busy_after_delivery` — é o que
+    /// serializa rajadas ao mesmo alvo). O teto `retention_timeout_ms` corta QUALQUER espera
+    /// (inclusive circular): estourou → `None` (a entrega segue, semântica do
+    /// `READY_TIMEOUT`/W0-9; o desvio a DLQ é F1-0-7).
+    fn retention_verdict(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        now_ms: u64,
+    ) -> Option<(NodeId, &'static str)> {
+        // Resolução sem efeito colateral; só single-node.
+        let (recipient, policy) = match parse_target(&msg.to) {
+            TargetSpec::Broadcast => return None,
+            TargetSpec::Role(r) => (Recipient::Role(r), RolePolicy::FirstIdle),
+            TargetSpec::Name(n) => match self.sup.node_by_name(&n) {
+                Some(id) => (Recipient::Node(id), RolePolicy::FirstIdle),
+                None => return None, // NoTarget → pipeline normal (retry transiente cobre)
+            },
+        };
+        let preview = self.sup.resolve(&recipient, policy, Some(sender));
+        let [target] = preview[..] else { return None };
+
+        // Teto da retenção: estourou → entrega mesmo assim (nunca espera infinita/circular).
+        if let Some(&first) = self.retained_since.get(&msg.id) {
+            if now_ms.saturating_sub(first) >= self.config.retention_timeout_ms {
+                eprintln!(
+                    "lina-core: retenção de {} estourou o teto ({} ms) — entregando mesmo \
+                     assim (DLQ é F1-0-7)",
+                    msg.id, self.config.retention_timeout_ms
+                );
+                self.retained_since.remove(&msg.id);
+                return None;
+            }
+        }
+
+        // Retenção é PURAMENTE por estado: a serialização "uma aguardando a outra"
+        // emerge da própria state-machine, porque o router marca o alvo `Busy` no
+        // instante de cada entrega (ver o loop de entrega) e só o ciclo real do alvo
+        // (EndDetector/lifecycle → Idle) o libera.
+        if self.sup.get(target)?.status == NodeStatus::Busy {
+            Some((target, "target_busy"))
+        } else {
+            None
+        }
+    }
+
+    /// **F1-0-4 — o alvo que acabou de receber um turno injetado ESTÁ `Busy`.** O router
+    /// (escritor único, com o store em mãos) registra a transição no padrão fato-antes-
+    /// do-efeito do `LifecycleEngine::transition` (evento → roster), com
+    /// `reason: "a2a_delivery"`. É o que torna a serialização determinística: a PRÓXIMA
+    /// mensagem ao mesmo alvo encontra `Busy` na hora, sem janela de corrida com a
+    /// detecção por output. A volta a `Idle` continua sendo do lifecycle (fim-de-resposta).
+    fn mark_busy_after_delivery(&self, store: &mut EventStore, target: NodeId) {
+        let Some(info) = self.sup.get(target) else {
+            return;
+        };
+        if info.status == NodeStatus::Busy || info.status == NodeStatus::Dead {
+            return; // no-op sem evento (anti-amplificação, padrão ADR 0005)
+        }
+        if let Err(e) = store.append(&DomainEvent::NodeStatusChanged {
+            node: target,
+            status: NodeStatus::Busy.as_str().to_string(),
+            from: info.status.as_str().to_string(),
+            reason: "a2a_delivery".to_string(),
+        }) {
+            eprintln!("lina-core: falha ao logar NodeStatusChanged(a2a_delivery): {e}");
+        }
+        if let Err(e) = self.sup.set_status(target, NodeStatus::Busy) {
+            eprintln!("lina-core: falha ao marcar {target} Busy pós-entrega: {e}");
+        }
+    }
+
     /// Remove entradas de dedupe (`seen`) E de orçamento (`budget`) mais velhas que a janela. As duas
     /// crescem com o tráfego; sem podar `budget` junto, ele vazaria memória numa sessão longa (A5),
-    /// ao contrário de `seen` que já era podado.
+    /// ao contrário de `seen` que já era podado. F1-0-4: também poda os relógios de retenção.
     fn prune_expired(&mut self, now_ms: u64) {
         let window = self.config.dedupe_window_ms;
         self.seen
             .retain(|_, &mut t| now_ms.saturating_sub(t) < window);
         self.budget
             .retain(|_, e| now_ms.saturating_sub(e.last_ms) < window);
+        // F1-0-4: cinto anti-vazamento (normalmente limpo na entrega/ack): relógios de
+        // retenção muito além do teto.
+        let retention_cap = self
+            .config
+            .retention_timeout_ms
+            .saturating_mul(4)
+            .max(window);
+        self.retained_since
+            .retain(|_, &mut t| now_ms.saturating_sub(t) < retention_cap);
         // Round 5 #8: poda bindings OCIOSOS (stale > janela), EXCETO de nós com await PENDENTE — podar
         // mid-await deixaria um root fresco roubar a cadeia ainda viva (o `await_timeout` pode exceder
         // a janela de dedupe). A poda + re-set na entrega é o que MIGRA o binding p/ a cadeia ativa,
@@ -1277,6 +1441,15 @@ mod tests {
         Box::new(std::io::sink())
     }
 
+    /// F1-0-4: o alvo "terminou o turno" (Idle). Desde a entrega ciente de estado, TODA
+    /// entrega marca o alvo `Busy` (serialização P1) — testes que entregam de novo ao
+    /// MESMO alvo simulam o fim do turno entre as entregas, como o lifecycle real faria
+    /// (EndDetector → Idle). Sem isto a 2ª entrega é `Retained{target_busy}` — que é
+    /// exatamente o comportamento de produto provado nos testes de retenção.
+    fn turn_done(sup: &Supervisor, node: NodeId) {
+        sup.set_status(node, NodeStatus::Idle).expect("set Idle");
+    }
+
     /// `deliver` de teste que só REGISTRA (target, from, text) — sem PTY real.
     type Recorder = Rc<RefCell<Vec<(NodeId, NodeId, String)>>>;
     fn recorder() -> (
@@ -1543,13 +1716,14 @@ mod tests {
     fn same_id_after_window_is_not_duplicate() {
         let (mut router, sup, dir) = router_with("window");
         let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("window");
         let (rec, mut deliver) = recorder();
 
         let msg = MailMessage::new("@A", "@B", "ask", "oi");
         router.route_message(&msg, &mut ts.store, 0, &mut deliver);
-        // Bem depois da janela de 60s → re-roteável (a entrada velha foi podada).
+        turn_done(&sup, b); // F1-0-4: B terminou o turno entre as duas entregas
+                            // Bem depois da janela de 60s → re-roteável (a entrada velha foi podada).
         let out = router.route_message(&msg, &mut ts.store, DEDUPE_WINDOW_MS + 1, &mut deliver);
         assert!(matches!(out, RouteOutcome::Delivered { .. }));
         assert_eq!(rec.borrow().len(), 2);
@@ -1564,7 +1738,7 @@ mod tests {
         let (mut router, sup, dir) = router_with("budget");
         let _a = sup.register("@A", None, sink());
         let _b = sup.register("@B", None, sink());
-        let _c = sup.register("@C", None, sink());
+        let c = sup.register("@C", None, sink());
         let mut ts = TmpStore::new("budget");
         let (_rec, mut deliver) = recorder();
 
@@ -1575,6 +1749,7 @@ mod tests {
         // B delega DELEGATION_BUDGET vezes, CADA uma com um root_cause_id FORJADO distinto → todas
         // ignoram o forjado e contam contra (root herdado, B); a (teto+1)-ésima estoura.
         for i in 0..DELEGATION_BUDGET {
+            turn_done(&sup, c); // F1-0-4: C termina cada turno (testa o BUDGET, não a retenção)
             let mut msg = MailMessage::new("@B", "@C", "ask", format!("t{i}"));
             msg.root_cause_id = Some(format!("forjado-{i}")); // IGNORADO (W1)
             assert!(
@@ -1585,6 +1760,7 @@ mod tests {
                 "delegação {i} deveria passar (root forjado ignorado)"
             );
         }
+        turn_done(&sup, c); // idem: o estouro abaixo deve vir do orçamento, não do estado
         let mut over = MailMessage::new("@B", "@C", "ask", "demais");
         over.root_cause_id = Some("forjado-final".into());
         assert_eq!(
@@ -1853,12 +2029,13 @@ mod tests {
     fn origin_delegations_are_not_limited_by_budget() {
         let (mut router, sup, dir) = router_with("budget-origin");
         let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("budget-origin");
         let (_rec, mut deliver) = recorder();
 
         // @A nunca recebe A2A → cada ask é ORIGEM (hops==0, root fresco). Manda BUDGET+5 asks 1-a-1.
         for i in 0..(DELEGATION_BUDGET + 5) {
+            turn_done(&sup, b); // F1-0-4: B termina cada turno (testa o ORÇAMENTO, não a retenção)
             let m = MailMessage::new("@A", "@B", "ask", format!("aviso {i}"));
             assert!(
                 matches!(
@@ -2200,7 +2377,7 @@ mod tests {
     fn budget_entries_are_pruned_after_window() {
         let (mut router, sup, dir) = router_with("budget-prune");
         let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("budget-prune");
         let (_rec, mut deliver) = recorder();
 
@@ -2214,6 +2391,7 @@ mod tests {
 
         // Bem depois da janela, qualquer route_message roda a poda no topo → a entrada velha some;
         // só a nova (do turno recente) permanece.
+        turn_done(&sup, b); // F1-0-4: B terminou o turno da 1ª entrega
         let later = MailMessage::new("@A", "@B", "ask", "depois");
         assert!(matches!(
             router.route_message(&later, &mut ts.store, DEDUPE_WINDOW_MS + 2000, &mut deliver),
@@ -2242,8 +2420,8 @@ mod tests {
     #[test]
     fn forged_root_does_not_bypass_loop_detection() {
         let (mut router, sup, dir) = router_with("loop");
-        let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("loop");
         let (_rec, mut deliver) = recorder();
 
@@ -2251,6 +2429,9 @@ mod tests {
         // o root real vem do binding, então o grafo NÃO fragmenta e o ciclo é amarrado).
         let pingpong = [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")];
         for (i, (from, to)) in pingpong.iter().enumerate() {
+            // F1-0-4: cada perna só acontece após o turno anterior terminar (ping-pong real).
+            turn_done(&sup, a);
+            turn_done(&sup, b);
             let mut m = MailMessage::new(*from, *to, "ask", "volta");
             m.root_cause_id = Some(format!("forjado{i}")); // distinto e IGNORADO
             assert!(
@@ -2262,6 +2443,8 @@ mod tests {
             );
         }
         // 3ª repetição do salto A→B (root forjado mais uma vez) → o loop apertado é cortado mesmo assim.
+        turn_done(&sup, a);
+        turn_done(&sup, b); // F1-0-4: o corte abaixo deve vir do ANTI-LOOP, não da retenção
         let mut over = MailMessage::new("@A", "@B", "ask", "volta demais");
         over.root_cause_id = Some("forjado_final".into());
         assert_eq!(
@@ -2317,8 +2500,8 @@ mod tests {
     #[test]
     fn tight_loop_blocked_after_revisit_limit() {
         let (mut router, sup, dir) = router_with("tightloop");
-        let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("tightloop");
         let (_rec, mut deliver) = recorder();
 
@@ -2326,6 +2509,9 @@ mod tests {
         // ocorrer 2× e B→A 2× antes do corte.
         let pingpong = [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")];
         for (i, (from, to)) in pingpong.iter().enumerate() {
+            // F1-0-4: cada perna só acontece após o turno anterior terminar (ping-pong real).
+            turn_done(&sup, a);
+            turn_done(&sup, b);
             let m = MailMessage::new(*from, *to, "ask", "ping");
             assert!(
                 matches!(
@@ -2436,7 +2622,7 @@ mod tests {
         let (mut router, sup, dir) = router_with("budget-inherit");
         let _a = sup.register("@A", None, sink());
         let _b = sup.register("@B", None, sink());
-        let _c = sup.register("@C", None, sink());
+        let c = sup.register("@C", None, sink());
         let mut ts = TmpStore::new("budget-inherit");
         let (_rec, mut deliver) = recorder();
 
@@ -2446,6 +2632,7 @@ mod tests {
 
         // B delega DELEGATION_BUDGET vezes (root herdado, root=None) → todas contam contra (root, B).
         for i in 0..DELEGATION_BUDGET {
+            turn_done(&sup, c); // F1-0-4: C termina cada turno (testa o ORÇAMENTO, não a retenção)
             let m = MailMessage::new("@B", "@C", "ask", format!("d{i}"));
             assert!(
                 matches!(
@@ -2456,6 +2643,7 @@ mod tests {
             );
         }
         // A (teto+1)-ésima de B, mesmo root herdado → estoura.
+        turn_done(&sup, c);
         let over = MailMessage::new("@B", "@C", "ask", "demais");
         assert_eq!(
             router.route_message(&over, &mut ts.store, 999, &mut deliver),
@@ -2511,6 +2699,313 @@ mod tests {
                 .iter()
                 .any(|r| r.kind == "MessageRouted"),
             "o roteamento ficou durável no log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────── F1-0-4: entrega ciente de estado (reter quando Busy) ─────────────────
+
+    /// Eventos de um `kind` no log (helper das asserções de retenção).
+    fn events_of(store: &EventStore, kind: &str) -> Vec<crate::events::EventRecord> {
+        store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == kind)
+            .collect()
+    }
+
+    /// **Critério 1 da story:** alvo `Busy` → NÃO injeta (Retained + `MessageRetained` 1×);
+    /// alvo volta a `Idle` → entrega EXATAMENTE 1× (sem perda, sem duplicata).
+    #[test]
+    fn retencao_alvo_busy_nao_injeta_e_entrega_no_idle() {
+        let (mut router, sup, dir) = router_with("ret-busy");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("ret-busy");
+        let (rec, mut deliver) = recorder();
+
+        sup.set_status(b, NodeStatus::Busy).expect("B ocupado");
+        let msg = MailMessage::new("@A", "@B", "ask", "espera tua vez");
+
+        // Busy → Retained; nada injetado; MessageRetained{target_busy} no log (1×).
+        assert_eq!(
+            router.route_message(&msg, &mut ts.store, 1_000, &mut deliver),
+            RouteOutcome::Retained { to: b }
+        );
+        assert!(rec.borrow().is_empty(), "nada injetado com o alvo Busy");
+        let retained = events_of(&ts.store, "MessageRetained");
+        assert_eq!(retained.len(), 1, "MessageRetained apendado na 1ª retenção");
+        assert_eq!(
+            retained[0].payload.get("reason").and_then(|v| v.as_str()),
+            Some("target_busy")
+        );
+
+        // Re-avaliação (próximo tick) com B ainda Busy → segue Retained, SEM 2º evento (A4).
+        assert_eq!(
+            router.route_message(&msg, &mut ts.store, 1_200, &mut deliver),
+            RouteOutcome::Retained { to: b }
+        );
+        assert_eq!(
+            events_of(&ts.store, "MessageRetained").len(),
+            1,
+            "retenção repetida NÃO re-apenda (anti-amplificação)"
+        );
+
+        // B termina o turno → a entrega acontece EXATAMENTE 1×.
+        turn_done(&sup, b);
+        assert!(matches!(
+            router.route_message(&msg, &mut ts.store, 1_400, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert_eq!(rec.borrow().len(), 1, "entregue exatamente 1×");
+        // Re-envio do mesmo id após a entrega → Duplicate (dedupe normal), nunca 2ª injeção.
+        assert_eq!(
+            router.route_message(&msg, &mut ts.store, 1_500, &mut deliver),
+            RouteOutcome::Duplicate
+        );
+        assert_eq!(rec.borrow().len(), 1, "sem duplicata");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Critério 2 da story:** 3 "respostas" simultâneas ao MESMO alvo são SERIALIZADAS —
+    /// o log mostra entregas intercaladas com retenções, uma aguardando a outra (a entrega
+    /// marca o alvo `Busy`; só o fim do turno libera a próxima).
+    #[test]
+    fn retencao_serializa_rajada_ao_mesmo_alvo() {
+        let (mut router, sup, dir) = router_with("ret-rajada");
+        for w in ["@W1", "@W2", "@W3"] {
+            sup.register(w, None, sink());
+        }
+        let a = sup.register("@Maestro", None, sink());
+        let mut ts = TmpStore::new("ret-rajada");
+        let (rec, mut deliver) = recorder();
+        sup.set_status(a, NodeStatus::Idle).expect("Maestro livre");
+
+        // A rajada da baseline: 3 retornos depositados no mesmo instante (Δ=0).
+        let m1 = MailMessage::new("@W1", "@Maestro", "ask", "RESULTADO 1");
+        let m2 = MailMessage::new("@W2", "@Maestro", "ask", "RESULTADO 2");
+        let m3 = MailMessage::new("@W3", "@Maestro", "ask", "RESULTADO 3");
+
+        // Tick 1: m1 entrega (Maestro estava Idle) e o router o marca Busy → m2/m3 RETIDAS.
+        assert!(matches!(
+            router.route_message(&m1, &mut ts.store, 1_000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert_eq!(
+            router.route_message(&m2, &mut ts.store, 1_000, &mut deliver),
+            RouteOutcome::Retained { to: a },
+            "m2 aguarda m1 (alvo Busy pela entrega de m1)"
+        );
+        assert_eq!(
+            router.route_message(&m3, &mut ts.store, 1_000, &mut deliver),
+            RouteOutcome::Retained { to: a }
+        );
+        assert_eq!(rec.borrow().len(), 1, "só m1 injetada no tick da rajada");
+
+        // Maestro terminou o turno de m1 → tick 2: m2 entrega, m3 segue aguardando.
+        turn_done(&sup, a);
+        assert!(matches!(
+            router.route_message(&m2, &mut ts.store, 2_000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert_eq!(
+            router.route_message(&m3, &mut ts.store, 2_000, &mut deliver),
+            RouteOutcome::Retained { to: a },
+            "m3 aguarda m2 — uma aguardando a outra"
+        );
+
+        // Turno de m2 termina → tick 3: m3 entrega. Serialização completa, 0 colisão.
+        turn_done(&sup, a);
+        assert!(matches!(
+            router.route_message(&m3, &mut ts.store, 3_000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        assert_eq!(rec.borrow().len(), 3, "as 3 entregaram, uma por turno");
+
+        // O LOG conta a história: 1 NodeStatusChanged{a2a_delivery} por entrega + 2 retenções.
+        let delivered = events_of(&ts.store, "MessageDelivered");
+        assert_eq!(delivered.len(), 3);
+        assert_eq!(events_of(&ts.store, "MessageRetained").len(), 2);
+        let busy_marks: Vec<_> = events_of(&ts.store, "NodeStatusChanged")
+            .into_iter()
+            .filter(|r| r.payload.get("reason").and_then(|v| v.as_str()) == Some("a2a_delivery"))
+            .collect();
+        assert_eq!(busy_marks.len(), 3, "cada entrega carimbou o alvo Busy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Critério 4 da story (anti-deadlock):** o TIMEOUT de retenção dispara antes de
+    /// qualquer espera circular — alvo PERPETUAMENTE Busy não retém para sempre: estourou
+    /// o teto, ENTREGA mesmo assim (DLQ é F1-0-7).
+    #[test]
+    fn retencao_estoura_teto_e_entrega_mesmo_busy() {
+        let (mut router, sup, dir) = router_with("ret-teto");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("ret-teto");
+        let (rec, mut deliver) = recorder();
+        let cfg = RouterConfig {
+            retention_timeout_ms: 1_000,
+            ..RouterConfig::default()
+        };
+        router.config = cfg;
+
+        sup.set_status(b, NodeStatus::Busy).expect("B preso");
+        let msg = MailMessage::new("@A", "@B", "ask", "não espere para sempre");
+
+        assert_eq!(
+            router.route_message(&msg, &mut ts.store, 10_000, &mut deliver),
+            RouteOutcome::Retained { to: b }
+        );
+        assert_eq!(
+            router.route_message(&msg, &mut ts.store, 10_500, &mut deliver),
+            RouteOutcome::Retained { to: b },
+            "dentro do teto segue retida"
+        );
+        // t=11_001 (>= 10_000 + 1_000): o teto corta a espera — entrega com B ainda Busy.
+        assert!(
+            matches!(
+                router.route_message(&msg, &mut ts.store, 11_001, &mut deliver),
+                RouteOutcome::Delivered { .. }
+            ),
+            "timeout de retenção dispara antes de qualquer ciclo (13.11 §P0)"
+        );
+        assert_eq!(rec.borrow().len(), 1, "1 entrega (pós-teto), nunca antes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Inv #4 + FIFO da story (via pump):** a fila retida VIVE no `.inflight` durável —
+    /// um RESTART do router (novo processo) re-deriva a fila e entrega em ordem FIFO por
+    /// alvo, exatamente 1× cada.
+    #[test]
+    fn retencao_via_pump_sobrevive_restart_fifo_exactly_once() {
+        let (mut router, sup, dir) = router_with("ret-pump");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("ret-pump");
+        let (rec, deliver) = recorder();
+        sup.set_status(b, NodeStatus::Busy).expect("B ocupado");
+
+        // 2 msgs (FIFO: id UUIDv7 temporal) depositadas pelo canal real (outbox por-nó).
+        let m1 = MailMessage::new("@A", "@B", "ask", "primeira");
+        let m2 = MailMessage::new("@A", "@B", "ask", "segunda");
+        router.mailbox().enqueue_as("@A", &m1).expect("enq m1");
+        router.mailbox().enqueue_as("@A", &m2).expect("enq m2");
+
+        // Tick com B Busy: ambas RETIDAS, nada ackeado (seguem duráveis no .inflight).
+        let r1 = router.pump(&mut ts.store, 1_000, deliver);
+        assert!(r1
+            .iter()
+            .all(|(_, o)| matches!(o, RouteOutcome::Retained { .. })));
+        let inflight = dir.join(".lina/outbox/.inflight");
+        assert_eq!(
+            std::fs::read_dir(&inflight).map(|d| d.count()).unwrap_or(0),
+            2,
+            "fila retida durável no .inflight"
+        );
+
+        // RESTART: router novo (estado em memória zerado) sobre a MESMA mailbox+store.
+        drop(router);
+        let mut router2 = Router::new(Arc::clone(&sup), Mailbox::new(dir.join(".lina")));
+        let (rec2, deliver2) = recorder();
+        // B ainda Busy → re-derivada e retida de novo (replay reconstrói a fila — inv #4).
+        let r2 = router2.pump(&mut ts.store, 2_000, deliver2);
+        assert!(r2
+            .iter()
+            .all(|(_, o)| matches!(o, RouteOutcome::Retained { .. })));
+
+        // B livre → tick entrega m1 (FIFO) e re-retém m2 (B re-Busy pela entrega).
+        turn_done(&sup, b);
+        let (rec3, deliver3) = recorder();
+        let r3 = router2.pump(&mut ts.store, 3_000, deliver3);
+        let delivered_now: Vec<&String> = r3
+            .iter()
+            .filter(|(_, o)| matches!(o, RouteOutcome::Delivered { .. }))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(
+            delivered_now,
+            vec![&m1.id],
+            "FIFO: a 1ª da fila entrega primeiro"
+        );
+        assert_eq!(rec3.borrow().len(), 1);
+
+        // Próximo turno → m2 entrega. Exactly-once de ponta a ponta.
+        turn_done(&sup, b);
+        let (rec4, deliver4) = recorder();
+        let r4 = router2.pump(&mut ts.store, 4_000, deliver4);
+        let delivered_last: Vec<&String> = r4
+            .iter()
+            .filter(|(_, o)| matches!(o, RouteOutcome::Delivered { .. }))
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(delivered_last, vec![&m2.id]);
+        assert_eq!(rec4.borrow().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(&inflight).map(|d| d.count()).unwrap_or(0),
+            0,
+            "tudo ackeado ao final (nada órfão)"
+        );
+        assert_eq!(
+            events_of(&ts.store, "MessageDelivered").len(),
+            2,
+            "cada mensagem entregue EXATAMENTE 1× (sem perda, sem duplicata)"
+        );
+        let _ = (rec, rec2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Reply retida não vira loop:** a retenção acontece ANTES do fechamento do await —
+    /// uma reply para um waiter `Busy` fica retida COM o ticket vivo; quando entrega, fecha
+    /// o await normalmente (`AwaitClosed{replied}`) e NUNCA é cortada como loop.
+    #[test]
+    fn reply_retida_fecha_await_so_na_entrega() {
+        let (mut router, sup, dir) = router_with("ret-reply");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("ret-reply");
+        let (_rec, mut deliver) = recorder();
+
+        // A --await--> B (abre o ticket; B fica Busy pela entrega da pergunta).
+        let q = MailMessage::new("@A", "@B", "ask", "pergunta").awaiting();
+        assert!(matches!(
+            router.route_message(&q, &mut ts.store, 1_000, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+
+        // A está processando OUTRA coisa (Busy) quando B responde → a reply é RETIDA e o
+        // ticket NÃO fecha (AwaitClosed ausente; aresta a→b viva).
+        sup.set_status(a, NodeStatus::Busy).expect("A ocupado");
+        let reply = MailMessage::new("@B", "@A", "ask", "resposta").replying_to(q.id.clone());
+        assert_eq!(
+            router.route_message(&reply, &mut ts.store, 1_100, &mut deliver),
+            RouteOutcome::Retained { to: a }
+        );
+        assert!(
+            events_of(&ts.store, "AwaitClosed").is_empty(),
+            "reply retida NÃO fecha o await antes de ser entregue"
+        );
+        assert!(
+            sup.begin_await(b, a).is_err(),
+            "aresta a→b segue viva enquanto a reply espera"
+        );
+
+        // A termina o turno → a reply entrega, fecha o await e NÃO é loop.
+        turn_done(&sup, a);
+        assert!(matches!(
+            router.route_message(&reply, &mut ts.store, 1_200, &mut deliver),
+            RouteOutcome::Delivered { .. }
+        ));
+        let closed = events_of(&ts.store, "AwaitClosed");
+        assert_eq!(closed.len(), 1, "await fechado na ENTREGA da reply");
+        assert_eq!(
+            closed[0].payload.get("reason").and_then(|v| v.as_str()),
+            Some("replied")
+        );
+        assert!(
+            !blocked_reasons(&ts.store).contains(&"loop_detected".to_string()),
+            "reply retida nunca é confundida com loop"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2725,8 +3220,8 @@ mod tests {
     #[test]
     fn forged_reply_to_does_not_bypass_loop() {
         let (mut router, sup, dir) = router_with("replybypass");
-        let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("replybypass");
         let (_rec, mut deliver) = recorder();
 
@@ -2734,6 +3229,9 @@ mod tests {
         // dentro do limite entregam (diálogo); o forjado não compra rodadas extras.
         let pingpong = [("@A", "@B"), ("@B", "@A"), ("@A", "@B"), ("@B", "@A")];
         for (i, (from, to)) in pingpong.iter().enumerate() {
+            // F1-0-4: cada perna só acontece após o turno anterior terminar (ping-pong real).
+            turn_done(&sup, a);
+            turn_done(&sup, b);
             let m = MailMessage::new(*from, *to, "ask", "volta").replying_to("msg_naoexiste");
             assert!(
                 matches!(
@@ -2744,6 +3242,8 @@ mod tests {
             );
         }
         // 3ª repetição do salto A→B com reply_to FORJADO → NÃO pula o guard → loop apertado cortado.
+        turn_done(&sup, a);
+        turn_done(&sup, b); // F1-0-4: o corte deve vir do anti-loop, não da retenção
         let forged =
             MailMessage::new("@A", "@B", "ask", "volta demais").replying_to("msg_naoexiste");
         assert_eq!(
@@ -2879,7 +3379,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let sup = Arc::new(Supervisor::new());
         let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let b = sup.register("@B", None, sink());
         let cfg = RouterConfig {
             token_budget_day: 100,
             ..RouterConfig::default()
@@ -2920,6 +3420,7 @@ mod tests {
 
         // ── (2) Uso (150) ≥ teto (100): a próxima delegação retorna CostCeiling, NÃO entrega, e
         //    apenda CostCeilingHit{day, tokens}; o workspace fica Paused (observável no log).
+        turn_done(&sup, b); // F1-0-4: o bloqueio abaixo deve vir do TETO, não da retenção
         let before = rec.borrow().len();
         let m2 = MailMessage::new("@A", "@B", "ask", "estoura");
         assert_eq!(
@@ -2972,6 +3473,7 @@ mod tests {
             !CostLedger::replay(&ts.store, now).expect("ledger").paused,
             "após resume o workspace não está mais Paused"
         );
+        turn_done(&sup, b); // F1-0-4: B livre — o que se testa é o pós-resume, não a retenção
         let m4 = MailMessage::new("@A", "@B", "ask", "depois do resume");
         assert!(
             matches!(
@@ -3216,7 +3718,7 @@ mod tests {
     fn delivered_root_migrates_to_active_chain_after_window() {
         let (mut router, sup, dir) = router_with("migrate");
         let _a = sup.register("@A", None, sink());
-        let _b = sup.register("@B", None, sink());
+        let b = sup.register("@B", None, sink());
         let _c = sup.register("@C", None, sink());
         let mut ts = TmpStore::new("migrate");
         let (_rec, mut deliver) = recorder();
@@ -3227,6 +3729,7 @@ mod tests {
         let r1 = m1.id.clone();
 
         // Passada a janela (B ocioso, sem await): A→B sob a cadeia NOVA R2 → o binding de B MIGRA.
+        turn_done(&sup, b); // F1-0-4: "B ocioso" agora é literal — terminou o turno de R1
         let later = 1000 + DEDUPE_WINDOW_MS + 1;
         let m2 = MailMessage::new("@A", "@B", "ask", "cadeia R2");
         router.route_message(&m2, &mut ts.store, later, &mut deliver);

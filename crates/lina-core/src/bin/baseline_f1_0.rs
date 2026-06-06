@@ -102,12 +102,29 @@ fn main() -> Result<()> {
     let prompt_re = regex::Regex::new(&detect.prompt_ready_regex)
         .map_err(|e| anyhow!("prompt_ready_regex do claude-code.toml não compila: {e}"))?;
 
-    // Perfil de ENTREGA = réplica do demo_profile() que o app usa em produção HOJE.
-    let delivery_profile = demo_profile_replica()?;
+    // Perfil de ENTREGA = espelho de produção. ANTES (baseline original): demo_profile()
+    // hardcoded (bridge.rs:326, hoje só fallback). DEPOIS (F1-0-2, f130144): produção
+    // carrega o claude-code.toml REAL (`production_profile()`) — o harness segue produção
+    // (dever anti-drift da baseline). `--legacy-demo-delivery` reproduz o ANTES.
+    let delivery_profile = if cfg.legacy_demo_delivery {
+        demo_profile_replica()?
+    } else {
+        detect.clone()
+    };
     eprintln!(
-        "[baseline] perfil de ENTREGA (produção hoje, bridge.rs:327): regex={:?} submit_delay_ms={}",
-        delivery_profile.prompt_ready_regex, delivery_profile.submit_delay_ms
+        "[baseline] perfil de ENTREGA ({}): regex={:?} submit_delay_ms={}",
+        if cfg.legacy_demo_delivery {
+            "LEGADO demo_profile — reproduz o ANTES"
+        } else {
+            "produção F1-0-2 — claude-code.toml real"
+        },
+        delivery_profile.prompt_ready_regex,
+        delivery_profile.submit_delay_ms
     );
+    // F1-0-4: janela de quietude que devolve um alvo Busy a Idle no harness (espelha o
+    // fim-de-turno por idle do meter de produção — bridge.rs ~2598 — sincronizado no
+    // ROSTER, que é a fonte da retenção).
+    let idle_ms = detect.idle_ms.unwrap_or(1_500);
 
     // ── Sobe N claudes reais headless (cabeamento de produção) ──
     let store = Arc::new(Mutex::new(
@@ -171,6 +188,7 @@ fn main() -> Result<()> {
         grids.clone(),
         Mailbox::new(ws.join(".lina")),
         delivery_profile,
+        idle_ms,
         Arc::clone(&stop),
     );
 
@@ -266,18 +284,47 @@ fn main() -> Result<()> {
 /// Réplica fiel do laço do `MailboxPump` do app (bridge.rs:443-528): a cada ~120 ms,
 /// reescreve `agents.json` quando o roster muda e roda `Router::pump` com o MESMO
 /// `deliver_fn` (grid do alvo + `WorkspaceTrust::from_members` + `deliver_a2a`).
+#[allow(clippy::too_many_arguments)]
 fn spawn_pump(
     sup: Arc<Supervisor>,
     store: Arc<Mutex<EventStore>>,
     grids: BTreeMap<NodeId, Grid>,
     mailbox: Mailbox,
     profile: CliProfile,
+    idle_ms: u64,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut router = Router::with_config(Arc::clone(&sup), mailbox, RouterConfig::default());
         let mut last_roster: Vec<AgentPresence> = Vec::new();
+        // F1-0-4: detector de fim-de-turno por quietude do grid (espelha o meter de
+        // produção, SINCRONIZADO NO ROSTER — a fonte da retenção). Um alvo `Busy` cujo
+        // grid não muda por `idle_ms` volta a `Idle` pelo caminho canônico do lifecycle.
+        let mut engine = lina_core::LifecycleEngine::new();
+        let mut last_change: BTreeMap<NodeId, (u64, std::time::Instant)> = BTreeMap::new();
         while !stop.load(Ordering::SeqCst) {
+            for (node, grid) in &grids {
+                let h = rows_hash(&grid_rows(grid));
+                let entry = last_change
+                    .entry(*node)
+                    .or_insert((h, std::time::Instant::now()));
+                if entry.0 != h {
+                    *entry = (h, std::time::Instant::now());
+                } else if entry.1.elapsed() >= Duration::from_millis(idle_ms)
+                    && sup.get(*node).map(|i| i.status) == Some(lina_core::NodeStatus::Busy)
+                {
+                    let mut st = lock(&store);
+                    if let Err(e) = engine.transition(
+                        &sup,
+                        &mut st,
+                        *node,
+                        lina_core::NodeStatus::Idle,
+                        "idle_grid",
+                    ) {
+                        eprintln!("[pump] transição →Idle falhou: {e}");
+                    }
+                }
+            }
             // refresh_agents (bridge.rs:453-470)
             let roster: Vec<AgentPresence> = sup
                 .list()
@@ -315,6 +362,8 @@ fn spawn_pump(
                     | RouteOutcome::Duplicate
                     | RouteOutcome::Queued
                     | RouteOutcome::Presence => {}
+                    // F1-0-4: retenção é o caminho ESPERADO sob alvo Busy (sem ruído).
+                    RouteOutcome::Retained { .. } => {}
                     other => eprintln!("[pump] mensagem {id} não roteada: {other:?}"),
                 }
             }
@@ -897,6 +946,8 @@ struct Config {
     scenario: Scenario,
     claude_bin: String,
     claude_profile: PathBuf,
+    /// Reproduz o ANTES (entrega com demo_profile, pré-F1-0-2). Default: produção atual.
+    legacy_demo_delivery: bool,
 }
 
 fn parse_args() -> Result<Config> {
@@ -907,9 +958,11 @@ fn parse_args() -> Result<Config> {
     let mut scenario = Scenario::All;
     let mut claude_bin = "claude".to_string();
     let mut claude_profile = PathBuf::from("profiles/claude-code.toml");
+    let mut legacy_demo_delivery = false;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--legacy-demo-delivery" => legacy_demo_delivery = true,
             "--ws" => ws = Some(PathBuf::from(next(&mut args, "--ws")?)),
             "--claudes" => claudes = next(&mut args, "--claudes")?.parse()?,
             "--attempts" => attempts = next(&mut args, "--attempts")?.parse()?,
@@ -953,6 +1006,7 @@ fn parse_args() -> Result<Config> {
         scenario,
         claude_bin,
         claude_profile,
+        legacy_demo_delivery,
     })
 }
 

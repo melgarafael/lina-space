@@ -77,6 +77,17 @@ impl Env {
     fn store_dir(&self) -> PathBuf {
         self.tmp.join(".lina").join("events")
     }
+
+    /// F1-0-4: o nó "terminou o turno" (Idle). Desde a entrega ciente de estado, TODA
+    /// entrega marca o alvo `Busy` (serialização P1) — sequências que entregam de novo ao
+    /// MESMO alvo simulam o fim do turno entre as entregas (como o lifecycle real faria
+    /// no fim-de-resposta). Sem isto a entrega seguinte é `Retained{target_busy}`.
+    fn turn_done(&self, name: &str) {
+        let node = self.sup.node_by_name(name).expect("nó no roster");
+        self.sup
+            .set_status(node, lina_core::NodeStatus::Idle)
+            .expect("set Idle");
+    }
 }
 
 /// Sobe um Espaço com o `preset` (workspace criado) e a config dada.
@@ -330,6 +341,9 @@ fn c_anti_loop_por_turno() {
         .iter()
         .enumerate()
     {
+        // F1-0-4: cada perna do ping-pong só acontece após o turno anterior terminar.
+        e.turn_done("@A");
+        e.turn_done("@B");
         let m = MailMessage::new(*from, *to, "ask", "ping");
         assert!(
             matches!(
@@ -341,6 +355,8 @@ fn c_anti_loop_por_turno() {
         );
     }
     // A repetição que cruza `MAX_CYCLE_REVISITS` fecha o ciclo apertado → LoopDetected.
+    e.turn_done("@A");
+    e.turn_done("@B"); // F1-0-4: o corte deve vir do ANTI-LOOP, não da retenção
     let over = MailMessage::new("@A", "@B", "ask", "ping demais");
     assert_eq!(
         e.router
@@ -424,6 +440,7 @@ fn d_teto_de_custo_pausa_e_reabre() {
     }
 
     // (2) Uso (150) ≥ teto (100): a próxima delegação é GATEADA (Paused), não entregue.
+    e.turn_done("@B"); // F1-0-4: o bloqueio abaixo deve vir do TETO, não da retenção
     let m2 = MailMessage::new("@A", "@B", "ask", "estoura");
     assert_eq!(
         e.router.route_message(&m2, &mut e.store, now, &mut deliver),
@@ -473,6 +490,7 @@ fn d_teto_de_custo_pausa_e_reabre() {
         !CostLedger::replay(&e.store, now).expect("ledger").paused,
         "após resume, o workspace não está mais Paused"
     );
+    e.turn_done("@B"); // F1-0-4: B terminou o turno de m1 — o que se testa é o pós-resume
     let m4 = MailMessage::new("@A", "@B", "ask", "depois do resume");
     assert!(matches!(
         e.router.route_message(&m4, &mut e.store, now, &mut deliver),
@@ -525,6 +543,7 @@ fn e_await_reply_autenticado() {
     );
 
     // (3) O target REAL (@B) responde para o waiter (@A) → fecha (AwaitClosed{replied} + libera).
+    e.turn_done("@A"); // F1-0-4: A terminou o turno da msg do intruso — testa o AWAIT, não a retenção
     let reply = MailMessage::new("@B", "@A", "ask", "resposta").replying_to(q.id.clone());
     assert!(matches!(
         e.router
@@ -588,10 +607,15 @@ fn f_blocks_logados_e_dedupe_ausente() {
             .iter()
             .enumerate()
         {
+            // F1-0-4: cada perna só após o turno anterior terminar (ping-pong real).
+            e.turn_done("@A");
+            e.turn_done("@B");
             let m = MailMessage::new(*from, *to, "ask", "ping");
             e.router
                 .route_message(&m, &mut e.store, 1 + i as u64, &mut deliver);
         }
+        e.turn_done("@A");
+        e.turn_done("@B"); // F1-0-4: o corte abaixo deve vir do anti-loop
         let over = MailMessage::new("@A", "@B", "ask", "ping demais");
         assert_eq!(
             e.router
@@ -691,6 +715,7 @@ fn f_blocks_logados_e_dedupe_ausente() {
         let m0 = MailMessage::new("@A", "@B", "ask", "inicia");
         e.router.route_message(&m0, &mut e.store, 1, &mut deliver);
         for i in 0..DELEGATION_BUDGET {
+            e.turn_done("@C"); // F1-0-4: C termina cada turno (testa o ORÇAMENTO)
             let m = MailMessage::new("@B", "@C", "ask", format!("d{i}"));
             assert!(matches!(
                 e.router
@@ -698,6 +723,7 @@ fn f_blocks_logados_e_dedupe_ausente() {
                 RouteOutcome::Delivered { .. }
             ));
         }
+        e.turn_done("@C"); // F1-0-4: o estouro deve vir do orçamento, não da retenção
         let over = MailMessage::new("@B", "@C", "ask", "demais");
         assert_eq!(
             e.router
@@ -851,6 +877,7 @@ fn b2_forja_de_hops_e_root_nao_compra_privilegio_de_origem() {
         // DELEGATION_BUDGET delegações @B→@C, cada uma FORJANDO root novo + hops=0 → todas entregam
         // (acumulam contra (R, @B) — o root do binding —, não contra o root forjado).
         for i in 0..DELEGATION_BUDGET {
+            e.turn_done("@C"); // F1-0-4: C termina cada turno (testa o ORÇAMENTO, não a retenção)
             let mut atq = MailMessage::new("@B", "@C", "ask", format!("forja{i}"));
             atq.hops = 0;
             atq.root_cause_id = Some(format!("forjado-fresco-{i}"));
@@ -864,6 +891,7 @@ fn b2_forja_de_hops_e_root_nao_compra_privilegio_de_origem() {
             );
         }
         // A (n+1)-ésima, AINDA forjando root fresco + hops=0, ESTOURA — o root REAL do binding acumulou.
+        e.turn_done("@C"); // F1-0-4: o estouro deve vir do ORÇAMENTO, não da retenção
         let mut over = MailMessage::new("@B", "@C", "ask", "estoura");
         over.hops = 0;
         over.root_cause_id = Some("forjado-fresco-final".to_string());

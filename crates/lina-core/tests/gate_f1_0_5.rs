@@ -310,6 +310,10 @@ fn c_compat_v1_handoff_sem_contract_roteia() {
         router.route_message(&v1, &mut store, now_ms(), &mut deliver),
         RouteOutcome::Delivered { .. }
     ));
+    // F1-0-4: desde a entrega ciente de estado, entregar marca o alvo Busy — o turno de
+    // @B "termina" antes da próxima entrega (como o lifecycle real faria no fim-de-resposta).
+    _sup.set_status(b, lina_core::NodeStatus::Idle)
+        .expect("B terminou o turno");
 
     // JSON @1 congelado (forma da era W3-7 — sem `contract`, com `ref`).
     let frozen = r#"{
@@ -364,11 +368,15 @@ fn d_upcasting_log_v1_replaya_sem_erro_e_fingerprint_estavel() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let mut deliver = recording_deliver(captured);
         // Tráfego @1 real: ask entregue + handoff entregue + um bloqueio (alvo fantasma).
+        // F1-0-4: entre entregas ao MESMO alvo, o turno termina (Idle) — senão a 2ª é Retained.
+        let b = sup.node_by_name("@B").expect("@B registrado");
         for msg in [
             MailMessage::new("@A", "@B", "ask", "oi"),
             MailMessage::new("@A", "@B", "handoff", "tarefa @1"),
             MailMessage::new("@A", "@Ghost", "ask", "ninguém"),
         ] {
+            sup.set_status(b, lina_core::NodeStatus::Idle)
+                .expect("B livre p/ o próximo turno");
             let _ = router.route_message(&msg, &mut store, now_ms(), &mut deliver);
         }
         store.project().expect("project vivo").fingerprint()

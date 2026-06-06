@@ -135,4 +135,37 @@ alvo Maestro: 20 entregas
 
 ---
 
-PRONTO desta story (resumo na resposta ao Maestro). Artefatos versionados: `tools/lina_watch.py`, `crates/lina-core/src/bin/baseline_f1_0.rs` (+ 6 testes), este `baseline-f1-0.md`. Dados crus da corrida: `<ws>/baseline-artifacts/` (não versionados; em `/tmp`).
+## DEPOIS — F1-0-4 (entrega ciente de estado / retenção) — atropelamento P1 ZERADO
+
+> Corrida do **mesmo roteiro** de colisão (5 claudes reais, 5 rodadas, fan-out simultâneo ao Maestro) com a **retenção por estado ativa** (F1-0-4) sobre o stack de produção atual (F1-0-2: `claude-code.toml` real — `submit_delay_ms=400`, `idle_ms=1500`). Workspace isolado `/tmp/lina-depois-f1-0-4`. **Data:** 2026-06-06.
+
+| Métrica P1 (atropelamento) | ANTES (baseline) | DEPOIS (F1-0-4) |
+|---|---|---|
+| Pares consecutivos ao mesmo alvo **<2s** | **15/15** | **0/15** |
+| Δ **mínimo** entre entregas (mesma rodada) | 155 ms | **3194 ms** |
+| Δ **mediano** | 160 ms | **9634 ms** |
+| Entregas totais ao Maestro | 20 | 20 (nenhuma perdida) |
+
+**A serialização é da RETENÇÃO, não de claudes lentos** (prova no log `/tmp/lina-depois-f1-0-4/.lina/events/log.jsonl`):
+- **19 `MessageRetained{reason:target_busy}`** — quase toda mensagem que chegou com o Maestro ocupado foi retida (não injetada) em vez de atropelar.
+- **18 `NodeStatusChanged{reason:a2a_delivery}`** — cada entrega marcou o alvo `Busy` (o que serializa a próxima); as que acharam o alvo já Busy são no-op (por isso 18, não 20).
+- **20 `MessageDelivered`** — todas entregues exatamente 1× (0 perda, 0 duplicata), agora espaçadas pelo ciclo real de cada turno (Busy→Idle).
+
+**Trecho do log (rodada 1, retornos ao Maestro — comparar com a tabela do ANTES, onde os 4 chegavam em ~784 ms):**
+
+| seq | ts (ms) | remetente | Δ vs anterior |
+|---:|---:|:--|---:|
+| 18 | 1780771834793 | W1 | — |
+| 25 | 1780771837987 | W2 | **3194 ms** |
+| 29 | 1780771853893 | W3 | **15906 ms** |
+| 33 | 1780771861748 | W4 | **7855 ms** |
+
+Reproduzir: `cargo run --release -p lina-core --bin baseline_f1_0 -- --ws <novo-dir> --claudes 5 --scenario collision --rounds 5` (DEPOIS, produção atual) · adicione `--legacy-demo-delivery` para reproduzir o caminho de entrega do ANTES.
+
+> **Ressalva honesta da comparação:** o DEPOIS roda com DUAS mudanças concomitantes vs o ANTES — o perfil de entrega real (F1-0-2) **e** a retenção (F1-0-4). A serialização (Δ >> 2s, 19 retenções) é atribuível **à retenção** — o perfil de entrega não serializa nada, só calibra o submit; o `RouteOutcome::Retained` + os `MessageRetained` no log isolam a causa. O P0 (texto-colado) DEPOIS é mérito do F1-0-2 (dono separado) e não foi re-medido aqui (esta rodada cobriu só o cenário de colisão / P1, que é o escopo da F1-0-4).
+
+Cobertura headless (determinística, no crate — `cargo test -p lina-core`): `retencao_alvo_busy_nao_injeta_e_entrega_no_idle` (critério 1), `retencao_serializa_rajada_ao_mesmo_alvo` (critério 2), `retencao_estoura_teto_e_entrega_mesmo_busy` (critério 4 anti-deadlock), `retencao_via_pump_sobrevive_restart_fifo_exactly_once` (inv #4 + FIFO), `reply_retida_fecha_await_so_na_entrega` (reply retida ≠ loop).
+
+---
+
+PRONTO desta story (resumo na resposta ao Maestro). Artefatos versionados: `tools/lina_watch.py`, `crates/lina-core/src/bin/baseline_f1_0.rs` (+ testes), este `baseline-f1-0.md`. Dados crus das corridas: `<ws>/baseline-artifacts/` (não versionados; em `/tmp`).
