@@ -19,6 +19,9 @@ tokio = { version = "1", features = ["sync"] }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# F1-0-3 (ADR 0019 §1): tail_hash do heartbeat = SHA-256 dos últimos ~80 chars do tail do PTY.
+# Mesma versão já vendorizada na árvore (lina-webhooks) — zero churn de lockfile.
+sha2 = "0.10"
 regex = "1.12.3"
 # W5-1: amostragem cross-platform de RSS do processo no benchmark de carga (bin bench_load).
 sysinfo = "0.33"

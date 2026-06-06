@@ -73,6 +73,13 @@ pub struct RouterConfig {
     /// janela contábil atingir este valor, o workspace entra em `Paused` (gate humano via `lina
     /// resume`, não kill — invariante #6).
     pub token_budget_day: u64,
+    /// F1-0-3 (ADR 0019 §1): cadência de amostragem do heartbeat de progresso, em ms (2 min).
+    pub heartbeat_sample_ms: u64,
+    /// F1-0-3 (ADR 0019 §3): amostras consecutivas sem progresso em `Busy` → WARN `NodeStalled`.
+    pub stall_warn_samples: u32,
+    /// F1-0-3 (ADR 0019 §3): amostras até o circuit breaker (pausa-com-gate; a AÇÃO é F1-0-7 —
+    /// compare com `LifecycleEngine::stall_samples`).
+    pub stall_breaker_samples: u32,
 }
 
 impl Default for RouterConfig {
@@ -85,6 +92,9 @@ impl Default for RouterConfig {
             autonomy: AutonomyLevel::Assisted,
             await_timeout_ms: AWAIT_TIMEOUT_MS,
             token_budget_day: 0, // desligado por padrão (opt-in por workspace)
+            heartbeat_sample_ms: crate::lifecycle::HEARTBEAT_SAMPLE_MS,
+            stall_warn_samples: crate::lifecycle::STALL_WARN_SAMPLES,
+            stall_breaker_samples: crate::lifecycle::STALL_BREAKER_SAMPLES,
         }
     }
 }

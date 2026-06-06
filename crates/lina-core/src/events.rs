@@ -122,6 +122,15 @@ pub enum DomainEvent {
     NodeStatusChanged {
         node: NodeId,
         status: String,
+        /// F1-0-3 (ADR 0019): estado de ORIGEM da transição (`status` é o destino). Campo
+        /// ADITIVO via `serde(default)` — logs antigos (shape `{node,status}`) replayam com
+        /// `""`, sem upcast (ADR 0001 §2). Produzido pelo `lifecycle::LifecycleEngine`.
+        #[serde(default)]
+        from: String,
+        /// F1-0-3: o SINAL que causou a transição (`pty_output`/`end_of_response`/`pty_exit`/
+        /// `custody_gate`/…, consts em `lifecycle::reason`). Aditivo via `serde(default)`.
+        #[serde(default)]
+        reason: String,
     },
     NodeRemoved {
         node: NodeId,
@@ -318,6 +327,26 @@ pub enum DomainEvent {
     SnapshotTaken {
         seq: u64,
     },
+    /// F1-0-3 (ADR 0019 §3): nó `Busy` acumulou `stall_warn_samples` amostras consecutivas SEM
+    /// progresso (tail_hash estagnado E zero evento de domínio atribuível) → WARN. Emitido **uma
+    /// única vez, na transição para stalled** (anti-amplificação, ADR 0003/0005) pelo
+    /// `lifecycle::LifecycleEngine`; re-arma se houver progresso e novo stall. As amostras cruas
+    /// do heartbeat são EFÊMERAS (alto volume/baixo sinal) — só o veredito entra no log.
+    /// `cycle_count` = contagem de advances-com-output no instante do veredito (diagnóstico).
+    NodeStalled {
+        node: NodeId,
+        cycle_count: u64,
+    },
+    /// F1-1-1 (coordenado via Maestro; consumidor: Dev 02): um CLI de IA foi DETECTADO num
+    /// terminal — conversão campo-a-campo de `lina_cli_profiles::CliDetection`. A emissão no
+    /// supervisor é fiação posterior (esta rodada só reserva o contrato no log). META — sem
+    /// efeito na projeção do canvas; `node_id` é `String` espelhando o shape de origem.
+    CliDetected {
+        node_id: String,
+        cli: String,
+        confidence: f32,
+        evidence: String,
+    },
 }
 
 impl DomainEvent {
@@ -362,6 +391,8 @@ impl DomainEvent {
             DomainEvent::WebhookConfigured { .. } => "WebhookConfigured",
             DomainEvent::WebhookReceived { .. } => "WebhookReceived",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
+            DomainEvent::NodeStalled { .. } => "NodeStalled",
+            DomainEvent::CliDetected { .. } => "CliDetected",
         }
     }
 
@@ -430,6 +461,11 @@ pub struct ProjectedNode {
     pub x: f64,
     pub y: f64,
     pub cli: Option<String>,
+    /// F1-0-3: WARN de travamento (`NodeStalled`) consultável; limpo na PRÓXIMA transição de
+    /// status do nó (conservador — recuperação sem mudança de estado mantém o WARN até o estado
+    /// confirmar saúde). `serde(default)` → snapshots antigos desserializam com `false`.
+    #[serde(default)]
+    pub stalled: bool,
 }
 
 /// Estado projetado do domínio. `BTreeMap` garante ordem estável → fingerprint estável.
@@ -494,6 +530,7 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
                     x: *x,
                     y: *y,
                     cli: None,
+                    stalled: false,
                 },
             );
         }
@@ -513,9 +550,19 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
                 n.role = Some(role.clone());
             }
         }
-        DomainEvent::NodeStatusChanged { node, status } => {
+        DomainEvent::NodeStatusChanged { node, status, .. } => {
             if let Some(n) = state.nodes.get_mut(node) {
                 n.status = Some(status.clone());
+                // F1-0-3: qualquer transição de status limpa o WARN de stall — o estado
+                // novo é a confirmação de saúde (ADR 0019; ver doc de `ProjectedNode.stalled`).
+                n.stalled = false;
+            }
+        }
+        // F1-0-3: WARN de travamento — liga o flag consultável; NÃO muda o status (o stall é
+        // um veredito sobre um nó que SEGUE Busy, não um estado da máquina).
+        DomainEvent::NodeStalled { node, .. } => {
+            if let Some(n) = state.nodes.get_mut(node) {
+                n.stalled = true;
             }
         }
         DomainEvent::NodeRemoved { node } => {
@@ -584,6 +631,9 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // reconstrói suas ligações varrendo o log — sem efeito na projeção do canvas (padrão CostLedger).
         | DomainEvent::WebhookConfigured { .. }
         | DomainEvent::WebhookReceived { .. }
+        // F1-1-1: detecção de CLI é META (livro-razão da descoberta); o consumidor (F1-1)
+        // reconstrói o que precisar varrendo o log — sem efeito na projeção do canvas.
+        | DomainEvent::CliDetected { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
@@ -1563,6 +1613,153 @@ mod tests {
         assert_eq!(
             jsonl_seqs, expected_seqs,
             "o JSONL deve espelhar exatamente os mesmos seqs únicos/contíguos do SQLite"
+        );
+    }
+
+    // ─────────────────────────── F1-0-3 · lifecycle no log ───────────────────────────
+
+    /// F1-0-3: payload ANTIGO de `NodeStatusChanged` (só `node`+`status`, sem os campos
+    /// aditivos `from`/`reason`) replaya com defaults vazios — compat por `serde(default)`,
+    /// sem upcast (ADR 0001 §2: campo novo em variante existente, nunca evento paralelo).
+    #[test]
+    #[serial]
+    fn node_status_changed_old_payload_replays_with_defaults() {
+        let tmp = TempDir::new("nsc-compat");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let node = Uuid::now_v7();
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+            })
+            .expect("add");
+        // Shape antigo, gravado CRU — como um log pré-F1 teria persistido (o enum é
+        // internamente tagged por `event`, então o tag faz parte do payload no disco).
+        store
+            .insert_raw(
+                "NodeStatusChanged",
+                1,
+                serde_json::json!({ "event": "NodeStatusChanged", "node": node, "status": "Busy" }),
+            )
+            .expect("raw antigo");
+        let state = store.project().expect("project");
+        assert_eq!(
+            state.nodes.get(&node).expect("nó").status.as_deref(),
+            Some("Busy"),
+            "payload antigo deve replayar (from/reason = default)"
+        );
+
+        // E a forma CORRENTE (com from/reason) faz round-trip e projeta normalmente.
+        store
+            .append(&DomainEvent::NodeStatusChanged {
+                node,
+                status: "Idle".into(),
+                from: "Busy".into(),
+                reason: "end_of_response".into(),
+            })
+            .expect("append forma nova");
+        let state2 = store.project().expect("project 2");
+        assert_eq!(
+            state2.nodes.get(&node).expect("nó").status.as_deref(),
+            Some("Idle")
+        );
+    }
+
+    /// F1-0-3: `NodeStalled` liga o flag `stalled` na projeção (consultável pelo
+    /// `lina check`/fila de atenção) e a PRÓXIMA transição de status do nó o limpa —
+    /// o WARN persiste até o estado mudar (conservador, ADR 0019 §3).
+    #[test]
+    #[serial]
+    fn node_stalled_projects_flag_and_next_transition_clears() {
+        let tmp = TempDir::new("stall-proj");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let node = Uuid::now_v7();
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+            })
+            .expect("add");
+        store
+            .append(&DomainEvent::NodeStatusChanged {
+                node,
+                status: "Busy".into(),
+                from: "Ready".into(),
+                reason: "pty_output".into(),
+            })
+            .expect("busy");
+        store
+            .append(&DomainEvent::NodeStalled {
+                node,
+                cycle_count: 42,
+            })
+            .expect("stalled");
+
+        let state = store.project().expect("project");
+        let n = state.nodes.get(&node).expect("nó");
+        assert!(n.stalled, "NodeStalled deve ligar o flag na projeção");
+        assert_eq!(n.status.as_deref(), Some("Busy"), "stall NÃO muda o status");
+
+        store
+            .append(&DomainEvent::NodeStatusChanged {
+                node,
+                status: "Idle".into(),
+                from: "Busy".into(),
+                reason: "end_of_response".into(),
+            })
+            .expect("idle");
+        let state2 = store.project().expect("project 2");
+        let n2 = state2.nodes.get(&node).expect("nó");
+        assert!(!n2.stalled, "transição de status limpa o flag stalled");
+        assert_eq!(n2.status.as_deref(), Some("Idle"));
+    }
+
+    /// F1-1-1 (coordenação via Maestro, Dev 02): `CliDetected` persiste e replaya; é META
+    /// para a projeção do canvas (a emissão real no supervisor é fiação posterior).
+    #[test]
+    #[serial]
+    fn cli_detected_round_trips_and_is_meta_for_projection() {
+        let tmp = TempDir::new("cli-detected");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let node = Uuid::now_v7();
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 1.0,
+                y: 2.0,
+            })
+            .expect("add");
+        let before = store.project().expect("project 1");
+
+        store
+            .append(&DomainEvent::CliDetected {
+                node_id: node.to_string(),
+                cli: "claude".into(),
+                confidence: 0.95,
+                evidence: "claude --version → 1.2.3".into(),
+            })
+            .expect("append CliDetected");
+
+        let rec = store
+            .events()
+            .expect("events")
+            .pop()
+            .expect("último registro");
+        assert_eq!(rec.kind, "CliDetected");
+        assert_eq!(rec.payload["cli"], "claude");
+        assert_eq!(rec.payload["node_id"], node.to_string());
+
+        // Replay segue íntegro e a projeção do nó fica INTOCADA (evento meta).
+        let after = store.project().expect("project 2");
+        assert_eq!(
+            before.nodes.get(&node),
+            after.nodes.get(&node),
+            "CliDetected é meta — não muda a projeção do nó"
         );
     }
 }

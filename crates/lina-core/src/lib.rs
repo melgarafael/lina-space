@@ -81,6 +81,10 @@ pub use broker::{
     CLASS_GATED_HARD_EXTERNAL, CUSTODY_ACTIONS,
 };
 
+// F1-0-3: state-machine de lifecycle + heartbeat com progresso (ADR 0019).
+pub mod lifecycle;
+pub use lifecycle::{LifecycleEngine, LifecycleError, SampleOutcome};
+
 pub mod bench;
 
 /// W5-2: scrollback com cap por painel + paginação em disco (SQLite WAL) — janela viva em RAM,
@@ -688,10 +692,19 @@ fn flush(
 // Tecnica]] §3 e [[47 - R2 LLM Engineer]] §1.
 
 /// Estado de um nó no roster (presença = `status != Dead`).
+///
+/// F1-0-3: os estados CANÔNICOS da state-machine de lifecycle (ADR 0019) são
+/// `Ready/Busy/Idle/Blocked/Dead`; `Starting`/`Running` permanecem como estados legados de
+/// boot/genérico (Fase 0) — a doutrina de transição vive em [`lifecycle::LifecycleEngine`].
+/// ⚠️ Fiação pendente COORDENADA VIA MAESTRO: `app/lina-gpui/src/bridge.rs` mapeia este enum
+/// exaustivamente (linha ~1155) e precisa do arm `CoreStatus::Ready => …` (sugestão: tratar
+/// como `Idle` na UI até F1-1-5 exibir estados ricos).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
     Starting,
     Running,
+    /// F1-0-3: spawn concluído, pronto para receber trabalho, antes do 1º output.
+    Ready,
     Idle,
     Busy,
     Blocked,
@@ -709,8 +722,22 @@ impl NodeStatus {
     pub fn is_available(self) -> bool {
         matches!(
             self,
-            NodeStatus::Idle | NodeStatus::Running | NodeStatus::Starting
+            NodeStatus::Idle | NodeStatus::Running | NodeStatus::Starting | NodeStatus::Ready
         )
+    }
+    /// F1-0-3: nome CANÔNICO persistido no log (`NodeStatusChanged.status/.from`) e lido pela
+    /// projeção — estável por contrato (mudar uma string quebra replay de logs existentes).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeStatus::Starting => "Starting",
+            NodeStatus::Running => "Running",
+            NodeStatus::Ready => "Ready",
+            NodeStatus::Idle => "Idle",
+            NodeStatus::Busy => "Busy",
+            NodeStatus::Blocked => "Blocked",
+            NodeStatus::Dead => "Dead",
+        }
     }
 }
 
