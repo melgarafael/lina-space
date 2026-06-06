@@ -15,14 +15,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 // W3-2: motor de bootstrap turno-0 (gera o `<workspace>/CLAUDE.md` por terminal).
 use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 // W4-2 (M2): deriva o papel do agente pelo nome ("Revisor" -> reviewer).
-use lina_role_discovery::RoleRegistry;
 
 use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
@@ -1485,42 +1484,24 @@ pub fn scrub_pty_secret_env() -> Vec<&'static str> {
 /// passam um comando leve (`cat`) p/ serem determinísticos e headless.
 pub type CmdFactory = Arc<dyn Fn(&str) -> PtyCommand + Send + Sync>;
 
-/// Registry de papéis (W3-1), construído UMA vez (regexes compiladas) e cacheado. `None` se o YAML
-/// embutido falhar (não deve ocorrer) → o caller cai num papel genérico, nunca panica.
-///
-/// **W4-2:** aplica um OVERLAY app-side adicionando o papel `reviewer` (o `default-roles.yaml` da crate
-/// role-discovery não o tem) — assim "Revisor" deriva `reviewer` (critério de aceite) SEM tocar aquela
-/// crate. Falha de overlay é best-effort (segue com o default).
-fn role_registry() -> Option<&'static RoleRegistry> {
-    /// Papéis que o registry default (lina-role-discovery) não cobre, mas o canvas T4 precisa.
-    const APP_ROLE_OVERLAY: &str = "\
-roles:
-  - role: reviewer
-    patterns: [revisor, reviewer, review, revisao]
-    skills: [pr-review-toolkit:review-pr]
-";
-    static REG: OnceLock<Option<RoleRegistry>> = OnceLock::new();
-    REG.get_or_init(|| {
-        let mut reg = RoleRegistry::with_defaults()
-            .map_err(|e| {
-                eprintln!("lina-gpui: role-registry default inválido ({e}); papel genérico")
-            })
-            .ok()?;
-        if let Err(e) = reg.overlay_yaml_str(APP_ROLE_OVERLAY, "<app-role-overlay>") {
-            eprintln!(
-                "lina-gpui: overlay de papel 'reviewer' falhou ({e}); seguindo com o default"
-            );
-        }
-        Some(reg)
-    })
-    .as_ref()
+/// **F1-2-2 (M6)** — o MOTOR escolhido no modal: comando vindo do CLI Profile TOML (quando o
+/// profile existe) ou do binário descoberto (W4-1). `label` é o rótulo LEIGO ("Claude Code") que
+/// vai p/ `TerminalSpawned.cli`; nada disso atravessa para o core (inv. #7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEngine {
+    pub program: String,
+    pub args: Vec<String>,
+    pub profile_id: Option<String>,
+    pub label: String,
 }
 
 /// **W4-2 (M2) — deriva o PAPEL canônico pelo nome do agente** ("Revisor" → `reviewer`, "@Dev" →
 /// backend, …) via role-discovery (W3-1). Determinístico e infalível: nome desconhecido cai no
-/// fallback do registry; registry indisponível → `"generalist"`.
+/// fallback do registry; registry indisponível → `"generalist"`. O registry (com o overlay
+/// `reviewer`) é o MESMO do co-piloto (F1-2-2: fonte única em `role_suggester::role_registry` —
+/// sugestão na tela e papel gravado no log nunca divergem).
 fn infer_agent_role(name: &str) -> String {
-    match role_registry() {
+    match crate::role_suggester::role_registry() {
         Some(reg) => reg.infer_role(name).role,
         None => "generalist".to_string(),
     }
@@ -2060,6 +2041,52 @@ impl NodeManager {
         Ok(())
     }
 
+    /// **F1-2-2 (M6-E)** — atribui/troca o PAPEL de um nó vivo: persiste `NodeRoleAssigned` (a
+    /// projeção/`lina list --json` refletem) e reescreve os `CLAUDE.md` (roster). A **re-injeção
+    /// da doutrina pela fila serial do nó** (com confirmação + freio W4-3) é a F1-2-4 — este
+    /// método NÃO injeta nada no PTY vivo (nunca silencioso).
+    pub fn assign_role(&self, node: NodeId, role: &str) -> Result<(), String> {
+        let role = role.trim();
+        if role.is_empty() || role.chars().any(char::is_control) {
+            return Err(format!("papel inválido: {role:?}"));
+        }
+        let count = {
+            let mut s = lock(&self.store);
+            s.append(&DomainEvent::NodeRoleAssigned {
+                node,
+                role: role.to_string(),
+            })
+            .map_err(|e| e.to_string())?;
+            s.event_count().ok()
+        };
+        {
+            let mut m = lock(&self.model);
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+        self.rewrite_bootstrap();
+        Ok(())
+    }
+
+    /// O `.lina/` do Espaço vivo (F1-2-2: os CLI Profiles do usuário moram em `<aqui>/profiles`).
+    #[must_use]
+    pub fn lina_home(&self) -> &std::path::Path {
+        &self.lina_dir
+    }
+
+    /// **F1-2-2 (M6-E)** — o papel CANÔNICO corrente de um nó, lido da PROJEÇÃO do log (o
+    /// `NodeView` de UI não carrega role/cli — projection-only, lição do W4-2). Replay sob
+    /// demanda: chamado só ao ABRIR o modal de edição, nunca por frame.
+    #[must_use]
+    pub fn node_role(&self, node: NodeId) -> Option<String> {
+        lock(&self.store)
+            .project()
+            .ok()
+            .and_then(|st| st.nodes.get(&node).and_then(|n| n.role.clone()))
+    }
+
     /// Nº de nós vivos (projeção).
     #[must_use]
     pub fn count(&self) -> usize {
@@ -2177,12 +2204,29 @@ impl NodeManager {
         Ok(node)
     }
 
-    /// **W4-2 · M2 "Novo Agente" — cria um agente PELO NOME.** Deriva o PAPEL do nome (role-discovery
-    /// W3-1: "Revisor" → `reviewer`), spawna um terminal com CLI REAL **com `VIBE_ROLE` no env**, e
-    /// **grava o papel** no roster (Supervisor) + no log (`NodeRoleAssigned`) → visível em
-    /// `lina list --json` e no Inspetor (P4). Mesma disciplina do [`Self::add_node`]: persiste ANTES de
-    /// projetar; se a persistência falhar, desfaz o PTY (`retire_pty`). Devolve o `NodeId` (p/ focar).
-    pub fn create_agent(&self, name: &str) -> Result<NodeId, String> {
+    /// **W4-2 · M2 → F1-2-2 · M6 "Novo Agente" — cria um agente PELO NOME.** Deriva o PAPEL do nome
+    /// (role-discovery W3-1: "Revisor" → `reviewer`) salvo `role_override`, spawna um terminal com CLI
+    /// REAL **com `VIBE_ROLE` no env**, e **grava o papel** no roster (Supervisor) + no log
+    /// (`NodeRoleAssigned`) → visível em `lina list --json` e no Inspetor (P4). Mesma disciplina do
+    /// [`Self::add_node`]: persiste ANTES de projetar; falhou a persistência → desfaz o PTY
+    /// (`retire_pty`). Devolve o `NodeId` (p/ focar).
+    /// **F1-2-2 (M6)** — cria um agente com o MOTOR escolhido no modal e a
+    /// pasta de trabalho do usuário:
+    /// - `engine: Some` → spawna `program + args` do CLI Profile/descoberta (em vez do
+    ///   `cmd_factory` default) e, havendo `profile_id`, grava **`CliProfileSet`** no log
+    ///   (projeção `ProjectedNode.cli`). `TerminalSpawned.cli` recebe o RÓTULO do motor.
+    /// - `cwd: Some` → o terminal nasce na pasta escolhida (picker do M6). O `CLAUDE.md` do
+    ///   bootstrap **não** é escrito em pasta do usuário (só nos cwds gerenciados) — o turno-0
+    ///   doutrinado em pasta própria do usuário é assunto da F1-2-4/W3-2, não silencioso aqui.
+    /// - `role_override: Some` → o usuário ESCOLHEU o papel no modal ([Trocar]/galeria) — vale
+    ///   sobre o inferido pelo nome (a sugestão aceita coincide com o inferido; a troca não).
+    pub fn create_agent_with(
+        &self,
+        name: &str,
+        engine: Option<&AgentEngine>,
+        cwd: Option<&std::path::Path>,
+        role_override: Option<&str>,
+    ) -> Result<NodeId, String> {
         let name = name.trim();
         if name.is_empty()
             || name.chars().any(char::is_control)
@@ -2191,7 +2235,10 @@ impl NodeManager {
         {
             return Err(format!("nome de agente inválido: {name:?}"));
         }
-        let role = infer_agent_role(name);
+        let role = match role_override.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => r.to_string(),
+            None => infer_agent_role(name),
+        };
 
         let seq = {
             let mut s = lock(&self.seq);
@@ -2201,8 +2248,25 @@ impl NodeManager {
         };
         let key = format!("t{seq}");
         // CLI real + cwd próprio (CLAUDE.md) + **VIBE_ROLE no env do PTY** (o agente sabe seu papel).
-        let mut cmd = (*self.cmd_factory)(name).env("VIBE_ROLE", &role);
-        if let Some(dir) = self.ensure_cwd(&key) {
+        // Motor escolhido (M6) constrói o comando do profile/descoberta; sem motor, fábrica default.
+        let mut cmd = match engine {
+            Some(e) => {
+                let mut c = PtyCommand::new(&e.program);
+                for a in &e.args {
+                    c = c.arg(a);
+                }
+                c
+            }
+            None => (*self.cmd_factory)(name),
+        }
+        .env("VIBE_ROLE", &role);
+        if let Some(dir) = cwd {
+            // Pasta escolhida pelo usuário (M6): best-effort de existência; SEM CLAUDE.md aqui.
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return Err(format!("não consigo trabalhar nessa pasta: {e}"));
+            }
+            cmd = cmd.cwd(dir.to_path_buf());
+        } else if let Some(dir) = self.ensure_cwd(&key) {
             cmd = cmd.cwd(dir);
             if let Some(bw) = &self.bootstrap {
                 let mut roster: Vec<String> = self
@@ -2246,7 +2310,8 @@ impl NodeManager {
             }
             if let Err(e) = s.append(&DomainEvent::TerminalSpawned {
                 node,
-                cli: name.to_string(),
+                // Rótulo do MOTOR quando escolhido no M6 ("Claude Code"); senão o nome (M2, legado).
+                cli: engine.map_or_else(|| name.to_string(), |e| e.label.clone()),
             }) {
                 drop(s);
                 self.retire_pty(node, key);
@@ -2260,6 +2325,18 @@ impl NodeManager {
                 drop(s);
                 self.retire_pty(node, key);
                 return Err(e.to_string());
+            }
+            // F1-2-2: motor com CLI Profile → `CliProfileSet` (projeção `ProjectedNode.cli`;
+            // o Inspetor P4 e o `lina list --json` enxergam o profile do nó).
+            if let Some(pid) = engine.and_then(|e| e.profile_id.as_deref()) {
+                if let Err(e) = s.append(&DomainEvent::CliProfileSet {
+                    node,
+                    profile: pid.to_string(),
+                }) {
+                    drop(s);
+                    self.retire_pty(node, key);
+                    return Err(e.to_string());
+                }
             }
             s.event_count().ok()
         };
@@ -3125,6 +3202,12 @@ mod tests {
         }
         let mut bridge = GpuiBridgeHost::new(Arc::clone(&model));
 
+        // F1-0-2 (costura coordenada): a entrega agora EXIGE prontidão real — timeout não
+        // injeta mais, e a região de input de um grid VAZIO não casa o regex. O alvo é `cat`
+        // (nunca imprime prompt) → semeia uma linha-prompt viva no grid de B, como um CLI real
+        // mostraria (a detecção de prontidão em si é testada no core — gate F1-0-2).
+        lock(&grid_b).advance(b"\r\n> ");
+
         // A2A A→B: route (publica Message) + deliver_a2a (injeta) + persist.
         let env = A2aEnvelope::new(node_a, Recipient::Node(node_b), Some("a2a".into()));
         let id = env.id.clone();
@@ -3228,6 +3311,10 @@ mod tests {
         let _ = sup.set_status(node_b, CoreStatus::Running);
 
         let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        // F1-0-2 (costura coordenada): timeout de prontidão NÃO injeta mais; `cat` nunca
+        // imprime prompt → semeia a linha-prompt viva nos grids (a prontidão real é do core).
+        lock(&grid_a).advance(b"\r\n> ");
+        lock(&grid_b).advance(b"\r\n> ");
         lock(&grids).insert(node_a, grid_a);
         lock(&grids).insert(node_b, grid_b);
 
@@ -3599,7 +3686,9 @@ mod tests {
         let (nm, store, model) = test_manager("m2", None);
         assert_eq!(lock(&model).order.len(), 2, "começa com 2 nós");
 
-        let id = nm.create_agent("Revisor").expect("M2 cria o agente");
+        let id = nm
+            .create_agent_with("Revisor", None, None, None)
+            .expect("M2/M6 cria o agente");
         assert_eq!(lock(&model).order.len(), 3, "o agente entra no canvas");
         assert!(
             lock(&model)
@@ -3625,9 +3714,12 @@ mod tests {
         );
 
         // Nome inválido → recusado, canvas inalterado.
-        assert!(nm.create_agent("  ").is_err(), "nome vazio recusado");
         assert!(
-            nm.create_agent("a{{b}}").is_err(),
+            nm.create_agent_with("  ", None, None, None).is_err(),
+            "nome vazio recusado"
+        );
+        assert!(
+            nm.create_agent_with("a{{b}}", None, None, None).is_err(),
             "nome com sentinela recusado"
         );
         assert_eq!(lock(&model).order.len(), 3, "recusas não criam nó");

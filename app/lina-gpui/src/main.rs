@@ -35,6 +35,10 @@ mod creators;
 // F1-2-1: design system tokenizado (dark/light + 8 acentos curados) — a FONTE ÚNICA de cor do shell.
 // Todo pixel pintado lê `theme::active()`; o gate WCAG + o lint anti-cor-hardcoded moram lá. gpui-free.
 mod theme;
+// F1-2-2/F1-2-3: contrato de fronteira do co-piloto de papel (nome → sugestão + porquê). gpui-free.
+mod role_suggester;
+// F1-2-2 (M6/M6-E): modal de criar/editar Agente — evolui o M2. Modelo gpui-free + render fina.
+mod agent_modal;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -45,8 +49,9 @@ use std::time::{Duration, Instant};
 use gpui::{
     div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, ClipboardItem, Context,
     Entity, FocusHandle, FontWeight, InputHandler, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, Rgba, Role, ScrollDelta,
-    ScrollWheelEvent, TitlebarOptions, UTF16Selection, Window, WindowBounds, WindowOptions,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render, Rgba,
+    Role, ScrollDelta, ScrollWheelEvent, TitlebarOptions, UTF16Selection, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_platform::application;
 
@@ -422,9 +427,12 @@ struct WorkspaceView {
     /// W3-6c: mesa de custódia compartilhada com a [`BrokerPump`]. O banner do gate humano é lido
     /// daqui; ⌘⏎ sinaliza a confirmação (tecla na janela = gate inforjável pelo PTY do agente).
     desk: Desk,
-    /// W4-2 · M2 "Novo Agente": `Some(buffer)` enquanto o humano DIGITA o nome do agente novo (modo
-    /// nomeação). Enter cria (papel derivado do nome), Esc cancela. `None` = fora do modo nomeação.
-    naming: Option<String>,
+    /// F1-2-2 · M6/M6-E: o modal de criar/editar Agente (evoluiu o modo-nomeação M2 da Fase 0).
+    /// `Some` = aberto (teclado vai pro modal; eventos SÓ no Criar/Salvar).
+    agent_modal: Option<agent_modal::AgentModal>,
+    /// F1-2-2: resultado da varredura de motores (descoberta W4-1 roda FORA da thread de UI e
+    /// deposita aqui; o loop do modal o consome — lição: discovery off-thread + injetável).
+    modal_scan: Option<Arc<Mutex<Option<Vec<agent_modal::Engine>>>>>,
     /// W4-3: FREIO da auto-orquestração, compartilhado com a [`MailboxPump`]. A UI lê `paused` p/ o
     /// rótulo do rodapé e sinaliza `toggle_requested` ao clicar.
     brake: wiring::Brake,
@@ -514,7 +522,8 @@ impl WorkspaceView {
             dragging_sel: false,
             report_node: None,
             desk,
-            naming: None,
+            agent_modal: None,
+            modal_scan: None,
             brake,
             // W4-6 gap3: este campo é o OVERRIDE do usuário (rodapé); o SO/env entra via
             // `a11y::reduce_motion_effective` (fonte única) no pulso/rótulo. Começa sem override.
@@ -581,16 +590,29 @@ impl WorkspaceView {
                 format!("🎯 Focar: {}", nv.name),
                 A::FocusNode(id),
             ));
+            // F1-2-2 (M6-E): editar um Agente vivo pela paleta (entry point do fluxo (a)).
+            if matches!(nv.kind, NodeKind::Terminal) {
+                cmds.push(Command::new(
+                    format!("✏️ Editar Agente: {}", nv.name),
+                    A::EditAgent(id),
+                ));
+            }
         }
         cmds
     }
 
-    /// W4-2 · M1: executa a ação escolhida na paleta (toca o estado do canvas — `naming`/`focus`/`brake`
+    /// W4-2 · M1: executa a ação escolhida na paleta (abre o modal M6, foca, alterna o freio,
     /// ou abre o modo CRIAÇÃO de nota/pasta — M3/M4).
-    fn run_palette_action(&mut self, action: palette::PaletteAction, window: &Window) {
+    fn run_palette_action(
+        &mut self,
+        action: palette::PaletteAction,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         use palette::PaletteAction as A;
         match action {
-            A::NewAgent => self.naming = Some(String::new()), // reusa o modo nomeação do M2
+            A::NewAgent => self.open_agent_modal_create(cx),
+            A::EditAgent(node) => self.open_agent_modal_edit(node, cx),
             A::FocusNode(node) => {
                 self.focus(node);
                 self.reveal(node, window);
@@ -600,6 +622,250 @@ impl WorkspaceView {
             A::NewNote => self.creating = Some((creators::CreatorKind::Note, String::new())),
             A::NewFolder => self.creating = Some((creators::CreatorKind::Folder, String::new())),
         }
+    }
+
+    // ───────────────────────── F1-2-2 · M6/M6-E (modal de Agente) ─────────────────────────
+
+    /// Nomes vivos do Espaço (dedup "(2)" do modal).
+    fn live_names(&self) -> Vec<String> {
+        self.nodes
+            .cards()
+            .into_iter()
+            .map(|(_, v)| v.name)
+            .collect()
+    }
+
+    /// Abre o M6 em modo CRIAR.
+    fn open_agent_modal_create(&mut self, cx: &mut Context<Self>) {
+        let modal = agent_modal::AgentModal::new_create(
+            Arc::new(role_suggester::W31Suggester),
+            self.live_names(),
+        );
+        self.open_agent_modal(modal, cx);
+    }
+
+    /// Abre o M6-E em modo EDITAR (pré-preenchido com nome + papel correntes do nó).
+    fn open_agent_modal_edit(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        let Some(name) = lock(&self.nodes.model)
+            .nodes
+            .get(&node)
+            .map(|v| v.name.clone())
+        else {
+            return; // nó sumiu entre o build da paleta e o clique — nada a editar.
+        };
+        let role = self.nodes.node_role(node);
+        let modal = agent_modal::AgentModal::new_edit(
+            Arc::new(role_suggester::W31Suggester),
+            node,
+            &name,
+            role.as_deref(),
+            self.live_names(),
+        );
+        self.open_agent_modal(modal, cx);
+    }
+
+    /// Abre o modal + dispara a VARREDURA de motores fora da thread de UI (lição W4-1: discovery
+    /// off-thread) + o loop de ticks (~50ms) que dirige o debounce do co-piloto e consome a
+    /// varredura. O loop morre sozinho quando o modal fecha.
+    fn open_agent_modal(&mut self, modal: agent_modal::AgentModal, cx: &mut Context<Self>) {
+        let scan: Arc<Mutex<Option<Vec<agent_modal::Engine>>>> = Arc::new(Mutex::new(None));
+        self.modal_scan = Some(Arc::clone(&scan));
+        let lina_home = self.nodes.lina_home().to_path_buf();
+        thread::spawn(move || {
+            // Profiles TOML do DISCO (critério 7) + binários no PATH (W4-1). Nunca na thread de UI.
+            let profiles = agent_modal::load_profiles(&agent_modal::profiles_dir(&lina_home));
+            let found = lina_core::discover_clis();
+            *lock(&scan) = Some(agent_modal::engines_from(&found, &profiles));
+        });
+        self.agent_modal = Some(modal);
+        cx.spawn(async move |this, cx| loop {
+            let Ok(open) = this.update(cx, |view, cx| {
+                let Some(m) = view.agent_modal.as_mut() else {
+                    view.modal_scan = None;
+                    return false;
+                };
+                let mut changed = m.tick();
+                if let Some(scan) = &view.modal_scan {
+                    if let Some(engines) = lock(scan).take() {
+                        m.set_engines(engines);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+                true
+            }) else {
+                break;
+            };
+            if !open {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn modal_select_engine(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.select_engine(idx);
+            cx.notify();
+        }
+    }
+
+    fn modal_accept_suggestion(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.accept_suggestion();
+            cx.notify();
+        }
+    }
+
+    fn modal_toggle_why(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.toggle_why();
+            cx.notify();
+        }
+    }
+
+    fn modal_cycle_role(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.cycle_role();
+            cx.notify();
+        }
+    }
+
+    fn modal_toggle_advanced(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.toggle_advanced();
+            cx.notify();
+        }
+    }
+
+    fn modal_focus(&mut self, f: agent_modal::FocusField, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.set_focus(f);
+            cx.notify();
+        }
+    }
+
+    fn modal_cancel(&mut self, cx: &mut Context<Self>) {
+        self.agent_modal = None;
+        cx.notify();
+    }
+
+    /// "+ Instalar outro motor…"/estado vazio: REUSA o fluxo W4-1 (T1) — abre a janela do
+    /// onboarding com o instalador humano. (Instalação EMBUTIDA no modal é aprofundamento da
+    /// story — ver DONE; o caminho do leigo nunca tem beco.)
+    fn modal_install_engine(&mut self, cx: &mut Context<Self>) {
+        let lina_home = self.nodes.lina_home().to_path_buf();
+        let onboarding_dir = lina_home
+            .parent()
+            .map(|p| p.join("onboarding"))
+            .unwrap_or_else(|| lina_home.join("onboarding"));
+        onboarding::open_window(cx, onboarding_dir, lina_home);
+    }
+
+    /// Picker NATIVO de pasta (só-pastas), fora da thread de UI — padrão do segundo cérebro.
+    fn modal_pick_folder(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Usar esta pasta".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(p) = paths.into_iter().next() {
+                    let _ = this.update(cx, |view, cx| {
+                        if let Some(m) = view.agent_modal.as_mut() {
+                            m.set_cwd(p);
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// `[[ Criar Agente ]]` / `[[ Salvar ]]` — o ÚNICO ponto onde o modal vira eventos no log
+    /// (critério 6: kill -9 antes daqui não deixa rastro). Erro de validação fica INLINE.
+    fn modal_commit(&mut self, window: &Window, cx: &mut Context<Self>) {
+        use agent_modal::ModalMode;
+        // 1) plano sob o borrow do modal; 2) efeito sobre self com o modal solto.
+        enum Plan {
+            Create(agent_modal::CreatePlan),
+            Save(agent_modal::SavePlan),
+        }
+        let plan = {
+            let Some(m) = self.agent_modal.as_mut() else {
+                return;
+            };
+            let r = match m.mode {
+                ModalMode::Create => m.create_plan().map(Plan::Create),
+                ModalMode::Edit { .. } => m.save_plan().map(Plan::Save),
+            };
+            match r {
+                Ok(p) => p,
+                Err(msg) => {
+                    m.set_error(msg);
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let result: Result<Option<NodeId>, String> = match &plan {
+            Plan::Create(p) => self
+                .nodes
+                .create_agent_with(
+                    &p.name,
+                    Some(&p.engine),
+                    p.cwd.as_deref(),
+                    p.role.as_deref(),
+                )
+                .map(Some),
+            Plan::Save(p) => self
+                .nodes
+                .rename_node(p.node, &p.name)
+                .and_then(|()| match &p.role {
+                    Some(role) => self.nodes.assign_role(p.node, role),
+                    None => Ok(()),
+                })
+                .map(|()| None),
+        };
+        match result {
+            Ok(created) => {
+                if let Plan::Create(p) = &plan {
+                    if let Some(note) = &p.dup_note {
+                        eprintln!("lina-gpui: M6 — {note}");
+                    }
+                }
+                self.agent_modal = None;
+                // M6-E3: o foco vai direto pro input do Agente recém-criado (zero cliques).
+                if let Some(node) = created {
+                    self.focus(node);
+                    self.reveal(node, window);
+                }
+            }
+            Err(e) => {
+                // Tabela de erros do fluxo (a): nunca stack trace na tela — copy leiga inline
+                // (erros de validação do plano já são leigos; falha de spawn/persistência ganha
+                // a mensagem genérica e o detalhe técnico vai ao stderr).
+                eprintln!("lina-gpui: M6 — commit falhou: {e}");
+                if let Some(m) = self.agent_modal.as_mut() {
+                    let leiga = if e.starts_with("não consigo trabalhar nessa pasta") {
+                        e
+                    } else {
+                        agent_modal::COPY_ERR_COMMIT.to_string()
+                    };
+                    m.set_error(leiga);
+                }
+            }
+        }
+        cx.notify();
     }
 
     // ───────────────────────── W2-4: seleção · copiar/colar · mouse ─────────────────────────
@@ -822,53 +1088,52 @@ impl WorkspaceView {
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        // W4-2 · M2 — MODO NOMEAÇÃO: enquanto o humano digita o nome do agente novo, as teclas montam
-        // o buffer (NÃO vão para o PTY). Enter cria (papel derivado do nome); Esc cancela; Backspace
-        // apaga. Captura ANTES de tudo (é um modo modal leve).
-        if self.naming.is_some() {
-            match ks.key.as_str() {
-                "escape" => {
-                    self.naming = None;
-                }
-                "enter" | "return" => {
-                    let name = self.naming.take().unwrap_or_default();
-                    let name = name.trim().to_string();
-                    if !name.is_empty() {
-                        match self.nodes.create_agent(&name) {
-                            Ok(node) => {
-                                self.focus(node);
-                                self.reveal(node, window);
+        // F1-2-2 · M6/M6-E — MODAL DE AGENTE: enquanto aberto, o teclado o dirige (digitar monta o
+        // campo focado; Tab aceita a sugestão do co-piloto; Enter cria/salva; Esc arma/descarta).
+        // EXCEÇÃO de precedência ABSOLUTA (fluxo b): ⌘⏎ com Pedido pendente na Fila NÃO cria —
+        // cai no gate humano abaixo (a custódia vence o atalho de Criar; M6-E3).
+        if self.agent_modal.is_some() {
+            let custody_pending = lock(&self.desk).front().is_some();
+            let cmd_enter = ks.modifiers.platform && (ks.key == "enter" || ks.key == "return");
+            if !(cmd_enter && custody_pending) {
+                match ks.key.as_str() {
+                    "escape" => {
+                        if self.agent_modal.as_mut().is_some_and(|m| m.escape()) {
+                            self.agent_modal = None;
+                        }
+                    }
+                    "tab" => {
+                        if let Some(m) = self.agent_modal.as_mut() {
+                            m.accept_suggestion();
+                        }
+                    }
+                    "enter" | "return" => self.modal_commit(window, cx),
+                    "backspace" => {
+                        if let Some(m) = self.agent_modal.as_mut() {
+                            m.backspace();
+                        }
+                    }
+                    _ => {
+                        // Imprimível → campo focado (ignora chords ⌘/Ctrl e teclas-controle).
+                        if !ks.modifiers.platform && !ks.modifiers.control {
+                            if let Some(kc) = ks
+                                .key_char
+                                .as_ref()
+                                .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                            {
+                                if let Some(m) = self.agent_modal.as_mut() {
+                                    m.type_char(kc);
+                                }
                             }
-                            Err(e) => eprintln!("lina-gpui: M2 criar agente '{name}': {e}"),
                         }
                     }
                 }
-                "backspace" => {
-                    if let Some(buf) = self.naming.as_mut() {
-                        buf.pop();
-                    }
-                }
-                _ => {
-                    // Caractere imprimível → entra no nome (ignora chords com ⌘/Ctrl e teclas-controle).
-                    if !ks.modifiers.platform && !ks.modifiers.control {
-                        if let Some(kc) = ks
-                            .key_char
-                            .as_ref()
-                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
-                        {
-                            if let Some(buf) = self.naming.as_mut() {
-                                buf.push_str(kc);
-                            }
-                        }
-                    }
-                }
+                // Modal: a janela é dona do teclado. `stop_propagation` impede o gpui de rotear a
+                // tecla ao `insertText` do IME (senão a letra VAZARIA ao PTY focado — lição M2).
+                cx.stop_propagation();
+                cx.notify();
+                return;
             }
-            // Modo modal: a janela do canvas é dona do teclado. `stop_propagation` marca a tecla como
-            // consumida → o gpui NÃO a roteia ao `insertText` do IME (gpui_macos `handle_key_event`),
-            // senão a letra do nome também VAZARIA ao PTY do nó focado (dupla escrita).
-            cx.stop_propagation();
-            cx.notify();
-            return;
         }
         // W4-2 · M3/M4 — MODO CRIAÇÃO de nota/pasta (disparado pela paleta): digita o título; Enter cria
         // (semeia o nó VIVO + foca); Esc cancela; Backspace apaga. Modal leve, irmão do naming (M2).
@@ -924,11 +1189,16 @@ impl WorkspaceView {
                 ks.key_char.as_deref()
             };
             if let Some(action) = self.palette.handle_key(ks.key.as_str(), ch) {
-                self.run_palette_action(action, window);
+                self.run_palette_action(action, window, cx);
             }
             // Modal: consome a tecla de filtro p/ o IME não vazar a query ao PTY (ver naming acima).
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        // ⌘N abre o M6 "Novo Agente" (atalho canônico do fluxo (a)).
+        if ks.modifiers.platform && ks.key == "n" {
+            self.open_agent_modal_create(cx);
             return;
         }
         // ⌘K abre a paleta (rebuild dos comandos com o roster do momento).
@@ -1658,40 +1928,21 @@ impl Render for WorkspaceView {
                 .child(text!("➕ Terminal")),
         );
 
-        // W4-2 · M2 "Novo Agente": entra no modo nomeação (o humano digita o nome → papel derivado).
-        // Quando ativo, mostra o buffer com cursor; senão, o botão.
-        match &self.naming {
-            Some(buf) => {
-                topbar = topbar.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(rgb(th.surface.raised_alt))
-                        .text_color(rgb(th.text.bright))
-                        .child(text!(format!(
-                            "✦ Novo agente: {buf}▌  (Enter cria · Esc cancela)"
-                        ))),
-                );
-            }
-            None => {
-                topbar = topbar.child(
-                    div()
-                        .id("new-agent-btn")
-                        .px_3()
-                        .py_1()
-                        .rounded_md()
-                        .bg(rgb(th.accent.create))
-                        .text_color(rgb(th.text.on_accent))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
-                            // Abre o modo nomeação; o `handle_key` monta o buffer e cria no Enter.
-                            view.naming = Some(String::new());
-                        }))
-                        .child(text!("✦ Novo Agente")),
-                );
-            }
-        }
+        // F1-2-2 · M6 "Novo Agente": o botão abre o MODAL (evoluiu o modo-nomeação M2; ⌘N idem).
+        topbar = topbar.child(
+            div()
+                .id("new-agent-btn")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(th.accent.create))
+                .text_color(rgb(th.text.on_accent))
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                    view.open_agent_modal_create(cx);
+                }))
+                .child(text!("✦ Novo Agente")),
+        );
 
         // W4-2 · M3/M4: modo CRIAÇÃO ativo → banner do título da nota/pasta sendo digitado.
         if let Some((kind, buf)) = &self.creating {
@@ -1877,11 +2128,10 @@ impl Render for WorkspaceView {
         }
 
         let root = root.child(topbar).child(footer);
-        // BUG 4 · M2: overlay CENTRAL e proeminente do modo "Novo Agente" — o feedback no topbar é
-        // discreto demais ("clico, nada acontece, nao sei pra que serve"). Modal sobre o canvas: o
-        // usuário VÊ que entrou no modo + o que digitar. Mutuamente exclusivo com a paleta (topo).
-        let root = match &self.naming {
-            Some(buf) => root.child(naming_overlay(buf)),
+        // F1-2-2 · M6/M6-E: o modal de Agente é o overlay central (evoluiu o overlay do M2 — BUG 4
+        // resolvido por um modal de verdade). A paleta, quando aberta, continua mais ao topo.
+        let root = match &self.agent_modal {
+            Some(m) => root.child(agent_modal::render(m, cx)),
             None => root,
         };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
@@ -1891,61 +2141,6 @@ impl Render for WorkspaceView {
             root
         }
     }
-}
-
-/// BUG 4 · M2: overlay CENTRAL do modo "Novo Agente" — modal sobre o canvas com título, instrução,
-/// o nome digitado (com cursor) ou um placeholder, e as teclas. Torna o modo VISÍVEL (o feedback no
-/// topbar é discreto demais). Não-interativo: o teclado (`handle_key`) dirige (Enter cria · Esc cancela).
-fn naming_overlay(buf: &str) -> impl IntoElement {
-    let th = theme::active();
-    let (typed, typed_fg) = if buf.is_empty() {
-        ("Digite o nome do agente…".to_string(), rgb(th.text.muted))
-    } else {
-        (format!("{buf}▌"), rgb(th.text.bright))
-    };
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .bottom_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .px_6()
-                .py_5()
-                .rounded_lg()
-                .bg(rgb(th.surface.panel))
-                .border_2()
-                .border_color(rgb(th.accent.create))
-                .child(
-                    div()
-                        .text_size(px(22.0))
-                        .text_color(rgb(th.text.bright))
-                        .child(text!("✦ Novo Agente")),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(th.text.secondary))
-                        .child(text!("Digite o nome — o papel vem do nome")),
-                )
-                .child(
-                    div()
-                        .text_size(px(26.0))
-                        .text_color(typed_fg)
-                        .child(text!(typed)),
-                )
-                .child(
-                    div()
-                        .text_color(rgb(th.text.muted))
-                        .child(text!("Enter cria · Esc cancela")),
-                ),
-        )
 }
 
 /// PRODUÇÃO vs DEMO. `LINA_DEMO` (1/true/on/yes) liga o modo demo do fundador: semeia Terminal A/B,

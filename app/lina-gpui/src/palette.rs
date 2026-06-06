@@ -9,12 +9,14 @@
 use gpui::{div, prelude::*, px, rgb, text, AnyElement};
 use lina_host::NodeId;
 
-/// O que a paleta dispara. Genérico: o `WorkspaceView` executa (abre o modo-nomeação do M2, foca um
+/// O que a paleta dispara. Genérico: o `WorkspaceView` executa (abre o modal M6, foca um
 /// nó, alterna o freio, ou — placeholder até `creators.rs` — cria nota/pasta).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
-    /// M2: abre o modo nomeação ("Novo agente").
+    /// F1-2-2 (M6): abre o modal "Novo Agente" (evoluiu o modo-nomeação do M2).
     NewAgent,
+    /// F1-2-2 (M6-E): abre o modal em modo EDITAR para um nó vivo.
+    EditAgent(NodeId),
     /// Foca (e revela) um nó do canvas.
     FocusNode(NodeId),
     /// W4-3: alterna o freio (pausa/retoma a auto-orquestração).

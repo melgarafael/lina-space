@@ -1,0 +1,1415 @@
+//! `agent_modal` — **F1-2-2 (M6/M6-E): o modal de criar/editar Agente** (evolui o M2 da Fase 0).
+//!
+//! A tese da story: superar o Maestri por **menos** — 4 controles visíveis (motor·nome·papel·
+//! pasta), zero YAML/jargão na superfície, co-piloto de papel pelo nome (via o contrato
+//! [`crate::role_suggester::RoleSuggester`] — fronteira F1-2-2↔F1-2-3) e quick-start **somente
+//! dos motores detectados** (W4-1), nunca lista fixa.
+//!
+//! Split sedimentado do shell: [`AgentModal`] é **gpui-free e testável** (estados, debounce por
+//! tick, validação, dedup de nome, plano de criação); [`render`] é a casca fina gpui. Toda
+//! mutação vira evento **só no Criar/Salvar** (kill -9 no meio do preenchimento não deixa nó
+//! fantasma — estado do modal é RAM). Wireframe/copy: `ux-flows.md` fluxo (a), autoritativo.
+//!
+//! **Critério 7 (neutralidade)**: o comando do motor vem do **CLI Profile TOML lido do disco em
+//! runtime** ([`load_profiles`] — semeado uma vez de `profiles/claude-code.toml` e depois SEMPRE
+//! lido do arquivo: trocar o TOML muda o comando sem recompilar). Descoberta de motores roda
+//! **fora da thread de UI** e entra por [`AgentModal::set_engines`] (lição W4-1: injetável).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, FontWeight};
+use lina_cli_profiles::ProfileRegistry;
+use lina_core::DiscoveredCli;
+use lina_host::NodeId;
+
+use crate::bridge::AgentEngine;
+use crate::role_suggester::{humanize, role_registry, RoleSuggester, RoleSuggestion};
+use crate::theme;
+use crate::WorkspaceView;
+
+// ═══════════════════════════ copy (auditável — critério 2: zero jargão) ═══════════════════════════
+// Toda string visível do modal mora AQUI e passa pelo teste `copy_has_no_jargon` (proíbe
+// YAML/TOML/profile/terminal em QUALQUER estado — anti-padrões 1/2/5 do fluxo (a)).
+
+pub const COPY_TITLE_CREATE: &str = "Novo Agente";
+pub const COPY_TITLE_EDIT: &str = "Editar Agente";
+pub const COPY_QUICKSTART: &str = "Início rápido — motores prontos no seu computador:";
+pub const COPY_SCANNING: &str = "Procurando motores no seu computador…";
+pub const COPY_EMPTY_TITLE: &str = "Vamos preparar tudo para você";
+pub const COPY_EMPTY_CTA: &str = "Instalar o motor recomendado";
+pub const COPY_INSTALL_OTHER: &str = "+ Instalar outro motor…";
+pub const COPY_NAME_LABEL: &str = "Nome";
+pub const COPY_NAME_PLACEHOLDER: &str = "Ex.: Revisor, Designer de Landing…";
+pub const COPY_ROLE_LABEL: &str = "Papel";
+pub const COPY_ROLE_PLACEHOLDER: &str =
+    "Escolha um papel pelo botão Trocar — ou descreva pelo nome, que eu sugiro.";
+pub const COPY_ROLE_SWAP: &str = "Trocar";
+pub const COPY_CWD_LABEL: &str = "Pasta de trabalho";
+pub const COPY_CWD_DEFAULT: &str = "a pasta deste Espaço";
+pub const COPY_CWD_PICK: &str = "Trocar…";
+pub const COPY_ADVANCED: &str = "▸ Avançado";
+pub const COPY_ADVANCED_OPEN: &str = "▾ Avançado";
+pub const COPY_CMD_LABEL: &str = "Comando do motor (modo técnico)";
+pub const COPY_CREATE: &str = "Criar Agente";
+pub const COPY_SAVE: &str = "Salvar";
+pub const COPY_CANCEL: &str = "Cancelar";
+pub const COPY_ERR_EMPTY_NAME: &str = "Dê um nome ao agente antes de criar.";
+pub const COPY_ERR_SCANNING: &str = "Um instante — ainda estou procurando os motores.";
+pub const COPY_ERR_NO_ENGINE: &str =
+    "Nenhum motor instalado ainda — use o botão acima e eu instalo para você.";
+pub const COPY_DISCARD_ARMED: &str = "Descartar este Agente? (Esc de novo descarta)";
+/// Falha ao criar/salvar (ex.: motor sumiu entre a detecção e o clique) — leiga, sem stack trace;
+/// o detalhe técnico vai ao stderr.
+pub const COPY_ERR_COMMIT: &str =
+    "Não consegui criar agora — o motor pode ter mudado. Tente de novo ou escolha outro.";
+pub const COPY_EDIT_ENGINE_LOCKED: &str = "⚠ trocar o motor reinicia o Agente — em breve";
+pub const COPY_EDIT_APPLY_NOTE: &str = "Mudanças de nome e papel valem agora.";
+pub const COPY_WHY_PREFIX: &str = "ⓘ por quê?";
+
+/// Linha-fantasma do co-piloto (M6-E2): nunca popup, nunca rouba foco.
+#[must_use]
+pub fn copy_ghost(label: &str) -> String {
+    format!("Parece um {label} — usar este papel? (Tab)")
+}
+
+/// Aviso leve de nome duplicado (tabela de erros do fluxo (a): sufixo automático, não bloqueia).
+#[must_use]
+pub fn copy_dup_note(unique: &str) -> String {
+    format!("Já existia um com esse nome — este será \u{201c}{unique}\u{201d}.")
+}
+
+// ═══════════════════════════ motores (W4-1 → quick-start) ═══════════════════════════
+
+/// Um motor pronto para o quick-start: rótulo leigo + comando (do CLI Profile TOML quando há;
+/// senão o binário descoberto, cru).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Engine {
+    /// id da descoberta (`"claude"`, `"codex"`, …).
+    pub id: String,
+    /// Rótulo leigo do chip ("Claude Code").
+    pub label: String,
+    pub version: Option<String>,
+    pub program: String,
+    pub args: Vec<String>,
+    /// id do CLI Profile TOML quando existe (`"claude-code"`) → vira `CliProfileSet` no log.
+    pub profile_id: Option<String>,
+}
+
+/// Rótulo leigo de um CLI descoberto (ids do `KNOWN_CLIS` do core).
+#[must_use]
+pub fn engine_label(id: &str) -> String {
+    match id {
+        "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "gemini" => "Gemini CLI".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "copilot" => "Copilot CLI".to_string(),
+        "agy" => "Antigravity".to_string(),
+        other => {
+            let mut s = other.to_string();
+            if let Some(f) = s.get_mut(0..1) {
+                f.make_ascii_uppercase();
+            }
+            s
+        }
+    }
+}
+
+/// Monta a lista de motores do quick-start a partir da DESCOBERTA (W4-1) + os profiles TOML do
+/// disco. **Recomendado primeiro** (claude), demais na ordem da descoberta. Puro e testável.
+#[must_use]
+pub fn engines_from(found: &[DiscoveredCli], profiles: &ProfileRegistry) -> Vec<Engine> {
+    let mut out: Vec<Engine> = found
+        .iter()
+        .map(|d| {
+            // O profile cujo `program` é o binário descoberto dá comando/args/identidade.
+            let profile = profiles.ids().find_map(|id| {
+                let p = profiles.get(id)?;
+                (p.program == d.id).then_some(p)
+            });
+            Engine {
+                id: d.id.clone(),
+                label: engine_label(&d.id),
+                version: d.version.clone(),
+                program: profile.map_or_else(|| d.id.clone(), |p| p.program.clone()),
+                args: profile.map(|p| p.args.clone()).unwrap_or_default(),
+                profile_id: profile.map(|p| p.id.clone()),
+            }
+        })
+        .collect();
+    // Recomendado (claude) primeiro — estabilidade no resto (sem reordenar surpresa).
+    out.sort_by_key(|e| if e.id == "claude" { 0 } else { 1 });
+    out
+}
+
+/// Estado da varredura de motores (a descoberta roda FORA da thread de UI e entra por
+/// [`AgentModal::set_engines`] — lição W4-1: off-thread + injetável p/ teste determinístico).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineScan {
+    Scanning,
+    Ready(Vec<Engine>),
+}
+
+// ═══════════════════════════ CLI Profiles em RUNTIME (critério 7) ═══════════════════════════
+
+/// Seed do profile recomendado — escrito UMA vez no dir de profiles do usuário; depois disso o
+/// arquivo do DISCO manda (editar/trocar o TOML muda o comando sem recompilar).
+const CLAUDE_PROFILE_SEED: &str = include_str!("../../../profiles/claude-code.toml");
+
+/// Onde os CLI Profiles do usuário moram: `LINA_PROFILES` (override de dev) ou
+/// `<ws_root>/.lina/profiles` (local-first, por Espaço).
+#[must_use]
+pub fn profiles_dir(mailbox_dir: &Path) -> PathBuf {
+    std::env::var_os("LINA_PROFILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| mailbox_dir.join("profiles"))
+}
+
+/// Carrega os CLI Profiles TOML **do disco** (semeando `claude-code.toml` na primeira vez).
+/// Best-effort: erro de I/O/parse → registry vazio + stderr (o modal degrada para o binário
+/// descoberto; criação nunca bloqueia).
+#[must_use]
+pub fn load_profiles(dir: &Path) -> ProfileRegistry {
+    let seed = dir.join("claude-code.toml");
+    if !seed.exists() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("lina-gpui: M6 — não criei {} ({e})", dir.display());
+        } else if let Err(e) = std::fs::write(&seed, CLAUDE_PROFILE_SEED) {
+            eprintln!("lina-gpui: M6 — não semeei {} ({e})", seed.display());
+        }
+    }
+    match ProfileRegistry::load_dir(dir) {
+        Ok(reg) => reg,
+        Err(e) => {
+            eprintln!(
+                "lina-gpui: M6 — profiles de {} inválidos ({e})",
+                dir.display()
+            );
+            ProfileRegistry::new()
+        }
+    }
+}
+
+// ═══════════════════════════ o modelo (gpui-free) ═══════════════════════════
+
+/// Ticks do loop do modal (~50ms cada) até o co-piloto disparar após a pausa de digitação
+/// (M6-E2: ~600ms). 12 × 50ms = 600ms.
+pub const SUGGEST_DEBOUNCE_TICKS: u32 = 12;
+
+/// Criar do zero ou editar um nó vivo (M6-E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalMode {
+    Create,
+    Edit { node: NodeId },
+}
+
+/// Qual buffer de texto recebe o teclado (Nome é o foco inicial; Comando só no Avançado).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusField {
+    Name,
+    Command,
+}
+
+/// O plano de CRIAÇÃO commitado pelo `[[ Criar Agente ]]` — só aqui nascem eventos (critério 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePlan {
+    /// Nome final (dedup com sufixo "(2)" aplicado).
+    pub name: String,
+    /// Aviso leve quando o dedup agiu (tabela de erros: não bloqueia).
+    pub dup_note: Option<String>,
+    pub engine: AgentEngine,
+    /// Pasta escolhida (None = pasta gerenciada do Espaço).
+    pub cwd: Option<PathBuf>,
+    /// Papel CANÔNICO escolhido/aceito (None = inferir do nome, comportamento M2).
+    pub role: Option<String>,
+}
+
+/// O plano de SALVAR do modo edição (M6-E): aplica nome/papel agora; motor fica p/ F1-2-4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavePlan {
+    pub node: NodeId,
+    pub name: String,
+    /// Papel canônico a gravar (None = não mudou).
+    pub role: Option<String>,
+}
+
+/// O modal M6/M6-E — estado puro (nenhum gpui; nenhum evento até Criar/Salvar).
+pub struct AgentModal {
+    pub mode: ModalMode,
+    name: String,
+    /// Ticks desde a última tecla no Nome (None = sem digitação pendente de sugestão).
+    typing_ticks: Option<u32>,
+    /// Linha-fantasma corrente (não aplicada — some se ignorada).
+    suggestion: Option<RoleSuggestion>,
+    /// Cartão de Papel APLICADO (Tab/clique/Trocar). Nunca aplicado silenciosamente.
+    role: Option<RoleSuggestion>,
+    /// `true` → o papel veio de escolha manual ([Trocar]) e NÃO deve ser re-sugerido por cima.
+    role_pinned: bool,
+    engines: EngineScan,
+    selected_engine: usize,
+    /// Pasta escolhida (None = default leigo "a pasta deste Espaço").
+    cwd: Option<PathBuf>,
+    advanced: bool,
+    /// Override do comando (Avançado). None = derivado do motor selecionado.
+    command: Option<String>,
+    focus: FocusField,
+    error: Option<String>,
+    /// Esc com conteúdo arma a confirmação de descarte (2º Esc fecha).
+    discard_armed: bool,
+    /// Tooltip "por quê" aberto (transparência da sugestão).
+    why_open: bool,
+    /// Nomes já existentes no Espaço (dedup "(2)").
+    existing: Vec<String>,
+    /// [Trocar]: índice do ciclo pela biblioteca de papéis do registry.
+    swap_idx: usize,
+    suggester: Arc<dyn RoleSuggester>,
+    /// (M6-E) nome/papel originais — p/ detectar mudança real no Salvar.
+    original: Option<(String, Option<String>)>,
+}
+
+impl AgentModal {
+    /// Modal em modo CRIAR. `existing` = nomes vivos do Espaço (dedup).
+    #[must_use]
+    pub fn new_create(suggester: Arc<dyn RoleSuggester>, existing: Vec<String>) -> Self {
+        Self {
+            mode: ModalMode::Create,
+            name: String::new(),
+            typing_ticks: None,
+            suggestion: None,
+            role: None,
+            role_pinned: false,
+            engines: EngineScan::Scanning,
+            selected_engine: 0,
+            cwd: None,
+            advanced: false,
+            command: None,
+            focus: FocusField::Name,
+            error: None,
+            discard_armed: false,
+            why_open: false,
+            existing,
+            swap_idx: 0,
+            suggester,
+            original: None,
+        }
+    }
+
+    /// Modal em modo EDITAR (M6-E): pré-preenchido com o estado atual do nó.
+    #[must_use]
+    pub fn new_edit(
+        suggester: Arc<dyn RoleSuggester>,
+        node: NodeId,
+        name: &str,
+        role_canon: Option<&str>,
+        existing: Vec<String>,
+    ) -> Self {
+        let mut m = Self::new_create(suggester, existing);
+        m.mode = ModalMode::Edit { node };
+        m.name = name.to_string();
+        m.role = role_canon.map(|r| {
+            let (label, blurb) = humanize(r);
+            RoleSuggestion {
+                role: r.to_string(),
+                label,
+                blurb,
+                why: "Papel atual deste Agente.".to_string(),
+            }
+        });
+        // editar nunca re-sugere por cima do papel vigente sem novo nome (M6-E: pergunta antes).
+        m.role_pinned = m.role.is_some();
+        m.original = Some((name.to_string(), role_canon.map(str::to_string)));
+        m
+    }
+
+    // ── leitura (render/testes) ──
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    #[must_use]
+    pub fn suggestion(&self) -> Option<&RoleSuggestion> {
+        self.suggestion.as_ref()
+    }
+    #[must_use]
+    pub fn role(&self) -> Option<&RoleSuggestion> {
+        self.role.as_ref()
+    }
+    #[must_use]
+    pub fn engines(&self) -> &EngineScan {
+        &self.engines
+    }
+    #[must_use]
+    pub fn selected_engine(&self) -> Option<&Engine> {
+        match &self.engines {
+            EngineScan::Ready(v) => v.get(self.selected_engine),
+            EngineScan::Scanning => None,
+        }
+    }
+    #[must_use]
+    pub fn selected_engine_idx(&self) -> usize {
+        self.selected_engine
+    }
+    #[must_use]
+    pub fn cwd_display(&self) -> String {
+        self.cwd
+            .as_ref()
+            .map_or_else(|| COPY_CWD_DEFAULT.to_string(), |p| p.display().to_string())
+    }
+    #[must_use]
+    pub fn advanced_open(&self) -> bool {
+        self.advanced
+    }
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    #[must_use]
+    pub fn discard_armed(&self) -> bool {
+        self.discard_armed
+    }
+    #[must_use]
+    pub fn why_open(&self) -> bool {
+        self.why_open
+    }
+    #[must_use]
+    pub fn focus_field(&self) -> FocusField {
+        self.focus
+    }
+
+    /// O comando EXIBIDO no Avançado: override do usuário, senão o do motor (profile TOML).
+    #[must_use]
+    pub fn effective_command(&self) -> String {
+        if let Some(c) = &self.command {
+            return c.clone();
+        }
+        match self.selected_engine() {
+            Some(e) => {
+                let mut s = e.program.clone();
+                for a in &e.args {
+                    s.push(' ');
+                    s.push_str(a);
+                }
+                s
+            }
+            None => String::new(),
+        }
+    }
+
+    // ── mutação (teclado/cliques) ──
+
+    /// Caractere imprimível no campo focado. Digitar no Nome re-arma o debounce do co-piloto e
+    /// desarma o descarte; digitar dispensa a linha-fantasma corrente sem fricção (M6-E2).
+    pub fn type_char(&mut self, s: &str) {
+        self.discard_armed = false;
+        self.error = None;
+        match self.focus {
+            FocusField::Name => {
+                self.name.push_str(s);
+                self.typing_ticks = Some(0);
+                self.suggestion = None;
+            }
+            FocusField::Command => {
+                let mut c = self.effective_command();
+                c.push_str(s);
+                self.command = Some(c);
+            }
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        self.discard_armed = false;
+        self.error = None;
+        match self.focus {
+            FocusField::Name => {
+                self.name.pop();
+                self.typing_ticks = Some(0);
+                self.suggestion = None;
+            }
+            FocusField::Command => {
+                let mut c = self.effective_command();
+                c.pop();
+                self.command = Some(c);
+            }
+        }
+    }
+
+    pub fn set_focus(&mut self, f: FocusField) {
+        self.focus = f;
+    }
+
+    /// Um tick do loop do modal (~50ms). Devolve `true` se algo visível mudou (→ `cx.notify`).
+    /// O co-piloto dispara na PAUSA (SUGGEST_DEBOUNCE_TICKS), com 3+ chars, e **re-sugere só em
+    /// mudança substancial**: papel diferente do já aplicado/sugerido (não a cada tecla).
+    pub fn tick(&mut self) -> bool {
+        let Some(t) = self.typing_ticks else {
+            return false;
+        };
+        if t + 1 < SUGGEST_DEBOUNCE_TICKS {
+            self.typing_ticks = Some(t + 1);
+            return false;
+        }
+        self.typing_ticks = None;
+        let fresh = self.suggester.suggest(&self.name);
+        match fresh {
+            Some(s) => {
+                // papel manual ([Trocar]) não é atropelado; igual ao aplicado = sem ghost (ruído).
+                let same_as_applied = self.role.as_ref().is_some_and(|r| r.role == s.role);
+                if same_as_applied || (self.role_pinned && self.role.is_some()) {
+                    // M6-E: renomear COM papel pinado → a pergunta explícita fica visível na
+                    // linha-fantasma mesmo assim quando o papel sugerido difere.
+                    if self.role_pinned && self.role.as_ref().is_some_and(|r| r.role != s.role) {
+                        self.suggestion = Some(s);
+                        return true;
+                    }
+                    self.suggestion = None;
+                    return true;
+                }
+                self.suggestion = Some(s);
+                true
+            }
+            None => self.suggestion.take().is_some(),
+        }
+    }
+
+    /// Aceita a sugestão (Tab/clique) — ÚNICO caminho que aplica papel sugerido (nunca silencioso).
+    pub fn accept_suggestion(&mut self) -> bool {
+        match self.suggestion.take() {
+            Some(s) => {
+                self.role = Some(s);
+                self.role_pinned = false;
+                self.why_open = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [Trocar]: cicla a biblioteca de papéis (registry W3-1 humanizado — template-driven; a
+    /// galeria rica com busca/duplicar é aprofundamento da F1-2-3).
+    pub fn cycle_role(&mut self) {
+        let Some(reg) = role_registry() else { return };
+        let names: Vec<&str> = reg.role_names().collect();
+        if names.is_empty() {
+            return;
+        }
+        let canon = names[self.swap_idx % names.len()];
+        self.swap_idx = self.swap_idx.wrapping_add(1);
+        let (label, blurb) = humanize(canon);
+        self.role = Some(RoleSuggestion {
+            role: canon.to_string(),
+            label,
+            blurb,
+            why: "Você escolheu este papel na biblioteca.".to_string(),
+        });
+        self.role_pinned = true;
+        self.suggestion = None;
+    }
+
+    pub fn toggle_why(&mut self) {
+        self.why_open = !self.why_open;
+    }
+
+    pub fn toggle_advanced(&mut self) {
+        self.advanced = !self.advanced;
+        if !self.advanced {
+            self.focus = FocusField::Name;
+        }
+    }
+
+    pub fn select_engine(&mut self, idx: usize) {
+        if let EngineScan::Ready(v) = &self.engines {
+            if idx < v.len() {
+                self.selected_engine = idx;
+                self.command = None; // o comando derivado segue o motor novo
+            }
+        }
+    }
+
+    /// Resultado da descoberta off-thread (ou snapshot injetado em teste).
+    pub fn set_engines(&mut self, engines: Vec<Engine>) {
+        self.engines = EngineScan::Ready(engines);
+        self.selected_engine = 0;
+    }
+
+    pub fn set_cwd(&mut self, p: PathBuf) {
+        self.cwd = Some(p);
+    }
+
+    /// Esc: com conteúdo digitado, ARMA a confirmação («Descartar este Agente?»); sem conteúdo
+    /// (ou já armado), devolve `true` = fechar agora. (Mapa de cliques #11.)
+    pub fn escape(&mut self) -> bool {
+        if self.discard_armed || self.name.trim().is_empty() {
+            return true;
+        }
+        self.discard_armed = true;
+        false
+    }
+
+    /// Valida e monta o plano de CRIAÇÃO (critérios 1/3/4/5): nome leigo obrigatório, motor
+    /// detectado obrigatório (estado vazio aponta o caminho de instalar — nunca beco), dedup de
+    /// nome com sufixo. **Nenhum evento aqui** — quem commita é o caller com o plano.
+    pub fn create_plan(&mut self) -> Result<CreatePlan, String> {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err(COPY_ERR_EMPTY_NAME.to_string());
+        }
+        let engine = match &self.engines {
+            EngineScan::Scanning => return Err(COPY_ERR_SCANNING.to_string()),
+            EngineScan::Ready(v) if v.is_empty() => return Err(COPY_ERR_NO_ENGINE.to_string()),
+            EngineScan::Ready(v) => v[self.selected_engine.min(v.len() - 1)].clone(),
+        };
+        // Comando final: override do Avançado (split simples; modo técnico) ou o do profile.
+        let (program, args) = match &self.command {
+            Some(c) if !c.trim().is_empty() => {
+                let mut it = c.split_whitespace().map(str::to_string);
+                let program = it.next().unwrap_or_else(|| engine.program.clone());
+                (program, it.collect())
+            }
+            _ => (engine.program.clone(), engine.args.clone()),
+        };
+        let unique = unique_name(&name, &self.existing);
+        let dup_note = (unique != name).then(|| copy_dup_note(&unique));
+        Ok(CreatePlan {
+            name: unique,
+            dup_note,
+            engine: AgentEngine {
+                program,
+                args,
+                profile_id: engine.profile_id.clone(),
+                label: engine.label.clone(),
+            },
+            cwd: self.cwd.clone(),
+            role: self.role.as_ref().map(|r| r.role.clone()),
+        })
+    }
+
+    /// Valida e monta o plano de SALVAR (M6-E): nome/papel valem agora; motor é F1-2-4.
+    pub fn save_plan(&mut self) -> Result<SavePlan, String> {
+        let ModalMode::Edit { node } = self.mode else {
+            return Err("não está em modo edição".to_string());
+        };
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err(COPY_ERR_EMPTY_NAME.to_string());
+        }
+        let (orig_name, orig_role) = self.original.clone().unwrap_or_default();
+        let role_now = self.role.as_ref().map(|r| r.role.clone());
+        // dedup ignora o PRÓPRIO nome original (renomear para si mesmo não ganha sufixo).
+        let others: Vec<String> = self
+            .existing
+            .iter()
+            .filter(|n| **n != orig_name)
+            .cloned()
+            .collect();
+        Ok(SavePlan {
+            node,
+            name: unique_name(&name, &others),
+            role: (role_now != orig_role).then_some(role_now).flatten(),
+        })
+    }
+
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
+    }
+}
+
+/// Dedup leigo: nome já existe → sufixo " (2)"/" (3)"… (tabela de erros: avisa, não bloqueia).
+#[must_use]
+fn unique_name(name: &str, existing: &[String]) -> String {
+    let taken = |n: &str| existing.iter().any(|e| e.trim() == n);
+    if !taken(name) {
+        return name.to_string();
+    }
+    for i in 2..100 {
+        let candidate = format!("{name} ({i})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{name} (∞)")
+}
+
+// ═══════════════════════════ a casca gpui (render fina) ═══════════════════════════
+
+/// Renderiza o modal sobre o canvas. Cliques roteiam por métodos do [`WorkspaceView`]
+/// (`modal_*`) — o modelo continua gpui-free.
+pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement {
+    let th = theme::active();
+    let is_edit = matches!(modal.mode, ModalMode::Edit { .. });
+
+    let mut col = div().flex().flex_col().gap_3();
+
+    // ── título ──
+    let title = if is_edit {
+        format!("{COPY_TITLE_EDIT} — {}", modal.name())
+    } else {
+        COPY_TITLE_CREATE.to_string()
+    };
+    col = col.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(20.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(th.text.bright))
+                    .child(text!(title)),
+            )
+            .child(
+                div()
+                    .id("m6-close")
+                    .px_2()
+                    .rounded_md()
+                    .text_color(rgb(th.text.muted))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_cancel(cx);
+                    }))
+                    .child(text!("✕")),
+            ),
+    );
+
+    // ── quick-start de motores (M6-E1) ──
+    match modal.engines() {
+        EngineScan::Scanning => {
+            col = col.child(
+                div()
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(COPY_SCANNING)),
+            );
+        }
+        EngineScan::Ready(v) if v.is_empty() => {
+            // Estado vazio (critério 4): caminho ÚNICO de instalar — nunca quick-start vazio.
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded_md()
+                    .bg(rgb(th.surface.panel))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(th.text.primary))
+                            .child(text!(COPY_EMPTY_TITLE)),
+                    )
+                    .child(
+                        div()
+                            .id("m6-install-reco")
+                            .px_4()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(th.accent.action))
+                            .text_color(rgb(th.text.on_accent))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                                v.modal_install_engine(cx);
+                            }))
+                            .child(text!(COPY_EMPTY_CTA)),
+                    ),
+            );
+        }
+        EngineScan::Ready(v) => {
+            col = col.child(
+                div()
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(COPY_QUICKSTART)),
+            );
+            let mut chips = div().flex().flex_row().flex_wrap().items_center().gap_2();
+            for (i, e) in v.iter().enumerate() {
+                let active = i == modal.selected_engine_idx();
+                let mark = if active { "◉" } else { "○" };
+                let reco = if e.id == "claude" {
+                    " «recomendado»"
+                } else {
+                    ""
+                };
+                let mut chip = div()
+                    .id(("m6-engine", i))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(if active {
+                        th.surface.raised_alt
+                    } else {
+                        th.surface.raised
+                    }))
+                    .text_color(rgb(th.text.bright))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
+                        view.modal_select_engine(i, cx);
+                    }))
+                    .child(text!(format!("{mark} {}{reco}", e.label)));
+                if active {
+                    chip = chip.border_2().border_color(rgb(th.focus.ring));
+                }
+                chips = chips.child(chip);
+            }
+            chips = chips.child(
+                div()
+                    .id("m6-install-other")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.surface.raised))
+                    .text_color(rgb(th.text.primary))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_install_engine(cx);
+                    }))
+                    .child(text!(COPY_INSTALL_OTHER)),
+            );
+            col = col.child(chips);
+        }
+    }
+
+    // (M6-E) motor travado nesta story: troca exige reinício — F1-2-4 (nunca silencioso).
+    if is_edit {
+        col = col.child(
+            div()
+                .text_color(rgb(th.state.warning))
+                .child(text!(COPY_EDIT_ENGINE_LOCKED)),
+        );
+    }
+
+    // ── Nome (foco do teclado; dispara o co-piloto) ──
+    let (typed, typed_fg) = if modal.name().is_empty() {
+        (COPY_NAME_PLACEHOLDER.to_string(), th.text.muted)
+    } else {
+        (format!("{}▌", modal.name()), th.text.bright)
+    };
+    col = col.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(120.0))
+                    .text_color(rgb(th.text.primary))
+                    .child(text!(COPY_NAME_LABEL)),
+            )
+            .child(
+                div()
+                    .id("m6-name")
+                    .flex_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.surface.chrome))
+                    .border_1()
+                    .border_color(rgb(if modal.focus_field() == FocusField::Name {
+                        th.focus.ring
+                    } else {
+                        th.surface.border
+                    }))
+                    .text_color(rgb(typed_fg))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_focus(FocusField::Name, cx);
+                    }))
+                    .child(text!(typed)),
+            ),
+    );
+
+    // ── linha-fantasma do co-piloto (M6-E2) + por quê ──
+    if let Some(s) = modal.suggestion() {
+        let mut ghost = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("m6-ghost")
+                    .text_color(rgb(th.accent.primary))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_accept_suggestion(cx);
+                    }))
+                    .child(text!(copy_ghost(&s.label))),
+            )
+            .child(
+                div()
+                    .id("m6-why")
+                    .text_color(rgb(th.text.muted))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_toggle_why(cx);
+                    }))
+                    .child(text!(COPY_WHY_PREFIX)),
+            );
+        if modal.why_open() {
+            ghost = ghost.child(
+                div()
+                    .text_color(rgb(th.text.secondary))
+                    .child(text!(s.why.clone())),
+            );
+        }
+        col = col.child(ghost);
+    }
+
+    // ── cartão de Papel (humano: nome + 1 frase; nunca textarea/YAML) ──
+    let role_card = match modal.role() {
+        Some(r) => div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(th.surface.panel))
+            .border_1()
+            .border_color(rgb(th.surface.border))
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(th.text.primary))
+                    .child(text!(format!("✎ {}", r.label))),
+            )
+            .child(
+                div()
+                    .text_color(rgb(th.text.secondary))
+                    .child(text!(r.blurb.clone())),
+            ),
+        None => div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(th.surface.panel))
+            .text_color(rgb(th.text.muted))
+            .child(text!(COPY_ROLE_PLACEHOLDER)),
+    };
+    col = col.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(120.0))
+                    .text_color(rgb(th.text.primary))
+                    .child(text!(COPY_ROLE_LABEL)),
+            )
+            .child(div().flex_1().child(role_card))
+            .child(
+                div()
+                    .id("m6-role-swap")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.surface.raised))
+                    .text_color(rgb(th.text.bright))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_cycle_role(cx);
+                    }))
+                    .child(text!(COPY_ROLE_SWAP)),
+            ),
+    );
+
+    // ── Pasta de trabalho ──
+    col = col.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(120.0))
+                    .text_color(rgb(th.text.primary))
+                    .child(text!(COPY_CWD_LABEL)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(rgb(th.text.secondary))
+                    .child(text!(modal.cwd_display())),
+            )
+            .child(
+                div()
+                    .id("m6-cwd-pick")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.surface.raised))
+                    .text_color(rgb(th.text.bright))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_pick_folder(cx);
+                    }))
+                    .child(text!(COPY_CWD_PICK)),
+            ),
+    );
+
+    // ── ▸ Avançado (divulgação progressiva — o comando NUNCA é controle primário) ──
+    col = col.child(
+        div()
+            .id("m6-advanced")
+            .text_color(rgb(th.text.muted))
+            .cursor_pointer()
+            .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                v.modal_toggle_advanced(cx);
+            }))
+            .child(text!(if modal.advanced_open() {
+                COPY_ADVANCED_OPEN
+            } else {
+                COPY_ADVANCED
+            })),
+    );
+    if modal.advanced_open() {
+        let cmd = modal.effective_command();
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_CMD_LABEL)),
+                )
+                .child(
+                    div()
+                        .id("m6-cmd")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.chrome))
+                        .border_1()
+                        .border_color(rgb(if modal.focus_field() == FocusField::Command {
+                            th.focus.ring
+                        } else {
+                            th.surface.border
+                        }))
+                        .font_family("Menlo")
+                        .text_color(rgb(th.text.primary))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                            v.modal_focus(FocusField::Command, cx);
+                        }))
+                        .child(text!(format!("{cmd}▌"))),
+                ),
+        );
+    }
+
+    // ── erro inline (leigo) / descarte armado ──
+    if let Some(e) = modal.error() {
+        col = col.child(
+            div()
+                .text_color(rgb(th.state.danger))
+                .child(text!(e.to_string())),
+        );
+    }
+    if modal.discard_armed() {
+        col = col.child(
+            div()
+                .text_color(rgb(th.state.warning))
+                .child(text!(COPY_DISCARD_ARMED)),
+        );
+    }
+    if is_edit {
+        col = col.child(
+            div()
+                .text_color(rgb(th.text.muted))
+                .child(text!(COPY_EDIT_APPLY_NOTE)),
+        );
+    }
+
+    // ── rodapé: Cancelar · Criar/Salvar ──
+    col = col.child(
+        div()
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap_2()
+            .child(
+                div()
+                    .id("m6-cancel")
+                    .px_4()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.surface.raised))
+                    .text_color(rgb(th.text.bright))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_cancel(cx);
+                    }))
+                    .child(text!(COPY_CANCEL)),
+            )
+            .child(
+                div()
+                    .id("m6-create")
+                    .px_4()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.accent.confirm))
+                    .text_color(rgb(th.text.on_accent))
+                    .font_weight(FontWeight::BOLD)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, window, cx| {
+                        v.modal_commit(window, cx);
+                    }))
+                    .child(text!(if is_edit { COPY_SAVE } else { COPY_CREATE })),
+            ),
+    );
+
+    // backdrop + caixa central (irmão do overlay de nomeação do M2 que este modal substitui).
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(px(640.0))
+                .flex()
+                .flex_col()
+                .px_6()
+                .py_5()
+                .gap_2()
+                .rounded_lg()
+                .bg(rgb(th.surface.card))
+                .border_2()
+                .border_color(rgb(th.accent.create))
+                .child(col),
+        )
+        .into_any_element()
+}
+
+// ═══════════════════════════ testes (gpui-free) ═══════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::role_suggester::W31Suggester;
+
+    fn modal() -> AgentModal {
+        AgentModal::new_create(Arc::new(W31Suggester), vec![])
+    }
+
+    fn type_str(m: &mut AgentModal, s: &str) {
+        for c in s.chars() {
+            m.type_char(&c.to_string());
+        }
+    }
+
+    fn engines_one() -> Vec<Engine> {
+        vec![Engine {
+            id: "claude".into(),
+            label: engine_label("claude"),
+            version: Some("2.1".into()),
+            program: "claude".into(),
+            args: vec!["--flag".into()],
+            profile_id: Some("claude-code".into()),
+        }]
+    }
+
+    /// M6-E2: o co-piloto dispara na PAUSA (~600ms = SUGGEST_DEBOUNCE_TICKS), nunca a cada tecla.
+    #[test]
+    fn suggestion_fires_after_debounce_pause() {
+        let mut m = modal();
+        type_str(&mut m, "Revisor");
+        assert!(m.suggestion().is_none(), "sem sugestão antes da pausa");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS - 1 {
+            m.tick();
+        }
+        assert!(m.suggestion().is_none(), "ainda dentro da pausa");
+        assert!(m.tick(), "o tick da pausa produz mudança visível");
+        let s = m.suggestion().expect("linha-fantasma");
+        assert_eq!(s.role, "reviewer");
+        assert!(!s.why.is_empty(), "transparência: o porquê vem junto");
+    }
+
+    /// Aceitar (Tab) preenche o cartão de Papel; a sugestão NUNCA se aplica sozinha (governança).
+    #[test]
+    fn accept_fills_role_card_never_silently() {
+        let mut m = modal();
+        type_str(&mut m, "Revisor");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert!(m.role().is_none(), "antes do Tab o papel está vazio");
+        assert!(m.accept_suggestion());
+        assert_eq!(m.role().expect("cartão").role, "reviewer");
+        assert!(m.suggestion().is_none(), "ghost some após aceitar");
+        // continuar digitando NÃO muda o papel aplicado sem novo aceite.
+        type_str(&mut m, " Senior");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert_eq!(m.role().expect("cartão").role, "reviewer");
+    }
+
+    /// Re-sugestão só em mudança SUBSTANCIAL (papel diferente) — não a cada tecla (M6-E2).
+    #[test]
+    fn resuggests_only_on_substantial_change() {
+        let mut m = modal();
+        type_str(&mut m, "Revisor");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        m.accept_suggestion();
+        // mesmo papel re-derivado → sem ghost novo (sem ruído).
+        type_str(&mut m, " de PRs");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert!(m.suggestion().is_none(), "mesmo papel não re-sugere");
+        // nome que muda o papel → ghost novo aparece.
+        for _ in 0.."Revisor de PRs".len() {
+            m.backspace();
+        }
+        type_str(&mut m, "Designer de Landing");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert_eq!(
+            m.suggestion().expect("re-sugere").role,
+            "UIUX_DESIGNER",
+            "mudança substancial re-sugere"
+        );
+    }
+
+    /// Critério 5: nome vazio/só-espaços → erro INLINE leigo; NENHUM plano (nenhum evento).
+    #[test]
+    fn empty_name_is_rejected_inline_before_commit() {
+        let mut m = modal();
+        m.set_engines(engines_one());
+        assert_eq!(m.create_plan().unwrap_err(), COPY_ERR_EMPTY_NAME);
+        type_str(&mut m, "   ");
+        assert_eq!(m.create_plan().unwrap_err(), COPY_ERR_EMPTY_NAME);
+    }
+
+    /// Critérios 3/4: varrendo → espera leiga; zero motores → caminho de instalar (nunca beco);
+    /// com motor → plano com comando do CLI Profile (programa + args do TOML).
+    #[test]
+    fn engine_states_guard_creation() {
+        let mut m = modal();
+        type_str(&mut m, "Revisor");
+        assert_eq!(m.create_plan().unwrap_err(), COPY_ERR_SCANNING);
+        m.set_engines(vec![]);
+        assert_eq!(m.create_plan().unwrap_err(), COPY_ERR_NO_ENGINE);
+        m.set_engines(engines_one());
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.engine.program, "claude");
+        assert_eq!(plan.engine.args, vec!["--flag".to_string()]);
+        assert_eq!(plan.engine.profile_id.as_deref(), Some("claude-code"));
+    }
+
+    /// Dedup do nome (tabela de erros): sufixo automático "(2)" + aviso leve, sem bloquear.
+    #[test]
+    fn duplicate_name_gets_suffix_and_note() {
+        let mut m = AgentModal::new_create(
+            Arc::new(W31Suggester),
+            vec!["Revisor".into(), "Revisor (2)".into()],
+        );
+        m.set_engines(engines_one());
+        type_str(&mut m, "Revisor");
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.name, "Revisor (3)");
+        assert!(plan.dup_note.is_some(), "aviso leve presente");
+    }
+
+    /// Critério 7 (neutralidade): os profiles são lidos do DISCO em runtime — trocar o TOML muda
+    /// o comando do quick-start SEM recompilar (seed na 1ª vez; depois o arquivo manda).
+    #[test]
+    fn command_follows_profile_toml_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-m6-profiles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // 1ª carga: semeia o claude-code.toml default e o lê do disco.
+        let reg = load_profiles(&dir);
+        let found = vec![DiscoveredCli {
+            id: "claude".into(),
+            version: None,
+            path: "/usr/local/bin/claude".into(),
+        }];
+        let engines = engines_from(&found, &reg);
+        assert_eq!(engines[0].profile_id.as_deref(), Some("claude-code"));
+        assert_eq!(engines[0].program, "claude");
+        let default_args = engines[0].args.clone();
+        assert!(!default_args.is_empty(), "args do TOML default presentes");
+
+        // Usuário TROCA o TOML no disco (sem recompilar) → o comando muda.
+        std::fs::write(
+            dir.join("claude-code.toml"),
+            r#"
+id = "claude-code"
+program = "claude"
+args = ["--minha-flag-custom"]
+delivery = "pty_inject"
+prompt_ready_regex = '.'
+[end_signal]
+kind = "idle"
+"#,
+        )
+        .expect("escrever TOML custom");
+        let reg2 = load_profiles(&dir);
+        let engines2 = engines_from(&found, &reg2);
+        assert_eq!(
+            engines2[0].args,
+            vec!["--minha-flag-custom".to_string()],
+            "trocar o TOML mudou o comando sem recompilar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Esc com texto ARMA a confirmação de descarte; o 2º Esc fecha; sem texto fecha direto.
+    #[test]
+    fn escape_arms_discard_confirmation() {
+        let mut m = modal();
+        assert!(m.escape(), "vazio fecha direto");
+        let mut m = modal();
+        type_str(&mut m, "Revisor");
+        assert!(!m.escape(), "1º Esc arma, não fecha");
+        assert!(m.discard_armed());
+        assert!(m.escape(), "2º Esc descarta");
+        // digitar desarma (o usuário desistiu de descartar).
+        let mut m = modal();
+        type_str(&mut m, "Rev");
+        m.escape();
+        m.type_char("i");
+        assert!(!m.discard_armed(), "digitar desarma o descarte");
+    }
+
+    /// [Trocar] cicla papéis da biblioteca (humanizados) e PINA — a re-sugestão não atropela.
+    #[test]
+    fn cycle_role_pins_choice() {
+        let mut m = modal();
+        m.cycle_role();
+        let first = m.role().expect("papel da biblioteca").clone();
+        assert!(!first.label.contains('_'), "rótulo leigo");
+        m.cycle_role();
+        assert_ne!(m.role().unwrap().role, first.role, "cicla papéis distintos");
+        // papel pinado + nome que sugere outro → ghost aparece (pergunta), mas não troca sozinho.
+        type_str(&mut m, "Revisor");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert_ne!(
+            m.role().unwrap().role,
+            "reviewer",
+            "pinado não troca sozinho"
+        );
+    }
+
+    /// M6-E (modo edição): pré-preenchido; Salvar detecta mudança de nome e papel; renomear p/
+    /// o PRÓPRIO nome não ganha sufixo de dedup.
+    #[test]
+    fn edit_mode_save_plan_detects_changes() {
+        let node = uuid::Uuid::now_v7();
+        let mut m = AgentModal::new_edit(
+            Arc::new(W31Suggester),
+            node,
+            "Ajudante",
+            Some("WRITER"),
+            vec!["Ajudante".into(), "Outro".into()],
+        );
+        assert_eq!(m.role().unwrap().role, "WRITER");
+        // sem mudanças: plano preserva nome, papel None (não mudou).
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.name, "Ajudante");
+        assert_eq!(p.role, None);
+        // muda papel via biblioteca → plano carrega papel novo.
+        m.cycle_role();
+        let role_now = m.role().unwrap().role.clone();
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.role.as_deref(), Some(role_now.as_str()));
+    }
+
+    /// Critério 2 (auditoria de copy): NENHUM estado do modal mostra YAML/TOML/"profile"/
+    /// "terminal" — o leigo nunca vê jargão (anti-padrões 1/2/5 do fluxo (a)).
+    #[test]
+    fn copy_has_no_jargon() {
+        let dynamic = [
+            copy_ghost("Revisor"),
+            copy_dup_note("Revisor (2)"),
+            engine_label("claude"),
+            engine_label("agy"),
+        ];
+        let all: Vec<&str> = [
+            COPY_TITLE_CREATE,
+            COPY_TITLE_EDIT,
+            COPY_QUICKSTART,
+            COPY_SCANNING,
+            COPY_EMPTY_TITLE,
+            COPY_EMPTY_CTA,
+            COPY_INSTALL_OTHER,
+            COPY_NAME_LABEL,
+            COPY_NAME_PLACEHOLDER,
+            COPY_ROLE_LABEL,
+            COPY_ROLE_PLACEHOLDER,
+            COPY_ROLE_SWAP,
+            COPY_CWD_LABEL,
+            COPY_CWD_DEFAULT,
+            COPY_CWD_PICK,
+            COPY_ADVANCED,
+            COPY_ADVANCED_OPEN,
+            COPY_CMD_LABEL,
+            COPY_CREATE,
+            COPY_SAVE,
+            COPY_CANCEL,
+            COPY_ERR_EMPTY_NAME,
+            COPY_ERR_SCANNING,
+            COPY_ERR_NO_ENGINE,
+            COPY_DISCARD_ARMED,
+            COPY_EDIT_ENGINE_LOCKED,
+            COPY_EDIT_APPLY_NOTE,
+            COPY_WHY_PREFIX,
+        ]
+        .into_iter()
+        .chain(dynamic.iter().map(String::as_str))
+        .collect();
+        for s in all {
+            let low = s.to_lowercase();
+            for jargon in ["yaml", "toml", "profile", "terminal", "frontmatter"] {
+                assert!(
+                    !low.contains(jargon),
+                    "jargão {jargon:?} na copy do modal: {s:?}"
+                );
+            }
+        }
+    }
+
+    /// Comando custom no Avançado: o override entra no plano (programa + args re-parseados);
+    /// trocar o motor selecionado descarta o override (o comando segue o motor).
+    #[test]
+    fn advanced_command_override_enters_plan() {
+        let mut m = modal();
+        m.set_engines(engines_one());
+        type_str(&mut m, "Revisor");
+        m.toggle_advanced();
+        m.set_focus(FocusField::Command);
+        // limpa o derivado e digita um comando custom.
+        for _ in 0..m.effective_command().len() {
+            m.backspace();
+        }
+        type_str(&mut m, "meu-cli --x");
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.engine.program, "meu-cli");
+        assert_eq!(plan.engine.args, vec!["--x".to_string()]);
+        // trocar o motor reseta o override.
+        m.select_engine(0);
+        assert_eq!(m.effective_command(), "claude --flag");
+    }
+}
