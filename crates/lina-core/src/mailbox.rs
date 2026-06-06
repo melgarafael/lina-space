@@ -16,6 +16,32 @@ use uuid::Uuid;
 /// Versão do contrato de mensagem na mailbox (design §3.4).
 pub const MAIL_SCHEMA_V1: &str = "lina/msg@1";
 
+/// **F1-0-5 — `lina/msg@2`:** o envelope com `intent` OBRIGATÓRIO do enum canônico e
+/// contrato de handoff estruturado ([`HandoffContract`]). O `@1` segue aceito intacto
+/// (upcasting: `contract` ausente → `None`; intent livre tolerado como sempre foi).
+pub const MAIL_SCHEMA_V2: &str = "lina/msg@2";
+
+/// **Enum canônico de intents do `lina/msg@2`** (F1-0-5). Decisões registradas:
+/// - `status` **CANONIZADO** (DIRECIONAMENTO §P2-bônus: os agentes o inventaram em campo
+///   e é observabilidade útil — canonizar > remover da doutrina).
+/// - O `plan` da proposta inicial da story foi realizado nos **2 verbos reais** do W3-5
+///   (`plan.claim`/`plan.check`) — inventar um `plan` solto quebraria o mecanismo vivo.
+/// - `reply` (resposta que fecha `await`, exige `reply_to`) e `permission` (fila de
+///   permissão F1-1) entram reservados.
+/// - `review` (resíduo do doc do `@1`) **NÃO entra**: nenhum mecanismo o consome; a
+///   doutrina deve parar de citá-lo (sync doutrina×binário é o critério 3 de F1-0-6).
+pub const CANONICAL_INTENTS_V2: &[&str] = &[
+    "ask",
+    "handoff",
+    "reply",
+    "status",
+    "broadcast",
+    "handshake",
+    "plan.claim",
+    "plan.check",
+    "permission",
+];
+
 /// Teto de tamanho de uma mensagem da mailbox (guarda anti-DoS no `drain`). Uma `MailMessage`
 /// legítima é pequena; acima disto é descartada sem ser lida (evita travar o supervisor).
 pub const MAX_MSG_BYTES: u64 = 256 * 1024;
@@ -98,6 +124,120 @@ pub struct MailMessage {
     /// Carimbo de chegada (ms desde a época) — janela de dedupe.
     #[serde(default)]
     pub ts_ms: u64,
+    /// **F1-0-5 (`lina/msg@2`):** contrato estruturado do handoff. Obrigatório quando
+    /// `schema == lina/msg@2` e `intent == handoff` (validado DE FORMA pelo router —
+    /// jamais pelo LLM); `None` em `@1` (upcasting) e nos demais intents. São **dados
+    /// transportados** ao destino: NENHUM campo daqui decide identidade/ordem/autorização
+    /// (a autenticação em duas camadas — carimbo no drain + roster — segue a única
+    /// autoridade; ADR 0006/0007).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<HandoffContract>,
+}
+
+/// **F1-0-5 — contrato de handoff do `lina/msg@2`** (pesquisa 13.11 §P2: "constraints
+/// implícitas não atravessam o handoff — e isso é estrutural"). Campos com `default`
+/// no serde de propósito: um contrato MAL-FORMADO deve chegar ao **router** e ser
+/// recusado com erro legível (nunca descartado em silêncio no parse do drain).
+/// `input_schema`/`output_schema` são **texto/JSON-string descritivo** — a validação do
+/// router é de PRESENÇA/forma; o conteúdo é honrado pelo agente destino.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffContract {
+    /// O que o destino recebe (forma da entrada — descrição ou JSON-schema textual).
+    #[serde(default)]
+    pub input_schema: String,
+    /// O que o destino deve devolver (forma da saída esperada).
+    #[serde(default)]
+    pub output_schema: String,
+    /// Códigos de erro que o destino pode devolver (ex.: `E_TIMEOUT`).
+    #[serde(default)]
+    pub error_codes: Vec<String>,
+    /// Teto da tarefa em segundos (>= 1; `0` = ausente → recusado).
+    #[serde(default)]
+    pub timeout_sec: u64,
+    /// Política de retry combinada (ex.: `none` | `manual`).
+    #[serde(default)]
+    pub retry_policy: String,
+    /// Constraints EXPLÍCITAS serializadas (nível de autonomia, budget restante, escopo
+    /// de arquivos…) — nada implícito "que o outro agente deve adivinhar".
+    #[serde(default)]
+    pub constraints_metadata: std::collections::BTreeMap<String, String>,
+}
+
+/// Violação de forma de um envelope `@2` — vira `RouteBlocked` tipado + erro legível.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvelopeViolation {
+    /// `intent`/schema fora do contrato (loga `invalid_intent`).
+    Intent(String),
+    /// Bloco `contract` ausente/incompleto num handoff (loga `invalid_contract`).
+    Contract(String),
+}
+
+impl EnvelopeViolation {
+    /// A mensagem legível para o agente corrigir.
+    #[must_use]
+    pub fn why(&self) -> &str {
+        match self {
+            EnvelopeViolation::Intent(w) | EnvelopeViolation::Contract(w) => w,
+        }
+    }
+}
+
+/// **F1-0-5 — validação DE FORMA do envelope, no router (nunca no LLM).**
+/// `@1` passa intacto (compat total — o contorno `ask --intent handoff` de campo segue
+/// roteando); `@2` exige `intent` do enum canônico, `reply_to` em `reply`, e o
+/// [`HandoffContract`] completo em `handoff`. Schema desconhecido é recusado
+/// (forward-guard: nunca rotear o que não entendemos).
+///
+/// # Errors
+/// [`EnvelopeViolation`] com a mensagem que NOMEIA o campo faltante.
+pub fn validate_envelope_v2(msg: &MailMessage) -> Result<(), EnvelopeViolation> {
+    match msg.schema.as_str() {
+        MAIL_SCHEMA_V1 => Ok(()),
+        MAIL_SCHEMA_V2 => {
+            if !CANONICAL_INTENTS_V2.contains(&msg.intent.as_str()) {
+                return Err(EnvelopeViolation::Intent(format!(
+                    "intent {:?} fora do enum canônico do lina/msg@2 — use um de: {}",
+                    msg.intent,
+                    CANONICAL_INTENTS_V2.join("|")
+                )));
+            }
+            if msg.intent == "reply" && msg.reply_to.is_none() {
+                return Err(EnvelopeViolation::Intent(
+                    "intent 'reply' exige reply_to (o id da pergunta que esta resposta fecha)"
+                        .into(),
+                ));
+            }
+            if msg.intent == "handoff" {
+                let Some(c) = &msg.contract else {
+                    return Err(EnvelopeViolation::Contract(
+                        "handoff lina/msg@2 exige o bloco `contract` (contrato ausente): \
+                         input_schema, output_schema, timeout_sec, retry_policy"
+                            .into(),
+                    ));
+                };
+                let missing = if c.input_schema.trim().is_empty() {
+                    Some(("input_schema", "o que o destino recebe"))
+                } else if c.output_schema.trim().is_empty() {
+                    Some(("output_schema", "a forma da resposta esperada"))
+                } else if c.timeout_sec == 0 {
+                    Some(("timeout_sec", "teto da tarefa em segundos, >= 1"))
+                } else if c.retry_policy.trim().is_empty() {
+                    Some(("retry_policy", "ex.: none | manual"))
+                } else {
+                    None
+                };
+                if let Some((field, hint)) = missing {
+                    return Err(EnvelopeViolation::Contract(format!(
+                        "contrato de handoff inválido: falta {field} ({hint})"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        other => Err(EnvelopeViolation::Intent(format!(
+            "schema desconhecido {other:?} — este lina fala {MAIL_SCHEMA_V1} e {MAIL_SCHEMA_V2}"
+        ))),
+    }
 }
 
 impl MailMessage {
@@ -122,7 +262,30 @@ impl MailMessage {
             reply_to: None,
             hops: 0,
             ts_ms: now_ms(),
+            contract: None,
         }
+    }
+
+    /// **F1-0-5:** nova mensagem `lina/msg@2` — como [`MailMessage::new`], mas com o
+    /// schema v2 (intent passa a ser OBRIGATÓRIO do enum canônico; ver
+    /// [`validate_envelope_v2`]).
+    #[must_use]
+    pub fn new_v2(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        intent: impl Into<String>,
+        payload: impl Into<String>,
+    ) -> Self {
+        let mut msg = Self::new(from, to, intent, payload);
+        msg.schema = MAIL_SCHEMA_V2.to_string();
+        msg
+    }
+
+    /// Anexa o contrato de handoff (encadeável) — obrigatório em `@2` + `handoff`.
+    #[must_use]
+    pub fn with_contract(mut self, contract: HandoffContract) -> Self {
+        self.contract = Some(contract);
+        self
     }
 
     /// Marca como bloqueante (`--await`).
@@ -701,7 +864,8 @@ pub fn render_message_block(
 /// **Renderiza o bloco `[LINA::MSG]` COMPLETO** (W3-7) — como [`render_message_block`], mas inclui
 /// `root_cause_id` e `hops` (auditoria/UX), achatados/neutralizados como os demais campos. O
 /// ENFORCEMENT de cadeia NÃO depende destes campos (vem do binding do supervisor — A2); aqui são
-/// apenas informativos para o agente/observador.
+/// apenas informativos para o agente/observador. Forma `@1` congelada (sem contrato) —
+/// delega em [`render_message_block_v2`] com `contract = None`.
 #[must_use]
 pub fn render_message_block_full(
     id: &str,
@@ -712,12 +876,62 @@ pub fn render_message_block_full(
     root_cause_id: &str,
     hops: u8,
 ) -> String {
+    render_message_block_v2(
+        id,
+        from_name,
+        to_name,
+        intent,
+        payload,
+        root_cause_id,
+        hops,
+        None,
+    )
+}
+
+/// **F1-0-5 — bloco `[LINA::MSG]` com o contrato de handoff LEGÍVEL** (constraint-transfer:
+/// o destino lê `contract.*`/`constraint.*` linha a linha; nada implícito atravessa o
+/// handoff "para o outro agente adivinhar"). Sem contrato (`None`) o output é
+/// byte-idêntico ao [`render_message_block_full`] do W3-7 (forma `@1` congelada).
+/// Mesma defesa-em-profundidade: TODO campo (inclusive chaves/valores das constraints)
+/// é achatado em uma linha e tem as sentinelas neutralizadas.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn render_message_block_v2(
+    id: &str,
+    from_name: &str,
+    to_name: &str,
+    intent: &str,
+    payload: &str,
+    root_cause_id: &str,
+    hops: u8,
+    contract: Option<&HandoffContract>,
+) -> String {
     let id = one_line(&neutralize_sentinels(id));
     let root_cause_id = one_line(&neutralize_sentinels(root_cause_id));
     let from_name = one_line(from_name);
     let to_name = one_line(to_name);
     let intent = one_line(if intent.is_empty() { "ask" } else { intent });
     let payload = one_line(&neutralize_sentinels(payload));
+    let contract_block = contract.map_or(String::new(), |c| {
+        let input = one_line(&neutralize_sentinels(&c.input_schema));
+        let output = one_line(&neutralize_sentinels(&c.output_schema));
+        let errors = one_line(&neutralize_sentinels(&c.error_codes.join(", ")));
+        let retry = one_line(&neutralize_sentinels(&c.retry_policy));
+        let mut s = format!(
+            "contract.input_schema: {input}\n\
+             contract.output_schema: {output}\n\
+             contract.error_codes: {errors}\n\
+             contract.timeout_sec: {}\n\
+             contract.retry_policy: {retry}\n",
+            c.timeout_sec
+        );
+        for (k, v) in &c.constraints_metadata {
+            let k = one_line(&neutralize_sentinels(k));
+            let v = one_line(&neutralize_sentinels(v));
+            s.push_str(&format!("constraint.{k}: {v}\n"));
+        }
+        s
+    });
     format!(
         "[LINA::MSG]\n\
          id: {id}\n\
@@ -727,6 +941,7 @@ pub fn render_message_block_full(
          to: {to_name}\n\
          intent: {intent}\n\
          payload: {payload}\n\
+         {contract_block}\
          [EXPECTED] responda ao colega no formato pedido; narre ao usuario so o resultado em pt-br.\n\
          [/LINA::MSG]"
     )

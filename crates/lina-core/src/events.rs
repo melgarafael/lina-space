@@ -60,6 +60,12 @@ pub enum BlockReason {
     BudgetExceeded,
     Deadlock,
     LoopDetected,
+    /// F1-0-5 (`lina/msg@2`): `intent` fora do enum canônico, `reply` sem `reply_to`,
+    /// ou schema desconhecido. Aditivo — logs antigos não o contêm (replay intacto).
+    InvalidIntent,
+    /// F1-0-5 (`lina/msg@2`): handoff sem o contrato completo (input/output_schema,
+    /// timeout_sec, retry_policy). Aditivo como acima.
+    InvalidContract,
 }
 
 /// W3-7b (ADR 0002): motivo do fechamento de um `await`. Serializa em `snake_case`

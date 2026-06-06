@@ -53,8 +53,9 @@ pub use a2a::{
 /// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
 mod mailbox;
 pub use mailbox::{
-    now_ms, parse_target, render_message_block, render_message_block_full, AgentPresence,
-    MailMessage, Mailbox, TargetSpec, MAIL_SCHEMA_V1,
+    now_ms, parse_target, render_message_block, render_message_block_full, render_message_block_v2,
+    validate_envelope_v2, AgentPresence, EnvelopeViolation, HandoffContract, MailMessage, Mailbox,
+    TargetSpec, CANONICAL_INTENTS_V2, MAIL_SCHEMA_V1, MAIL_SCHEMA_V2,
 };
 
 /// W3-4: roteador do supervisor (pipeline `route_message` com guardrails 0-4).

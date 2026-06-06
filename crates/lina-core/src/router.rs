@@ -15,7 +15,10 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::events::{AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, StoreError};
-use crate::mailbox::{parse_target, render_message_block_full, MailMessage, Mailbox, TargetSpec};
+use crate::mailbox::{
+    parse_target, render_message_block_v2, validate_envelope_v2, EnvelopeViolation, MailMessage,
+    Mailbox, TargetSpec,
+};
 use crate::plan::PlanError;
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, Recipient, RolePolicy, Supervisor};
 
@@ -147,6 +150,12 @@ pub enum RouteOutcome {
     /// de `UnknownSender("")`: o drain FLAT do handshake anonimiza `from → ""`, e antes deste desfecho a
     /// presença morria como erro espúrio no log (ruído que PARECIA falha, mas é o caminho esperado).
     Presence,
+    /// F1-0-5 (`lina/msg@2`): envelope recusado pela validação DE FORMA — intent fora do
+    /// enum canônico, `reply` sem `reply_to`, schema desconhecido, ou handoff sem o
+    /// contrato completo. A `String` é o erro LEGÍVEL que nomeia o campo, para o agente
+    /// corrigir e reenviar (a recusa também vai ao log: `RouteBlocked{invalid_intent|
+    /// invalid_contract}` — ADR 0003, o log é o livro-razão das recusas).
+    ContractRejected(String),
 }
 
 /// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
@@ -460,6 +469,20 @@ impl Router {
             return RouteOutcome::UnknownSender(msg.from.clone());
         };
 
+        // ── F1-0-5: validação DE FORMA do envelope (`lina/msg@2`) — intent canônico +
+        //    contrato de handoff completo. DEPOIS da autenticação do remetente (identidade
+        //    decide ANTES de qualquer campo do contrato — red-team da story) e ANTES do
+        //    desvio de plano/entrega. `@1` passa intacto (compat). Validação NO ROUTER,
+        //    nunca no LLM (13.11 §P2); a recusa é estruturada e LEGÍVEL (o agente corrige).
+        if let Err(violation) = validate_envelope_v2(msg) {
+            let reason = match &violation {
+                EnvelopeViolation::Intent(_) => BlockReason::InvalidIntent,
+                EnvelopeViolation::Contract(_) => BlockReason::InvalidContract,
+            };
+            log_block(store, msg, reason);
+            return RouteOutcome::ContractRejected(violation.why().to_string());
+        }
+
         // ── W3-5: intents de plano NÃO são delegação A2A. O supervisor os APLICA ao `plan.md`
         //    (escritor único) e LOGA o evento, sem entregar a nenhuma PTY. Desviam aqui — depois do
         //    dedupe (reenvios são absorvidos) E da resolução de origem (Round 6: `by` = origem
@@ -712,8 +735,11 @@ impl Router {
         }
 
         // Renderiza o bloco [LINA::MSG] (com root_cause_id/hops achatados — auditoria/UX) e entrega.
+        // F1-0-5: o contrato/constraints (quando presentes) entram LEGÍVEIS no bloco — é o
+        // constraint-transfer: nada implícito atravessa o handoff. São dados transportados;
+        // nenhuma decisão do router (acima) os leu.
         let to_label = recipient_label(&recipient, &msg.to);
-        let block = render_message_block_full(
+        let block = render_message_block_v2(
             &msg.id,
             &msg.from,
             &to_label,
@@ -721,6 +747,7 @@ impl Router {
             &msg.payload,
             &root,
             hops,
+            msg.contract.as_ref(),
         );
         let mut delivered = Vec::with_capacity(targets.len());
         for target in targets {

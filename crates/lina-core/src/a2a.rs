@@ -35,9 +35,9 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 const PASTE_END_STR: &str = "\x1b[201~";
 const PASTE_BEGIN_STR: &str = "\x1b[200~";
 
-/// Tempo máximo esperando o prompt ficar pronto antes de injetar mesmo assim.
-const READY_TIMEOUT: Duration = Duration::from_secs(2);
-/// Intervalo de polling do grid no `wait_ready`.
+/// Intervalo de polling do grid no `wait_ready`. O ORÇAMENTO da espera vem do perfil
+/// (`CliProfile::ready_timeout`, default 2s) — F1-0-2: timeout → **não injeta** (o
+/// "injeta mesmo assim" histórico era o mecanismo do texto-colado 18/20 da baseline).
 const READY_POLL: Duration = Duration::from_millis(10);
 /// Timeout para adquirir o lock lógico do PTY do alvo.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,6 +56,12 @@ pub enum A2aError {
     /// Política de injeção negou este par (allow-list por nó).
     #[error("injeção de {from} em {target} negada pela allow-list")]
     InjectionDenied { from: NodeId, target: NodeId },
+    /// F1-0-2: o prompt do alvo NÃO ficou pronto dentro do orçamento — a mensagem **não
+    /// foi injetada** (zero write na fila). Quem decide re-tentar é o chamador (F1-0-4
+    /// retém por estado; até lá o desfecho é visível no log como entrega falhada, nunca
+    /// texto-colado silencioso).
+    #[error("prompt de {target} não ficou pronto em {waited_ms}ms; mensagem NÃO injetada")]
+    NotReady { target: NodeId, waited_ms: u64 },
     /// Erro vindo do supervisor (alvo inexistente, lock, etc.).
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
@@ -68,7 +74,41 @@ pub enum A2aError {
 pub trait GridSense: Send + Sync {
     fn mode(&self) -> TermMode;
     fn last_nonempty_line(&self) -> String;
+    /// F1-0-2: texto da REGIÃO DE INPUT do grid (da última linha-prompt ao fim; ver a
+    /// impl real). É o que o `prompt_ready_regex` multiline e os `busy_markers` julgam —
+    /// a ÚLTIMA linha sozinha é o sensor errado (na TUI do Claude Code ela é o rodapé
+    /// de atalhos, nunca o prompt — grids reais da baseline F1-0). Default compatível
+    /// para sensores simples: a última linha não-vazia.
+    fn input_region_text(&self) -> String {
+        self.last_nonempty_line()
+    }
 }
+
+/// Linha de prompt vivo da TUI: `>` ou `❯` no início seguido de whitespace (espaço
+/// comum na v2.1.166 — grids da baseline; **NBSP** U+00A0 na v2.1.167 — prova com
+/// claude vivo do gate F1-0-2), opcionalmente atrás da borda `│`. Sem aceitar o NBSP,
+/// a âncora da região cai numa linha de ECO do histórico (`❯ msg já submetida`) e o
+/// sensor erra a região inteira — a deriva de TUI que a baseline §3 previu.
+fn is_prompt_row(row: &str) -> bool {
+    let mut t = row.trim_start();
+    if let Some(rest) = t.strip_prefix('│') {
+        t = rest.trim_start();
+    }
+    for glyph in ['>', '❯'] {
+        if let Some(rest) = t.strip_prefix(glyph) {
+            // fim de linha ("❯") ou glifo seguido de QUALQUER whitespace unicode
+            // (espaço, NBSP…) — mesma família que o `\s` do prompt_ready_regex casa.
+            if rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Fallback quando nenhuma linha-prompt existe no viewport: últimas N linhas não-vazias
+/// (mesma constante da calibração da baseline).
+const REGION_FALLBACK_ROWS: usize = 8;
 
 /// O grid do pty-host vive atrás de `Arc<Mutex<Box<dyn VtBackend>>>`; lê sob lock.
 impl GridSense for Arc<Mutex<Box<dyn VtBackend>>> {
@@ -77,6 +117,24 @@ impl GridSense for Arc<Mutex<Box<dyn VtBackend>>> {
     }
     fn last_nonempty_line(&self) -> String {
         lock(self).last_nonempty_line()
+    }
+    /// Região de input REAL: linhas não-vazias do viewport, da ÚLTIMA linha-prompt
+    /// (`>`/`❯`, com/sem borda) até o fim — echo de mensagens já submetidas fica ACIMA
+    /// do prompt vivo e fora da região. Sem linha-prompt → últimas 8 não-vazias.
+    fn input_region_text(&self) -> String {
+        let rows: Vec<String> = {
+            let g = lock(self);
+            let (_, nrows) = g.dims();
+            (0..nrows)
+                .map(|i| g.row_text(i))
+                .filter(|r| !r.trim().is_empty())
+                .collect()
+        };
+        let start = rows
+            .iter()
+            .rposition(|r| is_prompt_row(r))
+            .unwrap_or_else(|| rows.len().saturating_sub(REGION_FALLBACK_ROWS));
+        rows[start..].join("\n")
     }
 }
 
@@ -127,10 +185,25 @@ pub fn build_paste(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
-fn wait_ready(grid: &dyn GridSense, prompt: &Regex, timeout: Duration) -> bool {
+/// F1-0-2: veredito de prontidão sobre a REGIÃO de input — pronto ⇔ alguma linha casa o
+/// `prompt_ready_regex` **E** nenhum `busy_marker` está presente. O glifo de prompt
+/// sozinho NÃO basta: a TUI do Claude Code mostra `❯ ` o tempo todo (inclusive com
+/// mensagem enfileirada — "Press up to edit queued messages"); o que distingue ocupado
+/// é o marcador no rodapé ("esc to interrupt"). Função PURA — testada contra réplicas
+/// byte-fiéis dos grids reais capturados pela baseline F1-0.
+fn ready_now(region: &str, prompt: &Regex, busy_markers: &[String]) -> bool {
+    prompt.is_match(region) && !busy_markers.iter().any(|m| region.contains(m.as_str()))
+}
+
+fn wait_ready(
+    grid: &dyn GridSense,
+    prompt: &Regex,
+    busy_markers: &[String],
+    timeout: Duration,
+) -> bool {
     let start = Instant::now();
     loop {
-        if prompt.is_match(&grid.last_nonempty_line()) {
+        if ready_now(&grid.input_region_text(), prompt, busy_markers) {
             return true;
         }
         if start.elapsed() >= timeout {
@@ -239,10 +312,20 @@ pub fn deliver_a2a(
         return Ok(DeliveryOutcome::SessionResume);
     }
 
-    // 1) wait_ready: o prompt do alvo está pronto? (compila o regex 1x).
+    // 1) wait_ready: espera o prompt REAL do alvo dentro do orçamento do perfil
+    //    (`ready_timeout_ms`, default 2s). F1-0-2: timeout → **NÃO injeta** — injetar
+    //    "mesmo assim" num alvo ocupado era o mecanismo do texto-colado (18/20 na
+    //    baseline). O desfecho é erro EXPLÍCITO; F1-0-4 evolui para retenção por estado.
     let prompt =
         Regex::new(&profile.prompt_ready_regex).map_err(|e| A2aError::BadRegex(e.to_string()))?;
-    let ready = wait_ready(grid, &prompt, READY_TIMEOUT);
+    let budget = profile.ready_timeout();
+    if !wait_ready(grid, &prompt, &profile.busy_markers, budget) {
+        return Err(A2aError::NotReady {
+            target,
+            waited_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        });
+    }
+    let ready = true; // invariante pós-fix: só se injeta com prontidão verificada
 
     // 2) bracketed só se o alvo está em BRACKETED_PASTE mode.
     let bracketed = grid.mode().bracketed_paste;
@@ -845,14 +928,275 @@ mod tests {
         assert!(!r.truncated);
     }
 
-    /// `wait_ready` casa o `prompt_ready_regex` na última linha do grid.
+    /// `wait_ready` casa o `prompt_ready_regex` na REGIÃO de input do grid (F1-0-2).
     #[test]
     fn wait_ready_matches_prompt() {
         let re = Regex::new(r"\$").expect("regex");
         let ready = grid("$ ", false);
-        assert!(wait_ready(&ready, &re, Dur::from_millis(50)));
+        assert!(wait_ready(&ready, &re, &[], Dur::from_millis(50)));
 
         let not_ready = grid("trabalhando...", false);
-        assert!(!wait_ready(&not_ready, &re, Dur::from_millis(50)));
+        assert!(!wait_ready(&not_ready, &re, &[], Dur::from_millis(50)));
+    }
+
+    // ── F1-0-2: prontidão REAL — região de input + busy markers (grids da baseline) ──
+
+    /// Região de baixo de um claude OCUPADO streamando — réplica byte-fiel do grid REAL
+    /// capturado pela baseline F1-0 (`baseline-artifacts/grids/stuck-11.txt`): a caixa de
+    /// input mostra `❯ ` MESMO ocupado; o que denuncia o ocupado é o rodapé.
+    const REAL_BUSY_REGION: &str =
+        "❯ \n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt";
+    /// Grid REAL com mensagem ENFILEIRADA (`stuck-15.txt`) — o prompt-glifo aparece E a
+    /// linha do prompt carrega o banner de fila (o caso que enganaria o regex sozinho).
+    const REAL_QUEUED_REGION: &str = "❯ Press up to edit queued messages\n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt";
+    /// Claude OCIOSO no prompt: rodapé SEM "esc to interrupt" (validar na tela — F1-0-2
+    /// critério 2; a forma exata do rodapé idle é a única parte não coberta pelos grids
+    /// da baseline, que só capturou alvos presos).
+    const REAL_IDLE_REGION: &str = "❯ \n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    /// O regex REAL do `profiles/claude-code.toml` (testado contra ele no
+    /// `claude_profile_real_file_is_calibrated`).
+    const REAL_PROMPT_REGEX: &str = r"(?m)^\s*[>❯]\s";
+
+    fn claude_busy_markers() -> Vec<String> {
+        vec![
+            "esc to interrupt".to_string(),
+            "Press up to edit queued messages".to_string(),
+        ]
+    }
+
+    /// Perfil com o regex REAL do claude-code + busy markers REAIS + budget curto (teste).
+    fn claude_like_profile(ready_timeout_ms: u64) -> CliProfile {
+        let src = format!(
+            r#"
+            id = "claude-like"
+            program = "claude"
+            delivery = "pty_inject"
+            submit_delay_ms = 5
+            prompt_ready_regex = '(?m)^\s*[>❯]\s'
+            ready_timeout_ms = {ready_timeout_ms}
+            busy_markers = ["esc to interrupt", "Press up to edit queued messages"]
+            idle_ms = 100
+            ask_timeout_ms = 100000
+            [end_signal]
+            kind = "stream_json"
+            event_type = "result"
+        "#
+        );
+        CliProfile::from_toml_str(&src, "<test>").expect("perfil claude-like parseia")
+    }
+
+    /// Mock de grid com região FIXA (para fixtures dos grids reais).
+    struct FixedGrid {
+        region: String,
+        bracketed: bool,
+    }
+    impl GridSense for FixedGrid {
+        fn mode(&self) -> TermMode {
+            TermMode {
+                bracketed_paste: self.bracketed,
+                app_cursor: false,
+            }
+        }
+        fn last_nonempty_line(&self) -> String {
+            self.region.lines().last().unwrap_or_default().to_string()
+        }
+        fn input_region_text(&self) -> String {
+            self.region.clone()
+        }
+    }
+
+    /// Região OCIOSA REAL do Claude Code **v2.1.167** (capturada pela prova com claude
+    /// vivo do gate F1-0-2): o prompt vivo VAZIO renderiza `❯` + **NBSP** (U+00A0), e o
+    /// rodapé idle não tem "esc to interrupt". A v2.1.166 usava espaço comum — a regra
+    /// de linha-prompt precisa aceitar os dois (deriva de TUI prevista na baseline §3).
+    const REAL_IDLE_REGION_V2167: &str =
+        "❯\u{a0}\n────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+
+    /// `is_prompt_row` reconhece o prompt vivo nas DUAS gerações da TUI: espaço comum
+    /// (v2.1.166, grids da baseline) e NBSP (v2.1.167, prova com claude vivo) — sem o
+    /// NBSP a âncora da região cai na linha de ECO do histórico (`❯ PROBE…`), que
+    /// produz falso "preso" e região errada.
+    #[test]
+    fn is_prompt_row_accepts_nbsp_live_prompt() {
+        assert!(is_prompt_row("❯ "), "espaço comum (v2.1.166)");
+        assert!(is_prompt_row("❯\u{a0}"), "NBSP (v2.1.167, claude real)");
+        assert!(is_prompt_row("❯\u{a0}texto digitado"), "NBSP com texto");
+        assert!(is_prompt_row("│ ❯ x"), "com borda de caixa");
+        assert!(
+            !is_prompt_row("⏺ Ok, mensagem ignorada."),
+            "linha de resposta não"
+        );
+        assert!(!is_prompt_row("✻ Churned for 5s"), "spinner não");
+    }
+
+    /// A região idle REAL da v2.1.167 é julgada PRONTA (regex `\s` casa NBSP; rodapé
+    /// idle não carrega busy marker).
+    #[test]
+    fn ready_now_accepts_real_v2167_idle_region() {
+        let re = Regex::new(REAL_PROMPT_REGEX).expect("regex");
+        assert!(ready_now(
+            REAL_IDLE_REGION_V2167,
+            &re,
+            &claude_busy_markers()
+        ));
+    }
+
+    /// `ready_now` julga as regiões REAIS corretamente: ocupado/enfileirado → NÃO pronto
+    /// (mesmo com o glifo `❯` visível); ocioso → pronto; sem prompt → não pronto.
+    #[test]
+    fn ready_now_judges_real_grid_regions() {
+        let re = Regex::new(REAL_PROMPT_REGEX).expect("regex real compila");
+        let markers = claude_busy_markers();
+        assert!(
+            !ready_now(REAL_BUSY_REGION, &re, &markers),
+            "claude streamando (rodapé 'esc to interrupt') NÃO está pronto"
+        );
+        assert!(
+            !ready_now(REAL_QUEUED_REGION, &re, &markers),
+            "mensagem enfileirada NÃO é prontidão — o caso que o regex sozinho erraria"
+        );
+        assert!(
+            ready_now(REAL_IDLE_REGION, &re, &markers),
+            "ocioso no prompt → pronto"
+        );
+        assert!(
+            !ready_now("✻ Pondering…\n  trabalhando", &re, &markers),
+            "região sem linha-prompt não é prontidão"
+        );
+    }
+
+    /// **Critério 1 da F1-0-2 (o fix do P0):** alvo fora do prompt → `deliver_a2a` espera
+    /// até o budget e, no timeout, **NÃO injeta** (erro explícito; zero `WriteOp` na fila).
+    /// Antes do fix: injetava "mesmo assim" (`ready:false`) — exatamente o texto-colado
+    /// 18/20 da baseline.
+    #[test]
+    #[serial]
+    fn deliver_not_ready_never_injects() {
+        let sup = Supervisor::new();
+        let from = sup.register("@A", None, Box::new(std::io::sink()));
+        let target = sup.register("@B", None, Box::new(std::io::sink()));
+        let busy = FixedGrid {
+            region: REAL_BUSY_REGION.to_string(),
+            bracketed: true,
+        };
+        let prof = claude_like_profile(80); // budget curto: o teste não espera 30s
+
+        let res = deliver_a2a(
+            &sup,
+            target,
+            from,
+            "PROBE — não deveria entrar",
+            &prof,
+            &busy,
+            InjectPolicy::AllowAll,
+        );
+        assert!(
+            matches!(res, Err(A2aError::NotReady { .. })),
+            "timeout de prontidão deve ser erro explícito, obteve {res:?}"
+        );
+        std::thread::sleep(Dur::from_millis(50));
+        assert!(
+            sup.applied_ops(target).is_empty(),
+            "alvo não-pronto NUNCA recebe write (era o mecanismo do texto-colado)"
+        );
+    }
+
+    /// O caminho feliz do fix: alvo ocupado fica pronto DENTRO do budget → a entrega
+    /// espera e injeta faseado (AgentText + Submit) com `ready: true`.
+    #[test]
+    #[serial]
+    fn deliver_waits_until_ready_then_injects() {
+        let sup = Supervisor::new();
+        let from = sup.register("@A", None, Box::new(std::io::sink()));
+        let target = sup.register("@B", None, Box::new(std::io::sink()));
+
+        // Grid compartilhado que COMEÇA ocupado e fica ocioso depois de ~60ms.
+        struct SwitchingGrid {
+            region: Arc<Mutex<String>>,
+        }
+        impl GridSense for SwitchingGrid {
+            fn mode(&self) -> TermMode {
+                TermMode {
+                    bracketed_paste: true,
+                    app_cursor: false,
+                }
+            }
+            fn last_nonempty_line(&self) -> String {
+                lock(&self.region)
+                    .lines()
+                    .last()
+                    .unwrap_or_default()
+                    .to_string()
+            }
+            fn input_region_text(&self) -> String {
+                lock(&self.region).clone()
+            }
+        }
+        let region = Arc::new(Mutex::new(REAL_BUSY_REGION.to_string()));
+        let g = SwitchingGrid {
+            region: Arc::clone(&region),
+        };
+        let flipper = {
+            let region = Arc::clone(&region);
+            std::thread::spawn(move || {
+                std::thread::sleep(Dur::from_millis(60));
+                *lock(&region) = REAL_IDLE_REGION.to_string();
+            })
+        };
+
+        let prof = claude_like_profile(2_000);
+        let res = deliver_a2a(
+            &sup,
+            target,
+            from,
+            "agora sim",
+            &prof,
+            &g,
+            InjectPolicy::AllowAll,
+        )
+        .expect("alvo ficou pronto dentro do budget → entrega");
+        assert_eq!(
+            res,
+            DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true
+            }
+        );
+        assert!(poll_until(Dur::from_secs(5), || sup
+            .applied_ops(target)
+            .len()
+            == 2));
+        flipper.join().expect("join flipper");
+    }
+
+    /// A região de input REAL extraída de um `VtBackend` de verdade: alimenta o backend
+    /// com o conteúdo do grid preso da baseline e confere que a região vai da última
+    /// linha-prompt ao fim (inclui o rodapé — onde mora o busy marker).
+    #[test]
+    fn input_region_from_real_vt_backend() {
+        let mut b = AlacrittyBackend::new(120, 24);
+        b.advance(b"\x1b[2J\x1b[H");
+        b.advance("⏺ Recebidas as mensagens de probe — ignoradas.\r\n".as_bytes());
+        b.advance("✻ Cogitated for 9s\r\n".as_bytes());
+        b.advance("❯ \r\n".as_bytes());
+        b.advance("────────\r\n".as_bytes());
+        b.advance("  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt".as_bytes());
+        let g: Arc<Mutex<Box<dyn VtBackend>>> = Arc::new(Mutex::new(Box::new(b)));
+
+        let region = g.input_region_text();
+        assert!(
+            region.contains("esc to interrupt"),
+            "a região deve incluir o rodapé (busy marker): {region:?}"
+        );
+        let first = region.lines().next().unwrap_or_default();
+        assert!(
+            first.trim_start().starts_with('❯'),
+            "a região começa na última linha-prompt, não no histórico: {region:?}"
+        );
+        assert!(
+            !region.contains("Cogitated"),
+            "histórico acima do prompt fica FORA da região"
+        );
     }
 }

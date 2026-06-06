@@ -1126,6 +1126,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lina-session-watch"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lina-vt"
 version = "0.0.1"
 dependencies = [
