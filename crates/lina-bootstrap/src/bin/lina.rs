@@ -13,10 +13,12 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use lina_bootstrap::{autonomy_from_env, pretooluse_output, BootstrapInput, Bootstrapper};
+use lina_bootstrap::{
+    autonomy_from_env, pretooluse_output, Autonomy, BootstrapInput, Bootstrapper,
+};
 use lina_core::{
-    check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, MailMessage, Mailbox,
-    CLASS_GATED_HARD_EXTERNAL,
+    check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, HandoffContract,
+    MailMessage, Mailbox, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -27,6 +29,8 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("whoami") => run_whoami(args.iter().any(|a| a == "--bootstrap")),
         Some("ask") => run_ask(&args[1..]),
+        Some("handoff") => run_handoff(&args[1..]),
+        Some("check") => run_check(&args[1..]),
         Some("broadcast") => run_broadcast(&args[1..]),
         Some("handshake") => run_handshake(),
         Some("plan") => run_plan(&args[1..]),
@@ -44,7 +48,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -187,50 +191,280 @@ fn run_ask(args: &[String]) -> ExitCode {
     if let Some(rt) = reply_to {
         msg = msg.replying_to(rt);
     }
+    enqueue_and_report(&from, msg)
+}
+
+/// Enfileira no outbox POR-NÓ (W3-6c A3: `from` autenticado pela origem, dir-dono) e
+/// reporta o desfecho REAL do roteamento — caminho compartilhado por `ask` e `handoff`
+/// (F1-0-6: o handoff é açúcar estruturado sobre a MESMA fila, nunca um canal novo).
+///
+/// CONFIRMAÇÃO REAL (fix do "envio nada acontece"): a entrega é assíncrona (o supervisor
+/// roteia DEPOIS), mas o resultado é registrado no event log. Antes, imprimíamos um
+/// "ok: enviada" CEGO mesmo quando o roteador BLOQUEAVA a msg (unknown_sender/no_target) —
+/// o agente não sabia que falhou e concluía que o colega era um "stub mudo". Aguardamos
+/// (poll bounded no espelho `log.jsonl`) o desfecho REAL e o reportamos.
+fn enqueue_and_report(from: &str, msg: MailMessage) -> ExitCode {
     let mailbox = Mailbox::new(mailbox_root());
-    // W3-6c A3: outbox POR-NÓ — `from` é autenticado pela origem (dir-dono), não pelo campo forjável.
-    match enqueue_per_node(&mailbox, &from, &msg) {
-        Ok(()) => {
-            // CONFIRMAÇÃO REAL (fix do "envio nada acontece"): a entrega é assíncrona (o supervisor
-            // roteia DEPOIS), mas o resultado é registrado no event log. Antes, imprimíamos um
-            // "ok: enviada" CEGO mesmo quando o roteador BLOQUEAVA a msg (unknown_sender/no_target) —
-            // o agente não sabia que falhou e concluía que o colega era um "stub mudo". Agora aguardamos
-            // (poll bounded no espelho `log.jsonl`) o desfecho REAL e o reportamos.
-            match poll_route_outcome(&msg.id) {
-                RouteConfirm::Delivered { to_node } => {
-                    let dst = if to_node.is_empty() {
-                        msg.to.clone()
-                    } else {
-                        to_node
-                    };
-                    println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
-                    ExitCode::SUCCESS
-                }
-                RouteConfirm::Blocked { reason } => {
-                    eprintln!(
-                        "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
-                        msg.to,
-                        explain_block(&reason),
-                        block_hint(&reason)
-                    );
-                    ExitCode::from(1)
-                }
-                RouteConfirm::Pending => {
-                    println!(
-                        "ok: enviada a {} (id {}); ainda SEM confirmacao de entrega apos a espera (o \
-                         Espaco pode estar ocupado). Confirme com `lina list` se o destino esta vivo e \
-                         tente de novo — NAO conclua que o colega e um stub.",
-                        msg.to, msg.id
-                    );
-                    ExitCode::SUCCESS
-                }
+    match enqueue_per_node(&mailbox, from, &msg) {
+        Ok(()) => match poll_route_outcome(&msg.id) {
+            RouteConfirm::Delivered { to_node } => {
+                let dst = if to_node.is_empty() {
+                    msg.to.clone()
+                } else {
+                    to_node
+                };
+                println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
+                ExitCode::SUCCESS
             }
-        }
+            RouteConfirm::Blocked { reason } => {
+                eprintln!(
+                    "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
+                    msg.to,
+                    explain_block(&reason),
+                    block_hint(&reason)
+                );
+                ExitCode::from(1)
+            }
+            RouteConfirm::Pending => {
+                println!(
+                    "ok: enviada a {} (id {}); ainda SEM confirmacao de entrega apos a espera (o \
+                     Espaco pode estar ocupado). Confirme com `lina list` se o destino esta vivo e \
+                     tente de novo — NAO conclua que o colega e um stub.",
+                    msg.to, msg.id
+                );
+                ExitCode::SUCCESS
+            }
+        },
         Err(e) => {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
             ExitCode::from(1)
         }
     }
+}
+
+/// **F1-0-6 — `lina handoff @<alvo> "<tarefa>" [--context arq] [--ref plan:ID]
+/// [--timeout-sec N] [--await]`**: delegação ESTRUTURADA no contrato `lina/msg@2`
+/// (F1-0-5) — açúcar sobre a mesma fila do `ask`, com `intent=handoff` canônico e o
+/// [`HandoffContract`] completo (o router valida campo a campo; nada implícito "que o
+/// outro agente deve adivinhar"). Capacidade sensível = VERBO estruturado (doutrina
+/// InsForge do épico), nunca o contorno `ask --intent handoff` sem contrato.
+fn run_handoff(args: &[String]) -> ExitCode {
+    let mut positional: Vec<String> = Vec::new();
+    let mut context: Option<String> = None;
+    let mut ref_id: Option<String> = None;
+    let mut timeout_sec: u64 = 600;
+    let mut await_reply = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--await" => await_reply = true,
+            "--context" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => context = Some(v.clone()),
+                    None => {
+                        eprintln!("lina: --context exige um arquivo");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--ref" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => ref_id = Some(v.clone()),
+                    None => {
+                        eprintln!("lina: --ref exige um id (ex.: plan:T4)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--timeout-sec" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(v) if v >= 1 => timeout_sec = v,
+                    _ => {
+                        eprintln!("lina: --timeout-sec exige um inteiro >= 1");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let mut it = positional.into_iter();
+    let (Some(to), Some(task)) = (it.next(), it.next()) else {
+        usage();
+        return ExitCode::from(2);
+    };
+
+    let input = match load_input() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Bloqueio LOCAL em `manual` (doutrina bloco 5: "garantido pelo proprio comando, nao
+    // por hook") — handoff é DELEGAÇÃO; em manual o agente só PROPÕE ao usuário. O router
+    // segue como backstop (defesa em profundidade), mas a recusa nasce aqui, visível.
+    if input.autonomy == Autonomy::Manual {
+        eprintln!(
+            "lina: handoff bloqueado — a autonomia do workspace esta em MANUAL e delegar e \
+             acao de delegacao. PROPONHA a tarefa ao usuario em portugues simples e execute \
+             so depois do sim dele (ou peca para mudar a autonomia)."
+        );
+        return ExitCode::from(1);
+    }
+    let from = input.terminal_name;
+
+    // --context: ANEXA o conteúdo (falha VISÍVEL se ilegível — nunca enfileirar um handoff
+    // prometendo um contexto que não foi anexado; fidelidade > contorno).
+    let mut payload = task;
+    let mut input_schema =
+        String::from("tarefa em texto no payload; responda no formato do output_schema");
+    if let Some(path) = context {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                payload.push_str(&format!("\n\n--- contexto anexado ({path}) ---\n{content}"));
+                input_schema =
+                    format!("tarefa em texto + contexto anexado ({path}) no proprio payload");
+            }
+            Err(e) => {
+                eprintln!("lina: nao consegui ler o --context {path}: {e} — handoff NAO enviado");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    let mut constraints = std::collections::BTreeMap::new();
+    constraints.insert("autonomy".to_string(), input.autonomy.label().to_string());
+    let contract = HandoffContract {
+        input_schema,
+        output_schema:
+            "resultado da tarefa no formato pedido em [EXPECTED]; termine com PRONTO: <resumo> \
+             ou BLOCKED: <motivo>"
+                .to_string(),
+        error_codes: vec!["E_TIMEOUT".to_string(), "E_BLOCKED".to_string()],
+        timeout_sec,
+        retry_policy: "manual".to_string(),
+        constraints_metadata: constraints,
+    };
+
+    let mut msg = MailMessage::new_v2(from.clone(), to, "handoff", payload).with_contract(contract);
+    if await_reply {
+        msg = msg.awaiting();
+    }
+    if let Some(r) = ref_id {
+        msg.ref_id = Some(r);
+    }
+    enqueue_and_report(&from, msg)
+}
+
+/// **F1-0-6 — `lina check @<alvo>`**: estado VIVO do colega pela PROJEÇÃO do lifecycle
+/// (F1-0-3/ADR 0019 §5: o veredito vem do log, nunca de view cacheada) + última
+/// atividade A2A. **Leitura PURA** de `agents.json` + `log.jsonl` — não injeta NADA no
+/// terminal do colega (espiar ≠ interromper; é o anti-"cutucar pra ver se está vivo").
+fn run_check(args: &[String]) -> ExitCode {
+    let Some(target_raw) = args.first() else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let target = target_raw.trim_start_matches('@');
+
+    // Roster (papel + status do app) — mesmo leitor do `lina list`.
+    let mailbox = Mailbox::new(mailbox_root());
+    let roster = mailbox.read_agents().unwrap_or_default();
+    let roster_entry = roster
+        .iter()
+        .find(|a| a.name == target || a.name.trim_start_matches('@') == target);
+
+    // Projeção do lifecycle + última atividade, varrendo o espelho `log.jsonl` em ordem
+    // (tolerante a linha parcial — arquivo sob append, mesma postura do poll de `ask`).
+    let mut node_id: Option<String> = None;
+    let mut state: Option<(String, String)> = None; // (status, reason)
+    let mut stalled = false;
+    let mut last_a2a: Option<(String, String, String, u64)> = None; // intent, from, to, ts
+    if let Ok(content) = std::fs::read_to_string(event_log_path()) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let p = &v["payload"];
+            match v["kind"].as_str().unwrap_or_default() {
+                "NodeRenamed" if p["name"].as_str() == Some(target) => {
+                    node_id = p["node"].as_str().map(str::to_string);
+                }
+                "NodeStatusChanged"
+                    if node_id.is_some() && node_id.as_deref() == p["node"].as_str() =>
+                {
+                    state = Some((
+                        p["status"].as_str().unwrap_or("?").to_string(),
+                        p["reason"].as_str().unwrap_or("").to_string(),
+                    ));
+                    stalled = false; // transição limpa o WARN (regra da projeção F1-0-3)
+                }
+                "NodeStalled" if node_id.is_some() && node_id.as_deref() == p["node"].as_str() => {
+                    stalled = true;
+                }
+                "MessageRouted" => {
+                    let from = p["from"].as_str().unwrap_or_default();
+                    let to = p["to"].as_str().unwrap_or_default();
+                    let to_node = p["to_node"].as_str().unwrap_or_default();
+                    let touches = from == target
+                        || to.trim_start_matches('@') == target
+                        || (!to_node.is_empty() && node_id.as_deref() == Some(to_node));
+                    if touches {
+                        last_a2a = Some((
+                            p["intent"].as_str().unwrap_or("?").to_string(),
+                            from.to_string(),
+                            to.to_string(),
+                            v["ts"].as_u64().unwrap_or(0),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if state.is_none() && roster_entry.is_none() {
+        eprintln!(
+            "lina: nao encontrei '{target_raw}' nem no lifecycle do log nem no roster — \
+             confira quem esta no Espaco com `lina list`."
+        );
+        return ExitCode::from(1);
+    }
+
+    match (&state, roster_entry) {
+        (Some((status, reason)), entry) => {
+            let stall_txt = if stalled {
+                " · TRAVADO (Busy sem progresso — ADR 0019; veja se precisa de ajuda ou re-direcao)"
+            } else {
+                ""
+            };
+            println!("@{target} — estado: {status} (motivo: {reason}){stall_txt}");
+            if let Some(a) = entry {
+                println!("papel: {}", a.role.as_deref().unwrap_or("—"));
+            }
+        }
+        (None, Some(a)) => {
+            println!(
+                "@{target} — estado: {} (do roster do app; sem lifecycle deste no no log)",
+                a.status
+            );
+            println!("papel: {}", a.role.as_deref().unwrap_or("—"));
+        }
+        (None, None) => unreachable!("guard acima"),
+    }
+    match last_a2a {
+        Some((intent, from, to, ts)) => {
+            println!("ultima atividade A2A: {intent} de {from} para {to} (ts {ts})");
+        }
+        None => println!("ultima atividade A2A: nenhuma registrada no log"),
+    }
+    ExitCode::SUCCESS
 }
 
 /// Desfecho REAL do roteamento de uma `lina ask`, lido do espelho `log.jsonl`.
