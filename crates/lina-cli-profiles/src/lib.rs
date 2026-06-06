@@ -121,6 +121,19 @@ pub struct CliProfile {
     pub prompt_ready_regex: String,
     /// Como detectar fim-de-resposta.
     pub end_signal: EndSignal,
+    /// F1-0-2: orçamento (ms) do `wait_ready` da entrega A2A — quanto esperar o prompt
+    /// REAL do alvo antes de desistir desta tentativa (timeout → **não injeta**; nunca
+    /// "injeta mesmo assim"). `None` = default 2s (o `READY_TIMEOUT` histórico de W0-9).
+    /// Calibrável por CLI sem recompilar (invariante #3).
+    #[serde(default)]
+    pub ready_timeout_ms: Option<u64>,
+    /// F1-0-2: marcadores de OCUPADO na região de input do grid — se QUALQUER um estiver
+    /// presente, o alvo NÃO está pronto, mesmo que o glifo de prompt apareça (a TUI do
+    /// Claude Code mostra `❯ ` o tempo todo; o que distingue ocupado é o rodapé
+    /// "esc to interrupt" / o banner "Press up to edit queued messages" — grids REAIS
+    /// da baseline F1-0). Vazio = só o `prompt_ready_regex` decide (CLIs simples).
+    #[serde(default)]
+    pub busy_markers: Vec<String>,
     /// Quietude (ms) que conta como "idle" para heurísticas de fim/timeout (W0-10).
     #[serde(default)]
     pub idle_ms: Option<u64>,
@@ -151,6 +164,12 @@ impl CliProfile {
     /// `submit_delay_ms` como [`Duration`] — ergonomia para o agendador da A2A (W0-9).
     pub fn submit_delay(&self) -> Duration {
         Duration::from_millis(self.submit_delay_ms)
+    }
+
+    /// F1-0-2: orçamento do `wait_ready` como [`Duration`] (default 2s — comportamento
+    /// histórico de W0-9 para perfis que não declaram `ready_timeout_ms`).
+    pub fn ready_timeout(&self) -> Duration {
+        Duration::from_millis(self.ready_timeout_ms.unwrap_or(2_000))
     }
 
     /// Parseia um profile a partir de uma string TOML.
@@ -501,9 +520,24 @@ mod tests {
         assert_eq!(profile.program, "claude");
 
         // Os 4 campos-chave do gate de aceite (W0-8).
+        // F1-0-2: submit_delay calibrado 300→400ms (story F1-0-2; margem contra o
+        // paste-colapsado observado na baseline).
         assert_eq!(profile.delivery, Delivery::PtyInject);
-        assert_eq!(profile.submit_delay_ms, 300);
-        assert_eq!(profile.submit_delay(), Duration::from_millis(300));
+        assert_eq!(profile.submit_delay_ms, 400);
+        assert_eq!(profile.submit_delay(), Duration::from_millis(400));
+
+        // F1-0-2 (vigência da calibração de prontidão): o perfil REAL declara o budget
+        // do wait_ready e os busy markers extraídos dos grids da baseline.
+        assert_eq!(
+            profile.ready_timeout_ms,
+            Some(30_000),
+            "ready_timeout_ms calibrado (timeout → não injeta)"
+        );
+        assert_eq!(
+            profile.busy_markers,
+            vec!["esc to interrupt", "Press up to edit queued messages"],
+            "busy markers dos grids reais (stuck-11/15 da baseline)"
+        );
         assert!(
             !profile.prompt_ready_regex.trim().is_empty(),
             "prompt_ready_regex deve estar presente"
@@ -601,6 +635,48 @@ mod tests {
             !p.capabilities.has("hooks"),
             "sem declaração = sem capability"
         );
+    }
+
+    // ── F1-0-2: prontidão de entrega (ready_timeout_ms + busy_markers) ──
+
+    #[test]
+    fn readiness_fields_parse_from_toml() {
+        let toml_src = r#"
+            id = "fake"
+            program = "fake"
+            delivery = "pty_inject"
+            prompt_ready_regex = "> "
+            ready_timeout_ms = 30000
+            busy_markers = ["esc to interrupt", "queued messages"]
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(toml_src, "<inline>").expect("deve parsear");
+        assert_eq!(p.ready_timeout_ms, Some(30_000));
+        assert_eq!(p.ready_timeout(), Duration::from_millis(30_000));
+        assert_eq!(p.busy_markers, vec!["esc to interrupt", "queued messages"]);
+    }
+
+    #[test]
+    fn readiness_fields_default_when_absent() {
+        // TOML antigo (pré-F1-0-2) segue válido: budget default de 2s (o READY_TIMEOUT
+        // histórico de W0-9) e zero busy_markers (só o prompt decide).
+        let minimal = r#"
+            id = "shell"
+            program = "bash"
+            delivery = "pty_inject"
+            prompt_ready_regex = '\$\s$'
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(minimal, "<inline>").expect("deve parsear");
+        assert_eq!(p.ready_timeout_ms, None);
+        assert_eq!(
+            p.ready_timeout(),
+            Duration::from_millis(2_000),
+            "default preserva o comportamento histórico (READY_TIMEOUT 2s)"
+        );
+        assert!(p.busy_markers.is_empty());
     }
 
     #[test]

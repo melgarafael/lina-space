@@ -15,12 +15,27 @@ args = ["--output-format", "stream-json", "--verbose"]
 # Entrega A2A faseada (CLAUDE.md §A2A): bracketed-paste -> submit_delay -> Enter
 # (0x0D) enviado SEPARADO, em fila serial por terminal.
 delivery = "pty_inject"
-submit_delay_ms = 300
+# F1-0-2: 300→400ms — margem extra entre a colagem e o Enter (a baseline observou o
+# chip de paste-colapsado em alvo lento; faixa sugerida pela story: 400-500; validar
+# na tela e ajustar AQUI, sem recompilar).
+submit_delay_ms = 400
 
 # Heurística "prompt pronto para receber input": uma linha começando com o glifo
 # de prompt da TUI (> ou ❯). String literal TOML (aspas simples) p/ não escapar o
 # regex. Compilação/validação do regex no load é incremento de W0-9.
+# F1-0-2: o regex é avaliado sobre a REGIÃO DE INPUT do grid (da última linha-prompt
+# ao fim), nunca só sobre a última linha (que na TUI do Claude Code é o rodapé).
 prompt_ready_regex = '(?m)^\s*[>❯]\s'
+
+# F1-0-2: orçamento do wait_ready da entrega A2A. Timeout -> NÃO injeta (erro explícito;
+# era o "injeta mesmo assim" que produzia o texto-colado 18/20 da baseline). Calibrado
+# contra os bursts reais observados na baseline ("Cogitated for 9s") com margem ~3x.
+ready_timeout_ms = 30000
+
+# F1-0-2: marcadores de OCUPADO na região de input — a TUI mostra `❯ ` o tempo todo
+# (até com mensagem enfileirada), então o glifo sozinho NÃO é prontidão. Extraídos dos
+# grids REAIS capturados pela baseline (baseline-artifacts/grids/stuck-11/15.txt).
+busy_markers = ["esc to interrupt", "Press up to edit queued messages"]
 
 # Janela de quietude (ms) p/ heurística de idle e timeout do `ask` A2A (W0-9/W0-10).
 # NOTA (F1-1-1): estas chaves são TOP-LEVEL e por isso vivem ANTES de [end_signal] —
