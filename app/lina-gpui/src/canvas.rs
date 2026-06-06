@@ -73,17 +73,19 @@ impl Badge {
         }
     }
 
-    /// Cor de fundo do badge (RGB) — verde=rodando, âmbar=precisa de você, cinza=aguardando/encerrado.
+    /// Cor de fundo do badge — TOKENS do design system (F1-2-1): warning=precisa de você,
+    /// confirm=rodando, neutro fosco=aguardando, danger fosco=encerrado.
     /// BUG B: a periferia voltou a desenhar o GRID (legível), então o render NÃO usa mais este chip de
     /// badge; reservado p/ um chip de status futuro (`allow(dead_code)` no padrão do módulo).
     #[allow(dead_code)]
     #[must_use]
     pub fn bg(&self) -> u32 {
+        let th = crate::theme::active();
         match self.kind {
-            BadgeKind::NeedsYou => 0xe0af68, // âmbar (o mesmo do gate de custódia)
-            BadgeKind::Running => 0x2c7a4b,  // verde
-            BadgeKind::Waiting => 0x3a3f5a,  // cinza-azulado fosco (neutro, NÃO alarmante)
-            BadgeKind::Stopped => 0x6b2b3a,  // bordô apagado
+            BadgeKind::NeedsYou => th.state.warning, // o mesmo do gate de custódia
+            BadgeKind::Running => th.accent.confirm,
+            BadgeKind::Waiting => th.surface.raised_alt, // neutro, NÃO alarmante
+            BadgeKind::Stopped => th.surface.danger_muted,
         }
     }
 }

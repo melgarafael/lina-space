@@ -34,15 +34,11 @@ use crate::onboarding::{install_recipe_with, run_install, InstallState, Onboardi
 
 // ───────────────────────────── paleta (espelha o onboarding/canvas) ─────────────────────────────
 // Mantidas locais (as do `onboarding` são module-private); os valores ESPELHAM a paleta de lá.
-const PANEL: u32 = 0x141a36;
-const ACCENT: u32 = 0x7aa2f7;
-const TEXT: u32 = 0xc8d3f5;
-const MUTED: u32 = 0x5b658f;
-const GREEN: u32 = 0x9ece6a;
-const AMBER: u32 = 0xe0af68;
-const RED: u32 = 0xf7768e;
-
-// ═══════════════════════════ catálogo de ferramentas (id ≠ binário ≠ rótulo) ═══════════════════════════
+/// F1-2-1: tokens VIVOS do design system — cada chamada lê o tema ATIVO (trocar dark/light ou
+/// acento no T7 re-pinta esta janela no frame seguinte, sem restart). Fonte única: `theme::active`.
+fn th() -> crate::theme::Theme {
+    crate::theme::active()
+}
 
 /// Uma ferramenta de desenvolvimento que a tela detecta/instala. `id` é a chave LÓGICA no
 /// `dev-tools.toml` (e no snapshot de descoberta); `bin` é o nome do executável no PATH (≠ id no caso
@@ -570,20 +566,20 @@ impl DevToolsModel {
         // Banner de estado da varredura (procurando / tudo pronto / nenhuma) — sem falso "nenhuma" durante a busca.
         if self.is_discovering() {
             col = col.child(banner(
-                PANEL,
-                ACCENT,
+                th().surface.panel,
+                th().accent.primary,
                 "Procurando as ferramentas no seu computador…",
             ));
         } else if self.all_present() {
             col = col.child(banner(
-                0x18301f,
-                GREEN,
+                th().surface.success_muted,
+                th().state.success,
                 "Tudo pronto! Você já tem todas as ferramentas. É só continuar.",
             ));
         } else if self.nothing_found() {
             col = col.child(banner(
-                0x33202c,
-                AMBER,
+                th().surface.danger_muted,
+                th().state.warning,
                 "Ainda não encontrei nenhuma — escolha uma abaixo e clique \"Instalar para mim\".",
             ));
         }
@@ -612,16 +608,16 @@ impl DevToolsModel {
                 .px_4()
                 .py_3()
                 .rounded_md()
-                .bg(rgb(PANEL))
+                .bg(rgb(th().surface.panel))
                 .child(div().size(px(9.0)).rounded_full().bg(rgb(if present {
-                    GREEN
+                    th().state.success
                 } else {
-                    0x3a4566
+                    th().surface.raised_alt
                 })))
                 .child(
                     div()
                         .w(px(150.0))
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(th().text.primary))
                         .font_weight(FontWeight::BOLD)
                         .child(text!(t.label.to_string())),
                 );
@@ -633,7 +629,7 @@ impl DevToolsModel {
                 row = row.child(
                     div()
                         .flex_1()
-                        .text_color(rgb(GREEN))
+                        .text_color(rgb(th().state.success))
                         .child(text!(format!("✓ {ver}"))),
                 );
             } else if installing_this {
@@ -645,7 +641,7 @@ impl DevToolsModel {
                 row = row.child(
                     div()
                         .flex_1()
-                        .text_color(rgb(AMBER))
+                        .text_color(rgb(th().state.warning))
                         .child(text!(format!("⟳ {line}"))),
                 );
             } else {
@@ -653,7 +649,7 @@ impl DevToolsModel {
                     .child(
                         div()
                             .flex_1()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(th().text.muted))
                             .child(text!("não encontrado")),
                     )
                     .child(install_button(id, cx));
@@ -666,21 +662,21 @@ impl DevToolsModel {
         if let Some(notice) = self.notice() {
             col = col.child(match notice {
                 DevNotice::TerminalOpened { tool } => banner(
-                    PANEL,
-                    ACCENT,
+                    th().surface.panel,
+                    th().accent.primary,
                     &format!(
                         "Abri uma janela de Terminal para instalar {tool}. Ela pode pedir a senha do seu \
                          Mac — isso é normal e seguro. Quando terminar, volte aqui e clique \"Verificar de novo\"."
                     ),
                 ),
                 DevNotice::NeedsFirst { tool, needs } => banner(
-                    PANEL,
-                    ACCENT,
+                    th().surface.panel,
+                    th().accent.primary,
                     &format!("Para instalar {tool}, instale o {needs} primeiro (logo acima). Depois é só clicar em instalar de novo."),
                 ),
                 DevNotice::RunManually { tool, command } => banner(
-                    0x33202c,
-                    AMBER,
+                    th().surface.danger_muted,
+                    th().state.warning,
                     &format!("Não consegui abrir o instalador de {tool} sozinho. Você pode rodar este comando no seu terminal:\n{command}"),
                 ),
             });
@@ -689,8 +685,8 @@ impl DevToolsModel {
         // Falha acionável da instalação silenciosa (sem jargão; nunca trava "Continuar").
         if let InstallState::Failed { reason } = &install {
             col = col.child(banner(
-                0x33202c,
-                RED,
+                th().surface.danger_muted,
+                th().state.danger,
                 &format!(
                     "⚠ {reason}  ·  Nada quebrou — você pode tentar de novo ou seguir sem isso."
                 ),
@@ -750,13 +746,13 @@ fn heading(title: &str, subtitle: &str) -> AnyElement {
             div()
                 .text_size(px(28.0))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(TEXT))
+                .text_color(rgb(th().text.primary))
                 .child(text!(title.to_string())),
         )
         .child(
             div()
                 .text_size(px(15.0))
-                .text_color(rgb(MUTED))
+                .text_color(rgb(th().text.muted))
                 .child(text!(subtitle.to_string())),
         )
         .into_any_element()
@@ -781,8 +777,8 @@ fn install_button(id: &'static str, cx: &mut Context<OnboardingView>) -> AnyElem
         .px_4()
         .py_2()
         .rounded_md()
-        .bg(rgb(0x3d59c9))
-        .text_color(rgb(0xeef1ff))
+        .bg(rgb(th().accent.action))
+        .text_color(rgb(th().text.on_accent))
         .cursor_pointer()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, _w, cx| {
             onb.dev_tools.start_install(id);
@@ -804,8 +800,8 @@ fn primary_button(
         .px_5()
         .py_2()
         .rounded_md()
-        .bg(rgb(0x2c7a4b))
-        .text_color(rgb(0xeef1ff))
+        .bg(rgb(th().accent.confirm))
+        .text_color(rgb(th().text.on_accent))
         .font_weight(FontWeight::BOLD)
         .cursor_pointer()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, window, cx| on_click(onb, window, cx)))
@@ -825,8 +821,8 @@ fn ghost_button(
         .px_4()
         .py_2()
         .rounded_md()
-        .bg(rgb(0x2a3152))
-        .text_color(rgb(TEXT))
+        .bg(rgb(th().surface.raised))
+        .text_color(rgb(th().text.primary))
         .cursor_pointer()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, window, cx| on_click(onb, window, cx)))
         .child(text!(label))

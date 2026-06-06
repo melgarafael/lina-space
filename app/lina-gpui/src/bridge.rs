@@ -1154,6 +1154,8 @@ fn map_status(s: CoreStatus) -> NodeStatus {
     match s {
         CoreStatus::Starting => NodeStatus::Starting,
         CoreStatus::Running => NodeStatus::Running,
+        // Costura F1-0-3 (coordenada via Maestro): UI trata Ready≈Idle até F1-1-5 exibir estados ricos.
+        CoreStatus::Ready => NodeStatus::Idle,
         CoreStatus::Idle => NodeStatus::Idle,
         CoreStatus::Busy => NodeStatus::Busy,
         CoreStatus::Blocked => NodeStatus::Busy,

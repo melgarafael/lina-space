@@ -139,6 +139,8 @@ impl PaletteState {
     /// seleção destacada. Sem listeners (a paleta é dirigida por teclado).
     #[must_use]
     pub fn render(&self) -> AnyElement {
+        // F1-2-1: tokens vivos do tema (dark/light + acento aplicam-se à paleta também).
+        let th = crate::theme::active();
         let filtered = self.filtered();
         let sel = self.selected;
 
@@ -148,7 +150,7 @@ impl PaletteState {
                 div()
                     .px_4()
                     .py_2()
-                    .text_color(rgb(0x5b658f))
+                    .text_color(rgb(th.text.muted))
                     .child(text!("(nenhum comando casa)")),
             );
         } else {
@@ -158,8 +160,16 @@ impl PaletteState {
                     div()
                         .px_4()
                         .py_2()
-                        .bg(rgb(if selected { 0x3a3f5a } else { 0x141a36 }))
-                        .text_color(rgb(if selected { 0xeef1ff } else { 0xc8d3f5 }))
+                        .bg(rgb(if selected {
+                            th.surface.raised_alt
+                        } else {
+                            th.surface.panel
+                        }))
+                        .text_color(rgb(if selected {
+                            th.text.bright
+                        } else {
+                            th.text.primary
+                        }))
                         .child(text!(c.label.clone())),
                 );
             }
@@ -180,17 +190,17 @@ impl PaletteState {
                     .w(px(560.0))
                     .flex()
                     .flex_col()
-                    .bg(rgb(0x0c1130))
+                    .bg(rgb(th.surface.chrome))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x3a3f5a))
+                    .border_color(rgb(th.surface.raised_alt))
                     .overflow_hidden()
                     .child(
                         div()
                             .px_4()
                             .py_3()
-                            .bg(rgb(0x141a36))
-                            .text_color(rgb(0xeef1ff))
+                            .bg(rgb(th.surface.panel))
+                            .text_color(rgb(th.text.bright))
                             .child(text!(format!("⌘K  {}▌", self.query))),
                     )
                     .child(list),

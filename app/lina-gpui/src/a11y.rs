@@ -10,7 +10,9 @@
 //!   e `.entrega-w46.md` (hoje é banner VISÍVEL + legível ao focar; auto-anúncio é gap pendente do gpui).
 //! - **Rótulo anunciável**: [`node_label`] junta nome + o badge do W4-2 (`canvas::Badge`: "💤 dormindo",
 //!   "precisa de você", "rodando") → o leitor de tela fala o estado do nó.
-//! - **Contraste WCAG (gate de CI ≥4.5:1)**: [`contrast_ratio`]/[`meets_aa`] + teste sobre a paleta.
+//! - **Contraste WCAG**: a maquinaria ([`wcag::contrast_ratio`]/[`wcag::meets_aa`]) mora aqui; o
+//!   **GATE de CI** mora em `theme.rs` (F1-2-1: cobre os 2 temas, 8 acentos e todos os tokens de
+//!   texto — fechou o furo "o gate guarda uma cópia" apontado pelo red-team do 13.15).
 //! - **reduce-motion**: [`os_reduce_motion`] (env/SO) alimenta o `reduce_motion` do canvas (W4-3 já
 //!   corta o pulso A→B quando `true`).
 //!
@@ -24,26 +26,7 @@ use lina_core::VtBackend;
 use lina_host::{NodeId, NodeStatus};
 
 use crate::canvas::aggregate_badge;
-
-// ═══════════════════════════ paleta (fonte única — o gate WCAG assere SOBRE ela) ═══════════════════════════
-
-/// Paleta canônica do shell. O gate WCAG ([`palette_meets_wcag_contrast_gate`]) assere SOBRE estas
-/// consts — então uma regressão de cor é pega pelo teste. **AVISO:** `main.rs`/`persistence_ui.rs` ainda
-/// usam `rgb(0x…)` inline; adotar estas consts em todo o shell fecha o furo "o gate guarda uma cópia"
-/// (achado do red-team). Ver `.entrega-w46.md`.
-pub mod palette {
-    // O gate WCAG (teste) e `main.rs`/`persistence_ui` (após adotarem estas consts) as usam; hoje só
-    // PANEL/GREEN entram em produção (`live_region_element`) → `allow` até a adoção em todo o shell.
-    #![allow(dead_code)]
-    pub const BG: u32 = 0x0a0e27;
-    pub const PANEL: u32 = 0x141a36;
-    pub const TEXT: u32 = 0xc8d3f5;
-    pub const ACCENT: u32 = 0x7aa2f7;
-    pub const MUTED: u32 = 0x5b658f;
-    pub const GREEN: u32 = 0x9ece6a;
-    pub const AMBER: u32 = 0xe0af68;
-    pub const RED: u32 = 0xf7768e;
-}
+use crate::theme;
 
 // ═══════════════════════════ AccessibleBuffer (W0-2: linearização sem ANSI) ═══════════════════════════
 
@@ -132,8 +115,8 @@ impl LiveRegion {
 
 // ═══════════════════════════ contraste WCAG (gate de CI ≥4.5:1) ═══════════════════════════
 
-/// Maquinaria do **GATE WCAG** (o teste `palette_meets_wcag_contrast_gate`, que FALHA se um tema
-/// regredir abaixo do limiar). Não é chamada em produção (a paleta é estática) → `#![allow(dead_code)]`.
+/// Maquinaria do **GATE WCAG** (o gate vivo é `theme::tests::themes_meet_wcag_contrast_gate`, que
+/// FALHA se um tema regredir abaixo do limiar). Não é chamada em produção → `#![allow(dead_code)]`.
 pub mod wcag {
     #![allow(dead_code)]
 
@@ -215,6 +198,7 @@ pub fn reduce_motion_effective(user_override: bool) -> bool {
 /// **auto-anúncio sem foco** exige uma API `set_live` no gpui (patch do gpui pinado — fora do escopo do
 /// W4-6). Ver `.entrega-w46.md`. NÃO afirmar que o leitor de tela anuncia sozinho até a API existir.
 pub fn live_region_element(msg: &str) -> AnyElement {
+    let th = theme::active();
     div()
         .id("a11y-live")
         .role(Role::Status)
@@ -222,15 +206,14 @@ pub fn live_region_element(msg: &str) -> AnyElement {
         .px_3()
         .py_1()
         .rounded_md()
-        .bg(rgb(palette::PANEL))
-        .text_color(rgb(palette::GREEN))
+        .bg(rgb(th.surface.panel))
+        .text_color(rgb(th.state.success))
         .child(text!(format!("🔊 {msg}")))
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::palette::{ACCENT, AMBER, BG, GREEN, MUTED, RED, TEXT};
     use super::*;
     use lina_core::AlacrittyBackend;
     use uuid::Uuid;
@@ -330,30 +313,12 @@ mod tests {
         assert_eq!(lr.observe(&[(a, "A".into(), NodeStatus::Idle)]), None);
     }
 
-    /// **Gate WCAG (CI):** as cores de texto primárias atingem AA (≥4.5:1) sobre o fundo; a cor MUTED
-    /// (secundária) atinge ao menos AA-grande (≥3:1). FALHA se um tema regredir abaixo disso.
+    /// Sanidade da MAQUINARIA WCAG (extremos branco/preto e identidade). O gate de PALETA vivo é
+    /// `theme::tests::themes_meet_wcag_contrast_gate` (F1-2-1: 2 temas × 8 acentos × todos os
+    /// tokens de texto) — este teste só protege a matemática que aquele gate usa.
     #[test]
-    fn palette_meets_wcag_contrast_gate() {
-        use wcag::{contrast_ratio, meets_aa, meets_aa_large};
-        for (name, c) in [
-            ("TEXT", TEXT),
-            ("ACCENT", ACCENT),
-            ("GREEN", GREEN),
-            ("AMBER", AMBER),
-            ("RED", RED),
-        ] {
-            assert!(
-                meets_aa(c, BG),
-                "{name} ({:.2}:1) deve atingir AA (≥4.5:1) sobre o fundo",
-                contrast_ratio(c, BG)
-            );
-        }
-        assert!(
-            meets_aa_large(MUTED, BG) && !meets_aa(MUTED, BG),
-            "MUTED é cor secundária: AA-grande (≥3:1) sim, AA-normal não ({:.2}:1)",
-            contrast_ratio(MUTED, BG)
-        );
-        // sanidade dos extremos (branco/preto).
+    fn wcag_math_sanity() {
+        use wcag::contrast_ratio;
         assert!((contrast_ratio(0xffffff, 0x000000) - 21.0).abs() < 0.01);
         assert!((contrast_ratio(0x123456, 0x123456) - 1.0).abs() < 0.001);
     }

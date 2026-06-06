@@ -32,6 +32,9 @@ mod a11y;
 mod inspector;
 // W4-2 · M3/M4: criadores de NOTA e PASTA (apenda Note/FolderCreated + persiste em .lina/) — gpui-free, testável.
 mod creators;
+// F1-2-1: design system tokenizado (dark/light + 8 acentos curados) — a FONTE ÚNICA de cor do shell.
+// Todo pixel pintado lê `theme::active()`; o gate WCAG + o lint anti-cor-hardcoded moram lá. gpui-free.
+mod theme;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -68,12 +71,16 @@ use lina_secrets::{MockStore, SecretVault};
 
 /// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
 const FONT_PX: f32 = 13.0;
-/// Cor de fundo das células SELECIONADAS (W2-4) — azul fosco, mantém o texto legível.
-const SELECTION_BG: VtRgb = VtRgb {
-    r: 0x33,
-    g: 0x45,
-    b: 0x73,
-};
+
+/// Token `0xRRGGBB` do tema → [`VtRgb`] (cores do shell entrando no pipeline de células do grid:
+/// cursor padrão e fundo de seleção — únicos pontos onde o tema toca o conteúdo do terminal).
+fn vt(token: u32) -> VtRgb {
+    VtRgb {
+        r: ((token >> 16) & 0xff) as u8,
+        g: ((token >> 8) & 0xff) as u8,
+        b: (token & 0xff) as u8,
+    }
+}
 
 /// Quantas cols×rows cabem na área de grid de um card (>= 80×24, "tamanho útil").
 fn fit_dims() -> (u16, u16) {
@@ -276,28 +283,19 @@ fn render_line(
         bold: bool,
         text: String,
     }
+    // F1-2-1: cursor padrão + fundo de seleção vêm dos tokens de TERMINAL (superfície escura nos
+    // 2 temas — o conteúdo ANSI do CLI não é tematizado; só BG/cursor padrão, escopo da story).
+    let term = theme::active().terminal;
     let mut runs: Vec<Run> = Vec::new();
     for (col, cell) in cells.iter().enumerate() {
         let selected =
             sel.is_some_and(|(sc, sr, ec, er)| cell_in_selection(col, row, sc, sr, ec, er));
         let (fg, bg, bold) = if cursor_col == Some(col) {
             // Bloco do cursor: bg accent, fg escuro.
-            (
-                VtRgb {
-                    r: 0x0a,
-                    g: 0x0e,
-                    b: 0x27,
-                },
-                VtRgb {
-                    r: 0x7a,
-                    g: 0xa2,
-                    b: 0xf7,
-                },
-                false,
-            )
+            (vt(term.cursor_text), vt(term.cursor), false)
         } else if selected {
             // Célula SELECIONADA: bg de destaque, mantém fg/negrito (texto legível).
-            (cell.fg, SELECTION_BG, cell.bold)
+            (cell.fg, vt(term.selection), cell.bold)
         } else {
             (cell.fg, cell.bg, cell.bold)
         };
@@ -1033,6 +1031,10 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.request_animation_frame();
 
+        // F1-2-1: tokens VIVOS do design system — uma cópia por frame (trocar tema/acento no T7
+        // re-pinta este render no frame seguinte, sem restart). Nenhuma cor hard-coded abaixo.
+        let th = theme::active();
+
         // W5-1 (instrumentação de FPS): amostra o FRAMETIME = intervalo desde o frame anterior. O loop
         // de animação (`request_animation_frame` + a tarefa `cx.spawn` do pulso) só dirige frames
         // ENQUANTO há atividade (pan/zoom/pulso vivo), então o intervalo é a cadência REAL de desenho.
@@ -1116,20 +1118,20 @@ impl Render for WorkspaceView {
         let a11y_announce: Option<String> = self.a11y_live.current().map(str::to_string);
 
         let aura_color = if connected {
-            rgb(0x7aa2f7)
+            rgb(th.accent.primary)
         } else {
-            rgb(0x222a44)
+            rgb(th.surface.border_muted)
         };
         let mut root = div()
             .id("canvas")
             .track_focus(&self.focus)
             .relative()
             .size_full()
-            .bg(rgb(0x0a0e27))
+            .bg(rgb(th.surface.canvas))
             .border_2()
             .border_dashed()
             .border_color(aura_color)
-            .text_color(rgb(0xc8d3f5))
+            .text_color(rgb(th.text.primary))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, ev: &MouseDownEvent, window, _cx| {
@@ -1290,16 +1292,17 @@ impl Render for WorkspaceView {
             panels_drawn += 1; // W5-1: passou da guarda de suspenso → este painel é DESENHADO.
             let (sx, sy) = cam.world_to_screen((nv.x, nv.y));
             let z = cam.zoom;
+            // Foco = token `focus.ring` (≥3:1 nos 2 temas — gate F1-2-1; F1-2-6 reusa no teclado).
             let card_border = if node_id == focused {
-                rgb(0x7aa2f7)
+                rgb(th.focus.ring)
             } else {
-                rgb(0x2a3152)
+                rgb(th.surface.border)
             };
             let status_dot = match nv.status {
-                NodeStatus::Idle => rgb(0x9ece6a),
-                NodeStatus::Busy | NodeStatus::Running => rgb(0xe0af68),
-                NodeStatus::Crashed | NodeStatus::Dead => rgb(0xf7768e),
-                _ => rgb(0x7aa2f7),
+                NodeStatus::Idle => rgb(th.state.success),
+                NodeStatus::Busy | NodeStatus::Running => rgb(th.state.warning),
+                NodeStatus::Crashed | NodeStatus::Dead => rgb(th.state.danger),
+                _ => rgb(th.accent.primary),
             };
 
             let mut title = div()
@@ -1309,14 +1312,14 @@ impl Render for WorkspaceView {
                 .gap_2()
                 .px_3()
                 .py_2()
-                .bg(rgb(0x141a36))
+                .bg(rgb(th.surface.panel))
                 .text_size(px(13.0 * z))
-                .text_color(rgb(0x7aa2f7))
+                .text_color(rgb(th.accent.primary))
                 .child(div().size(px(9.0 * z)).rounded_full().bg(status_dot))
                 .child(text!(nv.name.clone()))
                 .child(
                     div()
-                        .text_color(rgb(0x5b658f))
+                        .text_color(rgb(th.text.muted))
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
             // O ✕ só aparece quando há >1 card: o ÚLTIMO nó nunca pode ser fechado (o canvas
@@ -1327,8 +1330,8 @@ impl Render for WorkspaceView {
                         .id(("close", card_eid))
                         .px_2()
                         .rounded_md()
-                        .bg(rgb(0x33202c))
-                        .text_color(rgb(0xf7768e))
+                        .bg(rgb(th.surface.danger_muted))
+                        .text_color(rgb(th.state.danger))
                         .cursor_pointer()
                         .on_click(cx.listener(move |view, _ev: &ClickEvent, window, _cx| {
                             if let Err(e) = view.nodes.remove_node(node_id) {
@@ -1369,7 +1372,15 @@ impl Render for WorkspaceView {
                 .flex_1()
                 .overflow_hidden()
                 .p_1()
-                .bg(rgb(0x0d1228))
+                // F1-2-1: TERMINAL é superfície escura nos 2 temas (conteúdo ANSI assume fundo
+                // escuro); nós-ARTEFATO (nota/pasta) usam a superfície de card TEMÁTICA.
+                .bg(rgb(
+                    if matches!(nv.kind, NodeKind::Note | NodeKind::Folder) {
+                        th.surface.card
+                    } else {
+                        th.terminal.bg
+                    },
+                ))
                 // BUG B: um leve dim SÓ quando o nó está IDLE de verdade (periferia sem atividade) —
                 // legível, não "apagado". A periferia ATIVA (ou focada) fica em opacidade plena.
                 .opacity(if dim { 0.82 } else { 1.0 })
@@ -1400,13 +1411,13 @@ impl Render for WorkspaceView {
                         .child(div().text_size(px(40.0 * z)).child(text!(icon)))
                         .child(
                             div()
-                                .text_color(rgb(0xc8d3f5))
+                                .text_color(rgb(th.text.primary))
                                 .text_size(px(15.0 * z))
                                 .child(text!(nv.name.clone())),
                         )
                         .child(
                             div()
-                                .text_color(rgb(0x5b658f))
+                                .text_color(rgb(th.text.muted))
                                 .text_size(px(11.0 * z))
                                 .child(text!(what)),
                         ),
@@ -1437,7 +1448,7 @@ impl Render for WorkspaceView {
                 .h(px(CARD_H * z))
                 .flex()
                 .flex_col()
-                .bg(rgb(0x0d1228))
+                .bg(rgb(th.surface.card))
                 .border_2()
                 .border_color(card_border)
                 .rounded_md()
@@ -1540,7 +1551,7 @@ impl Render for WorkspaceView {
                             .top(dot_y - px(13.0))
                             .size(px(26.0))
                             .rounded_full()
-                            .bg(rgb(0x7aa2f7))
+                            .bg(rgb(th.accent.primary))
                             .opacity(alpha * 0.35),
                     );
                     root = root.child(
@@ -1550,7 +1561,7 @@ impl Render for WorkspaceView {
                             .top(dot_y - px(6.0))
                             .size(px(12.0))
                             .rounded_full()
-                            .bg(rgb(0xbb9af7))
+                            .bg(rgb(th.accent.secondary))
                             .opacity(alpha),
                     );
                 }
@@ -1572,8 +1583,8 @@ impl Render for WorkspaceView {
             .gap_2()
             .px_4()
             .py_2()
-            .bg(rgb(0x0c1130))
-            .text_color(rgb(0x7aa2f7))
+            .bg(rgb(th.surface.chrome))
+            .text_color(rgb(th.accent.primary))
             .child(text!(
                 "Lina Space · terminais reais (clique p/ focar · digite · scroll)"
             ));
@@ -1585,10 +1596,10 @@ impl Render for WorkspaceView {
                     .flex_row()
                     .items_center()
                     .gap_2()
-                    .child(div().size(px(8.0)).rounded_full().bg(rgb(0x9ece6a)))
+                    .child(div().size(px(8.0)).rounded_full().bg(rgb(th.state.success)))
                     .child(
                         div()
-                            .text_color(rgb(0x9ece6a))
+                            .text_color(rgb(th.state.success))
                             .child(text!("Time conectado · todos se falam")),
                     ),
             );
@@ -1596,7 +1607,7 @@ impl Render for WorkspaceView {
 
         topbar = topbar.child(
             div()
-                .text_color(rgb(0x5b658f))
+                .text_color(rgb(th.text.muted))
                 .child(text!(format!("log: {event_count} eventos"))),
         );
 
@@ -1609,8 +1620,8 @@ impl Render for WorkspaceView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x3d59c9))
-                    .text_color(rgb(0xeef1ff))
+                    .bg(rgb(th.accent.action))
+                    .text_color(rgb(th.text.on_accent))
                     .cursor_pointer()
                     .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
                         // O B é um shell real: injeta um COMANDO válido (roda limpo nele).
@@ -1631,8 +1642,8 @@ impl Render for WorkspaceView {
                 .px_3()
                 .py_1()
                 .rounded_md()
-                .bg(rgb(0x2c7a4b))
-                .text_color(rgb(0xeef1ff))
+                .bg(rgb(th.accent.confirm))
+                .text_color(rgb(th.text.on_accent))
                 .cursor_pointer()
                 .on_click(cx.listener(|view, _ev: &ClickEvent, window, _cx| {
                     // Cria um shell real novo, idêntico aos demais, foca e o TRAZ p/ a viewport.
@@ -1656,8 +1667,8 @@ impl Render for WorkspaceView {
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x3a3f5a))
-                        .text_color(rgb(0xeef1ff))
+                        .bg(rgb(th.surface.raised_alt))
+                        .text_color(rgb(th.text.bright))
                         .child(text!(format!(
                             "✦ Novo agente: {buf}▌  (Enter cria · Esc cancela)"
                         ))),
@@ -1670,8 +1681,8 @@ impl Render for WorkspaceView {
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgb(0x6c4ad1))
-                        .text_color(rgb(0xeef1ff))
+                        .bg(rgb(th.accent.create))
+                        .text_color(rgb(th.text.on_accent))
                         .cursor_pointer()
                         .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
                             // Abre o modo nomeação; o `handle_key` monta o buffer e cria no Enter.
@@ -1693,8 +1704,8 @@ impl Render for WorkspaceView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0x3a3f5a))
-                    .text_color(rgb(0xeef1ff))
+                    .bg(rgb(th.surface.raised_alt))
+                    .text_color(rgb(th.text.bright))
                     .child(text!(format!(
                         "{icon} {what}: {buf}▌  (Enter cria · Esc cancela)"
                     ))),
@@ -1709,8 +1720,8 @@ impl Render for WorkspaceView {
                 .px_3()
                 .py_1()
                 .rounded_md()
-                .bg(rgb(0x2a3152))
-                .text_color(rgb(0xc8d3f5))
+                .bg(rgb(th.surface.raised))
+                .text_color(rgb(th.text.primary))
                 .cursor_pointer()
                 .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
                     view.camera.reset();
@@ -1724,8 +1735,8 @@ impl Render for WorkspaceView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0xf7768e))
-                    .text_color(rgb(0x11111b))
+                    .bg(rgb(th.state.danger))
+                    .text_color(rgb(th.text.on_emphasis))
                     .child(text!("⟳ Recuperando…")),
             );
         }
@@ -1738,8 +1749,8 @@ impl Render for WorkspaceView {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0xf7768e))
-                    .text_color(rgb(0x11111b))
+                    .bg(rgb(th.state.danger))
+                    .text_color(rgb(th.text.on_emphasis))
                     .child(text!(
                         "🛑 teto de custo atingido · workspace PAUSADO — rode `lina resume` e confirme (⌘⏎)"
                     )),
@@ -1753,14 +1764,20 @@ impl Render for WorkspaceView {
             (d.banner(), d.front().is_some())
         };
         if let Some(banner) = custody_banner {
-            let bg = if custody_pending { 0xe0af68 } else { 0x2c7a4b };
+            // Pares (bg, fg) cobertos pelo gate WCAG: warning+on_emphasis / confirm+on_accent
+            // (o antigo texto escuro fixo violava AA sobre o verde — corrigido na migração F1-2-1).
+            let (bg, fg) = if custody_pending {
+                (th.state.warning, th.text.on_emphasis)
+            } else {
+                (th.accent.confirm, th.text.on_accent)
+            };
             topbar = topbar.child(
                 div()
                     .px_3()
                     .py_1()
                     .rounded_md()
                     .bg(rgb(bg))
-                    .text_color(rgb(0x11111b))
+                    .text_color(rgb(fg))
                     .child(text!(banner)),
             );
         }
@@ -1770,17 +1787,30 @@ impl Render for WorkspaceView {
         // W4-6 gap3: o rótulo do rodapé reflete o EFETIVO (fonte única) — não o override cru.
         let reduce_motion = a11y::reduce_motion_effective(self.reduce_motion);
         // BUG 5: rótulo em linguagem de leigo (sem "orquestração" cru) + legenda explicando o que faz.
-        let (freio_bg, freio_txt) = if paused {
-            (0x2c7a4b, "▶ Retomar cooperação dos agentes")
+        // Pares (bg, fg) em tokens cobertos pelo gate WCAG (F1-2-1).
+        let (freio_bg, freio_fg, freio_txt) = if paused {
+            (
+                th.accent.confirm,
+                th.text.on_accent,
+                "▶ Retomar cooperação dos agentes",
+            )
         } else {
-            (0xe0af68, "⏸ Pausar cooperação dos agentes")
+            (
+                th.state.warning,
+                th.text.on_emphasis,
+                "⏸ Pausar cooperação dos agentes",
+            )
         };
         // BUG 5: o toggle deixa EXPLÍCITO o que liga/desliga (ANIMAÇÕES) + cor de estado óbvia (âmbar
         // quando desligadas = "redução ativa"). `reduce_motion` já é o EFETIVO (fonte única, W4-6).
         let (anim_bg, anim_fg, anim_txt) = if reduce_motion {
-            (0xe0af68, 0x11111b, "🎞 Animações: DESLIGADAS")
+            (
+                th.state.warning,
+                th.text.on_emphasis,
+                "🎞 Animações: DESLIGADAS",
+            )
         } else {
-            (0x2a3152, 0xc8d3f5, "🎞 Animações: ligadas")
+            (th.surface.raised, th.text.primary, "🎞 Animações: ligadas")
         };
         let mut footer = div()
             .absolute()
@@ -1795,7 +1825,7 @@ impl Render for WorkspaceView {
             .gap_2()
             .px_4()
             .py_2()
-            .bg(rgb(0x0c1130))
+            .bg(rgb(th.surface.chrome))
             .child(
                 div()
                     .id("freio-btn")
@@ -1803,7 +1833,7 @@ impl Render for WorkspaceView {
                     .py_1()
                     .rounded_md()
                     .bg(rgb(freio_bg))
-                    .text_color(rgb(0x11111b))
+                    .text_color(rgb(freio_fg))
                     .cursor_pointer()
                     .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
                         // Só SINALIZA: a MailboxPump aplica Router::pause/resume no próximo tick.
@@ -1826,11 +1856,11 @@ impl Render for WorkspaceView {
                     .child(text!(anim_txt)),
             )
             // BUG 5: legenda SEMPRE visível explicando o freio em linguagem de leigo.
-            .child(div().text_color(rgb(0x5b658f)).child(text!(
+            .child(div().text_color(rgb(th.text.muted)).child(text!(
                 "ℹ Cooperação = os agentes se delegam tarefas sozinhos · Pausar segura isso (nada se perde, retoma quando quiser)"
             )));
         if paused {
-            footer = footer.child(div().text_color(rgb(0xe0af68)).child(text!(
+            footer = footer.child(div().text_color(rgb(th.state.warning)).child(text!(
                 "⏸ pausado · novas delegações ficam na FILA (nada se perde; nenhum trabalho some)"
             )));
         }
@@ -1867,10 +1897,11 @@ impl Render for WorkspaceView {
 /// o nome digitado (com cursor) ou um placeholder, e as teclas. Torna o modo VISÍVEL (o feedback no
 /// topbar é discreto demais). Não-interativo: o teclado (`handle_key`) dirige (Enter cria · Esc cancela).
 fn naming_overlay(buf: &str) -> impl IntoElement {
+    let th = theme::active();
     let (typed, typed_fg) = if buf.is_empty() {
-        ("Digite o nome do agente…".to_string(), rgb(0x5b658f))
+        ("Digite o nome do agente…".to_string(), rgb(th.text.muted))
     } else {
-        (format!("{buf}▌"), rgb(0xeef1ff))
+        (format!("{buf}▌"), rgb(th.text.bright))
     };
     div()
         .absolute()
@@ -1889,18 +1920,18 @@ fn naming_overlay(buf: &str) -> impl IntoElement {
                 .px_6()
                 .py_5()
                 .rounded_lg()
-                .bg(rgb(0x141a36))
+                .bg(rgb(th.surface.panel))
                 .border_2()
-                .border_color(rgb(0x6c4ad1))
+                .border_color(rgb(th.accent.create))
                 .child(
                     div()
                         .text_size(px(22.0))
-                        .text_color(rgb(0xeef1ff))
+                        .text_color(rgb(th.text.bright))
                         .child(text!("✦ Novo Agente")),
                 )
                 .child(
                     div()
-                        .text_color(rgb(0x9aa5d4))
+                        .text_color(rgb(th.text.secondary))
                         .child(text!("Digite o nome — o papel vem do nome")),
                 )
                 .child(
@@ -1911,7 +1942,7 @@ fn naming_overlay(buf: &str) -> impl IntoElement {
                 )
                 .child(
                     div()
-                        .text_color(rgb(0x5b658f))
+                        .text_color(rgb(th.text.muted))
                         .child(text!("Enter cria · Esc cancela")),
                 ),
         )
@@ -1962,6 +1993,7 @@ fn resolve_ws_root(demo: bool) -> PathBuf {
 /// o raro caso de spawn que falhou), uma guia centralizada substitui o vazio — o aluno sabe o próximo
 /// passo (⌘T). Some sozinho assim que o 1º card existe.
 fn empty_canvas_hint() -> impl IntoElement {
+    let th = theme::active();
     div()
         .absolute()
         .size_full()
@@ -1975,13 +2007,13 @@ fn empty_canvas_hint() -> impl IntoElement {
             div()
                 .text_size(px(20.0))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(0xc8d3f5))
+                .text_color(rgb(th.text.primary))
                 .child(text!("Seu Espaço está pronto")),
         )
         .child(
             div()
                 .text_size(px(15.0))
-                .text_color(rgb(0x8a93b8))
+                .text_color(rgb(th.text.secondary))
                 .child(text!("Pressione ⌘T para criar seu primeiro agente")),
         )
 }
@@ -2177,6 +2209,12 @@ fn main() {
     let ws_root = resolve_ws_root(demo);
     let mailbox_dir = ws_root.join(".lina");
     let dir = mailbox_dir.join("events");
+    // F1-2-1: aplica o tema PERSISTIDO (T7 `settings.json`, ao lado do event log) ANTES de abrir
+    // qualquer janela — a escolha dark/light + acento sobrevive ao restart, 100% local (inv #2).
+    {
+        let s = persistence_ui::load_settings(&dir);
+        theme::apply(s.theme_mode(), &s.accent);
+    }
     // Estado PERSISTENTE do onboarding (progresso + log próprio), co-locado no workspace (subdir, não
     // colide com `.lina/events` do canvas). Sobrevive ao reboot em produção → o onboarding só aparece
     // na 1ª execução de verdade.

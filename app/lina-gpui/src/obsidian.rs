@@ -43,15 +43,11 @@ use crate::dev_tools::{decide_plan, open_in_terminal, InstallPlan};
 use crate::onboarding::{install_recipe_with, run_install, InstallState, OnboardingView};
 
 // ───────────────────────────── paleta (espelha o onboarding/canvas) ─────────────────────────────
-const PANEL: u32 = 0x141a36;
-const PANEL_SEL: u32 = 0x1b2347; // linha selecionada (UX §6)
-const ACCENT: u32 = 0x7aa2f7;
-const TEXT: u32 = 0xc8d3f5;
-const MUTED: u32 = 0x5b658f;
-const GREEN: u32 = 0x9ece6a;
-const AMBER: u32 = 0xe0af68;
-
-/// Nome do app bundle do Obsidian (macOS `Obsidian.app`).
+/// F1-2-1: tokens VIVOS do design system — cada chamada lê o tema ATIVO (trocar dark/light ou
+/// acento no T7 re-pinta esta janela no frame seguinte, sem restart). Fonte única: `theme::active`.
+fn th() -> crate::theme::Theme {
+    crate::theme::active()
+}
 const OBSIDIAN_APP: &str = "Obsidian";
 /// id lógico da receita no `second-brain.toml`.
 const OBSIDIAN_ID: &str = "obsidian";
@@ -1808,8 +1804,8 @@ impl SecondBrainModel {
         col = col.child(self.banner(screen, count));
         // Âncora A — privacidade (🔒): cor é REFORÇO, o significado vem do ícone+texto (inv#6).
         col = col.child(banner(
-            0x18301f,
-            GREEN,
+            th().surface.success_muted,
+            th().state.success,
             "🔒 Tudo fica no SEU computador. A Lina lê suas anotações aqui, na sua máquina. Nada é \
              enviado pra internet, nem pra nuvem — e você pode desligar quando quiser.",
         ));
@@ -1824,12 +1820,12 @@ impl SecondBrainModel {
 
         // Âncora B — não-destruição (🛡️) + lembrete de estado salvo (💾), acima do rodapé.
         col = col.child(banner(
-            PANEL,
-            ACCENT,
+            th().surface.panel,
+            th().accent.primary,
             "🛡️ A Lina nunca apaga nem altera suas anotações. Ela só escreve numa pastinha nova \
              chamada \"Lina\", que cria dentro da pasta que você escolher. No resto, NUNCA mexe.",
         ));
-        col = col.child(div().text_color(rgb(MUTED)).child(text!(
+        col = col.child(div().text_color(rgb(th().text.muted)).child(text!(
             "💾 Salvo automaticamente. Pode fechar e voltar quando quiser — nada se perde."
         )));
 
@@ -1842,13 +1838,13 @@ impl SecondBrainModel {
     fn banner(&self, screen: Screen, count: usize) -> AnyElement {
         match screen {
             Screen::Searching => banner(
-                PANEL,
-                ACCENT,
+                th().surface.panel,
+                th().accent.primary,
                 "🔵 Procurando o Obsidian no seu computador… Isso costuma levar uns segundos.",
             ),
             Screen::NotInstalled => banner(
-                0x33202c,
-                AMBER,
+                th().surface.danger_muted,
+                th().state.warning,
                 "🟠 Ainda não encontramos o Obsidian aqui no seu computador. Tudo bem — ele não vem \
                  instalado. · é opcional",
             ),
@@ -1860,8 +1856,8 @@ impl SecondBrainModel {
                     format!("{n} pastas de anotações")
                 };
                 banner(
-                    0x18301f,
-                    GREEN,
+                    th().surface.success_muted,
+                    th().state.success,
                     &format!(
                         "🟢 Achei o Obsidian e encontrei {pastas}. Marque quais você quer que a Lina \
                          use pra te ajudar."
@@ -1869,8 +1865,8 @@ impl SecondBrainModel {
                 )
             }
             Screen::NoVaults => banner(
-                0x33202c,
-                AMBER,
+                th().surface.danger_muted,
+                th().state.warning,
                 "🟠 Achei o Obsidian, mas você ainda não tem nenhuma pasta de anotações criada. Sem \
                  problema — dá pra resolver.",
             ),
@@ -1881,8 +1877,8 @@ impl SecondBrainModel {
                     format!("{count} pastas de anotações")
                 };
                 banner(
-                    0x18301f,
-                    GREEN,
+                    th().surface.success_muted,
+                    th().state.success,
                     &format!(
                         "🟢 Pronto! A Lina agora aprende com {pastas}. Ela vai usar o que está nelas \
                          pra te ajudar melhor."
@@ -1900,12 +1896,12 @@ impl SecondBrainModel {
             .gap_2()
             .child(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(th().text.muted))
                     .child(text!("⟳ Procurando o app Obsidian … aguarde")),
             )
             .child(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(th().text.muted))
                     .child(text!("⟳ Lendo a lista de pastas de anotações … aguarde")),
             )
             .into_any_element()
@@ -1918,11 +1914,12 @@ impl SecondBrainModel {
             install,
             InstallState::Installing { .. } | InstallState::Verifying
         );
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(div().text_color(rgb(TEXT)).child(text!(
+        let mut col =
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(div().text_color(rgb(th().text.primary)).child(text!(
             "Seu caderno de anotações vira a memória da Lina — ela aprende com o que você escreve \
                  e te ajuda melhor."
         )));
@@ -1933,8 +1930,8 @@ impl SecondBrainModel {
                 _ => "verificando…".to_string(),
             };
             col = col.child(banner(
-                PANEL,
-                AMBER,
+                th().surface.panel,
+                th().state.warning,
                 &format!("⟳ Instalando o Obsidian: {line}"),
             ));
         } else {
@@ -1947,7 +1944,7 @@ impl SecondBrainModel {
                     .child(action_button(
                         "sb-install",
                         "⬇ Instalar para mim (recomendado)",
-                        0x3d59c9,
+                        th().accent.action,
                         cx,
                         |onb, _w, cx| {
                             onb.second_brain.start_install();
@@ -1967,7 +1964,11 @@ impl SecondBrainModel {
             col = col.child(self.notice_banner(notice));
         }
         if let InstallState::Failed { reason } = &install {
-            col = col.child(banner(0x33202c, AMBER, &format!("⚠ {reason}")));
+            col = col.child(banner(
+                th().surface.danger_muted,
+                th().state.warning,
+                &format!("⚠ {reason}"),
+            ));
         }
         col.into_any_element()
     }
@@ -1978,16 +1979,16 @@ impl SecondBrainModel {
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().text_color(rgb(TEXT)).child(text!(
+            .child(div().text_color(rgb(th().text.primary)).child(text!(
                 "O que a Lina faz: ela LÊ suas anotações pra te entender — como uma leitura. E só \
                  ESCREVE numa pastinha nova \"Lina\" que cria dentro da sua pasta. No resto, NUNCA mexe."
             )))
-            .child(div().text_color(rgb(MUTED)).child(text!(
+            .child(div().text_color(rgb(th().text.muted)).child(text!(
                 "Marque as pastas de anotações (no Obsidian, essas pastas são chamadas de \"vault\"):"
             )))
             .child(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(th().text.muted))
                     .child(text!(format!("Selecionadas: {count} de {}", self.all_vaults().len()))),
             );
 
@@ -2002,7 +2003,11 @@ impl SecondBrainModel {
 
         // Confirmar (corpo, verde) — desabilitado-com-dica em 0 (o RODAPÉ nunca trava; UX §5).
         if count == 0 {
-            col = col.child(banner(PANEL, MUTED, "Confirmar (nenhuma pasta marcada)"));
+            col = col.child(banner(
+                th().surface.panel,
+                th().text.muted,
+                "Confirmar (nenhuma pasta marcada)",
+            ));
         } else {
             let label = if count == 1 {
                 "✓ Confirmar 1 pasta para a Lina".to_string()
@@ -2015,7 +2020,7 @@ impl SecondBrainModel {
             col = col.child(action_button(
                 "sb-confirm",
                 &label,
-                0x2c7a4b,
+                th().accent.confirm,
                 cx,
                 |onb, _w, cx| {
                     onb.second_brain.confirm();
@@ -2055,7 +2060,11 @@ impl SecondBrainModel {
             .px_4()
             .py_3()
             .rounded_md()
-            .bg(rgb(if selected { PANEL_SEL } else { PANEL }))
+            .bg(rgb(if selected {
+                th().surface.selected_row
+            } else {
+                th().surface.panel
+            }))
             .cursor_pointer()
             .on_click(cx.listener(move |onb, _ev: &ClickEvent, _w, cx| {
                 onb.second_brain.toggle(&path);
@@ -2071,19 +2080,23 @@ impl SecondBrainModel {
                     .child(
                         div()
                             .flex_1()
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(th().text.primary))
                             .font_weight(FontWeight::BOLD)
                             .child(text!(name_line)),
                     )
                     .child(
                         div()
-                            .text_color(rgb(if selected { GREEN } else { MUTED }))
+                            .text_color(rgb(if selected {
+                                th().state.success
+                            } else {
+                                th().text.muted
+                            }))
                             .child(text!(status)),
                     ),
             )
             .child(
                 div()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(th().text.muted))
                     .child(text!(v.path.display().to_string())),
             )
             .into_any_element()
@@ -2097,20 +2110,20 @@ impl SecondBrainModel {
             .gap_3()
             .child(
                 div()
-                    .text_color(rgb(GREEN))
+                    .text_color(rgb(th().state.success))
                     .child(text!("● Obsidian (seu caderno de anotações) … encontrado")),
             )
             .child(
                 div()
-                    .text_color(rgb(AMBER))
+                    .text_color(rgb(th().state.warning))
                     .child(text!("● Pastas de anotações … nenhuma ainda")),
             )
-            .child(div().text_color(rgb(TEXT)).child(text!(
+            .child(div().text_color(rgb(th().text.primary)).child(text!(
                 "① Apontar uma pasta que você já tem — se você já guarda anotações numa pasta do \
                  computador, é só mostrar ela pra Lina."
             )))
             .child(add_folder_button("sb-pick", "＋ Escolher uma pasta…", cx))
-            .child(div().text_color(rgb(TEXT)).child(text!(
+            .child(div().text_color(rgb(th().text.primary)).child(text!(
                 "② Criar uma pasta no Obsidian — abra o Obsidian, clique em \"Create new vault\" \
                  (criar nova pasta de anotações) e depois volte aqui."
             )))
@@ -2160,16 +2173,16 @@ impl SecondBrainModel {
                     .px_4()
                     .py_3()
                     .rounded_md()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(th().surface.panel))
                     .child(
                         div()
-                            .text_color(rgb(GREEN))
+                            .text_color(rgb(th().state.success))
                             .font_weight(FontWeight::BOLD)
                             .child(text!(format!("✓ {}", v.name))),
                     )
                     .child(
                         div()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(th().text.muted))
                             .child(text!(format!("{}  ·  Vai ser usada", v.path.display()))),
                     ),
             );
@@ -2178,9 +2191,9 @@ impl SecondBrainModel {
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().text_color(rgb(TEXT)).child(text!("O que você acabou de combinar com a Lina:")))
+            .child(div().text_color(rgb(th().text.primary)).child(text!("O que você acabou de combinar com a Lina:")))
             .child(list)
-            .child(div().text_color(rgb(MUTED)).child(text!(
+            .child(div().text_color(rgb(th().text.muted)).child(text!(
                 "E o limite continua valendo, sempre: a Lina só escreve na pastinha \"Lina\" que ela \
                  cria; nunca toca, move ou apaga mais nada seu. Você pode mudar isto depois."
             )))
@@ -2205,14 +2218,14 @@ impl SecondBrainModel {
     fn notice_banner(&self, notice: &InstallNotice) -> AnyElement {
         match notice {
             InstallNotice::TerminalOpened => banner(
-                PANEL,
-                ACCENT,
+                th().surface.panel,
+                th().accent.primary,
                 "Abri uma janela de Terminal para instalar o Obsidian. Ela pode pedir a senha do seu \
                  Mac — é normal e seguro. Quando terminar, volte e clique \"Verificar\".",
             ),
             InstallNotice::UseWebsite => banner(
-                0x33202c,
-                AMBER,
+                th().surface.danger_muted,
+                th().state.warning,
                 "Não consegui instalar sozinho. Você pode baixar do site (obsidian.md) e clicar em \
                  \"Verificar\" — ou pular esta etapa por agora.",
             ),
@@ -2250,7 +2263,7 @@ impl SecondBrainModel {
         row = row.child(action_button(
             "sb-primary",
             &label,
-            0x2c7a4b,
+            th().accent.confirm,
             cx,
             move |onb, _w, _cx| {
                 if confirm_and_advance {
@@ -2284,13 +2297,13 @@ fn heading(title: &str, subtitle: &str) -> AnyElement {
             div()
                 .text_size(px(28.0))
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(TEXT))
+                .text_color(rgb(th().text.primary))
                 .child(text!(title.to_string())),
         )
         .child(
             div()
                 .text_size(px(15.0))
-                .text_color(rgb(MUTED))
+                .text_color(rgb(th().text.muted))
                 .child(text!(subtitle.to_string())),
         )
         .into_any_element()
@@ -2322,7 +2335,7 @@ fn action_button(
         .py_2()
         .rounded_md()
         .bg(rgb(bg))
-        .text_color(rgb(0xeef1ff))
+        .text_color(rgb(th().text.bright))
         .font_weight(FontWeight::BOLD)
         .cursor_pointer()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, window, cx| on_click(onb, window, cx)))
@@ -2342,8 +2355,8 @@ fn ghost_button(
         .px_4()
         .py_2()
         .rounded_md()
-        .bg(rgb(0x2a3152))
-        .text_color(rgb(TEXT))
+        .bg(rgb(th().surface.raised))
+        .text_color(rgb(th().text.primary))
         .cursor_pointer()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, window, cx| on_click(onb, window, cx)))
         .child(text!(label.to_string()))
@@ -2363,8 +2376,8 @@ fn add_folder_button(
         .px_4()
         .py_2()
         .rounded_md()
-        .bg(rgb(0x2a3152))
-        .text_color(rgb(TEXT))
+        .bg(rgb(th().surface.raised))
+        .text_color(rgb(th().text.primary))
         .cursor_pointer()
         .on_click(cx.listener(move |_onb, _ev: &ClickEvent, _w, cx| {
             let rx = cx.prompt_for_paths(PathPromptOptions {

@@ -44,18 +44,11 @@ use lina_core::{
 };
 use serde::{Deserialize, Serialize};
 
-// ───────────────────────────── paleta (espelha o canvas) ─────────────────────────────
-
-const BG: u32 = 0x0a0e27;
-const PANEL: u32 = 0x141a36;
-const ACCENT: u32 = 0x7aa2f7;
-const TEXT: u32 = 0xc8d3f5;
-const MUTED: u32 = 0x5b658f;
-const GREEN: u32 = 0x9ece6a;
-const AMBER: u32 = 0xe0af68;
-const RED: u32 = 0xf7768e;
-
-// ═══════════════════════════════ máquina de passos (gpui-free) ═══════════════════════════════
+/// F1-2-1: tokens VIVOS do design system — cada chamada lê o tema ATIVO (trocar dark/light ou
+/// acento no T7 re-pinta esta janela no frame seguinte, sem restart). Fonte única: `theme::active`.
+fn th() -> crate::theme::Theme {
+    crate::theme::active()
+}
 
 /// Os passos do onboarding (T0→T3 + estado final). `Provider` (T2) é um passe-through leve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,8 +774,8 @@ impl OnboardingView {
             .px_5()
             .py_2()
             .rounded_md()
-            .bg(rgb(0x2c7a4b))
-            .text_color(rgb(0xeef1ff))
+            .bg(rgb(th().accent.confirm))
+            .text_color(rgb(th().text.on_accent))
             .font_weight(FontWeight::BOLD)
             .cursor_pointer()
             .on_click(cx.listener(move |view, _ev: &ClickEvent, window, cx| {
@@ -806,8 +799,8 @@ impl OnboardingView {
             .px_4()
             .py_2()
             .rounded_md()
-            .bg(rgb(0x2a3152))
-            .text_color(rgb(TEXT))
+            .bg(rgb(th().surface.raised))
+            .text_color(rgb(th().text.primary))
             .cursor_pointer()
             .on_click(cx.listener(move |view, _ev: &ClickEvent, window, cx| {
                 on_click(view, window, cx);
@@ -829,7 +822,11 @@ impl OnboardingView {
                     .w(px(if i == cur { 26.0 } else { 12.0 }))
                     .h(px(6.0))
                     .rounded_full()
-                    .bg(rgb(if on { ACCENT } else { 0x2a3152 })),
+                    .bg(rgb(if on {
+                        th().accent.primary
+                    } else {
+                        th().surface.raised
+                    })),
             );
         }
         row.into_any_element()
@@ -845,13 +842,13 @@ impl OnboardingView {
                 div()
                     .text_size(px(28.0))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(th().text.primary))
                     .child(text!(title.to_string())),
             )
             .child(
                 div()
                     .text_size(px(15.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(th().text.muted))
                     .child(text!(subtitle.to_string())),
             )
             .into_any_element()
@@ -895,8 +892,8 @@ impl OnboardingView {
                     .px_4()
                     .py_3()
                     .rounded_md()
-                    .bg(rgb(PANEL))
-                    .text_color(rgb(ACCENT))
+                    .bg(rgb(th().surface.panel))
+                    .text_color(rgb(th().accent.primary))
                     .child(text!("Procurando assistentes no seu computador…")),
             );
         } else if self.model.nothing_found() {
@@ -905,8 +902,8 @@ impl OnboardingView {
                     .px_4()
                     .py_3()
                     .rounded_md()
-                    .bg(rgb(0x33202c))
-                    .text_color(rgb(AMBER))
+                    .bg(rgb(th().surface.danger_muted))
+                    .text_color(rgb(th().state.warning))
                     .child(text!(
                         "Nenhum assistente encontrado ainda — escolha um abaixo e clique \"Instalar para mim\"."
                     )),
@@ -938,16 +935,16 @@ impl OnboardingView {
                 .px_4()
                 .py_3()
                 .rounded_md()
-                .bg(rgb(PANEL))
+                .bg(rgb(th().surface.panel))
                 .child(div().size(px(9.0)).rounded_full().bg(rgb(if present {
-                    GREEN
+                    th().state.success
                 } else {
-                    0x3a4566
+                    th().surface.raised_alt
                 })))
                 .child(
                     div()
                         .w(px(120.0))
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(th().text.primary))
                         .font_weight(FontWeight::BOLD)
                         .child(text!(display_name(id))),
                 );
@@ -960,7 +957,7 @@ impl OnboardingView {
                 row = row.child(
                     div()
                         .flex_1()
-                        .text_color(rgb(GREEN))
+                        .text_color(rgb(th().state.success))
                         .child(text!(format!("✓ {ver}"))),
                 );
             } else if installing_this {
@@ -972,7 +969,7 @@ impl OnboardingView {
                 row = row.child(
                     div()
                         .flex_1()
-                        .text_color(rgb(AMBER))
+                        .text_color(rgb(th().state.warning))
                         .child(text!(format!("⟳ {line}"))),
                 );
             } else {
@@ -980,7 +977,7 @@ impl OnboardingView {
                     .child(
                         div()
                             .flex_1()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(th().text.muted))
                             .child(text!("não encontrado")),
                     )
                     .child(self.install_button(id, cx));
@@ -996,8 +993,8 @@ impl OnboardingView {
                     .px_4()
                     .py_3()
                     .rounded_md()
-                    .bg(rgb(0x33202c))
-                    .text_color(rgb(RED))
+                    .bg(rgb(th().surface.danger_muted))
+                    .text_color(rgb(th().state.danger))
                     .child(text!(format!("⚠ {reason}"))),
             );
         }
@@ -1037,8 +1034,8 @@ impl OnboardingView {
             .px_4()
             .py_2()
             .rounded_md()
-            .bg(rgb(0x3d59c9))
-            .text_color(rgb(0xeef1ff))
+            .bg(rgb(th().accent.action))
+            .text_color(rgb(th().text.on_accent))
             .cursor_pointer()
             .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
                 view.model.start_install(id);
@@ -1128,13 +1125,13 @@ impl OnboardingView {
                 div()
                     .text_size(px(26.0))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(GREEN))
+                    .text_color(rgb(th().state.success))
                     .child(text!("Espaço criado!")),
             )
             .child(
                 div()
                     .text_size(px(15.0))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(th().text.muted))
                     .child(text!(
                     "Tudo pronto. Seu Espaço foi salvo — abra o canvas para começar a trabalhar."
                 )),
@@ -1179,8 +1176,8 @@ impl Render for OnboardingView {
             .track_focus(&self.focus)
             .size_full()
             .overflow_y_scroll()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(th().surface.canvas))
+            .text_color(rgb(th().text.primary))
             .child(
                 // O flex (centralização) fica AQUI, num wrapper INTERNO — NUNCA no root de scroll.
                 // `items_start` não estica o painel na vertical (deixa ele com a altura natural).
@@ -1208,7 +1205,7 @@ impl Render for OnboardingView {
                                     .gap_4()
                                     .child(
                                         div()
-                                            .text_color(rgb(ACCENT))
+                                            .text_color(rgb(th().accent.primary))
                                             .font_weight(FontWeight::BOLD)
                                             .child(text!("Lina Space")),
                                     )
