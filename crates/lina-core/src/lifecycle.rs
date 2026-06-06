@@ -62,6 +62,61 @@ pub mod reason {
     pub const CUSTODY_GATE: &str = "custody_gate";
     /// Spawn/registro concluído → `Ready`.
     pub const SPAWN: &str = "spawn";
+    /// F1-0-8 (P4): morte PÓSTUMA registrada na reabertura do workspace — o processo
+    /// do terminal morreu junto com a sessão anterior do app (kill -9/crash/fechar),
+    /// e a reabertura é o primeiro momento em que o fato pode entrar no log.
+    pub const APP_REOPENED: &str = "app_reopened";
+}
+
+/// F1-0-8 (P4) — fecha o ciclo de vida da geração ANTERIOR no log (nós-fantasma).
+///
+/// ## O problema (DIRECIONAMENTO P4 / pesquisa 13.2)
+/// 3 reaberturas do app = 17 `NodeAdded` / 0 mortes no log → o replay "via" 17
+/// terminais vivos; o roster do Supervisor só funcionava porque ignorava o replay —
+/// tensão direta com o invariante #4 ("o event log é a fonte da verdade").
+///
+/// ## Decisão registrada: opção (a) — mortes PÓSTUMAS explícitas, por nó
+/// Ao abrir o workspace (logo após `EventStore::open`/`open_or_recover`, ANTES de
+/// registrar a nova geração), apenda `NodeStatusChanged{status:"dead", from:<último
+/// status projetado>, reason:"app_reopened"}` para cada terminal da geração anterior
+/// ainda "vivo" no log. Usa o evento EXISTENTE (zero variante nova) — o fato é
+/// verdadeiro (os processos morreram com a sessão) e fica auditável POR NÓ:
+/// `NodeAdded − mortes == nós vivos` fecha no próprio `log.jsonl`.
+///
+/// A alternativa (b) — snapshot/compactação — foi DESCARTADA por design: snapshot
+/// materializa a projeção, e a projeção é exatamente o que está errado; congelar o
+/// estado não acrescenta ao log o fato que falta (as mortes), e "compactar" eventos
+/// seria reescrever história — anti-invariante #4 frontal. Um evento único de
+/// geração (variante de (a)) também foi descartado: tornaria a morte de cada nó
+/// IMPLÍCITA (regra não-local na projeção) e quebraria a aritmética por evento que
+/// o critério de aceite exige. Nenhuma porta da §3 é fechada (mudança aditiva) →
+/// sem ADR; decisão registrada aqui e no relatório da story.
+///
+/// ## Por que NÃO passa pelo `LifecycleEngine::transition`
+/// O choke point do engine opera sobre o roster VIVO do Supervisor — e a geração
+/// anterior não existe no processo novo (não há o que `mark_dead`). Esta é a única
+/// escrita de status legítima fora do engine: é um fato PÓSTUMO, derivado do log
+/// para o log. Nós sem status (notas, nós nunca spawnados) não têm ciclo de vida de
+/// processo e atravessam intactos; nós já `dead` não morrem duas vezes (idempotente).
+pub fn close_previous_generation(store: &mut EventStore) -> Result<Vec<NodeId>, StoreError> {
+    let state = store.project()?;
+    let mut closed = Vec::new();
+    for (node, projected) in &state.nodes {
+        let Some(last_status) = projected.status.as_deref() else {
+            continue; // sem ciclo de vida (nota/nunca spawnou) — não é fantasma
+        };
+        if last_status == NodeStatus::Dead.as_str() {
+            continue; // já fechado (idempotência entre reaberturas)
+        }
+        store.append(&DomainEvent::NodeStatusChanged {
+            node: *node,
+            status: NodeStatus::Dead.as_str().to_string(),
+            from: last_status.to_string(),
+            reason: reason::APP_REOPENED.to_string(),
+        })?;
+        closed.push(*node);
+    }
+    Ok(closed)
 }
 
 /// Erros do engine de lifecycle.
@@ -706,5 +761,135 @@ mod tests {
         );
         assert!(!projected.nodes.get(&a).expect("A").stalled);
         assert_eq!(stall_events(&store), 1);
+    }
+
+    // ── F1-0-8 (P4): fechar o ciclo de vida no log — nós-fantasma de gerações anteriores ──
+
+    /// Conta eventos do log por (kind, predicado no payload) — o "grep" do critério 2.
+    fn count_events(
+        store: &EventStore,
+        kind: &str,
+        pred: impl Fn(&serde_json::Value) -> bool,
+    ) -> usize {
+        store
+            .events()
+            .expect("events")
+            .iter()
+            .filter(|r| r.kind == kind && pred(&r.payload))
+            .count()
+    }
+
+    /// Critérios 1+2 da story: 2 ciclos de "abre → mata → reabre"; o replay do log final
+    /// produz roster idêntico ao Supervisor vivo (N nós, não 3N), e a aritmética de
+    /// eventos `NodeAdded − mortes == nós vivos` fecha — o mesmo grep que revelou o P4.
+    #[test]
+    #[serial]
+    fn reopening_closes_ghosts_of_previous_generations() {
+        let tmp = TempDir::new("ghosts");
+        let add_terminal = |store: &mut EventStore, sup: &Supervisor, name: &str| {
+            let n = sup.register(name, None, Box::new(std::io::sink()));
+            store
+                .append(&DomainEvent::NodeAdded {
+                    node: n,
+                    kind: "Terminal".into(),
+                    x: 0.0,
+                    y: 0.0,
+                })
+                .expect("NodeAdded");
+            n
+        };
+
+        // ── Geração 1: 3 terminais vivos + 1 nota (sem processo) — e o app "morre" (drop). ──
+        let note;
+        {
+            let mut store = EventStore::open(tmp.path()).expect("open g1");
+            let sup = Supervisor::new();
+            let mut eng = LifecycleEngine::new();
+            for name in ["A", "B", "C"] {
+                let n = add_terminal(&mut store, &sup, name);
+                eng.transition(&sup, &mut store, n, NodeStatus::Ready, reason::SPAWN)
+                    .expect("→ Ready");
+            }
+            // Nó-NOTA: nunca recebe status — não é fantasma, deve atravessar intacto.
+            note = sup.register("nota", None, Box::new(std::io::sink()));
+            store
+                .append(&DomainEvent::NodeAdded {
+                    node: note,
+                    kind: "Note".into(),
+                    x: 1.0,
+                    y: 1.0,
+                })
+                .expect("NodeAdded nota");
+        } // kill -9 simulado: nenhum encerramento gracioso de domínio
+
+        // ── Reabertura 1: fecha a geração anterior ANTES da nova; idempotente. ──
+        {
+            let mut store = EventStore::open(tmp.path()).expect("reopen 1");
+            let closed = close_previous_generation(&mut store).expect("close g1");
+            assert_eq!(closed.len(), 3, "fecha exatamente os 3 terminais da g1");
+            let again = close_previous_generation(&mut store).expect("close 2x");
+            assert!(again.is_empty(), "idempotente: nada vivo para fechar");
+
+            let sup = Supervisor::new();
+            let mut eng = LifecycleEngine::new();
+            for name in ["D", "E"] {
+                let n = add_terminal(&mut store, &sup, name);
+                eng.transition(&sup, &mut store, n, NodeStatus::Ready, reason::SPAWN)
+                    .expect("→ Ready");
+            }
+        } // morre de novo
+
+        // ── Reabertura 2: fecha a g2; sobe a g3 (1 terminal, que fica Busy). ──
+        let mut store = EventStore::open(tmp.path()).expect("reopen 2");
+        let closed = close_previous_generation(&mut store).expect("close g2");
+        assert_eq!(closed.len(), 2, "fecha exatamente os 2 terminais da g2");
+
+        let sup = Supervisor::new();
+        let mut eng = LifecycleEngine::new();
+        let f = add_terminal(&mut store, &sup, "F");
+        eng.transition(&sup, &mut store, f, NodeStatus::Ready, reason::SPAWN)
+            .expect("→ Ready");
+        eng.transition(&sup, &mut store, f, NodeStatus::Busy, reason::PTY_OUTPUT)
+            .expect("→ Busy");
+
+        // ── Critério 1: replay == roster vivo (1 terminal vivo, não 3N). ──
+        let projected = store.project().expect("project");
+        let alive: Vec<_> = projected
+            .nodes
+            .iter()
+            .filter(|(_, n)| {
+                n.status.is_some() && n.status.as_deref() != Some(NodeStatus::Dead.as_str())
+            })
+            .collect();
+        assert_eq!(
+            alive.len(),
+            1,
+            "replay vê 1 terminal vivo (não os fantasmas)"
+        );
+        assert_eq!(*alive[0].0, f);
+        assert_eq!(
+            alive[0].1.status.as_deref(),
+            Some(sup.get(f).expect("roster").status.as_str()),
+            "status do vivo bate com o Supervisor (inv#4)"
+        );
+        // A nota atravessou as gerações intacta (sem status, presente, nunca "morta").
+        let n = projected.nodes.get(&note).expect("nota presente");
+        assert_eq!(n.status, None, "nota não tem ciclo de vida de processo");
+
+        // ── Critério 2: a aritmética do log fecha (o grep que revelou o P4). ──
+        let added = count_events(&store, "NodeAdded", |_| true);
+        let dead = count_events(&store, "NodeStatusChanged", |p| {
+            p.get("status").and_then(|s| s.as_str()) == Some(NodeStatus::Dead.as_str())
+        });
+        let removed = count_events(&store, "NodeRemoved", |_| true);
+        // 7 added (6 terminais + nota) − 5 mortes (3+2) − 0 removed = 2 vivos (F + nota).
+        assert_eq!(added - dead - removed, 2, "NodeAdded − mortes == nós vivos");
+
+        // As mortes póstumas carregam a razão canônica e o `from` projetado.
+        let posthumous = count_events(&store, "NodeStatusChanged", |p| {
+            p.get("reason").and_then(|s| s.as_str()) == Some(reason::APP_REOPENED)
+                && p.get("from").and_then(|s| s.as_str()) == Some(NodeStatus::Ready.as_str())
+        });
+        assert_eq!(posthumous, 5, "toda morte póstuma registra reason+from");
     }
 }
