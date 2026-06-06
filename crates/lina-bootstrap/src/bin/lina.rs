@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         Some("resume") => run_resume(&args[1..]),
         Some("do") => run_do(&args[1..]),
         Some("list") => run_list(args.iter().any(|a| a == "--json")),
+        Some("vault") => run_vault(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -43,7 +44,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -190,21 +191,146 @@ fn run_ask(args: &[String]) -> ExitCode {
     // W3-6c A3: outbox POR-NÓ — `from` é autenticado pela origem (dir-dono), não pelo campo forjável.
     match enqueue_per_node(&mailbox, &from, &msg) {
         Ok(()) => {
-            // Feedback HONESTO (#22): a entrega é ASSÍNCRONA — quem decide o destino final é o
-            // supervisor (guardrails anti-loop/teto de custo podem barrar DEPOIS). Não prometer
-            // "entregue"; dizer que foi enviada e que, se um limite barrar, fica no log do Espaço.
-            // (Sem o jargão "enfileirada", que confundiu o fundador não-técnico.)
-            println!(
-                "ok: enviada a {} (id {}). A entrega é automática e pode levar um instante; se um \
-                 limite de segurança (anti-loop ou teto de custo) barrar, fica registrado no log do Espaço.",
-                msg.to, msg.id
-            );
-            ExitCode::SUCCESS
+            // CONFIRMAÇÃO REAL (fix do "envio nada acontece"): a entrega é assíncrona (o supervisor
+            // roteia DEPOIS), mas o resultado é registrado no event log. Antes, imprimíamos um
+            // "ok: enviada" CEGO mesmo quando o roteador BLOQUEAVA a msg (unknown_sender/no_target) —
+            // o agente não sabia que falhou e concluía que o colega era um "stub mudo". Agora aguardamos
+            // (poll bounded no espelho `log.jsonl`) o desfecho REAL e o reportamos.
+            match poll_route_outcome(&msg.id) {
+                RouteConfirm::Delivered { to_node } => {
+                    let dst = if to_node.is_empty() {
+                        msg.to.clone()
+                    } else {
+                        to_node
+                    };
+                    println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
+                    ExitCode::SUCCESS
+                }
+                RouteConfirm::Blocked { reason } => {
+                    eprintln!(
+                        "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
+                        msg.to,
+                        explain_block(&reason),
+                        block_hint(&reason)
+                    );
+                    ExitCode::from(1)
+                }
+                RouteConfirm::Pending => {
+                    println!(
+                        "ok: enviada a {} (id {}); ainda SEM confirmacao de entrega apos a espera (o \
+                         Espaco pode estar ocupado). Confirme com `lina list` se o destino esta vivo e \
+                         tente de novo — NAO conclua que o colega e um stub.",
+                        msg.to, msg.id
+                    );
+                    ExitCode::SUCCESS
+                }
+            }
         }
         Err(e) => {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Desfecho REAL do roteamento de uma `lina ask`, lido do espelho `log.jsonl`.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteConfirm {
+    /// O Espaço entregou/roteou a mensagem ao destino.
+    Delivered { to_node: String },
+    /// O roteador bloqueou a mensagem (`reason` = `unknown_sender`/`no_target`/`hop_limit`/…).
+    Blocked { reason: String },
+    /// Sem evento de desfecho no tempo de espera (o app pode estar ocupado/lento).
+    Pending,
+}
+
+/// Caminho do espelho append-only do event log (`<LINA_HOME>/events/log.jsonl`). Lemos ESTE (não o
+/// SQLite) p/ não abrir uma conexão concorrente ao banco do app (evita lock na troca de WAL).
+fn event_log_path() -> PathBuf {
+    mailbox_root().join("events").join("log.jsonl")
+}
+
+/// **PURO** (testável, sem I/O/timing): varre o conteúdo do `log.jsonl` pelo desfecho de `msg_id`.
+/// `Delivered` vence `Blocked` (se a msg foi entregue em alguma tentativa, chegou); `None` se ainda não
+/// há desfecho. Tolera linhas parciais/inválidas (arquivo sob append).
+fn scan_log_outcome(content: &str, msg_id: &str) -> Option<RouteConfirm> {
+    let mut last_block: Option<String> = None;
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        if p.get("id").and_then(serde_json::Value::as_str) != Some(msg_id) {
+            continue;
+        }
+        match v.get("kind").and_then(serde_json::Value::as_str) {
+            Some("MessageDelivered" | "MessageRouted") => {
+                let to = p
+                    .get("to_node")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| p.get("to").and_then(serde_json::Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                return Some(RouteConfirm::Delivered { to_node: to }); // sucesso vence bloqueio
+            }
+            Some("RouteBlocked") => {
+                last_block = p
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    last_block.map(|reason| RouteConfirm::Blocked { reason })
+}
+
+/// Aguarda (poll bounded ~3s) o desfecho do roteamento de `msg_id` no `log.jsonl`. Retorna `Delivered`
+/// assim que a msg é roteada/entregue; no fim do prazo, `Blocked` (se houve) ou `Pending`. Tolerante a
+/// log ausente. A lógica de parse vive em [`scan_log_outcome`] (pura/testada).
+fn poll_route_outcome(msg_id: &str) -> RouteConfirm {
+    use std::time::{Duration, Instant};
+    let path = event_log_path();
+    let deadline = Instant::now() + Duration::from_millis(3000);
+    loop {
+        let outcome = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| scan_log_outcome(&c, msg_id));
+        match outcome {
+            // Entregue → conclui já. Bloqueado → só conclui no prazo (pode ser re-tentado e entregar).
+            Some(o @ RouteConfirm::Delivered { .. }) => return o,
+            Some(o @ RouteConfirm::Blocked { .. }) if Instant::now() >= deadline => return o,
+            _ if Instant::now() >= deadline => return RouteConfirm::Pending,
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+}
+
+/// Tradução acionável do motivo de bloqueio (o leitor é um agente de IA — texto claro, sem jargão de log).
+fn explain_block(reason: &str) -> String {
+    match reason {
+        "unknown_sender" => {
+            "o Espaco nao reconheceu voce como remetente vivo (seu terminal pode nao \
+             estar no roster ainda, ou houve uma corrida de registro)"
+                .to_string()
+        }
+        "no_target" => "o destino nao foi encontrado entre os agentes vivos do Espaco".to_string(),
+        "hop_limit" => "o limite de encaminhamento (anti-loop) foi atingido".to_string(),
+        "self_message" => "voce tentou enviar para si mesmo".to_string(),
+        other => format!("motivo tecnico: {other}"),
+    }
+}
+
+/// Dica de recuperação por motivo. Para `unknown_sender`/`no_target` instrui EXPLICITAMENTE a NÃO
+/// concluir que o colega é um "stub" (foi o que enganou o agente: o roteamento falhou, o colega vive).
+fn block_hint(reason: &str) -> &'static str {
+    match reason {
+        "unknown_sender" | "no_target" => {
+            "→ Tente de novo em alguns segundos (o roster pode estar sincronizando) e confira os nomes \
+             vivos com `lina list`. NAO conclua que o colega e um \"stub\"/mudo: ele pode estar vivo — \
+             foi o ROTEAMENTO que falhou, nao o colega."
+        }
+        _ => "→ Veja o estado do Espaco com `lina list`.",
     }
 }
 
@@ -620,5 +746,316 @@ fn run_list(json: bool) -> ExitCode {
             }
         }
         ExitCode::SUCCESS
+    }
+}
+
+// ════════════════════════ `lina vault` — acesso ao "segundo cérebro" (Obsidian) ════════════════════════
+//
+// A doutrina (BLOCO 3) promete ao agente os verbos `lina vault path|read|search` para acionar os vaults
+// linkados no onboarding SEM explorar o filesystem na mão — mas o comando não existia (o agente batia em
+// "vault não implementado" e caía pro `cat`/`grep` direto, frágil). Aqui implementamos sobre o contrato
+// JÁ escrito pelo app: `<LINA_HOME>/vault.json` (vaults linkados) + `<LINA_HOME>/vault-index/*.md` (o
+// mapa estrutural PageIndex, determinístico). O bin NÃO importa o app: parseia o JSON simples localmente.
+
+/// Um vault linkado, lido de `vault.json` (formato escrito por `obsidian.rs::write_vault_config`).
+#[derive(serde::Deserialize)]
+struct VaultLinkJson {
+    #[serde(default)]
+    name: String,
+    path: String,
+}
+
+/// Conteúdo de `<LINA_HOME>/vault.json`. Campos extras (ex.: `writable`) são ignorados.
+#[derive(serde::Deserialize)]
+struct VaultConfigJson {
+    #[serde(default)]
+    primary: String,
+    #[serde(default)]
+    vaults: Vec<VaultLinkJson>,
+}
+
+/// Lê os vaults linkados de `<LINA_HOME>/vault.json`. `Err` acionável se não houver vault linkado (o
+/// agente é orientado a pedir ao usuário que rode o passo "Segundo cérebro" do onboarding).
+fn load_vault_config() -> Result<VaultConfigJson, String> {
+    let path = mailbox_root().join("vault.json");
+    let data = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "nenhum vault Obsidian linkado ainda ({}): {e}\n\
+             → peça ao usuário para concluir o passo \"Segundo cérebro\" do onboarding do Lina.",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&data).map_err(|e| format!("vault.json inválido: {e}"))
+}
+
+/// `lina vault <sub>` — roteia os subcomandos.
+fn run_vault(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("path") => vault_path(),
+        Some("index") => vault_index(),
+        Some("read") => vault_read(args.get(1).map(String::as_str)),
+        Some("search") => vault_search(args.get(1).map(String::as_str)),
+        _ => {
+            eprintln!(
+                "uso: lina vault path | index | read <nota> | search <termo>\n  \
+                 (index = mapa estrutural PageIndex; comece por ele para navegar antes de abrir notas)"
+            );
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina vault path` — raiz do vault primário + lista de todos os vaults linkados.
+fn vault_path() -> ExitCode {
+    let cfg = match load_vault_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!("{}", cfg.primary);
+    if cfg.vaults.len() > 1 {
+        eprintln!("(vaults linkados:)");
+        for v in &cfg.vaults {
+            eprintln!("  - {} · {}", v.name, v.path);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lina vault index` — imprime o(s) mapa(s) estrutural(is) PageIndex (`<LINA_HOME>/vault-index/*.md`),
+/// determinísticos e LOCAIS (não re-baixa o vault). É a "porta de entrada": o agente navega o grafo de
+/// pastas/headings/links/hubs aqui e SÓ ENTÃO abre as notas certas com `read`.
+fn vault_index() -> ExitCode {
+    let dir = mailbox_root().join("vault-index");
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(_) => {
+            eprintln!(
+                "lina: índice ainda não gerado ({}). O Lina o cria em segundo plano ao linkar o vault; \
+                 tente de novo em instantes, ou use `lina vault search`.",
+                dir.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let mut mds: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+        .collect();
+    mds.sort();
+    if mds.is_empty() {
+        eprintln!("lina: nenhum índice .md em {}", dir.display());
+        return ExitCode::from(1);
+    }
+    for p in mds {
+        match std::fs::read_to_string(&p) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("lina: não li {}: {e}", p.display()),
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Resolve uma `nota` (caminho relativo, com ou sem `.md`) contra os vaults linkados. 1º match vence.
+fn resolve_note(cfg: &VaultConfigJson, nota: &str) -> Option<PathBuf> {
+    let rel = nota.trim_start_matches('/');
+    for v in &cfg.vaults {
+        for cand in [
+            PathBuf::from(&v.path).join(rel),
+            PathBuf::from(&v.path).join(format!("{rel}.md")),
+        ] {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// `lina vault read <nota>` — lê uma nota inteira (resolve em qualquer vault linkado).
+fn vault_read(nota: Option<&str>) -> ExitCode {
+    let Some(nota) = nota else {
+        eprintln!("uso: lina vault read <caminho/da/nota.md>");
+        return ExitCode::from(2);
+    };
+    let cfg = match load_vault_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match resolve_note(&cfg, nota) {
+        Some(p) => match std::fs::read_to_string(&p) {
+            Ok(s) => {
+                println!("{s}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("lina: não consegui ler '{nota}': {e}");
+                ExitCode::from(1)
+            }
+        },
+        None => {
+            eprintln!("lina: nota '{nota}' não encontrada nos vaults linkados (use `lina vault index` para achar o caminho).");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Teto de resultados do `search` — evita varredura sem fim e flood na saída do agente.
+const VAULT_SEARCH_MAX_HITS: usize = 40;
+
+/// `lina vault search <termo>` — busca case-insensitive de uma substring no CONTEÚDO das notas `.md`
+/// (read-only, ignora `.obsidian/`/`.trash/`/ocultos). Para com teto de resultados. Para NAVEGAR a
+/// estrutura (mais barato que ler tudo) o agente deve preferir `lina vault index`.
+fn vault_search(termo: Option<&str>) -> ExitCode {
+    let Some(termo) = termo.map(str::trim).filter(|t| !t.is_empty()) else {
+        eprintln!("uso: lina vault search <termo>");
+        return ExitCode::from(2);
+    };
+    let cfg = match load_vault_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let needle = termo.to_lowercase();
+    let mut hits = 0usize;
+    for v in &cfg.vaults {
+        let root = PathBuf::from(&v.path);
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in rd.flatten() {
+                if hits >= VAULT_SEARCH_MAX_HITS {
+                    println!("… (parei em {VAULT_SEARCH_MAX_HITS} resultados — refine o termo)");
+                    return ExitCode::SUCCESS;
+                }
+                let p = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if p.is_dir() {
+                    if !name.starts_with('.') && name != ".trash" {
+                        stack.push(p);
+                    }
+                } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                    let Ok(content) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
+                    let rel = p
+                        .strip_prefix(&root)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    for (n, line) in content.lines().enumerate() {
+                        if line.to_lowercase().contains(&needle) {
+                            println!("{rel}:{}: {}", n + 1, line.trim());
+                            hits += 1;
+                            if hits >= VAULT_SEARCH_MAX_HITS {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if hits == 0 {
+        println!(
+            "(sem resultados para \"{termo}\" — tente `lina vault index` para ver a estrutura)"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+
+    /// O `vault.json` que o app escreve (formato de `obsidian.rs::write_vault_config`) desserializa,
+    /// expondo o `primary` e os caminhos — campos extras (`writable`) são ignorados sem quebrar.
+    #[test]
+    fn parses_app_vault_json() {
+        let json = r#"{
+          "primary": "/Users/x/Documents/Vault A",
+          "vaults": [
+            { "name": "Vault A", "path": "/Users/x/Documents/Vault A", "writable": "/Users/x/Documents/Vault A/Lina" },
+            { "name": "Vault B", "path": "/Users/x/Documents/Vault B", "writable": "/Users/x/Documents/Vault B/Lina" }
+          ]
+        }"#;
+        let cfg: VaultConfigJson = serde_json::from_str(json).expect("parseia o vault.json do app");
+        assert_eq!(cfg.primary, "/Users/x/Documents/Vault A");
+        assert_eq!(cfg.vaults.len(), 2);
+        assert_eq!(cfg.vaults[1].name, "Vault B");
+        assert_eq!(cfg.vaults[1].path, "/Users/x/Documents/Vault B");
+    }
+
+    /// `resolve_note` acha a nota em qualquer vault linkado, com ou sem `.md`, e devolve `None` p/ ausente.
+    #[test]
+    fn resolve_note_finds_with_and_without_md() {
+        let tmp = std::env::temp_dir().join(format!("lina-vault-test-{}", std::process::id()));
+        let vault = tmp.join("Vault");
+        std::fs::create_dir_all(vault.join("Area")).expect("mkdir");
+        std::fs::write(vault.join("Area").join("nota.md"), "# Oi\nconteúdo").expect("nota");
+        let cfg = VaultConfigJson {
+            primary: vault.display().to_string(),
+            vaults: vec![VaultLinkJson {
+                name: "Vault".into(),
+                path: vault.display().to_string(),
+            }],
+        };
+        // com .md explícito e sem (o resolver tenta `<rel>` e `<rel>.md`).
+        assert!(resolve_note(&cfg, "Area/nota.md").is_some());
+        assert!(resolve_note(&cfg, "Area/nota").is_some());
+        // barra inicial é tolerada.
+        assert!(resolve_note(&cfg, "/Area/nota.md").is_some());
+        // inexistente → None.
+        assert!(resolve_note(&cfg, "Area/fantasma.md").is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `scan_log_outcome` (núcleo da confirmação de `lina ask`): lê o desfecho real do `log.jsonl`.
+    /// Formato verbatim do espelho (`kind` + `payload.id`/`reason`/`to_node`).
+    #[test]
+    fn scan_log_outcome_reads_real_route_events() {
+        let blocked = r#"{"seq":3,"ts":1,"kind":"RouteBlocked","version":1,"payload":{"event":"RouteBlocked","id":"msg_X","reason":"unknown_sender","from":"Terminal B","to":"@Terminal C"}}"#;
+        let delivered = r#"{"seq":4,"ts":2,"kind":"MessageRouted","version":1,"payload":{"event":"MessageRouted","id":"msg_Y","from":"Terminal B","to":"@Terminal C","to_node":"019e-uuid","intent":"ask","hops":0,"root_cause_id":"msg_Y"}}"#;
+
+        // Bloqueada → reporta o motivo.
+        assert_eq!(
+            scan_log_outcome(blocked, "msg_X"),
+            Some(RouteConfirm::Blocked {
+                reason: "unknown_sender".into()
+            })
+        );
+        // Entregue → reporta o nó destino.
+        assert_eq!(
+            scan_log_outcome(delivered, "msg_Y"),
+            Some(RouteConfirm::Delivered {
+                to_node: "019e-uuid".into()
+            })
+        );
+        // Entrega VENCE bloqueio quando a mesma msg tem os dois (re-tentada e entregue).
+        let both = format!(
+            "{}\n{}",
+            blocked.replace("msg_X", "msg_Z"),
+            delivered.replace("msg_Y", "msg_Z")
+        );
+        assert_eq!(
+            scan_log_outcome(&both, "msg_Z"),
+            Some(RouteConfirm::Delivered {
+                to_node: "019e-uuid".into()
+            })
+        );
+        // id ausente → None (ainda sem desfecho); linha parcial/lixo é tolerada.
+        assert_eq!(scan_log_outcome(blocked, "msg_INEXISTENTE"), None);
+        assert_eq!(scan_log_outcome("{lixo parcial\n", "msg_X"), None);
     }
 }

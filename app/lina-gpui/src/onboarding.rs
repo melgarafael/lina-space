@@ -8,7 +8,7 @@
 //! O progresso é **retomável** (persistido em disco): fechar no meio e reabrir cai no passo onde parou.
 //!
 //! ## Split (igual ao resto do shell: lógica gpui-free + view fina)
-//! - [`OnboardingModel`] + helpers (`install_command`, `run_install`, `Progress`) são **gpui-free e
+//! - [`OnboardingModel`] + helpers (`install_recipe`, `run_install`, `Progress`) são **gpui-free e
 //!   testáveis** — toda a lógica vive aqui.
 //! - [`OnboardingView`] só renderiza o modelo e roteia cliques.
 //!
@@ -24,9 +24,14 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
+
+use lina_cli_profiles::{InstallRecipe, Installers};
+
+use crate::dev_tools::DevToolsModel;
+use crate::obsidian::SecondBrainModel;
 
 use gpui::{
     div, prelude::*, px, rgb, size, text, AnyElement, App, Bounds, ClickEvent, Context,
@@ -59,6 +64,10 @@ pub enum Step {
     Welcome,
     /// T1 — check-up de CLIs + "Instalar para mim".
     Checkup,
+    /// T1.5 — ferramentas de desenvolvimento (git, GitHub CLI, Vercel, Node.js, Python). Passe-through.
+    DevTools,
+    /// T1.6 — "Seu segundo cérebro" (Obsidian): detecta/instala, escolhe vault(s), gera o PageIndex.
+    SecondBrain,
     /// T2 — provedor/conta (passe-through).
     Provider,
     /// T3 — criar o 1º Espaço.
@@ -68,15 +77,17 @@ pub enum Step {
 }
 
 impl Step {
-    const ORDER: [Step; 5] = [
+    const ORDER: [Step; 7] = [
         Step::Welcome,
         Step::Checkup,
+        Step::DevTools,
+        Step::SecondBrain,
         Step::Provider,
         Step::CreateSpace,
         Step::Done,
     ];
 
-    /// Índice 0..=4 (ordem de progresso) — base da persistência retomável e dos "dots".
+    /// Índice 0..=5 (ordem de progresso) — base da persistência retomável e dos "dots".
     #[must_use]
     pub fn index(self) -> u8 {
         Self::ORDER.iter().position(|s| *s == self).unwrap_or(0) as u8
@@ -94,7 +105,7 @@ impl Step {
     /// Próximo passo (satura em `Done`).
     #[must_use]
     pub fn next(self) -> Step {
-        Self::from_index((self.index() + 1).min(4))
+        Self::from_index((self.index() + 1).min(Step::Done.index()))
     }
 
     /// Passo anterior (satura em `Welcome`).
@@ -154,12 +165,36 @@ pub fn save_progress(dir: &Path, p: &Progress) {
 
 // ═══════════════════════════════ "Instalar para mim" (gpui-free) ═══════════════════════════════
 
-/// Comando de instalação resolvido (programa + args). O comando real do CLI vive numa tabela
-/// app-local por SO (o `CliProfile` TOML de W0-8 ainda não tem campo de install — ver `.entrega`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallCmd {
-    pub program: String,
-    pub args: Vec<String>,
+/// Receitas de instalação por SO embutidas (config TOML, NÃO hardcoded em Rust — inv#3). Um dir
+/// externo opcional `LINA_INSTALLERS` pode adicionar/sobrescrever CLIs sem recompilar (porta aberta).
+const INSTALLERS_TOML: &str = include_str!("../../../profiles/installers/recipes.toml");
+
+/// Tabela de receitas parseada uma única vez. TOML inválido → tabela vazia (o botão vira fallback
+/// "instale manualmente"); nunca derruba o app.
+fn installers() -> &'static Installers {
+    static INSTALLERS: OnceLock<Installers> = OnceLock::new();
+    INSTALLERS.get_or_init(|| {
+        let mut table = Installers::from_toml_str(INSTALLERS_TOML, "profiles/installers/recipes.toml")
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "onboarding: installers/recipes.toml inválido ({e}); 'Instalar para mim' indisponível"
+                );
+                Installers::default()
+            });
+        // Override externo OPCIONAL (sem recompilar — inv#3): `LINA_INSTALLERS=/caminho/recipes.toml`
+        // adiciona/sobrescreve receitas por id. Best-effort: arquivo ausente/inválido é só logado.
+        if let Some(path) = std::env::var_os("LINA_INSTALLERS") {
+            match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|src| {
+                    Installers::from_toml_str(&src, &path.to_string_lossy()).map_err(|e| e.to_string())
+                }) {
+                Ok(ext) => table.0.extend(ext.0), // entradas externas vencem as embutidas (mesmo id)
+                Err(e) => eprintln!("onboarding: LINA_INSTALLERS ignorado ({e})"),
+            }
+        }
+        table
+    })
 }
 
 /// Estado do trabalho de instalação (mapeia os estados do design: detectando → instalando → ok →
@@ -178,48 +213,46 @@ pub enum InstallState {
     Failed { reason: String },
 }
 
-/// Tabela default de instalação por CLI (best-effort; nomes oficiais dos pacotes npm). `None` = sem
-/// comando conhecido (o usuário instala manualmente).
-fn default_install(cli_id: &str) -> Option<(&'static str, Vec<&'static str>)> {
-    match cli_id {
-        "claude" => Some(("npm", vec!["install", "-g", "@anthropic-ai/claude-code"])),
-        "codex" => Some(("npm", vec!["install", "-g", "@openai/codex"])),
-        "gemini" => Some(("npm", vec!["install", "-g", "@google/gemini-cli"])),
-        "opencode" => Some(("npm", vec!["install", "-g", "opencode-ai"])),
-        "copilot" => Some((
-            "npm",
-            vec!["install", "-g", "@githubnext/github-copilot-cli"],
-        )),
-        _ => None,
-    }
-}
-
-/// Resolve o comando de install, dado o valor de override do ambiente (puro — testável sem mexer no
-/// `env` do processo). Override (`LINA_INSTALL_<ID>`) roda via `sh -c "<string>"` (flexível p/ o
-/// fundador apontar `brew`/script oficial e p/ testes injetarem um instalador falso).
+/// Resolve a RECEITA de instalação do CLI p/ o SO atual (puro — testável sem mexer no `env`/TOML
+/// reais). Override `LINA_INSTALL_<ID>` (string de shell via `sh -c`) tem prioridade — flexível p/ o
+/// fundador apontar um instalador alternativo e p/ os testes injetarem um instalador falso. Sem
+/// override, vem da tabela `installers`. `None` = sem receita p/ este CLI/SO → fallback manual.
 #[must_use]
-pub fn install_command_with(cli_id: &str, env_override: Option<&str>) -> Option<InstallCmd> {
+pub fn install_recipe_with(
+    cli_id: &str,
+    env_override: Option<&str>,
+    installers: &Installers,
+) -> Option<InstallRecipe> {
     if let Some(s) = env_override {
         let s = s.trim();
         if !s.is_empty() {
-            return Some(InstallCmd {
+            return Some(InstallRecipe {
                 program: "sh".into(),
                 args: vec!["-c".into(), s.to_string()],
+                env: Default::default(),
+                verify_paths: Vec::new(),
             });
         }
     }
-    let (program, args) = default_install(cli_id)?;
-    Some(InstallCmd {
-        program: program.to_string(),
-        args: args.into_iter().map(String::from).collect(),
-    })
+    installers.recipe_for(cli_id).cloned()
 }
 
-/// Resolve o comando de install do CLI (lê o override de `LINA_INSTALL_<ID>` no ambiente).
+/// Receita do CLI lendo o override `LINA_INSTALL_<ID>` do ambiente + a tabela embutida.
 #[must_use]
-pub fn install_command(cli_id: &str) -> Option<InstallCmd> {
+pub fn install_recipe(cli_id: &str) -> Option<InstallRecipe> {
     let key = format!("LINA_INSTALL_{}", cli_id.to_ascii_uppercase());
-    install_command_with(cli_id, std::env::var(&key).ok().as_deref())
+    install_recipe_with(cli_id, std::env::var(&key).ok().as_deref(), installers())
+}
+
+/// Rótulo amigável (sem jargão, inv#6) a partir do id de descoberta (= nome do binário no PATH). Só
+/// `agy` precisa de tradução — é o binário do Antigravity, que o usuário conhece como "antigravity";
+/// o resto (claude/codex/…) já é o nome conhecido.
+#[must_use]
+pub fn display_name(id: &str) -> String {
+    match id {
+        "agy" => "antigravity".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Atualiza o estado compartilhado de instalação (best-effort sob poison).
@@ -234,7 +267,7 @@ fn set_install(state: &Arc<Mutex<InstallState>>, s: InstallState) {
 /// `PATH`) — a fonte da verdade do sucesso é o CLI **aparecer** depois (não o exit code do npm).
 /// `verify` é injetável: produção passa `discover_clis().find(id)`; testes injetam `discover_clis_in`.
 pub fn run_install(
-    cmd: InstallCmd,
+    recipe: InstallRecipe,
     state: Arc<Mutex<InstallState>>,
     verify: impl Fn() -> Option<DiscoveredCli> + Send + 'static,
 ) -> thread::JoinHandle<()> {
@@ -248,7 +281,11 @@ pub fn run_install(
 
         let mut pty = PtyManager::new();
         const KEY: &str = "onboarding-install";
-        let pcmd = PtyCommand::new(cmd.program).args(cmd.args);
+        let mut pcmd = PtyCommand::new(recipe.program).args(recipe.args);
+        // `env` da receita garante não-interatividade (ex.: CODEX_NON_INTERACTIVE=1).
+        for (k, v) in &recipe.env {
+            pcmd = pcmd.env(k, v);
+        }
         if let Err(e) = pty.spawn(KEY, pcmd, 100, 30) {
             set_install(
                 &state,
@@ -479,13 +516,13 @@ impl OnboardingModel {
         ) {
             return;
         }
-        let Some(cmd) = install_command(cli_id) else {
+        let Some(recipe) = install_recipe(cli_id) else {
             set_install(
                 &self.install,
                 InstallState::Failed {
                     reason: format!(
-                        "ainda não sei instalar '{cli_id}' automaticamente — instale manualmente e \
-                         clique em Verificar"
+                        "ainda não sei instalar '{cli_id}' neste sistema automaticamente — instale \
+                         manualmente e clique em Verificar"
                     ),
                 },
             );
@@ -494,12 +531,25 @@ impl OnboardingModel {
         self.install_target = Some(cli_id.to_string());
         self.install_consumed = false;
         self.save();
-        set_install(&self.install, InstallState::Idle);
+        // Feedback OTIMISTA: marca Installing já (a thread confirma em seguida) para que o 1º frame
+        // após o clique mostre "⟳ iniciando…" no lugar do botão — sem isto há uma janela em que o
+        // estado segue Idle e o usuário acha que "nada aconteceu".
+        set_install(
+            &self.install,
+            InstallState::Installing {
+                line: "iniciando…".into(),
+            },
+        );
         let id = cli_id.to_string();
-        // `verify` reusa a MESMA descoberta injetada (consistente em teste/produção); roda na thread
-        // de instalação (não na de UI).
+        let verify_paths = recipe.verify_paths.clone();
+        // `verify` reusa a descoberta injetada (consistente em teste/produção); roda na thread de
+        // instalação. ANTES de descobrir, RE-HIDRATA o PATH: o instalador acabou de escrever seu dir
+        // no rc do shell (um login shell novo já o enxerga) e unimos os `verify_paths` fixos da receita
+        // (ex.: ~/.opencode/bin). Grava o PATH no processo → a verificação acha o binário recém-instalado
+        // E o canvas já consegue spawná-lo sem reabrir o app. (Era o furo do "instalou mas não apareceu".)
         let discover = Arc::clone(&self.discover);
-        let handle = run_install(cmd, Arc::clone(&self.install), move || {
+        let handle = run_install(recipe, Arc::clone(&self.install), move || {
+            crate::refresh_path_after_install(&verify_paths);
             discover().into_iter().find(|c| c.id == id)
         });
         self.install_handle = Some(handle);
@@ -607,8 +657,9 @@ pub fn should_show(dir: &Path, demo: bool) -> bool {
 
 /// Abre a janela do onboarding (chamada de dentro do `application().run` de `main.rs`). `dir` é o
 /// diretório PERSISTENTE de estado do onboarding (progresso + log próprio) — em produção mora no
-/// Application Support do usuário (ver `main.rs`), nunca em `temp`.
-pub fn open_window(cx: &mut App, dir: PathBuf) {
+/// Application Support do usuário (ver `main.rs`), nunca em `temp`. `lina_dir` é o `<ws_root>/.lina`
+/// onde a etapa do segundo cérebro grava `vault.json` + `vault-index/` (integração com a doutrina).
+pub fn open_window(cx: &mut App, dir: PathBuf, lina_dir: PathBuf) {
     let bounds = Bounds::centered(None, size(px(920.0), px(640.0)), cx);
     let opened = cx.open_window(
         WindowOptions {
@@ -619,7 +670,7 @@ pub fn open_window(cx: &mut App, dir: PathBuf) {
             }),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| OnboardingView::new(dir, window, cx)),
+        |window, cx| cx.new(|cx| OnboardingView::new(dir, lina_dir, window, cx)),
     );
     if let Err(e) = opened {
         eprintln!("onboarding: não abri a janela: {e}");
@@ -631,15 +682,87 @@ pub fn open_window(cx: &mut App, dir: PathBuf) {
 /// View gpui do onboarding — só renderiza o [`OnboardingModel`] e roteia cliques.
 pub struct OnboardingView {
     model: OnboardingModel,
+    /// Tela "Ferramentas de desenvolvimento" (passo após o check-up). Lógica gpui-free em `dev_tools`;
+    /// `pub(crate)` p/ a render dela rotear cliques (instalar/verificar) pela view-pai.
+    pub(crate) dev_tools: DevToolsModel,
+    /// Tela "Seu segundo cérebro" (Obsidian). Lógica gpui-free em `obsidian`; `pub(crate)` p/ a render
+    /// dela rotear cliques (instalar/marcar/confirmar/adicionar pasta) pela view-pai.
+    pub(crate) second_brain: SecondBrainModel,
     focus: FocusHandle,
 }
 
 impl OnboardingView {
-    fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Avança o passo (chamado pelo "Continuar →" da tela de ferramentas). `pub(crate)` p/ `dev_tools`.
+    pub(crate) fn nav_continue(&mut self) {
+        self.model.advance();
+    }
+
+    /// Volta um passo (chamado pelo "← Voltar" da tela de ferramentas). `pub(crate)` p/ `dev_tools`.
+    pub(crate) fn nav_back(&mut self) {
+        self.model.back();
+    }
+}
+
+impl OnboardingView {
+    /// `dir` = estado persistente do onboarding (`onboarding/`); `lina_dir` = `<ws_root>/.lina` (onde a
+    /// tela do segundo cérebro grava `vault.json` + `vault-index/`).
+    fn new(dir: PathBuf, lina_dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+
+        // PULSO DE ANIMAÇÃO (mesmo mecanismo do canvas — ver `main.rs`). O gpui só redesenha quando a
+        // view está "dirty"; o `request_animation_frame` do `render` SÓ se auto-sustenta enquanto
+        // CHEGAM frames do SO, e o trabalho assíncrono do onboarding (varredura de CLIs + "Instalar
+        // para mim") muda o estado a partir de uma thread GPUI-FREE — que NÃO acorda o event loop.
+        // Sem este loop, o clique dispara a instalação (o `npm` roda no PTY oculto), mas a tela
+        // CONGELA no frame do clique e o usuário vê "nada acontece". Aqui forçamos `cx.notify()`
+        // enquanto há varredura/instalação em voo (mais o frame de assentamento, p/ desenhar o ✓/⚠
+        // final), dormindo barato quando ocioso. Encerra sozinho quando a view é dropada (janela
+        // fechada → `this.update` devolve `Err`).
+        cx.spawn(async move |this, cx| {
+            let mut was_busy = false;
+            loop {
+                let Ok(busy) = this.update(cx, |view, cx| {
+                    view.model.poll_install();
+                    view.dev_tools.poll_install();
+                    // O mesmo pulso dirige as telas de ferramentas E do segundo cérebro (mesma natureza
+                    // assíncrona: descoberta + "Instalar para mim" mudam o estado de uma thread gpui-free).
+                    view.second_brain.poll();
+                    let busy = matches!(
+                        view.model.install_state(),
+                        InstallState::Installing { .. } | InstallState::Verifying
+                    ) || view.model.is_discovering()
+                        || matches!(
+                            view.dev_tools.install_state(),
+                            InstallState::Installing { .. } | InstallState::Verifying
+                        )
+                        || view.dev_tools.is_discovering()
+                        || matches!(
+                            view.second_brain.install_state(),
+                            InstallState::Installing { .. } | InstallState::Verifying
+                        )
+                        || view.second_brain.is_discovering();
+                    // `busy || was_busy`: redesenha durante o trabalho E no 1º frame após ele terminar,
+                    // p/ que o estado final (Ok ✓ / Failed ⚠ / lista re-detectada) realmente apareça.
+                    if busy || was_busy {
+                        cx.notify();
+                    }
+                    busy
+                }) else {
+                    break; // view dropada (app/janela fechando) → encerra o pulso.
+                };
+                was_busy = busy;
+                cx.background_executor()
+                    .timer(Duration::from_millis(if busy { 16 } else { 120 }))
+                    .await;
+            }
+        })
+        .detach();
+
         Self {
             model: OnboardingModel::load(dir),
+            dev_tools: DevToolsModel::new(),
+            second_brain: SecondBrainModel::new(lina_dir),
             focus,
         }
     }
@@ -697,8 +820,10 @@ impl OnboardingView {
     fn step_dots(&self) -> AnyElement {
         let cur = self.model.step().index();
         let mut row = div().flex().flex_row().gap_2().items_center();
-        for i in 0..4u8 {
-            let on = i <= cur.min(3);
+        // 6 dots p/ os 6 passos antes do `Done` (Welcome..CreateSpace, índices 0..=5); `Done` (6) acende
+        // todos. `cur.min(5)` clampa o último dot aceso no fim do fluxo.
+        for i in 0..6u8 {
+            let on = i <= cur.min(5);
             row = row.child(
                 div()
                     .w(px(if i == cur { 26.0 } else { 12.0 }))
@@ -824,7 +949,7 @@ impl OnboardingView {
                         .w(px(120.0))
                         .text_color(rgb(TEXT))
                         .font_weight(FontWeight::BOLD)
-                        .child(text!(id.to_string())),
+                        .child(text!(display_name(id))),
                 );
 
             if present {
@@ -915,8 +1040,9 @@ impl OnboardingView {
             .bg(rgb(0x3d59c9))
             .text_color(rgb(0xeef1ff))
             .cursor_pointer()
-            .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, _cx| {
+            .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
                 view.model.start_install(id);
+                cx.notify(); // desenha o feedback NA HORA; o pulso assume a animação do progresso
             }))
             .child(text!("Instalar para mim"))
             .into_any_element()
@@ -1035,44 +1161,62 @@ impl Render for OnboardingView {
         let content = match self.model.step() {
             Step::Welcome => self.render_welcome(cx),
             Step::Checkup => self.render_checkup(cx),
+            Step::DevTools => self.dev_tools.render(window, cx),
+            Step::SecondBrain => self.second_brain.render(window, cx),
             Step::Provider => self.render_provider(cx),
             Step::CreateSpace => self.render_create(cx),
             Step::Done => self.render_done(cx),
         };
 
+        // SCROLL — estrutura IDÊNTICA ao exemplo canônico `scrollable.rs` do gpui: root BLOCO
+        // (NÃO-flex) `size_full().overflow_y_scroll()` cujo filho transborda a janela. A v1 punha
+        // `.flex().flex_col().items_center()` NO root de scroll — e flex no root de scroll NÃO engatava
+        // o `content_size > bounds`: o conteúdo só transbordava a JANELA (cortado), nunca virava
+        // viewport rolável (por isso só "esticar a janela" mostrava tudo). Bloco + overflow + filho de
+        // altura natural maior que a janela → scroll_max>0 → rola de verdade, em TODAS as telas.
         div()
             .id("onboarding")
             .track_focus(&self.focus)
             .size_full()
+            .overflow_y_scroll()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .flex()
-            .flex_col()
-            .items_center()
             .child(
-                // Painel central com largura confortável de leitura.
+                // O flex (centralização) fica AQUI, num wrapper INTERNO — NUNCA no root de scroll.
+                // `items_start` não estica o painel na vertical (deixa ele com a altura natural).
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_8()
-                    .w(px(680.0))
-                    .mt(px(72.0))
+                    .flex_row()
+                    .justify_center()
+                    .items_start()
+                    .w_full()
                     .child(
+                        // Painel central com largura confortável de leitura.
                         div()
                             .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_4()
+                            .flex_col()
+                            .flex_shrink_0()
+                            .gap_8()
+                            .w(px(680.0))
+                            .mt(px(72.0))
+                            .pb(px(40.0)) // respiro no fim do scroll: o último botão não cola na borda
                             .child(
                                 div()
-                                    .text_color(rgb(ACCENT))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(text!("Lina Space")),
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_4()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(ACCENT))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(text!("Lina Space")),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(self.step_dots()),
                             )
-                            .child(div().flex_1())
-                            .child(self.step_dots()),
-                    )
-                    .child(content),
+                            .child(content),
+                    ),
             )
     }
 }
@@ -1121,10 +1265,16 @@ mod tests {
     #[test]
     fn step_machine_orders_and_saturates() {
         assert_eq!(Step::Welcome.index(), 0);
-        assert_eq!(Step::Done.index(), 4);
+        assert_eq!(Step::Done.index(), 6); // +2 passos (DevTools, SecondBrain) entre Checkup e Provider
         assert_eq!(Step::Welcome.prev(), Step::Welcome); // satura
         assert_eq!(Step::Done.next(), Step::Done); // satura
         assert_eq!(Step::Welcome.next(), Step::Checkup);
+        // DevTools e SecondBrain entram após o check-up: Checkup → DevTools → SecondBrain → Provider.
+        assert_eq!(Step::Checkup.next(), Step::DevTools);
+        assert_eq!(Step::DevTools.next(), Step::SecondBrain);
+        assert_eq!(Step::SecondBrain.next(), Step::Provider);
+        assert_eq!(Step::SecondBrain.prev(), Step::DevTools);
+        assert_eq!(Step::DevTools.prev(), Step::Checkup);
         assert_eq!(Step::CreateSpace.next(), Step::Done);
         for s in Step::ORDER {
             assert_eq!(Step::from_index(s.index()), s);
@@ -1168,21 +1318,48 @@ mod tests {
         assert_eq!(load_progress(tmp.path()), p);
     }
 
-    /// Comando de install: default por id + override de ambiente (puro, sem mexer no env).
+    /// Resolução de receita (puro): override `sh -c` tem prioridade; a tabela embutida resolve os CLIs
+    /// conhecidos p/ o SO atual; CLI desconhecido → None (fallback manual). Regressão do copilot:
+    /// usa `@github/copilot` (binário `copilot`), NUNCA o deprecado `github-copilot-cli`.
     #[test]
-    fn install_command_default_and_override() {
-        let claude = install_command_with("claude", None).expect("claude tem default");
-        assert_eq!(claude.program, "npm");
-        assert!(claude.args.iter().any(|a| a.contains("claude-code")));
-        assert!(install_command_with("desconhecido", None).is_none());
-
-        let over = install_command_with("claude", Some("echo oi")).expect("override");
+    fn install_recipe_resolution_and_override() {
+        let inst = installers();
+        // Override vence tudo e roda via `sh -c`.
+        let over = install_recipe_with("claude", Some("echo oi"), inst).expect("override");
         assert_eq!(over.program, "sh");
         assert_eq!(over.args, vec!["-c".to_string(), "echo oi".to_string()]);
-        // override vazio cai no default.
+        // Override vazio cai na tabela.
         assert_eq!(
-            install_command_with("claude", Some("   ")),
-            install_command_with("claude", None)
+            install_recipe_with("claude", Some("   "), inst),
+            install_recipe_with("claude", None, inst)
+        );
+        // CLI conhecido → receita do SO atual com programa não-vazio.
+        let claude = install_recipe_with("claude", None, inst).expect("claude tem receita");
+        assert!(!claude.program.trim().is_empty());
+        // CLI desconhecido → None (fallback manual).
+        assert!(install_recipe_with("desconhecido", None, inst).is_none());
+        // Regressão copilot: `@github/copilot`, nunca o pacote deprecado.
+        let copilot = install_recipe_with("copilot", None, inst).expect("copilot tem receita");
+        let joined = copilot.args.join(" ");
+        assert!(joined.contains("@github/copilot"), "veio {joined:?}");
+        assert!(!joined.contains("githubnext"));
+    }
+
+    /// Antigravity: o id de descoberta é `agy` (o nome do binário no PATH), o rótulo amigável é
+    /// "antigravity", e há receita p/ o SO atual apontando o instalador OFICIAL.
+    #[test]
+    fn antigravity_agy_recipe_and_label() {
+        assert_eq!(display_name("agy"), "antigravity");
+        assert_eq!(display_name("claude"), "claude"); // os demais não mudam
+        assert!(
+            KNOWN_CLIS.contains(&"agy"),
+            "agy deve estar nos CLIs conhecidos"
+        );
+        let agy = install_recipe_with("agy", None, installers()).expect("agy tem receita");
+        let joined = agy.args.join(" ");
+        assert!(
+            joined.contains("antigravity.google"),
+            "deve usar o instalador oficial, veio {joined:?}"
         );
     }
 
@@ -1203,7 +1380,8 @@ mod tests {
             bin_path.display(),
             bin_path.display()
         );
-        let cmd = install_command_with("claude", Some(&script)).expect("override install");
+        let cmd =
+            install_recipe_with("claude", Some(&script), installers()).expect("override install");
 
         let state = Arc::new(Mutex::new(InstallState::Idle));
         let verify_dir = bin_path.clone();
@@ -1232,7 +1410,7 @@ mod tests {
         use lina_core::discover_clis_in;
         let empty = TempDir::new("empty");
         let dir = empty.path().to_path_buf();
-        let cmd = install_command_with("claude", Some("true")).expect("noop install");
+        let cmd = install_recipe_with("claude", Some("true"), installers()).expect("noop install");
         let state = Arc::new(Mutex::new(InstallState::Idle));
         let handle = run_install(cmd, Arc::clone(&state), move || {
             discover_clis_in(&dir.display().to_string())
@@ -1257,7 +1435,8 @@ mod tests {
         save_progress(
             tmp.path(),
             &Progress {
-                step: 2,
+                // Índice simbólico (robusto à reordenação dos passos — DevTools entrou no meio).
+                step: Step::Provider.index(),
                 provider_ready: false,
                 chosen_cli: None,
             },
@@ -1303,7 +1482,9 @@ mod tests {
             let mut model = OnboardingModel::load_with(tmp.path().to_path_buf(), empty_discover());
             model.block_on_discovery();
             model.advance(); // Welcome → Checkup
-            model.advance(); // Checkup → Provider
+            model.advance(); // Checkup → DevTools
+            model.advance(); // DevTools → SecondBrain
+            model.advance(); // SecondBrain → Provider
             model.advance(); // Provider → CreateSpace
             assert_eq!(model.step(), Step::CreateSpace);
             model.back(); // CreateSpace → Provider (usuário recuou antes de fechar)

@@ -1840,6 +1840,16 @@ impl BootstrapWriter {
         self.ws_root.join(key)
     }
 
+    /// Vault primário EFETIVO a injetar na doutrina. O que o usuário linkou no onboarding
+    /// (`<ws_root>/.lina/vault.json`) tem PRIORIDADE; só cai no `vault_path` do boot (fallback) se ainda
+    /// não houver vault linkado. **Re-lido a cada escrita** — corrige o bug de ORDEM: o `vault_path` era
+    /// congelado no boot (ANTES de o onboarding confirmar os vaults), então as doutrinas geradas depois
+    /// apontavam para o fallback `<ws_root>/vault` (inexistente) em vez do vault real do usuário.
+    fn effective_vault(&self) -> String {
+        crate::obsidian::read_primary_vault(&self.ws_root.join(".lina"))
+            .unwrap_or_else(|| self.vault_path.clone())
+    }
+
     /// Escreve os arquivos de bootstrap de **UM** terminal (`key`/`name`) com o `roster` dado.
     /// Usado tanto no `rewrite_all` quanto no write-before-spawn do `add_node` (o nó novo já sobe
     /// com o `CLAUDE.md` no `cwd`). Erro de I/O é logado (best-effort): o app não trava por isto.
@@ -1848,7 +1858,7 @@ impl BootstrapWriter {
         let input = BootstrapInput::new(
             name.to_string(),
             roster.to_vec(),
-            self.vault_path.clone(),
+            self.effective_vault(),
             self.autonomy,
         );
         if let Err(e) = self
@@ -4073,6 +4083,62 @@ mod tests {
         nm.remove_node(c).expect("remove C");
         let a4 = std::fs::read_to_string(&a_md).expect("re-read A pós-remove");
         assert!(!a4.contains("Terminal C"), "A não lista mais C");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// **Regressão (bug de ordem do vault):** o `vault_path` é resolvido no boot, ANTES de o onboarding
+    /// confirmar os vaults — então ficava no fallback `<ws_root>/vault` (inexistente). Ao linkar um vault
+    /// (gravando `.lina/vault.json`), a doutrina REGENERADA deve apontar para o vault REAL, não o fallback.
+    #[test]
+    fn bootstrap_picks_linked_vault_over_boot_fallback() {
+        let ws = std::env::temp_dir().join(format!("lina-vaultfix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        // Boot: vault_path cai no FALLBACK (o que o main.rs resolve quando ainda não há vault.json).
+        let fallback = ws.join("vault").display().to_string();
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            fallback.clone(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        // ANTES de linkar: a doutrina usa o fallback.
+        let real_vault = "/Users/teste/Documents/Meu Vault";
+        bw.write_one("X", "Terminal X", &["Terminal X".to_string()]);
+        let x_md = ws.join("X").join("CLAUDE.md");
+        let before = std::fs::read_to_string(&x_md).expect("CLAUDE.md de X");
+        assert!(
+            before.contains(&fallback),
+            "antes de linkar: usa o fallback"
+        );
+        assert!(
+            !before.contains(real_vault),
+            "antes de linkar: não conhece o vault real"
+        );
+
+        // Usuário linka o vault no onboarding → grava .lina/vault.json (escrita do obsidian.rs).
+        let cfg = crate::obsidian::VaultConfig {
+            primary: real_vault.to_string(),
+            vaults: vec![crate::obsidian::VaultEntry {
+                name: "Meu Vault".to_string(),
+                path: real_vault.to_string(),
+                writable: format!("{real_vault}/Lina"),
+            }],
+        };
+        crate::obsidian::write_vault_config(&ws.join(".lina"), &cfg).expect("grava vault.json");
+
+        // DEPOIS de linkar: a MESMA regeneração passa a apontar pro vault REAL (re-lê o vault.json).
+        bw.write_one("X", "Terminal X", &["Terminal X".to_string()]);
+        let after = std::fs::read_to_string(&x_md).expect("re-read X");
+        assert!(
+            after.contains(real_vault),
+            "depois de linkar: usa o vault REAL"
+        );
+        assert!(
+            !after.contains(&fallback),
+            "depois de linkar: não usa mais o fallback inexistente"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

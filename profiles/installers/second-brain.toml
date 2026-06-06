@@ -1,0 +1,37 @@
+# second-brain.toml — receita de instalação do OBSIDIAN (o "caderno de anotações" do segundo
+# cérebro), por SO. Formato IDÊNTICO ao `recipes.toml`/`dev-tools.toml` (consumido pelo mesmo
+# `lina_cli_profiles::Installers`): seções `[<id>.<os>]` com `program`/`args`/`env`/`verify_paths`.
+#
+# A CHAVE é o id lógico `obsidian`. ATENÇÃO: o Obsidian é um APP (bundle .app no macOS / pacote no
+# SO), NÃO um binário no PATH. Por isso a VERIFICAÇÃO pós-instalação NÃO é `find_in_path` — é
+# `find_app_bundle("Obsidian")` (ver `app/lina-gpui/src/obsidian.rs`). Não há `verify_paths` aqui:
+# diretório de PATH não acharia um `.app`.
+#
+# Princípios (mesmos do `dev-tools.toml`):
+#  - SILENCIOSO por padrão. No macOS com Homebrew presente, o cask instala sem perguntar nada (roda
+#    no PTY oculto do onboarding). Sem o `brew`, o `decide_plan` cai no caminho interativo (terminal
+#    real) — o app nunca roda no escuro algo que pode pedir a senha.
+#  - macOS é o único VERIFICADO em runtime; Windows/Linux vêm das docs oficiais (2026-06) + fallback
+#    "baixe do site / instale manualmente e clique Verificar".
+#  - `deny_unknown_fields` (crate intocável): SÓ `program`/`args`/`env`/`verify_paths` cabem aqui.
+#    O flag "precisa de interação" é DERIVADO do comando em Rust (`sudo`/`winget`), não um campo novo.
+
+# ───────────────────────────── obsidian (macOS) ─────────────────────────────
+# Cask oficial do Homebrew (https://formulae.brew.sh/cask/obsidian). Instala o `Obsidian.app` em
+# /Applications. Verificação por bundle (find_app_bundle), não por PATH.
+[obsidian.macos]
+program = "bash"
+args = ["-c", 'NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask obsidian']
+
+# ───────────────────────────── obsidian (Windows) ─────────────────────────────
+# winget oficial (id `Obsidian.Obsidian`). `winget` aciona UAC → caminho INTERATIVO (decide_plan).
+[obsidian.windows]
+program = "winget"
+args = ["install", "--id", "Obsidian.Obsidian", "-e", "--silent", "--accept-package-agreements", "--accept-source-agreements"]
+
+# ───────────────────────────── obsidian (Linux) ─────────────────────────────
+# Flatpak oficial do Flathub (https://flathub.org/apps/md.obsidian.Obsidian). SEM sudo → silencioso
+# onde o flatpak estiver disponível; onde não estiver, o app cai no fallback manual ("baixe do site").
+[obsidian.linux]
+program = "bash"
+args = ["-c", 'flatpak install -y flathub md.obsidian.Obsidian']

@@ -3174,6 +3174,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "lina-bootstrap",
+ "lina-cli-profiles",
  "lina-core",
  "lina-host",
  "lina-role-discovery",

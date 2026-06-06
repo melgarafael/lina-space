@@ -1,0 +1,93 @@
+# dev-tools.toml — receitas de instalação das FERRAMENTAS DE DESENVOLVIMENTO (git, GitHub CLI,
+# Vercel CLI, Node.js, Python), por SO. Formato IDÊNTICO ao `recipes.toml` (consumido pelo mesmo
+# `lina_cli_profiles::Installers`): seções `[<id>.<os>]` com `program`/`args`/`env`/`verify_paths`.
+#
+# A CHAVE é o **id lógico** da ferramenta (git/gh/vercel/node/python) — NÃO o nome do binário no PATH
+# (que para o Python é `python3`) nem o rótulo amigável (mapa em `app/lina-gpui/src/dev_tools.rs`).
+#
+# Princípios (mesmos do `recipes.toml`):
+#  - SILENCIOSO por padrão. No macOS com Homebrew presente, TUDO instala sem perguntar nada (roda no
+#    PTY oculto do onboarding). Onde o instalador PRECISA da senha do usuário (sudo no apt) ou de UAC
+#    (winget no Windows), o app NÃO roda no escuro: abre um terminal real (ver `dev_tools.rs`). O flag
+#    "precisa de interação" é DERIVADO do comando em Rust (`sudo`/`winget`), pois o schema do
+#    `InstallRecipe` (`deny_unknown_fields`, no crate intocável) não aceita um campo novo aqui.
+#  - macOS é o único VERIFICADO em runtime; Linux/Windows vêm das docs oficiais (2026-06) + fallback
+#    "rode no terminal" / "instale manualmente e clique Verificar".
+#  - `verify_paths`: diretórios FIXOS onde o binário cai fora do PATH atual (ex.: `~/.local/bin` do
+#    tarball do Node no Linux). No macOS o bin do brew e o bin global do npm entram via re-hidratação
+#    do PATH do shell de login (ver `main.rs::refresh_path_after_install`).
+
+# ───────────────────────────── git (Git) ─────────────────────────────
+# macOS: git já costuma vir do Xcode Command Line Tools; se faltar, o brew resolve em silêncio.
+[git.macos]
+program = "bash"
+args = ["-c", 'NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 brew install git']
+
+[git.linux]
+program = "bash"
+args = ["-c", 'sudo apt-get install -y git']
+
+[git.windows]
+program = "winget"
+args = ["install", "--id", "Git.Git", "-e", "--silent", "--accept-package-agreements", "--accept-source-agreements"]
+
+# ───────────────────────────── gh (GitHub CLI) ─────────────────────────────
+[gh.macos]
+program = "bash"
+args = ["-c", 'NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 brew install gh']
+
+# Receita oficial do repositório apt do gh (https://github.com/cli/cli/blob/trunk/docs/install_linux.md).
+# Vários `sudo` → caminho INTERATIVO (terminal real); o app não responde senha no escuro.
+[gh.linux]
+program = "bash"
+args = ["-c", '(type -p wget >/dev/null || sudo apt-get install -y wget) && sudo mkdir -p -m 755 /etc/apt/keyrings && wget -nv -O- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null && sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null && sudo apt-get update && sudo apt-get install -y gh']
+
+[gh.windows]
+program = "winget"
+args = ["install", "--id", "GitHub.cli", "-e", "--silent", "--accept-package-agreements", "--accept-source-agreements"]
+
+# ───────────────────────────── node (Node.js) ─────────────────────────────
+[node.macos]
+program = "bash"
+args = ["-c", 'NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 brew install node']
+
+# Linux SEM sudo: baixa o tarball LTS oficial p/ ~/.local (não mexe em /usr, não pede senha → SILENCIOSO).
+# `v22.11.0` é a release em que o Node 22 ("Jod") entrou em LTS; confirme/atualize a versão LTS atual
+# nas docs (https://nodejs.org/en/about/previous-releases). O `verify_paths` cobre o `~/.local/bin`.
+[node.linux]
+program = "bash"
+args = ["-c", 'curl -fsSL https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-x64.tar.xz -o /tmp/node.tar.xz && mkdir -p "$HOME/.local" "$HOME/.local/bin" && tar -xJf /tmp/node.tar.xz -C "$HOME/.local" && ln -sf "$HOME/.local/node-v22.11.0-linux-x64/bin/node" "$HOME/.local/bin/node" && ln -sf "$HOME/.local/node-v22.11.0-linux-x64/bin/npm" "$HOME/.local/bin/npm"']
+verify_paths = ["~/.local/bin"]
+
+[node.windows]
+program = "winget"
+args = ["install", "--id", "OpenJS.NodeJS.LTS", "-e", "--silent", "--accept-package-agreements", "--accept-source-agreements"]
+
+# ───────────────────────────── vercel (Vercel CLI) ─────────────────────────────
+# Pacote npm global (binário `vercel`). PRÉ-REQUISITO: Node.js — o `dev_tools.rs` bloqueia com
+# "instale o Node.js primeiro" se o `node` não estiver presente (não tenta instalar vercel sem npm).
+[vercel.macos]
+program = "bash"
+args = ["-c", 'npm install -g vercel']
+
+[vercel.linux]
+program = "bash"
+args = ["-c", 'npm install -g vercel']
+
+[vercel.windows]
+program = "npm"
+args = ["install", "-g", "vercel"]
+
+# ───────────────────────────── python (Python 3) ─────────────────────────────
+# Binário no PATH = `python3` (o mapa de descoberta em `dev_tools.rs` traduz id `python` → bin `python3`).
+[python.macos]
+program = "bash"
+args = ["-c", 'NONINTERACTIVE=1 HOMEBREW_NO_ENV_HINTS=1 brew install python']
+
+[python.linux]
+program = "bash"
+args = ["-c", 'sudo apt-get install -y python3 python3-pip']
+
+[python.windows]
+program = "winget"
+args = ["install", "--id", "Python.Python.3.12", "-e", "--silent", "--accept-package-agreements", "--accept-source-agreements"]
