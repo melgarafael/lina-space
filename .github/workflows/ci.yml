@@ -125,6 +125,8 @@ jobs:
           workspaces: app/lina-gpui
       - name: Build (gpui — pin de SHA + runtime_shaders no macOS)
         run: cargo build
+      - name: Test (gpui-free — tokens/WCAG, lifecycle de UI, criadores; lacuna escalada na F1-2-1)
+        run: cargo test
       - name: Clippy (-D warnings)
         run: cargo clippy --all-targets -- -D warnings
       - name: Fmt
