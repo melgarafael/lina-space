@@ -985,7 +985,7 @@ impl WorkspaceView {
         }
         // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona (foca+revela); ⌘⌫ fecha o focado;
         // ⌘+ / ⌘- dão zoom in/out no centro da viewport.
-        if ks.modifiers.platform && ks.key == "t" {
+        if shortcut_modifier(ks) && ks.key == "t" {
             match self.nodes.add_node() {
                 Ok(node) => {
                     self.focus(node);
@@ -1017,6 +1017,16 @@ impl WorkspaceView {
             self.input.submit(self.focused, WriteOp::HumanKeys(bytes));
         }
     }
+}
+
+#[cfg(windows)]
+fn shortcut_modifier(ks: &Keystroke) -> bool {
+    ks.modifiers.control || ks.modifiers.platform
+}
+
+#[cfg(not(windows))]
+fn shortcut_modifier(ks: &Keystroke) -> bool {
+    ks.modifiers.platform
 }
 
 impl Render for WorkspaceView {

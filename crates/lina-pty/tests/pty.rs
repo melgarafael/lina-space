@@ -17,6 +17,7 @@ use lina_pty::{PtyCommand, PtyError, PtyManager};
 
 /// Lê do `reader` até achar uma linha só-dígitos (o PID que `echo $$` imprime) ou
 /// EOF. O eco do input (`echo $$`) nunca é só-dígitos, então não confunde.
+#[cfg(not(windows))]
 fn read_pid(mut reader: Box<dyn Read + Send>) -> Option<u32> {
     let mut acc = String::new();
     let mut buf = [0u8; 4096];
@@ -34,6 +35,7 @@ fn read_pid(mut reader: Box<dyn Read + Send>) -> Option<u32> {
     find_pid(&acc)
 }
 
+#[cfg(not(windows))]
 fn find_pid(text: &str) -> Option<u32> {
     text.lines()
         .map(str::trim)
@@ -49,6 +51,44 @@ fn all_distinct(values: &[u32]) -> bool {
     sorted.len() == values.len()
 }
 
+#[cfg(windows)]
+fn test_shell() -> PtyCommand {
+    PtyCommand::new("cmd.exe").args(["/Q", "/K"])
+}
+
+#[cfg(not(windows))]
+fn test_shell() -> PtyCommand {
+    PtyCommand::new("sh")
+}
+
+#[cfg(windows)]
+fn line(s: &str) -> Vec<u8> {
+    format!("{s}\r").into_bytes()
+}
+
+#[cfg(not(windows))]
+fn line(s: &str) -> Vec<u8> {
+    format!("{s}\n").into_bytes()
+}
+
+#[cfg(windows)] // só o caminho Windows lê via read_until; no unix vira dead_code
+fn read_until(mut reader: Box<dyn Read + Send>, needle: &str) -> Option<String> {
+    let mut acc = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if acc.contains(needle) {
+                    return Some(acc);
+                }
+            }
+        }
+    }
+    acc.contains(needle).then_some(acc)
+}
+
 /// Critério de aceite W0-1: 8 PTYs concorrentes => 8 PIDs distintos.
 #[test]
 fn eight_concurrent_ptys_report_distinct_pids() {
@@ -59,11 +99,14 @@ fn eight_concurrent_ptys_report_distinct_pids() {
     for i in 0..N {
         let id = format!("node-{i}");
         let pid = manager
-            .spawn(id.as_str(), PtyCommand::new("sh"), 80, 24)
+            .spawn(id.as_str(), test_shell(), 80, 24)
             .expect("spawn do PTY");
         spawn_pids.push(pid);
     }
     assert_eq!(manager.len(), N, "deve haver 8 PTYs vivos");
+
+    #[cfg(windows)]
+    thread::sleep(Duration::from_millis(500));
 
     let mut pending = Vec::with_capacity(N);
     for i in 0..N {
@@ -74,33 +117,54 @@ fn eight_concurrent_ptys_report_distinct_pids() {
             .expect("tomar writer (1 dono)");
 
         let (tx, rx) = mpsc::channel();
+        #[cfg(not(windows))]
         let join = thread::spawn(move || {
             let _ = tx.send(read_pid(reader));
         });
+        #[cfg(windows)]
+        let marker = format!("LINA_NODE_{i}");
+        #[cfg(windows)]
+        let join = {
+            let marker = marker.clone();
+            thread::spawn(move || {
+                let _ = tx.send(read_until(reader, &marker).map(|_| i as u32 + 1));
+            })
+        };
 
-        // Escreve no master de cada: pede o PID e manda sair (gera EOF no reader).
+        // Escreve no master de cada e manda sair (gera EOF no reader).
+        #[cfg(not(windows))]
         writer
             .write_all(b"echo $$\n")
             .expect("escrever echo no master");
-        writer.write_all(b"exit\n").expect("escrever exit");
+        #[cfg(windows)]
+        writer
+            .write_all(&line(&format!("echo {marker}")))
+            .expect("escrever echo no master");
+        writer.write_all(&line("exit")).expect("escrever exit");
         writer.flush().expect("flush do master");
         pending.push((rx, join));
     }
 
-    let mut echoed_pids = Vec::with_capacity(N);
+    let mut observed = Vec::with_capacity(N);
     for (rx, join) in pending {
-        let pid = rx
+        let value = rx
             .recv_timeout(Duration::from_secs(15))
-            .expect("PID dentro do timeout")
-            .expect("linha de PID encontrada na saída");
+            .expect("resposta dentro do timeout")
+            .expect("resposta encontrada na saída");
         join.join().expect("join da thread de leitura");
-        echoed_pids.push(pid);
+        observed.push(value);
     }
 
-    assert_eq!(echoed_pids.len(), N);
+    assert_eq!(observed.len(), N);
+    #[cfg(not(windows))]
     assert!(
-        all_distinct(&echoed_pids),
-        "os PIDs lidos de `echo $$` devem ser distintos: {echoed_pids:?}"
+        all_distinct(&observed),
+        "os PIDs lidos de `echo $$` devem ser distintos: {observed:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        all_distinct(&observed),
+        "cada PTY Windows deve reportar seu marker: {observed:?}"
     );
     assert!(
         all_distinct(&spawn_pids) && spawn_pids.iter().all(|&p| p > 0),
@@ -112,9 +176,7 @@ fn eight_concurrent_ptys_report_distinct_pids() {
 #[test]
 fn writer_is_single_owner() {
     let mut manager = PtyManager::new();
-    manager
-        .spawn("solo", PtyCommand::new("sh"), 80, 24)
-        .expect("spawn");
+    manager.spawn("solo", test_shell(), 80, 24).expect("spawn");
     let _writer = manager.take_writer("solo").expect("1º take_writer ok");
     let second = manager.take_writer("solo");
     assert!(
@@ -129,37 +191,48 @@ fn writer_is_single_owner() {
 #[test]
 fn spawn_runs_command_and_streams_output() {
     let mut manager = PtyManager::new();
-    manager
-        .spawn("calc", PtyCommand::new("sh"), 80, 24)
-        .expect("spawn");
-    let mut reader = manager.clone_reader("calc").expect("reader");
+    #[cfg(not(windows))]
+    let cmd = test_shell();
+    #[cfg(windows)]
+    let cmd = PtyCommand::new("cmd.exe").args(["/Q", "/C", "echo 42"]);
+    manager.spawn("calc", cmd, 80, 24).expect("spawn");
+    let reader = manager.clone_reader("calc").expect("reader");
+    #[cfg(not(windows))]
     let mut writer = manager.take_writer("calc").expect("writer");
+    #[cfg(not(windows))]
     writer
         .write_all(b"echo $((6*7))\nexit\n")
         .expect("escrever comando");
+    #[cfg(not(windows))]
     writer.flush().expect("flush");
 
-    let mut out = String::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+    #[cfg(not(windows))]
+    let out = {
+        let mut reader = reader;
+        let mut out = String::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
         }
-    }
+        out
+    };
+    #[cfg(windows)]
+    let out = read_until(reader, "42").unwrap_or_default();
     assert!(
         out.contains("42"),
         "esperava 42 na saída do shell; veio: {out:?}"
     );
+    let _ = manager.kill("calc", Duration::from_millis(500));
 }
 
 /// `resize` funciona em PTY existente; operações em nó inexistente erram limpo.
 #[test]
 fn resize_works_and_missing_node_errors_cleanly() {
     let mut manager = PtyManager::new();
-    manager
-        .spawn("r", PtyCommand::new("sh"), 80, 24)
-        .expect("spawn");
+    manager.spawn("r", test_shell(), 80, 24).expect("spawn");
     manager
         .resize("r", 120, 40)
         .expect("resize do PTY existente");

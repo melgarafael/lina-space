@@ -5,10 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish = false
 [dependencies]
-# Onda 0: portable-pty do crates.io (Mac/Linux funcionam direto).
-# TODO(W5-3): vendorizar read-only + patch dos 3 flags ConPTY + bundle
-# conpty.dll/OpenConsole.exe no Windows. NAO bloqueia o Mac aqui.
-portable-pty = "0.9.0"
+# Windows usa vendor para permitir patch controlado dos flags ConPTY.
+portable-pty = { path = "../../vendor/portable-pty" }
 thiserror.workspace = true
 tracing.workspace = true
 
