@@ -35,6 +35,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod pricing;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -95,7 +97,9 @@ pub struct Session {
     pub tokens_cache: u64,
     /// Tokens de thinking, quando a fonte os expõe (0 quando não).
     pub tokens_thinking: u64,
-    /// Custo somado dos campos `costUSD` presentes — SEMPRE estimativa.
+    /// Custo somado — `costUSD` da linha quando presente (formato antigo); senão
+    /// DERIVADO de `usage` × preço do modelo ([`pricing`]; o formato atual não grava
+    /// `costUSD`). SEMPRE estimativa; modelo fora da tabela não soma (sem chute).
     pub cost_usd: f64,
     /// `true` quando a fonte é JSONL (subcontagem documentada, 13.5 achado 2).
     pub cost_estimated: bool,
@@ -184,6 +188,11 @@ struct SessionAgg {
     last_ts: Option<String>,
     subagents: BTreeSet<String>,
     tools: BTreeSet<String>,
+    /// `requestId`s (fallback: `message.id`) cujo `usage` JÁ foi contado. O formato
+    /// real grava VÁRIAS linhas `assistant` por request repetindo o MESMO `usage`
+    /// (medido: 56/62 requests com 2-4 linhas idênticas num arquivo real) — sem este
+    /// dedup, tokens e custo estimado inflam ~3×.
+    counted_requests: BTreeSet<String>,
 }
 
 impl SessionAgg {
@@ -229,17 +238,45 @@ impl SessionAgg {
         if let Some(model) = message.get("model").and_then(|v| v.as_str()) {
             self.model = Some(model.to_owned());
         }
+        // Dedup de usage POR REQUEST: o formato real repete o MESMO `usage` em 2-4
+        // linhas do mesmo `requestId` (ver doc de `counted_requests`). Linha sem chave
+        // (formato antigo) conta sempre — comportamento anterior preservado.
+        let request_key = line
+            .get("requestId")
+            .and_then(|v| v.as_str())
+            .or_else(|| message.get("id").and_then(|v| v.as_str()));
+        let first_of_request = match request_key {
+            Some(key) => self.counted_requests.insert(key.to_owned()),
+            None => true,
+        };
         if let Some(usage) = message.get("usage") {
-            let n = |k: &str| {
-                usage
-                    .get(k)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0)
-            };
-            self.tokens_in += n("input_tokens");
-            self.tokens_out += n("output_tokens");
-            self.tokens_cache += n("cache_creation_input_tokens") + n("cache_read_input_tokens");
-            self.tokens_thinking += n("thinking_tokens");
+            if first_of_request {
+                let n = |k: &str| {
+                    usage
+                        .get(k)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                };
+                self.tokens_in += n("input_tokens");
+                self.tokens_out += n("output_tokens");
+                self.tokens_cache +=
+                    n("cache_creation_input_tokens") + n("cache_read_input_tokens");
+                self.tokens_thinking += n("thinking_tokens");
+
+                // Custo: `costUSD` da linha vence (formato antigo, já somado acima).
+                // SEM ele — o formato atual NUNCA o grava — deriva a ESTIMATIVA de
+                // usage × preço do modelo (o da linha; fallback: último da sessão).
+                // Modelo fora da tabela → nada somado (fallback honesto do card).
+                if line.get("costUSD").is_none() {
+                    let model = message
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .or(self.model.as_deref());
+                    if let Some(est) = model.and_then(|m| pricing::estimate_usage_cost(m, usage)) {
+                        self.cost_usd += est;
+                    }
+                }
+            }
         }
         if let Some(content) = message.get("content").and_then(|v| v.as_array()) {
             for block in content {
@@ -311,6 +348,11 @@ impl SessionScanner {
             total += agg.last_ts.as_ref().map_or(0, |s| s.len() + s_str);
             total += agg.tools.iter().map(|t| t.len() + s_str).sum::<usize>();
             total += agg.subagents.iter().map(|t| t.len() + s_str).sum::<usize>();
+            total += agg
+                .counted_requests
+                .iter()
+                .map(|r| r.len() + s_str)
+                .sum::<usize>();
         }
         for (path, cursor) in &self.files {
             total += std::mem::size_of::<FileCursor>() + std::mem::size_of::<PathBuf>();
@@ -849,6 +891,142 @@ mod tests {
         "\n",
     );
 
+    /// Fixture no formato ATUAL do Claude Code (verificado em session-files reais de
+    /// 2026-06): NÃO existe `costUSD` em linha alguma — só `message.usage` — e um
+    /// MESMO request gera 2-4 linhas `assistant` repetindo o MESMO `usage` (medido:
+    /// 56/62 requests multi-linha num arquivo real). Conteúdo inventado; estrutura fiel.
+    const FIXTURE_REAL: &str = concat!(
+        // req_A: 2 linhas com o MESMO requestId + MESMO usage (duplicação real do formato).
+        r#"{"type":"assistant","sessionId":"sess-real","requestId":"req_A","cwd":"/Users/test/Library/Application Support/Lina/walking-skeleton/t0","timestamp":"2026-06-07T14:10:12.010Z","message":{"id":"msg_A","model":"claude-opus-4-8","usage":{"input_tokens":16456,"output_tokens":2896,"cache_creation_input_tokens":41804,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":41804,"ephemeral_5m_input_tokens":0},"service_tier":"standard"},"content":[{"type":"text","text":"oi"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","sessionId":"sess-real","requestId":"req_A","cwd":"/Users/test/Library/Application Support/Lina/walking-skeleton/t0","timestamp":"2026-06-07T14:10:13.000Z","message":{"id":"msg_A","model":"claude-opus-4-8","usage":{"input_tokens":16456,"output_tokens":2896,"cache_creation_input_tokens":41804,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":41804,"ephemeral_5m_input_tokens":0},"service_tier":"standard"},"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+        "\n",
+        // req_B: 1 linha, cache write 5m + cache read.
+        r#"{"type":"assistant","sessionId":"sess-real","requestId":"req_B","cwd":"/Users/test/Library/Application Support/Lina/walking-skeleton/t0","timestamp":"2026-06-07T14:10:49.056Z","message":{"id":"msg_B","model":"claude-opus-4-8","usage":{"input_tokens":2,"output_tokens":378,"cache_creation_input_tokens":1245,"cache_read_input_tokens":64702,"cache_creation":{"ephemeral_5m_input_tokens":1245,"ephemeral_1h_input_tokens":0}},"content":[{"type":"text","text":"ok"}]}}"#,
+        "\n",
+    );
+
+    /// Preço oficial (USD/Mtok) usado nas contas esperadas dos testes — Opus 4.5+.
+    const OPUS_IN: f64 = 5.0 / 1e6;
+    const OPUS_OUT: f64 = 25.0 / 1e6;
+
+    /// Custo total esperado da [`FIXTURE_REAL`], request a request (dedup por requestId):
+    /// cache write 1h = 2× input; write 5m = 1.25×; read = 0.1× (multiplicadores da API).
+    fn fixture_real_expected_cost() -> f64 {
+        let req_a = 16456.0 * OPUS_IN + 2896.0 * OPUS_OUT + 41804.0 * OPUS_IN * 2.0;
+        let req_b =
+            2.0 * OPUS_IN + 378.0 * OPUS_OUT + 1245.0 * OPUS_IN * 1.25 + 64702.0 * OPUS_IN * 0.1;
+        req_a + req_b
+    }
+
+    // ── BUG custo-zero no .app (F1-1-5): formato real SEM costUSD → custo derivado ──
+
+    /// O bug do fundador: session-file no formato ATUAL (sem `costUSD`) deixava
+    /// `cost_usd = 0` → card "sem estimativa de custo ainda" para sempre. O custo deve
+    /// ser DERIVADO de `usage` × preço do modelo (estimativa honesta), com dedup por
+    /// `requestId` (senão tokens e custo inflam ~3× — duplicação medida no formato real).
+    #[test]
+    fn real_format_without_costusd_derives_estimated_cost_deduped() {
+        let tmp = TempDir::new("real-cost");
+        let file = tmp.path().join("sess-real.jsonl");
+        std::fs::write(&file, FIXTURE_REAL).expect("escrever fixture");
+
+        let mut scanner = SessionScanner::new();
+        scanner.scan_file("claude-code", &file).expect("scan");
+        let s = scanner
+            .session("claude-code", "sess-real")
+            .expect("sessão agregada");
+
+        // Dedup: req_A tem 2 linhas com o MESMO usage → conta UMA vez.
+        assert_eq!(s.tokens_in, 16456 + 2, "usage de req_A não pode dobrar");
+        assert_eq!(s.tokens_out, 2896 + 378);
+        assert_eq!(s.tokens_cache, 41804 + 1245 + 64702);
+
+        // O coração do bug: custo > 0 derivado de usage × preço, mesmo sem costUSD.
+        assert!(
+            s.cost_usd > 0.0,
+            "formato real sem costUSD precisa render custo estimado (era o bug do .app)"
+        );
+        assert!(
+            (s.cost_usd - fixture_real_expected_cost()).abs() < 1e-9,
+            "custo {} != esperado {}",
+            s.cost_usd,
+            fixture_real_expected_cost()
+        );
+        assert!(s.cost_estimated, "derivado de usage → SEMPRE estimativa");
+        // cwd REAL com espaços (Application Support) preservado p/ correlação sessão↔nó.
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some("/Users/test/Library/Application Support/Lina/walking-skeleton/t0")
+        );
+    }
+
+    /// Honestidade: modelo fora da tabela de preço → custo NÃO é chutado (fica 0 →
+    /// o dashboard exibe "sem estimativa ainda", nunca um número inventado).
+    #[test]
+    fn unknown_model_without_costusd_stays_without_estimate() {
+        let tmp = TempDir::new("unknown-model");
+        let file = tmp.path().join("sess-x.jsonl");
+        std::fs::write(
+            &file,
+            concat!(
+                r#"{"type":"assistant","sessionId":"sess-x","requestId":"req_X","message":{"model":"futuro-llm-99","usage":{"input_tokens":100,"output_tokens":50}}}"#,
+                "\n"
+            ),
+        )
+        .expect("escrever");
+        let mut scanner = SessionScanner::new();
+        scanner.scan_file("claude-code", &file).expect("scan");
+        let s = scanner.session("claude-code", "sess-x").expect("sessão");
+        assert_eq!(s.tokens_in, 100, "tokens contam mesmo sem preço");
+        assert!(
+            s.cost_usd == 0.0,
+            "modelo desconhecido nunca chuta preço (got {})",
+            s.cost_usd
+        );
+    }
+
+    /// REPRO headless do ambiente do .app (Finder): home injetado, layout REAL de
+    /// `~/.claude/projects/<cwd-codificado>/<uuid>.jsonl`, pattern do TOML de produção
+    /// e JSONL no formato atual. Antes do fix: custo 0 ("sem estimativa" eterno).
+    /// O processo de teste pode rodar sob `env -i HOME=… PATH=/usr/bin:/bin` — nada
+    /// aqui depende de env além do home INJETADO (mesma resolução do boot).
+    #[test]
+    fn headless_app_bundle_repro_yields_estimated_cost() {
+        let tmp = TempDir::new("app-repro");
+        // Layout real: nome de pasta codificado como o claude grava p/ cwd com espaços.
+        let proj = tmp.path().join(
+            ".claude/projects/-Users-test-Library-Application-Support-Lina-walking-skeleton-t0",
+        );
+        std::fs::create_dir_all(&proj).expect("árvore");
+        std::fs::write(
+            proj.join("0eecfc25-a46c-4358-b4ed-cb0bc29fce70.jsonl"),
+            FIXTURE_REAL,
+        )
+        .expect("fixture");
+
+        let mut watch = SessionWatch::with_home(tmp.path());
+        // Pattern EXATO do profiles/claude-code.toml de produção (F1-1-1).
+        watch.add_source("claude-code", "~/.claude/projects/*/*.jsonl");
+        let out = watch.poll_once().expect("poll");
+        assert_eq!(out.files_scanned, 1, "descobriu o session-file do .app");
+
+        let s = watch
+            .scanner()
+            .session("claude-code", "sess-real")
+            .expect("sessão do terminal do .app");
+        assert!(
+            s.cost_usd > 0.0,
+            "ambiente do .app precisa produzir custo estimado (era o bug)"
+        );
+        assert!(s.cost_estimated);
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some("/Users/test/Library/Application Support/Lina/walking-skeleton/t0"),
+            "cwd com espaços preservado → correlação sessão↔nó casa com o hint do spawn"
+        );
+    }
+
     // ── Ciclo A (F1-1-2 critério 1): agregação da fixture no schema único ──
 
     #[test]
@@ -870,8 +1048,18 @@ mod tests {
         assert_eq!(s.tokens_cache, 40);
         assert_eq!(s.tokens_thinking, 8);
 
-        // Custo: somado quando a linha traz costUSD — e SEMPRE estimativa (13.5).
-        assert!((s.cost_usd - 0.0123).abs() < 1e-9);
+        // Custo: linha COM costUSD usa o valor gravado (0.0123); linhas SÓ com usage
+        // derivam a estimativa tokens×preço (fix do custo-zero — o formato atual nunca
+        // grava costUSD). Linha 3 (modelo opus-4-8): 50×in + 60×out + 5×read(0,1×in).
+        // Linha 4 (sidechain, sem model → último da sessão): 5×in + 5×out.
+        let est_line3 = 50.0 * OPUS_IN + 60.0 * OPUS_OUT + 5.0 * OPUS_IN * 0.1;
+        let est_line4 = 5.0 * OPUS_IN + 5.0 * OPUS_OUT;
+        let expected = 0.0123 + est_line3 + est_line4;
+        assert!(
+            (s.cost_usd - expected).abs() < 1e-9,
+            "custo {} != {expected}",
+            s.cost_usd
+        );
         assert!(s.cost_estimated, "fonte JSONL → cost_estimated = true");
 
         // Identidade/atividade.
