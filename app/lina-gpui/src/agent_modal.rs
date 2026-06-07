@@ -18,7 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, FontWeight};
+use gpui::{
+    div, prelude::*, px, rgb, text, transparent_black, AnyElement, ClickEvent, Context, FontWeight,
+    Pixels, ScrollHandle, Size,
+};
 use lina_cli_profiles::ProfileRegistry;
 use lina_core::DiscoveredCli;
 use lina_host::NodeId;
@@ -209,16 +212,139 @@ pub fn load_profiles(dir: &Path) -> ProfileRegistry {
 /// (M6-E2: ~600ms). 12 × 50ms = 600ms.
 pub const SUGGEST_DEBOUNCE_TICKS: u32 = 12;
 
+// ═══════════ contenção do seletor (fix de tela bugB2 — matemática PURA, testável) ═══════════
+// O dropdown da galeria ESTOURAVA o modal e a janela (lista inteira inline, sem viewport; caixa
+// de 640px fixa em janela estreita). gpui não roda headless → o clamp vive AQUI, em f32 puro,
+// com teste unitário; o render só APLICA os números. As constantes são FONTE ÚNICA: a mesma
+// tabela alimenta a conta e os `.h(px(..))`/`.line_height(px(..))` do render — se divergirem, a
+// matemática mente (teste `gallery_row_math_matches_render_constants` guarda a amarração).
+
+/// Largura de projeto da caixa do modal (a de antes do fix — preservada quando há espaço).
+pub const MODAL_W: f32 = 640.0;
+/// Piso da caixa em janela minúscula (abaixo disso o conteúdo vira ruído).
+pub const MODAL_W_MIN: f32 = 320.0;
+/// Respiro mínimo entre a caixa e CADA borda da janela (requisito 3: nunca colar/estourar).
+pub const WINDOW_MARGIN: f32 = 16.0;
+/// Padding horizontal da caixa (px_6) — a largura útil do modal é `w - 2*MODAL_PAD_X`.
+pub const MODAL_PAD_X: f32 = 24.0;
+/// Padding interno do dropdown (px_3/py_3).
+pub const GALLERY_PAD: f32 = 12.0;
+/// gap_2 entre cabeçalho · busca · lista.
+pub const GALLERY_GAP: f32 = 8.0;
+/// border_1 do container do dropdown — conta no chrome (taffy é border-box: a borda come o
+/// espaço interno; sem ela na soma, a lista clipa 2px).
+pub const GALLERY_BORDER: f32 = 1.0;
+/// line_height EXPLÍCITA de cada linha de texto (lição do projeto: a natural da fonte clipa).
+pub const GALLERY_LINE_H: f32 = 20.0;
+/// Cabeçalho do dropdown (1 linha: título + hint).
+pub const GALLERY_HEADER_H: f32 = 20.0;
+/// Caixa de busca (py_2 + 1 linha) — FIXA no topo (requisito 4); só a lista rola.
+pub const GALLERY_SEARCH_H: f32 = 36.0;
+/// Linha da lista: 2 linhas de texto + py_2 + border_2 dos dois lados (geometria UNIFORME — a
+/// inativa usa borda transparente, então navegar nunca reflui o layout).
+pub const GALLERY_ROW_H: f32 = 60.0;
+/// Espaço entre linhas da lista (gap_1, via mb por linha — o viewport de scroll é bloco).
+pub const GALLERY_ROW_GAP: f32 = 4.0;
+/// Teto de conforto da viewport (~6,4 linhas): em tela grande a lista NÃO vira um totem — o
+/// corte não-inteiro de linha sinaliza visualmente que rola.
+pub const GALLERY_VIEWPORT_MAX: f32 = 384.0;
+/// Orçamento vertical do modal SEM a lista (título + chips + nome + papel + pasta + avançado +
+/// rodapé + gaps + paddings), estimado por cima de propósito: sobrar é seguro, faltar estoura.
+pub const MODAL_BASE_RESERVED: f32 = 500.0;
+
+/// Tamanho lógico em px — `f32` cru (gpui-free) para o teste rodar headless.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinSize {
+    pub w: f32,
+    pub h: f32,
+}
+
+/// O quadro da caixa do modal DENTRO da janela: largura clampada + teto de altura.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModalFrame {
+    /// Largura final da caixa (`MODAL_W` quando cabe; encolhe em janela estreita).
+    pub w: f32,
+    /// Teto de altura da caixa (janela − 2×margem) — o render aplica como `max_h`.
+    pub max_h: f32,
+}
+
+/// Quadro do modal para uma janela: NUNCA mais largo/alto que a janela menos as margens
+/// (era o estouro horizontal: `w(px(640))` fixo em janela estreita).
+#[must_use]
+pub fn modal_frame(window: WinSize) -> ModalFrame {
+    ModalFrame {
+        w: MODAL_W.min(window.w - 2.0 * WINDOW_MARGIN).max(MODAL_W_MIN),
+        max_h: (window.h - 2.0 * WINDOW_MARGIN).max(160.0),
+    }
+}
+
+/// Altura do "chrome" do dropdown (tudo menos a viewport da lista): bordas + paddings + gaps +
+/// cabeçalho + busca.
+#[must_use]
+pub fn gallery_chrome_h() -> f32 {
+    2.0 * GALLERY_BORDER
+        + 2.0 * GALLERY_PAD
+        + 2.0 * GALLERY_GAP
+        + GALLERY_HEADER_H
+        + GALLERY_SEARCH_H
+}
+
+/// Bounds finais do dropdown + viewport da lista (o contrato do fix).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GalleryLayout {
+    /// Largura do dropdown == largura ÚTIL do modal (requisito 1: nunca mais largo).
+    pub w: f32,
+    /// Altura total do dropdown (chrome + viewport).
+    pub h: f32,
+    /// Altura da VIEWPORT da lista — o conteúdo rola POR DENTRO quando excede (requisito 2).
+    pub list_viewport_h: f32,
+    /// O conteúdo excede a viewport? (o render usa a viewport igual; a flag é dos testes/UX.)
+    pub scrolls: bool,
+}
+
+/// **A conta do fix**: dado o quadro do modal + a janela + nº de itens filtrados → bounds do
+/// dropdown e viewport da lista. Clamp em 3 camadas: conteúdo justo (sem buraco morto) ≤ espaço
+/// vertical disponível (janela − orçamento base − chrome) ≤ teto de conforto — com PISO de 1
+/// linha (janela degenerada mantém o seletor usável; o residual é absorvido pelo scroll do
+/// corpo do modal, fallback declarativo do render — nunca pintado por cima do canvas).
+#[must_use]
+pub fn gallery_layout(modal: ModalFrame, window: WinSize, n_items: usize) -> GalleryLayout {
+    let w = modal.w - 2.0 * MODAL_PAD_X;
+    let content = if n_items == 0 {
+        GALLERY_ROW_H // a linha única da mensagem de "nenhum papel casa".
+    } else {
+        n_items as f32 * GALLERY_ROW_H + (n_items as f32 - 1.0) * GALLERY_ROW_GAP
+    };
+    // Teto REAL: o menor entre o quadro recebido e a própria janela (robusto a um frame que
+    // não veio de `modal_frame`).
+    let ceiling = (window.h - 2.0 * WINDOW_MARGIN).min(modal.max_h);
+    let space = ceiling - MODAL_BASE_RESERVED - gallery_chrome_h();
+    // clamp seguro: ROW_H (60) ≤ VIEWPORT_MAX (384) por construção — nunca panica.
+    let cap = space.clamp(GALLERY_ROW_H, GALLERY_VIEWPORT_MAX);
+    let list_viewport_h = content.min(cap);
+    GalleryLayout {
+        w,
+        h: gallery_chrome_h() + list_viewport_h,
+        list_viewport_h,
+        scrolls: content > list_viewport_h + 0.5,
+    }
+}
+
 /// **Seletor de papéis** ([Trocar] — F1-2-3 + feedback de tela do fundador: "tinha que ser um
 /// seletor ou dropdown", não ciclar de um em um). TODOS os papéis da biblioteca visíveis de uma
 /// vez (a biblioteca É o registry W3-1 humanizado — fonte única, offline, zero LLM), com busca
 /// por texto (nome leigo OU descrição) e navegação por teclado (↑↓ + Enter; Esc fecha).
-/// gpui-free e testável — espelha o idioma da paleta M1.
+/// gpui-free e testável — espelha o idioma da paleta M1. (Exceção consciente: o `scroll` é um
+/// `gpui::ScrollHandle` — um Rc-cell INERTE, sem janela/plataforma — para o ↑↓ manter a linha
+/// destacada visível dentro da viewport; construí-lo em teste headless é seguro.)
 pub struct RoleGallery {
     items: Vec<RoleSuggestion>,
     query: String,
     /// Índice selecionado DENTRO da lista filtrada (teclado ↑↓; clamp ao filtrar).
     selected: usize,
+    /// Scroll da viewport da lista (one-shot `scroll_to_item` ao navegar por teclado — não
+    /// briga com o wheel: fora da navegação o offset é do usuário).
+    scroll: ScrollHandle,
 }
 
 impl RoleGallery {
@@ -244,7 +370,14 @@ impl RoleGallery {
             items,
             query: String::new(),
             selected: 0,
+            scroll: ScrollHandle::new(),
         }
+    }
+
+    /// Handle do scroll da lista — o render amarra na viewport via `track_scroll`.
+    #[must_use]
+    pub fn scroll_handle(&self) -> &ScrollHandle {
+        &self.scroll
     }
 
     /// Os papéis que casam com a busca (case-insensitive, nome leigo OU descrição). Sem busca →
@@ -276,14 +409,17 @@ impl RoleGallery {
     pub fn type_char(&mut self, s: &str) {
         self.query.push_str(s);
         self.selected = 0;
+        self.scroll.scroll_to_item(0); // filtro novo → lista volta ao topo.
     }
 
     pub fn backspace(&mut self) {
         self.query.pop();
         self.selected = 0;
+        self.scroll.scroll_to_item(0);
     }
 
-    /// ↑↓ com clamp nas bordas (sem wrap — previsível pro leitor de tela).
+    /// ↑↓ com clamp nas bordas (sem wrap — previsível pro leitor de tela). A viewport SEGUE a
+    /// seleção (scroll mínimo one-shot) — o destaque nunca some abaixo/acima da dobra.
     pub fn move_selection(&mut self, delta: i32) {
         let len = self.filtered().len();
         if len == 0 {
@@ -291,6 +427,7 @@ impl RoleGallery {
         }
         let cur = self.selected() as i32;
         self.selected = (cur + delta).clamp(0, len as i32 - 1) as usize;
+        self.scroll.scroll_to_item(self.selected);
     }
 
     /// O papel sob o cursor (Enter) — `None` com a busca vazia de resultados.
@@ -797,9 +934,19 @@ fn unique_name(name: &str, existing: &[String]) -> String {
 
 /// Renderiza o modal sobre o canvas. Cliques roteiam por métodos do [`WorkspaceView`]
 /// (`modal_*`) — o modelo continua gpui-free.
-pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement {
+pub fn render(
+    modal: &AgentModal,
+    viewport: Size<Pixels>,
+    cx: &mut Context<WorkspaceView>,
+) -> AnyElement {
     let th = theme::active();
     let is_edit = matches!(modal.mode, ModalMode::Edit { .. });
+    // Contenção (fix bugB2): TODA dimensão vem da matemática pura — o render só aplica.
+    let win = WinSize {
+        w: f32::from(viewport.width),
+        h: f32::from(viewport.height),
+    };
+    let frame = modal_frame(win);
 
     let mut col = div().flex().flex_col().gap_3();
 
@@ -1127,46 +1274,80 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
     );
 
     // ── seletor de papéis aberto (F1-2-3): TODOS os papéis + busca + teclado ──
+    // Fix bugB2: o dropdown CONTIDO — largura = útil do modal, busca FIXA no topo e lista numa
+    // VIEWPORT de altura calculada (matemática pura `gallery_layout`) que rola por dentro.
     if let Some(g) = modal.gallery() {
         let filtered = g.filtered();
         let sel = g.selected();
+        let lay = gallery_layout(frame, win, filtered.len());
         let (qtxt, qfg) = if g.query().is_empty() {
             (COPY_GALLERY_SEARCH_PLACEHOLDER.to_string(), th.text.muted)
         } else {
             (format!("{}▌", g.query()), th.text.bright)
         };
-        let mut list = div().flex().flex_col().gap_1();
+        // Viewport da lista: raiz de scroll em BLOCO (lição W6: flex no root de scroll não
+        // engata) com altura TRAVADA pela conta; as linhas são filhas DIRETAS — é o que o
+        // `scroll_to_item` do teclado indexa (child_bounds do container trackeado).
+        let mut list = div()
+            .id("m6-gallery-list")
+            // a11y: anuncia o tamanho real da lista e, quando a viewport corta, que rola.
+            .aria_label(if lay.scrolls {
+                format!("lista de papéis, {} resultados — rola", filtered.len())
+            } else {
+                format!("lista de papéis, {} resultados", filtered.len())
+            })
+            .track_scroll(g.scroll_handle())
+            .overflow_y_scroll()
+            .h(px(lay.list_viewport_h))
+            .w_full();
         if filtered.is_empty() {
             list = list.child(
                 div()
+                    .h(px(GALLERY_ROW_H))
                     .px_3()
                     .py_2()
+                    .overflow_hidden()
+                    .line_height(px(GALLERY_LINE_H))
                     .text_color(rgb(th.text.muted))
                     .child(text!(COPY_GALLERY_EMPTY)),
             );
         }
         for (i, r) in filtered.iter().enumerate() {
             let active = i == sel;
-            let mut row = div()
+            // Geometria UNIFORME por linha: altura fixa (== GALLERY_ROW_H da conta), borda
+            // sempre presente (transparente na inativa) — navegar não reflui o layout, e a
+            // matemática do viewport nunca mente. a11y: ElementId ÚNICO por linha (lição:
+            // text! em loop colide nó AccessKit) + rótulo anunciável completo.
+            let row = div()
                 .id(("m6-role-item", i))
-                // a11y (gate da onda): linha anunciável — nome leigo + o que ele faz.
                 .aria_label(format!("papel {} — {}", r.label, r.blurb))
+                .h(px(GALLERY_ROW_H))
+                .mb(px(GALLERY_ROW_GAP))
                 .flex()
                 .flex_col()
                 .px_3()
                 .py_2()
                 .rounded_md()
+                .overflow_hidden()
                 .bg(rgb(if active {
                     th.surface.raised_alt
                 } else {
                     th.surface.panel
                 }))
+                .border_2()
+                .border_color(if active {
+                    // foco visível: o MESMO token do design system (≥3:1 nos 2 temas — F1-2-1).
+                    rgb(th.focus.ring).into()
+                } else {
+                    transparent_black()
+                })
                 .cursor_pointer()
                 .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
                     v.modal_gallery_pick(Some(i), cx);
                 }))
                 .child(
                     div()
+                        .line_height(px(GALLERY_LINE_H))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(if active {
                             th.text.bright
@@ -1177,17 +1358,17 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
                 )
                 .child(
                     div()
+                        .line_height(px(GALLERY_LINE_H))
                         .text_color(rgb(th.text.secondary))
                         .child(text!(r.blurb.clone())),
                 );
-            if active {
-                // foco visível: o MESMO token do design system (≥3:1 nos 2 temas — F1-2-1).
-                row = row.border_2().border_color(rgb(th.focus.ring));
-            }
             list = list.child(row);
         }
         col = col.child(
             div()
+                // bounds FINAIS da conta: largura útil do modal × chrome+viewport — pinados.
+                .w(px(lay.w))
+                .h(px(lay.h))
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -1199,18 +1380,22 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
                 .border_color(rgb(th.surface.raised_alt))
                 .child(
                     div()
+                        .h(px(GALLERY_HEADER_H))
                         .flex()
                         .flex_row()
                         .items_center()
+                        .overflow_hidden()
                         .child(
                             div()
                                 .flex_1()
+                                .line_height(px(GALLERY_HEADER_H))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(th.text.primary))
                                 .child(text!(COPY_GALLERY_TITLE)),
                         )
                         .child(
                             div()
+                                .line_height(px(GALLERY_HEADER_H))
                                 .text_color(rgb(th.text.muted))
                                 .child(text!(COPY_GALLERY_HINT)),
                         ),
@@ -1218,8 +1403,11 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
                 .child(
                     div()
                         .id("m6-gallery-search")
+                        .h(px(GALLERY_SEARCH_H))
                         .px_3()
                         .py_2()
+                        .overflow_hidden()
+                        .line_height(px(GALLERY_LINE_H))
                         .rounded_md()
                         .bg(rgb(th.surface.panel))
                         .text_color(rgb(qfg))
@@ -1377,6 +1565,10 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
     );
 
     // backdrop + caixa central (irmão do overlay de nomeação do M2 que este modal substitui).
+    // Fix bugB2: a caixa vem do `modal_frame` (clamp à janela nos 2 eixos — era `w(640)` fixo
+    // sem teto). O corpo é raiz de scroll em BLOCO (lição W6): se algum estado raro exceder o
+    // orçamento (`MODAL_BASE_RESERVED`), o conteúdo ROLA dentro da caixa — nunca pinta por
+    // cima do canvas nem passa da borda da janela.
     div()
         .absolute()
         .top_0()
@@ -1388,7 +1580,8 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
         .justify_center()
         .child(
             div()
-                .w(px(640.0))
+                .w(px(frame.w))
+                .max_h(px(frame.max_h))
                 .flex()
                 .flex_col()
                 .px_6()
@@ -1398,7 +1591,16 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
                 .bg(rgb(th.surface.card))
                 .border_2()
                 .border_color(rgb(th.accent.create))
-                .child(col),
+                .child(
+                    div()
+                        .id("m6-body")
+                        // min_h(0): filho de flex-col tem min-height:auto — sem isto o corpo
+                        // nunca encolhe e o scroll-fallback não engata.
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .w_full()
+                        .child(col),
+                ),
         )
         .into_any_element()
 }
@@ -1688,6 +1890,205 @@ kind = "idle"
         assert!(
             m3.gallery_open(),
             "seletor segue aberto p/ corrigir a busca"
+        );
+    }
+
+    /// **GUARDIÃO (fix de tela bugB2 — dropdown estourava modal e janela)**: a caixa do modal
+    /// SEMPRE cabe na janela — largura de projeto (640) só quando há espaço; janela estreita
+    /// (o screenshot do fundador, ~736 lógicos) clampa com folga de respiro nas duas bordas.
+    #[test]
+    fn modal_frame_clamps_to_window() {
+        // janela folgada → largura de projeto + teto de altura com margem dos dois lados.
+        let f = modal_frame(WinSize {
+            w: 1440.0,
+            h: 900.0,
+        });
+        assert!((f.w - MODAL_W).abs() < 0.01, "largura de projeto: {}", f.w);
+        assert!(
+            (f.max_h - (900.0 - 2.0 * WINDOW_MARGIN)).abs() < 0.01,
+            "teto = janela - 2*margem: {}",
+            f.max_h
+        );
+        // janela estreita → a caixa encolhe (era o estouro horizontal da tela do fundador).
+        let f = modal_frame(WinSize { w: 700.0, h: 800.0 });
+        assert!(
+            f.w <= 700.0 - 2.0 * WINDOW_MARGIN,
+            "caixa dentro da janela estreita: {}",
+            f.w
+        );
+        assert!(f.w >= MODAL_W_MIN, "nunca degenera abaixo do mínimo");
+    }
+
+    /// O dropdown NUNCA é mais largo que a largura útil do modal (requisito 1 do fundador) —
+    /// em qualquer janela, a largura vem do frame, não do conteúdo.
+    #[test]
+    fn gallery_never_wider_than_modal_usable_width() {
+        for win in [
+            WinSize {
+                w: 1440.0,
+                h: 900.0,
+            },
+            WinSize { w: 700.0, h: 800.0 },
+            WinSize { w: 420.0, h: 600.0 },
+        ] {
+            let frame = modal_frame(win);
+            let lay = gallery_layout(frame, win, 14);
+            assert!(
+                (lay.w - (frame.w - 2.0 * MODAL_PAD_X)).abs() < 0.01,
+                "largura útil exata do modal em {win:?}: {} vs frame {}",
+                lay.w,
+                frame.w
+            );
+        }
+    }
+
+    /// Requisito 2: lista longa (8+ papéis) → viewport LIMITADA com scroll interno; o dropdown
+    /// inteiro (busca + viewport) cabe no orçamento vertical do modal dentro da janela.
+    #[test]
+    fn gallery_long_list_scrolls_inside_window_budget() {
+        let win = WinSize {
+            w: 1440.0,
+            h: 900.0,
+        };
+        let frame = modal_frame(win);
+        let lay = gallery_layout(frame, win, 14);
+        let content = 14.0 * GALLERY_ROW_H + 13.0 * GALLERY_ROW_GAP;
+        assert!(
+            lay.list_viewport_h < content,
+            "viewport menor que o conteúdo: {} < {content}",
+            lay.list_viewport_h
+        );
+        assert!(lay.scrolls, "lista longa rola por dentro");
+        assert!(
+            MODAL_BASE_RESERVED + lay.h <= frame.max_h + 0.01,
+            "modal + dropdown cabem no teto: {} + {} > {}",
+            MODAL_BASE_RESERVED,
+            lay.h,
+            frame.max_h
+        );
+    }
+
+    /// Poucos itens → viewport JUSTA (sem buraco morto) e sem scroll.
+    #[test]
+    fn gallery_few_items_fit_exactly_without_scroll() {
+        let win = WinSize {
+            w: 1440.0,
+            h: 900.0,
+        };
+        let lay = gallery_layout(modal_frame(win), win, 3);
+        let content = 3.0 * GALLERY_ROW_H + 2.0 * GALLERY_ROW_GAP;
+        assert!(
+            (lay.list_viewport_h - content).abs() < 0.01,
+            "viewport == conteúdo: {} vs {content}",
+            lay.list_viewport_h
+        );
+        assert!(!lay.scrolls);
+    }
+
+    /// Busca sem resultado (n=0) → viewport de UMA linha (a mensagem de vazio), sem scroll.
+    #[test]
+    fn gallery_empty_search_keeps_single_row_viewport() {
+        let win = WinSize {
+            w: 1440.0,
+            h: 900.0,
+        };
+        let lay = gallery_layout(modal_frame(win), win, 0);
+        assert!(
+            (lay.list_viewport_h - GALLERY_ROW_H).abs() < 0.01,
+            "1 linha p/ a mensagem de vazio: {}",
+            lay.list_viewport_h
+        );
+        assert!(!lay.scrolls);
+    }
+
+    /// Janela DEGENERADA (menor que o orçamento base do modal): a viewport mantém o piso de
+    /// 1 linha (usabilidade) — o transbordo residual é absorvido pelo scroll do corpo do modal
+    /// (fallback declarativo no render), nunca pintado por cima do canvas.
+    #[test]
+    fn gallery_degenerate_window_keeps_one_row_floor() {
+        let win = WinSize { w: 400.0, h: 300.0 };
+        let lay = gallery_layout(modal_frame(win), win, 14);
+        assert!(
+            lay.list_viewport_h >= GALLERY_ROW_H - 0.01,
+            "piso de 1 linha: {}",
+            lay.list_viewport_h
+        );
+        assert!(lay.scrolls, "14 itens numa linha só → rola");
+    }
+
+    /// **Varredura de invariantes** (janelas × nº de itens): largura sempre a útil do modal;
+    /// viewport sempre ≥ piso e ≤ máx de conforto; `scrolls` ⟺ conteúdo > viewport; altura do
+    /// dropdown = chrome + viewport; e em janela não-degenerada (altura ≥ 700 = orçamento base
+    /// + chrome + piso de 1 linha + margens) o modal INTEIRO respeita o teto — o bug não volta.
+    #[test]
+    fn gallery_containment_invariants_sweep() {
+        for w in [360.0_f32, 640.0, 736.0, 1024.0, 1440.0, 2560.0] {
+            for h in [300.0_f32, 600.0, 640.0, 700.0, 768.0, 900.0, 1200.0, 1600.0] {
+                for n in [0_usize, 1, 3, 8, 14, 40] {
+                    let win = WinSize { w, h };
+                    let frame = modal_frame(win);
+                    let lay = gallery_layout(frame, win, n);
+                    let content = if n == 0 {
+                        GALLERY_ROW_H
+                    } else {
+                        n as f32 * GALLERY_ROW_H + (n as f32 - 1.0) * GALLERY_ROW_GAP
+                    };
+                    assert!(
+                        (lay.w - (frame.w - 2.0 * MODAL_PAD_X)).abs() < 0.01,
+                        "largura útil em {w}x{h}/n={n}"
+                    );
+                    assert!(
+                        lay.list_viewport_h >= GALLERY_ROW_H.min(content) - 0.01,
+                        "piso da viewport em {w}x{h}/n={n}: {}",
+                        lay.list_viewport_h
+                    );
+                    assert!(
+                        lay.list_viewport_h <= GALLERY_VIEWPORT_MAX.max(GALLERY_ROW_H) + 0.01,
+                        "máx de conforto em {w}x{h}/n={n}: {}",
+                        lay.list_viewport_h
+                    );
+                    assert_eq!(
+                        lay.scrolls,
+                        content > lay.list_viewport_h + 0.5,
+                        "scrolls ⟺ conteúdo > viewport em {w}x{h}/n={n}"
+                    );
+                    assert!(
+                        (lay.h - (gallery_chrome_h() + lay.list_viewport_h)).abs() < 0.01,
+                        "altura = chrome + viewport em {w}x{h}/n={n}"
+                    );
+                    if h >= 700.0 {
+                        assert!(
+                            MODAL_BASE_RESERVED + lay.h <= frame.max_h + 0.01,
+                            "contenção estrita em {w}x{h}/n={n}: {} + {} > {}",
+                            MODAL_BASE_RESERVED,
+                            lay.h,
+                            frame.max_h
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// As constantes da matemática SÃO as do render (fonte única): linha da lista = 2 linhas de
+    /// texto com line_height explícita (lição: a natural da fonte clipa) + py_2 + borda_2 dos
+    /// dois lados (geometria uniforme — a linha inativa usa borda transparente).
+    #[test]
+    fn gallery_row_math_matches_render_constants() {
+        assert!(
+            (GALLERY_ROW_H - (2.0 * GALLERY_LINE_H + 2.0 * 8.0 + 2.0 * 2.0)).abs() < 0.01,
+            "linha = 2*line_height + py_2 + border_2: {GALLERY_ROW_H}"
+        );
+        assert!(
+            (gallery_chrome_h()
+                - (2.0 * GALLERY_BORDER
+                    + 2.0 * GALLERY_PAD
+                    + 2.0 * GALLERY_GAP
+                    + GALLERY_HEADER_H
+                    + GALLERY_SEARCH_H))
+                .abs()
+                < 0.01,
+            "chrome = bordas + paddings + gaps + cabeçalho + busca"
         );
     }
 

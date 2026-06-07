@@ -674,7 +674,9 @@ impl WorkspaceView {
     /// → 3) atividade. Tokens 100% do `theme` (zero cor hardcoded); `ElementId` único
     /// por linha (lição AccessKit); sonda `[DASH]` loga a latência evento→card 1× por
     /// evento — o Maestro valida por DADOS, o fundador pelo olho.
-    fn render_dashboard(&mut self, th: &theme::Theme) -> impl IntoElement {
+    /// Geometria: `dashboard::dashboard_panel_rect` (PURA, clampada à janela — bug da
+    /// rodada: o painel fixo vazava a borda direita) + clip + scroll interno das linhas.
+    fn render_dashboard(&mut self, th: &theme::Theme, viewport: (f32, f32)) -> impl IntoElement {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -749,13 +751,17 @@ impl WorkspaceView {
             }
         };
 
-        let mut panel = div()
+        // Clamp aos bounds da janela (função pura, testada headless) + clip: o painel
+        // NUNCA vaza — texto/linhas além do retângulo são cortados ou rolam, não vazam.
+        let rect = dashboard::dashboard_panel_rect(viewport.0, viewport.1);
+        let panel = div()
             .id("dash-panel")
             .absolute()
-            .top(px(44.))
-            .right_0()
-            .bottom(px(28.))
-            .w(px(340.))
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.w))
+            .h(px(rect.h))
+            .overflow_hidden()
             .bg(rgb(th.surface.panel))
             .flex()
             .flex_col()
@@ -785,9 +791,13 @@ impl WorkspaceView {
                         dashboard::COST_TOOLTIP
                     )),
             );
+        // Linhas por terminal num viewport ROLÁVEL próprio (lição do onboarding: root de
+        // scroll é BLOCO `overflow_y_scroll`; o flex fica num wrapper interno). Muitos
+        // terminais → rola DENTRO do painel; nunca vaza a base da janela.
+        let mut rows_box = div().flex().flex_col().gap_2();
         for (i, row) in rows.into_iter().enumerate() {
             let color = state_color(row.state);
-            panel = panel.child(
+            rows_box = rows_box.child(
                 div()
                     .id(("dash-row", i as u64))
                     .flex()
@@ -809,7 +819,14 @@ impl WorkspaceView {
                     ),
             );
         }
-        panel
+        panel.child(
+            div()
+                .id("dash-rows")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(rows_box),
+        )
     }
 
     /// **Fix de tela (F1-2-1/inv#6)**: abre a janela de Ajustes (T7 — Aparência/Espaços/T8) SOB
@@ -2394,8 +2411,10 @@ impl Render for WorkspaceView {
 
         let root = root.child(topbar).child(footer);
         // F1-1-5 (P6/fluxo c): painel "Atividade e custos" — zona lateral direita, sob os modais.
+        // Geometria clampada ao viewport REAL (fix: o painel fixo vazava a borda direita).
         let root = if self.dashboard_open {
-            let panel = self.render_dashboard(&th);
+            let vp = window.viewport_size();
+            let panel = self.render_dashboard(&th, (f32::from(vp.width), f32::from(vp.height)));
             root.child(panel)
         } else {
             root
@@ -2403,7 +2422,7 @@ impl Render for WorkspaceView {
         // F1-2-2 · M6/M6-E: o modal de Agente é o overlay central (evoluiu o overlay do M2 — BUG 4
         // resolvido por um modal de verdade). A paleta, quando aberta, continua mais ao topo.
         let root = match &self.agent_modal {
-            Some(m) => root.child(agent_modal::render(m, cx)),
+            Some(m) => root.child(agent_modal::render(m, window.viewport_size(), cx)),
             None => root,
         };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).

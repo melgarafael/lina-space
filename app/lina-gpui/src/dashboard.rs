@@ -18,10 +18,12 @@
 //!
 //! ## Honestidade de custo (nota da rodada: JSONL subconta até ~75% — pesquisa 13.5)
 //! TODO custo exibido leva o marcador **"~" + "(estimado)"** quando a fonte é JSONL
-//! ([`Session::cost_estimated`]) — é CRITÉRIO, não polish. Sem dado de custo (tokens sem
-//! `costUSD`) → **"sem estimativa ainda"**, nunca "US$ 0,00" (zero seria mentira). Fonte
-//! distinta do teto (`cost.rs` super-conta por bytes de propósito — anti-runaway); este
-//! módulo NUNCA alimenta o teto.
+//! ([`Session::cost_estimated`]) — é CRITÉRIO, não polish. O custo vem do `costUSD` da
+//! linha (formato antigo) ou DERIVADO de `usage`×preço (`lina_session_watch::pricing` —
+//! o formato atual não grava `costUSD`). Sem custo apurável (sem sessão, ambíguo ou
+//! modelo fora da tabela de preço) → **"sem estimativa ainda"**, nunca "US$ 0,00"
+//! (zero seria mentira). Fonte distinta do teto (`cost.rs` super-conta por bytes de
+//! propósito — anti-runaway); este módulo NUNCA alimenta o teto.
 //!
 //! ## Sessão↔nó sem chute (doutrina da camada 3 — 13.9)
 //! Match por `cwd` exato contra os hints do app (que CONHECE o cwd de cada spawn);
@@ -439,6 +441,42 @@ fn aggregate_today(
     (CostLine::from_today(cost, estimated), tk)
 }
 
+// ═══════════ Clamp do painel aos bounds da janela — LÓGICA pura (gpui não roda headless) ═══════════
+
+/// Largura preferida do painel "Atividade e custos" (P6 — encolhe antes de vazar).
+pub const PANEL_PREFERRED_W: f32 = 340.0;
+/// Inset do topo (sob a topbar) e da base (sobre o footer) — os mesmos px da fiação.
+pub const PANEL_TOP_INSET: f32 = 44.0;
+pub const PANEL_BOTTOM_INSET: f32 = 28.0;
+
+/// Retângulo final do painel DENTRO da janela (origem no canto sup. esquerdo).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// **Geometria clampada do painel** — função PURA que o render gpui consome (bug da
+/// rodada: o painel fixava `w=340 / top=44 / bottom=28` sem olhar a janela e VAZAVA a
+/// borda direita no app do fundador). Invariantes (testadas): `x ≥ 0`, `x+w ≤ win_w`,
+/// `y ≥ 0`, `y+h ≤ win_h` — em QUALQUER tamanho de janela, inclusive degenerado (0×0).
+/// Altura do conteúdo > `h` é problema do scroll interno (render), não desta função.
+#[must_use]
+pub fn dashboard_panel_rect(win_w: f32, win_h: f32) -> PanelRect {
+    let win_w = win_w.max(0.0);
+    let win_h = win_h.max(0.0);
+    // Largura: a preferida, encolhida ao vão da janela; ancorado à direita sem vazar.
+    let w = PANEL_PREFERRED_W.min(win_w);
+    let x = win_w - w;
+    // Altura: entre os insets; janela baixa demais → encolhe até 0 (nunca negativo).
+    let y = PANEL_TOP_INSET.min(win_h);
+    let bottom = (win_h - PANEL_BOTTOM_INSET).clamp(y, win_h);
+    let h = bottom - y;
+    PanelRect { x, y, w, h }
+}
+
 /// Totais do Espaço (base do B1 — Medidor): agrega os cards de hoje.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceTotals {
@@ -642,7 +680,8 @@ mod tests {
         );
     }
 
-    /// Honestidade: tokens sem `costUSD` → "sem estimativa ainda", NUNCA "US$ 0,00".
+    /// Honestidade: sessão sem custo apurável (ex.: modelo fora da tabela de preço)
+    /// → "sem estimativa ainda", NUNCA "US$ 0,00".
     #[test]
     fn cost_without_data_is_honest() {
         let mut state = ProjectedState::default();
@@ -788,6 +827,63 @@ mod tests {
             "só a sessão do ws E de hoje"
         );
         assert!(cost.estimated && cost.text.contains("estimado"));
+    }
+
+    /// Clamp do painel: janela confortável usa a geometria preferida, exata.
+    #[test]
+    fn panel_rect_in_comfortable_window_uses_preferred_geometry() {
+        let r = dashboard_panel_rect(1200.0, 800.0);
+        assert_eq!(
+            r,
+            PanelRect {
+                x: 1200.0 - PANEL_PREFERRED_W,
+                y: PANEL_TOP_INSET,
+                w: PANEL_PREFERRED_W,
+                h: 800.0 - PANEL_TOP_INSET - PANEL_BOTTOM_INSET,
+            }
+        );
+    }
+
+    /// O BUG da rodada: o painel nunca pode vazar a borda direita — janela mais
+    /// estreita que a largura preferida ENCOLHE o painel (x trava em 0).
+    #[test]
+    fn panel_rect_never_leaks_past_right_edge() {
+        let r = dashboard_panel_rect(200.0, 800.0);
+        assert_eq!(r.w, 200.0, "encolhe ao vão da janela");
+        assert_eq!(r.x, 0.0);
+        assert!(r.x + r.w <= 200.0, "borda direita respeitada");
+    }
+
+    /// Janela baixa demais: altura degrada até 0 — nunca negativa, nunca abaixo do rodapé.
+    #[test]
+    fn panel_rect_degrades_height_in_short_windows() {
+        let r = dashboard_panel_rect(1200.0, 60.0); // só 16px entre topbar e footer
+        assert!(r.h >= 0.0);
+        assert!(r.y + r.h <= 60.0, "nunca vaza a base");
+        let r0 = dashboard_panel_rect(1200.0, 30.0); // nem o inset do topo cabe
+        assert!(r0.h >= 0.0 && r0.y + r0.h <= 30.0);
+    }
+
+    /// Invariantes em GRADE de tamanhos (inclui 0×0 e negativos defensivos):
+    /// o painel SEMPRE cabe na janela — é o contrato que o render gpui consome.
+    #[test]
+    fn panel_rect_invariants_hold_for_any_window_size() {
+        for &w in &[
+            0.0, 1.0, 27.0, 44.0, 200.0, 339.0, 340.0, 341.0, 1024.0, 3840.0,
+        ] {
+            for &h in &[0.0, 1.0, 28.0, 44.0, 72.0, 73.0, 600.0, 2160.0] {
+                let r = dashboard_panel_rect(w, h);
+                assert!(r.x >= 0.0, "x≥0 em {w}x{h}: {r:?}");
+                assert!(r.y >= 0.0, "y≥0 em {w}x{h}: {r:?}");
+                assert!(r.w >= 0.0 && r.h >= 0.0, "dimensões ≥0 em {w}x{h}: {r:?}");
+                assert!(r.x + r.w <= w + 1e-3, "vaza direita em {w}x{h}: {r:?}");
+                assert!(r.y + r.h <= h + 1e-3, "vaza base em {w}x{h}: {r:?}");
+                assert!(r.w <= PANEL_PREFERRED_W, "nunca mais largo que o preferido");
+            }
+        }
+        // Entrada negativa defensiva (viewport ainda não medido) → rect nulo, sem NaN.
+        let r = dashboard_panel_rect(-10.0, -10.0);
+        assert_eq!((r.x, r.y, r.w, r.h), (0.0, 0.0, 0.0, 0.0));
     }
 
     /// Totais do workspace (base do B1): soma custo de hoje + conta warnings.
