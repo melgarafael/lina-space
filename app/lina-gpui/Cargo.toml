@@ -24,6 +24,9 @@ lina-secrets = { path = "../../crates/lina-secrets" }
 # W4-1 (Instalar para mim): receitas de instalação NÃO-interativas por SO vivem em config TOML
 # (`profiles/installers/recipes.toml`), nunca hardcoded — neutralidade multi-CLI (CLAUDE.md inv#3).
 lina-cli-profiles = { path = "../../crates/lina-cli-profiles" }
+# F1-1-5 (dashboard vivo): schema único de sessão (tokens/custo~ por terminal) da camada 3 —
+# o card consome `Session` + o match sessão↔nó por cwd (sem chute; doutrina 13.9).
+lina-session-watch = { path = "../../crates/lina-session-watch" }
 # W3-6c Round 5: desserializar `MailMessage` no drain AUTENTICADO por-nó da fila de broker (o app lê
 # só os subdirs por-nó, carimbando a origem; rejeita flat) — precisa nomear `serde_json` direto.
 serde_json = "1"

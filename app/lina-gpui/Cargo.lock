@@ -3180,6 +3180,7 @@ dependencies = [
  "lina-host",
  "lina-role-discovery",
  "lina-secrets",
+ "lina-session-watch",
  "lina-vt",
  "serde",
  "serde_json",
@@ -3220,6 +3221,15 @@ version = "0.0.1"
 dependencies = [
  "getrandom 0.2.17",
  "keyring",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lina-session-watch"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

@@ -50,6 +50,12 @@ pub const COPY_ROLE_NO_MATCH: &str =
     "Não reconheci um papel nesse nome — escolha um com o Trocar, ou crie assim mesmo (dá para definir depois).";
 /// Hint do preview da sugestão DENTRO do campo Papel (aceita por Tab ou clique).
 pub const COPY_ROLE_SUGGESTED_HINT: &str = "sugestão — aceite com Tab ou clique";
+// ── seletor de papéis (F1-2-3 + requisito do fundador: dropdown, não ciclar) ──
+pub const COPY_GALLERY_TITLE: &str = "Escolha o papel";
+pub const COPY_GALLERY_SEARCH_PLACEHOLDER: &str = "busque por nome ou pelo que ele faz…";
+pub const COPY_GALLERY_EMPTY: &str =
+    "Nenhum papel casa com a busca — apague para ver todos, ou comece pelo Nome que eu sugiro.";
+pub const COPY_GALLERY_HINT: &str = "↑↓ navega · Enter escolhe · Esc fecha";
 pub const COPY_ROLE_SWAP: &str = "Trocar";
 pub const COPY_CWD_LABEL: &str = "Pasta de trabalho";
 pub const COPY_CWD_DEFAULT: &str = "a pasta deste Espaço";
@@ -203,6 +209,103 @@ pub fn load_profiles(dir: &Path) -> ProfileRegistry {
 /// (M6-E2: ~600ms). 12 × 50ms = 600ms.
 pub const SUGGEST_DEBOUNCE_TICKS: u32 = 12;
 
+/// **Seletor de papéis** ([Trocar] — F1-2-3 + feedback de tela do fundador: "tinha que ser um
+/// seletor ou dropdown", não ciclar de um em um). TODOS os papéis da biblioteca visíveis de uma
+/// vez (a biblioteca É o registry W3-1 humanizado — fonte única, offline, zero LLM), com busca
+/// por texto (nome leigo OU descrição) e navegação por teclado (↑↓ + Enter; Esc fecha).
+/// gpui-free e testável — espelha o idioma da paleta M1.
+pub struct RoleGallery {
+    items: Vec<RoleSuggestion>,
+    query: String,
+    /// Índice selecionado DENTRO da lista filtrada (teclado ↑↓; clamp ao filtrar).
+    selected: usize,
+}
+
+impl RoleGallery {
+    /// Monta a biblioteca a partir do registry W3-1 (humanizado): nome leigo + 1 frase por papel.
+    #[must_use]
+    pub fn from_library() -> Self {
+        let items = role_registry()
+            .map(|reg| {
+                reg.role_names()
+                    .map(|canon| {
+                        let (label, blurb) = humanize(canon);
+                        RoleSuggestion {
+                            role: canon.to_string(),
+                            label,
+                            blurb,
+                            why: "Você escolheu este papel na biblioteca.".to_string(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            items,
+            query: String::new(),
+            selected: 0,
+        }
+    }
+
+    /// Os papéis que casam com a busca (case-insensitive, nome leigo OU descrição). Sem busca →
+    /// TODOS de uma vez (o requisito do fundador).
+    #[must_use]
+    pub fn filtered(&self) -> Vec<&RoleSuggestion> {
+        let q = self.query.trim().to_lowercase();
+        self.items
+            .iter()
+            .filter(|r| {
+                q.is_empty()
+                    || r.label.to_lowercase().contains(&q)
+                    || r.blurb.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Índice selecionado na lista FILTRADA (p/ o render destacar com o focus ring).
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected.min(self.filtered().len().saturating_sub(1))
+    }
+
+    pub fn type_char(&mut self, s: &str) {
+        self.query.push_str(s);
+        self.selected = 0;
+    }
+
+    pub fn backspace(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+
+    /// ↑↓ com clamp nas bordas (sem wrap — previsível pro leitor de tela).
+    pub fn move_selection(&mut self, delta: i32) {
+        let len = self.filtered().len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.selected() as i32;
+        self.selected = (cur + delta).clamp(0, len as i32 - 1) as usize;
+    }
+
+    /// O papel sob o cursor (Enter) — `None` com a busca vazia de resultados.
+    #[must_use]
+    pub fn pick(&self) -> Option<RoleSuggestion> {
+        self.filtered().get(self.selected()).map(|r| (*r).clone())
+    }
+
+    /// O papel na posição `idx` da lista FILTRADA (clique do mouse).
+    #[must_use]
+    pub fn pick_at(&self, idx: usize) -> Option<RoleSuggestion> {
+        self.filtered().get(idx).map(|r| (*r).clone())
+    }
+}
+
 /// Criar do zero ou editar um nó vivo (M6-E).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalMode {
@@ -270,8 +373,8 @@ pub struct AgentModal {
     no_match: bool,
     /// Nomes já existentes no Espaço (dedup "(2)").
     existing: Vec<String>,
-    /// [Trocar]: índice do ciclo pela biblioteca de papéis do registry.
-    swap_idx: usize,
+    /// [Trocar] aberto: o seletor de papéis (dropdown — F1-2-3; fundador: "não ciclar").
+    gallery: Option<RoleGallery>,
     suggester: Arc<dyn RoleSuggester>,
     /// (M6-E) nome/papel originais — p/ detectar mudança real no Salvar.
     original: Option<(String, Option<String>)>,
@@ -299,7 +402,7 @@ impl AgentModal {
             why_open: false,
             no_match: false,
             existing,
-            swap_idx: 0,
+            gallery: None,
             suggester,
             original: None,
         }
@@ -505,26 +608,65 @@ impl AgentModal {
         self.no_match
     }
 
-    /// [Trocar]: cicla a biblioteca de papéis (registry W3-1 humanizado — template-driven; a
-    /// galeria rica com busca/duplicar é aprofundamento da F1-2-3).
-    pub fn cycle_role(&mut self) {
-        let Some(reg) = role_registry() else { return };
-        let names: Vec<&str> = reg.role_names().collect();
-        if names.is_empty() {
-            return;
+    /// [Trocar]: abre o SELETOR de papéis (F1-2-3 + feedback do fundador — todos os papéis de
+    /// uma vez, com busca; nada de ciclar de um em um).
+    pub fn open_gallery(&mut self) {
+        self.gallery = Some(RoleGallery::from_library());
+    }
+
+    #[must_use]
+    pub fn gallery(&self) -> Option<&RoleGallery> {
+        self.gallery.as_ref()
+    }
+
+    #[must_use]
+    pub fn gallery_open(&self) -> bool {
+        self.gallery.is_some()
+    }
+
+    pub fn gallery_close(&mut self) {
+        self.gallery = None;
+    }
+
+    pub fn gallery_type(&mut self, s: &str) {
+        if let Some(g) = self.gallery.as_mut() {
+            g.type_char(s);
         }
-        let canon = names[self.swap_idx % names.len()];
-        self.swap_idx = self.swap_idx.wrapping_add(1);
-        let (label, blurb) = humanize(canon);
-        self.role = Some(RoleSuggestion {
-            role: canon.to_string(),
-            label,
-            blurb,
-            why: "Você escolheu este papel na biblioteca.".to_string(),
-        });
-        self.role_pinned = true;
-        self.suggestion = None;
-        self.no_match = false;
+    }
+
+    pub fn gallery_backspace(&mut self) {
+        if let Some(g) = self.gallery.as_mut() {
+            g.backspace();
+        }
+    }
+
+    pub fn gallery_move(&mut self, delta: i32) {
+        if let Some(g) = self.gallery.as_mut() {
+            g.move_selection(delta);
+        }
+    }
+
+    /// Aplica o papel escolhido (Enter / clique em `idx`) — PINA (escolha manual vence a
+    /// re-sugestão, mesma regra do antigo Trocar) e fecha o seletor. `false` = nada escolhido.
+    pub fn gallery_pick(&mut self, idx: Option<usize>) -> bool {
+        let Some(g) = self.gallery.as_ref() else {
+            return false;
+        };
+        let picked = match idx {
+            Some(i) => g.pick_at(i),
+            None => g.pick(),
+        };
+        match picked {
+            Some(role) => {
+                self.role = Some(role);
+                self.role_pinned = true;
+                self.suggestion = None;
+                self.no_match = false;
+                self.gallery = None;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn toggle_why(&mut self) {
@@ -978,11 +1120,114 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
                     .text_color(rgb(th.text.bright))
                     .cursor_pointer()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
-                        v.modal_cycle_role(cx);
+                        v.modal_open_gallery(cx);
                     }))
                     .child(text!(COPY_ROLE_SWAP)),
             ),
     );
+
+    // ── seletor de papéis aberto (F1-2-3): TODOS os papéis + busca + teclado ──
+    if let Some(g) = modal.gallery() {
+        let filtered = g.filtered();
+        let sel = g.selected();
+        let (qtxt, qfg) = if g.query().is_empty() {
+            (COPY_GALLERY_SEARCH_PLACEHOLDER.to_string(), th.text.muted)
+        } else {
+            (format!("{}▌", g.query()), th.text.bright)
+        };
+        let mut list = div().flex().flex_col().gap_1();
+        if filtered.is_empty() {
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(COPY_GALLERY_EMPTY)),
+            );
+        }
+        for (i, r) in filtered.iter().enumerate() {
+            let active = i == sel;
+            let mut row = div()
+                .id(("m6-role-item", i))
+                // a11y (gate da onda): linha anunciável — nome leigo + o que ele faz.
+                .aria_label(format!("papel {} — {}", r.label, r.blurb))
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(if active {
+                    th.surface.raised_alt
+                } else {
+                    th.surface.panel
+                }))
+                .cursor_pointer()
+                .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                    v.modal_gallery_pick(Some(i), cx);
+                }))
+                .child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(if active {
+                            th.text.bright
+                        } else {
+                            th.text.primary
+                        }))
+                        .child(text!(r.label.clone())),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(th.text.secondary))
+                        .child(text!(r.blurb.clone())),
+                );
+            if active {
+                // foco visível: o MESMO token do design system (≥3:1 nos 2 temas — F1-2-1).
+                row = row.border_2().border_color(rgb(th.focus.ring));
+            }
+            list = list.child(row);
+        }
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .py_3()
+                .rounded_md()
+                .bg(rgb(th.surface.chrome))
+                .border_1()
+                .border_color(rgb(th.surface.raised_alt))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(th.text.primary))
+                                .child(text!(COPY_GALLERY_TITLE)),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(th.text.muted))
+                                .child(text!(COPY_GALLERY_HINT)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("m6-gallery-search")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.panel))
+                        .text_color(rgb(qfg))
+                        .child(text!(format!("🔎 {qtxt}"))),
+                )
+                .child(list),
+        );
+    }
 
     // ── Pasta de trabalho ──
     col = col.child(
@@ -1359,25 +1604,119 @@ kind = "idle"
         assert!(!m.discard_armed(), "digitar desarma o descarte");
     }
 
-    /// [Trocar] cicla papéis da biblioteca (humanizados) e PINA — a re-sugestão não atropela.
+    /// **GUARDIÃO DO SELETOR (F1-2-3 + feedback do fundador: "dropdown, não ciclar")**:
+    /// [Trocar] abre a biblioteca com TODOS os papéis visíveis de uma vez (nome leigo + 1 frase,
+    /// nenhum jargão); a busca filtra por nome OU descrição; escolher aplica NA HORA, pina (a
+    /// re-sugestão não atropela) e fecha o seletor.
     #[test]
-    fn cycle_role_pins_choice() {
+    fn gallery_shows_all_roles_at_once_search_and_pick() {
         let mut m = modal();
-        m.cycle_role();
-        let first = m.role().expect("papel da biblioteca").clone();
-        assert!(!first.label.contains('_'), "rótulo leigo");
-        m.cycle_role();
-        assert_ne!(m.role().unwrap().role, first.role, "cicla papéis distintos");
-        // papel pinado + nome que sugere outro → ghost aparece (pergunta), mas não troca sozinho.
-        type_str(&mut m, "Revisor");
+        m.open_gallery();
+        let total = crate::role_suggester::role_registry()
+            .expect("registry")
+            .role_names()
+            .count();
+        {
+            let g = m.gallery().expect("seletor aberto");
+            let all = g.filtered();
+            assert_eq!(all.len(), total, "TODOS os papéis da biblioteca de uma vez");
+            assert!(
+                all.len() >= 10,
+                "biblioteca real, não amostra: {}",
+                all.len()
+            );
+            for r in &all {
+                assert!(!r.label.contains('_'), "rótulo leigo: {}", r.label);
+                assert!(!r.blurb.is_empty(), "1 frase por papel: {}", r.label);
+            }
+        }
+        // busca por TEXTO (nome leigo)…
+        m.gallery_type("revis");
+        assert_eq!(m.gallery().unwrap().filtered().len(), 1, "busca estreita");
+        // …e escolher aplica na hora + pina + fecha.
+        assert!(m.gallery_pick(None));
+        assert!(!m.gallery_open(), "escolher fecha o seletor");
+        assert_eq!(m.role().expect("papel aplicado").role, "reviewer");
+        type_str(&mut m, "Designer de Landing");
         for _ in 0..SUGGEST_DEBOUNCE_TICKS {
             m.tick();
         }
-        assert_ne!(
+        assert_eq!(
             m.role().unwrap().role,
             "reviewer",
             "pinado não troca sozinho"
         );
+        // busca por DESCRIÇÃO também acha (ex.: "telas" → Especialista em telas).
+        m.open_gallery();
+        m.gallery_type("telas");
+        assert!(
+            m.gallery()
+                .unwrap()
+                .filtered()
+                .iter()
+                .any(|r| r.role == "FRONTEND"),
+            "busca pela descrição/função acha o papel"
+        );
+    }
+
+    /// Teclado do seletor (a11y do gate): ↑↓ navega com clamp nas bordas, Enter escolhe o
+    /// destacado, Esc fecha SEM aplicar; busca sem resultado → Enter não aplica nada.
+    #[test]
+    fn gallery_keyboard_navigation_and_escape() {
+        let mut m = modal();
+        m.open_gallery();
+        m.gallery_move(-1);
+        assert_eq!(m.gallery().unwrap().selected(), 0, "clamp no topo");
+        m.gallery_move(1);
+        m.gallery_move(1);
+        assert_eq!(m.gallery().unwrap().selected(), 2);
+        let expected = m.gallery().unwrap().filtered()[2].role.clone();
+        assert!(m.gallery_pick(None), "Enter escolhe o destacado");
+        assert_eq!(m.role().unwrap().role, expected);
+        // Esc fecha sem aplicar.
+        let mut m2 = modal();
+        m2.open_gallery();
+        m2.gallery_close();
+        assert!(!m2.gallery_open());
+        assert!(m2.role().is_none(), "Esc não aplica nada");
+        // busca sem resultados → Enter é no-op (não aplica fantasma).
+        let mut m3 = modal();
+        m3.open_gallery();
+        m3.gallery_type("zzz-nada");
+        assert!(m3.gallery().unwrap().filtered().is_empty());
+        assert!(!m3.gallery_pick(None), "sem resultado, nada a escolher");
+        assert!(
+            m3.gallery_open(),
+            "seletor segue aberto p/ corrigir a busca"
+        );
+    }
+
+    /// **Critério 3 da F1-2-3 (auditoria de deps)**: NENHUM client de LLM/rede no app — a
+    /// sugestão é heurística local (W3-1), offline por construção (invariantes #1/#2).
+    #[test]
+    fn no_llm_or_network_client_deps() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("Cargo.toml");
+        for forbidden in [
+            "openai",
+            "anthropic",
+            "genai",
+            "llm",
+            "reqwest",
+            "hyper",
+            "ureq",
+            "curl",
+        ] {
+            assert!(
+                !manifest.lines().any(|l| {
+                    let l = l.trim();
+                    !l.starts_with('#') && l.starts_with(forbidden)
+                }),
+                "dep proibida no app (LLM/rede): {forbidden}"
+            );
+        }
     }
 
     /// M6-E (modo edição): pré-preenchido; Salvar detecta mudança de nome e papel; renomear p/
@@ -1397,8 +1736,10 @@ kind = "idle"
         let p = m.save_plan().expect("plano");
         assert_eq!(p.name, "Ajudante");
         assert_eq!(p.role, None);
-        // muda papel via biblioteca → plano carrega papel novo.
-        m.cycle_role();
+        // muda papel via SELETOR → plano carrega papel novo.
+        m.open_gallery();
+        m.gallery_move(1); // um papel diferente do atual
+        assert!(m.gallery_pick(None));
         let role_now = m.role().unwrap().role.clone();
         let p = m.save_plan().expect("plano");
         assert_eq!(p.role.as_deref(), Some(role_now.as_str()));
@@ -1441,7 +1782,8 @@ kind = "idle"
             m2.tick();
         }
         assert!(m2.copilot_no_match());
-        m2.cycle_role();
+        m2.open_gallery();
+        assert!(m2.gallery_pick(None));
         assert!(!m2.copilot_no_match(), "Trocar resolve o fallback");
         assert!(m2.role().is_some());
     }

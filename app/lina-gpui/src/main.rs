@@ -39,6 +39,8 @@ mod theme;
 mod role_suggester;
 // F1-2-2 (M6/M6-E): modal de criar/editar Agente — evolui o M2. Modelo gpui-free + render fina.
 mod agent_modal;
+// F1-1-5 (P6 §Atividade): dashboard vivo por terminal — estado/motor/custo~/atividade. gpui-free.
+mod dashboard;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -748,9 +750,16 @@ impl WorkspaceView {
         }
     }
 
-    fn modal_cycle_role(&mut self, cx: &mut Context<Self>) {
+    fn modal_open_gallery(&mut self, cx: &mut Context<Self>) {
         if let Some(m) = self.agent_modal.as_mut() {
-            m.cycle_role();
+            m.open_gallery();
+            cx.notify();
+        }
+    }
+
+    fn modal_gallery_pick(&mut self, idx: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.gallery_pick(idx);
             cx.notify();
         }
     }
@@ -1114,6 +1123,33 @@ impl WorkspaceView {
             let custody_pending = lock(&self.desk).front().is_some();
             let cmd_enter = ks.modifiers.platform && (ks.key == "enter" || ks.key == "return");
             if !(cmd_enter && custody_pending) {
+                // Seletor de papéis aberto ([Trocar]): ↑↓ navega, Enter escolhe, Esc fecha (só o
+                // seletor), digitação filtra — F1-2-3 + a11y do gate (teclado de ponta a ponta).
+                if self.agent_modal.as_ref().is_some_and(|m| m.gallery_open()) {
+                    if let Some(m) = self.agent_modal.as_mut() {
+                        match ks.key.as_str() {
+                            "escape" => m.gallery_close(),
+                            "up" => m.gallery_move(-1),
+                            "down" => m.gallery_move(1),
+                            "enter" | "return" => {
+                                m.gallery_pick(None);
+                            }
+                            "backspace" => m.gallery_backspace(),
+                            _ => {
+                                if !ks.modifiers.platform && !ks.modifiers.control {
+                                    if let Some(kc) = ks.key_char.as_ref().filter(|c| {
+                                        !c.is_empty() && !c.chars().any(char::is_control)
+                                    }) {
+                                        m.gallery_type(kc);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 match ks.key.as_str() {
                     "escape" => {
                         if self.agent_modal.as_mut().is_some_and(|m| m.escape()) {
