@@ -46,6 +46,39 @@ use thiserror::Error;
 /// RAM nem travar o scan (streaming por linha, nunca o arquivo inteiro).
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// **Fonte do custo/tokens de uma sessão** (F1-1-4 — ponto de merge do schema).
+/// `Jsonl` = derivado dos session-files (subcontado, `cost_estimated=true`); `Otel` =
+/// recebido pelo collector local (preferido quando presente — 13.5 item 9 corrige o
+/// subconto). O dashboard (F1-1-5) exibe esta origem (critério 1 da story).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CostSource {
+    /// Session-file JSONL (camada 3, F1-1-2) — sempre estimativa.
+    #[default]
+    Jsonl,
+    /// OTel local (camada opcional, F1-1-4) — fonte preferida de custo quando ligada.
+    Otel,
+}
+
+impl CostSource {
+    /// Rótulo estável (persistido na projeção e exibido).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CostSource::Jsonl => "jsonl",
+            CostSource::Otel => "otel",
+        }
+    }
+    /// Parse tolerante (projeção antiga/desconhecida → `Jsonl`, o default seguro).
+    #[must_use]
+    pub fn from_str_or_jsonl(s: &str) -> Self {
+        if s == "otel" {
+            CostSource::Otel
+        } else {
+            CostSource::Jsonl
+        }
+    }
+}
+
 /// Schema ÚNICO de sessão (13.5 item 4) — a projeção normalizada que o dashboard
 /// (F1-1-5) e a camada 3 de detecção consomem, independente do CLI de origem.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +109,66 @@ pub struct Session {
     pub subagents: Vec<String>,
     /// Ferramentas distintas usadas (`content[].type == "tool_use"` → `name`).
     pub tools: Vec<String>,
+    /// **F1-1-4:** fonte do custo/tokens — `Jsonl` por default; vira `Otel` quando o
+    /// collector local enriquece a sessão ([`Session::merge_otel_cost`]).
+    pub source: CostSource,
+}
+
+/// **F1-1-4 — custo/tokens normalizados vindos do OTel** para uma sessão. Tipo
+/// PRIMITIVO (o crate `lina-otel` o produz e chama [`Session::merge_otel_cost`]); fica
+/// AQUI para que o ponto de merge não dependa do receiver — sem ciclo de crates.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OtelCost {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_cache: u64,
+    pub tokens_thinking: u64,
+    /// Custo em USD **medido** (não estimado) quando o CLI o emite; `None` = só tokens
+    /// (custo derivado tokens×pricing fica a cargo do consumidor — 13.5 por-CLI honesto).
+    pub cost_usd: Option<f64>,
+    pub model: Option<String>,
+}
+
+/// **F1-1-4 — divergência relativa entre o custo JSONL e o OTel** (13.5 item 1: o
+/// sanity check que LOGA quando as fontes discordam acima de um threshold). `|otel −
+/// jsonl| / max(otel, ε)`; `0.0` quando ambos ~zero. Função pura.
+#[must_use]
+pub fn cost_divergence(jsonl_cost: f64, otel_cost: f64) -> f64 {
+    let denom = otel_cost.abs().max(1e-9);
+    (otel_cost - jsonl_cost).abs() / denom
+}
+
+/// Threshold default do sanity check (20%) — acima disso, o merge sinaliza divergência.
+pub const COST_DIVERGENCE_THRESHOLD: f64 = 0.20;
+
+impl Session {
+    /// **F1-1-4 — ponto de merge: OTel é a fonte PREFERIDA de custo** (13.5 item 9).
+    /// Devolve a sessão com tokens/custo do OTel, `source = Otel` e
+    /// `cost_estimated = false` quando o OTel trouxe custo medido. Os campos NÃO-custo
+    /// (cwd, tools, subagents, last_ts) permanecem do JSONL (o OTel não os carrega).
+    /// Retorna também a **divergência** de custo (para o sanity check / log do chamador).
+    #[must_use]
+    pub fn merge_otel_cost(&self, otel: &OtelCost) -> (Session, f64) {
+        let divergence = cost_divergence(self.cost_usd, otel.cost_usd.unwrap_or(self.cost_usd));
+        let merged = Session {
+            tokens_in: otel.tokens_in,
+            tokens_out: otel.tokens_out,
+            tokens_cache: otel.tokens_cache,
+            tokens_thinking: otel.tokens_thinking,
+            cost_usd: otel.cost_usd.unwrap_or(self.cost_usd),
+            // Custo OTEL medido → não é estimativa; só-tokens (custo derivado) segue estimado.
+            cost_estimated: otel.cost_usd.is_none(),
+            model: otel.model.clone().or_else(|| self.model.clone()),
+            source: CostSource::Otel,
+            cli: self.cli.clone(),
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            last_ts: self.last_ts.clone(),
+            subagents: self.subagents.clone(),
+            tools: self.tools.clone(),
+        };
+        (merged, divergence)
+    }
 }
 
 /// Agregado interno por sessão (sets para distintos; vira [`Session`] na leitura).
@@ -109,6 +202,7 @@ impl SessionAgg {
             last_ts: self.last_ts.clone(),
             subagents: self.subagents.iter().cloned().collect(),
             tools: self.tools.iter().cloned().collect(),
+            source: CostSource::Jsonl, // origem deste agregado é o session-file
         }
     }
 
@@ -538,6 +632,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_ts         TEXT,
     subagents       TEXT NOT NULL,
     tools           TEXT NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'jsonl',
     PRIMARY KEY (cli, session_id)
 );
 ";
@@ -581,8 +676,8 @@ impl SessionProjection {
         self.conn.execute(
             "INSERT OR REPLACE INTO sessions
              (cli, session_id, tokens_in, tokens_out, tokens_cache, tokens_thinking,
-              cost_usd, cost_estimated, model, cwd, last_ts, subagents, tools)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+              cost_usd, cost_estimated, model, cwd, last_ts, subagents, tools, source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 s.cli,
                 s.session_id,
@@ -597,6 +692,7 @@ impl SessionProjection {
                 s.last_ts,
                 subagents,
                 tools,
+                s.source.as_str(),
             ],
         )?;
         Ok(())
@@ -609,7 +705,7 @@ impl SessionProjection {
             .conn
             .query_row(
                 "SELECT tokens_in, tokens_out, tokens_cache, tokens_thinking, cost_usd,
-                        cost_estimated, model, cwd, last_ts, subagents, tools
+                        cost_estimated, model, cwd, last_ts, subagents, tools, source
                  FROM sessions WHERE cli = ?1 AND session_id = ?2",
                 rusqlite::params![cli, session_id],
                 |r| {
@@ -625,11 +721,13 @@ impl SessionProjection {
                         r.get::<_, Option<String>>(8)?,
                         r.get::<_, String>(9)?,
                         r.get::<_, String>(10)?,
+                        r.get::<_, String>(11)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((t_in, t_out, t_cache, t_think, cost, est, model, cwd, last_ts, sub, tools)) = row
+        let Some((t_in, t_out, t_cache, t_think, cost, est, model, cwd, last_ts, sub, tools, src)) =
+            row
         else {
             return Ok(None);
         };
@@ -653,6 +751,7 @@ impl SessionProjection {
             last_ts,
             subagents: parse_vec(&sub)?,
             tools: parse_vec(&tools)?,
+            source: CostSource::from_str_or_jsonl(&src),
         }))
     }
 

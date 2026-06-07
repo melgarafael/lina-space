@@ -1,0 +1,31 @@
+[package]
+name = "lina-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# F1-1-4 — fonte OTel OPCIONAL da observabilidade de sessões: receiver OTLP/HTTP
+# LOOPBACK-ONLY (localhost:4318) que recebe métricas/eventos de telemetria dos CLIs
+# (Claude Code 1ª classe) e os normaliza no MESMO schema de sessão da F1-1-2, corrigindo
+# o subconto de tokens do JSONL quando disponível. OPT-IN (invariante #2: nada sai da
+# máquina; desligado por default) e por CliProfile (invariante #3 — capability `otel`).
+# Degradação: sem OTel = o JSONL da F1-1-2 continua sozinho, zero quebra.
+
+[dependencies]
+lina-cli-profiles = { path = "../lina-cli-profiles" }
+# O ponto de merge do schema vive no session-watch (sem ciclo: otel → session-watch).
+lina-session-watch = { path = "../lina-session-watch" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror.workspace = true
+tracing.workspace = true
+# Mesma família do lina-webhooks (W5-4): axum loopback + tokio. Nada de cliente HTTP.
+axum = "0.7"
+tokio = { version = "1", features = ["rt", "net", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+# Round-trip determinístico do router axum no gate (sem TCP frágil).
+tower = { version = "0.5", features = ["util"] }
+http = "1"
