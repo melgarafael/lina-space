@@ -786,6 +786,9 @@ mod tests {
             parent_id: None,
             ts,
             trusted: false,
+            // Aditivos do seam F1-1-6 — a timeline não os consome (ainda).
+            message: None,
+            tool_input: None,
         };
         // Sem hook → sem opinião.
         assert_eq!(tl.activity("Ajudante Dev", 1_000), None);

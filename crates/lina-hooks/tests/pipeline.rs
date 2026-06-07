@@ -77,6 +77,13 @@ async fn pre_and_post_tooluse_normalize_for_timeline() {
     assert_eq!(pre.node_id, "QA");
     assert_eq!(pre.kind, HookKind::PreToolUse);
     assert_eq!(pre.tool_name.as_deref(), Some("Bash"));
+    // Seam F1-1-6 (aditivo): o argumento LITERAL da tool atravessa o pipeline —
+    // payload sem os campos novos segue parseando (None; provado no unit do crate).
+    assert_eq!(
+        pre.tool_input.as_deref(),
+        Some(r#"{"command":"cargo test"}"#),
+        "tool_input compacto lossless p/ o detail do toast"
+    );
     assert!(pre.ts > 0, "ts de chegada para a duração da timeline");
     assert!(
         !pre.trusted,

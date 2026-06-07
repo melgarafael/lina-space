@@ -109,6 +109,16 @@ pub struct HookEvent {
     pub ts: u64,
     /// SEMPRE `false` por contrato: hook é observabilidade; autoridade vem do guard/router.
     pub trusted: bool,
+    /// **ADITIVO (seam F1-1-6):** campo `message` do payload (ex.: o texto da
+    /// `Notification` — "Claude needs your permission to use Bash"). `None` quando o
+    /// payload não o traz — consumidor antigo nunca quebra. Telemetria, não-decisório.
+    pub message: Option<String>,
+    /// **ADITIVO (seam F1-1-6):** `tool_input` do payload, como o argumento LITERAL da
+    /// tool — é o que deixa o `detail` do toast dizer "git push origin/master" em vez
+    /// de só "Bash". Objeto/array vira **JSON compacto lossless** (string preserva o
+    /// `Eq` do contrato; o consumidor re-parseia se quiser estruturado); string passa
+    /// como está. `None` quando ausente. Telemetria, não-decisório.
+    pub tool_input: Option<String>,
 }
 
 /// Normalização PURA payload→evento (testável sem rede). Lê só campos descritivos;
@@ -121,6 +131,15 @@ pub fn normalize_payload(
     now_ms: u64,
 ) -> HookEvent {
     let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    // `tool_input` real do Claude Code é um OBJETO ({"command": "git push …"}) —
+    // serializa compacto (lossless); se já vier string, passa sem aspas extras.
+    let tool_input = payload
+        .get("tool_input")
+        .filter(|v| !v.is_null())
+        .map(|v| match v.as_str() {
+            Some(raw) => raw.to_string(),
+            None => v.to_string(),
+        });
     HookEvent {
         node_id: node_id.to_string(),
         kind,
@@ -129,6 +148,8 @@ pub fn normalize_payload(
         parent_id: s("parent_id").or_else(|| s("parent_session_id")),
         ts: now_ms,
         trusted: false,
+        message: s("message"),
+        tool_input,
     }
 }
 
@@ -320,5 +341,64 @@ impl SubagentTree {
             .get(node_id)
             .map(|v| v.iter().map(String::as_str).collect())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seam da F1-1-6 (campos ADITIVOS): payload COM `message`/`tool_input` os carrega
+    /// no evento — é o que permite ao `detail` do toast dizer "git push origin/master"
+    /// literal em vez de só "Bash".
+    #[test]
+    fn payload_with_message_and_tool_input_fills_additive_fields() {
+        let payload: serde_json::Value = serde_json::json!({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push origin master"},
+            "message": "Claude needs your permission to use Bash",
+        });
+        let ev = normalize_payload("QA", HookKind::Notification, &payload, 1_000);
+        assert_eq!(
+            ev.message.as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+        // tool_input objeto → JSON COMPACTO lossless (o consumidor re-parseia se quiser
+        // estruturado; string mantém o `Eq` do contrato).
+        let raw = ev.tool_input.as_deref().expect("tool_input presente");
+        let round: serde_json::Value = serde_json::from_str(raw).expect("JSON válido");
+        assert_eq!(round["command"], "git push origin master");
+        assert!(!ev.trusted, "aditivo não muda a doutrina: telemetria");
+    }
+
+    /// Aditivo de verdade: payload ANTIGO/sem os campos parseia com `None` — nenhum
+    /// consumidor existente quebra (contrato de evento: campos novos têm default).
+    #[test]
+    fn payload_without_new_fields_parses_with_none() {
+        let payload: serde_json::Value = serde_json::json!({
+            "session_id": "sess-abc",
+            "tool_name": "Bash",
+        });
+        let ev = normalize_payload("QA", HookKind::PreToolUse, &payload, 1_000);
+        assert_eq!(ev.message, None);
+        assert_eq!(ev.tool_input, None);
+        assert_eq!(
+            ev.tool_name.as_deref(),
+            Some("Bash"),
+            "campos antigos intactos"
+        );
+
+        // Payload ilegível (Null — caminho do handler p/ body inválido) idem.
+        let ev = normalize_payload("QA", HookKind::Stop, &serde_json::Value::Null, 1_000);
+        assert_eq!((ev.message, ev.tool_input), (None, None));
+    }
+
+    /// `tool_input` que JÁ é string no payload passa como está (sem aspas extras).
+    #[test]
+    fn string_tool_input_passes_through_unquoted() {
+        let payload = serde_json::json!({"tool_input": "ls -la"});
+        let ev = normalize_payload("QA", HookKind::PreToolUse, &payload, 1_000);
+        assert_eq!(ev.tool_input.as_deref(), Some("ls -la"));
     }
 }
