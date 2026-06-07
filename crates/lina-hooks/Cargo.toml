@@ -1,0 +1,26 @@
+[package]
+name = "lina-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# F1-1-3 — pipeline de hooks de CLI em tempo real: listener HTTP LOOPBACK-ONLY que
+# recebe os POSTs dos hooks gerados no spawn (Claude Code 1ª classe, handler HTTP do
+# settings.json) e os normaliza num contrato único (`HookEvent`) para o core, com
+# degradação graciosa por capability (`capabilities.hooks` do CliProfile).
+
+[dependencies]
+lina-cli-profiles = { path = "../lina-cli-profiles" }
+# Mesma família do lina-webhooks (W5-4): axum loopback + tokio.
+axum = "0.7"
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror.workspace = true
+tracing.workspace = true
+# Token de atribuição por nó (opaco, nasce no spawn — nunca vem de campo do payload).
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }

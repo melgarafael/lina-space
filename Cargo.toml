@@ -11,6 +11,8 @@ members = [
     "crates/lina-role-discovery",
     "crates/lina-bootstrap",
     "crates/lina-webhooks",
+    "crates/lina-hooks",
+    "crates/lina-otel",
 ]
 # Spikes da Onda 1 (gpui vs Slint): crates EXPERIMENTAIS fora do workspace —
 # um spike que nao compila nao pode derrubar o build do core.

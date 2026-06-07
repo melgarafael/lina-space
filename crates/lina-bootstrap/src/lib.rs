@@ -397,6 +397,23 @@ impl Bootstrapper {
         input: &BootstrapInput,
         lina_bin: &str,
     ) -> std::io::Result<()> {
+        self.write_terminal_files_with_hooks(dir, input, lina_bin, None)
+    }
+
+    /// F1-1-3: como [`Self::write_terminal_files`], instalando TAMBÉM os hooks de
+    /// observabilidade no settings quando o app fornece a fiação (porta do listener +
+    /// token do nó). `None` = comportamento histórico byte-idêntico (CLI sem hooks /
+    /// listener ausente — degradação por omissão, nada quebra).
+    ///
+    /// # Errors
+    /// Propaga erros de I/O (criar dirs / escrever arquivos).
+    pub fn write_terminal_files_with_hooks(
+        &self,
+        dir: &Path,
+        input: &BootstrapInput,
+        lina_bin: &str,
+        wiring: Option<&HookWiring>,
+    ) -> std::io::Result<()> {
         let lina = dir.join(".lina");
         let claude = dir.join(".claude");
         std::fs::create_dir_all(&lina)?;
@@ -406,7 +423,10 @@ impl Bootstrapper {
         std::fs::write(dir.join("GEMINI.md"), self.gemini_doctrine(input))?;
         let json = serde_json::to_string_pretty(input).unwrap_or_else(|_| String::from("{}"));
         std::fs::write(lina.join("bootstrap.json"), json)?;
-        std::fs::write(claude.join("settings.json"), hook_settings_json(lina_bin))?;
+        std::fs::write(
+            claude.join("settings.json"),
+            hook_settings_json_with_observability(lina_bin, wiring),
+        )?;
         Ok(())
     }
 }
@@ -422,10 +442,49 @@ impl Bootstrapper {
 /// `--pretooluse` já devolve `allow` para qualquer tool não-Bash, se o matcher for alargado depois.
 #[must_use]
 pub fn hook_settings_json(lina_bin: &str) -> String {
+    hook_settings_json_with_observability(lina_bin, None)
+}
+
+/// **F1-1-3 — fiação dos hooks de observabilidade** no spawn de um terminal: a porta do
+/// listener loopback do app (`lina-hooks::HookListener`) + o TOKEN opaco de atribuição
+/// deste nó (`register_node`). Primitivos de propósito — o bootstrap não depende do
+/// crate do pipeline; quem liga as pontas é o app.
+#[derive(Debug, Clone)]
+pub struct HookWiring {
+    /// Porta efêmera do listener (sempre `127.0.0.1` — inv#2; o host não é configurável).
+    pub port: u16,
+    /// Token opaco deste nó — a ÚNICA fonte de atribuição do POST (nunca o payload).
+    pub token: String,
+}
+
+/// Os kinds de observabilidade instalados no settings — ESPELHO de
+/// `lina_hooks::HookKind::ALL` (duplicado de propósito: o bootstrap não depende do
+/// pipeline; mudou lá, mude aqui — o teste de settings denuncia divergência de URL).
+const OBSERVABILITY_HOOK_KINDS: [&str; 6] = [
+    "PreToolUse",
+    "PostToolUse",
+    "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+];
+
+/// Como [`hook_settings_json`], com os hooks de OBSERVABILIDADE opcionais (F1-1-3):
+/// `wiring = Some` adiciona a cada kind um handler **HTTP assíncrono** (13.10 achado 1:
+/// handler HTTP do Claude Code, fev/2026; `async` roda em background sem bloquear o
+/// turno do agente) → `http://127.0.0.1:<porta>/hook/<token>/<kind>`. Os handlers
+/// `command` históricos (SessionStart turno-0 W3-2 + PreToolUse gate W3-6) permanecem
+/// SEMPRE — observabilidade nunca substitui o gate. `wiring = None` (CLI sem hooks /
+/// app sem listener) → settings byte-idêntico ao histórico (degradação por omissão).
+#[must_use]
+pub fn hook_settings_json_with_observability(
+    lina_bin: &str,
+    wiring: Option<&HookWiring>,
+) -> String {
     let quoted = format!("'{}'", lina_bin.replace('\'', "'\\''"));
     let session_cmd = format!("{quoted} whoami --bootstrap");
     let pretooluse_cmd = format!("{quoted} guard --pretooluse");
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "hooks": {
             "SessionStart": [
                 { "hooks": [ { "type": "command", "command": session_cmd } ] }
@@ -435,6 +494,23 @@ pub fn hook_settings_json(lina_bin: &str) -> String {
             ]
         }
     });
+    if let Some(w) = wiring {
+        if let Some(hooks) = v["hooks"].as_object_mut() {
+            for kind in OBSERVABILITY_HOOK_KINDS {
+                let url = format!("http://127.0.0.1:{}/hook/{}/{kind}", w.port, w.token);
+                let entry = serde_json::json!({
+                    "hooks": [ { "type": "http", "url": url, "async": true } ]
+                });
+                match hooks.get_mut(kind).and_then(|k| k.as_array_mut()) {
+                    // Kind já existe (PreToolUse do gate): ACRESCENTA a entry http.
+                    Some(arr) => arr.push(entry),
+                    None => {
+                        hooks.insert(kind.to_string(), serde_json::json!([entry]));
+                    }
+                }
+            }
+        }
+    }
     serde_json::to_string_pretty(&v).unwrap_or_else(|_| String::from("{}"))
 }
 
@@ -630,6 +706,76 @@ mod tests {
             .expect("ctx");
         assert!(ctx.contains("@Arquiteto"));
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    }
+
+    // ── F1-1-3: hooks de observabilidade (handlers HTTP → listener do lina-hooks) ──
+
+    /// Sem fiação (porta/token ausentes — app sem listener, CLI sem hooks, testes
+    /// antigos): o settings é BYTE-IDÊNTICO ao histórico — degradação por omissão.
+    #[test]
+    fn settings_without_wiring_is_unchanged() {
+        let bin = "/usr/local/bin/lina";
+        assert_eq!(
+            hook_settings_json_with_observability(bin, None),
+            hook_settings_json(bin),
+            "sem wiring nada muda (compat com o gerado do W3-2/W3-6)"
+        );
+    }
+
+    /// Com fiação: cada um dos 6 kinds de observabilidade ganha um handler **HTTP
+    /// assíncrono** (13.10: handler HTTP do Claude Code, fev/2026; async não bloqueia o
+    /// turno) apontando para `http://127.0.0.1:<porta>/hook/<token>/<kind>` — e os
+    /// handlers `command` históricos (SessionStart turno-0 + PreToolUse gate W3-6)
+    /// PERMANECEM intactos (observabilidade nunca substitui o gate).
+    #[test]
+    fn settings_with_wiring_adds_http_observability_hooks() {
+        let wiring = HookWiring {
+            port: 45678,
+            token: "tok123abc".into(),
+        };
+        let j = hook_settings_json_with_observability("/usr/local/bin/lina", Some(&wiring));
+        let v: serde_json::Value = serde_json::from_str(&j).expect("json válido");
+
+        for kind in [
+            "PreToolUse",
+            "PostToolUse",
+            "Notification",
+            "SubagentStart",
+            "SubagentStop",
+            "Stop",
+        ] {
+            let entries = v["hooks"][kind].as_array().unwrap_or_else(|| {
+                panic!("kind {kind} deve existir no settings: {j}");
+            });
+            let has_http = entries.iter().any(|e| {
+                e["hooks"].as_array().is_some_and(|hs| {
+                    hs.iter().any(|h| {
+                        h["type"] == "http"
+                            && h["url"].as_str().is_some_and(|u| {
+                                u == format!("http://127.0.0.1:45678/hook/tok123abc/{kind}")
+                            })
+                            && h["async"] == true
+                    })
+                })
+            });
+            assert!(has_http, "{kind} deve ter handler HTTP async: {j}");
+        }
+
+        // Os handlers históricos seguem lá: o gate é o guard, não o hook HTTP.
+        let pre = v["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
+        let still_gated = pre.iter().any(|e| {
+            e["matcher"] == "Bash"
+                && e["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("guard --pretooluse"))
+        });
+        assert!(still_gated, "o gate command do W3-6 permanece: {j}");
+        assert!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("whoami --bootstrap")),
+            "SessionStart turno-0 permanece"
+        );
     }
 
     /// O comando do hook é **single-quoted** (espaços ok) e metacaracteres ficam literais.

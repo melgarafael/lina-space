@@ -1090,10 +1090,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "lina-hooks"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "lina-cli-profiles",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "lina-host"
 version = "0.0.1"
 dependencies = [
  "uuid",
+]
+
+[[package]]
+name = "lina-otel"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "http",
+ "lina-cli-profiles",
+ "lina-session-watch",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
