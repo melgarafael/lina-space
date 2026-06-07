@@ -79,6 +79,25 @@ pub enum AwaitReason {
     Deadlock,
 }
 
+/// F1-1-6: QUAL camada detectou o pedido de permissão (campo `evidence` do
+/// [`DomainEvent::PermissionAsked`]). Serializa em `snake_case` (`"hook"`/`"grid"`).
+/// `Hook` = detecção primária (Notification correlacionada ao `PreToolUse` pendente);
+/// `Grid` = fallback por regex sobre o grid VT (heurística — FP medido, nunca "zero").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionEvidence {
+    Hook,
+    Grid,
+}
+
+/// `Grid` como default CONSERVADOR (replay de payload sem o campo lê a evidência de
+/// MENOR confiança — nunca promove um registro degradado a detecção primária).
+impl Default for PermissionEvidence {
+    fn default() -> Self {
+        Self::Grid
+    }
+}
+
 /// W4-4: durabilidade do último `append`, para a UI projetar **"salvando…" ↔ "Tudo salvo ✓"**
 /// (rodapé, invariante #6 "estado sempre salvo e visível"). O core emite a transição via callback
 /// (ver [`EventStore::append_with_flush`]); o shell a mapeia para seu evento de UI **sem o core
@@ -396,6 +415,57 @@ pub enum DomainEvent {
         confidence: f32,
         evidence: String,
     },
+    /// F1-1-6 (consumidores F1-1-7/8 na próxima rodada): um terminal está BLOQUEADO
+    /// aguardando aprovação humana — pedido de permissão detectado pelo
+    /// `permission_detect::PermissionDetector` (hook `Notification` correlacionado ao
+    /// `PreToolUse` pendente, ou fallback por regex no grid — ver `evidence`).
+    /// `stable_id` é a chave de IDEMPOTÊNCIA derivada de `(session, tool_call, ts)`
+    /// (padrão OpenCode, 13.13 achado 4): consumidores deduplicam por ela — dois
+    /// pedidos seguidos do MESMO nó têm `stable_id` distintos (o `ts` difere), e o
+    /// replay nunca duplica (o log guarda fatos; a detecção não roda no replay).
+    /// META — sem efeito na projeção do canvas; a fila de atenção (F1-1-7) reconstrói
+    /// as pendências varrendo o log (padrão `CostLedger`). Campos com `serde(default)`:
+    /// payload de shape antigo/parcial replaya com defaults, nunca quebra (ADR 0001 §2).
+    PermissionAsked {
+        /// Nó atribuído pelo TOKEN de spawn (hook) ou pelo roster (grid) — `String`
+        /// espelhando o shape de origem do pipeline de hooks (precedente: `CliDetected`).
+        #[serde(default)]
+        node_id: String,
+        /// Tool correlacionada (`"Bash"`, …) quando o `PreToolUse` precedente existir.
+        #[serde(default)]
+        tool: Option<String>,
+        /// Resumo legível do pedido: o COMANDO (`"git push origin/master"`) quando a
+        /// origem o expõe, ou a linha do prompt no grid (fallback). É o que permite ao
+        /// toast (F1-1-7) dizer O QUE pede aprovação, não só "precisa de aprovação".
+        #[serde(default)]
+        detail: Option<String>,
+        /// Camada que detectou (`hook`/`grid`) — confiabilidade NÃO-uniforme por design.
+        #[serde(default)]
+        evidence: PermissionEvidence,
+        #[serde(default)]
+        stable_id: String,
+    },
+    /// F1-2-3 parte 2 (costura adiantada nesta rodada; consumidor é o modal de papéis,
+    /// na próxima): um papel CUSTOM do usuário foi salvo (modelo duplicar+modificar da
+    /// biblioteca) — persiste como evento e REAPARECE nos próximos modais. Heurística
+    /// local + templates, ZERO LLM embutido (invariante #1). `ts` = instante do salvar
+    /// em ms (relógio do usuário, distinto do `ts` de persistência do `EventRecord`).
+    /// META — sem efeito na projeção do canvas; o modal reconstrói a biblioteca custom
+    /// varrendo o log (último `name` vence — padrão `CostLedger`). `serde(default)` em
+    /// todos os campos: replay de payload antigo/parcial nunca quebra.
+    RoleTemplateSaved {
+        /// Nome do papel em linguagem de leigo ("Revisora", "Designer de Landing").
+        #[serde(default)]
+        name: String,
+        /// Descrição curta leiga (a doutrina técnica fica atrás de "ver detalhes").
+        #[serde(default)]
+        description: String,
+        /// Doutrina/role completa (o texto técnico injetado no bootstrap turno-0).
+        #[serde(default)]
+        doctrine: String,
+        #[serde(default)]
+        ts: u64,
+    },
 }
 
 impl DomainEvent {
@@ -446,6 +516,8 @@ impl DomainEvent {
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
             DomainEvent::NodeStalled { .. } => "NodeStalled",
             DomainEvent::CliDetected { .. } => "CliDetected",
+            DomainEvent::PermissionAsked { .. } => "PermissionAsked",
+            DomainEvent::RoleTemplateSaved { .. } => "RoleTemplateSaved",
         }
     }
 
@@ -695,6 +767,13 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // F1-1-1: detecção de CLI é META (livro-razão da descoberta); o consumidor (F1-1)
         // reconstrói o que precisar varrendo o log — sem efeito na projeção do canvas.
         | DomainEvent::CliDetected { .. }
+        // F1-1-6: pedido de permissão é META (livro-razão da atenção pendente); a fila
+        // unificada (F1-1-7) reconstrói as pendências varrendo o log, com dedupe por
+        // `stable_id` — sem efeito na projeção do canvas.
+        | DomainEvent::PermissionAsked { .. }
+        // F1-2-3 (parte 2): papel custom salvo é META (biblioteca de papéis); o modal
+        // reconstrói varrendo o log (último `name` vence) — sem efeito na projeção.
+        | DomainEvent::RoleTemplateSaved { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
@@ -1042,7 +1121,7 @@ fn now_nanos() -> u128 {
         .unwrap_or(0)
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for &b in bytes {
         hash ^= u64::from(b);
@@ -1822,5 +1901,179 @@ mod tests {
             after.nodes.get(&node),
             "CliDetected é meta — não muda a projeção do nó"
         );
+    }
+
+    // ─────────────────────────── F1-1-6 · PermissionAsked ───────────────────────────
+
+    /// F1-1-6 (critério 4): dois pedidos seguidos do mesmo nó persistem com `stable_id`
+    /// DISTINTOS; o evento é META (projeção intacta) e o replay repetido NÃO duplica —
+    /// mesmo `event_count`, mesmo fingerprint (o log guarda fatos, a detecção não roda
+    /// no replay).
+    #[test]
+    #[serial]
+    fn permission_asked_two_asks_distinct_stable_ids_replay_no_dup() {
+        let tmp = TempDir::new("perm-asked");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let node = Uuid::now_v7();
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+            })
+            .expect("add");
+        let before = store.project().expect("project 1");
+
+        store
+            .append(&DomainEvent::PermissionAsked {
+                node_id: node.to_string(),
+                tool: Some("Bash".into()),
+                detail: Some("git push origin/master".into()),
+                evidence: PermissionEvidence::Hook,
+                stable_id: "pa-1".into(),
+            })
+            .expect("ask 1");
+        store
+            .append(&DomainEvent::PermissionAsked {
+                node_id: node.to_string(),
+                tool: None,
+                detail: Some("Continue? (y/n)".into()),
+                evidence: PermissionEvidence::Grid,
+                stable_id: "pa-2".into(),
+            })
+            .expect("ask 2");
+
+        // Round-trip dos campos no log (incl. snake_case do evidence).
+        let recs: Vec<EventRecord> = store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == "PermissionAsked")
+            .collect();
+        assert_eq!(recs.len(), 2, "2 pedidos = 2 eventos no log");
+        assert_eq!(recs[0].payload["evidence"], "hook");
+        assert_eq!(recs[0].payload["tool"], "Bash");
+        assert_eq!(recs[0].payload["detail"], "git push origin/master");
+        assert_eq!(recs[1].payload["evidence"], "grid");
+        assert_ne!(
+            recs[0].payload["stable_id"], recs[1].payload["stable_id"],
+            "pedidos seguidos do mesmo nó → stable_id distintos"
+        );
+
+        // META: projeção do canvas intacta; replay 2× = mesmo estado e mesma contagem.
+        let after = store.project().expect("project 2");
+        assert_eq!(before.fingerprint(), after.fingerprint());
+        let count_1 = store.event_count().expect("count 1");
+        let fp_1 = store.project().expect("replay 1").fingerprint();
+        let fp_2 = store.project().expect("replay 2").fingerprint();
+        assert_eq!(fp_1, fp_2, "replay não duplica nem altera nada");
+        assert_eq!(store.event_count().expect("count 2"), count_1);
+    }
+
+    /// F1-1-6 (aditividade): payload PARCIAL de `PermissionAsked` (sem tool/detail/
+    /// evidence) replaya com defaults — `evidence` cai no conservador `grid` — e o
+    /// replay do log inteiro segue íntegro.
+    #[test]
+    #[serial]
+    fn permission_asked_partial_payload_replays_with_defaults() {
+        let tmp = TempDir::new("perm-partial");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .insert_raw(
+                "PermissionAsked",
+                1,
+                serde_json::json!({
+                    "event": "PermissionAsked",
+                    "node_id": "n1",
+                    "stable_id": "pa-x"
+                }),
+            )
+            .expect("raw parcial");
+        // Replay não erra; o registro desserializa com defaults.
+        store.project().expect("replay com payload parcial");
+        let rec = store.events().expect("events").pop().expect("registro");
+        let ev = DomainEvent::from_record(&rec.kind, rec.version, rec.payload)
+            .expect("desserializa com serde(default)");
+        match ev {
+            DomainEvent::PermissionAsked {
+                tool,
+                detail,
+                evidence,
+                ..
+            } => {
+                assert_eq!(tool, None);
+                assert_eq!(detail, None);
+                assert_eq!(
+                    evidence,
+                    PermissionEvidence::Grid,
+                    "evidência ausente lê o default conservador (grid)"
+                );
+            }
+            other => panic!("kind errado: {other:?}"),
+        }
+    }
+
+    // ─────────────────────── F1-2-3 (parte 2) · RoleTemplateSaved ───────────────────────
+
+    /// F1-2-3: papel custom persiste como evento (round-trip dos 4 campos), é META para
+    /// a projeção do canvas, sobrevive a replay, e payload PARCIAL (só `name`) replaya
+    /// com defaults — log antigo nunca quebra.
+    #[test]
+    #[serial]
+    fn role_template_saved_round_trips_meta_and_partial_payload_defaults() {
+        let tmp = TempDir::new("role-template");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let before = store.project().expect("project 1").fingerprint();
+
+        store
+            .append(&DomainEvent::RoleTemplateSaved {
+                name: "Revisora".into(),
+                description: "Revisa textos e aponta melhorias".into(),
+                doctrine: "Você é a revisora do time…".into(),
+                ts: 1_700_000_000_000,
+            })
+            .expect("save template");
+
+        let rec = store.events().expect("events").pop().expect("registro");
+        assert_eq!(rec.kind, "RoleTemplateSaved");
+        assert_eq!(rec.payload["name"], "Revisora");
+        assert_eq!(
+            rec.payload["description"],
+            "Revisa textos e aponta melhorias"
+        );
+        assert_eq!(rec.payload["doctrine"], "Você é a revisora do time…");
+        assert_eq!(rec.payload["ts"], 1_700_000_000_000_u64);
+
+        // META + replay determinístico.
+        let after = store.project().expect("project 2");
+        assert_eq!(after.fingerprint(), before, "RoleTemplateSaved é META");
+
+        // Payload parcial (só name) → defaults, replay íntegro.
+        store
+            .insert_raw(
+                "RoleTemplateSaved",
+                1,
+                serde_json::json!({ "event": "RoleTemplateSaved", "name": "Faz-tudo" }),
+            )
+            .expect("raw parcial");
+        store.project().expect("replay com payload parcial");
+        let rec = store.events().expect("events").pop().expect("registro");
+        let ev = DomainEvent::from_record(&rec.kind, rec.version, rec.payload)
+            .expect("desserializa com serde(default)");
+        match ev {
+            DomainEvent::RoleTemplateSaved {
+                name,
+                description,
+                doctrine,
+                ts,
+            } => {
+                assert_eq!(name, "Faz-tudo");
+                assert_eq!(description, "");
+                assert_eq!(doctrine, "");
+                assert_eq!(ts, 0);
+            }
+            other => panic!("kind errado: {other:?}"),
+        }
     }
 }

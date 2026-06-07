@@ -1072,6 +1072,7 @@ dependencies = [
  "anyhow",
  "libc",
  "lina-cli-profiles",
+ "lina-hooks",
  "lina-host",
  "lina-pty",
  "lina-secrets",

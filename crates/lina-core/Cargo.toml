@@ -37,3 +37,9 @@ libc = "0.2"
 
 [dev-dependencies]
 serial_test = "3.4.0"
+# F1-1-6: o probe de latência REAL (examples/permission_probe.rs) consome o pipeline
+# de hooks de verdade (HookListener do F1-1-3) + runtime tokio completo. DEV-only —
+# nada disso entra no grafo de dependências da lib (sem ciclo: lina-hooks não depende
+# de lina-core).
+lina-hooks = { path = "../lina-hooks" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }

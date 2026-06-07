@@ -34,7 +34,7 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 mod events;
 pub use events::{
     apply, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, FlushState,
-    ProjectedNode, ProjectedState, StoreError,
+    PermissionEvidence, ProjectedNode, ProjectedState, StoreError,
 };
 
 /// W4-1: CliDiscovery — varredura do `PATH` por CLIs de IA (substrato do check-up de onboarding).
@@ -85,6 +85,11 @@ pub use broker::{
 // F1-0-3: state-machine de lifecycle + heartbeat com progresso (ADR 0019).
 pub mod lifecycle;
 pub use lifecycle::{LifecycleEngine, LifecycleError, SampleOutcome};
+
+/// F1-1-6: detecção de permissão bloqueante multi-camada (hook Notification correlacionado
+/// ao `PreToolUse` pendente + fallback por regex no grid via `VtBackend`, FP medido).
+pub mod permission_detect;
+pub use permission_detect::{DetectionTelemetry, PermissionAsk, PermissionDetector};
 
 pub mod bench;
 
