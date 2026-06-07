@@ -445,6 +445,13 @@ struct WorkspaceView {
     a11y_live: a11y::LiveRegion,
     /// W4-2 · M1: paleta de comandos (Cmd-K). Fechada por padrão.
     palette: palette::PaletteState,
+    /// F1-1-5 (P6/fluxo c): painel "Atividade e custos" aberto? (toggle pela paleta).
+    dashboard_open: bool,
+    /// F1-1-5: fios vivos do dashboard (timeline de hooks + sessões + identidades).
+    dash: dashboard::DashWiring,
+    /// F1-1-5 (sonda `[DASH]`): último `ts` de hook reportado por nó — loga a latência
+    /// evento→card 1× por evento (na MUDANÇA), sem spammar o stderr a 60fps.
+    dash_lat_reported: BTreeMap<String, u64>,
     /// W4-2 · M3/M4: `Some((kind, buffer))` enquanto o humano DIGITA o título da nota/pasta a criar
     /// (disparado pela paleta). Enter cria + foca; Esc cancela. `None` = fora do modo criação.
     creating: Option<(creators::CreatorKind, String)>,
@@ -471,6 +478,7 @@ struct WorkspaceView {
 
 impl WorkspaceView {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // construtor único do root; os fios entram aqui.
     fn new(
         nodes: NodeManager,
         input: Arc<dyn InputSink>,
@@ -478,6 +486,7 @@ impl WorkspaceView {
         focused: NodeId,
         desk: Desk,
         brake: wiring::Brake,
+        dash: dashboard::DashWiring,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -491,6 +500,26 @@ impl WorkspaceView {
         // nascimento por poll BARATO do model (sem render) e força `cx.notify()` a ~60fps até
         // `Pulse::progress()` expirar (~1100ms). Cobre os DOIS caminhos (lina-ask e Bus) sem tocar a
         // ponte gpui-free e sem quebrar o caminho do botão A2A.
+        // F1-1-5 (wiring): heartbeat do painel "Atividade e custos" — timeline/sessões
+        // mudam em threads gpui-free (não acordam o event loop); enquanto o painel está
+        // aberto, ~2 ticks/s marcam dirty (lição: animação precisa de dirty). Barato
+        // quando fechado (1 check booleano a cada 500ms).
+        cx.spawn(async move |this, cx| loop {
+            if this
+                .update(cx, |view, cx| {
+                    if view.dashboard_open {
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(alive) = this.update(cx, |view, cx| {
@@ -532,6 +561,14 @@ impl WorkspaceView {
             reduce_motion: false,
             a11y_live: a11y::LiveRegion::default(),
             palette: palette::PaletteState::default(),
+            // LINA_DASH=1 abre o painel no BOOT (validação por dados/roteiro do fundador,
+            // mesmo idioma de LINA_DEMO). Produção: fechado; abre pela paleta (Cmd+K).
+            dashboard_open: matches!(
+                std::env::var("LINA_DASH").ok().as_deref().map(str::trim),
+                Some("1")
+            ),
+            dash,
+            dash_lat_reported: BTreeMap::new(),
             creating: None,
             diag_last_frame: String::new(),
             diag_last_pulse: String::new(),
@@ -620,7 +657,159 @@ impl WorkspaceView {
             // M3/M4: abre o modo CRIAÇÃO (digita o título → Enter cria + foca; ver `handle_key`).
             A::NewNote => self.creating = Some((creators::CreatorKind::Note, String::new())),
             A::NewFolder => self.creating = Some((creators::CreatorKind::Folder, String::new())),
+            A::ToggleDashboard => self.toggle_dashboard(cx),
         }
+    }
+
+    /// F1-1-5 (wiring): abre/fecha o painel "Atividade e custos" (P6/fluxo c). Enquanto
+    /// aberto, um loop de tick (~500ms) marca dirty — timeline/sessões mudam em threads
+    /// gpui-free e NÃO acordam o event loop (lição: animação precisa de dirty).
+    fn toggle_dashboard(&mut self, cx: &mut Context<Self>) {
+        self.dashboard_open = !self.dashboard_open;
+        cx.notify(); // o heartbeat do painel (new) cuida do refresh enquanto aberto
+    }
+
+    /// F1-1-5 (P6/fluxo c — wiring): o painel "Atividade e custos". Hierarquia do
+    /// wireframe: 1) estado (palavra+cor) → 2) custo (dinheiro, `~estimado` obrigatório)
+    /// → 3) atividade. Tokens 100% do `theme` (zero cor hardcoded); `ElementId` único
+    /// por linha (lição AccessKit); sonda `[DASH]` loga a latência evento→card 1× por
+    /// evento — o Maestro valida por DADOS, o fundador pelo olho.
+    fn render_dashboard(&mut self, th: &theme::Theme) -> impl IntoElement {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let today = dashboard::utc_day_prefix(now_ms);
+        let sessions = lock(&self.dash.sessions).clone();
+        let total = dashboard::workspace_cost_today(&sessions, &self.dash.ws_root, &today);
+        let engine = dashboard::EngineBadge::from_cli(Some(&self.dash.cli_id));
+
+        // Linhas por terminal: nome + estado canônico + atividade da timeline.
+        struct Row {
+            name: String,
+            state: dashboard::UiState,
+            activity: String,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        {
+            let tl = lock(&self.dash.timeline);
+            let model = lock(&self.nodes.model);
+            for view in model.nodes.values() {
+                if !matches!(view.kind, NodeKind::Terminal) {
+                    continue;
+                }
+                // `lina_host::NodeStatus` (UI) → string do vocabulário do core (o mapeamento
+                // canônico vive em `dashboard::UiState::from_projection`). `Crashed` ≈ hang real.
+                let status_str = match view.status {
+                    NodeStatus::Busy => "Busy",
+                    NodeStatus::Dead => "Dead",
+                    NodeStatus::Crashed => "Crashed",
+                    NodeStatus::Idle => "Idle",
+                    NodeStatus::Starting | NodeStatus::Running => "Running",
+                    _ => "Running", // variantes futuras: vivo sem distinção (fallback honesto)
+                };
+                let state = dashboard::UiState::from_projection(
+                    Some(status_str),
+                    view.status == NodeStatus::Crashed,
+                );
+                let activity = match tl.activity(&view.name, now_ms) {
+                    Some((_, Some(tool))) => format!("rodando: {tool}"),
+                    Some((crate::inspector::Activity::Idle, None)) => {
+                        "terminou a resposta".to_owned()
+                    }
+                    Some((_, None)) => "trabalhando".to_owned(),
+                    None => "—".to_owned(),
+                };
+                // Sonda [DASH]: latência evento→card, 1× por evento novo (na mudança).
+                if let Some(ts) = tl.last_ts(&view.name) {
+                    if self.dash_lat_reported.get(&view.name) != Some(&ts) {
+                        eprintln!(
+                            "lina-gpui: [DASH] card node={} lat_evento->card_ms={}",
+                            view.name,
+                            now_ms.saturating_sub(ts)
+                        );
+                        self.dash_lat_reported.insert(view.name.clone(), ts);
+                    }
+                }
+                rows.push(Row {
+                    name: view.name.clone(),
+                    state,
+                    activity,
+                });
+            }
+        }
+
+        let state_color = |s: dashboard::UiState| -> u32 {
+            match s.color_token() {
+                "verde" => th.state.success,
+                "ambar" => th.state.warning,
+                "vermelho-suave" => th.state.danger,
+                "azul-escuro" => th.accent.primary,
+                _ => th.text.muted, // cinza / cinza-escuro
+            }
+        };
+
+        let mut panel = div()
+            .id("dash-panel")
+            .absolute()
+            .top(px(44.))
+            .right_0()
+            .bottom(px(28.))
+            .w(px(340.))
+            .bg(rgb(th.surface.panel))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(th.text.primary))
+                    .child("Atividade e custos do time"),
+            )
+            .child(
+                // Custo do Espaço HOJE — dinheiro primeiro, com o marcador honesto.
+                div()
+                    .id("dash-total")
+                    .text_size(px(15.))
+                    .text_color(rgb(th.text.primary))
+                    .child(format!("Hoje: {}", total.text)),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(th.text.muted))
+                    .child(format!(
+                        "motor: {} · {}",
+                        engine.label,
+                        dashboard::COST_TOOLTIP
+                    )),
+            );
+        for (i, row) in rows.into_iter().enumerate() {
+            let color = state_color(row.state);
+            panel = panel.child(
+                div()
+                    .id(("dash-row", i as u64))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .bg(rgb(th.surface.card))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(th.text.primary))
+                            .child(format!("{}  ● {}", row.name, row.state.label())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(color))
+                            .child(row.activity),
+                    ),
+            );
+        }
+        panel
     }
 
     /// **Fix de tela (F1-2-1/inv#6)**: abre a janela de Ajustes (T7 — Aparência/Espaços/T8) SOB
@@ -2204,6 +2393,13 @@ impl Render for WorkspaceView {
         }
 
         let root = root.child(topbar).child(footer);
+        // F1-1-5 (P6/fluxo c): painel "Atividade e custos" — zona lateral direita, sob os modais.
+        let root = if self.dashboard_open {
+            let panel = self.render_dashboard(&th);
+            root.child(panel)
+        } else {
+            root
+        };
         // F1-2-2 · M6/M6-E: o modal de Agente é o overlay central (evoluiu o overlay do M2 — BUG 4
         // resolvido por um modal de verdade). A paleta, quando aberta, continua mais ao topo.
         let root = match &self.agent_modal {
@@ -2581,9 +2777,75 @@ fn main() {
         .or_else(|| std::env::var("LINA_VAULT").ok())
         .unwrap_or_else(|| ws_root.join("vault").display().to_string());
     let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
-    let bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
-        .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
-        .ok();
+    let mut bootstrap =
+        BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
+            .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
+            .ok();
+
+    // ── F1-1-3/F1-1-5 (wiring) · HOOKS + TIMELINE + SESSÕES — antes de qualquer write/spawn. ──
+    // Listener 1x no boot; cada terminal ganha token no settings SE o perfil declarar a
+    // capability (TOML — inv#3). Degradação limpa: sem capability/bind → app como antes.
+    let dash =
+        dashboard::DashWiring::new(injection_profile.id.clone(), ws_root.display().to_string());
+    if injection_profile.capabilities.has("hooks") {
+        if let Some(hooks) = bridge::HooksShared::start() {
+            if let Some(bw) = bootstrap.as_mut() {
+                bw.set_hooks(Arc::clone(&hooks));
+            }
+            let tl = Arc::clone(&dash.timeline);
+            hooks.spawn_drain(move |ev| {
+                // Sonda [DASH]: latência de INGESTÃO (chegada no listener → timeline).
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                eprintln!(
+                    "lina-gpui: [DASH] hook node={} kind={:?} tool={:?} lat_ingest_ms={}",
+                    ev.node_id,
+                    ev.kind,
+                    ev.tool_name,
+                    now.saturating_sub(ev.ts)
+                );
+                if let Ok(mut t) = tl.lock() {
+                    t.note(ev);
+                }
+            });
+        }
+    } else {
+        eprintln!(
+            "lina-gpui: [DASH] perfil '{}' sem capability hooks — settings sem hooks (como antes)",
+            injection_profile.id
+        );
+    }
+    // Sessões (camada 3 — custo~): poll do SessionWatch em thread própria (gpui-free);
+    // o pattern vem do TOML do perfil (F1-1-1); HOME real do usuário (não é teste).
+    if let Some(pattern) = injection_profile.session_dir_pattern.clone() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let out = Arc::clone(&dash.sessions);
+            let cli_id = injection_profile.id.clone();
+            thread::spawn(move || {
+                let mut watch = lina_session_watch::SessionWatch::with_home(PathBuf::from(home));
+                watch.add_source(cli_id, pattern);
+                let mut known: std::collections::BTreeSet<(String, String)> =
+                    std::collections::BTreeSet::new();
+                loop {
+                    if let Ok(o) = watch.poll_once() {
+                        if !o.sessions_updated.is_empty() {
+                            known.extend(o.sessions_updated);
+                            let snapshot: Vec<_> = known
+                                .iter()
+                                .filter_map(|(c, s)| watch.scanner().session(c, s))
+                                .collect();
+                            if let Ok(mut dst) = out.lock() {
+                                *dst = snapshot;
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            });
+        }
+    }
 
     // ── W3-6c (ADR 0004) · COFRE DE SEGREDO + ENV LIMPO (fios 1 e 3) — ANTES de spawnar qualquer PTY.
     // Cofre do workspace. DEMO: backend em memória (`MockStore`) p/ não tocar o keyring do SO no
@@ -2836,7 +3098,9 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| WorkspaceView::new(nodes, input, a2a, focused, desk, brake, window, cx))
+                cx.new(|cx| {
+                    WorkspaceView::new(nodes, input, a2a, focused, desk, brake, dash, window, cx)
+                })
             },
         );
         // no-panic: se a janela não abrir (gpui/SO catastrófico) encerra com mensagem, não com backtrace.

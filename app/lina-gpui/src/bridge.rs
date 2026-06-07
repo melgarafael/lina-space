@@ -1887,6 +1887,90 @@ pub struct BootstrapWriter {
     vault_path: String,
     autonomy: Autonomy,
     lina_bin: String,
+    /// F1-1-3 (wiring): listener de hooks compartilhado do app. `None` = degradação
+    /// limpa (CLI sem `capabilities.hooks` OU bind falhou) → settings SEM hooks, como hoje.
+    hooks: Option<Arc<HooksShared>>,
+}
+
+/// **F1-1-3 (wiring) — o listener de hooks do app, ÚNICO por processo.** Faz o
+/// `HookListener::bind()` 1x no boot (porta efêmera em loopback — inv#2) e mantém o
+/// runtime tokio dedicado VIVO (1 worker; o `serve` do axum roda nele). Cada spawn
+/// pede um token por nó ([`Self::register`]); a timeline consome [`Self::subscribe`].
+pub struct HooksShared {
+    /// Mantém o serve vivo — dropar o runtime mataria o listener.
+    _rt: tokio::runtime::Runtime,
+    listener: lina_hooks::HookListener,
+}
+
+impl HooksShared {
+    /// Sobe runtime + listener. Falha NUNCA derruba o app: `None` + stderr (degradação
+    /// VISÍVEL — sem hooks o app funciona exatamente como antes desta fiação).
+    pub fn start() -> Option<Arc<Self>> {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: [DASH] runtime de hooks indisponível ({e}) — seguindo sem hooks"
+                );
+                return None;
+            }
+        };
+        match rt.block_on(lina_hooks::HookListener::bind()) {
+            Ok(listener) => {
+                eprintln!(
+                    "lina-gpui: [DASH] hook listener vivo em 127.0.0.1:{}",
+                    listener.local_addr().port()
+                );
+                Some(Arc::new(Self { _rt: rt, listener }))
+            }
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: [DASH] bind do hook listener falhou ({e}) — seguindo sem hooks"
+                );
+                None
+            }
+        }
+    }
+
+    /// Porta efêmera do listener (entra no settings de cada terminal via `HookWiring`).
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.listener.local_addr().port()
+    }
+
+    /// Token de atribuição do nó `key` — a ÚNICA fonte de identidade do POST.
+    #[must_use]
+    pub fn register(&self, key: &str) -> String {
+        self.listener.register_node(key)
+    }
+
+    /// Stream dos eventos normalizados (a timeline do dashboard drena daqui).
+    #[must_use]
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<lina_hooks::HookEvent> {
+        self.listener.subscribe()
+    }
+
+    /// Drena o stream NO runtime do próprio listener (sem thread extra): cada evento
+    /// vai ao callback (timeline + sonda `[DASH]`). Lag é CONTADO no stderr, nunca
+    /// silencioso; o loop morre junto com o listener.
+    pub fn spawn_drain(&self, mut on_event: impl FnMut(lina_hooks::HookEvent) + Send + 'static) {
+        let mut rx = self.subscribe();
+        self._rt.spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => on_event(ev),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("lina-gpui: [DASH] timeline perdeu {n} eventos (lag)");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 }
 
 impl BootstrapWriter {
@@ -1904,7 +1988,15 @@ impl BootstrapWriter {
             vault_path,
             autonomy,
             lina_bin,
+            hooks: None,
         })
+    }
+
+    /// F1-1-3 (wiring): liga os hooks de observabilidade nos PRÓXIMOS writes — chamado
+    /// no boot quando o perfil do CLI declara `capabilities.hooks=true` (TOML, F1-1-1)
+    /// E o listener subiu. Sem esta chamada = degradação (settings como hoje).
+    pub fn set_hooks(&mut self, hooks: Arc<HooksShared>) {
+        self.hooks = Some(hooks);
     }
 
     /// Diretório (cwd) do terminal `key`.
@@ -1934,10 +2026,21 @@ impl BootstrapWriter {
             self.effective_vault(),
             self.autonomy,
         );
-        if let Err(e) = self
-            .bootstrapper
-            .write_terminal_files(&dir, &input, &self.lina_bin)
-        {
+        // F1-1-3 (wiring): com o listener vivo, o terminal ganha settings de hooks com
+        // TOKEN próprio (atribuição por spawn — nunca pelo payload). O token registra o
+        // NOME do terminal (identidade A2A única do roster) — é o `node_id` que chega na
+        // timeline e casa com `NodeView.name` no painel. `None` = degradação limpa:
+        // settings sem hooks, exatamente como antes da fiação.
+        let wiring = self.hooks.as_ref().map(|h| lina_bootstrap::HookWiring {
+            port: h.port(),
+            token: h.register(name),
+        });
+        if let Err(e) = self.bootstrapper.write_terminal_files_with_hooks(
+            &dir,
+            &input,
+            &self.lina_bin,
+            wiring.as_ref(),
+        ) {
             eprintln!("lina-gpui: bootstrap de {name} falhou: {e}");
         }
         // Instala a skill `lina-agent-bus` no cwd do terminal → A2A automático no turno 0

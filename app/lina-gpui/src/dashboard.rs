@@ -119,7 +119,7 @@ pub struct EngineBadge {
 }
 
 impl EngineBadge {
-    fn from_cli(cli: Option<&str>) -> Self {
+    pub fn from_cli(cli: Option<&str>) -> Self {
         match cli {
             Some(id) if !id.trim().is_empty() => Self {
                 label: humanize_kebab(id),
@@ -193,6 +193,125 @@ impl CostLine {
 /// Tooltip do ⓘ de custo (1 frase, wireframe P6) — constante p/ o render.
 pub const COST_TOOLTIP: &str = "calculado pelo uso de IA deste Agente × preço do motor. \
 O valor exato aparece na fatura do seu provedor.";
+
+// ═══════════ Timeline viva (wiring F1-1-3→F1-1-5): hooks → atividade do card ═══════════
+
+/// Janela (ms) em que um hook de trabalho recente conta como "Trabalhando" mesmo sem
+/// evento de fim — depois disso a timeline se declara sem opinião (cai no fallback).
+pub const ACTIVITY_FRESH_MS: u64 = 10_000;
+
+/// Última palavra dos hooks por terminal (chave = NOME do nó — é o `node_id` atribuído
+/// pelo TOKEN de spawn; identidade A2A única do roster). Alimentada pela drenagem do
+/// `HookListener` (bridge), lida pelo render. Telemetria NÃO-decisória (13.5 achado 8).
+#[derive(Debug, Default)]
+pub struct Timeline {
+    last: BTreeMap<String, lina_hooks::HookEvent>,
+}
+
+impl Timeline {
+    /// Absorve um evento normalizado do listener (último por nó vence).
+    pub fn note(&mut self, ev: lina_hooks::HookEvent) {
+        self.last.insert(ev.node_id.clone(), ev);
+    }
+
+    /// Atividade derivada do último hook do nó — `now_ms` é INJETADO (lição wall-clock):
+    /// - `Stop` → `Idle` ("terminou a resposta"), sem janela (o fim é explícito);
+    /// - hook de trabalho há menos de [`ACTIVITY_FRESH_MS`] → `Busy` + a ferramenta;
+    /// - sem hook / hook velho → `None` (o caller cai na fonte anterior: damage/Idle).
+    #[must_use]
+    pub fn activity(&self, name: &str, now_ms: u64) -> Option<(Activity, Option<String>)> {
+        let ev = self.last.get(name)?;
+        if ev.kind == lina_hooks::HookKind::Stop {
+            return Some((Activity::Idle, None));
+        }
+        if now_ms.saturating_sub(ev.ts) <= ACTIVITY_FRESH_MS {
+            return Some((Activity::Busy, ev.tool_name.clone()));
+        }
+        None
+    }
+
+    /// Chegada (`ts` do listener) do último hook do nó — base da medição de latência
+    /// evento→card (`[DASH]`).
+    #[must_use]
+    pub fn last_ts(&self, name: &str) -> Option<u64> {
+        self.last.get(name).map(|e| e.ts)
+    }
+}
+
+/// Fios do dashboard que o BOOT liga e o root consome (1 parâmetro no construtor).
+pub struct DashWiring {
+    /// Última palavra dos hooks por nó (alimentada por `HooksShared::spawn_drain`).
+    pub timeline: std::sync::Arc<std::sync::Mutex<Timeline>>,
+    /// Snapshot das sessões da camada 3 (alimentado pela thread do `SessionWatch`).
+    pub sessions: std::sync::Arc<std::sync::Mutex<Vec<Session>>>,
+    /// `id` do perfil de injeção (badge do motor — v1: todos os terminais usam o mesmo).
+    pub cli_id: String,
+    /// Raiz do workspace (string) — recorte honesto do custo do Espaço.
+    pub ws_root: String,
+}
+
+impl DashWiring {
+    #[must_use]
+    pub fn new(cli_id: String, ws_root: String) -> Self {
+        Self {
+            timeline: std::sync::Arc::default(),
+            sessions: std::sync::Arc::default(),
+            cli_id,
+            ws_root,
+        }
+    }
+}
+
+/// Prefixo `YYYY-MM-DD` (UTC) do instante `epoch_ms` — algoritmo civil determinístico,
+/// sem dependência de data. **Limitação registrada (v1):** o "hoje" é o dia UTC (desvio
+/// de até 3h vs Brasília); timezone local é melhoria futura — preferimos o recorte
+/// honesto e testável a uma dependência nova nesta fiação.
+#[must_use]
+pub fn utc_day_prefix(epoch_ms: u64) -> String {
+    let days = (epoch_ms / 86_400_000) as i64;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `days` desde 1970-01-01 → (ano, mês, dia) no calendário civil (Howard Hinnant).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Custo TOTAL do Espaço hoje (sessões cujo `cwd` vive sob o `ws_root` e cujo último
+/// movimento é de hoje) — v1 da tela: o total é atribuível com certeza ao Espaço; a
+/// atribuição POR NÓ continua exigindo hint não-ambíguo (sem chute — doutrina 13.9).
+#[must_use]
+pub fn workspace_cost_today(sessions: &[Session], ws_root: &str, today_prefix: &str) -> CostLine {
+    let mut cost = 0.0f64;
+    let mut estimated = false;
+    let mut any = false;
+    for s in sessions {
+        let in_ws = s.cwd.as_deref().is_some_and(|c| c.starts_with(ws_root));
+        let today = s
+            .last_ts
+            .as_deref()
+            .is_some_and(|ts| ts.starts_with(today_prefix));
+        if in_ws && today {
+            any = true;
+            cost += s.cost_usd;
+            estimated |= s.cost_estimated || s.source == CostSource::Jsonl;
+        }
+    }
+    if !any {
+        return CostLine::without_data();
+    }
+    CostLine::from_today(cost, estimated)
+}
 
 /// Breakdown de tokens — mora nos "Detalhes técnicos" (dobrado; jargão fora da superfície).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -614,6 +733,61 @@ mod tests {
         );
         let cards = build_cards(&state, &[], &[], &BTreeMap::new(), TODAY);
         assert_eq!(cards.len(), 1, "só o terminal vira card");
+    }
+
+    /// Timeline: hook fresco → Busy+tool; Stop → Idle; velho/desconhecido → None.
+    #[test]
+    fn timeline_derives_activity_from_hooks_with_injected_clock() {
+        let mut tl = Timeline::default();
+        let ev = |kind, tool: Option<&str>, ts| lina_hooks::HookEvent {
+            node_id: "Ajudante Dev".into(),
+            kind,
+            tool_name: tool.map(str::to_owned),
+            subagent_id: None,
+            parent_id: None,
+            ts,
+            trusted: false,
+        };
+        // Sem hook → sem opinião.
+        assert_eq!(tl.activity("Ajudante Dev", 1_000), None);
+        // PreToolUse fresco → Trabalhando + ferramenta.
+        tl.note(ev(lina_hooks::HookKind::PreToolUse, Some("Bash"), 1_000));
+        assert_eq!(
+            tl.activity("Ajudante Dev", 2_000),
+            Some((Activity::Busy, Some("Bash".into())))
+        );
+        // Velho (> janela) → sem opinião (cai no fallback).
+        assert_eq!(
+            tl.activity("Ajudante Dev", 1_000 + ACTIVITY_FRESH_MS + 1),
+            None
+        );
+        // Stop → Idle explícito, sem janela.
+        tl.note(ev(lina_hooks::HookKind::Stop, None, 5_000));
+        assert_eq!(
+            tl.activity("Ajudante Dev", 99_000),
+            Some((Activity::Idle, None))
+        );
+    }
+
+    /// Dia UTC determinístico (sem dependência) + recorte do custo do Espaço.
+    #[test]
+    fn utc_day_prefix_and_workspace_cost_today() {
+        // 2026-06-06T14:00:00Z = 1780754400000 ms.
+        assert_eq!(utc_day_prefix(1_780_754_400_000), "2026-06-06");
+        assert_eq!(utc_day_prefix(0), "1970-01-01");
+
+        let inside = session("/ws/terminal-a", "2026-06-06T10:00:00.000Z");
+        let mut outside_ws = session("/outro/lugar", "2026-06-06T10:00:00.000Z");
+        outside_ws.session_id = "s2".into();
+        let mut yesterday = session("/ws/terminal-b", "2026-06-05T10:00:00.000Z");
+        yesterday.session_id = "s3".into();
+        let cost = workspace_cost_today(&[inside, outside_ws, yesterday], "/ws", "2026-06-06");
+        assert!(cost.has_data);
+        assert!(
+            (cost.usd - 0.0123).abs() < 1e-9,
+            "só a sessão do ws E de hoje"
+        );
+        assert!(cost.estimated && cost.text.contains("estimado"));
     }
 
     /// Totais do workspace (base do B1): soma custo de hoje + conta warnings.

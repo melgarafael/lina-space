@@ -27,6 +27,8 @@ pub enum PaletteAction {
     NewNote,
     /// M4 (placeholder até `creators.rs`): nova pasta.
     NewFolder,
+    /// F1-1-5 (P6/fluxo c): abre/fecha o painel "Atividade e custos" do Espaço.
+    ToggleDashboard,
 }
 
 /// Comandos BASE da paleta (independentes do roster) — puro p/ o guardião de entry points.
@@ -46,6 +48,12 @@ pub fn base_commands() -> Vec<Command> {
         ),
         Command::new("📝 Nova nota", PaletteAction::NewNote),
         Command::new("📁 Nova pasta", PaletteAction::NewFolder),
+        // F1-1-5 (entry point descobrível do P6 — fluxo c): "dashboard", "atividade",
+        // "custo" são os termos que um leigo digita.
+        Command::new(
+            "📊 Dashboard: atividade e custos do time",
+            PaletteAction::ToggleDashboard,
+        ),
     ]
 }
 
