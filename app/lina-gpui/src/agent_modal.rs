@@ -330,6 +330,55 @@ pub fn gallery_layout(modal: ModalFrame, window: WinSize, n_items: usize) -> Gal
     }
 }
 
+// ── linhas texto+ação (fix bugB3 — o botão é INEGOCIÁVEL, o texto cede) ──
+// Regressão da rodada bugB2: o min-content de um texto gpui é a LINHA INTEIRA quando alguma
+// medição roda sem largura Definite (text.rs: `wrap_width` exige Definite; e o cache de
+// TextLayout aceita hit com wrap_width=None → o min-content que o taffy enxerga depende da
+// ORDEM das medições — inserir o wrapper de scroll mudou a ordem). Célula sem `min_w(0)` herda
+// esse min-content gigante, não encolhe e EXPULSA o botão da linha (o scroll container clipa →
+// [Trocar] sumiu; a galeria ficou inalcançável). Doutrina de TODA linha texto+ação do modal:
+// label `flex_none` · célula de texto `flex_1 + min_w(0) + overflow_hidden` (quem cede) ·
+// ação `flex_none` (nunca encolhe, nunca sai). A matemática abaixo espelha essa resolução.
+
+/// Largura da label esquerda das linhas do formulário (Nome/Papel/Pasta) — fonte única.
+pub const ROW_LABEL_W: f32 = 120.0;
+/// Gap entre label · célula · ação nas linhas do formulário — o render usa `gap(px(ROW_GAP))`
+/// (fonte única com a varredura de contenção, não coincidência com um token de espaçamento).
+pub const ROW_GAP: f32 = 12.0;
+
+/// Geometria resolvida de uma linha texto+ação (label fixa à esquerda, texto que cede no
+/// meio, ação inegociável à direita). Espelho-de-spec da doutrina acima: existe PARA o teste
+/// guardião (`cfg(test)` — gpui não roda headless; o render real usa flex com a doutrina, e a
+/// varredura prova aqui que a geometria é viável em toda largura do `modal_frame`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActionRowLayout {
+    /// Largura da célula de texto (o que CEDE; nunca negativa).
+    pub text_w: f32,
+    /// x da borda esquerda da ação, relativo à linha.
+    pub action_x: f32,
+    /// Largura da ação (clampada à linha — jamais maior que ela).
+    pub action_w: f32,
+}
+
+/// Layout PURO da linha texto+ação sob a doutrina do fix: espelha a resolução flex do taffy
+/// para `label flex_none · célula min_w(0) · ação flex_none` — a ação cola à direita SEMPRE
+/// dentro da linha; o texto fica com o resto (zero no aperto). O caso degenerado (partes fixas
+/// maiores que a linha) clampa a ação para dentro — o teste de varredura prova que a geometria
+/// real do modal nunca o atinge.
+#[cfg(test)]
+#[must_use]
+pub fn action_row_layout(row_w: f32, label_w: f32, gap: f32, action_w: f32) -> ActionRowLayout {
+    let action_w = action_w.min(row_w);
+    let action_x = row_w - action_w;
+    let text_w = (row_w - label_w - action_w - 2.0 * gap).max(0.0);
+    ActionRowLayout {
+        text_w,
+        action_x,
+        action_w,
+    }
+}
+
 /// **Seletor de papéis** ([Trocar] — F1-2-3 + feedback de tela do fundador: "tinha que ser um
 /// seletor ou dropdown", não ciclar de um em um). TODOS os papéis da biblioteca visíveis de uma
 /// vez (a biblioteca É o registry W3-1 humanizado — fonte única, offline, zero LLM), com busca
@@ -962,8 +1011,11 @@ pub fn render(
             .flex_row()
             .items_center()
             .child(
+                // bugB3: o título cede (nome de Edit pode ser longo) — o ✕ nunca sai.
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .text_size(px(20.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(th.text.bright))
@@ -972,6 +1024,7 @@ pub fn render(
             .child(
                 div()
                     .id("m6-close")
+                    .flex_none()
                     .px_2()
                     .rounded_md()
                     .text_color(rgb(th.text.muted))
@@ -1099,10 +1152,11 @@ pub fn render(
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
+            .gap(px(ROW_GAP))
             .child(
                 div()
-                    .w(px(120.0))
+                    .flex_none()
+                    .w(px(ROW_LABEL_W))
                     .text_color(rgb(th.text.primary))
                     .child(text!(COPY_NAME_LABEL)),
             )
@@ -1110,6 +1164,8 @@ pub fn render(
                 div()
                     .id("m6-name")
                     .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -1137,8 +1193,13 @@ pub fn render(
             .items_center()
             .gap_2()
             .child(
+                // bugB3: o ghost é a célula que CEDE (clicável mesmo clipado); o ⓘ por quê?
+                // é a ação flex_none — nunca sai da linha.
                 div()
                     .id("m6-ghost")
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .text_color(rgb(th.accent.primary))
                     .cursor_pointer()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
@@ -1149,6 +1210,7 @@ pub fn render(
             .child(
                 div()
                     .id("m6-why")
+                    .flex_none()
                     .text_color(rgb(th.text.muted))
                     .cursor_pointer()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
@@ -1159,6 +1221,9 @@ pub fn render(
         if modal.why_open() {
             ghost = ghost.child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .text_color(rgb(th.text.secondary))
                     .child(text!(s.why.clone())),
             );
@@ -1249,17 +1314,28 @@ pub fn render(
             .flex()
             .flex_row()
             .items_start()
-            .gap_3()
+            .gap(px(ROW_GAP))
             .child(
                 div()
-                    .w(px(120.0))
+                    .flex_none()
+                    .w(px(ROW_LABEL_W))
                     .text_color(rgb(th.text.primary))
                     .child(text!(COPY_ROLE_LABEL)),
             )
-            .child(div().flex_1().child(role_card))
             .child(
+                // bugB3 (A regressão): a célula do cartão é quem CEDE — min_w(0) mata o
+                // min-content de linha-única do texto; overflow_hidden é o cinto.
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .child(role_card),
+            )
+            .child(
+                // O [Trocar] é INEGOCIÁVEL: sem ele a galeria fica inalcançável.
                 div()
                     .id("m6-role-swap")
+                    .flex_none()
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -1388,6 +1464,8 @@ pub fn render(
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
                                 .line_height(px(GALLERY_HEADER_H))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(rgb(th.text.primary))
@@ -1395,6 +1473,7 @@ pub fn render(
                         )
                         .child(
                             div()
+                                .flex_none()
                                 .line_height(px(GALLERY_HEADER_H))
                                 .text_color(rgb(th.text.muted))
                                 .child(text!(COPY_GALLERY_HINT)),
@@ -1423,22 +1502,27 @@ pub fn render(
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
+            .gap(px(ROW_GAP))
             .child(
                 div()
-                    .w(px(120.0))
+                    .flex_none()
+                    .w(px(ROW_LABEL_W))
                     .text_color(rgb(th.text.primary))
                     .child(text!(COPY_CWD_LABEL)),
             )
             .child(
+                // bugB3: caminho de pasta pode ser longo — cede; o [Trocar…] nunca sai.
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .text_color(rgb(th.text.secondary))
                     .child(text!(modal.cwd_display())),
             )
             .child(
                 div()
                     .id("m6-cwd-pick")
+                    .flex_none()
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -1482,6 +1566,9 @@ pub fn render(
                 .child(
                     div()
                         .id("m6-cmd")
+                        // bugB3: comando pode ser uma "palavra" longa — clipa dentro da caixa.
+                        .min_w(px(0.0))
+                        .overflow_hidden()
                         .px_3()
                         .py_2()
                         .rounded_md()
@@ -1534,8 +1621,10 @@ pub fn render(
             .justify_end()
             .gap_2()
             .child(
+                // bugB3: o par de botões do rodapé é inegociável (flex_none nos dois).
                 div()
                     .id("m6-cancel")
+                    .flex_none()
                     .px_4()
                     .py_2()
                     .rounded_md()
@@ -1550,6 +1639,7 @@ pub fn render(
             .child(
                 div()
                     .id("m6-create")
+                    .flex_none()
                     .px_4()
                     .py_2()
                     .rounded_md()
@@ -2090,6 +2180,70 @@ kind = "idle"
                 < 0.01,
             "chrome = bordas + paddings + gaps + cabeçalho + busca"
         );
+    }
+
+    /// **GUARDIÃO (regressão bugB3 — [Trocar] expulso da linha Papel)**: em TODA largura que o
+    /// `modal_frame` produz, TODA linha texto+ação do modal mantém a ação DENTRO da linha — o
+    /// texto é quem cede. Mecanismo da regressão: o min-content do texto gpui é a LINHA INTEIRA
+    /// quando a medição roda sem largura Definite (e o cache de TextLayout torna isso dependente
+    /// da ORDEM das medições do taffy) → célula sem `min_w(0)` não encolhe e empurra o botão p/
+    /// fora (o scroll container clipa → botão some). A doutrina do render: célula `min_w(0)` +
+    /// `overflow_hidden`, ação `flex_none` — e esta varredura prova a geometria viável.
+    #[test]
+    fn action_rows_contained_in_every_modal_frame() {
+        // (label_w, gap, action_w por cima) das linhas texto+ação REAIS do modal:
+        // título+✕ · Papel+[Trocar] · Pasta+[Trocar…] · ghost+ⓘ por quê? · rodapé (2 botões).
+        let rows = [
+            (0.0_f32, ROW_GAP, 40.0_f32),  // título: ✕
+            (ROW_LABEL_W, ROW_GAP, 100.0), // Papel: [Trocar]
+            (ROW_LABEL_W, ROW_GAP, 110.0), // Pasta: [Trocar…]
+            (0.0, 8.0, 80.0),              // ghost: ⓘ por quê?
+            (0.0, 8.0, 250.0),             // rodapé: Cancelar+Criar Agente (par à direita)
+        ];
+        for w in [360.0_f32, 640.0, 736.0, 1024.0, 1440.0, 2560.0] {
+            for h in [300.0_f32, 700.0, 900.0, 1600.0] {
+                let frame = modal_frame(WinSize { w, h });
+                let usable = frame.w - 2.0 * MODAL_PAD_X;
+                for (label_w, gap, action_w) in rows {
+                    // Pré-condição estrutural (garante que o caso degenerado do clamp da ação
+                    // nunca é atingido com a geometria real): partes fixas cabem SEMPRE.
+                    assert!(
+                        label_w + 2.0 * gap + action_w <= usable + 0.01,
+                        "partes fixas não cabem em {w}x{h} (usable {usable}): \
+                         label {label_w} + gaps + ação {action_w}"
+                    );
+                    let r = action_row_layout(usable, label_w, gap, action_w);
+                    assert!(r.action_x >= -0.01, "ação começa dentro em {w}x{h}");
+                    assert!(
+                        r.action_x + r.action_w <= usable + 0.01,
+                        "ação TERMINA dentro em {w}x{h}: {} + {} > {usable}",
+                        r.action_x,
+                        r.action_w
+                    );
+                    assert!(
+                        r.action_x >= label_w + gap - 0.01,
+                        "ação não sobrepõe a label em {w}x{h}"
+                    );
+                    assert!(
+                        (r.text_w - (usable - label_w - action_w - 2.0 * gap)).abs() < 0.01,
+                        "o texto cede exatamente o resto em {w}x{h}: {}",
+                        r.text_w
+                    );
+                    assert!(r.text_w >= 0.0, "célula nunca negativa");
+                }
+            }
+        }
+    }
+
+    /// Degenerado do `action_row_layout`: ação mais larga que a própria linha é CLAMPADA para
+    /// dentro (nunca sai), e a célula de texto zera — o render real nunca chega aqui (a
+    /// pré-condição da varredura garante), mas a função não pode mentir se chegar.
+    #[test]
+    fn action_row_clamps_oversized_action_inside() {
+        let r = action_row_layout(200.0, 120.0, 12.0, 400.0);
+        assert!((r.action_w - 200.0).abs() < 0.01, "ação clampada à linha");
+        assert!(r.action_x >= -0.01 && r.action_x + r.action_w <= 200.01);
+        assert!((r.text_w - 0.0).abs() < 0.01, "texto cede tudo");
     }
 
     /// **Critério 3 da F1-2-3 (auditoria de deps)**: NENHUM client de LLM/rede no app — a
