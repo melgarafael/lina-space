@@ -42,6 +42,16 @@ fn default_stream_json_event() -> String {
     "result".to_string()
 }
 
+/// F1-1-8 (ADR 0021 §1): default conservador de APROVAÇÃO — `y` + Enter como tecla crua.
+fn default_approve_keys() -> String {
+    "y\r".to_string()
+}
+
+/// F1-1-8 (ADR 0021 §1): default conservador de RECUSA — `n` + Enter como tecla crua.
+fn default_deny_keys() -> String {
+    "n\r".to_string()
+}
+
 /// Como o orquestrador entrega um novo prompt a um terminal vivo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,6 +103,40 @@ impl Capabilities {
     #[must_use]
     pub fn has(&self, name: &str) -> bool {
         self.0.get(name).copied().unwrap_or(false)
+    }
+}
+
+/// F1-1-8 (ADR 0021 §1): sequências de **tecla crua** que respondem um prompt de
+/// permissão y/n — exclusivamente o que o write de aprovação digita no PTY, **sem
+/// bracketed-paste** (o faseamento paste→`submit_delay`→Enter é protocolo de mensagem
+/// A2A, não de aprovação; prompts y/n leem tecla, não mensagem).
+///
+/// Campo ADITIVO do profile: ausente no TOML ⇒ default conservador `"y\r"` aprova /
+/// `"n\r"` recusa. CLIs cujo prompt recusa por **Esc** declaram `deny = "\u001B"`
+/// (escape TOML do ESC, `0x1B`). Calibração por CLI entra por TOML, sem recompilar
+/// (invariante #3), p.ex.:
+/// ```toml
+/// [approval_keys]
+/// approve = "y\r"
+/// deny = "\u001B"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalKeys {
+    /// Bytes digitados para APROVAR (default `"y\r"` — `y` + Enter `0x0D`).
+    #[serde(default = "default_approve_keys")]
+    pub approve: String,
+    /// Bytes digitados para RECUSAR (default `"n\r"`; Esc = `"\u001B"`).
+    #[serde(default = "default_deny_keys")]
+    pub deny: String,
+}
+
+impl Default for ApprovalKeys {
+    fn default() -> Self {
+        Self {
+            approve: default_approve_keys(),
+            deny: default_deny_keys(),
+        }
     }
 }
 
@@ -158,6 +202,11 @@ pub struct CliProfile {
     /// e os guards por CLI (decision table no TOML, 13.9 item 5).
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// F1-1-8 (ADR 0021 §1): teclas cruas de resposta a prompt de permissão y/n —
+    /// o ÚNICO conteúdo que o write de aprovação digita (ver [`ApprovalKeys`]).
+    /// ADITIVO: ausente no TOML ⇒ default conservador `"y\r"`/`"n\r"`.
+    #[serde(default)]
+    pub approval_keys: ApprovalKeys,
 }
 
 impl CliProfile {
@@ -225,6 +274,21 @@ impl CliProfile {
                     path: label.to_owned(),
                 });
             }
+        }
+        // F1-1-8: tecla de aprovação/recusa vazia escreveria ZERO bytes "com sucesso" —
+        // typo de config, erro claro no load (mesma doutrina do session_dir_pattern).
+        // (Sem `trim()`: `"\r"`/ESC são whitespace/controle legítimos aqui.)
+        if self.approval_keys.approve.is_empty() {
+            return Err(ProfileError::EmptyField {
+                field: "approval_keys.approve",
+                path: label.to_owned(),
+            });
+        }
+        if self.approval_keys.deny.is_empty() {
+            return Err(ProfileError::EmptyField {
+                field: "approval_keys.deny",
+                path: label.to_owned(),
+            });
         }
         Ok(())
     }
@@ -850,6 +914,92 @@ mod tests {
         let err = ProfileRegistry::load_dir(profiles_dir().join("does-not-exist"))
             .expect_err("diretório inexistente deve falhar");
         assert!(matches!(err, ProfileError::Io { .. }));
+    }
+
+    // ── F1-1-8 (ADR 0021 §1): `approval_keys` — campo ADITIVO, default conservador ──
+
+    /// Profile SEM a seção `[approval_keys]` (todos os TOMLs existentes) parseia com o
+    /// default conservador `"y\r"`/`"n\r"` — aditividade provada.
+    #[test]
+    fn approval_keys_default_when_absent() {
+        let toml = r#"
+            id = "shell"
+            program = "bash"
+            delivery = "pty_inject"
+            prompt_ready_regex = '\$\s$'
+            [end_signal]
+            kind = "idle"
+        "#;
+        let profile = CliProfile::from_toml_str(toml, "<inline>").expect("deve parsear");
+        assert_eq!(profile.approval_keys, ApprovalKeys::default());
+        assert_eq!(profile.approval_keys.approve, "y\r");
+        assert_eq!(profile.approval_keys.deny, "n\r");
+    }
+
+    /// Seção declarada: teclas customizadas entram por TOML (sem recompilar), inclusive
+    /// recusa por Esc (`0x1B`) via escape `\u001B`. Seção PARCIAL completa com o default.
+    #[test]
+    fn approval_keys_custom_and_partial_sections_parse() {
+        let toml = r#"
+            id = "custom"
+            program = "custom-cli"
+            delivery = "pty_inject"
+            prompt_ready_regex = "> "
+            [end_signal]
+            kind = "idle"
+            [approval_keys]
+            approve = "1\r"
+            deny = "\u001B"
+        "#;
+        let profile = CliProfile::from_toml_str(toml, "<inline>").expect("deve parsear");
+        assert_eq!(profile.approval_keys.approve, "1\r");
+        assert_eq!(profile.approval_keys.deny, "\u{1b}", "Esc cru, byte 0x1B");
+
+        let partial = r#"
+            id = "partial"
+            program = "p"
+            delivery = "pty_inject"
+            prompt_ready_regex = "> "
+            [end_signal]
+            kind = "idle"
+            [approval_keys]
+            deny = "\u001B"
+        "#;
+        let profile = CliProfile::from_toml_str(partial, "<inline>").expect("deve parsear");
+        assert_eq!(
+            profile.approval_keys.approve, "y\r",
+            "omitido cai no default"
+        );
+        assert_eq!(profile.approval_keys.deny, "\u{1b}");
+    }
+
+    /// Tecla declarada porém VAZIA escreveria zero bytes "com sucesso" — typo de
+    /// config, erro claro no load (sem panic), como `session_dir_pattern`.
+    #[test]
+    fn approval_keys_empty_string_is_config_error() {
+        for (section, field) in [
+            ("approve = \"\"", "approval_keys.approve"),
+            ("deny = \"\"", "approval_keys.deny"),
+        ] {
+            let toml = format!(
+                r#"
+                    id = "bad"
+                    program = "b"
+                    delivery = "pty_inject"
+                    prompt_ready_regex = "> "
+                    [end_signal]
+                    kind = "idle"
+                    [approval_keys]
+                    {section}
+                "#
+            );
+            let err = CliProfile::from_toml_str(&toml, "<inline>")
+                .expect_err("tecla vazia deve falhar no load");
+            match err {
+                ProfileError::EmptyField { field: f, .. } => assert_eq!(f, field),
+                other => panic!("erro errado para {field}: {other:?}"),
+            }
+        }
     }
 
     // ── F1-1-1: CliDetector camada 1 (ADR de detecção: spawn-time, determinística, primária) ──

@@ -98,6 +98,42 @@ impl Default for PermissionEvidence {
     }
 }
 
+/// F1-1-7/8 (ADR 0021 §2/§3): a DECISÃO de um [`DomainEvent::PermissionResolved`].
+/// Serializa em `snake_case` (`"approve"`/`"deny"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// `Deny` como default CONSERVADOR: payload degradado/antigo NUNCA replaya como
+/// aprovação (fail-safe na direção do ADR 0021 §3 — "deny é re-emissível; approve
+/// não é des-apertável").
+impl Default for ApprovalDecision {
+    fn default() -> Self {
+        Self::Deny
+    }
+}
+
+/// F1-1-7/8 (ADR 0021 §2/§3): POR QUAL VIA a decisão nasceu — gesto humano na UI
+/// autenticada ou SLA de timeout (auto-deny aos 10 min; nunca auto-approve).
+/// Serializa em `snake_case` (`"human"`/`"timeout"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionVia {
+    Human,
+    Timeout,
+}
+
+/// `Timeout` como default CONSERVADOR: payload degradado NUNCA fabrica um gesto
+/// humano que não foi registrado (doutrina do gate humano — ADRs 0004/0021 §5).
+impl Default for ResolutionVia {
+    fn default() -> Self {
+        Self::Timeout
+    }
+}
+
 /// W4-4: durabilidade do último `append`, para a UI projetar **"salvando…" ↔ "Tudo salvo ✓"**
 /// (rodapé, invariante #6 "estado sempre salvo e visível"). O core emite a transição via callback
 /// (ver [`EventStore::append_with_flush`]); o shell a mapeia para seu evento de UI **sem o core
@@ -466,6 +502,87 @@ pub enum DomainEvent {
         #[serde(default)]
         ts: u64,
     },
+    /// F1-1-7/8 (ADR 0021 §2 — ordem: Resolved → write → Injected): a DECISÃO sobre um
+    /// pedido de permissão (`stable_id` correlaciona ao `PermissionAsked`), por gesto
+    /// humano (via=human) ou SLA de 10 min (via=timeout, decision=deny — NUNCA
+    /// auto-approve, sem knob). **Dono do append (arbitragem da costura F1-1-7×F1-1-8):**
+    /// com o executor FIADO, o desfecho inteiro (Resolved → Injected/Aborted/
+    /// DuplicateIgnored) nasce na porta única de escrita (`deliver_approval`) — um só
+    /// escritor garante a ordem do §2 por construção; `AttentionQueue::resolve` é o
+    /// VALIDADOR do gesto (alias→canônico, idempotência) e a fila NÃO apenda por conta
+    /// própria. Sem executor fiado (fila standalone), o chamador apenda o retorno de
+    /// `resolve` — caminho auditável desta rodada. A decisão NÃO é o efeito: o write
+    /// no PTY é exclusivo do executor (`ApprovalInjected`).
+    /// META — a fila reconstrói pendências varrendo o log (pendente = `PermissionAsked`
+    /// sem Resolved/Dismissed posterior do mesmo `stable_id`).
+    PermissionResolved {
+        #[serde(default)]
+        stable_id: String,
+        /// `approve`/`deny` — default CONSERVADOR `deny` (replay degradado nunca
+        /// fabrica aprovação).
+        #[serde(default)]
+        decision: ApprovalDecision,
+        /// `human`/`timeout` — default CONSERVADOR `timeout` (replay degradado nunca
+        /// fabrica gesto humano).
+        #[serde(default)]
+        via: ResolutionVia,
+    },
+    /// F1-1-8 (ADR 0021 §2 — o EFEITO): o write de `approval_keys` aconteceu no PTY
+    /// alvo, com a tela validada no instante do write. `vt_snapshot_hash` é o hash da
+    /// região do prompt que a validação conferiu — evidência auditável da pré-condição.
+    /// META — consumido pelo ledger de idempotência do executor (porta única de escrita).
+    ApprovalInjected {
+        #[serde(default)]
+        stable_id: String,
+        #[serde(default)]
+        vt_snapshot_hash: String,
+    },
+    /// F1-1-8 (ADR 0021 §1/§4): a injeção foi ABORTADA sem escrever nenhum byte —
+    /// `reason` em snake_case aberto (`"screen_changed"` = snapshot divergiu entre a
+    /// detecção e o gesto; `"target_mismatch"` = cross-check stable_id↔node_id falhou).
+    /// String (não enum) de propósito: razões novas entram sem quebrar replay antigo.
+    /// META — auditável como Resolved + Aborted, SEM Injected (ADR 0021 §2).
+    ApprovalAborted {
+        #[serde(default)]
+        stable_id: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// F1-1-8 (ADR 0021 §2): segunda via de aprovação do MESMO `stable_id` já
+    /// resolvido — no-op auditado, emitido NO MÁXIMO 1× por pedido (anti-amplificação,
+    /// ADR 0003). Aprovar 2× injeta exatamente 1×. META.
+    ApprovalDuplicateIgnored {
+        #[serde(default)]
+        stable_id: String,
+    },
+    /// F1-1-7 (mitigação de FP como produto — decisão do Maestro): o humano marcou o
+    /// item como "não era um pedido" (botão da fila/toast). Remove a pendência SEM
+    /// decidir permissão (não é deny — nada será escrito nem negado ao agente) e
+    /// alimenta a telemetria de FP do detector (`record_false_positive`, rótulo
+    /// externo — nunca auto-inferido, #28174). META.
+    PermissionDismissed {
+        #[serde(default)]
+        stable_id: String,
+    },
+    /// F1-1-7 (allowlist por nó — decisão do Maestro): liga/desliga o fallback de
+    /// detecção por grid PARA UM NÓ (CLI cujo output dispara FPs estruturais).
+    /// Persistido como evento e REVERSÍVEL: o último evento do nó vence (padrão
+    /// CostLedger) — `muted:false` re-liga. Só afeta a camada de GRID; a detecção
+    /// por hook continua (é estrutural, não-heurística). META.
+    NodeDetectionMuted {
+        #[serde(default)]
+        node_id: String,
+        /// Default `true`: payload mínimo `{node_id}` significa "mutado" (casa com o
+        /// nome do evento; `false` só existe explicitamente, no unmute).
+        #[serde(default = "default_muted")]
+        muted: bool,
+    },
+}
+
+/// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
+/// payload mínimo casar com a semântica do nome do evento.
+fn default_muted() -> bool {
+    true
 }
 
 impl DomainEvent {
@@ -518,6 +635,12 @@ impl DomainEvent {
             DomainEvent::CliDetected { .. } => "CliDetected",
             DomainEvent::PermissionAsked { .. } => "PermissionAsked",
             DomainEvent::RoleTemplateSaved { .. } => "RoleTemplateSaved",
+            DomainEvent::PermissionResolved { .. } => "PermissionResolved",
+            DomainEvent::ApprovalInjected { .. } => "ApprovalInjected",
+            DomainEvent::ApprovalAborted { .. } => "ApprovalAborted",
+            DomainEvent::ApprovalDuplicateIgnored { .. } => "ApprovalDuplicateIgnored",
+            DomainEvent::PermissionDismissed { .. } => "PermissionDismissed",
+            DomainEvent::NodeDetectionMuted { .. } => "NodeDetectionMuted",
         }
     }
 
@@ -533,8 +656,9 @@ impl DomainEvent {
     }
 
     /// Reconstrói um evento a partir de um registro persistido: aplica [`upcast`] e
-    /// então desserializa na forma corrente.
-    fn from_record(
+    /// então desserializa na forma corrente. `pub(crate)` para projeções-irmãs que
+    /// varrem `EventRecord`s (F1-1-7: `attention::AttentionQueue::replay`).
+    pub(crate) fn from_record(
         kind: &str,
         version: u32,
         payload: serde_json::Value,
@@ -774,6 +898,16 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // F1-2-3 (parte 2): papel custom salvo é META (biblioteca de papéis); o modal
         // reconstrói varrendo o log (último `name` vence) — sem efeito na projeção.
         | DomainEvent::RoleTemplateSaved { .. }
+        // F1-1-7/8 (ADR 0021): decisão/efeito/abort/no-op da aprovação + dismiss de FP
+        // + mute do fallback são META (livro-razão da fila de atenção e do ledger de
+        // idempotência do executor) — a fila (attention.rs) e o executor (F1-1-8)
+        // reconstroem varrendo o log; sem efeito na projeção do canvas.
+        | DomainEvent::PermissionResolved { .. }
+        | DomainEvent::ApprovalInjected { .. }
+        | DomainEvent::ApprovalAborted { .. }
+        | DomainEvent::ApprovalDuplicateIgnored { .. }
+        | DomainEvent::PermissionDismissed { .. }
+        | DomainEvent::NodeDetectionMuted { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
@@ -2009,6 +2143,142 @@ mod tests {
                     PermissionEvidence::Grid,
                     "evidência ausente lê o default conservador (grid)"
                 );
+            }
+            other => panic!("kind errado: {other:?}"),
+        }
+    }
+
+    // ──────────────── F1-1-7/8 · família Approval*/PermissionResolved (ADR 0021) ────────────────
+
+    /// F1-1-7/8: a família inteira persiste com round-trip dos campos (incl. snake_case
+    /// dos enums), é META (projeção do canvas intacta) e o replay repetido não duplica.
+    #[test]
+    #[serial]
+    fn approval_family_round_trips_meta_and_replays_clean() {
+        let tmp = TempDir::new("approval-family");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let before = store.project().expect("project 1");
+
+        store
+            .append(&DomainEvent::PermissionResolved {
+                stable_id: "pa-1".into(),
+                decision: ApprovalDecision::Approve,
+                via: ResolutionVia::Human,
+            })
+            .expect("resolved");
+        store
+            .append(&DomainEvent::ApprovalInjected {
+                stable_id: "pa-1".into(),
+                vt_snapshot_hash: "abc123".into(),
+            })
+            .expect("injected");
+        store
+            .append(&DomainEvent::ApprovalAborted {
+                stable_id: "pa-2".into(),
+                reason: "screen_changed".into(),
+            })
+            .expect("aborted");
+        store
+            .append(&DomainEvent::ApprovalDuplicateIgnored {
+                stable_id: "pa-1".into(),
+            })
+            .expect("dup");
+        store
+            .append(&DomainEvent::PermissionDismissed {
+                stable_id: "pa-3".into(),
+            })
+            .expect("dismissed");
+        store
+            .append(&DomainEvent::NodeDetectionMuted {
+                node_id: "n1".into(),
+                muted: true,
+            })
+            .expect("muted");
+
+        let recs = store.events().expect("events");
+        let by_kind = |k: &str| {
+            recs.iter()
+                .find(|r| r.kind == k)
+                .unwrap_or_else(|| panic!("{k} ausente do log"))
+        };
+        let resolved = by_kind("PermissionResolved");
+        assert_eq!(resolved.payload["decision"], "approve", "snake_case");
+        assert_eq!(resolved.payload["via"], "human", "snake_case");
+        assert_eq!(resolved.payload["stable_id"], "pa-1");
+        assert_eq!(
+            by_kind("ApprovalInjected").payload["vt_snapshot_hash"],
+            "abc123"
+        );
+        assert_eq!(
+            by_kind("ApprovalAborted").payload["reason"],
+            "screen_changed"
+        );
+        assert_eq!(
+            by_kind("ApprovalDuplicateIgnored").payload["stable_id"],
+            "pa-1"
+        );
+        assert_eq!(by_kind("PermissionDismissed").payload["stable_id"], "pa-3");
+        assert_eq!(by_kind("NodeDetectionMuted").payload["muted"], true);
+
+        // META: projeção intacta; replay 2× = mesmo fingerprint, mesma contagem.
+        let after = store.project().expect("project 2");
+        assert_eq!(before.fingerprint(), after.fingerprint());
+        let count = store.event_count().expect("count");
+        assert_eq!(
+            store.project().expect("replay").fingerprint(),
+            after.fingerprint()
+        );
+        assert_eq!(store.event_count().expect("count 2"), count);
+    }
+
+    /// F1-1-7/8 (aditividade + doutrina): payload PARCIAL replaya com defaults
+    /// CONSERVADORES — `PermissionResolved` sem decision/via lê `deny`/`timeout`
+    /// (degradação nunca fabrica aprovação nem gesto humano — ADR 0021 §3/§5);
+    /// `NodeDetectionMuted` mínimo lê `muted:true` (casa com o nome do evento).
+    #[test]
+    #[serial]
+    fn approval_partial_payloads_replay_with_conservative_defaults() {
+        let tmp = TempDir::new("approval-partial");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .insert_raw(
+                "PermissionResolved",
+                1,
+                serde_json::json!({ "event": "PermissionResolved", "stable_id": "pa-x" }),
+            )
+            .expect("raw resolved");
+        store
+            .insert_raw(
+                "NodeDetectionMuted",
+                1,
+                serde_json::json!({ "event": "NodeDetectionMuted", "node_id": "n1" }),
+            )
+            .expect("raw muted");
+        store.project().expect("replay com payloads parciais");
+
+        let recs = store.events().expect("events");
+        let resolved = recs
+            .iter()
+            .find(|r| r.kind == "PermissionResolved")
+            .expect("registro resolved");
+        match DomainEvent::from_record(&resolved.kind, resolved.version, resolved.payload.clone())
+            .expect("desserializa")
+        {
+            DomainEvent::PermissionResolved { decision, via, .. } => {
+                assert_eq!(decision, ApprovalDecision::Deny, "default fail-safe");
+                assert_eq!(via, ResolutionVia::Timeout, "default não-fabrica-humano");
+            }
+            other => panic!("kind errado: {other:?}"),
+        }
+        let muted = recs
+            .iter()
+            .find(|r| r.kind == "NodeDetectionMuted")
+            .expect("registro muted");
+        match DomainEvent::from_record(&muted.kind, muted.version, muted.payload.clone())
+            .expect("desserializa")
+        {
+            DomainEvent::NodeDetectionMuted { muted, .. } => {
+                assert!(muted, "payload mínimo = mutado (semântica do nome)");
             }
             other => panic!("kind errado: {other:?}"),
         }

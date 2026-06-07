@@ -24,7 +24,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Re-exports da camada de PTY/VT para abrir terminais e ler o grid (gate E2E inclusive).
-pub use lina_cli_profiles::CliProfile;
+pub use lina_cli_profiles::{ApprovalKeys, CliProfile};
 /// Re-exports do contrato de UI para os consumidores do core (e o host headless de teste).
 pub use lina_host::{BusTarget, HeadlessUiHost, HostEvent, NodeId, NodeKind, UiHost};
 pub use lina_pty::{PtyCommand, PtyManager};
@@ -33,8 +33,8 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
 pub use events::{
-    apply, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, FlushState,
-    PermissionEvidence, ProjectedNode, ProjectedState, StoreError,
+    apply, ApprovalDecision, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore,
+    FlushState, PermissionEvidence, ProjectedNode, ProjectedState, ResolutionVia, StoreError,
 };
 
 /// W4-1: CliDiscovery — varredura do `PATH` por CLIs de IA (substrato do check-up de onboarding).
@@ -90,6 +90,24 @@ pub use lifecycle::{LifecycleEngine, LifecycleError, SampleOutcome};
 /// ao `PreToolUse` pendente + fallback por regex no grid via `VtBackend`, FP medido).
 pub mod permission_detect;
 pub use permission_detect::{DetectionTelemetry, PermissionAsk, PermissionDetector};
+
+/// F1-1-7: fila de atenção UNIFICADA (custódia + permissão) — projeção do event log com
+/// precedência custódia > permissão, round-robin por nó e escalação visual aos 5 min
+/// (ADR 0021 §3/§6 — esta projeção nunca escreve no PTY; o write é F1-1-8).
+pub mod attention;
+pub use attention::{
+    AttentionEvidence, AttentionItem, AttentionKind, AttentionQueue, AttentionState,
+    ESCALATE_AFTER_MS, LAYER_MERGE_WINDOW_MS,
+};
+
+/// F1-1-8 (ADR 0021): confirmação de aprovação — snapshot da região do prompt (Captura 1),
+/// porta única de escrita validada contra a tela (Captura 2) e idempotência por projeção.
+pub mod approval;
+pub use approval::{
+    check_screen, prompt_snapshot_hash, AbortReason, ApprovalExecutor, ApprovalGesture,
+    ApprovalLedger, ApprovalOutcome, ApprovalOutcomeKind, ApprovalPort, PortError, PortOutcome,
+    ScreenCheck, PROMPT_REGION_ROWS,
+};
 
 pub mod bench;
 
@@ -468,6 +486,45 @@ impl PtyHost {
         let term = self.terminals.get(&node)?;
         let guard = lock(&term.shared.vt);
         Some(f(&**guard))
+    }
+
+    /// F1-1-8 (ADR 0021 §1, Captura 2): a **porta única** de entrega de aprovação —
+    /// re-snapshot da região do prompt ([`approval::prompt_snapshot_hash`]), comparação
+    /// com `expected_hash` e write de `keys`, tudo SOB o mesmo lock do `VtBackend` que
+    /// serializa o `advance` do `flush()`: nenhum byte do PTY é aplicado ao grid entre o
+    /// check e o write — a atomicidade local do "mesmo turno do loop". Tela divergente ⇒
+    /// NENHUM byte é escrito (fail-safe). `region_rows` = o `K` da Captura 1 (mesmo valor,
+    /// senão nunca casa). Output do filho ainda no buffer do kernel é a janela irredutível
+    /// documentada (ADR §4 R2) — reduzida, não eliminada.
+    pub fn deliver_approval(
+        &self,
+        node: NodeId,
+        expected_hash: &str,
+        keys: &[u8],
+        region_rows: usize,
+    ) -> Result<approval::PortOutcome, PtyHostError> {
+        let term = self
+            .terminals
+            .get(&node)
+            .ok_or(PtyHostError::NotFound(node))?;
+        let vt = lock(&term.shared.vt);
+        match approval::check_screen(&**vt, expected_hash, region_rows) {
+            approval::ScreenCheck::Changed { current_hash } => {
+                Ok(approval::PortOutcome::ScreenChanged { current_hash })
+            }
+            approval::ScreenCheck::Match { vt_snapshot_hash } => {
+                // Write com o guard do VT ainda vivo: o reader-loop espera o lock para
+                // aplicar o próximo lote — check↔write sem `advance` intercalado.
+                let mut writer = lock(&term.writer);
+                writer
+                    .write_all(keys)
+                    .map_err(|e| PtyHostError::Io(node, e.to_string()))?;
+                writer
+                    .flush()
+                    .map_err(|e| PtyHostError::Io(node, e.to_string()))?;
+                Ok(approval::PortOutcome::Written { vt_snapshot_hash })
+            }
+        }
     }
 
     /// Quantos terminais estão em `Running`.
