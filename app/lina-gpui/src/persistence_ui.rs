@@ -527,7 +527,9 @@ impl PersistenceModel {
 
 // ═══════════════════════════════ entrada (main.rs) ═══════════════════════════════
 
-/// Mostra o painel? Env-gated (`LINA_PERSIST_PANEL=1|true`) para não perturbar a demo do canvas.
+/// AUTO-ABRE o painel no boot? Env-gated (`LINA_PERSIST_PANEL=1|true`) — hoje é só um
+/// **override de dev**: em produção a janela abre SOB DEMANDA pela engrenagem da barra, `⌘,`
+/// ou paleta (fix de tela F1-2-1 — antes o tema era inalcançável sem a env, violando inv#6).
 #[must_use]
 pub fn should_show() -> bool {
     matches!(

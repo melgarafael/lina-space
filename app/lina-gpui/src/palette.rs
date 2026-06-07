@@ -21,10 +21,32 @@ pub enum PaletteAction {
     FocusNode(NodeId),
     /// W4-3: alterna o freio (pausa/retoma a auto-orquestração).
     ToggleBrake,
+    /// F1-2-1 (fix de tela): abre a janela de Ajustes (T7 — Aparência: tema/acento, Espaços, T8).
+    OpenSettings,
     /// M3 (placeholder até `creators.rs`): nova nota.
     NewNote,
     /// M4 (placeholder até `creators.rs`): nova pasta.
     NewFolder,
+}
+
+/// Comandos BASE da paleta (independentes do roster) — puro p/ o guardião de entry points.
+/// O rótulo de Ajustes carrega os termos que o T7§A manda a paleta achar: "tema", "cor",
+/// "aparência", "claro/escuro" (fix de tela: o tema era INALCANÇÁVEL sem env de dev — inv#6).
+#[must_use]
+pub fn base_commands() -> Vec<Command> {
+    vec![
+        Command::new("✦ Novo agente", PaletteAction::NewAgent),
+        Command::new(
+            "🎨 Aparência: tema e cores (claro/escuro) — Ajustes",
+            PaletteAction::OpenSettings,
+        ),
+        Command::new(
+            "⏸ Pausar / retomar orquestração (freio)",
+            PaletteAction::ToggleBrake,
+        ),
+        Command::new("📝 Nova nota", PaletteAction::NewNote),
+        Command::new("📁 Nova pasta", PaletteAction::NewFolder),
+    ]
 }
 
 /// Um comando listável: rótulo (o que o humano lê/filtra) + ação.
@@ -235,6 +257,26 @@ pub fn fuzzy_match(query: &str, label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **GUARDIÃO (fix de tela F1-2-1/inv#6)**: o tema NUNCA volta a ficar inalcançável — os
+    /// comandos base da paleta SEMPRE incluem a entrada de Ajustes/Aparência, encontrável pelos
+    /// termos do T7§A ("tema", "cor", "aparência", "claro/escuro"). Quem remover a entrada
+    /// quebra este teste — e o fundador volta a não achar o botão.
+    #[test]
+    fn settings_entry_is_always_reachable_from_palette() {
+        let cmds = base_commands();
+        let settings = cmds
+            .iter()
+            .find(|c| matches!(c.action, PaletteAction::OpenSettings))
+            .expect("entrada de Ajustes nos comandos base");
+        let label = settings.label.to_lowercase();
+        for term in ["tema", "cor", "aparência", "claro", "escuro", "ajustes"] {
+            assert!(
+                label.contains(term),
+                "o rótulo precisa ser encontrável por {term:?} (T7§A): {label}"
+            );
+        }
+    }
     use uuid::Uuid;
 
     fn cmds() -> Vec<Command> {

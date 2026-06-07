@@ -579,12 +579,8 @@ impl WorkspaceView {
     /// estáticos + "Focar: <nó>" por nó vivo.
     fn palette_commands(&self) -> Vec<palette::Command> {
         use palette::{Command, PaletteAction as A};
-        let mut cmds = vec![
-            Command::new("✦ Novo agente", A::NewAgent),
-            Command::new("⏸ Pausar / retomar orquestração (freio)", A::ToggleBrake),
-            Command::new("📝 Nova nota", A::NewNote),
-            Command::new("📁 Nova pasta", A::NewFolder),
-        ];
+        // Base pura (inclui "Aparência: tema e cores" — guardião em palette::tests) + roster vivo.
+        let mut cmds = palette::base_commands();
         for (id, nv) in self.nodes.cards() {
             cmds.push(Command::new(
                 format!("🎯 Focar: {}", nv.name),
@@ -618,10 +614,32 @@ impl WorkspaceView {
                 self.reveal(node, window);
             }
             A::ToggleBrake => lock(&self.brake).toggle_requested = true,
+            A::OpenSettings => self.open_settings_window(cx),
             // M3/M4: abre o modo CRIAÇÃO (digita o título → Enter cria + foca; ver `handle_key`).
             A::NewNote => self.creating = Some((creators::CreatorKind::Note, String::new())),
             A::NewFolder => self.creating = Some((creators::CreatorKind::Folder, String::new())),
         }
+    }
+
+    /// **Fix de tela (F1-2-1/inv#6)**: abre a janela de Ajustes (T7 — Aparência/Espaços/T8) SOB
+    /// DEMANDA — engrenagem na barra, `⌘,` e paleta. Antes só existia atrás de
+    /// `LINA_PERSIST_PANEL=1` (dev) e o tema era INALCANÇÁVEL em produção. Janela única: se já
+    /// há um painel aberto, reativa em vez de duplicar.
+    fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        let existing = cx
+            .windows()
+            .into_iter()
+            .find_map(|w| w.downcast::<persistence_ui::PersistenceView>());
+        if let Some(handle) = existing {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            return;
+        }
+        persistence_ui::open_window(
+            cx,
+            Arc::clone(&self.nodes.model),
+            self.nodes.store_handle(),
+            self.nodes.lina_home().join("events"),
+        );
     }
 
     // ───────────────────────── F1-2-2 · M6/M6-E (modal de Agente) ─────────────────────────
@@ -1194,6 +1212,11 @@ impl WorkspaceView {
             // Modal: consome a tecla de filtro p/ o IME não vazar a query ao PTY (ver naming acima).
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        // ⌘, abre Ajustes (padrão macOS — entry point do T7; fix de tela: tema alcançável).
+        if ks.modifiers.platform && ks.key == "," {
+            self.open_settings_window(cx);
             return;
         }
         // ⌘N abre o M6 "Novo Agente" (atalho canônico do fluxo (a)).
@@ -1978,6 +2001,23 @@ impl Render for WorkspaceView {
                     view.camera.reset();
                 }))
                 .child(text!("🏠 Centralizar")),
+        );
+
+        // Fix de tela (F1-2-1/inv#6): Ajustes DESCOBRÍVEL — engrenagem ao lado de Centralizar
+        // (⌘, e a paleta também abrem; o env LINA_PERSIST_PANEL segue só como auto-open de dev).
+        topbar = topbar.child(
+            div()
+                .id("settings-btn")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(th.surface.raised))
+                .text_color(rgb(th.text.primary))
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                    view.open_settings_window(cx);
+                }))
+                .child(text!("⚙️ Ajustes")),
         );
 
         if recovering {

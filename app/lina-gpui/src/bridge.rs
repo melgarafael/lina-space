@@ -2166,6 +2166,13 @@ impl NodeManager {
         &self.lina_dir
     }
 
+    /// Handle do event store vivo (clone do `Arc`) — p/ a janela de Ajustes aberta SOB DEMANDA
+    /// (fix de tela F1-2-1: o painel era env-gated e o tema ficava inalcançável em produção).
+    #[must_use]
+    pub fn store_handle(&self) -> Arc<Mutex<EventStore>> {
+        Arc::clone(&self.store)
+    }
+
     /// **F1-2-2 (M6-E)** — o papel CANÔNICO corrente de um nó, lido da PROJEÇÃO do log (o
     /// `NodeView` de UI não carrega role/cli — projection-only, lição do W4-2). Replay sob
     /// demanda: chamado só ao ABRIR o modal de edição, nunca por frame.

@@ -43,7 +43,13 @@ pub const COPY_NAME_LABEL: &str = "Nome";
 pub const COPY_NAME_PLACEHOLDER: &str = "Ex.: Revisor, Designer de Landing…";
 pub const COPY_ROLE_LABEL: &str = "Papel";
 pub const COPY_ROLE_PLACEHOLDER: &str =
-    "Escolha um papel pelo botão Trocar — ou descreva pelo nome, que eu sugiro.";
+    "O papel nasce do nome: digite o nome acima que eu sugiro aqui. Para escolher você mesmo, use o Trocar.";
+/// Fix de tela: nome sem padrão conhecido (ex.: "Teles") mostra fallback HONESTO no campo —
+/// nunca silêncio (o fundador digitou e "nada aconteceu").
+pub const COPY_ROLE_NO_MATCH: &str =
+    "Não reconheci um papel nesse nome — escolha um com o Trocar, ou crie assim mesmo (dá para definir depois).";
+/// Hint do preview da sugestão DENTRO do campo Papel (aceita por Tab ou clique).
+pub const COPY_ROLE_SUGGESTED_HINT: &str = "sugestão — aceite com Tab ou clique";
 pub const COPY_ROLE_SWAP: &str = "Trocar";
 pub const COPY_CWD_LABEL: &str = "Pasta de trabalho";
 pub const COPY_CWD_DEFAULT: &str = "a pasta deste Espaço";
@@ -259,6 +265,9 @@ pub struct AgentModal {
     discard_armed: bool,
     /// Tooltip "por quê" aberto (transparência da sugestão).
     why_open: bool,
+    /// O co-piloto RODOU (3+ chars, pausa) e não reconheceu papel — o campo mostra o fallback
+    /// honesto em vez de silêncio (fix de tela). Limpa ao sugerir/aceitar/trocar.
+    no_match: bool,
     /// Nomes já existentes no Espaço (dedup "(2)").
     existing: Vec<String>,
     /// [Trocar]: índice do ciclo pela biblioteca de papéis do registry.
@@ -288,6 +297,7 @@ impl AgentModal {
             error: None,
             discard_armed: false,
             why_open: false,
+            no_match: false,
             existing,
             swap_idx: 0,
             suggester,
@@ -452,6 +462,8 @@ impl AgentModal {
         }
         self.typing_ticks = None;
         let fresh = self.suggester.suggest(&self.name);
+        // Fix de tela: rodou e NÃO reconheceu (nome com 3+ chars) → fallback honesto no campo.
+        self.no_match = fresh.is_none() && self.name.trim().len() >= 3;
         match fresh {
             Some(s) => {
                 // papel manual ([Trocar]) não é atropelado; igual ao aplicado = sem ghost (ruído).
@@ -480,10 +492,17 @@ impl AgentModal {
                 self.role = Some(s);
                 self.role_pinned = false;
                 self.why_open = false;
+                self.no_match = false;
                 true
             }
             None => false,
         }
+    }
+
+    /// O co-piloto rodou e não reconheceu papel no nome atual (fallback honesto no campo).
+    #[must_use]
+    pub fn copilot_no_match(&self) -> bool {
+        self.no_match
     }
 
     /// [Trocar]: cicla a biblioteca de papéis (registry W3-1 humanizado — template-driven; a
@@ -505,6 +524,7 @@ impl AgentModal {
         });
         self.role_pinned = true;
         self.suggestion = None;
+        self.no_match = false;
     }
 
     pub fn toggle_why(&mut self) {
@@ -857,9 +877,14 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
         col = col.child(ghost);
     }
 
-    // ── cartão de Papel (humano: nome + 1 frase; nunca textarea/YAML) ──
-    let role_card = match modal.role() {
-        Some(r) => div()
+    // ── cartão de Papel — M6 manda CARTÃO humano (ícone + nome + 1 frase), nunca textarea/
+    //    YAML; a edição de instruções é o "Ver e ajustar" da F1-2-3. Fix de tela: 4 estados
+    //    explícitos, todos com cara do que são — (a) APLICADO: read-only deliberado (sem cursor
+    //    de clique); (b) PREVIEW da sugestão VIVA no campo enquanto digita (clicável: aceita);
+    //    (c) co-piloto rodou e não reconheceu → fallback HONESTO (nunca silêncio); (d) vazio:
+    //    copy que diz onde digitar (o nome, acima) e como escolher (Trocar).
+    let role_card: AnyElement = match (modal.role(), modal.suggestion()) {
+        (Some(r), _) => div()
             .flex()
             .flex_col()
             .gap_1()
@@ -879,14 +904,56 @@ pub fn render(modal: &AgentModal, cx: &mut Context<WorkspaceView>) -> AnyElement
                 div()
                     .text_color(rgb(th.text.secondary))
                     .child(text!(r.blurb.clone())),
-            ),
-        None => div()
+            )
+            .into_any_element(),
+        (None, Some(s)) => div()
+            .id("m6-role-preview")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(th.surface.panel))
+            .border_1()
+            .border_color(rgb(th.accent.primary))
+            .cursor_pointer()
+            .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                v.modal_accept_suggestion(cx);
+            }))
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(th.accent.primary))
+                    .child(text!(format!("✨ {}", s.label))),
+            )
+            .child(
+                div()
+                    .text_color(rgb(th.text.secondary))
+                    .child(text!(s.blurb.clone())),
+            )
+            .child(
+                div()
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(COPY_ROLE_SUGGESTED_HINT)),
+            )
+            .into_any_element(),
+        (None, None) if modal.copilot_no_match() => div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(th.surface.panel))
+            .text_color(rgb(th.text.secondary))
+            .child(text!(COPY_ROLE_NO_MATCH))
+            .into_any_element(),
+        _ => div()
             .px_3()
             .py_2()
             .rounded_md()
             .bg(rgb(th.surface.panel))
             .text_color(rgb(th.text.muted))
-            .child(text!(COPY_ROLE_PLACEHOLDER)),
+            .child(text!(COPY_ROLE_PLACEHOLDER))
+            .into_any_element(),
     };
     col = col.child(
         div()
@@ -1337,6 +1404,48 @@ kind = "idle"
         assert_eq!(p.role.as_deref(), Some(role_now.as_str()));
     }
 
+    /// **GUARDIÃO (fix de tela)**: nome SEM padrão conhecido ("Teles", o caso do fundador) →
+    /// o co-piloto roda e o campo mostra o fallback HONESTO (`copilot_no_match`), nunca
+    /// silêncio. Nome conhecido depois → o fallback dá lugar à sugestão viva no campo.
+    #[test]
+    fn unknown_name_shows_honest_fallback_never_silence() {
+        let mut m = modal();
+        type_str(&mut m, "Teles");
+        assert!(!m.copilot_no_match(), "antes da pausa, sem veredito");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert!(m.suggestion().is_none(), "'Teles' não tem papel conhecido");
+        assert!(
+            m.copilot_no_match(),
+            "rodou e não reconheceu → fallback honesto NO CAMPO (nunca silêncio)"
+        );
+        // nome que sugere → o fallback sai e a sugestão viva entra no campo.
+        for _ in 0.."Teles".len() {
+            m.backspace();
+        }
+        type_str(&mut m, "Revisor");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m.tick();
+        }
+        assert!(m.suggestion().is_some(), "sugestão viva no campo");
+        assert!(!m.copilot_no_match(), "fallback deu lugar à sugestão");
+        // aceitar (clique no preview/Tab) limpa tudo e aplica.
+        assert!(m.accept_suggestion());
+        assert!(!m.copilot_no_match());
+        assert_eq!(m.role().unwrap().role, "reviewer");
+        // [Trocar] também limpa o no_match (escolha manual é resposta válida ao fallback).
+        let mut m2 = modal();
+        type_str(&mut m2, "Teles");
+        for _ in 0..SUGGEST_DEBOUNCE_TICKS {
+            m2.tick();
+        }
+        assert!(m2.copilot_no_match());
+        m2.cycle_role();
+        assert!(!m2.copilot_no_match(), "Trocar resolve o fallback");
+        assert!(m2.role().is_some());
+    }
+
     /// Critério 2 (auditoria de copy): NENHUM estado do modal mostra YAML/TOML/"profile"/
     /// "terminal" — o leigo nunca vê jargão (anti-padrões 1/2/5 do fluxo (a)).
     #[test]
@@ -1359,6 +1468,8 @@ kind = "idle"
             COPY_NAME_PLACEHOLDER,
             COPY_ROLE_LABEL,
             COPY_ROLE_PLACEHOLDER,
+            COPY_ROLE_NO_MATCH,
+            COPY_ROLE_SUGGESTED_HINT,
             COPY_ROLE_SWAP,
             COPY_CWD_LABEL,
             COPY_CWD_DEFAULT,
