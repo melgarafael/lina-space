@@ -219,6 +219,11 @@ pub struct Settings {
     pub reduce_motion: bool,
     /// Pasta padrão de novos Espaços.
     pub default_cwd: String,
+    /// F1-1-7: mute do lembrete sonoro da Fila de Atenção (som 1×/30s com fila >0).
+    /// `serde(default)` = som LIGADO (ON discreto, 13.13 achado 9); settings.json
+    /// antigos (sem o campo) seguem carregando sem resetar as demais escolhas.
+    #[serde(default)]
+    pub attention_sound_muted: bool,
 }
 
 fn default_accent_setting() -> String {
@@ -232,6 +237,7 @@ impl Default for Settings {
             accent: default_accent_setting(),
             reduce_motion: false,
             default_cwd: String::new(),
+            attention_sound_muted: false,
         }
     }
 }
@@ -511,6 +517,12 @@ impl PersistenceModel {
     /// T7: alterna "reduzir animações" e persiste.
     pub fn toggle_reduce_motion(&mut self) {
         self.settings.reduce_motion = !self.settings.reduce_motion;
+        self.persist_settings();
+    }
+
+    /// F1-1-7: alterna o som da Fila de Atenção (mute) e persiste.
+    pub fn toggle_attention_sound(&mut self) {
+        self.settings.attention_sound_muted = !self.settings.attention_sound_muted;
         self.persist_settings();
     }
 
@@ -970,6 +982,39 @@ impl PersistenceView {
                         "(desligar reduz o movimento na tela — acessibilidade)"
                     ))),
             )
+            // F1-1-7: som da Fila de Atenção (1 toque suave a cada 30s enquanto algum
+            // agente espera você). Rótulo pelo ESTADO (mesma doutrina do toggle acima).
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(160.0))
+                            .text_color(rgb(th.text.primary))
+                            .child(text!("Som da Fila de Atenção")),
+                    )
+                    .child(self.button(
+                        "toggle-attention-sound",
+                        if s.attention_sound_muted {
+                            "desligado"
+                        } else {
+                            "ligado"
+                        },
+                        if s.attention_sound_muted {
+                            (th.state.warning, th.text.on_emphasis)
+                        } else {
+                            (th.surface.raised, th.text.bright)
+                        },
+                        cx,
+                        |v, _w, _cx| v.model.toggle_attention_sound(),
+                    ))
+                    .child(div().text_color(rgb(th.text.muted)).child(text!(
+                        "(um toque discreto a cada 30s enquanto um agente espera você)"
+                    ))),
+            )
             .child(
                 div()
                     .flex()
@@ -1230,6 +1275,43 @@ mod tests {
         assert_eq!(reloaded.theme, "claro");
         assert!(reloaded.reduce_motion);
         assert_eq!(reloaded.default_cwd, "/tmp/projetos");
+        theme::apply(theme::Mode::Dark, theme::DEFAULT_ACCENT); // não vaza estado global
+    }
+
+    /// F1-1-7: o mute do lembrete sonoro da Fila de Atenção PERSISTE (settings.json),
+    /// nasce LIGADO (ON discreto — ux-flows E6) e um settings.json ANTIGO (sem o campo)
+    /// segue carregando com o default (`serde(default)` — compat shape antigo).
+    #[test]
+    fn attention_sound_mute_persists_and_defaults_on() {
+        let _guard = crate::theme::THEME_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new("att-mute");
+        let events = seed_workspace(tmp.path(), "App", "T1");
+        let store = Arc::new(Mutex::new(EventStore::open(&events).expect("open")));
+        let shared = shared_with(0, false);
+        {
+            let mut model =
+                PersistenceModel::new(shared, store, events.clone(), tmp.path().to_path_buf());
+            assert!(
+                !model.settings().attention_sound_muted,
+                "default: som LIGADO (mute=false)"
+            );
+            model.toggle_attention_sound();
+        }
+        assert!(
+            load_settings(&events).attention_sound_muted,
+            "mute persistiu após 'reabrir'"
+        );
+        // settings.json de versão ANTERIOR (sem o campo) → default, sem resetar o resto.
+        std::fs::write(
+            events.join("settings.json"),
+            r#"{"theme":"claro","reduce_motion":true,"default_cwd":"/x"}"#,
+        )
+        .expect("settings antigo");
+        let old = load_settings(&events);
+        assert!(!old.attention_sound_muted, "shape antigo → som ligado");
+        assert_eq!(old.theme, "claro", "demais escolhas preservadas");
         theme::apply(theme::Mode::Dark, theme::DEFAULT_ACCENT); // não vaza estado global
     }
 

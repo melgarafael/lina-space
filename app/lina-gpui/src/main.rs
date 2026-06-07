@@ -41,6 +41,9 @@ mod role_suggester;
 mod agent_modal;
 // F1-1-5 (P6 §Atividade): dashboard vivo por terminal — estado/motor/custo~/atividade. gpui-free.
 mod dashboard;
+// F1-1-7: fila de atenção UNIFICADA + toast (permissão + custódia). Lógica de apresentação em
+// funções puras (gpui-free, testável headless); render fina. ZERO write no PTY (ADR 0021 §6).
+mod attention_ui;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -68,9 +71,9 @@ use lina_bootstrap::Autonomy;
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
     normalize_sel, screen_to_cell, scrub_pty_secret_env, shell_cmd, spawn_pump, wire_terminal,
-    A2aTrigger, BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk,
-    GpuiBridgeHost, Grid, MailboxPump, Model, NodeManager, NodeView, PtrAction, SharedModel,
-    CARD_H, CARD_W, CELL_H, CELL_W,
+    A2aTrigger, AttentionHub, BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput,
+    CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model, NodeManager, NodeView, PtrAction,
+    SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -474,6 +477,26 @@ struct WorkspaceView {
     /// (~[`FPS_WINDOW`] frames OU ~[`FPS_WINDOW_MS`] de render ativo). Lacunas de OCIOSIDADE (intervalo
     /// > [`IDLE_GAP_MS`], sem redraw) são descartadas p/ não envenenar p50/p95/p99.
     frametime_ms: Vec<f64>,
+    /// F1-1-7: fiação da Fila de Atenção (projeção `AttentionQueue` do core ↔ log ↔ desk).
+    attention: Arc<AttentionHub>,
+    /// F1-1-7: snapshot da fila do frame (sincronizado pelo heartbeat — ordenação do CORE).
+    attention_items: Vec<lina_core::AttentionItem>,
+    /// F1-1-7: memória do toast (countdown/«Depois»/snooze do colapsado) — gpui-free, testada.
+    attention_machine: attention_ui::ToastMachine,
+    /// F1-1-7: painel compacto da fila aberto? (badge 🔔 / ⌘J).
+    attention_panel_open: bool,
+    /// F1-1-7: instante do último lembrete sonoro (1×/30s enquanto fila >0).
+    attention_sound_last: Option<Instant>,
+    /// F1-1-7: cache do mute persistido (settings.json — recarregado pelo heartbeat).
+    attention_sound_muted: bool,
+    /// F1-1-7: último refresh do cache do mute (re-lê ~2s quando a fila está viva).
+    attention_settings_at: Option<Instant>,
+    /// F1-1-7 (sonda `[ATT]`): último diagnóstico da fila logado — loga só na MUDANÇA
+    /// (items/toast/badge), sem spammar o stderr (idioma diag_last_frame/pulse). O
+    /// Maestro valida por DADOS o que está na tela sem precisar vê-la.
+    attention_diag_last: String,
+    /// F1-1-7: onde settings.json mora (o MESMO dir do event log — padrão T7).
+    settings_dir: PathBuf,
 }
 
 impl WorkspaceView {
@@ -487,6 +510,8 @@ impl WorkspaceView {
         desk: Desk,
         brake: wiring::Brake,
         dash: dashboard::DashWiring,
+        attention: Arc<AttentionHub>,
+        settings_dir: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -539,6 +564,20 @@ impl WorkspaceView {
             }
         })
         .detach();
+        // F1-1-7: HEARTBEAT da Fila de Atenção — a fila muda em threads gpui-free
+        // (detector/pumps NÃO acordam o event loop; lição: animação precisa de dirty).
+        // Ritmo adaptativo: ~30fps com toast/pulso vivos (countdown/badge suaves);
+        // ~4Hz de dados quando só há pendência parada; o sync re-replaya SÓ quando o
+        // event_count mudou (padrão CostLedger — barato no ocioso).
+        cx.spawn(async move |this, cx| loop {
+            let Ok(animating) = this.update(cx, |view, cx| view.attention_heartbeat(cx)) else {
+                break;
+            };
+            cx.background_executor()
+                .timer(Duration::from_millis(if animating { 33 } else { 250 }))
+                .await;
+        })
+        .detach();
         Self {
             nodes,
             input,
@@ -575,6 +614,143 @@ impl WorkspaceView {
             ime_marked: None,
             last_frame_at: None,
             frametime_ms: Vec::with_capacity(FPS_WINDOW),
+            attention,
+            attention_items: Vec::new(),
+            attention_machine: attention_ui::ToastMachine::default(),
+            attention_panel_open: false,
+            attention_sound_last: None,
+            attention_sound_muted: false,
+            attention_settings_at: None,
+            attention_diag_last: String::new(),
+            settings_dir,
+        }
+    }
+
+    // ───────────────────────── F1-1-7 · Fila de Atenção (gestos + heartbeat) ─────────────────────────
+
+    /// Um tick da fila: sincroniza com o hub (core ordena; replay só com evento novo),
+    /// avança a máquina do toast, decide o lembrete sonoro (1×/30s, mute persistido) e
+    /// devolve se há ANIMAÇÃO viva (countdown/pulso → o loop sobe p/ ~30fps).
+    fn attention_heartbeat(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = lina_core::now_ms();
+        let items = self.attention.sync(now);
+        let changed = items != self.attention_items;
+        if changed {
+            self.attention_items = items;
+        }
+        self.attention_machine.tick(&self.attention_items, now);
+        // Cache do mute (settings.json — o T7 pode mudá-lo ao vivo): re-lê ~2s
+        // enquanto a fila está viva; fila vazia não toca o disco.
+        if !self.attention_items.is_empty() {
+            let stale = self
+                .attention_settings_at
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+            if stale {
+                self.attention_sound_muted =
+                    persistence_ui::load_settings(&self.settings_dir).attention_sound_muted;
+                self.attention_settings_at = Some(Instant::now());
+            }
+        }
+        let elapsed = self
+            .attention_sound_last
+            .map(|t| t.elapsed().as_millis() as u64);
+        if attention_ui::should_play_sound(
+            self.attention_items.len(),
+            self.attention_sound_muted,
+            elapsed,
+        ) {
+            attention_ui::play_attention_sound();
+            self.attention_sound_last = Some(Instant::now());
+        }
+        let visible = self.attention_machine.visible(&self.attention_items, now);
+        let toast_alive = matches!(visible, Some(attention_ui::ToastView::Single(_)));
+        let badge = attention_ui::badge_view(&self.attention_items);
+        let pulsing = badge.pulsing && !a11y::reduce_motion_effective(self.reduce_motion);
+        // Sonda [ATT]: estado da fila/toast/badge no stderr, SÓ na mudança (sem spam) —
+        // o Maestro valida por dados (toast em <2s, colapso >1, escalação) sem ver a tela.
+        let diag = format!(
+            "items={} toast={visible:?} badge_count={} badge_pulsing={}",
+            self.attention_items.len(),
+            badge.count,
+            badge.pulsing
+        );
+        if diag != self.attention_diag_last {
+            eprintln!("lina-gpui: [ATT] fila · {diag}");
+            self.attention_diag_last = diag;
+        }
+        let animating = toast_alive || pulsing;
+        if changed || animating {
+            cx.notify();
+        }
+        animating
+    }
+
+    /// Re-sincroniza JÁ (pós-gesto): o evento acabou de ser apendado — a tela reflete
+    /// no mesmo frame, sem esperar o próximo heartbeat.
+    fn attention_refresh_now(&mut self, cx: &mut Context<Self>) {
+        let now = lina_core::now_ms();
+        self.attention_items = self.attention.sync(now);
+        self.attention_machine.tick(&self.attention_items, now);
+        cx.notify();
+    }
+
+    fn attention_toggle_panel(&mut self, cx: &mut Context<Self>) {
+        self.attention_panel_open = !self.attention_panel_open;
+        cx.notify();
+    }
+
+    fn attention_open_panel(&mut self, cx: &mut Context<Self>) {
+        self.attention_panel_open = true;
+        cx.notify();
+    }
+
+    /// «Depois»/Esc-sem-decidir: recolhe o toast SEM decidir (item segue na fila+badge).
+    fn attention_snooze(&mut self, cx: &mut Context<Self>) {
+        self.attention_machine.snooze(&self.attention_items);
+        cx.notify();
+    }
+
+    /// Pause-on-hover do countdown (ponteiro sobre o toast).
+    fn attention_hover(&mut self, hovering: bool) {
+        self.attention_machine.hover(hovering, lina_core::now_ms());
+    }
+
+    /// Aprova uma PERMISSÃO: SÓ registra a decisão (`PermissionResolved{approve,human}`)
+    /// — nenhum byte vai ao PTY (ADR 0021 §6; o write é F1-1-8). Custódia nunca passa
+    /// por aqui (o hub/core devolvem `false` — o gesto dela é o ⌘⏎ existente).
+    fn attention_approve(&mut self, stable_id: &str, cx: &mut Context<Self>) {
+        if self.attention.resolve(
+            stable_id,
+            lina_core::ApprovalDecision::Approve,
+            lina_core::ResolutionVia::Human,
+        ) {
+            self.attention_refresh_now(cx);
+        }
+    }
+
+    /// Recusa uma PERMISSÃO (registro apenas — simetria do aprovar).
+    fn attention_deny(&mut self, stable_id: &str, cx: &mut Context<Self>) {
+        if self.attention.resolve(
+            stable_id,
+            lina_core::ApprovalDecision::Deny,
+            lina_core::ResolutionVia::Human,
+        ) {
+            self.attention_refresh_now(cx);
+        }
+    }
+
+    /// «Não era um pedido» (mitigação de FP): `PermissionDismissed` — não é deny.
+    fn attention_dismiss(&mut self, stable_id: &str, cx: &mut Context<Self>) {
+        if self.attention.dismiss(stable_id) {
+            self.attention_refresh_now(cx);
+        }
+    }
+
+    /// «Silenciar/Reativar detecção deste terminal» (allowlist por nó — reversível).
+    fn attention_toggle_mute(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        let muted = self.attention.is_node_muted(node_id);
+        if self.attention.set_node_muted(node_id, !muted) {
+            self.attention_refresh_now(cx);
         }
     }
 
@@ -1473,6 +1649,11 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
+        // F1-1-7: ⌘J abre/fecha a Fila de Atenção (proposta do ux-flows; sem colisão).
+        if ks.modifiers.platform && ks.key == "j" {
+            self.attention_toggle_panel(cx);
+            return;
+        }
         // W3-6c (ADR 0004) — GATE HUMANO na FRENTE da fila (custódia OU retomada do teto). Teclas NA
         // JANELA do app: o PTY do agente não as sintetiza → inforjável. ⌘⏎ APROVA; ⌘⇧⏎ RECUSA/dispensa
         // (saída p/ limpar flood/erro sem executar — hole 2). Confirma/recusa SÓ a frente. NÃO vai p/ o PTY.
@@ -1496,7 +1677,30 @@ impl WorkspaceView {
                             "lina-gpui: GATE HUMANO — pedido da frente confirmado na janela (⌘⏎)"
                         );
                     }
-                    None => eprintln!("lina-gpui: ⌘⏎ sem pedido pendente (nada a confirmar)"),
+                    // F1-1-7: SEM custódia na frente (precedência custódia > permissão
+                    // intacta — o bloco acima é o caminho histórico, intocado), o ⌘⏎
+                    // decide o TOAST visível de permissão ("foco implícito", ux-flows)
+                    // ou ABRE a fila — NUNCA decide o que não está na tela (regra de
+                    // ouro). Só REGISTRA a decisão (ADR 0021 §6); o write é F1-1-8.
+                    None => {
+                        let now = lina_core::now_ms();
+                        match self.attention_machine.visible(&self.attention_items, now) {
+                            Some(attention_ui::ToastView::Single(idx))
+                                if self.attention_items[idx].kind
+                                    == lina_core::AttentionKind::Permission =>
+                            {
+                                let sid = self.attention_items[idx].stable_id.clone();
+                                self.attention_approve(&sid, cx);
+                                eprintln!(
+                                    "lina-gpui: [ATT] ⌘⏎ aprovou a permissão do toast (registro; sem write)"
+                                );
+                            }
+                            _ if !self.attention_items.is_empty() => {
+                                self.attention_open_panel(cx);
+                            }
+                            _ => eprintln!("lina-gpui: ⌘⏎ sem pedido pendente (nada a confirmar)"),
+                        }
+                    }
                 }
             }
             return;
@@ -1542,6 +1746,29 @@ impl WorkspaceView {
         if ks.modifiers.platform && ks.key == "0" {
             self.camera.reset(); // ⌘0: volta ao home (resgate da vista).
             return;
+        }
+        // F1-1-7: Esc com TOAST visível — **ARBITRAGEM do Maestro (ux-flows vence a
+        // copy da story): Esc NUNCA decide**, em TODAS as superfícies. Fail-safe:
+        // recusar vira write no terminal na F1-1-8 e pode matar operação longa; tecla
+        // reflexa não decide — decisão é clique/⌘⏎ explícito. Esc só RECOLHE o toast
+        // p/ fila/badge, SEM evento de decisão (teste não-vacuoso no bridge:
+        // `esc_snooze_never_emits_decision_event`). Sem toast: fecha o painel da fila,
+        // se aberto. Senão segue ao PTY (intacto).
+        if ks.key == "escape" && !ks.modifiers.platform && !ks.modifiers.control {
+            let now = lina_core::now_ms();
+            if self
+                .attention_machine
+                .visible(&self.attention_items, now)
+                .is_some()
+            {
+                self.attention_snooze(cx);
+                return;
+            }
+            if self.attention_panel_open {
+                self.attention_panel_open = false;
+                cx.notify();
+                return;
+            }
         }
         let grid = lock(&self.nodes.grids).get(&self.focused).cloned();
         let app_cursor = grid.map(|g| lock(&g).mode().app_cursor).unwrap_or(false);
@@ -2146,6 +2373,19 @@ impl Render for WorkspaceView {
                 .child(text!(format!("log: {event_count} eventos"))),
         );
 
+        // F1-1-7: o sino 🔔 da Fila de Atenção — contagem de pendências reais; pulsa
+        // com item Escalated (≥5min), suprimido sob reduce-motion (fonte única W4-6).
+        let att_now = lina_core::now_ms();
+        let att_reduce = a11y::reduce_motion_effective(self.reduce_motion);
+        topbar = topbar.child(attention_ui::render_badge(
+            &self.attention_items,
+            self.attention_panel_open,
+            att_reduce,
+            att_now,
+            &th,
+            cx,
+        ));
+
         // O ⚡ A2A (A→B) é demo-only e só aparece com AMBOS os alvos vivos: em produção `a2a` é `None`
         // (sem A/B) e o botão nem existe; no demo, se o fundador fechar A ou B, `ready()` o esconde.
         if self.a2a.as_ref().is_some_and(|a| a.ready()) {
@@ -2410,6 +2650,49 @@ impl Render for WorkspaceView {
         }
 
         let root = root.child(topbar).child(footer);
+
+        // F1-1-7: TOAST da Fila de Atenção (canto inferior direito) — single com
+        // countdown (pause-on-hover) ou colapsado «+N» (countdown desativado). A
+        // visibilidade vem da MÁQUINA testada (expirado/«Depois» não renascem; o item
+        // segue no badge/fila — nada se perde).
+        let mut root = root;
+        if let Some(tv) = self
+            .attention_machine
+            .visible(&self.attention_items, att_now)
+        {
+            root = root.child(attention_ui::render_toast(
+                &self.attention_items,
+                tv,
+                self.attention_machine.timer(),
+                att_now,
+                &th,
+                cx,
+            ));
+        }
+        // F1-1-7: painel compacto da fila (badge 🔔 / ⌘J) — decide permissão (registro
+        // apenas), apresenta custódia com o gesto EXISTENTE; sob os modais (M6/paleta).
+        if self.attention_panel_open {
+            let muted_nodes: BTreeMap<String, bool> = self
+                .attention_items
+                .iter()
+                .map(|i| (i.node_id.clone(), self.attention.is_node_muted(&i.node_id)))
+                .collect();
+            let muted_set: std::collections::BTreeSet<String> = muted_nodes
+                .into_iter()
+                .filter_map(|(n, m)| m.then_some(n))
+                .collect();
+            let desk_front = lock(&self.desk).front().map(|p| p.id().to_string());
+            let vp = window.viewport_size();
+            root = root.child(attention_ui::render_panel(
+                &self.attention_items,
+                &muted_set,
+                desk_front.as_deref(),
+                (f32::from(vp.width), f32::from(vp.height)),
+                att_now,
+                &th,
+                cx,
+            ));
+        }
         // F1-1-5 (P6/fluxo c): painel "Atividade e custos" — zona lateral direita, sob os modais.
         // Geometria clampada ao viewport REAL (fix: o painel fixo vazava a borda direita).
         let root = if self.dashboard_open {
@@ -3074,6 +3357,39 @@ fn main() {
     )
     .spawn();
 
+    // F1-1-7: a FILA DE ATENÇÃO unificada — a projeção `AttentionQueue` do core cabeada
+    // ao MESMO event log (replay no boot reconstrói pendência pós-crash — critério 5) e
+    // à mesa de custódia (a fila APRESENTA custódia+permissão juntas; o gesto da
+    // custódia segue o ⌘⏎ existente). NENHUM byte vai ao PTY por este caminho (ADR 0021
+    // §6) — aprovar/recusar só registra a decisão; o write é F1-1-8.
+    let attention = Arc::new(AttentionHub::new(
+        Arc::clone(&store),
+        Arc::clone(&desk),
+        Arc::clone(&model),
+    ));
+    // LINA_ATTENTION_DEMO=1 (roteiro do fundador, idioma de LINA_DEMO/LINA_DASH): semeia
+    // UM pedido de permissão REAL no log → o toast da story aparece sem esperar um
+    // Claude travado de verdade; aprovar/recusar mostra o audit trail no log.
+    if matches!(
+        std::env::var("LINA_ATTENTION_DEMO")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1")
+    ) {
+        let seeded = lock(&store).append(&lina_core::DomainEvent::PermissionAsked {
+            node_id: "Terminal B".into(),
+            tool: Some("Bash".into()),
+            detail: Some("git push origin/master".into()),
+            evidence: lina_core::PermissionEvidence::Hook,
+            stable_id: format!("demo-{}", lina_core::now_ms()),
+        });
+        match seeded {
+            Ok(_) => eprintln!("lina-gpui: [ATT] DEMO — PermissionAsked semeado (toast em <2s)"),
+            Err(e) => eprintln!("lina-gpui: [ATT] DEMO — falha ao semear: {e}"),
+        }
+    }
+
     eprintln!(
         "lina-gpui: render de terminal · grid {cols}x{rows} · log {} · {event_count} eventos",
         dir.display()
@@ -3118,7 +3434,19 @@ fn main() {
             },
             |window, cx| {
                 cx.new(|cx| {
-                    WorkspaceView::new(nodes, input, a2a, focused, desk, brake, dash, window, cx)
+                    WorkspaceView::new(
+                        nodes,
+                        input,
+                        a2a,
+                        focused,
+                        desk,
+                        brake,
+                        dash,
+                        attention,
+                        panel_dir.clone(), // F1-1-7: settings.json mora no dir do event log
+                        window,
+                        cx,
+                    )
                 })
             },
         );

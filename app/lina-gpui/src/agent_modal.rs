@@ -60,6 +60,28 @@ pub const COPY_GALLERY_EMPTY: &str =
     "Nenhum papel casa com a busca — apague para ver todos, ou comece pelo Nome que eu sugiro.";
 pub const COPY_GALLERY_HINT: &str = "↑↓ navega · Enter escolhe · Esc fecha";
 pub const COPY_ROLE_SWAP: &str = "Trocar";
+// ── editor leve de papel custom (F1-2-3 p2: duplicar + modificar, persistente) ──
+pub const COPY_GALLERY_DUPLICATE: &str = "Duplicar";
+pub const COPY_TPL_TITLE: &str = "Criar o seu papel a partir de";
+pub const COPY_TPL_NAME_LABEL: &str = "Nome";
+pub const COPY_TPL_DESC_LABEL: &str = "O que ele faz";
+pub const COPY_TPL_DETAILS: &str = "▸ ver detalhes";
+pub const COPY_TPL_DETAILS_OPEN: &str = "▾ ver detalhes";
+pub const COPY_TPL_DOCTRINE_LABEL: &str = "Instruções completas (modo técnico — opcional)";
+pub const COPY_TPL_SAVE: &str = "Salvar papel";
+pub const COPY_TPL_BACK: &str = "Voltar";
+pub const COPY_TPL_HINT: &str = "↑↓ muda o campo · Esc volta";
+pub const COPY_TPL_BADGE: &str = "seu papel";
+pub const COPY_TPL_WHY: &str = "Você criou este papel na biblioteca.";
+pub const COPY_TPL_ERR_EMPTY_NAME: &str = "Dê um nome ao papel antes de salvar.";
+pub const COPY_TPL_ERR_SAVE: &str =
+    "Não consegui salvar o papel agora — tente de novo em instantes.";
+
+/// Nome pré-preenchido ao duplicar ("Revisor" → "Revisor (cópia)") — o fundador edita.
+#[must_use]
+pub fn copy_tpl_dup_name(label: &str) -> String {
+    format!("{label} (cópia)")
+}
 pub const COPY_CWD_LABEL: &str = "Pasta de trabalho";
 pub const COPY_CWD_DEFAULT: &str = "a pasta deste Espaço";
 pub const COPY_CWD_PICK: &str = "Trocar…";
@@ -330,6 +352,24 @@ pub fn gallery_layout(modal: ModalFrame, window: WinSize, n_items: usize) -> Gal
     }
 }
 
+// ── papéis customizados (F1-2-3 p2 — duplicar + modificar, persistente) ──
+
+/// Um papel CUSTOM do usuário, como REAPARECE do log (payload de `RoleTemplateSaved`, sem o
+/// `ts` — a ordem de log basta para o last-wins). Contrato do seam com o bridge:
+/// `NodeManager::role_templates()` devolve estas linhas EM ORDEM DE LOG, SEM dedup (o modal
+/// aplica último-`name`-vence, padrão `CostLedger` — doutrina do próprio evento no core);
+/// `NodeManager::save_role_template(name, description, doctrine)` faz o append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleTemplate {
+    /// Nome leigo ("Revisora de Landing") — também a CHAVE do last-wins.
+    pub name: String,
+    /// Descrição curta leiga (1 frase "o que ele faz").
+    pub description: String,
+    /// Instruções completas (texto técnico do bootstrap turno-0) — atrás de "ver detalhes",
+    /// nunca obrigatória (progressive disclosure).
+    pub doctrine: String,
+}
+
 // ── linhas texto+ação (fix bugB3 — o botão é INEGOCIÁVEL, o texto cede) ──
 // Regressão da rodada bugB2: o min-content de um texto gpui é a LINHA INTEIRA quando alguma
 // medição roda sem largura Definite (text.rs: `wrap_width` exige Definite; e o cache de
@@ -387,40 +427,160 @@ pub fn action_row_layout(row_w: f32, label_w: f32, gap: f32, action_w: f32) -> A
 /// `gpui::ScrollHandle` — um Rc-cell INERTE, sem janela/plataforma — para o ↑↓ manter a linha
 /// destacada visível dentro da viewport; construí-lo em teste headless é seguro.)
 pub struct RoleGallery {
-    items: Vec<RoleSuggestion>,
+    /// Embutidos (registry W3-1 humanizado) + customs (last-wins JÁ aplicado), nesta ordem.
+    items: Vec<GalleryItem>,
     query: String,
     /// Índice selecionado DENTRO da lista filtrada (teclado ↑↓; clamp ao filtrar).
     selected: usize,
+    /// F1-2-3 p2: editor leve aberto por 'Duplicar' (None = lista normal). Enquanto aberto, o
+    /// funil de teclado do main.rs (fixo) é REINTERPRETADO pelos métodos deste modelo.
+    editor: Option<TemplateEditor>,
     /// Scroll da viewport da lista (one-shot `scroll_to_item` ao navegar por teclado — não
     /// briga com o wheel: fora da navegação o offset é do usuário).
     scroll: ScrollHandle,
+}
+
+/// Item da galeria: a sugestão (o contrato que o pick devolve ao modal — INALTERADO) +
+/// metadados da biblioteca (é custom? instruções por trás de "ver detalhes").
+pub struct GalleryItem {
+    pub suggestion: RoleSuggestion,
+    /// `true` = papel salvo pelo usuário (badge "seu papel"; duplicar copia a doutrina).
+    pub custom: bool,
+    /// Instruções completas — vazia nos embutidos (o registry W3-1 não carrega doutrina; o
+    /// canal de bootstrap deles segue o existente da W3-2).
+    pub doctrine: String,
+}
+
+/// Campo focado do editor leve (↑↓ circula; Doutrina só entra com detalhes abertos).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorField {
+    Name,
+    Description,
+    Doctrine,
+}
+
+/// Editor LEVE de papel custom (modelo duplicar+modificar — F1-2-3 p2). gpui-free e testável;
+/// nada persiste até o clique em [Salvar papel] (kill -9 no meio não deixa lixo — estado RAM,
+/// mesmo princípio do modal).
+pub struct TemplateEditor {
+    /// Rótulo do template de ORIGEM (título "Criar o seu papel a partir de — X").
+    pub source: String,
+    pub name: String,
+    pub description: String,
+    pub doctrine: String,
+    pub focus: EditorField,
+    /// Progressive disclosure: instruções completas só com detalhes ABERTOS (nunca obrigatória).
+    pub details: bool,
+    /// Erro leigo do último salvar (limpo ao digitar).
+    pub error: Option<String>,
+}
+
+/// last-wins por `name` (doutrina do evento `RoleTemplateSaved`: "último name vence", padrão
+/// `CostLedger`) — PURO e testável; o seam do bridge entrega ordem de log SEM dedup.
+#[must_use]
+fn dedupe_last_wins(rows: Vec<RoleTemplate>) -> Vec<RoleTemplate> {
+    let mut out: Vec<RoleTemplate> = Vec::new();
+    for row in rows {
+        match out.iter_mut().find(|t| t.name == row.name) {
+            Some(slot) => *slot = row, // último vence; posição da 1ª aparição preservada.
+            None => out.push(row),
+        }
+    }
+    out
 }
 
 impl RoleGallery {
     /// Monta a biblioteca a partir do registry W3-1 (humanizado): nome leigo + 1 frase por papel.
     #[must_use]
     pub fn from_library() -> Self {
-        let items = role_registry()
+        Self {
+            items: Self::builtin_items(),
+            query: String::new(),
+            selected: 0,
+            editor: None,
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    /// Os embutidos (registry W3-1 humanizado) — a base sobre a qual os customs entram.
+    fn builtin_items() -> Vec<GalleryItem> {
+        role_registry()
             .map(|reg| {
                 reg.role_names()
                     .map(|canon| {
                         let (label, blurb) = humanize(canon);
-                        RoleSuggestion {
-                            role: canon.to_string(),
-                            label,
-                            blurb,
-                            why: "Você escolheu este papel na biblioteca.".to_string(),
+                        GalleryItem {
+                            suggestion: RoleSuggestion {
+                                role: canon.to_string(),
+                                label,
+                                blurb,
+                                why: "Você escolheu este papel na biblioteca.".to_string(),
+                            },
+                            custom: false,
+                            doctrine: String::new(),
                         }
                     })
                     .collect()
             })
-            .unwrap_or_default();
-        Self {
-            items,
-            query: String::new(),
-            selected: 0,
-            scroll: ScrollHandle::new(),
-        }
+            .unwrap_or_default()
+    }
+
+    /// F1-2-3 p2: injeta os papéis CUSTOM (linhas do log, ordem de log) — aplica o last-wins e
+    /// reconstrói a lista (embutidos primeiro, customs depois, com badge). Query/seleção
+    /// sobrevivem (clamp no `selected()`).
+    pub fn set_customs(&mut self, rows: Vec<RoleTemplate>) {
+        let mut items = Self::builtin_items();
+        items.extend(dedupe_last_wins(rows).into_iter().map(|t| GalleryItem {
+            suggestion: RoleSuggestion {
+                role: t.name.clone(), // canônico do custom = o próprio nome (roster/VIBE_ROLE).
+                label: t.name,
+                blurb: t.description,
+                why: COPY_TPL_WHY.to_string(),
+            },
+            custom: true,
+            doctrine: t.doctrine,
+        }));
+        self.items = items;
+    }
+
+    /// 'Duplicar' no item `idx` da lista FILTRADA → abre o editor leve pré-preenchido (nome
+    /// "(cópia)", descrição igual, instruções copiadas — vazias num embutido). Foco no Nome;
+    /// detalhes fechados (progressive disclosure).
+    pub fn duplicate(&mut self, idx: usize) {
+        // extrai os campos ANTES de tocar self.editor (filtered() empresta self).
+        let Some((source, description, doctrine)) = self.filtered().get(idx).map(|it| {
+            (
+                it.suggestion.label.clone(),
+                it.suggestion.blurb.clone(),
+                it.doctrine.clone(),
+            )
+        }) else {
+            return;
+        };
+        self.editor = Some(TemplateEditor {
+            name: copy_tpl_dup_name(&source),
+            source,
+            description,
+            doctrine,
+            focus: EditorField::Name,
+            details: false,
+            error: None,
+        });
+    }
+
+    /// O editor leve aberto (None = lista normal).
+    #[must_use]
+    pub fn editor(&self) -> Option<&TemplateEditor> {
+        self.editor.as_ref()
+    }
+
+    pub fn editor_mut(&mut self) -> Option<&mut TemplateEditor> {
+        self.editor.as_mut()
+    }
+
+    /// Fecha SÓ o editor (volta à lista) — o Esc do funil usa o downgrade em dois passos.
+    pub fn editor_close(&mut self) {
+        self.editor = None;
     }
 
     /// Handle do scroll da lista — o render amarra na viewport via `track_scroll`.
@@ -429,17 +589,17 @@ impl RoleGallery {
         &self.scroll
     }
 
-    /// Os papéis que casam com a busca (case-insensitive, nome leigo OU descrição). Sem busca →
-    /// TODOS de uma vez (o requisito do fundador).
+    /// Os papéis que casam com a busca (case-insensitive, nome leigo OU descrição — vale
+    /// também pros customs). Sem busca → TODOS de uma vez (o requisito do fundador).
     #[must_use]
-    pub fn filtered(&self) -> Vec<&RoleSuggestion> {
+    pub fn filtered(&self) -> Vec<&GalleryItem> {
         let q = self.query.trim().to_lowercase();
         self.items
             .iter()
-            .filter(|r| {
+            .filter(|it| {
                 q.is_empty()
-                    || r.label.to_lowercase().contains(&q)
-                    || r.blurb.to_lowercase().contains(&q)
+                    || it.suggestion.label.to_lowercase().contains(&q)
+                    || it.suggestion.blurb.to_lowercase().contains(&q)
             })
             .collect()
     }
@@ -455,21 +615,37 @@ impl RoleGallery {
         self.selected.min(self.filtered().len().saturating_sub(1))
     }
 
+    /// Digitar: com o editor aberto vai pro CAMPO focado (e limpa o erro); senão é a busca.
     pub fn type_char(&mut self, s: &str) {
+        if let Some(ed) = self.editor.as_mut() {
+            ed.error = None;
+            ed.field_mut().push_str(s);
+            return;
+        }
         self.query.push_str(s);
         self.selected = 0;
         self.scroll.scroll_to_item(0); // filtro novo → lista volta ao topo.
     }
 
     pub fn backspace(&mut self) {
+        if let Some(ed) = self.editor.as_mut() {
+            ed.error = None;
+            ed.field_mut().pop();
+            return;
+        }
         self.query.pop();
         self.selected = 0;
         self.scroll.scroll_to_item(0);
     }
 
-    /// ↑↓ com clamp nas bordas (sem wrap — previsível pro leitor de tela). A viewport SEGUE a
-    /// seleção (scroll mínimo one-shot) — o destaque nunca some abaixo/acima da dobra.
+    /// ↑↓ com clamp nas bordas (sem wrap — previsível pro leitor de tela). Com o editor aberto,
+    /// ↑↓ troca o CAMPO focado (Doutrina só entra com detalhes abertos — progressive
+    /// disclosure); na lista, a viewport SEGUE a seleção (scroll mínimo one-shot).
     pub fn move_selection(&mut self, delta: i32) {
+        if let Some(ed) = self.editor.as_mut() {
+            ed.move_focus(delta);
+            return;
+        }
         let len = self.filtered().len();
         if len == 0 {
             return;
@@ -479,16 +655,52 @@ impl RoleGallery {
         self.scroll.scroll_to_item(self.selected);
     }
 
-    /// O papel sob o cursor (Enter) — `None` com a busca vazia de resultados.
+    /// O papel sob o cursor (Enter) — `None` com a busca vazia de resultados, e `None` com o
+    /// editor aberto (Enter NÃO escolhe nem salva no meio da edição — salvar é o botão).
     #[must_use]
     pub fn pick(&self) -> Option<RoleSuggestion> {
-        self.filtered().get(self.selected()).map(|r| (*r).clone())
+        if self.editor.is_some() {
+            return None;
+        }
+        self.filtered()
+            .get(self.selected())
+            .map(|it| it.suggestion.clone())
     }
 
     /// O papel na posição `idx` da lista FILTRADA (clique do mouse).
     #[must_use]
     pub fn pick_at(&self, idx: usize) -> Option<RoleSuggestion> {
-        self.filtered().get(idx).map(|r| (*r).clone())
+        if self.editor.is_some() {
+            return None;
+        }
+        self.filtered().get(idx).map(|it| it.suggestion.clone())
+    }
+}
+
+impl TemplateEditor {
+    /// O buffer do campo focado (o funil de digitação escreve aqui).
+    fn field_mut(&mut self) -> &mut String {
+        match self.focus {
+            EditorField::Name => &mut self.name,
+            EditorField::Description => &mut self.description,
+            EditorField::Doctrine => &mut self.doctrine,
+        }
+    }
+
+    /// ↑↓ entre os campos, com clamp (sem wrap) — Doutrina só com detalhes abertos.
+    fn move_focus(&mut self, delta: i32) {
+        let order: &[EditorField] = if self.details {
+            &[
+                EditorField::Name,
+                EditorField::Description,
+                EditorField::Doctrine,
+            ]
+        } else {
+            &[EditorField::Name, EditorField::Description]
+        };
+        let cur = order.iter().position(|f| *f == self.focus).unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, order.len() as i32 - 1) as usize;
+        self.focus = order[next];
     }
 }
 
@@ -810,8 +1022,84 @@ impl AgentModal {
         self.gallery.is_some()
     }
 
+    /// Esc do funil (main.rs fixo): com o editor leve aberto, fecha SÓ o editor (volta à
+    /// lista); senão fecha a galeria. Dois Esc = fecha tudo (downgrade previsível).
     pub fn gallery_close(&mut self) {
+        if let Some(g) = self.gallery.as_mut() {
+            if g.editor().is_some() {
+                g.editor_close();
+                return;
+            }
+        }
         self.gallery = None;
+    }
+
+    // ── F1-2-3 p2: editor leve de papel custom (duplicar + modificar) ──
+
+    /// 'Duplicar' no item `idx` da lista filtrada → abre o editor leve pré-preenchido.
+    pub fn gallery_duplicate(&mut self, idx: usize) {
+        if let Some(g) = self.gallery.as_mut() {
+            g.duplicate(idx);
+        }
+    }
+
+    /// Injeta os papéis CUSTOM do log (ordem de log; last-wins aplicado aqui no modelo).
+    pub fn gallery_set_customs(&mut self, rows: Vec<RoleTemplate>) {
+        if let Some(g) = self.gallery.as_mut() {
+            g.set_customs(rows);
+        }
+    }
+
+    pub fn gallery_editor_toggle_details(&mut self) {
+        if let Some(ed) = self.gallery.as_mut().and_then(RoleGallery::editor_mut) {
+            ed.details = !ed.details;
+            // Fechar os detalhes com a Doutrina focada NÃO pode deixar o foco num campo
+            // invisível — rebaixa pra Descrição.
+            if !ed.details && ed.focus == EditorField::Doctrine {
+                ed.focus = EditorField::Description;
+            }
+        }
+    }
+
+    /// Clique num campo do editor foca-o (a Doutrina só existe com detalhes abertos).
+    pub fn gallery_editor_focus(&mut self, field: EditorField) {
+        if let Some(ed) = self.gallery.as_mut().and_then(RoleGallery::editor_mut) {
+            if field != EditorField::Doctrine || ed.details {
+                ed.focus = field;
+            }
+        }
+    }
+
+    /// Fecha só o editor (botão [Voltar] / após salvar com sucesso).
+    pub fn gallery_editor_cancel(&mut self) {
+        if let Some(g) = self.gallery.as_mut() {
+            g.editor_close();
+        }
+    }
+
+    /// Erro leigo no editor (ex.: o seam de persistência falhou) — some ao digitar.
+    pub fn gallery_editor_set_error(&mut self, msg: String) {
+        if let Some(ed) = self.gallery.as_mut().and_then(RoleGallery::editor_mut) {
+            ed.error = Some(msg);
+        }
+    }
+
+    /// O plano de SALVAR do editor: valida o nome (vazio → erro leigo, nunca evento) e devolve
+    /// o [`RoleTemplate`] exato (trim) que o seam `save_role_template` persistirá. Nenhum
+    /// estado muda aqui — o handler fecha o editor SÓ depois do append confirmado.
+    pub fn gallery_editor_plan(&self) -> Result<RoleTemplate, String> {
+        let Some(ed) = self.gallery.as_ref().and_then(RoleGallery::editor) else {
+            return Err(COPY_TPL_ERR_EMPTY_NAME.to_string());
+        };
+        let name = ed.name.trim();
+        if name.is_empty() {
+            return Err(COPY_TPL_ERR_EMPTY_NAME.to_string());
+        }
+        Ok(RoleTemplate {
+            name: name.to_string(),
+            description: ed.description.trim().to_string(),
+            doctrine: ed.doctrine.trim().to_string(),
+        })
     }
 
     pub fn gallery_type(&mut self, s: &str) {
@@ -1343,7 +1631,8 @@ pub fn render(
                     .text_color(rgb(th.text.bright))
                     .cursor_pointer()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
-                        v.modal_open_gallery(cx);
+                        // F1-2-3 p2: abre já com os papéis CUSTOM do log (replay → reaparecem).
+                        v.modal_open_gallery_with_customs(cx);
                     }))
                     .child(text!(COPY_ROLE_SWAP)),
             ),
@@ -1352,77 +1641,57 @@ pub fn render(
     // ── seletor de papéis aberto (F1-2-3): TODOS os papéis + busca + teclado ──
     // Fix bugB2: o dropdown CONTIDO — largura = útil do modal, busca FIXA no topo e lista numa
     // VIEWPORT de altura calculada (matemática pura `gallery_layout`) que rola por dentro.
+    // F1-2-3 p2: com o editor leve aberto ('Duplicar'), ele SUBSTITUI busca+lista no dropdown.
     if let Some(g) = modal.gallery() {
-        let filtered = g.filtered();
-        let sel = g.selected();
-        let lay = gallery_layout(frame, win, filtered.len());
-        let (qtxt, qfg) = if g.query().is_empty() {
-            (COPY_GALLERY_SEARCH_PLACEHOLDER.to_string(), th.text.muted)
+        if let Some(ed) = g.editor() {
+            col = col.child(render_template_editor(ed, frame, cx));
         } else {
-            (format!("{}▌", g.query()), th.text.bright)
-        };
-        // Viewport da lista: raiz de scroll em BLOCO (lição W6: flex no root de scroll não
-        // engata) com altura TRAVADA pela conta; as linhas são filhas DIRETAS — é o que o
-        // `scroll_to_item` do teclado indexa (child_bounds do container trackeado).
-        let mut list = div()
-            .id("m6-gallery-list")
-            // a11y: anuncia o tamanho real da lista e, quando a viewport corta, que rola.
-            .aria_label(if lay.scrolls {
-                format!("lista de papéis, {} resultados — rola", filtered.len())
+            let filtered = g.filtered();
+            let sel = g.selected();
+            let lay = gallery_layout(frame, win, filtered.len());
+            let (qtxt, qfg) = if g.query().is_empty() {
+                (COPY_GALLERY_SEARCH_PLACEHOLDER.to_string(), th.text.muted)
             } else {
-                format!("lista de papéis, {} resultados", filtered.len())
-            })
-            .track_scroll(g.scroll_handle())
-            .overflow_y_scroll()
-            .h(px(lay.list_viewport_h))
-            .w_full();
-        if filtered.is_empty() {
-            list = list.child(
-                div()
-                    .h(px(GALLERY_ROW_H))
-                    .px_3()
-                    .py_2()
-                    .overflow_hidden()
-                    .line_height(px(GALLERY_LINE_H))
-                    .text_color(rgb(th.text.muted))
-                    .child(text!(COPY_GALLERY_EMPTY)),
-            );
-        }
-        for (i, r) in filtered.iter().enumerate() {
-            let active = i == sel;
-            // Geometria UNIFORME por linha: altura fixa (== GALLERY_ROW_H da conta), borda
-            // sempre presente (transparente na inativa) — navegar não reflui o layout, e a
-            // matemática do viewport nunca mente. a11y: ElementId ÚNICO por linha (lição:
-            // text! em loop colide nó AccessKit) + rótulo anunciável completo.
-            let row = div()
-                .id(("m6-role-item", i))
-                .aria_label(format!("papel {} — {}", r.label, r.blurb))
-                .h(px(GALLERY_ROW_H))
-                .mb(px(GALLERY_ROW_GAP))
-                .flex()
-                .flex_col()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .overflow_hidden()
-                .bg(rgb(if active {
-                    th.surface.raised_alt
+                (format!("{}▌", g.query()), th.text.bright)
+            };
+            // Viewport da lista: raiz de scroll em BLOCO (lição W6: flex no root de scroll não
+            // engata) com altura TRAVADA pela conta; as linhas são filhas DIRETAS — é o que o
+            // `scroll_to_item` do teclado indexa (child_bounds do container trackeado).
+            let mut list = div()
+                .id("m6-gallery-list")
+                // a11y: anuncia o tamanho real da lista e, quando a viewport corta, que rola.
+                .aria_label(if lay.scrolls {
+                    format!("lista de papéis, {} resultados — rola", filtered.len())
                 } else {
-                    th.surface.panel
-                }))
-                .border_2()
-                .border_color(if active {
-                    // foco visível: o MESMO token do design system (≥3:1 nos 2 temas — F1-2-1).
-                    rgb(th.focus.ring).into()
-                } else {
-                    transparent_black()
+                    format!("lista de papéis, {} resultados", filtered.len())
                 })
-                .cursor_pointer()
-                .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
-                    v.modal_gallery_pick(Some(i), cx);
-                }))
-                .child(
+                .track_scroll(g.scroll_handle())
+                .overflow_y_scroll()
+                .h(px(lay.list_viewport_h))
+                .w_full();
+            if filtered.is_empty() {
+                list = list.child(
                     div()
+                        .h(px(GALLERY_ROW_H))
+                        .px_3()
+                        .py_2()
+                        .overflow_hidden()
+                        .line_height(px(GALLERY_LINE_H))
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_GALLERY_EMPTY)),
+                );
+            }
+            for (i, r) in filtered.iter().enumerate() {
+                let active = i == sel;
+                // Geometria UNIFORME por linha: altura fixa (== GALLERY_ROW_H da conta), borda
+                // sempre presente (transparente na inativa) — navegar não reflui o layout, e a
+                // matemática do viewport nunca mente. a11y: ElementId ÚNICO por linha (lição:
+                // text! em loop colide nó AccessKit) + rótulo anunciável completo. Doutrina B3:
+                // a célula de texto CEDE (min_w 0 + clip); o [Duplicar] é flex_none — nunca sai.
+                let mut label_line = div().flex().flex_row().items_center().gap_2().child(
+                    div()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
                         .line_height(px(GALLERY_LINE_H))
                         .font_weight(FontWeight::BOLD)
                         .text_color(rgb(if active {
@@ -1430,70 +1699,146 @@ pub fn render(
                         } else {
                             th.text.primary
                         }))
-                        .child(text!(r.label.clone())),
-                )
-                .child(
-                    div()
-                        .line_height(px(GALLERY_LINE_H))
-                        .text_color(rgb(th.text.secondary))
-                        .child(text!(r.blurb.clone())),
+                        .child(text!(r.suggestion.label.clone())),
                 );
-            list = list.child(row);
-        }
-        col = col.child(
-            div()
-                // bounds FINAIS da conta: largura útil do modal × chrome+viewport — pinados.
-                .w(px(lay.w))
-                .h(px(lay.h))
-                .flex()
-                .flex_col()
-                .gap_2()
-                .px_3()
-                .py_3()
-                .rounded_md()
-                .bg(rgb(th.surface.chrome))
-                .border_1()
-                .border_color(rgb(th.surface.raised_alt))
-                .child(
-                    div()
-                        .h(px(GALLERY_HEADER_H))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .overflow_hidden()
-                                .line_height(px(GALLERY_HEADER_H))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(th.text.primary))
-                                .child(text!(COPY_GALLERY_TITLE)),
+                if r.custom {
+                    // Badge do papel salvo pelo usuário — F1-2-3 p2 (reapareceu do log).
+                    label_line = label_line.child(
+                        div()
+                            .flex_none()
+                            .line_height(px(GALLERY_LINE_H))
+                            .text_color(rgb(th.text.muted))
+                            .child(text!(format!("· {COPY_TPL_BADGE}"))),
+                    );
+                }
+                let row = div()
+                    .id(("m6-role-item", i))
+                    .aria_label(if r.custom {
+                        format!(
+                            "papel {} ({COPY_TPL_BADGE}) — {}",
+                            r.suggestion.label, r.suggestion.blurb
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .line_height(px(GALLERY_HEADER_H))
-                                .text_color(rgb(th.text.muted))
-                                .child(text!(COPY_GALLERY_HINT)),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("m6-gallery-search")
-                        .h(px(GALLERY_SEARCH_H))
-                        .px_3()
-                        .py_2()
-                        .overflow_hidden()
-                        .line_height(px(GALLERY_LINE_H))
-                        .rounded_md()
-                        .bg(rgb(th.surface.panel))
-                        .text_color(rgb(qfg))
-                        .child(text!(format!("🔎 {qtxt}"))),
-                )
-                .child(list),
-        );
+                    } else {
+                        format!("papel {} — {}", r.suggestion.label, r.suggestion.blurb)
+                    })
+                    .h(px(GALLERY_ROW_H))
+                    .mb(px(GALLERY_ROW_GAP))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(if active {
+                        th.surface.raised_alt
+                    } else {
+                        th.surface.panel
+                    }))
+                    .border_2()
+                    .border_color(if active {
+                        // foco visível: o MESMO token do design system (≥3:1 nos 2 temas — F1-2-1).
+                        rgb(th.focus.ring).into()
+                    } else {
+                        transparent_black()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_gallery_pick(Some(i), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(label_line)
+                            .child(
+                                div()
+                                    .line_height(px(GALLERY_LINE_H))
+                                    .text_color(rgb(th.text.secondary))
+                                    .child(text!(r.suggestion.blurb.clone())),
+                            ),
+                    )
+                    .child(
+                        // F1-2-3 p2: a porta do "duplicar + modificar" — ação INEGOCIÁVEL da linha.
+                        div()
+                            .id(("m6-role-dup", i))
+                            .flex_none()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(th.surface.raised))
+                            .line_height(px(GALLERY_LINE_H))
+                            .text_color(rgb(th.text.bright))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                                // o clique no Duplicar NÃO escolhe a linha (papel só por gesto
+                                // explícito de escolha — critério 4).
+                                cx.stop_propagation();
+                                v.modal_gallery_duplicate(i, cx);
+                            }))
+                            .child(text!(COPY_GALLERY_DUPLICATE)),
+                    );
+                list = list.child(row);
+            }
+            col = col.child(
+                div()
+                    // bounds FINAIS da conta: largura útil do modal × chrome+viewport — pinados.
+                    .w(px(lay.w))
+                    .h(px(lay.h))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .px_3()
+                    .py_3()
+                    .rounded_md()
+                    .bg(rgb(th.surface.chrome))
+                    .border_1()
+                    .border_color(rgb(th.surface.raised_alt))
+                    .child(
+                        div()
+                            .h(px(GALLERY_HEADER_H))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .line_height(px(GALLERY_HEADER_H))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(th.text.primary))
+                                    .child(text!(COPY_GALLERY_TITLE)),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .line_height(px(GALLERY_HEADER_H))
+                                    .text_color(rgb(th.text.muted))
+                                    .child(text!(COPY_GALLERY_HINT)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("m6-gallery-search")
+                            .h(px(GALLERY_SEARCH_H))
+                            .px_3()
+                            .py_2()
+                            .overflow_hidden()
+                            .line_height(px(GALLERY_LINE_H))
+                            .rounded_md()
+                            .bg(rgb(th.surface.panel))
+                            .text_color(rgb(qfg))
+                            .child(text!(format!("🔎 {qtxt}"))),
+                    )
+                    .child(list),
+            );
+        }
     }
 
     // ── Pasta de trabalho ──
@@ -1693,6 +2038,334 @@ pub fn render(
                 ),
         )
         .into_any_element()
+}
+
+/// Uma caixa de CAMPO do editor leve (idioma do `#m6-name`): clique foca, caret ▌ no focado,
+/// borda = focus ring do design system. Doutrina B3: `min_w(0)` + clip — o texto cede.
+fn editor_field_box(
+    id: &'static str,
+    aria: String,
+    value: &str,
+    focused: bool,
+    target: EditorField,
+    cx: &mut Context<WorkspaceView>,
+) -> AnyElement {
+    let th = theme::active();
+    div()
+        .id(id)
+        .aria_label(aria)
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(th.surface.panel))
+        .border_1()
+        .border_color(rgb(if focused {
+            th.focus.ring
+        } else {
+            th.surface.border
+        }))
+        .line_height(px(GALLERY_LINE_H))
+        .text_color(rgb(if value.is_empty() && !focused {
+            th.text.muted
+        } else {
+            th.text.bright
+        }))
+        .cursor_pointer()
+        .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+            v.modal_gallery_editor_focus(target, cx);
+        }))
+        .child(text!(format!(
+            "{value}{}",
+            if focused { "\u{258c}" } else { "" }
+        )))
+        .into_any_element()
+}
+
+/// **F1-2-3 p2 — o editor LEVE do "duplicar + modificar"** (casca gpui; estado no
+/// [`TemplateEditor`], gpui-free). Substitui busca+lista DENTRO do dropdown: nome + "o que ele
+/// faz" na frente; instruções completas atrás de "ver detalhes" (progressive disclosure —
+/// NUNCA obrigatória). Sem altura pinada: o conteúdo é fixo e baixo; em janela degenerada o
+/// scroll-fallback do corpo (`#m6-body`, bugB2) absorve. Doutrina B3 em toda linha texto+ação
+/// (título cede ao hint; rodapé flex_none). Nada persiste até [Salvar papel].
+fn render_template_editor(
+    ed: &TemplateEditor,
+    frame: ModalFrame,
+    cx: &mut Context<WorkspaceView>,
+) -> AnyElement {
+    let th = theme::active();
+    let mut panel = div()
+        .w(px(frame.w - 2.0 * MODAL_PAD_X))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .bg(rgb(th.surface.chrome))
+        .border_1()
+        .border_color(rgb(th.surface.raised_alt))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    // o título cede (origem pode ter nome longo); o hint nunca sai.
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .line_height(px(GALLERY_HEADER_H))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(th.text.primary))
+                        .child(text!(format!("{COPY_TPL_TITLE} \u{2014} {}", ed.source))),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .line_height(px(GALLERY_HEADER_H))
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_TPL_HINT)),
+                ),
+        )
+        .child(
+            div()
+                .line_height(px(GALLERY_LINE_H))
+                .text_color(rgb(th.text.primary))
+                .child(text!(COPY_TPL_NAME_LABEL)),
+        )
+        .child(editor_field_box(
+            "m6-tpl-name",
+            format!("nome do papel: {}", ed.name),
+            &ed.name,
+            ed.focus == EditorField::Name,
+            EditorField::Name,
+            cx,
+        ))
+        .child(
+            div()
+                .line_height(px(GALLERY_LINE_H))
+                .text_color(rgb(th.text.primary))
+                .child(text!(COPY_TPL_DESC_LABEL)),
+        )
+        .child(editor_field_box(
+            "m6-tpl-desc",
+            format!("o que ele faz: {}", ed.description),
+            &ed.description,
+            ed.focus == EditorField::Description,
+            EditorField::Description,
+            cx,
+        ))
+        .child(
+            // progressive disclosure: as instruções completas moram ATRÁS deste toggle.
+            div()
+                .id("m6-tpl-details")
+                .line_height(px(GALLERY_LINE_H))
+                .text_color(rgb(th.text.muted))
+                .cursor_pointer()
+                .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                    v.modal_gallery_editor_toggle_details(cx);
+                }))
+                .child(text!(if ed.details {
+                    COPY_TPL_DETAILS_OPEN
+                } else {
+                    COPY_TPL_DETAILS
+                })),
+        );
+    if ed.details {
+        panel = panel
+            .child(
+                div()
+                    .line_height(px(GALLERY_LINE_H))
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(COPY_TPL_DOCTRINE_LABEL)),
+            )
+            .child(
+                // Caixa das instruções: raiz de scroll em BLOCO (lição W6), altura fixa — o
+                // texto longo rola POR DENTRO; clique foca (digitação vai pra cá).
+                div()
+                    .id("m6-tpl-doctrine")
+                    .aria_label(format!("instruções completas: {}", ed.doctrine))
+                    .h(px(4.0 * GALLERY_LINE_H + 16.0))
+                    .overflow_y_scroll()
+                    .min_w(px(0.0))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(th.surface.panel))
+                    .border_1()
+                    .border_color(rgb(if ed.focus == EditorField::Doctrine {
+                        th.focus.ring
+                    } else {
+                        th.surface.border
+                    }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_gallery_editor_focus(EditorField::Doctrine, cx);
+                    }))
+                    .child(
+                        div()
+                            .line_height(px(GALLERY_LINE_H))
+                            .text_color(rgb(
+                                if ed.doctrine.is_empty() && ed.focus != EditorField::Doctrine {
+                                    th.text.muted
+                                } else {
+                                    th.text.bright
+                                },
+                            ))
+                            .child(text!(format!(
+                                "{}{}",
+                                ed.doctrine,
+                                if ed.focus == EditorField::Doctrine {
+                                    "\u{258c}"
+                                } else {
+                                    ""
+                                }
+                            ))),
+                    ),
+            );
+    }
+    if let Some(err) = &ed.error {
+        panel = panel.child(
+            div()
+                .line_height(px(GALLERY_LINE_H))
+                .text_color(rgb(th.state.danger))
+                .child(text!(err.clone())),
+        );
+    }
+    panel
+        .child(
+            // rodapé do editor: o par de ações é INEGOCIÁVEL (doutrina B3 — flex_none).
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap_2()
+                .child(
+                    div()
+                        .id("m6-tpl-back")
+                        .flex_none()
+                        .px_4()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .line_height(px(GALLERY_LINE_H))
+                        .text_color(rgb(th.text.bright))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                            v.modal_gallery_editor_back(cx);
+                        }))
+                        .child(text!(COPY_TPL_BACK)),
+                )
+                .child(
+                    div()
+                        .id("m6-tpl-save")
+                        .flex_none()
+                        .px_4()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(th.accent.confirm))
+                        .line_height(px(GALLERY_LINE_H))
+                        .text_color(rgb(th.text.on_accent))
+                        .font_weight(FontWeight::BOLD)
+                        .cursor_pointer()
+                        .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                            v.modal_gallery_editor_save(cx);
+                        }))
+                        .child(text!(COPY_TPL_SAVE)),
+                ),
+        )
+        .into_any_element()
+}
+
+// ═══════════ F1-2-3 p2 · handlers do editor (UI deste módulo → seam do bridge) ═══════════
+// Moram AQUI, e não no main.rs (costura congelada nesta rodada): `impl` de tipo do próprio
+// crate vale em qualquer módulo, e os itens privados do root (campos `agent_modal`/`nodes`,
+// método `modal_open_gallery`) são visíveis em módulos descendentes. A ESCRITA core←app passa
+// pelo seam do bridge (NodeManager::save_role_template / role_templates — dono LLM Engineer):
+// porta ÚNICA de escrita preserva o inv#4; o last-wins fica no modelo (testável headless).
+impl WorkspaceView {
+    /// [Trocar] (F1-2-3 p2): abre a galeria pelo caminho original e injeta os papéis CUSTOM
+    /// do log — o critério "reaparece nos próximos modais" nasce aqui.
+    fn modal_open_gallery_with_customs(&mut self, cx: &mut Context<Self>) {
+        self.modal_open_gallery(cx); // o caminho original (main.rs) segue vivo.
+        let rows = self.nodes.role_templates();
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.gallery_set_customs(rows);
+        }
+        cx.notify();
+    }
+
+    fn modal_gallery_duplicate(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.gallery_duplicate(idx);
+            cx.notify();
+        }
+    }
+
+    fn modal_gallery_editor_focus(&mut self, field: EditorField, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.gallery_editor_focus(field);
+            cx.notify();
+        }
+    }
+
+    fn modal_gallery_editor_toggle_details(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.gallery_editor_toggle_details();
+            cx.notify();
+        }
+    }
+
+    fn modal_gallery_editor_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.gallery_editor_cancel();
+            cx.notify();
+        }
+    }
+
+    /// [Salvar papel]: valida (nome vazio → erro leigo, sem evento) → APPEND pelo seam →
+    /// refresh dos customs + volta à lista. O editor só fecha DEPOIS do append confirmado;
+    /// falha → erro leigo no editor (o detalhe técnico já foi pro stderr no bridge).
+    fn modal_gallery_editor_save(&mut self, cx: &mut Context<Self>) {
+        let plan = match self
+            .agent_modal
+            .as_ref()
+            .map(AgentModal::gallery_editor_plan)
+        {
+            Some(Ok(p)) => p,
+            Some(Err(msg)) => {
+                if let Some(m) = self.agent_modal.as_mut() {
+                    m.gallery_editor_set_error(msg);
+                }
+                cx.notify();
+                return;
+            }
+            None => return,
+        };
+        match self
+            .nodes
+            .save_role_template(&plan.name, &plan.description, &plan.doctrine)
+        {
+            Ok(()) => {
+                let rows = self.nodes.role_templates();
+                if let Some(m) = self.agent_modal.as_mut() {
+                    m.gallery_editor_cancel();
+                    m.gallery_set_customs(rows);
+                }
+            }
+            Err(e) => {
+                eprintln!("lina-gpui: F1-2-3p2 — salvar papel falhou: {e}");
+                if let Some(m) = self.agent_modal.as_mut() {
+                    m.gallery_editor_set_error(COPY_TPL_ERR_SAVE.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
 }
 
 // ═══════════════════════════ testes (gpui-free) ═══════════════════════════
@@ -1918,8 +2591,16 @@ kind = "idle"
                 all.len()
             );
             for r in &all {
-                assert!(!r.label.contains('_'), "rótulo leigo: {}", r.label);
-                assert!(!r.blurb.is_empty(), "1 frase por papel: {}", r.label);
+                assert!(
+                    !r.suggestion.label.contains('_'),
+                    "rótulo leigo: {}",
+                    r.suggestion.label
+                );
+                assert!(
+                    !r.suggestion.blurb.is_empty(),
+                    "1 frase por papel: {}",
+                    r.suggestion.label
+                );
             }
         }
         // busca por TEXTO (nome leigo)…
@@ -1946,7 +2627,7 @@ kind = "idle"
                 .unwrap()
                 .filtered()
                 .iter()
-                .any(|r| r.role == "FRONTEND"),
+                .any(|r| r.suggestion.role == "FRONTEND"),
             "busca pela descrição/função acha o papel"
         );
     }
@@ -1962,7 +2643,7 @@ kind = "idle"
         m.gallery_move(1);
         m.gallery_move(1);
         assert_eq!(m.gallery().unwrap().selected(), 2);
-        let expected = m.gallery().unwrap().filtered()[2].role.clone();
+        let expected = m.gallery().unwrap().filtered()[2].suggestion.role.clone();
         assert!(m.gallery_pick(None), "Enter escolhe o destacado");
         assert_eq!(m.role().unwrap().role, expected);
         // Esc fecha sem aplicar.
@@ -2182,6 +2863,236 @@ kind = "idle"
         );
     }
 
+    /// **F1-2-3 p2 (duplicar+modificar)**: 'Duplicar' num template abre o editor LEVE
+    /// pré-preenchido (nome "(cópia)", descrição = a frase do template; instruções vazias num
+    /// embutido — o registry W3-1 não carrega doutrina); foco no Nome; detalhes FECHADOS
+    /// (progressive disclosure — doutrina nunca obrigatória).
+    #[test]
+    fn gallery_duplicate_opens_prefilled_editor() {
+        let mut m = modal();
+        m.open_gallery();
+        let (label, blurb) = {
+            let it = &m.gallery().expect("aberta").filtered()[0];
+            (it.suggestion.label.clone(), it.suggestion.blurb.clone())
+        };
+        m.gallery_duplicate(0);
+        let ed = m.gallery().unwrap().editor().expect("editor aberto");
+        assert_eq!(ed.name, copy_tpl_dup_name(&label));
+        assert_eq!(ed.description, blurb);
+        assert!(ed.doctrine.is_empty(), "embutido não carrega doutrina");
+        assert_eq!(ed.focus, EditorField::Name);
+        assert!(!ed.details, "detalhes fechados por padrão");
+        assert!(m.gallery_open(), "galeria segue aberta por baixo");
+    }
+
+    /// O FUNIL de teclado do main.rs é fixo (gallery_type/backspace/move/pick/close) — com o
+    /// editor aberto o MODELO reinterpreta: digitar vai pro campo focado, ↑↓ troca o campo,
+    /// Enter NÃO escolhe papel nem fecha (salvar é o botão — clique explícito), Esc fecha SÓ o
+    /// editor (volta à lista) e um segundo Esc fecha a galeria.
+    #[test]
+    fn gallery_editor_reinterprets_key_funnel() {
+        let mut m = modal();
+        m.open_gallery();
+        m.gallery_duplicate(0);
+        // limpa o nome pré-preenchido e digita um novo.
+        while !m.gallery().unwrap().editor().unwrap().name.is_empty() {
+            m.gallery_backspace();
+        }
+        m.gallery_type("Fa");
+        m.gallery_type("z-tudo");
+        assert_eq!(m.gallery().unwrap().editor().unwrap().name, "Faz-tudo");
+        // ↓ foca a Descrição; digitar vai pra ela.
+        m.gallery_move(1);
+        assert_eq!(
+            m.gallery().unwrap().editor().unwrap().focus,
+            EditorField::Description
+        );
+        m.gallery_backspace();
+        m.gallery_type("!");
+        assert!(m
+            .gallery()
+            .unwrap()
+            .editor()
+            .unwrap()
+            .description
+            .ends_with('!'));
+        // Enter no editor: NÃO escolhe papel, NÃO fecha, NÃO aplica nada (governança).
+        assert!(!m.gallery_pick(None), "Enter no editor é no-op");
+        assert!(
+            m.gallery().unwrap().editor().is_some(),
+            "editor segue aberto"
+        );
+        assert!(m.role().is_none(), "nenhum papel aplicado silenciosamente");
+        // Esc 1: fecha só o editor (volta à lista). Esc 2: fecha a galeria.
+        m.gallery_close();
+        assert!(m.gallery_open(), "Esc no editor volta à LISTA");
+        assert!(m.gallery().unwrap().editor().is_none());
+        m.gallery_close();
+        assert!(!m.gallery_open(), "segundo Esc fecha a galeria");
+    }
+
+    /// Progressive disclosure: a doutrina só entra no ciclo do ↑↓ com os detalhes ABERTOS;
+    /// digitar com a doutrina focada edita a doutrina.
+    #[test]
+    fn gallery_editor_doctrine_behind_details() {
+        let mut m = modal();
+        m.open_gallery();
+        m.gallery_duplicate(0);
+        // Sem detalhes: ↓↓ para no campo Descrição (doutrina inacessível).
+        m.gallery_move(1);
+        m.gallery_move(1);
+        assert_eq!(
+            m.gallery().unwrap().editor().unwrap().focus,
+            EditorField::Description,
+            "sem detalhes a doutrina não entra no ciclo"
+        );
+        // Com detalhes: ↓ alcança a doutrina e digitar a edita.
+        m.gallery_editor_toggle_details();
+        m.gallery_move(1);
+        assert_eq!(
+            m.gallery().unwrap().editor().unwrap().focus,
+            EditorField::Doctrine
+        );
+        m.gallery_type("Você revisa o trabalho dos colegas.");
+        assert!(m
+            .gallery()
+            .unwrap()
+            .editor()
+            .unwrap()
+            .doctrine
+            .starts_with("Você revisa"));
+    }
+
+    /// O plano de salvar valida o NOME (vazio → erro leigo, nunca evento); válido → o
+    /// [`RoleTemplate`] exato (trim aplicado) que o seam do bridge vai persistir.
+    #[test]
+    fn gallery_editor_plan_requires_name() {
+        let mut m = modal();
+        m.open_gallery();
+        m.gallery_duplicate(0);
+        while !m.gallery().unwrap().editor().unwrap().name.is_empty() {
+            m.gallery_backspace();
+        }
+        assert_eq!(
+            m.gallery_editor_plan(),
+            Err(COPY_TPL_ERR_EMPTY_NAME.to_string()),
+            "sem nome não há evento"
+        );
+        m.gallery_type("  Minha Revisora  ");
+        let tpl = m.gallery_editor_plan().expect("plano válido");
+        assert_eq!(tpl.name, "Minha Revisora", "trim no nome");
+        assert!(!tpl.description.is_empty(), "descrição herdada do template");
+    }
+
+    /// Customs REAPARECEM: `gallery_set_customs` aplica last-wins por nome (doutrina do evento
+    /// no core), lista os customs JUNTO dos embutidos (com flag), a BUSCA acha por nome E por
+    /// descrição custom, e escolher um custom aplica papel = nome (só por gesto explícito).
+    #[test]
+    fn gallery_customs_last_wins_search_and_pick() {
+        let mut m = modal();
+        m.open_gallery();
+        let builtins = m.gallery().unwrap().filtered().len();
+        m.gallery_set_customs(vec![
+            RoleTemplate {
+                name: "Faz-tudo".into(),
+                description: "versão velha".into(),
+                doctrine: String::new(),
+            },
+            RoleTemplate {
+                name: "Garimpeira".into(),
+                description: "Garimpa fornecedores baratos.".into(),
+                doctrine: "instruções da garimpeira".into(),
+            },
+            RoleTemplate {
+                name: "Faz-tudo".into(),
+                description: "Resolve qualquer pepino do dia.".into(),
+                doctrine: String::new(),
+            },
+        ]);
+        {
+            let g = m.gallery().unwrap();
+            let all = g.filtered();
+            assert_eq!(all.len(), builtins + 2, "last-wins: Faz-tudo 1× só");
+            let faz = all
+                .iter()
+                .find(|it| it.suggestion.label == "Faz-tudo")
+                .expect("custom listado");
+            assert!(faz.custom, "flag de custom");
+            assert_eq!(
+                faz.suggestion.blurb, "Resolve qualquer pepino do dia.",
+                "o ÚLTIMO salvar vence"
+            );
+        }
+        // busca pela DESCRIÇÃO custom…
+        m.gallery_type("pepino");
+        assert_eq!(m.gallery().unwrap().filtered().len(), 1);
+        // …e escolher aplica papel = nome do custom (gesto explícito, critério 4).
+        assert!(m.gallery_pick(None));
+        assert_eq!(m.role().expect("papel aplicado").role, "Faz-tudo");
+        assert!(!m.gallery_open(), "escolher fecha a galeria");
+    }
+
+    /// **Critério (a) — a perna do REPLAY com o core real**: 2 saves do mesmo nome + 1 de outro
+    /// no EventStore; REABRIR o store (replay de verdade) e varrer os records como o bridge
+    /// fará (kind + payload serde) → um modal NOVO lista o custom com o campo modificado.
+    #[test]
+    fn custom_roles_survive_replay_into_new_modal() {
+        let dir = std::env::temp_dir().join(format!("lina-f123p2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut store = lina_core::EventStore::open(&dir).expect("abrir store");
+            for (name, desc) in [
+                ("Garimpeira", "rascunho"),
+                ("Garimpeira", "Garimpa fornecedores baratos."),
+            ] {
+                store
+                    .append(&lina_core::DomainEvent::RoleTemplateSaved {
+                        name: name.into(),
+                        description: desc.into(),
+                        doctrine: "instruções".into(),
+                        ts: 1,
+                    })
+                    .expect("append");
+            }
+        } // fecha o store — o replay abaixo parte do DISCO.
+        let store = lina_core::EventStore::open(&dir).expect("reabrir (replay)");
+        // Varredura ESPELHO do seam `role_templates()`: ordem de log, sem dedup.
+        let rows: Vec<RoleTemplate> = store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == "RoleTemplateSaved")
+            .map(|r| RoleTemplate {
+                name: r.payload["name"].as_str().unwrap_or_default().to_string(),
+                description: r.payload["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                doctrine: r.payload["doctrine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "sem dedup no seam (last-wins é do modal)");
+        let mut m = modal(); // modal NOVO — critério: reaparece nos próximos modais.
+        m.open_gallery();
+        m.gallery_set_customs(rows);
+        let g = m.gallery().unwrap();
+        let hits: Vec<_> = g
+            .filtered()
+            .into_iter()
+            .filter(|it| it.suggestion.label == "Garimpeira")
+            .collect();
+        assert_eq!(hits.len(), 1, "1 custom após last-wins");
+        assert_eq!(
+            hits[0].suggestion.blurb, "Garimpa fornecedores baratos.",
+            "o campo MODIFICADO sobreviveu ao replay"
+        );
+        assert_eq!(hits[0].doctrine, "instruções");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **GUARDIÃO (regressão bugB3 — [Trocar] expulso da linha Papel)**: em TODA largura que o
     /// `modal_frame` produz, TODA linha texto+ação do modal mantém a ação DENTRO da linha — o
     /// texto é quem cede. Mecanismo da regressão: o min-content do texto gpui é a LINHA INTEIRA
@@ -2199,6 +3110,10 @@ kind = "idle"
             (ROW_LABEL_W, ROW_GAP, 110.0), // Pasta: [Trocar…]
             (0.0, 8.0, 80.0),              // ghost: ⓘ por quê?
             (0.0, 8.0, 250.0),             // rodapé: Cancelar+Criar Agente (par à direita)
+            // F1-2-3 p2 — superfícies novas:
+            (0.0, 8.0, 110.0), // linha da galeria: [Duplicar]
+            (0.0, 8.0, 200.0), // cabeçalho do editor: hint "↑↓ muda o campo…"
+            (0.0, 8.0, 250.0), // rodapé do editor: Voltar+Salvar papel
         ];
         for w in [360.0_f32, 640.0, 736.0, 1024.0, 1440.0, 2560.0] {
             for h in [300.0_f32, 700.0, 900.0, 1600.0] {
@@ -2350,6 +3265,7 @@ kind = "idle"
         let dynamic = [
             copy_ghost("Revisor"),
             copy_dup_note("Revisor (2)"),
+            copy_tpl_dup_name("Revisor"),
             engine_label("claude"),
             engine_label("agy"),
         ];
@@ -2367,6 +3283,20 @@ kind = "idle"
             COPY_ROLE_PLACEHOLDER,
             COPY_ROLE_NO_MATCH,
             COPY_ROLE_SUGGESTED_HINT,
+            COPY_GALLERY_DUPLICATE,
+            COPY_TPL_TITLE,
+            COPY_TPL_NAME_LABEL,
+            COPY_TPL_DESC_LABEL,
+            COPY_TPL_DETAILS,
+            COPY_TPL_DETAILS_OPEN,
+            COPY_TPL_DOCTRINE_LABEL,
+            COPY_TPL_SAVE,
+            COPY_TPL_BACK,
+            COPY_TPL_HINT,
+            COPY_TPL_BADGE,
+            COPY_TPL_WHY,
+            COPY_TPL_ERR_EMPTY_NAME,
+            COPY_TPL_ERR_SAVE,
             COPY_ROLE_SWAP,
             COPY_CWD_LABEL,
             COPY_CWD_DEFAULT,

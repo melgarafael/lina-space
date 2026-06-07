@@ -26,8 +26,8 @@ use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
     BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome, DomainEvent,
-    EventStore, GridDelta, MailMessage, Mailbox, NodeStatus as CoreStatus, PtyCommand, PtyManager,
-    Recipient, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor, VtBackend,
+    EventRecord, EventStore, GridDelta, MailMessage, Mailbox, NodeStatus as CoreStatus, PtyCommand,
+    PtyManager, Recipient, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor, VtBackend,
     WorkspaceTrust,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
@@ -1238,6 +1238,176 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
     }
 }
 
+// ════════════════════ F1-1-7 · fiação da FILA DE ATENÇÃO (AttentionQueue ↔ app) ════════════════════
+//
+// A projeção `lina_core::AttentionQueue` (F1-1-7 core) é a FONTE ÚNICA de ordenação
+// (custódia > permissão, round-robin por nó) e de escalação (≥5 min). Aqui mora só a
+// fiação: replay do log no boot e a cada evento novo (padrão `CostLedger` — o
+// `from_record` é interno ao core), espelho da custódia VIVA do [`CustodyDesk`] (com
+// `first_seen` estável por id — a escalação não reseta entre re-replays), e os comandos
+// do gesto humano (resolve/dismiss/mute) que apendam o evento devolvido pelo core e
+// re-alimentam o fold. **NENHUM byte vai ao PTY por este caminho** (ADR 0021 §6 /
+// AC-0021.6): o hub não tem handle de PTY nem de `InputSink` — o write é F1-1-8.
+
+/// Fiação F1-1-7: `AttentionQueue` do core cabeada ao log + à mesa de custódia.
+pub struct AttentionHub {
+    queue: Mutex<lina_core::AttentionQueue>,
+    store: Arc<Mutex<EventStore>>,
+    desk: Desk,
+    model: Model,
+    /// `event_count` do último replay (re-replay SÓ com evento novo — padrão CostLedger).
+    last_ec: Mutex<u64>,
+    /// Espelho da custódia: id → (nó autenticado, display, first_seen ms). O first_seen
+    /// é cunhado no 1º sync que viu o id e SOBREVIVE a re-replays (escalação estável).
+    custody_seen: Mutex<BTreeMap<String, (String, String, u64)>>,
+}
+
+impl AttentionHub {
+    /// Cria o hub reconstruindo a fila do LOG (crash com pendência → reabrir reconstrói
+    /// — critério 5 da story; o replay é a mesma rota do live: fold único do core).
+    #[must_use]
+    pub fn new(store: Arc<Mutex<EventStore>>, desk: Desk, model: Model) -> Self {
+        let (queue, ec) = {
+            let s = lock(&store);
+            let records = s.events().unwrap_or_default();
+            (
+                lina_core::AttentionQueue::replay(&records),
+                s.event_count().unwrap_or(0),
+            )
+        };
+        Self {
+            queue: Mutex::new(queue),
+            store,
+            desk,
+            model,
+            last_ec: Mutex::new(ec),
+            custody_seen: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Sincroniza e devolve a fila ORDENADA para exibição: (1) evento novo no log →
+    /// re-replay + re-espelho da custódia conhecida; (2) diff da custódia VIVA do desk
+    /// (novos ids entram com `first_seen = now`; resolvidos pelo ⌘⏎ saem). Chamado pelo
+    /// heartbeat da view (~4 Hz) — re-replay só quando o `event_count` mudou.
+    pub fn sync(&self, now_ms: u64) -> Vec<lina_core::AttentionItem> {
+        let ec = lock(&self.store).event_count().unwrap_or(0);
+        let stale = {
+            let mut last = lock(&self.last_ec);
+            let stale = *last != ec;
+            *last = ec;
+            stale
+        };
+        if stale {
+            let records = lock(&self.store).events().unwrap_or_default();
+            let mut q = lina_core::AttentionQueue::replay(&records);
+            for (id, (node, display, ts)) in lock(&self.custody_seen).iter() {
+                q.custody_enqueued(id.clone(), node.clone(), display.clone(), *ts);
+            }
+            *lock(&self.queue) = q;
+        }
+        // Custódia viva (origem AUTENTICADA do drain — `requester()`, nunca payload).
+        let live: Vec<(String, String, String)> = lock(&self.desk)
+            .queue
+            .iter()
+            .map(|p| {
+                (
+                    p.id().to_string(),
+                    p.requester().to_string(),
+                    p.display().to_string(),
+                )
+            })
+            .collect();
+        let mut seen = lock(&self.custody_seen);
+        let mut q = lock(&self.queue);
+        for (id, node, display) in &live {
+            let (n, d, ts) = seen
+                .entry(id.clone())
+                .or_insert_with(|| (node.clone(), display.clone(), now_ms));
+            q.custody_enqueued(id.clone(), n.clone(), d.clone(), *ts);
+        }
+        let gone: Vec<String> = seen
+            .keys()
+            .filter(|k| !live.iter().any(|(id, _, _)| id == *k))
+            .cloned()
+            .collect();
+        for id in gone {
+            seen.remove(&id);
+            q.custody_resolved(&id);
+        }
+        q.items(now_ms)
+    }
+
+    /// Decisão humana sobre uma PERMISSÃO: apenda o `PermissionResolved` devolvido pelo
+    /// core e re-alimenta o fold. `false` = id desconhecido/já resolvido (clique duplo é
+    /// no-op sem 2º evento) ou item de CUSTÓDIA (decide pelo ⌘⏎ existente — zero
+    /// regressão, garantido pelo core). SÓ registra a decisão; o write é F1-1-8.
+    ///
+    /// **COSTURA F1-1-8 (combinada com o Arquiteto — próxima rodada):** este método
+    /// passa a chamar o `deliver_approval` do executor (porta única de escrita), que
+    /// emite o desfecho completo (Resolved → write validado → Injected/Aborted);
+    /// `dismiss` continua daqui (PermissionDismissed é da fila, sempre).
+    pub fn resolve(
+        &self,
+        stable_id: &str,
+        decision: lina_core::ApprovalDecision,
+        via: lina_core::ResolutionVia,
+    ) -> bool {
+        let Some(ev) = lock(&self.queue).resolve(stable_id, decision, via) else {
+            return false;
+        };
+        self.commit(ev, stable_id, "PermissionResolved")
+    }
+
+    /// «Não era um pedido» (mitigação de FP — decisão do Maestro): apenda o
+    /// `PermissionDismissed` (NÃO é deny; alimenta a telemetria de FP do detector).
+    pub fn dismiss(&self, stable_id: &str) -> bool {
+        let Some(ev) = lock(&self.queue).dismiss(stable_id) else {
+            return false;
+        };
+        self.commit(ev, stable_id, "PermissionDismissed")
+    }
+
+    /// «Silenciar detecção deste terminal» (allowlist por nó): apenda o
+    /// `NodeDetectionMuted` (reversível — último evento vence).
+    pub fn set_node_muted(&self, node_id: &str, muted: bool) -> bool {
+        let ev = lock(&self.queue).set_node_muted(node_id, muted);
+        self.commit(ev, node_id, "NodeDetectionMuted")
+    }
+
+    /// O fallback de grid está silenciado para o nó? (rótulo do botão na fila).
+    #[must_use]
+    pub fn is_node_muted(&self, node_id: &str) -> bool {
+        lock(&self.queue).is_node_muted(node_id)
+    }
+
+    /// Porta única de escrita do hub: apenda no log (fonte da verdade) e re-alimenta o
+    /// fold — o efeito na fila é imediato; o próximo re-replay converge para o mesmo
+    /// estado (fold único). Falha de append loga ALTO e NÃO muda a fila (o gesto não
+    /// "pegou" — o humano re-tenta; nunca estado fantasma sem evento).
+    fn commit(&self, ev: DomainEvent, subject: &str, kind: &str) -> bool {
+        if let Err(e) = lock(&self.store).append(&ev) {
+            eprintln!("lina-gpui: [ATT] {kind} de {subject:?} NÃO registrado (append falhou): {e}");
+            return false;
+        }
+        lock(&self.queue).observe(&ev, now_ms());
+        lock(&self.model).touch();
+        eprintln!("lina-gpui: [ATT] {kind} registrado no log para {subject:?}");
+        true
+    }
+
+    /// (teste) Apenda um evento cru no store do hub — simula o detector da F1-1-6.
+    #[cfg(test)]
+    pub fn store_append_for_test(&self, ev: &DomainEvent) {
+        lock(&self.store).append(ev).expect("append de teste");
+    }
+
+    /// (teste) Os registros do log do hub — p/ asserts de auditoria.
+    #[cfg(test)]
+    pub fn events_for_test(&self) -> Vec<EventRecord> {
+        lock(&self.store).events().expect("events de teste")
+    }
+}
+
 /// Mapeia o `NodeStatus` do core (Bus) para o `NodeStatus` do contrato de UI.
 fn map_status(s: CoreStatus) -> NodeStatus {
     match s {
@@ -2060,6 +2230,29 @@ impl BootstrapWriter {
     }
 }
 
+/// **F1-2-3 p2 — decode PURO dos papéis custom** (testável headless): filtra os
+/// `RoleTemplateSaved` de `records`, EM ORDEM DE LOG, SEM dedup (o modal aplica o
+/// last-wins por `name` — doutrina do evento no core). Campos ausentes do payload →
+/// `""` (espírito `serde(default)`: shape antigo/parcial nunca quebra o replay).
+#[must_use]
+fn role_templates_from_records(records: &[EventRecord]) -> Vec<crate::agent_modal::RoleTemplate> {
+    let field = |p: &serde_json::Value, k: &str| -> String {
+        p.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    records
+        .iter()
+        .filter(|r| r.kind == "RoleTemplateSaved")
+        .map(|r| crate::agent_modal::RoleTemplate {
+            name: field(&r.payload, "name"),
+            description: field(&r.payload, "description"),
+            doctrine: field(&r.payload, "doctrine"),
+        })
+        .collect()
+}
+
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
 /// (`PtyManager`, `Supervisor`, `EventStore`), a projeção (`SharedModel`) e os grids, e sabe
 /// ADICIONAR e REMOVER nós-terminal mantendo o **event log como fonte da verdade** (emite
@@ -2285,6 +2478,44 @@ impl NodeManager {
             .project()
             .ok()
             .and_then(|st| st.nodes.get(&node).and_then(|n| n.role.clone()))
+    }
+
+    /// **F1-2-3 p2 (seam p/ o modal de papéis)** — persiste um papel CUSTOM do usuário:
+    /// append de `RoleTemplateSaved` no event log (fonte da verdade; o modal reconstrói a
+    /// biblioteca varrendo o log). Idioma de erro do [`Self::create_agent_with`]: mensagem
+    /// LEIGA no `Err`, detalhe técnico no stderr.
+    pub fn save_role_template(
+        &mut self,
+        name: &str,
+        description: &str,
+        doctrine: &str,
+    ) -> Result<(), String> {
+        let mut s = lock(&self.store);
+        if let Err(e) = s.append(&DomainEvent::RoleTemplateSaved {
+            name: name.to_string(),
+            description: description.to_string(),
+            doctrine: doctrine.to_string(),
+            ts: now_ms(),
+        }) {
+            eprintln!("lina-gpui: save_role_template — append falhou: {e}");
+            return Err("não consegui salvar seu papel personalizado".to_string());
+        }
+        Ok(())
+    }
+
+    /// **F1-2-3 p2 (seam p/ o modal de papéis)** — os papéis CUSTOM como REAPARECEM do log:
+    /// EM ORDEM DE LOG, SEM dedup (o modal aplica o last-wins — doutrina do evento no core).
+    /// Replay sob demanda (ao abrir o modal), nunca por frame. Log ilegível → lista vazia
+    /// (best-effort, detalhe no stderr — o modal segue só com a biblioteca embutida).
+    #[must_use]
+    pub fn role_templates(&self) -> Vec<crate::agent_modal::RoleTemplate> {
+        match lock(&self.store).events() {
+            Ok(records) => role_templates_from_records(&records),
+            Err(e) => {
+                eprintln!("lina-gpui: role_templates — leitura do log falhou: {e}");
+                Vec::new()
+            }
+        }
     }
 
     /// Nº de nós vivos (projeção).
@@ -4723,5 +4954,272 @@ mod tests {
         assert!(skill.is_file(), "idempotente em recriação");
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    // ─────────────── F1-2-3 p2 (seam Dev 03): papéis custom do log ───────────────
+
+    /// O decode devolve as linhas EM ORDEM DE LOG, SEM dedup (o last-wins é do modal —
+    /// doutrina do evento no core), e payload PARCIAL (shape antigo) vira defaults, nunca
+    /// quebra. Round-trip: o que `RoleTemplateSaved` grava é o que o decode lê.
+    #[test]
+    fn role_templates_decode_in_log_order_without_dedup() {
+        let base = std::env::temp_dir().join(format!("lina-roletpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut store = EventStore::open(base.join("events")).expect("store");
+        for (n, d) in [("Revisora", "v1"), ("Designer", "d1"), ("Revisora", "v2")] {
+            store
+                .append(&DomainEvent::RoleTemplateSaved {
+                    name: n.into(),
+                    description: d.into(),
+                    doctrine: format!("doutrina {d}"),
+                    ts: now_ms(),
+                })
+                .expect("append");
+        }
+        let got = role_templates_from_records(&store.events().expect("events"));
+        assert_eq!(got.len(), 3, "SEM dedup — as 3 linhas, em ordem de log");
+        assert_eq!(
+            (got[0].name.as_str(), got[0].description.as_str()),
+            ("Revisora", "v1")
+        );
+        assert_eq!(got[1].name.as_str(), "Designer");
+        assert_eq!(
+            (got[2].name.as_str(), got[2].description.as_str()),
+            ("Revisora", "v2"),
+            "a duplicata de name SOBREVIVE (last-wins é decisão do modal)"
+        );
+        assert!(got[2].doctrine.contains("v2"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─────────────── F1-1-7 · AttentionHub (fiação core AttentionQueue ↔ app) ───────────────
+
+    /// Hub de teste enraizado num store temp + desk próprio. Devolve também o caminho
+    /// p/ limpeza.
+    fn attention_hub(tag: &str) -> (AttentionHub, Desk, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("lina-atthub-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let hub = AttentionHub::new(store, Arc::clone(&desk), model);
+        (hub, desk, base)
+    }
+
+    fn ask_event(sid: &str, node: &str, detail: &str) -> DomainEvent {
+        DomainEvent::PermissionAsked {
+            node_id: node.into(),
+            tool: Some("Bash".into()),
+            detail: Some(detail.into()),
+            evidence: lina_core::PermissionEvidence::Hook,
+            stable_id: sid.into(),
+        }
+    }
+
+    /// O gesto APROVAR/RECUSAR registra `PermissionResolved` no log (audit — critério 3
+    /// da story), remove a pendência, e o CLIQUE DUPLO não gera segundo evento
+    /// (idempotência da fila). NENHUM write no PTY existe neste caminho (ADR 0021 §6 —
+    /// auditável: o hub não tem handle de PTY; ver AC-0021.6).
+    #[test]
+    fn attention_hub_resolve_appends_once_and_removes_pending() {
+        let (hub, _desk, base) = attention_hub("resolve");
+        hub.store_append_for_test(&ask_event("s1", "Terminal B", "git push origin/master"));
+        let items = hub.sync(1_000);
+        assert_eq!(items.len(), 1, "pendência visível após o sync");
+        assert_eq!(items[0].stable_id, "s1");
+
+        assert!(hub.resolve(
+            "s1",
+            lina_core::ApprovalDecision::Approve,
+            lina_core::ResolutionVia::Human
+        ));
+        assert!(hub.sync(2_000).is_empty(), "decisão remove o toast/fila");
+        // Clique duplo: idempotente — NÃO apenda um 2º Resolved.
+        assert!(!hub.resolve(
+            "s1",
+            lina_core::ApprovalDecision::Approve,
+            lina_core::ResolutionVia::Human
+        ));
+        let resolved = hub
+            .events_for_test()
+            .into_iter()
+            .filter(|r| r.kind == "PermissionResolved")
+            .count();
+        assert_eq!(resolved, 1, "exatamente 1 evento de decisão");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// «Não era um pedido» (mitigação de FP): registra `PermissionDismissed` (NÃO é
+    /// deny) e remove a pendência.
+    #[test]
+    fn attention_hub_dismiss_records_false_positive() {
+        let (hub, _desk, base) = attention_hub("dismiss");
+        hub.store_append_for_test(&ask_event("s1", "Terminal A", "(y/n) fake"));
+        assert_eq!(hub.sync(1_000).len(), 1);
+        assert!(hub.dismiss("s1"));
+        assert!(hub.sync(2_000).is_empty());
+        assert!(!hub.dismiss("s1"), "já saiu — sem 2º evento");
+        let dismissed = hub
+            .events_for_test()
+            .into_iter()
+            .filter(|r| r.kind == "PermissionDismissed")
+            .count();
+        assert_eq!(dismissed, 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A custódia VIVA do `CustodyDesk` aparece na MESMA fila (unificação — critério 1),
+    /// com `first_seen` ESTÁVEL entre syncs (a escalação dos 5 min não reseta) e
+    /// PRECEDÊNCIA sobre permissão (ordenação do core). Decidir custódia pela fila é
+    /// IMPOSSÍVEL por construção (`resolve` → None; o canal é o ⌘⏎ existente).
+    #[test]
+    fn attention_hub_mirrors_live_custody_with_stable_first_seen() {
+        let (hub, desk, base) = attention_hub("custody");
+        hub.store_append_for_test(&ask_event("p1", "Terminal A", "git push"));
+        lock(&desk).queue.push_back(PendingGate::Custody {
+            id: "msg_c1".into(),
+            action: "deploy".into(),
+            secret_key: "prod".into(),
+            requester: "Terminal B".into(),
+            display: "🔒 CUSTODIA: deploy".into(),
+        });
+
+        let items = hub.sync(5_000);
+        assert_eq!(items.len(), 2, "custódia + permissão na MESMA fila");
+        assert_eq!(
+            items[0].kind,
+            lina_core::AttentionKind::Custody,
+            "custódia na frente (precedência do core)"
+        );
+        assert_eq!(items[0].created_ts, 5_000, "first_seen = 1º sync");
+        // Re-sync mais tarde: o first_seen NÃO anda (escalação estável).
+        let items = hub.sync(9_000);
+        assert_eq!(items[0].created_ts, 5_000, "first_seen estável entre syncs");
+        // Decidir custódia pela fila: bloqueado por construção (zero regressão ⌘⏎).
+        assert!(!hub.resolve(
+            "msg_c1",
+            lina_core::ApprovalDecision::Approve,
+            lina_core::ResolutionVia::Human
+        ));
+        // A pump resolveu o gate (⌘⏎ atual) → some da fila no próximo sync.
+        lock(&desk).queue.pop_front();
+        let items = hub.sync(10_000);
+        assert_eq!(items.len(), 1, "custódia saiu; a permissão fica");
+        assert_eq!(items[0].stable_id, "p1");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Crash com pendência → REABRIR reconstrói a fila do log (critério 5 da story):
+    /// um hub NOVO sobre o mesmo store re-projeta o pendente.
+    #[test]
+    fn attention_hub_rebuilds_pending_from_log_after_restart() {
+        let (hub, _desk, base) = attention_hub("replay");
+        hub.store_append_for_test(&ask_event("s1", "Terminal B", "npm publish"));
+        assert_eq!(hub.sync(1_000).len(), 1);
+        drop(hub);
+        // "Reabre o app": hub novo, mesmo log no disco.
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("reabrir store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let hub2 = AttentionHub::new(store, desk, model);
+        let items = hub2.sync(2_000);
+        assert_eq!(items.len(), 1, "pendência reconstruída do log");
+        assert_eq!(items[0].stable_id, "s1");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// «Silenciar detecção deste terminal»: persiste `NodeDetectionMuted` (reversível,
+    /// último vence) e o estado é legível p/ o rótulo do botão.
+    #[test]
+    fn attention_hub_node_mute_persists_and_reads_back() {
+        let (hub, _desk, base) = attention_hub("mute");
+        assert!(!hub.is_node_muted("Terminal A"));
+        assert!(hub.set_node_muted("Terminal A", true));
+        assert!(hub.is_node_muted("Terminal A"));
+        assert!(hub.set_node_muted("Terminal A", false));
+        assert!(!hub.is_node_muted("Terminal A"));
+        let muted_events = hub
+            .events_for_test()
+            .into_iter()
+            .filter(|r| r.kind == "NodeDetectionMuted")
+            .count();
+        assert_eq!(muted_events, 2, "liga + desliga persistidos no log");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **ARBITRAGEM do Maestro (ux-flows vence): Esc NUNCA decide.** O caminho do Esc
+    /// no `handle_key` é exatamente `ToastMachine::snooze` — aqui provamos, na camada
+    /// testável, que esse caminho recolhe o toast SEM emitir NENHUM evento de decisão
+    /// (`PermissionResolved`/`PermissionDismissed`) e o item segue pendente (fila/
+    /// badge). NÃO-VACUOSO por controle positivo: o mesmo contador captura o evento
+    /// quando uma decisão EXPLÍCITA (clique → `resolve`) acontece em seguida.
+    #[test]
+    fn esc_snooze_never_emits_decision_event() {
+        let (hub, _desk, base) = attention_hub("esc");
+        hub.store_append_for_test(&ask_event("s1", "Terminal B", "git push origin/master"));
+        let items = hub.sync(1_000);
+        let mut machine = crate::attention_ui::ToastMachine::default();
+        machine.tick(&items, 1_000);
+        assert!(
+            matches!(
+                machine.visible(&items, 1_000),
+                Some(crate::attention_ui::ToastView::Single(0))
+            ),
+            "toast single de permissão no ar"
+        );
+
+        machine.snooze(&items); // ← o que o Esc faz agora (e NADA mais)
+        machine.tick(&items, 1_100);
+        assert_eq!(machine.visible(&items, 1_100), None, "Esc recolheu o toast");
+        let items_after = hub.sync(1_200);
+        assert_eq!(items_after.len(), 1, "o item SEGUE pendente (fila/badge)");
+        let decided = |hub: &AttentionHub| {
+            hub.events_for_test()
+                .into_iter()
+                .filter(|r| r.kind == "PermissionResolved" || r.kind == "PermissionDismissed")
+                .count()
+        };
+        assert_eq!(decided(&hub), 0, "Esc não emitiu evento de decisão");
+
+        // Controle positivo (não-vacuidade): a decisão EXPLÍCITA emite — e o mesmo
+        // contador a captura.
+        assert!(hub.resolve(
+            "s1",
+            lina_core::ApprovalDecision::Deny,
+            lina_core::ResolutionVia::Human
+        ));
+        assert_eq!(decided(&hub), 1, "o contador captura decisões reais");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Payload parcial/estranho: campos ausentes → `""` (espírito `serde(default)`);
+    /// kinds alheios são ignorados — replay de log antigo nunca quebra o modal.
+    #[test]
+    fn role_templates_tolerate_partial_payload_and_skip_other_kinds() {
+        let rec = |seq: u64, kind: &str, payload: serde_json::Value| EventRecord {
+            seq,
+            ts: seq,
+            kind: kind.into(),
+            version: 1,
+            payload,
+        };
+        let records = vec![
+            rec(
+                1,
+                "RoleTemplateSaved",
+                serde_json::json!({"name":"Só Nome"}),
+            ),
+            rec(2, "NodeAdded", serde_json::json!({"node":"x"})),
+            rec(3, "RoleTemplateSaved", serde_json::json!({})),
+        ];
+        let got = role_templates_from_records(&records);
+        assert_eq!(got.len(), 2, "só os RoleTemplateSaved");
+        assert_eq!(got[0].name, "Só Nome");
+        assert_eq!(got[0].description, "", "ausente → default vazio");
+        assert_eq!(got[1].name, "", "payload vazio não quebra");
     }
 }
