@@ -1740,6 +1740,56 @@ pub fn scrub_pty_secret_env() -> Vec<&'static str> {
     removed
 }
 
+/// **R2c — env de ORQUESTRADOR ESTRANGEIRO (bug de tela 21:40 do fundador).** O Lina.app
+/// lançado de um terminal hospedado no Maestri herda `MAESTRI_CLI` (& afins) no env do
+/// processo; como TODO PTY filho herda esse env, a skill GLOBAL do Maestri
+/// (`~/.claude/skills/maestri`) vira "funcional" aos olhos do modelo — o agente do ⌘N
+/// tenta `maestri list` (exit 127) e `"$MAESTRI_CLI"` (exit 126: a VAR EXISTE).
+///
+/// Casa por **PREFIXO** (não nomes exatos): toda `MAESTRI_*` é plumbing do Maestri.
+/// Estruturado p/ novos orquestradores entrarem por esta lista (inv #3 — a
+/// neutralidade é também *não confundir* o agente com ferramentas de fora do Espaço).
+/// **Não** mira vars de auth (`ANTHROPIC_*`/`CLAUDE_*`) nem básicas (`PATH`/`HOME`/`TERM`)
+/// — o agente precisa delas para funcionar.
+pub const FOREIGN_ORCHESTRATOR_ENV_PREFIXES: &[&str] = &["MAESTRI_"];
+
+/// `true` se `key` é uma variável de plumbing de orquestrador estrangeiro (a ser
+/// scrubada do env do agente). PURA — testável sem tocar o env global.
+#[must_use]
+pub fn is_foreign_orchestrator_var(key: &str) -> bool {
+    FOREIGN_ORCHESTRATOR_ENV_PREFIXES
+        .iter()
+        .any(|p| key.starts_with(p))
+}
+
+/// As variáveis estrangeiras dentre `names` (seleção PURA — base do scrub real, testável
+/// sem mutar o env do processo).
+#[must_use]
+pub fn foreign_orchestrator_keys<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|k| is_foreign_orchestrator_var(k))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Remove do **próprio env do processo do app** (herdado por TODO PTY filho) as variáveis
+/// de orquestradores estrangeiros (`MAESTRI_*`). Chamado AQUI — antes de qualquer
+/// `wire_terminal` — para nenhum agente nascer enxergando o plumbing do Maestri. Coleta
+/// os nomes ANTES de remover (não dá para `remove_var` enquanto itera `vars_os`); a
+/// seleção é a função pura [`foreign_orchestrator_keys`] (mesma lógica que os testes
+/// exercitam sem tocar o env global). Retorna os nomes efetivamente removidos.
+pub fn scrub_foreign_orchestrator_env() -> Vec<String> {
+    let names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    let present = foreign_orchestrator_keys(names.iter().map(String::as_str));
+    for key in &present {
+        std::env::remove_var(key);
+    }
+    present
+}
+
 /// Fábrica injetável de comando por nome: o app passa [`shell_cmd`] (shell real); os testes
 /// passam um comando leve (`cat`) p/ serem determinísticos e headless.
 pub type CmdFactory = Arc<dyn Fn(&str) -> PtyCommand + Send + Sync>;
@@ -3266,6 +3316,56 @@ mod tests {
         assert!(desk.banner().unwrap().contains("segundo"));
     }
 
+    /// R2c (bug de tela 21:40 do fundador): a função PURA classifica QUAIS nomes de env
+    /// são de orquestradores estrangeiros — `MAESTRI_CLI` e todo `MAESTRI_*` (prefixo,
+    /// extensível); e NUNCA classifica PATH/HOME/TERM/SHELL nem as vars de auth do
+    /// claude (ANTHROPIC_*/CLAUDE_*) — esses precisam sobreviver no PTY do agente.
+    #[test]
+    fn foreign_orchestrator_var_matches_maestri_prefix_only() {
+        // Estrangeiras (vazam a skill do Maestri p/ o agente).
+        for k in [
+            "MAESTRI_CLI",
+            "MAESTRI_SESSION",
+            "MAESTRI_CANVAS_ID",
+            "MAESTRI_",
+        ] {
+            assert!(
+                is_foreign_orchestrator_var(k),
+                "{k} deveria ser estrangeira"
+            );
+        }
+        // Intocáveis: básicas do shell + auth do claude + as do próprio Lina.
+        for k in [
+            "PATH",
+            "HOME",
+            "TERM",
+            "SHELL",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "LINA_HOME",
+            "VIBE_ROLE",
+            "MAESTRO", // nome de papel do Lina, NÃO uma var MAESTRI_*
+        ] {
+            assert!(!is_foreign_orchestrator_var(k), "{k} NÃO pode ser scrubada");
+        }
+    }
+
+    /// A seleção PURA sobre um conjunto de nomes devolve só as estrangeiras — base do
+    /// scrub real, testável sem tocar o env global do processo (sem corrida entre testes).
+    #[test]
+    fn foreign_orchestrator_keys_selects_only_foreign() {
+        let names = [
+            "MAESTRI_CLI",
+            "PATH",
+            "MAESTRI_SESSION",
+            "HOME",
+            "ANTHROPIC_API_KEY",
+        ];
+        let mut got = foreign_orchestrator_keys(names.iter().copied());
+        got.sort();
+        assert_eq!(got, vec!["MAESTRI_CLI", "MAESTRI_SESSION"]);
+    }
+
     /// Fio 3: `scrub_pty_secret_env` remove do env do processo as vars portadoras de segredo (que os
     /// PTYs filhos herdariam). Prova que o token NÃO pode chegar ao env de um terminal do agente.
     #[test]
@@ -3282,6 +3382,37 @@ mod tests {
             std::env::var_os("LINA_DEPLOY_TOKEN").is_none(),
             "após o scrub, nenhum PTY filho herda o token (ele vive só no cofre)"
         );
+    }
+
+    /// R2c (fechamento do bug): `scrub_foreign_orchestrator_env` remove do env do
+    /// processo do app a var de orquestrador estrangeiro (que TODO PTY filho herdaria),
+    /// e PRESERVA as básicas do shell + auth do claude. Vars com nomes ÚNICOS (sufixo
+    /// pid) p/ não colidir com outros testes em paralelo que mutam o env global.
+    #[test]
+    fn scrub_removes_foreign_orchestrator_env_keeps_essentials() {
+        let pid = std::process::id();
+        let foreign = format!("MAESTRI_CLI_{pid}");
+        // `MAESTRI_CLI` "puro" também é coberto, mas a var com pid evita corrida.
+        std::env::set_var(&foreign, "/Users/x/.maestri/cli");
+        // Sentinelas que NÃO podem ser tocadas (auth do claude + shell).
+        let auth = format!("ANTHROPIC_API_KEY_{pid}"); // prefixo intocável
+        std::env::set_var(&auth, "sk-ant-xxx");
+        assert!(std::env::var_os(&foreign).is_some());
+
+        let removed = scrub_foreign_orchestrator_env();
+        assert!(
+            removed.contains(&foreign),
+            "a var estrangeira deve constar dos removidos: {removed:?}"
+        );
+        assert!(
+            std::env::var_os(&foreign).is_none(),
+            "após o scrub, nenhum PTY filho herda MAESTRI_* — a skill estrangeira morre"
+        );
+        assert!(
+            std::env::var_os(&auth).is_some(),
+            "auth do claude (ANTHROPIC_*) SOBREVIVE — o agente ainda funciona"
+        );
+        std::env::remove_var(&auth);
     }
 
     /// Roster vivo com os nós `names` registrados (writer = sink) — para o roster-check do hole 3.
@@ -5150,6 +5281,22 @@ mod tests {
         // Idempotência: reinstalar sobre o existente não falha e mantém o arquivo.
         install_agent_bus_skill(&cwd);
         assert!(skill.is_file(), "idempotente em recriação");
+
+        // R2c (T3): a skill INSTALADA traz os gatilhos pt-br do fundador (vence a skill
+        // estrangeira por matching de descrição) E o alerta anti-Maestri; o `alias
+        // maestri` (reforço do bug) sumiu.
+        assert!(
+            body.contains("mande") && body.contains("peça") && body.contains("avise"),
+            "descrição casa com a fala pt-br do fundador (mande/peça/avise)"
+        );
+        assert!(
+            body.contains("Maestri") && body.contains("MAESTRI_CLI"),
+            "a skill alerta contra o orquestrador estrangeiro"
+        );
+        assert!(
+            !body.contains("alias `maestri`"),
+            "o 'alias maestri' enganoso foi removido da skill"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

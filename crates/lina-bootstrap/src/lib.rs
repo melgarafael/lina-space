@@ -638,6 +638,35 @@ mod tests {
         }
     }
 
+    /// **R2c (bug de tela 21:40) — DOUTRINA anti-colisão de orquestrador:** as 3 fichas
+    /// (Claude/Codex/Gemini) dizem explicitamente que skills/CLIs de OUTROS
+    /// orquestradores (Maestri) NÃO funcionam e que a comunicação é SÓ pelos verbos
+    /// `lina`; e NÃO contêm mais o `alias maestri` (que reforçava a skill estrangeira na
+    /// máquina do fundador). Guarda contra regressão no re-render.
+    #[test]
+    fn doctrine_warns_against_foreign_orchestrators() {
+        let bs = Bootstrapper::new().expect("registry");
+        let input = sample("@Dev Backend");
+        for md in [
+            bs.doctrine(&input),
+            bs.agents_doctrine(&input),
+            bs.gemini_doctrine(&input),
+        ] {
+            assert!(
+                md.contains("Maestri") && md.contains("NÃO funciona"),
+                "a ficha alerta que orquestrador estrangeiro não funciona aqui"
+            );
+            assert!(
+                md.contains("lina-agent-bus"),
+                "a ficha aponta a skill oficial de A2A"
+            );
+            assert!(
+                !md.contains("alias `maestri`"),
+                "o 'alias maestri' (reforço do bug) foi removido"
+            );
+        }
+    }
+
     /// **Injeção barrada:** um nome com newline + `## header` + `{{placeholder}}` NÃO quebra os 8
     /// blocos nem deixa `{{` (sanitização no renderer).
     #[test]

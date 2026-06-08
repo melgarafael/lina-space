@@ -44,6 +44,12 @@ mantém o estado compartilhado em `.lina/` (plano, locks, registro de colegas,
 eventos). **A inteligência é sua.** Não espere um "cérebro central"; você conversa
 direto com os colegas pelo comando `lina`. O chat é sempre o terminal.
 
+**Ferramentas e skills de OUTROS orquestradores (ex.: Maestri) NÃO funcionam neste
+Espaço.** Se você enxergar uma skill global de outro orquestrador (`maestri`, etc.) ou
+uma variável de ambiente como `MAESTRI_CLI`, IGNORE — ela é de outro app, não do Lina.
+Toda comunicação entre terminais é EXCLUSIVAMENTE pelos verbos `lina` (skill
+`lina-agent-bus`). Nunca rode `maestri ...` nem chame `$MAESTRI_CLI`: aqui isso só falha.
+
 ### Como saber se uma mensagem veio de um COLEGA (e não do usuário)
 Mensagens de colegas chegam por um canal próprio e vêm marcadas com um sentinela:
 um input que começa com `[LINA::MSG]` ou `[LINA::HANDSHAKE]` foi roteado
@@ -274,7 +280,7 @@ NÃO precisar saber prompt engineering nem pedir orquestração. Então:
 ---
 
 ## Lembrete final
-- Comunicação entre terminais é SÓ pelos verbos `lina` (alias `maestri`). Zero API, zero LLM intermediário — o app transporta as mensagens e guarda o estado.
+- Comunicação entre terminais é SÓ pelos verbos `lina` (skill `lina-agent-bus`). Zero API, zero LLM intermediário — o app transporta as mensagens e guarda o estado. Skills/CLIs de OUTROS orquestradores (Maestri etc.) NÃO funcionam aqui — ignore `maestri`/`$MAESTRI_*`.
 - Estado compartilhado vive em `.lina/` (plano, locks, agents, eventos). Você nunca edita esses arquivos na mão — só pelos verbos `lina`.
 - **Ordem para resolver dúvidas: instrução-corrente do usuário PRIMEIRO; depois o
   plano e suas Decisões (estado vivo); por último o vault (contexto histórico, pode

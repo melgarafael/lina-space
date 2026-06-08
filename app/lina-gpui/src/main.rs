@@ -70,10 +70,10 @@ use lina_bootstrap::Autonomy;
 
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
-    normalize_sel, screen_to_cell, scrub_pty_secret_env, shell_cmd, spawn_pump, wire_terminal,
-    A2aTrigger, AttentionHub, BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput,
-    CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model, NodeManager, NodeView, PtrAction,
-    SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    normalize_sel, screen_to_cell, scrub_foreign_orchestrator_env, scrub_pty_secret_env, shell_cmd,
+    spawn_pump, wire_terminal, A2aTrigger, AttentionHub, BootstrapWriter, BrokerPump, Camera,
+    CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model,
+    NodeManager, NodeView, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -3220,6 +3220,17 @@ fn main() {
     let scrubbed = scrub_pty_secret_env();
     if !scrubbed.is_empty() {
         eprintln!("lina-gpui: env limpo — vars de segredo removidas do env do app (PTYs nao as herdam): {scrubbed:?}");
+    }
+    // R2c (bug de tela 21:40): se o Lina.app foi lançado de um terminal hospedado no
+    // Maestri, `MAESTRI_*` vaza no env → a skill GLOBAL do Maestri vira "funcional" p/ o
+    // agente do ⌘N (maestri list exit 127; "$MAESTRI_CLI" exit 126 — a var EXISTE). Scrub
+    // ANTES de qualquer `wire_terminal`: nenhum agente nasce enxergando plumbing de fora
+    // do Espaço (a comunicação entre terminais é EXCLUSIVA pelos verbos `lina`).
+    let foreign = scrub_foreign_orchestrator_env();
+    if !foreign.is_empty() {
+        eprintln!(
+            "lina-gpui: env limpo — vars de orquestrador estrangeiro removidas (PTYs nao as herdam; comunicacao so via `lina`): {foreign:?}"
+        );
     }
     // Mesa de custódia compartilhada: a UI confirma (⌘⏎); a BrokerPump executa COM o segredo do cofre.
     let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));

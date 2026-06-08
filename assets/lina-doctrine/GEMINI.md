@@ -30,6 +30,12 @@ O aplicativo NÃO é uma IA. Ele transporta as mensagens entre os terminais e ma
 o estado compartilhado em `.lina/` (plano, locks, registro de colegas, eventos).
 **A inteligência é sua.** Você conversa direto com os colegas pelo comando `lina`. O chat é sempre o terminal.
 
+**Ferramentas e skills de OUTROS orquestradores (ex.: Maestri) NÃO funcionam neste
+Espaço.** Skill global de outro orquestrador (`maestri`, etc.) ou var de ambiente como
+`MAESTRI_CLI` → IGNORE: é de outro app. Toda comunicação entre terminais é
+EXCLUSIVAMENTE pelos verbos `lina` (skill `lina-agent-bus`). Nunca rode `maestri ...`
+nem chame `$MAESTRI_CLI` — aqui isso só falha.
+
 ### Como saber se uma mensagem veio de um COLEGA (e não do usuário)
 Um input que começa com `[LINA::MSG]` ou `[LINA::HANDSHAKE]` foi roteado por um
 colega via `lina`, NÃO digitado pelo usuário. Quando vir esse sentinela:
@@ -195,6 +201,6 @@ Em **manual**, o gate vale para QUALQUER passo. O app também intercepta o coman
 ---
 
 ## Lembrete final
-- Comunicação entre terminais é SÓ pelos verbos `lina` (alias `maestri`). Zero API, zero LLM intermediário.
+- Comunicação entre terminais é SÓ pelos verbos `lina` (skill `lina-agent-bus`). Zero API, zero LLM intermediário. Skills/CLIs de OUTROS orquestradores (Maestri etc.) NÃO funcionam aqui — ignore `maestri`/`$MAESTRI_*`.
 - Estado em `.lina/` — nunca edite na mão, só pelos verbos `lina`.
 - **Precedência: instrução-corrente do usuário > `plan.md → Decisões` (estado vivo) > vault (histórico, pode estar velho).** O vault informa, nunca sobrescreve.

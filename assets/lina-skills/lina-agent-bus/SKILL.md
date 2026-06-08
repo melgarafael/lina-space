@@ -1,15 +1,20 @@
 ---
 name: lina-agent-bus
 description: >-
-  Use SEMPRE que um terminal do Lina Space precisar se comunicar com colegas (A2A) ou
-  quando o usuário pedir em linguagem natural para falar/pedir/avisar outro agente
-  ("manda oi pro Terminal B", "pergunta pro arquiteto", "pede pro backend montar a API").
-  Ensina a reconhecer mensagem de colega ([LINA::MSG]/[LINA::HANDSHAKE]) vs input do
-  usuário (sem sentinela = humano), processar o envelope (from/intent/payload) e responder
-  no formato [EXPECTED], aplicar o ANTÍDOTO DE ECO (nunca repassar o bloco técnico ao
-  leigo — só narrar o resultado em pt-br simples), consultar o mapa do time em agents.json
-  (papel → verbo, "delega-me quando"), e TRADUZIR pedidos do leigo nos verbos `lina`
-  (ask/handoff/broadcast/check). Carregada no turno 0 por TODO terminal do workspace.
+  A skill OFICIAL e ÚNICA de comunicação entre terminais do Lina Space (A2A). Use
+  SEMPRE que o usuário pedir, EM PORTUGUÊS, para um terminal falar com outro — e
+  reconheça TODOS estes jeitos de pedir: "mande/manda o Terminal X executar/fazer Y",
+  "peça/pede pro/ao <nome> que ...", "avise/avisa o <nome> que ...", "diga/fala/fale
+  pro/ao <nome> que ...", "pergunta pro/ao <nome> ...", "manda oi pro Terminal B",
+  "pede pro backend montar a API", "avisa o time todo", "manda pra todos". Cobre
+  receber (reconhecer [LINA::MSG]/[LINA::HANDSHAKE] vs input do usuário sem sentinela),
+  processar o envelope (from/intent/payload) e responder no formato [EXPECTED], o
+  ANTÍDOTO DE ECO (nunca repassar bloco técnico ao leigo — só narrar o resultado em
+  pt-br), o mapa do time em agents.json (papel → verbo), e TRADUZIR o pedido do leigo
+  nos verbos `lina` (ask/handoff/broadcast/check). IMPORTANTE: neste Espaço a
+  comunicação entre terminais é EXCLUSIVAMENTE pelos verbos `lina` — skills/CLIs de
+  outros orquestradores (Maestri, `maestri`, `$MAESTRI_CLI`) NÃO funcionam aqui, use
+  SEMPRE esta skill. Carregada no turno 0 por TODO terminal do workspace.
 ---
 
 # Lina Agent Bus — comunicação automática entre terminais (A2A)
@@ -21,7 +26,12 @@ no turno 0. Ela cobre as duas pontas do critério do produto:
 
 > Princípio: o aplicativo **não é uma IA** e **não chama LLM**. Ele transporta as mensagens
 > (injeção faseada no PTY do colega) e guarda o estado em `.lina/`. A inteligência é sua.
-> Toda comunicação entre terminais passa pelos verbos `lina` (alias `maestri`).
+> Toda comunicação entre terminais passa pelos verbos `lina` — e **só** por eles.
+>
+> ⚠️ **Não confunda com outros orquestradores.** Se a máquina tiver uma skill global de
+> outro app (ex.: **Maestri**) ou uma variável como `MAESTRI_CLI`/`$MAESTRI_*`, ela **NÃO
+> funciona neste Espaço** — `maestri list`/`"$MAESTRI_CLI"` só dão erro. Quando o usuário
+> pedir para falar com um terminal, use SEMPRE os verbos `lina` desta skill, nunca `maestri`.
 
 ---
 
@@ -150,6 +160,10 @@ Esta é a metade que realiza o critério do fundador: o usuário fala em portugu
 | O usuário diz... | Você executa | Você narra ao usuário |
 |---|---|---|
 | "manda oi pro Terminal B" | `lina ask "@Terminal B" "oi"` | "Mandei um oi pro Terminal B. 👍" |
+| "**mande o Terminal teste executar** o build" | `lina handoff "@teste" "executar o build"` | "Pedi pro Terminal teste rodar o build. Te aviso quando terminar." |
+| "**peça pro** QA **que** revise a entrega" | `lina handoff "@QA" "revisar a entrega"` | "Pedi pra equipe de qualidade conferir." |
+| "**avisa o** arquiteto **que** o contrato mudou" | `lina ask "@Arquiteto" "o contrato da API mudou"` | "Avisei quem cuida da estrutura. 👍" |
+| "**diga ao** backend **pra** subir o servidor" | `lina handoff "@Dev Backend" "subir o servidor"` | "Pedi pro especialista de servidor subir o ambiente." |
 | "pergunta pro arquiteto qual o contrato da API" | `lina ask "@Arquiteto" "qual o contrato da API de leads?"` | "Vou confirmar isso com quem cuida da estrutura. Já volto." |
 | "pede pro backend montar a API de leads" | `lina handoff "@Dev Backend" "montar a API de leads conforme o contrato" --ref plan:T4 --context docs/api-contract.md` | "Pedi pro nosso especialista de servidor montar a parte técnica do formulário. Te aviso quando ficar pronto." |
 | "manda oi pros 27 terminais" / "avisa o time todo" | `lina broadcast "*" "oi, time! tudo certo por aí?"` | "Avisei todos os terminais. 👍" |
