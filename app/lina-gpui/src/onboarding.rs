@@ -383,6 +383,10 @@ impl OnboardingModel {
     /// controlada que não roda `--version` em binários reais — determinística e sem travar).
     pub fn load_with(dir: PathBuf, discover: DiscoverFn) -> Self {
         let _ = std::fs::create_dir_all(&dir);
+        // ADR 0022 §6: este store (`onboarding/events`) é SCRATCH descartável do fluxo de
+        // onboarding — a única fonte da verdade do Espaço é `<ws>/.lina/events`. Nenhuma
+        // projeção do Espaço faz replay daqui; fato que precise sobreviver é re-emitido
+        // no store principal no fechamento do onboarding.
         let store = match EventStore::open(dir.join("events")) {
             Ok(s) => Some(Arc::new(Mutex::new(s))),
             Err(e) => {
