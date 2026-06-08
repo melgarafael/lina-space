@@ -45,9 +45,26 @@ use crate::events::{
 };
 
 /// SLA de escalação VISUAL (ADR 0021 §3): pendência sem resposta há ≥ 5 min vira
-/// [`AttentionState::Escalated`] (badge pulsante/entrada persistente na UI). O
-/// auto-deny aos 10 min NÃO é daqui (write no PTY = F1-1-8).
+/// [`AttentionState::Escalated`] (badge pulsante/entrada persistente na UI). O auto-deny
+/// aos 10 min é IDENTIFICADO aqui ([`AttentionQueue::auto_deny_due`]), mas o WRITE da
+/// recusa no PTY continua sendo do executor F1-1-8 — esta projeção não tem porta de
+/// escrita (fronteira intacta).
 pub const ESCALATE_AFTER_MS: u64 = 300_000;
+
+/// SLA de **auto-deny** (ADR 0021 §3): pendência de PERMISSÃO sem resposta há ≥ 10 min é
+/// NEGADA automaticamente (`decision=deny, via=timeout` — **NUNCA approve, sem knob**;
+/// anti-regressão pelo gate AC-0021.5). DISTINTO do `RETENTION_TIMEOUT_MS` do router (que
+/// rege a retenção de mensagem A2A, não a permissão). 10 min = mesma ordem de grandeza da
+/// atenção humana num workspace vivo (ADR 0020: turnos reais 200–600 s; `retention_timeout`
+/// = 10 min). [`AttentionQueue::auto_deny_due`] só IDENTIFICA as pendências vencidas; o
+/// write da recusa (com check de tela) é do executor — esta projeção nunca escreve no PTY.
+pub const AUTO_DENY_AFTER_MS: u64 = 600_000;
+
+// Invariante de COMPILAÇÃO (ADR 0021 §3) — escalate-before-auto-deny: a escalação VISUAL
+// precede o auto-deny, i.e. o pedido alerta o humano (5 min) ANTES de ser negado por
+// timeout (10 min). Recalibrar uma constante para violar a ordem QUEBRA O BUILD, nunca
+// silenciosamente o produto.
+const _: () = assert!(ESCALATE_AFTER_MS < AUTO_DENY_AFTER_MS);
 
 /// Janela de merge entre camadas POR NÓ: um `PermissionAsked` de camada DIFERENTE da
 /// de um item ainda pendente do mesmo nó, chegando dentro desta janela, é o MESMO
@@ -118,6 +135,24 @@ pub struct AttentionItem {
     /// R2b (ADR 0021 §1): a Captura 1 do detector — é o que torna a fila reconstruída
     /// por replay APROVÁVEL (o gesto passa este hash ao `deliver_approval` como
     /// `expected_hash`). `None` = origem sem captura (hook) ou item de custódia.
+    pub vt_snapshot_hash: Option<String>,
+}
+
+/// Uma pendência VENCIDA pelo SLA de auto-deny (ADR 0021 §3) — o que
+/// [`AttentionQueue::auto_deny_due`] entrega ao chamador para drenar pelo MESMO pipeline
+/// validado do executor com `decision=Deny, via=Timeout`. **NÃO é um write** nem um
+/// evento: é a IDENTIFICAÇÃO da pendência; o write (com re-snapshot + check de tela) é
+/// exclusivo do executor (fronteira F1-1-8). Por NÃO carregar decisão, nenhum caminho
+/// daqui pode produzir approve (a decisão é fixada `Deny` no ponto de drenagem).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoDenyDue {
+    /// `stable_id` CANÔNICO da pendência (o executor cruza com o binding do log — R4).
+    pub stable_id: String,
+    /// Nó dono (do `PermissionAsked` — binding de fonte interna; o executor re-verifica).
+    pub node_id: String,
+    /// Captura 1 (vira o `expected_hash` do check de tela do executor). `None` = origem
+    /// sem captura (hook-only): o executor não tem baseline ⇒ aborta fail-safe
+    /// (deny-não-entregue), nunca escreve às cegas.
     pub vt_snapshot_hash: Option<String>,
 }
 
@@ -432,6 +467,34 @@ impl AttentionQueue {
         let mut out = round_robin_by_node(custody.collect());
         out.extend(round_robin_by_node(perms.collect()));
         out
+    }
+
+    /// **Driver de auto-deny (ADR 0021 §3)** — as pendências de PERMISSÃO **Yn** sem
+    /// resposta há ≥ [`AUTO_DENY_AFTER_MS`] em `now_ms`. PURO (relógio injetado; sem
+    /// timer/thread). NÃO escreve no PTY nem apenda eventos (fronteira F1-1-8: o write
+    /// da recusa, com check de tela, é do executor) — devolve apenas a IDENTIFICAÇÃO.
+    ///
+    /// O chamador drena cada candidato pelo MESMO pipeline validado do executor com
+    /// `decision=Deny, via=Timeout` (simetria total do §3: tela válida ⇒ escreve a
+    /// recusa; tela divergiu ⇒ aborta sem escrever, deny-não-entregue). Como o candidato
+    /// **não carrega decisão**, ZERO caminho daqui produz approve (sem knob de
+    /// auto-approve — anti-regressão AC-0021.5).
+    ///
+    /// Recortes: **custódia** fica de fora (gate próprio da pump — ⌘⏎); **não-`Yn`**
+    /// (`Choice`/`Trust`) fica de fora (alerta+foco; digitar `n` numa caixa de escolha
+    /// seria input errado — mesma regra de [`AttentionQueue::resolve`]).
+    #[must_use]
+    pub fn auto_deny_due(&self, now_ms: u64) -> Vec<AutoDenyDue> {
+        self.permissions
+            .iter()
+            .filter(|p| p.prompt_kind == PromptKind::Yn)
+            .filter(|p| now_ms.saturating_sub(p.created_ts) >= AUTO_DENY_AFTER_MS)
+            .map(|p| AutoDenyDue {
+                stable_id: p.stable_id.clone(),
+                node_id: p.node_id.clone(),
+                vt_snapshot_hash: p.vt_snapshot_hash.clone(),
+            })
+            .collect()
     }
 
     /// Contagem de pendências (badge da UI: custódia + permissão).
@@ -814,6 +877,105 @@ mod tests {
             q.items(T0 + ESCALATE_AFTER_MS)[0].state,
             AttentionState::Escalated
         );
+    }
+
+    // ───────────── §3 · driver de auto-deny aos 10 min (NUNCA approve) ─────────────
+
+    /// SLA de auto-deny (ADR 0021 §3): pendência de PERMISSÃO **Yn** sem resposta há ≥
+    /// [`AUTO_DENY_AFTER_MS`] é candidata a NEGAÇÃO automática — PURO de `now_ms` (sem
+    /// timer/thread). NÃO-Yn (`Choice`/`Trust`) fica de fora (alerta+foco; injetar tecla
+    /// seria input errado); custódia fica de fora (gate próprio da pump). O threshold é
+    /// DISTINTO e MAIOR que o escalate (5 min). O candidato NÃO carrega decisão — quem
+    /// drena fixa Deny/Timeout pelo executor; por construção a fila nunca produz approve.
+    #[test]
+    fn auto_deny_due_after_ten_minutes_yn_only() {
+        // A ordem escalate (5 min) < auto-deny (10 min) é invariante de COMPILAÇÃO
+        // (`ESCALATE_BEFORE_AUTO_DENY`, no nível do módulo); aqui pino só o valor.
+        assert_eq!(AUTO_DENY_AFTER_MS, 600_000, "10 min (calibração ADR 0020)");
+
+        let mut q = AttentionQueue::new();
+        // Yn com Captura 1 (o que o executor usará como `expected_hash` no check de tela).
+        q.observe(
+            &ask_kind(
+                "A",
+                PermissionEvidence::Grid,
+                "yn1",
+                PromptKind::Yn,
+                Some("cap-yn"),
+            ),
+            T0,
+        );
+        // Choice: NUNCA auto-denied pela fila (defesa em profundidade além do gate de UI).
+        q.observe(
+            &ask_kind(
+                "B",
+                PermissionEvidence::Grid,
+                "ch1",
+                PromptKind::Choice,
+                Some("cap-ch"),
+            ),
+            T0,
+        );
+        // Custódia: gate próprio da pump (⌘⏎) — fora do auto-deny.
+        q.custody_enqueued("cust1", "C", "lina do deploy", T0);
+
+        // Antes dos 10 min: nada vence (CONTROLE: os 3 itens existem e seguem pendentes).
+        assert!(
+            q.auto_deny_due(T0 + AUTO_DENY_AFTER_MS - 1).is_empty(),
+            "antes de 10 min: nada vence"
+        );
+        assert_eq!(
+            q.items(T0 + AUTO_DENY_AFTER_MS - 1).len(),
+            3,
+            "controle positivo: os 3 itens seguem pendentes"
+        );
+
+        // Aos 10 min: SÓ o Yn vence; carrega o binding (nó) + a Captura 1.
+        let due = q.auto_deny_due(T0 + AUTO_DENY_AFTER_MS);
+        assert_eq!(
+            due.len(),
+            1,
+            "só o Yn vence (Choice e custódia ficam de fora)"
+        );
+        assert_eq!(due[0].stable_id, "yn1");
+        assert_eq!(
+            due[0].node_id, "A",
+            "binding de fonte interna (PermissionAsked), nunca posição da fila"
+        );
+        assert_eq!(
+            due[0].vt_snapshot_hash.as_deref(),
+            Some("cap-yn"),
+            "Captura 1 vira o expected_hash do check de tela do executor"
+        );
+    }
+
+    /// Escada do SLA no MESMO item Yn: Pending → Escalated (visual, 5 min) → candidato a
+    /// auto-deny (10 min). O escalate é estado VISUAL; o auto-deny é IDENTIFICAÇÃO p/ o
+    /// executor — nenhum write/decisão nasce na fila (fronteira F1-1-8). Item hook-only
+    /// (sem Captura 1) também vence: o executor aborta fail-safe (deny-não-entregue).
+    #[test]
+    fn sla_ladder_escalate_then_auto_deny() {
+        let mut q = AttentionQueue::new();
+        q.observe(&ask("A", PermissionEvidence::Hook, "p1"), T0); // hook-only: sem Captura 1
+
+        // 5 min: visual Escalated, mas AINDA não vence o auto-deny.
+        assert_eq!(
+            q.items(T0 + ESCALATE_AFTER_MS)[0].state,
+            AttentionState::Escalated
+        );
+        assert!(
+            q.auto_deny_due(T0 + ESCALATE_AFTER_MS).is_empty(),
+            "5 min escala (visual), não nega"
+        );
+
+        // 10 min: continua Escalated E agora vence o auto-deny (Captura 1 ausente → None).
+        assert_eq!(
+            q.items(T0 + AUTO_DENY_AFTER_MS)[0].state,
+            AttentionState::Escalated
+        );
+        let due = q.auto_deny_due(T0 + AUTO_DENY_AFTER_MS);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].vt_snapshot_hash, None, "hook-only não tem Captura 1");
     }
 
     /// Replay defensivo: o MESMO stable_id duas vezes no log (não deveria, mas o log
