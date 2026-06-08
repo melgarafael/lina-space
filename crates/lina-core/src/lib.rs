@@ -113,6 +113,27 @@ pub use approval::{
     ScreenCheck, PROMPT_REGION_ROWS,
 };
 
+impl ApprovalExecutor {
+    /// F1-1-8 (ADR 0021 §2 / ADR 0024): reconstrói a projeção do executor varrendo o log —
+    /// espelha [`AttentionQueue::replay`]/`CostLedger::replay`. O decode `EventRecord → DomainEvent`
+    /// (`DomainEvent::from_record`) é **interno ao core**, então este construtor mora aqui (não na
+    /// app, que só conhece `EventRecord`). Registros não-decodificáveis (kind de versão futura) são
+    /// pulados — a projeção é derivada, não validadora do log. NUNCA escreve no PTY (sem porta neste
+    /// caminho): replay/boot só reconstrói estado (trava por construção, ADR 0021 §2).
+    #[must_use]
+    pub fn replay(records: &[events::EventRecord]) -> Self {
+        let mut exec = Self::new();
+        for rec in records {
+            if let Ok(ev) =
+                events::DomainEvent::from_record(&rec.kind, rec.version, rec.payload.clone())
+            {
+                exec.observe(&ev);
+            }
+        }
+        exec
+    }
+}
+
 pub mod bench;
 
 /// W5-2: scrollback com cap por painel + paginação em disco (SQLite WAL) — janela viva em RAM,
@@ -898,6 +919,10 @@ pub enum SupervisorError {
     /// Não conseguiu o lock lógico do PTY dentro do timeout.
     #[error("timeout ao adquirir o lock lógico do PTY do nó {0}")]
     LockTimeout(NodeId),
+    /// F1-1-8 (ADR 0024): erro de I/O no write atômico da aprovação ([`Supervisor::deliver_approval_with_grid`]).
+    /// O efeito NÃO foi confirmado — o executor audita como `ApprovalAborted{port_error}`, sem `Injected`.
+    #[error("erro de I/O no write de aprovação do nó {0}: {1}")]
+    WriteFailed(NodeId, String),
 }
 
 /// Lock lógico de PTY com TTL — Arc-backed (o guard limpa no drop). Aquisição por
@@ -1061,23 +1086,35 @@ struct TermChannel {
     lock: PtyLock,
     applied: Arc<Mutex<Vec<WriteOp>>>,
     consumer: Option<JoinHandle<()>>,
+    /// F1-1-8 (ADR 0024): o writer do master, COMPARTILHADO entre a thread `serial_writer`
+    /// (fila A2A/humano) e a porta atômica de aprovação
+    /// ([`Supervisor::deliver_approval_with_grid`]). O `Mutex` serializa cada op — a ordem
+    /// dos bytes A2A é preservada — e coexiste com a porta de aprovação, que tranca o MESMO
+    /// writer SÓ depois de travar o grid (ordem de lock SEMPRE grid→writer, sem ciclo).
+    sync_writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
-/// Consumidor SERIAL da fila de escrita de um terminal: drena `rx` e aplica cada op
-/// ao writer do master, uma de cada vez — bytes nunca interleavam.
+/// Consumidor SERIAL da fila de escrita de um terminal: drena `rx` e aplica cada op ao
+/// writer do master, uma de cada vez — bytes nunca interleavam. ADR 0024: o writer é
+/// COMPARTILHADO (`Arc<Mutex<…>>`); trava-se o `Mutex` por op (escopo curto: write+flush),
+/// o que preserva a ordem serial E coexiste com a porta atômica de aprovação (que tranca o
+/// MESMO writer — a serialização é do `Mutex`, não da posse exclusiva).
 fn serial_writer(
     rx: Receiver<WriteOp>,
-    mut writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     applied: Arc<Mutex<Vec<WriteOp>>>,
     cap: usize,
 ) {
     while let Ok(op) = rx.recv() {
         let bytes = op.bytes();
-        // Erro de escrita não derruba o supervisor — o terminal pode ter saído.
-        if writer.write_all(&bytes).is_err() {
-            break;
+        {
+            let mut w = lock(&writer);
+            // Erro de escrita não derruba o supervisor — o terminal pode ter saído.
+            if w.write_all(&bytes).is_err() {
+                break;
+            }
+            let _ = w.flush();
         }
-        let _ = writer.flush();
         let mut log = lock(&applied);
         log.push(op);
         if log.len() > cap {
@@ -1151,8 +1188,13 @@ impl Supervisor {
         let applied = Arc::new(Mutex::new(Vec::new()));
         let cap = self.config.applied_log_cap;
 
+        // ADR 0024: o writer do master é COMPARTILHADO entre o consumidor serial (fila A2A/
+        // humano) e a porta atômica de aprovação — um `Arc<Mutex<…>>` único; o consumidor
+        // recebe um clone do MESMO handle.
+        let sync_writer = Arc::new(Mutex::new(writer));
         let consumer = {
             let applied = Arc::clone(&applied);
+            let writer = Arc::clone(&sync_writer);
             thread::Builder::new()
                 .name(format!("lina-bus-writer-{id}"))
                 .spawn(move || serial_writer(rx, writer, applied, cap))
@@ -1176,6 +1218,7 @@ impl Supervisor {
                 lock: PtyLock::new(self.config.lock_ttl),
                 applied,
                 consumer,
+                sync_writer,
             },
         );
         self.publish(BusEvent::NodeSpawned { node: id });
@@ -1418,6 +1461,54 @@ impl Supervisor {
             },
         )?;
         self.enqueue_write(target, WriteOp::Submit { from: Some(from) })
+    }
+
+    /// F1-1-8 / ADR 0024 — a **porta atômica de aprovação** do app (porta única, Captura 2).
+    /// Recebe o `grid` do app por referência (`&Mutex<Box<dyn VtBackend>>` — tipo de `lina-vt`,
+    /// que já é dep do core; NENHUM tipo de toolkit/gpui entra aqui): trava o grid (o MESMO lock
+    /// que o reader-loop do app segura antes de `advance` → bloqueia o advance), re-snapshota a
+    /// região do prompt ([`approval::check_screen`]) e, **só em `Match`**, trava o `sync_writer`
+    /// (compartilhado com a fila serial) e escreve `keys` — tudo com o grid-lock vivo. Tela
+    /// divergente ⇒ NENHUM byte. `region_rows` = o `K` da Captura 1.
+    ///
+    /// **Invariante anti-deadlock (ADR 0024):** a ordem de locks é SEMPRE grid→writer. O reader
+    /// segura só o grid; o `serial_writer` segura só o writer; este método segura grid e depois
+    /// writer. Sem ciclo.
+    pub fn deliver_approval_with_grid(
+        &self,
+        node: NodeId,
+        grid: &Mutex<Box<dyn VtBackend>>,
+        expected_hash: &str,
+        keys: &[u8],
+        region_rows: usize,
+    ) -> Result<approval::PortOutcome, SupervisorError> {
+        // Handle do writer compartilhado (lock breve do mapa, solto antes do grid).
+        let sync_writer = lock(&self.terminals)
+            .get(&node)
+            .map(|t| Arc::clone(&t.sync_writer))
+            .ok_or(SupervisorError::NodeNotFound(node))?;
+
+        // Trava o grid (o MESMO lock que o reader-loop do app segura antes de `advance`): nenhum
+        // byte do PTY é aplicado ao grid entre o check e o write — atomicidade local. O guard
+        // permanece VIVO por todo o `match` (inclusive durante write+flush).
+        let vt = lock(grid);
+        match approval::check_screen(&**vt, expected_hash, region_rows) {
+            approval::ScreenCheck::Changed { current_hash } => {
+                Ok(approval::PortOutcome::ScreenChanged { current_hash })
+            }
+            approval::ScreenCheck::Match { vt_snapshot_hash } => {
+                // Ordem grid→writer: o grid-lock segue seguro enquanto travamos o writer e
+                // escrevemos — o reader-loop espera o grid para o próximo lote (sem advance
+                // intercalado). Output do filho ainda no buffer do kernel é a janela irredutível
+                // documentada (ADR 0021 §4 R2).
+                let mut w = lock(&sync_writer);
+                w.write_all(keys)
+                    .map_err(|e| SupervisorError::WriteFailed(node, e.to_string()))?;
+                w.flush()
+                    .map_err(|e| SupervisorError::WriteFailed(node, e.to_string()))?;
+                Ok(approval::PortOutcome::Written { vt_snapshot_hash })
+            }
+        }
     }
 
     /// Log das ops já aplicadas no terminal (observabilidade/teste).
@@ -1737,6 +1828,257 @@ mod bus_tests {
         let mut dead = A2aEnvelope::new(a, Recipient::Node(b), None);
         dead.ttl = 0;
         assert!(sup.route(&dead, RolePolicy::FirstIdle).is_empty());
+    }
+
+    // ───────── F1-1-8 / ADR 0024 · porta atômica `deliver_approval_with_grid` ─────────
+
+    use crate::approval::{PortOutcome, PROMPT_REGION_ROWS};
+    const KK: usize = PROMPT_REGION_ROWS;
+
+    /// Grid vivo do app (o MESMO tipo do `wire_terminal`): `Arc<Mutex<Box<dyn VtBackend>>>`.
+    fn grid_with(bytes: &[u8]) -> Arc<Mutex<Box<dyn VtBackend>>> {
+        let mut vt = AlacrittyBackend::new(80, 24);
+        vt.advance(bytes);
+        Arc::new(Mutex::new(Box::new(vt) as Box<dyn VtBackend>))
+    }
+
+    fn hash_of(grid: &Arc<Mutex<Box<dyn VtBackend>>>) -> String {
+        let g = lock(grid);
+        crate::approval::prompt_snapshot_hash(&**g, KK)
+    }
+
+    /// Sink observável (escreve num `Vec` compartilhado) — o "log de writes do master".
+    struct VecSink(Arc<Mutex<Vec<u8>>>);
+    impl Write for VecSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Sink que BLOQUEIA dentro do `write` até o teste liberar — simula um write lento/
+    /// backpressured no master. Enquanto bloqueia, o grid-lock TEM que continuar seguro.
+    struct BlockingSink {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for BlockingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.buf).extend_from_slice(buf);
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// **ATOMICIDADE (RED se o grid-lock não cobrir o write):** enquanto `deliver_approval_with_grid`
+    /// está DENTRO do write (sink bloqueado), o grid-lock está SEGURO — uma thread concorrente NÃO
+    /// consegue travar o grid (logo não pode `advance`) entre o check e o write. Se o método
+    /// soltasse o grid-lock antes do write, o `try_lock` abaixo teria sucesso e o teste falharia.
+    #[test]
+    #[serial]
+    fn deliver_approval_with_grid_holds_grid_lock_across_the_write() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Box::new(BlockingSink {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            buf: Arc::clone(&buf),
+        });
+
+        let sup = Arc::new(Supervisor::new());
+        let node = sup.register("@T", None, sink);
+        let grid = grid_with(b"$ deploy\r\nDeploy to prod? (y/n) ");
+        let h = hash_of(&grid);
+
+        let sup2 = Arc::clone(&sup);
+        let grid2 = Arc::clone(&grid);
+        let h2 = h.clone();
+        let t =
+            thread::spawn(move || sup2.deliver_approval_with_grid(node, &grid2, &h2, b"y\r", KK));
+
+        // O write foi alcançado (tela casou) → o método está DENTRO do write, segurando o grid.
+        assert!(
+            poll_until(T, || entered.load(Ordering::SeqCst)),
+            "deliver_approval_with_grid deveria alcançar o write (tela casou)"
+        );
+        // A PROVA da atomicidade: o grid-lock está vivo durante o write.
+        assert!(
+            grid.try_lock().is_err(),
+            "grid-lock DEVE permanecer seguro durante o write (sem advance entre check e write)"
+        );
+        release.store(true, Ordering::SeqCst);
+
+        let outcome = t.join().expect("join").expect("deliver ok");
+        assert!(
+            matches!(outcome, PortOutcome::Written { .. }),
+            "tela casou → escreve: {outcome:?}"
+        );
+        assert_eq!(*lock(&buf), b"y\r".to_vec(), "exatamente as approval_keys");
+    }
+
+    /// Tela inalterada (hash casa) ⇒ escreve EXATAMENTE `keys` e devolve `Written`.
+    #[test]
+    #[serial]
+    fn deliver_approval_with_grid_writes_keys_when_screen_matches() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sup = Supervisor::new();
+        let node = sup.register("@T", None, Box::new(VecSink(Arc::clone(&buf))));
+        let grid = grid_with(b"Continue? (y/n) ");
+        let h = hash_of(&grid);
+
+        let out = sup
+            .deliver_approval_with_grid(node, &grid, &h, b"y\r", KK)
+            .expect("deliver ok");
+        assert!(matches!(out, PortOutcome::Written { .. }));
+        // O write síncrono é direto no sync_writer — sem passar pela fila; o byte chega.
+        assert!(
+            poll_until(T, || *lock(&buf) == b"y\r".to_vec()),
+            "o master recebe as approval_keys"
+        );
+    }
+
+    /// Tela DIVERGIU entre a Captura 1 e a entrega (hash velho) ⇒ `ScreenChanged` e ZERO bytes.
+    #[test]
+    #[serial]
+    fn deliver_approval_with_grid_aborts_with_zero_bytes_when_screen_changed() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sup = Supervisor::new();
+        let node = sup.register("@T", None, Box::new(VecSink(Arc::clone(&buf))));
+        let grid = grid_with(b"Deploy to prod? (y/n) ");
+        let stale = hash_of(&grid);
+        // A tela muda ANTES da entrega (output novo do CLI).
+        lock(&grid).advance(b"\r\nWARNING: lock changed\r\nDeploy to prod? (y/n) ");
+
+        let out = sup
+            .deliver_approval_with_grid(node, &grid, &stale, b"y\r", KK)
+            .expect("deliver ok");
+        assert!(
+            matches!(out, PortOutcome::ScreenChanged { .. }),
+            "tela mudada deve abortar: {out:?}"
+        );
+        // Dá tempo de um write indevido aparecer (não deve): zero bytes.
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            lock(&buf).is_empty(),
+            "ZERO bytes ao master quando a tela divergiu"
+        );
+    }
+
+    /// Nó inexistente erra limpo (`NodeNotFound`), sem panic.
+    #[test]
+    #[serial]
+    fn deliver_approval_with_grid_unknown_node_errors() {
+        let sup = Supervisor::new();
+        let grid = grid_with(b"Continue? (y/n) ");
+        let h = hash_of(&grid);
+        let ghost = Uuid::now_v7();
+        assert!(matches!(
+            sup.deliver_approval_with_grid(ghost, &grid, &h, b"y\r", KK),
+            Err(SupervisorError::NodeNotFound(_))
+        ));
+    }
+
+    /// **AC-0021.7 (mecanismo, via Supervisor real) — espelha o `pty_port_...` do `approval.rs`,
+    /// mas pelo caminho do APP (`Supervisor` + grid do app, não `PtyHost`).** Um `sh` bloqueado
+    /// num `read` após `printf '(y/n) '`; uma thread-leitora avança o grid (como o `wire_terminal`);
+    /// (1) a tela muda (humano digita `x` pela FILA SERIAL `write_human`); (2) entrega com o hash
+    /// VELHO ⇒ `ScreenChanged`, o `read` segue bloqueado; (3) entrega com o hash FRESCO ⇒ `Written`
+    /// e o programa destrava com EXATAMENTE `xy` — se o abort tivesse vazado bytes, o `read` teria
+    /// consumido outra coisa e o passo final falharia (prova positiva do zero-byte). Coexistência
+    /// provada: `write_human` (fila) e `deliver_approval_with_grid` (síncrono) no MESMO writer.
+    #[test]
+    #[serial]
+    fn deliver_approval_with_grid_unblocks_real_prompt_via_supervisor() {
+        let mut mgr = PtyManager::new();
+        let pty_key = lina_pty::NodeId::new("approval-seam-supervisor".to_string());
+        mgr.spawn(
+            pty_key.clone(),
+            PtyCommand::new("sh")
+                .arg("-c")
+                .arg("printf 'Continue? (y/n) '; read x; printf 'GOT:%s\\n' \"$x\""),
+            80,
+            24,
+        )
+        .expect("spawn do prompt sintético");
+        let writer = mgr.take_writer(pty_key.clone()).expect("writer do master");
+        let mut reader = mgr.clone_reader(pty_key.clone()).expect("reader do master");
+
+        let sup = Arc::new(Supervisor::new());
+        let node = sup.register("@claude-real", None, writer);
+
+        // Grid do app + thread-leitora que o avança (réplica fiel do `wire_terminal`).
+        let grid: Arc<Mutex<Box<dyn VtBackend>>> =
+            Arc::new(Mutex::new(Box::new(AlacrittyBackend::new(80, 24))));
+        let reader_grid = Arc::clone(&grid);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_r = Arc::clone(&stop);
+        let jh = thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                if stop_r.load(Ordering::Relaxed) {
+                    break;
+                }
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        lock(&reader_grid).advance(&buf[..n]);
+                    }
+                }
+            }
+        });
+
+        assert!(
+            poll_until(T, || lock(&grid).last_nonempty_line() == "Continue? (y/n)"),
+            "o prompt deveria aparecer no grid"
+        );
+        let captura1 = hash_of(&grid);
+
+        // A tela MUDA: o humano digita `x` pela FILA SERIAL do Supervisor (eco altera a região).
+        sup.write_human(node, b"x", Duration::from_secs(2))
+            .expect("write_human");
+        assert!(
+            poll_until(T, || lock(&grid).last_nonempty_line()
+                == "Continue? (y/n) x"),
+            "o eco do 'x' deveria mudar a tela"
+        );
+
+        // (2) Hash VELHO ⇒ ScreenChanged, nenhum byte.
+        let stale = sup
+            .deliver_approval_with_grid(node, &grid, &captura1, b"y\r", KK)
+            .expect("porta responde");
+        assert!(
+            matches!(stale, PortOutcome::ScreenChanged { .. }),
+            "tela mudada deve abortar: {stale:?}"
+        );
+
+        // (3) Hash FRESCO ⇒ Written; o read destrava com EXATAMENTE "xy".
+        let captura2 = hash_of(&grid);
+        let ok = sup
+            .deliver_approval_with_grid(node, &grid, &captura2, b"y\r", KK)
+            .expect("porta responde");
+        assert!(
+            matches!(ok, PortOutcome::Written { .. }),
+            "tela válida escreve: {ok:?}"
+        );
+        assert!(
+            poll_until(T, || lock(&grid).last_nonempty_line() == "GOT:xy"),
+            "o programa deveria destravar com EXATAMENTE o input 'xy'"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = mgr.kill(pty_key, Duration::from_secs(2));
+        let _ = jh.join();
     }
 }
 // TODO(W0-5): Event Store (rusqlite WAL + JSONL + snapshots; replay determinístico).

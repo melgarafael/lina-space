@@ -25,10 +25,12 @@ use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 
 use lina_core::{
     build_paste, deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence,
-    AlacrittyBackend, BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger,
-    DeliveryOutcome, DomainEvent, EventRecord, EventStore, GridDelta, GridSense, MailMessage,
-    Mailbox, NodeStatus as CoreStatus, ProjectedState, PtyCommand, PtyManager, Recipient,
-    RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor, VtBackend, WorkspaceTrust,
+    AlacrittyBackend, ApprovalDecision, ApprovalExecutor, ApprovalGesture, ApprovalKeys,
+    ApprovalPort, BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome,
+    DomainEvent, EventRecord, EventStore, GridDelta, GridSense, MailMessage, Mailbox,
+    NodeStatus as CoreStatus, PortError, PortOutcome, ProjectedState, PtyCommand, PtyManager,
+    Recipient, ResolutionVia, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor,
+    SupervisorError, VtBackend, WorkspaceTrust, PROMPT_REGION_ROWS,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
@@ -1420,7 +1422,72 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
 // re-alimentam o fold. **NENHUM byte vai ao PTY por este caminho** (ADR 0021 §6 /
 // AC-0021.6): o hub não tem handle de PTY nem de `InputSink` — o write é F1-1-8.
 
-/// Fiação F1-1-7: `AttentionQueue` do core cabeada ao log + à mesa de custódia.
+/// F1-1-8 / ADR 0024 — **a porta única de escrita validada, pelo caminho do app.** Implementa
+/// `lina_core::ApprovalPort` (a trait que o `ApprovalExecutor` aciona) traduzindo o `node_id`
+/// (que, na detecção do app, é o NOME canônico do roster — bridge.rs `AppPermissionWatch::scan`)
+/// para o `NodeId` via a AUTORIDADE do roster (`node_by_name` — nunca por texto do grid), achando
+/// o grid daquele nó e delegando ao `Supervisor::deliver_approval_with_grid` (check de tela + write
+/// atômicos, ordem grid→writer). `approval.rs` permanece INALTERADO.
+///
+/// **Defesa em profundidade:** se `node_by_name` resolvesse o nó errado (homônimo), o
+/// `check_screen` do core abortaria (o hash da tela não casa) — zero bytes, fail-safe.
+struct SupervisorApprovalPort<'a> {
+    sup: &'a Supervisor,
+    grids: &'a Mutex<BTreeMap<NodeId, Grid>>,
+}
+
+impl ApprovalPort for SupervisorApprovalPort<'_> {
+    fn deliver(
+        &mut self,
+        node_id: &str,
+        expected_hash: &str,
+        keys: &[u8],
+    ) -> Result<PortOutcome, PortError> {
+        // Identidade re-derivada pela autoridade única (roster), não pelo texto do pedido.
+        let node = self
+            .sup
+            .node_by_name(node_id)
+            .ok_or_else(|| PortError::NotFound(node_id.to_string()))?;
+        let grid = lock(self.grids)
+            .get(&node)
+            .cloned()
+            .ok_or_else(|| PortError::NotFound(node_id.to_string()))?;
+        match self.sup.deliver_approval_with_grid(
+            node,
+            &grid,
+            expected_hash,
+            keys,
+            PROMPT_REGION_ROWS,
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(SupervisorError::NodeNotFound(_)) => Err(PortError::NotFound(node_id.to_string())),
+            // Erro de I/O no write: efeito NÃO confirmado → o executor audita `port_error`.
+            Err(e) => Err(PortError::Io(e.to_string())),
+        }
+    }
+}
+
+/// F1-1-8 / ADR 0024 — o que o hub precisa para DIGITAR a aprovação (a fila F1-1-7 não tinha
+/// porta; este é o ganho novo da F1-1-8). `keys` é o `approval_keys` do CLI Profile do app.
+pub struct ApprovalWiring {
+    sup: Arc<Supervisor>,
+    grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+    keys: ApprovalKeys,
+}
+
+impl ApprovalWiring {
+    #[must_use]
+    pub fn new(
+        sup: Arc<Supervisor>,
+        grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+        keys: ApprovalKeys,
+    ) -> Self {
+        Self { sup, grids, keys }
+    }
+}
+
+/// Fiação F1-1-7/F1-1-8: `AttentionQueue` do core cabeada ao log + à mesa de custódia, e a porta
+/// de escrita validada (F1-1-8 / ADR 0024 — o gesto humano e o auto-deny do SLA digitam por aqui).
 pub struct AttentionHub {
     queue: Mutex<lina_core::AttentionQueue>,
     store: Arc<Mutex<EventStore>>,
@@ -1431,13 +1498,21 @@ pub struct AttentionHub {
     /// Espelho da custódia: id → (nó autenticado, display, first_seen ms). O first_seen
     /// é cunhado no 1º sync que viu o id e SOBREVIVE a re-replays (escalação estável).
     custody_seen: Mutex<BTreeMap<String, (String, String, u64)>>,
+    /// F1-1-8 (ADR 0024): a porta de escrita validada. O executor é reconstruído do LOG a cada
+    /// gesto/auto-deny (binding `node_of` + dedup vêm do log, JAMAIS de campo da UI/fila).
+    approval: ApprovalWiring,
 }
 
 impl AttentionHub {
     /// Cria o hub reconstruindo a fila do LOG (crash com pendência → reabrir reconstrói
     /// — critério 5 da story; o replay é a mesma rota do live: fold único do core).
     #[must_use]
-    pub fn new(store: Arc<Mutex<EventStore>>, desk: Desk, model: Model) -> Self {
+    pub fn new(
+        store: Arc<Mutex<EventStore>>,
+        desk: Desk,
+        model: Model,
+        approval: ApprovalWiring,
+    ) -> Self {
         let (queue, ec) = {
             let s = lock(&store);
             let records = s.events().unwrap_or_default();
@@ -1453,6 +1528,7 @@ impl AttentionHub {
             model,
             last_ec: Mutex::new(ec),
             custody_seen: Mutex::new(BTreeMap::new()),
+            approval,
         }
     }
 
@@ -1508,25 +1584,158 @@ impl AttentionHub {
         q.items(now_ms)
     }
 
-    /// Decisão humana sobre uma PERMISSÃO: apenda o `PermissionResolved` devolvido pelo
-    /// core e re-alimenta o fold. `false` = id desconhecido/já resolvido (clique duplo é
-    /// no-op sem 2º evento) ou item de CUSTÓDIA (decide pelo ⌘⏎ existente — zero
-    /// regressão, garantido pelo core). SÓ registra a decisão; o write é F1-1-8.
+    /// Decisão humana sobre uma PERMISSÃO (clique do toast/fila). `false` = id
+    /// desconhecido/já resolvido (clique duplo é no-op sem 2º evento — idempotência da fila),
+    /// item de CUSTÓDIA (decide pelo ⌘⏎ existente — zero regressão), ou `prompt_kind` não-`Yn`
+    /// (`Choice`/`Trust` alertam+focam, não aprovam — gate do core).
     ///
-    /// **COSTURA F1-1-8 (combinada com o Arquiteto — próxima rodada):** este método
-    /// passa a chamar o `deliver_approval` do executor (porta única de escrita), que
-    /// emite o desfecho completo (Resolved → write validado → Injected/Aborted);
-    /// `dismiss` continua daqui (PermissionDismissed é da fila, sempre).
+    /// **F1-1-8 / ADR 0024 (esta rodada):** o gesto agora DIGITA pela porta única. Branch por
+    /// propriedade-do-item, NÃO por wiring:
+    /// - **com Captura 1** (`vt_snapshot_hash` do `PermissionAsked` no LOG): dirige o
+    ///   [`ApprovalExecutor`] → `PermissionResolved` → write validado contra a tela
+    ///   (`Injected`) ou `ApprovalAborted` (tela mudou/erro);
+    /// - **sem Captura 1** (origem hook-only — sem baseline de tela): fail-safe (ADR 0021 §1) —
+    ///   registra a decisão (audit), JAMAIS digita às cegas; o humano vai ao terminal.
+    ///
+    /// INVARIANTE: `node_id` (binding) e `expected_hash` (Captura 1) vêm do LOG
+    /// (`ApprovalLedger.node_of` / projeção `AttentionQueue`), JAMAIS de campo da UI — o clique
+    /// só carrega o `stable_id` (uma referência, não autoridade).
     pub fn resolve(
         &self,
         stable_id: &str,
         decision: lina_core::ApprovalDecision,
         via: lina_core::ResolutionVia,
     ) -> bool {
-        let Some(ev) = lock(&self.queue).resolve(stable_id, decision, via) else {
+        // 1) Gate da FILA (comando PURO — não muta): item existe + é `Yn` + dá o `stable_id`
+        //    CANÔNICO (resolve aliases do merge entre camadas). Custódia/desconhecido/já-saiu/
+        //    não-`Yn` ⇒ `None` ⇒ no-op (idempotência do clique duplo intacta).
+        let Some(resolved_ev) = lock(&self.queue).resolve(stable_id, decision, via) else {
             return false;
         };
-        self.commit(ev, stable_id, "PermissionResolved")
+        let DomainEvent::PermissionResolved {
+            stable_id: canonical,
+            ..
+        } = &resolved_ev
+        else {
+            return false; // `resolve` só devolve PermissionResolved (defensivo)
+        };
+        let canonical = canonical.clone();
+
+        // 2) Captura 1 do item — do LOG (projeção da fila), nunca campo escrito pela UI.
+        let expected_hash = lock(&self.queue)
+            .items(now_ms())
+            .into_iter()
+            .find(|i| i.stable_id == canonical)
+            .and_then(|i| i.vt_snapshot_hash);
+
+        match expected_hash {
+            // 3a) Com Captura 1 → porta única (write validado contra a tela).
+            Some(hash) => self.deliver_via_executor(&canonical, decision, via, &hash),
+            // 3b) Sem Captura 1 (hook-only) → fail-safe: registra a decisão, ZERO bytes.
+            None => self.commit(resolved_ev, &canonical, "PermissionResolved"),
+        }
+    }
+
+    /// Reconstrói o [`ApprovalExecutor`] do LOG (o binding `node_of` + a dedup do executor são
+    /// projeções PURAS do log — reconstruí-las jamais escreve; a porta entra só no `deliver`).
+    /// Rota rara (gesto humano / tick de auto-deny), então o replay-por-chamada é barato.
+    fn rebuilt_executor(&self) -> ApprovalExecutor {
+        let records = lock(&self.store).events().unwrap_or_default();
+        ApprovalExecutor::replay(&records)
+    }
+
+    /// Drena UM gesto (humano ou auto-deny) pela porta única do executor: binding e dedup do
+    /// LOG, write atômico via [`SupervisorApprovalPort`], e apenda o desfecho (Resolved → write →
+    /// Injected/Aborted) no log + re-alimenta o fold. `false` só se o pedido não tem binding no
+    /// log (não deveria — veio do log; fail-safe sem escrever).
+    fn deliver_via_executor(
+        &self,
+        canonical: &str,
+        decision: lina_core::ApprovalDecision,
+        via: lina_core::ResolutionVia,
+        expected_hash: &str,
+    ) -> bool {
+        let mut exec = self.rebuilt_executor();
+        let Some(target) = exec.ledger().node_of(canonical).map(str::to_string) else {
+            eprintln!("lina-gpui: [ATT] resolve sem binding no log p/ {canonical:?} — abortado (fail-safe)");
+            return false;
+        };
+        let gesture = ApprovalGesture {
+            stable_id: canonical,
+            target_node: &target,
+            decision,
+            via,
+            expected_hash,
+            keys: &self.approval.keys,
+        };
+        let mut port = SupervisorApprovalPort {
+            sup: &self.approval.sup,
+            grids: &self.approval.grids,
+        };
+        let outcome = exec.deliver(&gesture, &mut port);
+        self.append_and_observe(&outcome.events);
+        eprintln!(
+            "lina-gpui: [ATT] gesto via executor: {canonical:?} via={via:?} → {:?}",
+            outcome.kind
+        );
+        true
+    }
+
+    /// Apenda os eventos do desfecho do executor NO LOG (fonte da verdade), na ordem, e
+    /// re-alimenta o fold da fila (efeito imediato; o re-replay converge ao mesmo estado). Append
+    /// que falha loga ALTO e segue (best-effort de auditoria) — nunca inventa estado.
+    fn append_and_observe(&self, events: &[DomainEvent]) {
+        for ev in events {
+            if let Err(e) = lock(&self.store).append(ev) {
+                eprintln!(
+                    "lina-gpui: [ATT] evento de aprovação NÃO registrado (append falhou): {e}"
+                );
+                continue;
+            }
+            lock(&self.queue).observe(ev, now_ms());
+        }
+        lock(&self.model).touch();
+    }
+
+    /// **F1-1-8 / ADR 0021 §3 — driver de auto-deny.** Identifica as pendências `Yn` vencidas
+    /// (≥ 10 min) pela projeção FRESCA do LOG (fonte da verdade — independe do `sync` da view) e
+    /// drena CADA uma pelo MESMO pipeline validado do executor com `Deny/Timeout`. Como o
+    /// candidato NÃO carrega decisão (a decisão é fixada `Deny` aqui), por construção NENHUM
+    /// caminho produz approve por timeout (sem knob — anti-regressão AC-0021.5). Relógio injetado
+    /// (`now_ms`); chamado pelo tick do pump.
+    pub fn drive_auto_deny(&self, now_ms: u64) {
+        let records = lock(&self.store).events().unwrap_or_default();
+        let due = lina_core::AttentionQueue::replay(&records).auto_deny_due(now_ms);
+        if due.is_empty() {
+            return;
+        }
+        let mut exec = ApprovalExecutor::replay(&records);
+        let mut port = SupervisorApprovalPort {
+            sup: &self.approval.sup,
+            grids: &self.approval.grids,
+        };
+        for d in due {
+            let Some(target) = exec.ledger().node_of(&d.stable_id).map(str::to_string) else {
+                continue; // sem binding no log — fail-safe (não escreve)
+            };
+            // Captura 1 ausente (hook-only) ⇒ sentinela "" nunca casa o hash real (64-hex) → o
+            // check de tela aborta (deny-não-entregue, zero bytes). Decisão FIXA `Deny`.
+            let hash = d.vt_snapshot_hash.clone().unwrap_or_default();
+            let gesture = ApprovalGesture {
+                stable_id: &d.stable_id,
+                target_node: &target,
+                decision: ApprovalDecision::Deny,
+                via: ResolutionVia::Timeout,
+                expected_hash: &hash,
+                keys: &self.approval.keys,
+            };
+            let outcome = exec.deliver(&gesture, &mut port);
+            self.append_and_observe(&outcome.events);
+            eprintln!(
+                "lina-gpui: [ATT] auto-deny (SLA 10min) {:?} → {:?}",
+                d.stable_id, outcome.kind
+            );
+        }
     }
 
     /// «Não era um pedido» (mitigação de FP — decisão do Maestro): apenda o
@@ -3664,6 +3873,8 @@ pub fn spawn_pump(
                 // PermissionAsked no log em <3s — o hub re-projeta e o toast aparece).
                 let mut watch = AppPermissionWatch::new();
                 let mut last_scan_ms = 0u64;
+                // F1-1-8 (ADR 0021 §3): relógio do driver de auto-deny do SLA (10 min).
+                let mut last_autodeny_ms = 0u64;
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -3722,6 +3933,14 @@ pub fn spawn_pump(
                         if !outcome.is_empty() {
                             worked = true;
                         }
+                    }
+                    // F1-1-8 / ADR 0021 §3: driver de auto-deny do SLA. Throttle ~15s (folga
+                    // sobejante p/ o threshold de 10 min). Drena cada pendência vencida pelo MESMO
+                    // pipeline validado do executor com Deny/Timeout (NUNCA approve) — a fila não
+                    // tem porta (AC-0021.6); o write valida a tela e aborta se ela divergiu.
+                    if now.saturating_sub(last_autodeny_ms) >= 15_000 {
+                        last_autodeny_ms = now;
+                        attention.drive_auto_deny(now);
                     }
                     // Fim-de-turno por idle → apenda TokenUsageReported (estimado) no store autoritativo.
                     for (node, tokens) in meter.poll_finished_turns(now, idle_ms) {
@@ -5424,6 +5643,11 @@ mod tests {
             Arc::clone(&store),
             desk_t,
             Arc::clone(&model),
+            ApprovalWiring::new(
+                Arc::clone(&sup),
+                Arc::clone(&grids),
+                ApprovalKeys::default(),
+            ),
         ));
         let mut pump = spawn_pump(
             GpuiBridgeHost::new(Arc::clone(&model)),
@@ -6291,7 +6515,14 @@ mod tests {
         ));
         let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
         let model: Model = Arc::new(Mutex::new(SharedModel::default()));
-        let hub = AttentionHub::new(store, Arc::clone(&desk), model);
+        // F1-1-8: estes testes (F1-1-7) usam itens hook-only (sem Captura 1) → caminho
+        // audit-only, que NÃO exercita a porta — wiring stub (sup/grids vazios) basta.
+        let wiring = ApprovalWiring::new(
+            Arc::new(Supervisor::new()),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            ApprovalKeys::default(),
+        );
+        let hub = AttentionHub::new(store, Arc::clone(&desk), model, wiring);
         (hub, desk, base)
     }
 
@@ -6415,7 +6646,12 @@ mod tests {
         ));
         let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
         let model: Model = Arc::new(Mutex::new(SharedModel::default()));
-        let hub2 = AttentionHub::new(store, desk, model);
+        let wiring = ApprovalWiring::new(
+            Arc::new(Supervisor::new()),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            ApprovalKeys::default(),
+        );
+        let hub2 = AttentionHub::new(store, desk, model, wiring);
         let items = hub2.sync(2_000);
         assert_eq!(items.len(), 1, "pendência reconstruída do log");
         assert_eq!(items[0].stable_id, "s1");
@@ -6438,6 +6674,197 @@ mod tests {
             .filter(|r| r.kind == "NodeDetectionMuted")
             .count();
         assert_eq!(muted_events, 2, "liga + desliga persistidos no log");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─────────── F1-1-8 / ADR 0024 · porta de escrita do hub (gesto humano + auto-deny) ───────────
+
+    /// Sink observável (escreve num `Vec` compartilhado) — o "log de writes do master" do nó.
+    struct VecSink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for VecSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Hub WIRED (F1-1-8): `Supervisor` real + 1 nó registrado (sink observável) + grid no mapa —
+    /// o caminho completo do app. Devolve o buffer de writes do master, a Captura 1 (hash da tela
+    /// atual) e o grid (para mutar nos testes de tela-divergente).
+    fn wired_hub(
+        tag: &str,
+        node_name: &str,
+        screen: &[u8],
+    ) -> (
+        AttentionHub,
+        Arc<Mutex<Vec<u8>>>,
+        String,
+        Grid,
+        std::path::PathBuf,
+    ) {
+        let base =
+            std::env::temp_dir().join(format!("lina-atthub-wired-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+
+        let sup = Arc::new(Supervisor::new());
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let node = sup.register(node_name, None, Box::new(VecSink(Arc::clone(&buf))));
+
+        let grid: Grid = {
+            let mut vt = AlacrittyBackend::new(80, 24);
+            vt.advance(screen);
+            Arc::new(Mutex::new(Box::new(vt)))
+        };
+        let captura1 = lina_core::prompt_snapshot_hash(&**lock(&grid), PROMPT_REGION_ROWS);
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        lock(&grids).insert(node, Arc::clone(&grid));
+
+        let wiring = ApprovalWiring::new(Arc::clone(&sup), grids, ApprovalKeys::default());
+        let hub = AttentionHub::new(store, desk, model, wiring);
+        (hub, buf, captura1, grid, base)
+    }
+
+    /// `PermissionAsked` Yn de GRID com a Captura 1 (`hash`) — o que o detector da F1-1-6 anexaria.
+    fn yn_ask(node: &str, sid: &str, hash: &str) -> DomainEvent {
+        DomainEvent::PermissionAsked {
+            node_id: node.into(),
+            tool: Some("Bash".into()),
+            detail: Some("git push origin/master".into()),
+            evidence: lina_core::PermissionEvidence::Grid,
+            stable_id: sid.into(),
+            vt_snapshot_hash: Some(hash.into()),
+            prompt_kind: lina_core::attention::PromptKind::Yn,
+        }
+    }
+
+    /// **Gesto humano APROVAR com Captura 1 → porta única → write `y\r` validado contra a tela.**
+    /// Binding e `expected_hash` vêm do LOG; o clique só carrega o `stable_id`. Clique duplo é no-op
+    /// (idempotência da fila) — não re-escreve. Audit completo: Resolved + ApprovalInjected.
+    #[test]
+    fn attention_hub_resolve_with_capture_writes_approve_keys() {
+        let (hub, buf, h, _grid, base) =
+            wired_hub("approve", "Terminal A", b"Deploy to prod? (y/n) ");
+        hub.store_append_for_test(&yn_ask("Terminal A", "s1", &h));
+        assert_eq!(hub.sync(1_000).len(), 1, "pendência visível");
+
+        assert!(hub.resolve("s1", ApprovalDecision::Approve, ResolutionVia::Human));
+        assert_eq!(
+            *lock(&buf),
+            b"y\r".to_vec(),
+            "approve digita as approve_keys no master"
+        );
+        assert!(hub.sync(2_000).is_empty(), "item resolvido sai da fila");
+
+        // Clique duplo: no-op (item já saiu) — não re-escreve.
+        assert!(!hub.resolve("s1", ApprovalDecision::Approve, ResolutionVia::Human));
+        assert_eq!(*lock(&buf), b"y\r".to_vec(), "clique duplo NÃO re-escreve");
+
+        let recs = hub.events_for_test();
+        assert_eq!(
+            recs.iter()
+                .filter(|r| r.kind == "PermissionResolved")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recs.iter().filter(|r| r.kind == "ApprovalInjected").count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Tela DIVERGIU entre a Captura 1 e o gesto (caminho completo do app):** resolve → executor →
+    /// porta → `deliver_approval_with_grid` re-snapshota o grid mudado ⇒ `ScreenChanged`, ZERO bytes
+    /// ao master; audit = Resolved + ApprovalAborted (SEM Injected).
+    #[test]
+    fn attention_hub_resolve_aborts_with_zero_bytes_when_screen_changed() {
+        let (hub, buf, h, grid, base) =
+            wired_hub("changed", "Terminal A", b"Deploy to prod? (y/n) ");
+        hub.store_append_for_test(&yn_ask("Terminal A", "s1", &h));
+        assert_eq!(hub.sync(1_000).len(), 1);
+
+        // A tela muda ANTES do clique (output novo do CLI).
+        lock(&grid).advance(b"\r\nWARNING: lock changed\r\nDeploy to prod? (y/n) ");
+
+        assert!(hub.resolve("s1", ApprovalDecision::Approve, ResolutionVia::Human));
+        assert!(
+            lock(&buf).is_empty(),
+            "tela divergiu ⇒ ZERO bytes ao master"
+        );
+        let recs = hub.events_for_test();
+        assert_eq!(
+            recs.iter()
+                .filter(|r| r.kind == "PermissionResolved")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recs.iter().filter(|r| r.kind == "ApprovalInjected").count(),
+            0,
+            "sem Injected"
+        );
+        assert_eq!(
+            recs.iter().filter(|r| r.kind == "ApprovalAborted").count(),
+            1,
+            "auditado como ApprovalAborted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **AUTO-DENY do SLA (10 min) end-to-end:** a pendência Yn vence → `drive_auto_deny` drena pela
+    /// MESMA porta com `Deny/Timeout` → digita as DENY keys (`n\r`), NUNCA approve. Antes dos 10 min,
+    /// zero bytes (controle). Idempotente: a 2ª passada não re-escreve (item já resolvido). É o teste
+    /// 5c do seam — prova o caminho do app, complementar ao AC-0021.5 do gate (executor isolado).
+    #[test]
+    fn attention_hub_auto_deny_writes_deny_keys_after_ten_minutes_never_approve() {
+        let (hub, buf, h, _grid, base) = wired_hub(
+            "autodeny",
+            "Terminal A",
+            b"$ deploy\r\nDeploy to prod? (y/n) ",
+        );
+        hub.store_append_for_test(&yn_ask("Terminal A", "s1", &h));
+        let ts = hub.events_for_test().last().expect("ask no log").ts;
+        let auto = lina_core::attention::AUTO_DENY_AFTER_MS;
+
+        // Controle: antes dos 10 min nada vence → zero bytes.
+        hub.drive_auto_deny(ts + auto - 1);
+        assert!(lock(&buf).is_empty(), "antes de 10 min: zero bytes");
+
+        // Aos 10 min: auto-deny digita as DENY keys (n\r) — NUNCA approve (seria y\r).
+        hub.drive_auto_deny(ts + auto);
+        assert_eq!(
+            *lock(&buf),
+            b"n\r".to_vec(),
+            "auto-deny digita DENY (n\\r), nunca approve (y\\r)"
+        );
+
+        let recs = hub.events_for_test();
+        assert_eq!(
+            recs.iter()
+                .filter(|r| r.kind == "PermissionResolved")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recs.iter().filter(|r| r.kind == "ApprovalInjected").count(),
+            1
+        );
+        // Item resolvido sai da fila; 2ª passada não re-escreve (idempotência via fila).
+        assert!(hub.sync(ts + auto + 1).is_empty());
+        hub.drive_auto_deny(ts + auto + 2);
+        assert_eq!(
+            *lock(&buf),
+            b"n\r".to_vec(),
+            "2ª passada não re-escreve (já resolvido)"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -6537,7 +6964,12 @@ mod tests {
         // Hub sobre o MESMO store (re-projeta o log a cada sync).
         let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
         let model: Model = Arc::new(Mutex::new(SharedModel::default()));
-        let hub = AttentionHub::new(Arc::clone(&store), desk, model);
+        let wiring = ApprovalWiring::new(
+            Arc::new(Supervisor::new()),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            ApprovalKeys::default(),
+        );
+        let hub = AttentionHub::new(Arc::clone(&store), desk, model, wiring);
         let t0 = 3_000_000_u64;
         watch.note_output(node, t0);
 

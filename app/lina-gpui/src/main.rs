@@ -68,10 +68,10 @@ use lina_bootstrap::Autonomy;
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
     normalize_sel, reinject_dir, screen_to_cell, scrub_foreign_orchestrator_env,
-    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, AttentionHub, BootstrapWriter,
-    BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid,
-    MailboxPump, Model, NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H,
-    CELL_W,
+    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, ApprovalWiring, AttentionHub,
+    BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost,
+    Grid, MailboxPump, Model, NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W,
+    CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -3453,10 +3453,18 @@ fn main() {
     // à mesa de custódia. NENHUM byte vai ao PTY por este caminho (ADR 0021 §6).
     // Criada ANTES do pump (R2b): a varredura viva da detecção usa a projeção de mute
     // do hub (mesma fonte do log — defesa em profundidade nas duas pontas).
+    // F1-1-8 / ADR 0024: o hub ganha a porta de escrita validada (gesto humano + auto-deny do
+    // SLA digitam por aqui). `sup`/`grids` são os MESMOS do app (Arc compartilhado); as
+    // `approval_keys` vêm do CLI Profile de injeção (lido ANTES do move para a MailboxPump).
     let attention = Arc::new(AttentionHub::new(
         Arc::clone(&store),
         Arc::clone(&desk),
         Arc::clone(&model),
+        ApprovalWiring::new(
+            Arc::clone(&sup),
+            Arc::clone(&grids),
+            injection_profile.approval_keys.clone(),
+        ),
     ));
     // R2b: `LINA_ATTENTION_DEMO` setado = teatro determinístico do fundador — o loop
     // VIVO de detecção desliga (demo OU real, nunca os dois; sem duplicar pedidos).
