@@ -67,11 +67,10 @@ use lina_bootstrap::Autonomy;
 
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
-    normalize_sel, reinject_dir, screen_to_cell, scrub_foreign_orchestrator_env,
-    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, ApprovalWiring, AttentionHub,
-    BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost,
-    Grid, MailboxPump, Model, NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W,
-    CELL_H, CELL_W,
+    normalize_sel, screen_to_cell, scrub_foreign_orchestrator_env, scrub_pty_secret_env, shell_cmd,
+    spawn_pump, A2aTrigger, ApprovalWiring, AttentionHub, BootstrapWriter, BrokerPump, Camera,
+    CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model,
+    NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -3514,7 +3513,7 @@ fn main() {
         Arc::clone(&store),
         Arc::clone(&grids),
         Mailbox::new(&mailbox_dir),
-        Mailbox::new(reinject_dir(&mailbox_dir)), // F1-2-4: fila serial de re-injeção de doutrina
+        nodes.reinject_queue(), // FIX-A3: fila EM-PROCESSO de re-injeção (sem superfície de filesystem)
         Arc::clone(&model),
         Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
         token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)

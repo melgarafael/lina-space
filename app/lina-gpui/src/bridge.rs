@@ -74,22 +74,42 @@ fn live_member_ids(sup: &Supervisor) -> Vec<NodeId> {
 // escrita do Supervisor** (o mesmo cano do teclado humano: `lock_pty` + `enqueue_write`), FASEADA
 // (`build_paste` → `submit_delay` → Enter separado), respeitando o FREIO W4-3.
 //
-// DURABILIDADE + FREIO: o `assign_role` ENFILEIRA a re-injeção numa fila `reinject` (`.lina/reinject`,
-// mailbox por-nó: `enqueue_as` carimba `from` = dono-do-subdir = origem AUTENTICADA). A `MailboxPump`
-// (escritor único) só DRENA+injeta quando o freio está SOLTO; pausada, a fila fica intacta (durável —
-// nada se perde, nada se injeta sob pausa). Log-verificável: `BusMessageSent` da doutrina só aparece
-// depois de `OrchestrationResumed`.
+// FIX-A3 (ALTA — red-team do gate F1-1): a re-injeção de doutrina NÃO usa mais uma mailbox de
+// FILESYSTEM. A antiga `<.lina>/reinject/<nó>/` era uma DROP-ZONE gravável por QUALQUER agente do
+// mesmo usuário de SO: um agente malicioso escrevia `reinject/<peer>/x.json` com `payload`
+// arbitrário, o drain carimbava `from`=nome-do-subdir=peer e INJETAVA o texto arbitrário no PTY do
+// peer — sem 2ª camada (router/WorkspaceTrust), ao contrário do A2A. Perms de arquivo não resolvem
+// (mesmo usuário). A correção (decisão do Maestro): FILA EM-PROCESSO, sem superfície de FS. Só o
+// app (`assign_role`, pós-confirmação humana) enfileira; o `target` é o `NodeId` AUTENTICADO do
+// roster (não um nome re-resolvido) e o TEXTO é REGENERADO no consumidor a partir do `role` —
+// nenhum texto arbitrário trafega. O FREIO W4-3 segue: pausado não drena (represa em RAM).
+//
+// TRADEOFF (aceito pelo Maestro): o aviso inline deixa de ser crash-durável (fila em RAM). A
+// mudança de PAPEL em si segue durável (`NodeRoleAssigned` + CLAUDE.md reescrito); o restore do
+// log NÃO re-deriva a re-injeção (evita re-injetar a cada boot).
 
-/// Intent canônico da re-injeção (`handoff` = entregar ao nó a doutrina do papel novo). O
-/// roteamento A2A NÃO o consome aqui — a entrega é pela fila serial de escrita — mas mantém o
-/// Envelope versionado coerente (nunca formato ad-hoc por feature).
-const REINJECT_INTENT: &str = "handoff";
+/// Item da fila EM-PROCESSO de re-injeção de doutrina (FIX-A3). `target` é o `NodeId` AUTENTICADO
+/// do roster, cunhado dentro do `assign_role` (que já o tem — sem round-trip por nome forjável);
+/// `role` REGENERA o texto no consumidor (nenhum texto arbitrário é transportado).
+#[derive(Debug, Clone)]
+pub struct ReinjectItem {
+    /// Id de auditoria (`reinject_<uuid v7>`) → vira o `id` do `BusMessageSent`.
+    id: String,
+    /// Alvo AUTENTICADO (NodeId do roster).
+    target: NodeId,
+    /// Papel novo — fonte da doutrina REGENERADA no consumidor.
+    role: String,
+}
 
-/// Diretório da fila de re-injeção, irmão do outbox A2A — `<.lina>/reinject`. O `Router` NUNCA a
-/// varre (é a fila serial de ESCRITA, não a de roteamento A2A). Fonte única do caminho — o
-/// `assign_role` (produtor) e a `MailboxPump` (consumidor) o derivam daqui.
-pub(crate) fn reinject_dir(lina_dir: &Path) -> PathBuf {
-    lina_dir.join("reinject")
+/// Fila EM-PROCESSO de re-injeção, compartilhada (clone de `Arc`) entre o produtor
+/// (`NodeManager::assign_role`) e o consumidor (`MailboxPump::drain_reinject`). Substitui a antiga
+/// mailbox de filesystem (FIX-A3): zero superfície que um processo/agente externo alcance.
+pub type ReinjectQueue = Arc<Mutex<VecDeque<ReinjectItem>>>;
+
+/// Cria uma fila de re-injeção vazia (em-processo).
+#[must_use]
+pub(crate) fn new_reinject_queue() -> ReinjectQueue {
+    Arc::new(Mutex::new(VecDeque::new()))
 }
 
 /// O texto de doutrina re-injetado no PTY vivo ao trocar de papel. Conciso (uma linha — a doutrina
@@ -102,29 +122,26 @@ fn doctrine_reinjection_text(role: &str) -> String {
     )
 }
 
-/// Enfileira (durável, atômico) a re-injeção de doutrina para o nó cujo nome AUTENTICADO é `addr`.
-/// Usa o outbox POR-NÓ (`enqueue_as`) → o drain carimba `from = addr` (origem autenticada), de modo
-/// que o alvo da entrega deriva da ORIGEM, nunca de um campo `to` forjável.
-///
-/// # Errors
-/// `addr` inválido como nome de subdir, ou falha de I/O ao escrever a mensagem.
-fn enqueue_doctrine_reinjection(reinject: &Mailbox, addr: &str, role: &str) -> Result<(), String> {
-    let text = doctrine_reinjection_text(role);
-    let msg = MailMessage::new(addr, addr, REINJECT_INTENT, text);
-    reinject.enqueue_as(addr, &msg).map_err(|e| e.to_string())
+/// Empurra uma re-injeção na fila EM-PROCESSO. `target` é o `NodeId` AUTENTICADO (já resolvido no
+/// `assign_role`); `role` regenera o texto no consumidor. SEM I/O e SEM filesystem — nenhum agente
+/// alcança esta fila (FIX-A3). Infalível (push em memória).
+fn enqueue_doctrine_reinjection(queue: &ReinjectQueue, target: NodeId, role: &str) {
+    lock(queue).push_back(ReinjectItem {
+        id: format!("reinject_{}", uuid::Uuid::now_v7()),
+        target,
+        role: role.to_string(),
+    });
 }
 
-/// **FREIO W4-3 aplicado à fila de re-injeção.** Pausado → devolve `[]` SEM tocar a fila (durável —
-/// nada se injeta, nada se perde). Solto → drena de forma recuperável (`drain_to_inflight`: move p/
-/// `.inflight`, ack só após o evento de entrega; um crash entre drenar e injetar reprocessa).
-fn drain_reinject_active(reinject: &Mailbox, paused: bool) -> Vec<MailMessage> {
+/// **FREIO W4-3 aplicado à fila EM-PROCESSO.** Pausado → devolve `[]` SEM tocar a fila (nada se
+/// injeta; a doutrina fica enfileirada em RAM até o "Retomar"). Solto → drena TODOS os itens.
+/// (FIX-A3: não é mais crash-durável — tradeoff aceito; o papel em si segue durável via
+/// `NodeRoleAssigned`+CLAUDE.md, e o restore NÃO re-deriva a re-injeção.)
+fn drain_reinject_active(queue: &ReinjectQueue, paused: bool) -> Vec<ReinjectItem> {
     if paused {
         return Vec::new();
     }
-    reinject.drain_to_inflight().unwrap_or_else(|e| {
-        eprintln!("lina-gpui: reinject drain falhou (será retentado): {e}");
-        Vec::new()
-    })
+    lock(queue).drain(..).collect()
 }
 
 /// Injeção FASEADA da doutrina no PTY vivo de `target`, pela fila serial de escrita do Supervisor
@@ -545,9 +562,10 @@ pub struct MailboxPump {
     model: Model,
     /// W4-3: estado do FREIO compartilhado com a UI (que pede pausa/retoma; a pump aplica no Router).
     brake: crate::wiring::Brake,
-    /// F1-2-4: fila serial de RE-INJEÇÃO de doutrina (`<.lina>/reinject`). O `assign_role` enfileira;
-    /// a pump (escritor único) drena+injeta no PTY vivo SÓ com o freio solto (pausado = represa).
-    reinject: Mailbox,
+    /// FIX-A3: fila EM-PROCESSO de RE-INJEÇÃO de doutrina (substitui a mailbox de FS, que era
+    /// drop-zone gravável por qualquer agente). O `assign_role` enfileira; a pump (escritor único)
+    /// drena+injeta no PTY vivo SÓ com o freio solto (pausado = represa em RAM).
+    reinject_queue: ReinjectQueue,
     /// Último roster escrito no `agents.json` (evita reescrever a cada tick sem mudança).
     last_roster: Vec<AgentPresence>,
     /// W3-7c: último `event_count` em que reconstruímos o `CostLedger` — só re-replaya quando há eventos
@@ -566,9 +584,9 @@ impl MailboxPump {
         store: Arc<Mutex<EventStore>>,
         grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
         mailbox: Mailbox,
-        // F1-2-4: a fila serial de re-injeção de doutrina (`<.lina>/reinject`) — irmã do outbox A2A,
-        // que o `assign_role` alimenta e esta pump drena (escritor único) sob o freio.
-        reinject: Mailbox,
+        // FIX-A3: a fila EM-PROCESSO de re-injeção de doutrina — compartilhada (clone de Arc) com o
+        // `NodeManager` (produtor via `assign_role`); esta pump drena (escritor único) sob o freio.
+        reinject_queue: ReinjectQueue,
         model: Model,
         brake: crate::wiring::Brake,
         token_budget_day: u64,
@@ -596,7 +614,7 @@ impl MailboxPump {
             profile,
             model,
             brake,
-            reinject,
+            reinject_queue,
             last_roster: Vec::new(),
             last_cost_ec: 0,
         }
@@ -731,60 +749,67 @@ impl MailboxPump {
         self.refresh_cost_paused();
     }
 
-    /// **F1-2-4 — drena+injeta as re-injeções de doutrina represadas, respeitando o FREIO W4-3.**
-    /// Pausado → não toca a fila (`drain_reinject_active` devolve `[]`): a doutrina fica enfileirada,
-    /// durável, até o "Retomar" (nada se injeta sob pausa, nada se perde). Solto → para cada item:
-    /// resolve o alvo pela ORIGEM AUTENTICADA (`from` carimbado pelo subdir, nunca o `to` forjável),
+    /// **F1-2-4 / FIX-A3 — drena+injeta as re-injeções de doutrina represadas, respeitando o FREIO
+    /// W4-3.** Pausado → não toca a fila (`drain_reinject_active` devolve `[]`): a doutrina fica
+    /// enfileirada em RAM até o "Retomar" (nada se injeta sob pausa). Solto → para cada item: o alvo
+    /// é o `NodeId` AUTENTICADO cunhado no `assign_role` (FIX-A3 — nenhum campo forjável decide
+    /// identidade), o TEXTO é REGENERADO de `role` no consumidor (jamais um payload transportado),
     /// injeta faseado pela fila serial de escrita e LOGA `BusMessageSent` (log-verificável: a doutrina
-    /// só aparece no log DEPOIS do `OrchestrationResumed`). `ack_inflight` só após o evento durável —
-    /// um crash entre drenar e injetar reprocessa (nada se perde); falha de entrega deixa no
-    /// `.inflight` p/ o próximo tick (nunca silenciosa).
+    /// só aparece no log DEPOIS do `OrchestrationResumed`). Removido da fila ao injetar com sucesso
+    /// (idempotente); nó sem grid (subindo) ou falha de entrega → RE-ENFILEIRA p/ o próximo tick
+    /// (nunca silenciosa). TRADEOFF FIX-A3: fila em RAM não é crash-durável — a mudança de papel em si
+    /// segue durável (`NodeRoleAssigned`+CLAUDE.md) e o restore NÃO re-deriva a re-injeção.
     fn drain_reinject(&mut self) {
-        let msgs = drain_reinject_active(&self.reinject, self.router.is_paused());
-        for m in msgs {
-            // A ORIGEM autenticada (subdir-dono) decide o alvo da auto-doutrina — JAMAIS o `to`.
-            let Some(target) = self.sup.node_by_name(&m.from) else {
+        let items = drain_reinject_active(&self.reinject_queue, self.router.is_paused());
+        let mut retry: Vec<ReinjectItem> = Vec::new();
+        for item in items {
+            // O alvo é o `NodeId` AUTENTICADO cunhado no `assign_role` — nenhum campo forjável
+            // decide identidade. Se o nó saiu do roster vivo, descarta (não há onde injetar).
+            let Some(info) = self.sup.get(item.target) else {
                 eprintln!(
-                    "lina-gpui: reinject — origem '{}' fora do roster vivo; descarta (ack)",
-                    m.from
+                    "lina-gpui: reinject — alvo {:?} fora do roster vivo; descarta",
+                    item.target
                 );
-                if let Err(e) = self.reinject.ack_inflight(&m.id) {
-                    eprintln!("lina-gpui: reinject ack '{}' falhou: {e}", m.id);
-                }
                 continue;
             };
-            let Some(grid) = lock(&self.grids).get(&target).cloned() else {
-                // Sem grid (nó ainda subindo): NÃO ack → re-tenta no próximo tick (nada se perde).
+            let Some(grid) = lock(&self.grids).get(&item.target).cloned() else {
+                // Sem grid (nó ainda subindo): re-enfileira p/ o próximo tick (nada se perde).
+                retry.push(item);
                 continue;
             };
-            match inject_doctrine_phased(&self.sup, target, &grid, &m.payload, &self.profile) {
+            // TEXTO REGENERADO no consumidor a partir do papel — jamais um payload transportado.
+            let text = doctrine_reinjection_text(&item.role);
+            match inject_doctrine_phased(&self.sup, item.target, &grid, &text, &self.profile) {
                 Ok(()) => {
                     let count = {
                         let mut s = lock(&self.store);
                         let _ = s.append(&DomainEvent::BusMessageSent {
-                            id: m.id.clone(),
-                            from: target,
-                            to: format!("doctrine:{}", m.from),
+                            id: item.id.clone(),
+                            from: item.target,
+                            to: format!("doctrine:{}", info.name),
                         });
                         s.event_count().ok()
                     };
-                    {
-                        let mut model = lock(&self.model);
-                        if let Some(c) = count {
-                            model.event_count = c;
-                        }
-                        model.touch();
+                    let mut model = lock(&self.model);
+                    if let Some(c) = count {
+                        model.event_count = c;
                     }
-                    if let Err(e) = self.reinject.ack_inflight(&m.id) {
-                        eprintln!("lina-gpui: reinject ack '{}' falhou: {e}", m.id);
-                    }
+                    model.touch();
                 }
                 Err(e) => {
-                    // Falha de entrega (lock/IO): deixa no `.inflight` p/ retry no próximo tick.
+                    // Falha de entrega (lock/IO): re-enfileira p/ retry no próximo tick (nunca silenciosa).
                     eprintln!(
                         "lina-gpui: reinject de doutrina falhou (retry no próximo tick): {e}"
                     );
+                    retry.push(item);
                 }
+            }
+        }
+        // Re-enfileira NA FRENTE (preserva a ordem relativa) os itens que pediram retry.
+        if !retry.is_empty() {
+            let mut q = lock(&self.reinject_queue);
+            for item in retry.into_iter().rev() {
+                q.push_front(item);
             }
         }
     }
@@ -2992,6 +3017,10 @@ pub struct NodeManager {
     bootstrap: Option<BootstrapWriter>,
     /// W4-2 (M3/M4): o `.lina/` do workspace — onde os criadores persistem `notes/` e `folders/`.
     lina_dir: PathBuf,
+    /// FIX-A3: fila EM-PROCESSO de re-injeção de doutrina (produtor: `assign_role`). Compartilhada
+    /// com a `MailboxPump` (consumidor) via [`NodeManager::reinject_queue`] — substitui a mailbox
+    /// de filesystem, que era drop-zone gravável por qualquer agente do mesmo usuário de SO.
+    reinject_queue: ReinjectQueue,
 }
 
 impl NodeManager {
@@ -3027,7 +3056,16 @@ impl NodeManager {
             seq: Mutex::new(seq_start),
             bootstrap,
             lina_dir,
+            reinject_queue: new_reinject_queue(),
         }
+    }
+
+    /// FIX-A3: a fila EM-PROCESSO de re-injeção de doutrina, compartilhada (clone de `Arc`) com a
+    /// [`MailboxPump`] (consumidor). O `main.rs` a obtém daqui e a passa ao pump após criar o
+    /// manager — é o canal produtor→consumidor sem superfície de filesystem.
+    #[must_use]
+    pub(crate) fn reinject_queue(&self) -> ReinjectQueue {
+        Arc::clone(&self.reinject_queue)
     }
 
     /// **W4-2 · M3/M4 — cria uma NOTA ou PASTA** pelo nome e a torna VIVA no canvas (não só na
@@ -3211,16 +3249,12 @@ impl NodeManager {
             m.touch();
         }
         self.rewrite_bootstrap();
-        // F1-2-4: enfileira a re-injeção da doutrina nova (durável). O alvo é o nome AUTENTICADO do
-        // roster (`sup.get`), o mesmo que o pump resolve por `node_by_name` — nunca um campo
-        // forjável. Best-effort: o papel JÁ está persistido; falha de enqueue é VISÍVEL no stderr,
-        // não derruba a troca de papel (o fundador pode re-disparar).
-        if let Some(addr) = self.sup.get(node).map(|info| info.name) {
-            let reinject = Mailbox::new(reinject_dir(&self.lina_dir));
-            if let Err(e) = enqueue_doctrine_reinjection(&reinject, &addr, role) {
-                eprintln!("lina-gpui: enfileirar re-injeção de doutrina falhou: {e}");
-            }
-        }
+        // FIX-A3: enfileira a re-injeção na FILA EM-PROCESSO com o `NodeId` AUTENTICADO (`node`, que
+        // já temos aqui — sem round-trip por nome/string forjável). O texto é REGENERADO no consumidor
+        // a partir do `role`. Nenhuma superfície de filesystem: nenhum agente alcança esta fila. O nó
+        // acabou de ser persistido (`NodeRoleAssigned`); se sumir do roster antes do drain, o consumidor
+        // descarta com log (nunca injeta às cegas).
+        enqueue_doctrine_reinjection(&self.reinject_queue, node, role);
         Ok(())
     }
 
@@ -4878,7 +4912,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&grids),
             Mailbox::new(&mailbox_root),
-            Mailbox::new(reinject_dir(&mailbox_root)),
+            new_reinject_queue(), // FIX-A3: reinject não exercitado aqui — fila vazia
             Arc::clone(&model),
             Arc::clone(&brake),
             0,              // teto de custo desligado neste teste (freio/pulso)
@@ -4977,42 +5011,44 @@ mod tests {
     /// perdida).
     #[test]
     fn reinject_drain_respects_brake() {
-        let dir = std::env::temp_dir().join(format!("lina-reinj-brake-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let reinject = Mailbox::new(reinject_dir(&dir.join(".lina")));
-        enqueue_doctrine_reinjection(&reinject, "Terminal A", "reviewer").expect("enfileira");
+        // Fila EM-PROCESSO (FIX-A3) — sem filesystem. O `target` é um NodeId qualquer: o GATE do
+        // freio (`drain_reinject_active`) não toca o roster, só decide SE drena.
+        let queue = new_reinject_queue();
+        let target: NodeId = uuid::Uuid::now_v7();
+        enqueue_doctrine_reinjection(&queue, target, "reviewer");
 
-        let under_brake = drain_reinject_active(&reinject, true);
+        let under_brake = drain_reinject_active(&queue, true);
         assert!(
             under_brake.is_empty(),
-            "sob o freio a re-injeção NÃO drena (fica enfileirada)"
+            "sob o freio a re-injeção NÃO drena (fica enfileirada em RAM)"
         );
 
-        let resumed = drain_reinject_active(&reinject, false);
+        let resumed = drain_reinject_active(&queue, false);
         assert_eq!(
             resumed.len(),
             1,
             "ao soltar o freio, a fila represada drena"
         );
-        assert!(
-            resumed[0].payload.contains("reviewer"),
-            "drena exatamente a doutrina represada"
+        assert_eq!(
+            resumed[0].role, "reviewer",
+            "drena exatamente a doutrina represada (papel preservado p/ regenerar o texto)"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **Red-team (invariante b — campo de agente jamais decide autoridade):** o ALVO da auto-doutrina
-    /// deriva da ORIGEM AUTENTICADA (subdir-dono, carimbado no drain), JAMAIS do campo `to` (forjável).
-    /// Mensagem DEPOSITADA no subdir de "Terminal A" mas com `from`/`to` apontando "Terminal B" → o
-    /// drain carimba `from="Terminal A"` e o alvo resolve para A, nunca B.
+    /// **FIX-A3 (ALTA — red-team do gate F1-1): a re-injeção NÃO tem mais superfície de FILESYSTEM
+    /// que um agente alcance.** Vetor original: um agente malicioso (mesmo usuário de SO) escrevia
+    /// direto em `<.lina>/reinject/<peer>/x.json` e o drain INJETAVA o payload arbitrário no PTY do
+    /// peer (sem 2ª camada). Prova (não-vacuosa por controle positivo): um drop BEM-FORMADO no
+    /// caminho FS legado é INERTE (o pump não lê mais o disco), enquanto a fila EM-PROCESSO legítima
+    /// injeta — i.e. o pump funciona, mas só pela fila interna.
     #[test]
-    fn reinject_target_is_authenticated_origin_not_to_field() {
-        let dir = std::env::temp_dir().join(format!("lina-reinj-auth-{}", std::process::id()));
+    fn reinject_has_no_filesystem_dropzone_fix_a3() {
+        let dir = std::env::temp_dir().join(format!("lina-reinj-a3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut pty = PtyManager::new();
         let sup = Arc::new(Supervisor::new());
         let (delta_tx, _drx) = std::sync::mpsc::channel::<GridDelta>();
-        let (node_a, _ga) = wire_terminal(
+        let (node_a, grid_a) = wire_terminal(
             &mut pty,
             &sup,
             &delta_tx,
@@ -5024,43 +5060,67 @@ mod tests {
             24,
         )
         .expect("wire A");
-        let (node_b, _gb) = wire_terminal(
-            &mut pty,
-            &sup,
-            &delta_tx,
-            "B",
-            "Terminal B",
-            "terminal",
-            PtyCommand::new("cat"),
-            80,
-            24,
-        )
-        .expect("wire B");
         let _ = sup.set_status(node_a, CoreStatus::Running);
-        let _ = sup.set_status(node_b, CoreStatus::Running);
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        lock(&grid_a).advance(b"\r\n> "); // semeia a linha-prompt viva (o `cat` não imprime prompt)
+        lock(&grids).insert(node_a, grid_a);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let brake = crate::wiring::new_brake(); // solto
+        let mailbox_root = dir.join(".lina");
+        let reinject_queue = new_reinject_queue();
+        let mut pump = MailboxPump::new(
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&grids),
+            Mailbox::new(&mailbox_root),
+            Arc::clone(&reinject_queue),
+            Arc::clone(&model),
+            Arc::clone(&brake),
+            0,
+            demo_profile(),
+        );
+        let bus_count = |s: &Arc<Mutex<EventStore>>| {
+            lock(s)
+                .events()
+                .expect("ev")
+                .into_iter()
+                .filter(|r| r.kind == "BusMessageSent")
+                .count()
+        };
 
-        let reinject = Mailbox::new(reinject_dir(&dir.join(".lina")));
-        // Forja: from/to apontam para B — mas a mensagem é depositada no subdir de A (enqueue_as).
-        let forged = MailMessage::new("Terminal B", "Terminal B", "handoff", "doutrina forjada");
-        reinject
+        // (NEGATIVO) ATAQUE A3: um agente deposita um drop BEM-FORMADO no caminho FS legado
+        // (`<.lina>/reinject/Terminal A/`). Antes do fix, o drain o injetaria no PTY de A.
+        let legacy_dropzone = Mailbox::new(mailbox_root.join("reinject"));
+        let forged = MailMessage::new(
+            "Terminal A",
+            "Terminal A",
+            "handoff",
+            "PAYLOAD MALICIOSO ARBITRÁRIO",
+        );
+        // O `enqueue_as` é o MESMO mecanismo que o código vulnerável usava (write atômico no subdir
+        // por-nó): o `.expect` Ok garante que o drop FOI gravado no disco, exatamente onde o drain
+        // antigo o leria — controle negativo não-vacuoso (há um drop real a ser ignorado).
+        legacy_dropzone
             .enqueue_as("Terminal A", &forged)
-            .expect("deposita no subdir de A");
+            .expect("atacante escreve no caminho FS legado");
+        let before = bus_count(&store);
+        pump.tick();
+        assert_eq!(
+            bus_count(&store),
+            before,
+            "FIX-A3: o drop no FILESYSTEM é INERTE — o pump não lê mais o disco (zero injeção)"
+        );
 
-        let drained = drain_reinject_active(&reinject, false);
-        assert_eq!(drained.len(), 1);
+        // (POSITIVO) a fila EM-PROCESSO legítima injeta — o pump FUNCIONA (teste não-vacuoso).
+        enqueue_doctrine_reinjection(&reinject_queue, node_a, "reviewer");
+        pump.tick();
         assert_eq!(
-            drained[0].from, "Terminal A",
-            "o drain carimba from = dono-do-subdir; o campo forjado perdeu"
-        );
-        assert_eq!(
-            sup.node_by_name(&drained[0].from),
-            Some(node_a),
-            "o alvo resolve pela ORIGEM autenticada (A)"
-        );
-        assert_ne!(
-            sup.node_by_name(&drained[0].from),
-            Some(node_b),
-            "JAMAIS o nó nomeado no campo `to`/`from` forjável (B)"
+            bus_count(&store),
+            before + 1,
+            "controle positivo: a fila em-processo injeta (1 BusMessageSent) — o pump não está inerte"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5161,26 +5221,25 @@ mod tests {
     }
 
     /// **Critério 3 (aceite → re-injeção enfileirada):** `assign_role` (chamado só na edição
-    /// confirmada) persiste `NodeRoleAssigned` E enfileira a re-injeção da doutrina na fila serial,
-    /// com a ORIGEM AUTENTICADA (= nome do roster do nó), payload citando o papel novo.
+    /// confirmada) persiste `NodeRoleAssigned` E enfileira a re-injeção na FILA EM-PROCESSO com o
+    /// `target` = `NodeId` AUTENTICADO do roster (não um nome re-resolvido depois) e o papel novo.
     #[test]
     fn assign_role_enqueues_doctrine_reinjection() {
         let (nm, _store, _model) = test_manager("reinject-assign", None);
         let node = *lock(&nm.model).order.first().expect("nó seed");
-        let name = lock(&nm.model).nodes.get(&node).expect("nó").name.clone();
 
         nm.assign_role(node, "reviewer").expect("assign role");
 
-        let reinject = Mailbox::new(reinject_dir(nm.lina_home()));
-        let drained = reinject.drain().expect("drain reinject");
+        let queue = nm.reinject_queue();
+        let drained = drain_reinject_active(&queue, false);
         assert_eq!(drained.len(), 1, "assign_role enfileira UMA re-injeção");
         assert_eq!(
-            drained[0].from, name,
-            "origem autenticada = nome do roster do nó (não um campo forjável)"
+            drained[0].target, node,
+            "target = NodeId AUTENTICADO do roster (não um nome/string re-resolvido depois)"
         );
-        assert!(
-            drained[0].payload.contains("reviewer"),
-            "a doutrina enfileirada cita o papel novo"
+        assert_eq!(
+            drained[0].role, "reviewer",
+            "a re-injeção carrega o papel novo (o texto é REGENERADO no consumidor)"
         );
     }
 
@@ -5216,18 +5275,18 @@ mod tests {
         let model: Model = Arc::new(Mutex::new(SharedModel::default()));
         let brake = crate::wiring::new_brake();
         let mailbox_root = dir.join(".lina");
+        let reinject_queue = new_reinject_queue();
         let mut pump = MailboxPump::new(
             Arc::clone(&sup),
             Arc::clone(&store),
             Arc::clone(&grids),
             Mailbox::new(&mailbox_root),
-            Mailbox::new(reinject_dir(&mailbox_root)),
+            Arc::clone(&reinject_queue),
             Arc::clone(&model),
             Arc::clone(&brake),
             0,
             demo_profile(),
         );
-        let reinject = Mailbox::new(reinject_dir(&mailbox_root));
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
                 .events()
@@ -5242,8 +5301,8 @@ mod tests {
         pump.tick();
         assert!(lock(&brake).paused, "freio pausado");
 
-        // (2) Enfileira a re-injeção SOB o freio.
-        enqueue_doctrine_reinjection(&reinject, "Terminal A", "reviewer").expect("enfileira");
+        // (2) Enfileira a re-injeção SOB o freio (fila em-processo, target = NodeId autenticado).
+        enqueue_doctrine_reinjection(&reinject_queue, node_a, "reviewer");
         let bus_before = bus_count(&store);
 
         // (3) Tick sob o freio: NÃO injeta → sem BusMessageSent novo (enfileirada até Retomar).
@@ -5326,7 +5385,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&grids),
             Mailbox::new(&mailbox_root),
-            Mailbox::new(reinject_dir(&mailbox_root)),
+            new_reinject_queue(), // FIX-A3: reinject não exercitado aqui — fila vazia
             Arc::clone(&model),
             Arc::clone(&brake),
             100,
