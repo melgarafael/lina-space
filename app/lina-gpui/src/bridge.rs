@@ -3003,7 +3003,16 @@ impl NodeManager {
             *s = s.wrapping_add(1);
             v
         };
-        let key = format!("t{seq}");
+        // O dir-casa gerenciado (`dir_for(key) = <ws_root>/<key>`) é a CHAVE de identidade de
+        // projeto do CLI (ex.: `~/.claude/projects/<slug-do-cwd>` + histórico). Por isso a key
+        // precisa ser ÚNICA e NÃO-RECICLÁVEL entre boots: `seq` REINICIA em 0 a cada abertura do
+        // app (main: `seq_start=0`), mas os dirs PERSISTEM com o conteúdo da sessão anterior —
+        // um `t{seq}` reusado faria o agente novo `ls` e CONTINUAR o projeto errado. UUID v7
+        // (monotônico+único globalmente; já dep do app) nasce VIRGEM por construção. O `seq`
+        // fica SÓ para o rótulo cosmético (`node_label` → "Terminal A/B/C…"), nunca para a
+        // identidade de filesystem. O cwd REAL persiste no `TerminalSpawned.cwd` (restore lê
+        // de lá, não recalcula a key).
+        let key = format!("n-{}", uuid::Uuid::now_v7());
 
         // 2) Validação de nome (regra ÚNICA do funil — antes espalhada por entry point).
         let name = match &plan.name {
@@ -3018,7 +3027,8 @@ impl NodeManager {
                 }
                 n.to_string()
             }
-            // Porta ⌘T: nome automático derivado do MESMO seq da key.
+            // Porta ⌘T: nome automático derivado do seq (rótulo cosmético; a key de
+            // filesystem é única/não-reciclável — ver o bloco da `key` acima).
             None => format!("Terminal {}", node_label(seq)),
         };
         let role = plan.role.trim().to_string();
@@ -4786,6 +4796,48 @@ mod tests {
         (nm, store, model)
     }
 
+    /// **Harness do funil de cwd ÚNICO (ADR 0022 §4 / fix do slot reciclável):** um
+    /// `NodeManager` com `ws_root`, `store_dir` e `seq_start` EXPLÍCITOS — para simular DOIS
+    /// boots (duas "sessões") sobre o MESMO workspace, ambos com `seq` reiniciado em 0 (como
+    /// no `main`). Sem seeds (o teste só exercita a admissão), bootstrap SEMPRE ligado (a
+    /// política `Managed` só cria/persiste o cwd quando há `BootstrapWriter`).
+    fn managed_manager(
+        ws_root: &std::path::Path,
+        store_dir: &std::path::Path,
+        seq_start: u32,
+    ) -> (NodeManager, Arc<Mutex<EventStore>>) {
+        let store = Arc::new(Mutex::new(EventStore::open(store_dir).expect("open store")));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let cmd_factory: CmdFactory = Arc::new(|_name: &str| PtyCommand::new("cat"));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let bw = BootstrapWriter::new(
+            ws_root.to_path_buf(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let nm = NodeManager::new(
+            pty,
+            sup,
+            Arc::clone(&store),
+            model,
+            grids,
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            seq_start,
+            cmd_factory,
+            Some(bw),
+            ws_root.join(".lina"),
+        );
+        (nm, store)
+    }
+
     /// **GATE de ADD (headless, determinístico):** `add_node` sobe a contagem 2→3, dá um grid
     /// ao novo nó, persiste a sequência CANÔNICA (ADR 0022 §2: NodeAdded + TerminalSpawned +
     /// NodeRoleAssigned — "terminal" também é papel, fim da classe dos 31-sem-papel), e o
@@ -5515,7 +5567,7 @@ mod tests {
             "lina".to_string(),
         )
         .expect("bootstrap writer");
-        let (nm, _store, model) = test_manager("boot", Some(bw));
+        let (nm, store, model) = test_manager("boot", Some(bw));
         nm.rewrite_bootstrap(); // seed inicial: escreve A e B.
 
         let a_md = ws.join("A").join("CLAUDE.md");
@@ -5529,9 +5581,18 @@ mod tests {
 
         // ADD: novo terminal C → CLAUDE.md próprio (no cwd dele) e o de A REESCRITO com C.
         let c = nm.add_node().expect("add C");
+        // O cwd de C é um dir gerenciado ÚNICO (`<ws>/n-<uuid>`), não mais o slot reciclável
+        // `t{seq}` — lido da projeção (costura canônica), nunca do nome de dir hardcoded.
+        let c_cwd = lock(&store)
+            .project()
+            .expect("project")
+            .nodes
+            .get(&c)
+            .and_then(|nd| nd.cwd.clone())
+            .expect("cwd gerenciado de C persistido");
         assert!(
-            ws.join("t2").join("CLAUDE.md").exists(),
-            "C tem CLAUDE.md no seu cwd"
+            std::path::Path::new(&c_cwd).join("CLAUDE.md").exists(),
+            "C tem CLAUDE.md no seu cwd gerenciado"
         );
         let a2 = std::fs::read_to_string(&a_md).expect("re-read A");
         assert!(a2.contains("Terminal C"), "A reescrito com o colega C");
@@ -6246,15 +6307,37 @@ mod tests {
             "CliProfileSet leva o id do profile"
         );
 
-        // O binding node↔cwd (§3): TODA porta persistiu o cwd REAL do spawn na projeção.
+        // O binding node↔cwd (§3): TODA porta persistiu o cwd REAL do spawn na projeção — e
+        // cada dir-casa gerenciado é ÚNICO por construção (`<ws>/n-<uuid>`, nunca o slot
+        // reciclável `t{seq}` que entre boots herdaria o projeto da sessão passada).
         let projected = lock(&store).project().expect("project");
-        for (id, key) in [(t, "t2"), (n, "t3"), (s, "t4"), (e, "t5")] {
+        let mut cwds: Vec<String> = Vec::new();
+        for (id, porta) in [(t, "⌘T"), (n, "⌘N"), (s, "seed"), (e, "⌘N+motor")] {
+            let cwd = projected
+                .nodes
+                .get(&id)
+                .and_then(|nd| nd.cwd.clone())
+                .unwrap_or_else(|| panic!("cwd REAL persistido p/ a porta {porta}"));
+            let p = std::path::Path::new(&cwd);
             assert_eq!(
-                projected.nodes.get(&id).and_then(|nd| nd.cwd.clone()),
-                Some(ws.join(key).display().to_string()),
-                "cwd REAL persistido p/ {key}"
+                p.parent(),
+                Some(ws.as_path()),
+                "o cwd gerenciado fica sob o ws_root ({porta})"
             );
+            assert!(
+                p.file_name()
+                    .is_some_and(|f| f.to_string_lossy().starts_with("n-")),
+                "dir-casa gerenciado é único por construção (n-<uuid>), não slot reciclável ({porta})"
+            );
+            cwds.push(cwd);
         }
+        cwds.sort();
+        cwds.dedup();
+        assert_eq!(
+            cwds.len(),
+            4,
+            "as 4 portas nascem em cwds DISTINTOS (slot gerenciado não-reciclável)"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -6340,15 +6423,25 @@ mod tests {
             lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
             "degradação VISÍVEL: kit_missing liga o badge no card"
         );
-        // Fim do dir-fantasma: o seq deste nó é 2 (seeds A/B = 0/1 no test_manager).
+        // Fim do dir-fantasma: a admissão de um UserDir não-consentido NÃO cunha dir-casa
+        // gerenciado algum. Pós-fix, o slot gerenciado é `<ws>/n-<uuid>` (único, não mais o
+        // reciclável `t{seq}`) — então a prova é "nenhum dir `n-*` órfão sob o ws" (só os
+        // seeds Managed A/B existem ali).
+        let has_managed_phantom = || {
+            std::fs::read_dir(&ws)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|ent| ent.file_name().to_string_lossy().starts_with("n-"))
+        };
         assert!(
-            !ws.join("t2").exists(),
-            "nenhum <ws_root>/t2 órfão criado na admissão"
+            !has_managed_phantom(),
+            "nenhum dir-casa gerenciado (n-<uuid>) órfão criado na admissão UserDir"
         );
         nm.rewrite_bootstrap();
         assert!(
-            !ws.join("t2").exists(),
-            "o rewrite de roster também NÃO cria o dir-fantasma"
+            !has_managed_phantom(),
+            "o rewrite de roster também NÃO cria o dir-fantasma gerenciado"
         );
         // O binding node↔cwd persiste a pasta REAL (correlação custo/sessão futura).
         let projected = lock(&store).project().expect("project");
@@ -6359,6 +6452,114 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// **ROOT CAUSE do bug do fundador (slot reciclável poluído):** o dir-casa de um agente
+    /// `Managed` é ÚNICO e VIRGEM por construção — nunca um slot `t{seq}` reusado entre boots.
+    /// O `seq` REINICIA em 0 a cada abertura do app, mas os dirs `t{seq}` PERSISTEM com o
+    /// conteúdo da sessão anterior; o CLI usa o cwd como CHAVE de identidade/histórico de
+    /// projeto, então um agente novo no slot reciclado CONTINUAVA o projeto errado. Prova:
+    /// planta o projeto de uma sessão passada no slot que a key reciclável (`t0`, seq_start=0)
+    /// reusaria; admite um agente novo no MESMO workspace; (a) o cwd persistido NÃO é o slot
+    /// poluído e (b) o dir do agente novo é VIRGEM (sem o `projeto-antigo.md`).
+    ///
+    /// NÃO-VACUOSO: no código com `key = format!("t{seq}")` o cwd resolve para `<ws>/t0` →
+    /// (a) falha (igual ao slot) e (b) falha (herda `projeto-antigo.md`). Controle positivo.
+    #[test]
+    fn agente_novo_nasce_em_cwd_virgem_nao_herda_projeto_de_sessao_passada() {
+        let ws = std::env::temp_dir().join(format!("lina-cwdunico-virgem-{}", std::process::id()));
+        let store_dir =
+            std::env::temp_dir().join(format!("lina-cwdunico-virgem-st-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store_dir);
+
+        // SESSÃO PASSADA: o slot que a key reciclável `t{seq}` (seq_start=0 → 1º admitido = t0)
+        // reusaria ENTRE boots — já POLUÍDO com o projeto de outra sessão (estado real do disco).
+        let slot_reciclavel = ws.join("t0");
+        std::fs::create_dir_all(&slot_reciclavel).expect("slot da sessão passada");
+        std::fs::write(
+            slot_reciclavel.join("projeto-antigo.md"),
+            "jogo-da-velha da sessão anterior",
+        )
+        .expect("plantar projeto antigo");
+
+        // SESSÃO ATUAL: novo boot (seq REINICIA em 0), MESMO ws_root.
+        let (nm, store) = managed_manager(&ws, &store_dir, 0);
+        let id = nm.add_node().expect("⌘T admite um terminal gerenciado");
+
+        let cwd = {
+            let projected = lock(&store).project().expect("project");
+            projected
+                .nodes
+                .get(&id)
+                .and_then(|n| n.cwd.clone())
+                .expect("cwd gerenciado persistido no TerminalSpawned")
+        };
+
+        // (a) IDENTIDADE FRESCA: o cwd gerenciado NÃO é o slot reciclável poluído.
+        assert_ne!(
+            cwd,
+            slot_reciclavel.display().to_string(),
+            "o agente novo NÃO nasce no slot t0 reciclado da sessão passada"
+        );
+        // (b) VIRGEM: o dir REAL do agente novo não contém o projeto da sessão anterior.
+        assert!(
+            !std::path::Path::new(&cwd)
+                .join("projeto-antigo.md")
+                .exists(),
+            "o cwd do agente novo é VIRGEM — sem o projeto-antigo.md da sessão passada"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// **Reforço do root cause (colisão entre boots):** DUAS sessões = dois boots do app sobre
+    /// o MESMO workspace, AMBOS com `seq` reiniciado em 0 (`main.rs` `seq_start=0`). O 1º
+    /// agente gerenciado de cada boot NÃO pode resolver para o MESMO dir — senão o segundo
+    /// herda o histórico/projeto do primeiro pelo cwd reusado.
+    ///
+    /// NÃO-VACUOSO: com `key = format!("t{seq}")` ambos os cwds são `<ws>/t0` → `assert_ne`
+    /// falha (colisão). Controle positivo: reverter o fix faz este teste falhar aqui.
+    #[test]
+    fn dois_boots_seq_zero_admitem_em_cwds_distintos() {
+        let ws = std::env::temp_dir().join(format!("lina-cwdunico-2boots-{}", std::process::id()));
+        let st1 =
+            std::env::temp_dir().join(format!("lina-cwdunico-2boots-st1-{}", std::process::id()));
+        let st2 =
+            std::env::temp_dir().join(format!("lina-cwdunico-2boots-st2-{}", std::process::id()));
+        for d in [&ws, &st1, &st2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+
+        let read_cwd = |store: &Arc<Mutex<EventStore>>, id: NodeId| -> String {
+            lock(store)
+                .project()
+                .expect("project")
+                .nodes
+                .get(&id)
+                .and_then(|n| n.cwd.clone())
+                .expect("cwd persistido")
+        };
+
+        // Boot 1 (seq=0).
+        let (nm1, store1) = managed_manager(&ws, &st1, 0);
+        let id1 = nm1.add_node().expect("boot 1 admite");
+        let cwd1 = read_cwd(&store1, id1);
+
+        // Boot 2 (seq REINICIA em 0), MESMO ws_root.
+        let (nm2, store2) = managed_manager(&ws, &st2, 0);
+        let id2 = nm2.add_node().expect("boot 2 admite");
+        let cwd2 = read_cwd(&store2, id2);
+
+        assert_ne!(
+            cwd1, cwd2,
+            "dois boots (seq=0) admitem em cwds DISTINTOS — o slot gerenciado não é reciclável"
+        );
+
+        for d in [&ws, &st1, &st2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     /// **UserDir COM consentimento + merge-safe (ADR 0022 §4):** (a) numa pasta com
