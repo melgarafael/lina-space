@@ -34,7 +34,8 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 mod events;
 pub use events::{
     apply, ApprovalDecision, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore,
-    FlushState, PermissionEvidence, ProjectedNode, ProjectedState, ResolutionVia, StoreError,
+    FlushState, PermissionEvidence, ProjectedNode, ProjectedState, PromptKind, ResolutionVia,
+    StoreError,
 };
 
 /// W4-1: CliDiscovery — varredura do `PATH` por CLIs de IA (substrato do check-up de onboarding).
@@ -89,7 +90,10 @@ pub use lifecycle::{LifecycleEngine, LifecycleError, SampleOutcome};
 /// F1-1-6: detecção de permissão bloqueante multi-camada (hook Notification correlacionado
 /// ao `PreToolUse` pendente + fallback por regex no grid via `VtBackend`, FP medido).
 pub mod permission_detect;
-pub use permission_detect::{DetectionTelemetry, PermissionAsk, PermissionDetector};
+pub use permission_detect::{
+    ClearedPrompt, DetectionTelemetry, LifecycleWiring, PermissionAsk, PermissionDetector,
+    PermissionWatch, ScanOutcome, WATCH_IDLE_MS,
+};
 
 /// F1-1-7: fila de atenção UNIFICADA (custódia + permissão) — projeção do event log com
 /// precedência custódia > permissão, round-robin por nó e escalação visual aos 5 min
@@ -486,6 +490,13 @@ impl PtyHost {
         let term = self.terminals.get(&node)?;
         let guard = lock(&term.shared.vt);
         Some(f(&**guard))
+    }
+
+    /// R2b: os terminais registrados neste host (ordem indefinida) — base da varredura
+    /// viva da detecção de permissão ([`permission_detect::PermissionWatch::scan`]).
+    #[must_use]
+    pub fn nodes(&self) -> Vec<NodeId> {
+        self.terminals.keys().copied().collect()
     }
 
     /// F1-1-8 (ADR 0021 §1, Captura 2): a **porta única** de entrega de aprovação —

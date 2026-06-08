@@ -502,6 +502,8 @@ mod tests {
             detail: None,
             evidence: PermissionEvidence::Grid,
             stable_id: stable_id.into(),
+            vt_snapshot_hash: None,
+            prompt_kind: crate::events::PromptKind::Yn,
         }
     }
 

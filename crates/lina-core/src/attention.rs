@@ -34,6 +34,12 @@
 
 use std::collections::HashMap;
 
+/// Re-export para o consumidor de UI (`lina_core::attention::PromptKind`): o shell
+/// decide a apresentação por formato — `Yn` rende toast aprovável; `Choice`/`Trust`
+/// rendem alerta + foco no terminal, SEM aprovar/recusar (direção do fundador R2b).
+/// (Re-export daqui, e não do lib.rs, porque o lib.rs está em obra de outro dono
+/// nesta rodada — costura coordenada.)
+pub use crate::events::PromptKind;
 use crate::events::{
     ApprovalDecision, DomainEvent, EventRecord, PermissionEvidence, ResolutionVia,
 };
@@ -104,6 +110,15 @@ pub struct AttentionItem {
     pub evidence: AttentionEvidence,
     pub created_ts: u64,
     pub state: AttentionState,
+    /// R2b: formato do bloqueante — a UI apresenta por ele: `Yn` = toast aprovável;
+    /// `Choice`/`Trust` = alerta + foco, sem aprovar/recusar (e [`AttentionQueue::resolve`]
+    /// devolve `None` para não-`Yn`, defesa em profundidade). Custódia carrega `Yn`
+    /// nominal (o campo não se aplica — o gate dela é o ⌘⏎ da pump).
+    pub prompt_kind: PromptKind,
+    /// R2b (ADR 0021 §1): a Captura 1 do detector — é o que torna a fila reconstruída
+    /// por replay APROVÁVEL (o gesto passa este hash ao `deliver_approval` como
+    /// `expected_hash`). `None` = origem sem captura (hook) ou item de custódia.
+    pub vt_snapshot_hash: Option<String>,
 }
 
 /// Pendência de permissão no fold (com os aliases do merge entre camadas).
@@ -117,6 +132,11 @@ struct PendingPermission {
     /// `stable_id`s ABSORVIDOS pelo merge entre camadas — resolver por qualquer um
     /// resolve o item; o evento sai sempre com o canônico (`stable_id`).
     aliases: Vec<String>,
+    /// Formato do bloqueante (R2b). No merge, só a camada de GRID atualiza — é ela
+    /// que VÊ a forma visual do prompt; o hook não sabe o formato.
+    prompt_kind: PromptKind,
+    /// Captura 1 (R2b) — preenche-se se ausente no merge (o grid é quem captura).
+    vt_snapshot_hash: Option<String>,
 }
 
 impl PendingPermission {
@@ -162,10 +182,24 @@ impl AttentionQueue {
                 detail,
                 evidence,
                 stable_id,
+                vt_snapshot_hash,
+                prompt_kind,
                 ..
-            } => self.fold_asked(node_id, detail.clone(), *evidence, stable_id, ts),
+            } => self.fold_asked(
+                node_id,
+                detail.clone(),
+                *evidence,
+                stable_id,
+                vt_snapshot_hash.clone(),
+                *prompt_kind,
+                ts,
+            ),
+            // Remoção da pendência: decisão (Resolved), rótulo de FP (Dismissed) ou
+            // prompt respondido DIRETO no terminal (PromptCleared, R2b item 5 — sem
+            // decisão fabricada; `matches` cobre canônico E aliases do merge).
             DomainEvent::PermissionResolved { stable_id, .. }
-            | DomainEvent::PermissionDismissed { stable_id } => {
+            | DomainEvent::PermissionDismissed { stable_id }
+            | DomainEvent::PermissionPromptCleared { stable_id, .. } => {
                 self.permissions.retain(|p| !p.matches(stable_id));
             }
             DomainEvent::NodeDetectionMuted { node_id, muted } => {
@@ -202,12 +236,15 @@ impl AttentionQueue {
         q
     }
 
+    #[allow(clippy::too_many_arguments)] // espelho 1:1 dos campos do evento (fold)
     fn fold_asked(
         &mut self,
         node_id: &str,
         detail: Option<String>,
         evidence: PermissionEvidence,
         stable_id: &str,
+        vt_snapshot_hash: Option<String>,
+        prompt_kind: PromptKind,
         ts: u64,
     ) {
         // Defesa em profundidade: nó mutado não acumula pendência de GRID (o chamador
@@ -236,9 +273,17 @@ impl AttentionQueue {
                 if detail.is_some() {
                     existing.detail = detail;
                 }
-            } else if existing.detail.is_none() {
-                // Grid chegando depois do hook (raro): só preenche exibição ausente.
-                existing.detail = detail;
+            } else {
+                // Grid chegando (antes OU depois do hook): é a camada que VÊ o prompt —
+                // atualiza o formato do bloqueante e preenche exibição ausente.
+                existing.prompt_kind = prompt_kind;
+                if existing.detail.is_none() {
+                    existing.detail = detail;
+                }
+            }
+            // Captura 1: preenche se ausente (o grid é quem captura; hook traz None).
+            if existing.vt_snapshot_hash.is_none() {
+                existing.vt_snapshot_hash = vt_snapshot_hash;
             }
             existing.aliases.push(stable_id.to_string());
             return;
@@ -250,6 +295,8 @@ impl AttentionQueue {
             evidence,
             created_ts: ts,
             aliases: Vec::new(),
+            prompt_kind,
+            vt_snapshot_hash,
         });
     }
 
@@ -288,11 +335,13 @@ impl AttentionQueue {
     // ───────────────────────── comandos (puros: estado → evento) ─────────────────────────
 
     /// Comando de decisão humana sobre uma PERMISSÃO pendente. Devolve o
-    /// `PermissionResolved` a apendar (com o `stable_id` CANÔNICO, mesmo se chamado
-    /// por um alias do merge) — ou `None` se o id é desconhecido/já resolvido
-    /// (idempotência da fila: clique duplo não gera segundo evento) ou se o item é de
-    /// CUSTÓDIA (a custódia decide pelo caminho existente da pump — zero regressão).
-    /// O chamador apenda no store e re-alimenta `observe` com o evento apendado.
+    /// `PermissionResolved` a entregar ao executor (com o `stable_id` CANÔNICO, mesmo
+    /// se chamado por um alias do merge) — ou `None` se: id desconhecido/já resolvido
+    /// (idempotência da fila: clique duplo não gera segundo evento); item de CUSTÓDIA
+    /// (a custódia decide pelo caminho existente da pump — zero regressão); ou
+    /// **`prompt_kind` não-`Yn`** (R2b: `Choice`/`Trust` alertam + focam, sem
+    /// aprovar/recusar — injetar `y` numa caixa de escolha seria input errado; defesa
+    /// em profundidade além do gate de apresentação da UI).
     #[must_use]
     pub fn resolve(
         &self,
@@ -301,6 +350,9 @@ impl AttentionQueue {
         via: ResolutionVia,
     ) -> Option<DomainEvent> {
         let item = self.permissions.iter().find(|p| p.matches(stable_id))?;
+        if item.prompt_kind != PromptKind::Yn {
+            return None;
+        }
         Some(DomainEvent::PermissionResolved {
             stable_id: item.stable_id.clone(),
             decision,
@@ -363,6 +415,8 @@ impl AttentionQueue {
             evidence: AttentionEvidence::Custody,
             created_ts: c.created_ts,
             state: state_of(c.created_ts),
+            prompt_kind: PromptKind::Yn, // nominal: não se aplica à custódia (gate ⌘⏎)
+            vt_snapshot_hash: None,
         });
         let perms = self.permissions.iter().map(|p| AttentionItem {
             stable_id: p.stable_id.clone(),
@@ -372,6 +426,8 @@ impl AttentionQueue {
             evidence: p.evidence.into(),
             created_ts: p.created_ts,
             state: state_of(p.created_ts),
+            prompt_kind: p.prompt_kind,
+            vt_snapshot_hash: p.vt_snapshot_hash.clone(),
         });
         let mut out = round_robin_by_node(custody.collect());
         out.extend(round_robin_by_node(perms.collect()));
@@ -439,6 +495,27 @@ mod tests {
             detail: Some(format!("detail-{stable_id}")),
             evidence,
             stable_id: stable_id.into(),
+            vt_snapshot_hash: None,
+            prompt_kind: PromptKind::Yn,
+        }
+    }
+
+    /// `ask` com formato + Captura 1 (R2b) — para os testes de prompt_kind/hash.
+    fn ask_kind(
+        node: &str,
+        evidence: PermissionEvidence,
+        stable_id: &str,
+        prompt_kind: PromptKind,
+        vt_snapshot_hash: Option<&str>,
+    ) -> DomainEvent {
+        DomainEvent::PermissionAsked {
+            node_id: node.into(),
+            tool: None,
+            detail: Some(format!("detail-{stable_id}")),
+            evidence,
+            stable_id: stable_id.into(),
+            vt_snapshot_hash: vt_snapshot_hash.map(str::to_string),
+            prompt_kind,
         }
     }
 
@@ -499,6 +576,8 @@ mod tests {
                 detail: Some("git push origin/master".into()),
                 evidence: PermissionEvidence::Hook,
                 stable_id: "h1".into(),
+                vt_snapshot_hash: None,
+                prompt_kind: PromptKind::Yn,
             },
             T0 + 5_800,
         );
@@ -518,6 +597,127 @@ mod tests {
         }
         q.observe(&ev, T0 + 7_000);
         assert!(q.is_empty(), "resolver via alias remove o item inteiro");
+    }
+
+    /// R2b: item `Choice` expõe formato + Captura 1 ao consumidor de UI; `resolve`
+    /// devolve `None` (alerta + foco, sem aprovar/recusar — injetar `y` numa caixa de
+    /// escolha seria input errado); `dismiss` (botão de FP) continua funcionando.
+    #[test]
+    fn choice_item_exposes_kind_and_is_not_resolvable() {
+        let mut q = AttentionQueue::new();
+        q.observe(
+            &ask_kind(
+                "A",
+                PermissionEvidence::Grid,
+                "c1",
+                PromptKind::Choice,
+                Some("cap1-xyz"),
+            ),
+            T0,
+        );
+        let items = q.items(T0 + 1_000);
+        assert_eq!(items[0].prompt_kind, PromptKind::Choice);
+        assert_eq!(items[0].vt_snapshot_hash.as_deref(), Some("cap1-xyz"));
+        assert!(
+            q.resolve("c1", ApprovalDecision::Approve, ResolutionVia::Human)
+                .is_none(),
+            "Choice não é aprovável pela fila (defesa além do gate da UI)"
+        );
+        assert!(
+            q.resolve("c1", ApprovalDecision::Deny, ResolutionVia::Timeout)
+                .is_none(),
+            "nem recusável — o caminho é alerta + foco no terminal"
+        );
+        assert!(
+            q.dismiss("c1").is_some(),
+            "FP dismiss vale p/ qualquer formato"
+        );
+    }
+
+    /// R2b: no merge entre camadas, o GRID é a fonte do formato (é quem VÊ o prompt) —
+    /// hook posterior não rebaixa `Choice` p/ `Yn`; grid posterior atualiza o formato
+    /// de item nascido do hook; a Captura 1 preenche-se quando ausente.
+    #[test]
+    fn merge_grid_owns_prompt_kind_and_fills_capture() {
+        // Grid-born Choice + cap1; hook (Yn, sem captura) enriquece SEM rebaixar.
+        let mut q = AttentionQueue::new();
+        q.observe(
+            &ask_kind(
+                "A",
+                PermissionEvidence::Grid,
+                "g1",
+                PromptKind::Choice,
+                Some("cap1-a"),
+            ),
+            T0,
+        );
+        q.observe(&ask("A", PermissionEvidence::Hook, "h1"), T0 + 5_000);
+        let items = q.items(T0 + 6_000);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].prompt_kind, PromptKind::Choice, "hook não rebaixa");
+        assert_eq!(items[0].vt_snapshot_hash.as_deref(), Some("cap1-a"));
+
+        // Hook-born (Yn, sem captura); grid posterior traz formato + Captura 1.
+        let mut q2 = AttentionQueue::new();
+        q2.observe(&ask("B", PermissionEvidence::Hook, "h2"), T0);
+        q2.observe(
+            &ask_kind(
+                "B",
+                PermissionEvidence::Grid,
+                "g2",
+                PromptKind::Trust,
+                Some("cap1-b"),
+            ),
+            T0 + 2_000,
+        );
+        let items2 = q2.items(T0 + 3_000);
+        assert_eq!(items2.len(), 1);
+        assert_eq!(items2[0].stable_id, "h2", "canônico = quem nasceu primeiro");
+        assert_eq!(
+            items2[0].prompt_kind,
+            PromptKind::Trust,
+            "grid define o formato"
+        );
+        assert_eq!(items2[0].vt_snapshot_hash.as_deref(), Some("cap1-b"));
+    }
+
+    /// R2b item 5: prompt respondido DIRETO no terminal (`PermissionPromptCleared`)
+    /// remove a pendência — inclusive via ALIAS do merge (o detector emite o id do
+    /// lado grid; o item pode ter canônico hook-born). Id desconhecido = no-op.
+    /// Sem decisão fabricada: nenhum Resolved/Dismissed no fluxo.
+    #[test]
+    fn prompt_cleared_removes_item_including_via_alias() {
+        let mut q = AttentionQueue::new();
+        q.observe(&ask("A", PermissionEvidence::Hook, "h1"), T0);
+        q.observe(
+            &ask_kind(
+                "A",
+                PermissionEvidence::Grid,
+                "g1",
+                PromptKind::Yn,
+                Some("cap"),
+            ),
+            T0 + 2_000,
+        );
+        assert_eq!(q.pending_count(), 1, "merge: 1 pedido físico");
+        q.observe(
+            &DomainEvent::PermissionPromptCleared {
+                node_id: "A".into(),
+                stable_id: "g1".into(),
+            },
+            T0 + 9_000,
+        );
+        assert!(q.is_empty(), "cleared via alias remove o item inteiro");
+
+        // Id desconhecido: no-op (replay defensivo).
+        q.observe(
+            &DomainEvent::PermissionPromptCleared {
+                node_id: "A".into(),
+                stable_id: "nope".into(),
+            },
+            T0 + 10_000,
+        );
+        assert!(q.is_empty());
     }
 
     /// Fora da janela de merge → pedidos DISTINTOS (não funde).

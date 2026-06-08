@@ -134,6 +134,28 @@ impl Default for ResolutionVia {
     }
 }
 
+/// R2b (direção do fundador: TODO bloqueante alerta): o FORMATO do prompt bloqueante
+/// detectado — `yn` é aprovável/recusável pelo pipeline do ADR 0021; `choice` (caixa
+/// de múltipla escolha do Claude Code, seleção numerada) e `trust` (diálogo "trust
+/// this folder" 2.1.x) só ALERTAM + focam o terminal (a fila não oferece
+/// aprovar/recusar — injetar `y` numa caixa de escolha seria input errado).
+/// Serializa em `snake_case` (`"yn"`/`"choice"`/`"trust"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptKind {
+    Yn,
+    Choice,
+    Trust,
+}
+
+/// `Yn` como default: payload antigo (pré-campo) era SEMPRE um prompt y/n — o
+/// detector só emitia esse formato; replay de log antigo lê o comportamento da época.
+impl Default for PromptKind {
+    fn default() -> Self {
+        Self::Yn
+    }
+}
+
 /// W4-4: durabilidade do último `append`, para a UI projetar **"salvando…" ↔ "Tudo salvo ✓"**
 /// (rodapé, invariante #6 "estado sempre salvo e visível"). O core emite a transição via callback
 /// (ver [`EventStore::append_with_flush`]); o shell a mapeia para seu evento de UI **sem o core
@@ -480,6 +502,18 @@ pub enum DomainEvent {
         evidence: PermissionEvidence,
         #[serde(default)]
         stable_id: String,
+        /// R2b (ADR 0021 §1): a CAPTURA 1 — hash da região do prompt no grid, anexado
+        /// pelo detector na detecção. Correlaciona com o `vt_snapshot_hash` do
+        /// `ApprovalInjected` (auditoria da pré-condição) e torna a fila reconstruída
+        /// por replay APROVÁVEL (o gesto pós-crash valida contra a captura original).
+        /// `None` = origem sem captura (ex.: caminho hook sem acesso ao grid).
+        #[serde(default)]
+        vt_snapshot_hash: Option<String>,
+        /// R2b (direção do fundador: todo bloqueante alerta): formato do prompt —
+        /// `yn` aprovável; `choice`/`trust` alertam + focam, sem aprovar/recusar.
+        /// Default `yn` = comportamento do log antigo (pré-campo).
+        #[serde(default)]
+        prompt_kind: PromptKind,
     },
     /// F1-2-3 parte 2 (costura adiantada nesta rodada; consumidor é o modal de papéis,
     /// na próxima): um papel CUSTOM do usuário foi salvo (modelo duplicar+modificar da
@@ -505,14 +539,13 @@ pub enum DomainEvent {
     /// F1-1-7/8 (ADR 0021 §2 — ordem: Resolved → write → Injected): a DECISÃO sobre um
     /// pedido de permissão (`stable_id` correlaciona ao `PermissionAsked`), por gesto
     /// humano (via=human) ou SLA de 10 min (via=timeout, decision=deny — NUNCA
-    /// auto-approve, sem knob). **Dono do append (arbitragem da costura F1-1-7×F1-1-8):**
-    /// com o executor FIADO, o desfecho inteiro (Resolved → Injected/Aborted/
-    /// DuplicateIgnored) nasce na porta única de escrita (`deliver_approval`) — um só
-    /// escritor garante a ordem do §2 por construção; `AttentionQueue::resolve` é o
-    /// VALIDADOR do gesto (alias→canônico, idempotência) e a fila NÃO apenda por conta
-    /// própria. Sem executor fiado (fila standalone), o chamador apenda o retorno de
-    /// `resolve` — caminho auditável desta rodada. A decisão NÃO é o efeito: o write
-    /// no PTY é exclusivo do executor (`ApprovalInjected`).
+    /// auto-approve, sem knob). **Emitido pelo EXECUTOR de entrega (porta única,
+    /// `deliver_approval`), que assina o desfecho inteiro Resolved → Injected/Aborted/
+    /// DuplicateIgnored — um só escritor garante a ordem do §2 por construção; a fila
+    /// apenas chama `deliver()`** (`AttentionQueue::resolve` é o VALIDADOR do gesto:
+    /// alias→canônico + idempotência; não apenda — arbitragem registrada em f4256f0).
+    /// A decisão NÃO é o efeito: o write no PTY é exclusivo do executor
+    /// (`ApprovalInjected`).
     /// META — a fila reconstrói pendências varrendo o log (pendente = `PermissionAsked`
     /// sem Resolved/Dismissed posterior do mesmo `stable_id`).
     PermissionResolved {
@@ -576,6 +609,20 @@ pub enum DomainEvent {
         /// nome do evento; `false` só existe explicitamente, no unmute).
         #[serde(default = "default_muted")]
         muted: bool,
+    },
+    /// R2b item 5 (pedido Dev 01 + UI, aprovado pelo Maestro): o prompt detectado
+    /// SUMIU do grid sem decisão pela fila — o humano respondeu DIRETO no terminal
+    /// (vale para y/n e choice; emitido pelo chamador de
+    /// `PermissionDetector::take_cleared`). A fila trata como REMOÇÃO no fold (mesma
+    /// família de Resolved/Dismissed), mas a semântica no log é distinta e
+    /// deliberada: NÃO é `PermissionDismissed` (o pedido era REAL — alimentaria a
+    /// telemetria de FP errado) e NÃO é `PermissionResolved` (ninguém decidiu pela
+    /// fila — o log guarda fatos, não inferências). META.
+    PermissionPromptCleared {
+        #[serde(default)]
+        node_id: String,
+        #[serde(default)]
+        stable_id: String,
     },
 }
 
@@ -641,6 +688,7 @@ impl DomainEvent {
             DomainEvent::ApprovalDuplicateIgnored { .. } => "ApprovalDuplicateIgnored",
             DomainEvent::PermissionDismissed { .. } => "PermissionDismissed",
             DomainEvent::NodeDetectionMuted { .. } => "NodeDetectionMuted",
+            DomainEvent::PermissionPromptCleared { .. } => "PermissionPromptCleared",
         }
     }
 
@@ -908,6 +956,9 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::ApprovalDuplicateIgnored { .. }
         | DomainEvent::PermissionDismissed { .. }
         | DomainEvent::NodeDetectionMuted { .. }
+        // R2b item 5: prompt respondido direto no terminal é META (livro-razão da
+        // fila — remoção sem decisão fabricada); a fila remove no fold.
+        | DomainEvent::PermissionPromptCleared { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
@@ -2066,6 +2117,8 @@ mod tests {
                 detail: Some("git push origin/master".into()),
                 evidence: PermissionEvidence::Hook,
                 stable_id: "pa-1".into(),
+                vt_snapshot_hash: None,
+                prompt_kind: PromptKind::Yn,
             })
             .expect("ask 1");
         store
@@ -2075,10 +2128,13 @@ mod tests {
                 detail: Some("Continue? (y/n)".into()),
                 evidence: PermissionEvidence::Grid,
                 stable_id: "pa-2".into(),
+                vt_snapshot_hash: Some("cap1-abc".into()),
+                prompt_kind: PromptKind::Choice,
             })
             .expect("ask 2");
 
-        // Round-trip dos campos no log (incl. snake_case do evidence).
+        // Round-trip dos campos no log (incl. snake_case do evidence/prompt_kind e os
+        // aditivos R2b: Captura 1 + formato do bloqueante).
         let recs: Vec<EventRecord> = store
             .events()
             .expect("events")
@@ -2089,7 +2145,10 @@ mod tests {
         assert_eq!(recs[0].payload["evidence"], "hook");
         assert_eq!(recs[0].payload["tool"], "Bash");
         assert_eq!(recs[0].payload["detail"], "git push origin/master");
+        assert_eq!(recs[0].payload["prompt_kind"], "yn");
         assert_eq!(recs[1].payload["evidence"], "grid");
+        assert_eq!(recs[1].payload["vt_snapshot_hash"], "cap1-abc");
+        assert_eq!(recs[1].payload["prompt_kind"], "choice");
         assert_ne!(
             recs[0].payload["stable_id"], recs[1].payload["stable_id"],
             "pedidos seguidos do mesmo nó → stable_id distintos"
@@ -2105,9 +2164,10 @@ mod tests {
         assert_eq!(store.event_count().expect("count 2"), count_1);
     }
 
-    /// F1-1-6 (aditividade): payload PARCIAL de `PermissionAsked` (sem tool/detail/
-    /// evidence) replaya com defaults — `evidence` cai no conservador `grid` — e o
-    /// replay do log inteiro segue íntegro.
+    /// F1-1-6 + R2b (aditividade): payload PARCIAL de `PermissionAsked` (sem tool/
+    /// detail/evidence e SEM os campos R2b — o shape do log antigo) replaya com
+    /// defaults — `evidence` cai no conservador `grid`, `vt_snapshot_hash` em `None`
+    /// e `prompt_kind` em `yn` (comportamento da época) — e o replay segue íntegro.
     #[test]
     #[serial]
     fn permission_asked_partial_payload_replays_with_defaults() {
@@ -2134,6 +2194,8 @@ mod tests {
                 tool,
                 detail,
                 evidence,
+                vt_snapshot_hash,
+                prompt_kind,
                 ..
             } => {
                 assert_eq!(tool, None);
@@ -2142,6 +2204,15 @@ mod tests {
                     evidence,
                     PermissionEvidence::Grid,
                     "evidência ausente lê o default conservador (grid)"
+                );
+                assert_eq!(
+                    vt_snapshot_hash, None,
+                    "log antigo não tem Captura 1 — replay lê None"
+                );
+                assert_eq!(
+                    prompt_kind,
+                    PromptKind::Yn,
+                    "log antigo era sempre y/n — replay lê o comportamento da época"
                 );
             }
             other => panic!("kind errado: {other:?}"),
@@ -2194,6 +2265,12 @@ mod tests {
                 muted: true,
             })
             .expect("muted");
+        store
+            .append(&DomainEvent::PermissionPromptCleared {
+                node_id: "n1".into(),
+                stable_id: "pa-4".into(),
+            })
+            .expect("cleared");
 
         let recs = store.events().expect("events");
         let by_kind = |k: &str| {
@@ -2219,6 +2296,9 @@ mod tests {
         );
         assert_eq!(by_kind("PermissionDismissed").payload["stable_id"], "pa-3");
         assert_eq!(by_kind("NodeDetectionMuted").payload["muted"], true);
+        let cleared = by_kind("PermissionPromptCleared");
+        assert_eq!(cleared.payload["stable_id"], "pa-4");
+        assert_eq!(cleared.payload["node_id"], "n1");
 
         // META: projeção intacta; replay 2× = mesmo fingerprint, mesma contagem.
         let after = store.project().expect("project 2");
