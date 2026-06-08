@@ -11,8 +11,9 @@
 //! fantasma — estado do modal é RAM). Wireframe/copy: `ux-flows.md` fluxo (a), autoritativo.
 //!
 //! **Critério 7 (neutralidade)**: o comando do motor vem do **CLI Profile TOML lido do disco em
-//! runtime** ([`load_profiles`] — semeado uma vez de `profiles/claude-code.toml` e depois SEMPRE
-//! lido do arquivo: trocar o TOML muda o comando sem recompilar). Descoberta de motores roda
+//! runtime** ([`load_profiles`] — os profiles embutidos (claude-code, antigravity, gemini) são
+//! semeados uma vez e depois SEMPRE lidos do arquivo: trocar o TOML muda o comando sem
+//! recompilar). Descoberta de motores roda
 //! **fora da thread de UI** e entra por [`AgentModal::set_engines`] (lição W4-1: injetável).
 
 use std::path::{Path, PathBuf};
@@ -199,9 +200,22 @@ pub enum EngineScan {
 
 // ═══════════════════════════ CLI Profiles em RUNTIME (critério 7) ═══════════════════════════
 
-/// Seed do profile recomendado — escrito UMA vez no dir de profiles do usuário; depois disso o
-/// arquivo do DISCO manda (editar/trocar o TOML muda o comando sem recompilar).
+/// CLI Profiles embutidos — escritos UMA vez no dir de profiles do usuário; depois disso o
+/// arquivo do DISCO manda (editar/trocar o TOML muda o comando sem recompilar — invariante #3).
+/// Antigravity + Gemini entram por F1-1-9: sem este seeding, um TOML novo no repo NÃO chega ao
+/// dir de runtime do usuário (o modal só lê o disco).
 const CLAUDE_PROFILE_SEED: &str = include_str!("../../../profiles/claude-code.toml");
+const ANTIGRAVITY_PROFILE_SEED: &str = include_str!("../../../profiles/antigravity.toml");
+const GEMINI_PROFILE_SEED: &str = include_str!("../../../profiles/gemini.toml");
+
+/// `(nome de arquivo, conteúdo)` de cada profile embutido, semeado **write-if-absent**: o
+/// arquivo do disco, uma vez escrito, é a fonte da verdade (um custom de mesmo `id` no dir
+/// do usuário continua sobrescrevendo o default por `id`, via `ProfileRegistry`).
+const SEEDED_PROFILES: &[(&str, &str)] = &[
+    ("claude-code.toml", CLAUDE_PROFILE_SEED),
+    ("antigravity.toml", ANTIGRAVITY_PROFILE_SEED),
+    ("gemini.toml", GEMINI_PROFILE_SEED),
+];
 
 /// Onde os CLI Profiles do usuário moram: `LINA_PROFILES` (override de dev) ou
 /// `<ws_root>/.lina/profiles` (local-first, por Espaço).
@@ -212,17 +226,24 @@ pub fn profiles_dir(mailbox_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| mailbox_dir.join("profiles"))
 }
 
-/// Carrega os CLI Profiles TOML **do disco** (semeando `claude-code.toml` na primeira vez).
-/// Best-effort: erro de I/O/parse → registry vazio + stderr (o modal degrada para o binário
-/// descoberto; criação nunca bloqueia).
+/// Carrega os CLI Profiles TOML **do disco**, semeando os profiles embutidos
+/// ([`SEEDED_PROFILES`]) que ainda não existem. Best-effort: erro de I/O/parse → registry
+/// vazio + stderr (o modal degrada para o binário descoberto; criação nunca bloqueia).
 #[must_use]
 pub fn load_profiles(dir: &Path) -> ProfileRegistry {
-    let seed = dir.join("claude-code.toml");
-    if !seed.exists() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("lina-gpui: M6 — não criei {} ({e})", dir.display());
-        } else if let Err(e) = std::fs::write(&seed, CLAUDE_PROFILE_SEED) {
-            eprintln!("lina-gpui: M6 — não semeei {} ({e})", seed.display());
+    // Semeia cada profile embutido write-if-absent: o arquivo do disco, uma vez presente,
+    // manda (o usuário pode editá-lo). Sem isso, Antigravity/Gemini (F1-1-9) nunca chegariam
+    // ao dir de runtime — o modal só lê o disco.
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("lina-gpui: M6 — não criei {} ({e})", dir.display());
+    } else {
+        for &(name, seed) in SEEDED_PROFILES {
+            let path = dir.join(name);
+            if !path.exists() {
+                if let Err(e) = std::fs::write(&path, seed) {
+                    eprintln!("lina-gpui: M6 — não semeei {} ({e})", path.display());
+                }
+            }
         }
     }
     match ProfileRegistry::load_dir(dir) {
@@ -2648,6 +2669,49 @@ kind = "idle"
             vec!["--minha-flag-custom".to_string()],
             "trocar o TOML mudou o comando sem recompilar"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1-1-9 (seeding): a 1ª carga leva os profiles EMBUTIDOS (claude-code + os NOVOS
+    /// Antigravity e Gemini) ao dir de runtime do usuário — um dir vazio vira um registry que
+    /// conhece os 3 CLIs, sem o usuário copiar TOML algum. (O repo sozinho não bastaria: o
+    /// modal só lê o disco; é o seeding que faz a ponte repo → runtime.)
+    #[test]
+    fn seeding_writes_all_embedded_profiles_on_first_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-f1-1-9-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // garante dir limpo
+
+        let reg = load_profiles(&dir);
+
+        // Os 3 profiles embutidos foram semeados e carregados na 1ª vez.
+        for id in ["claude-code", "antigravity", "gemini"] {
+            assert!(
+                reg.get(id).is_some(),
+                "{id} deve ser semeado e carregado na 1ª carga"
+            );
+        }
+        // E os arquivos REALMENTE existem no disco (não só em RAM).
+        assert!(
+            dir.join("antigravity.toml").exists(),
+            "antigravity.toml no disco"
+        );
+        assert!(dir.join("gemini.toml").exists(), "gemini.toml no disco");
+
+        // Identidade-chave do sucessor: binário `agy` (não `gemini`) + capability honesta.
+        let agy = reg.get("antigravity").expect("antigravity carregado");
+        assert_eq!(agy.program, "agy");
+        assert!(
+            !agy.capabilities.has("hooks"),
+            "spike .agents/hooks.json adiado → hooks=false"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

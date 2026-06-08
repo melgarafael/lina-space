@@ -1,0 +1,69 @@
+# CLI Profile — Gemini CLI (Google) · story F1-1-9 · ⚠️ TRANSITIONAL / EoL 2026-06-18
+#
+# Toda a especificidade deste CLI vive AQUI (TOML), nunca compilada no core
+# (CLAUDE.md §3 Neutralidade multi-CLI). Trocar de CLI = trocar de profile.
+#
+# ⚠️ FIM DE VIDA: o Google força a transição Gemini CLI → Antigravity CLI até 2026-06-18
+# (13.10 achado 3 — data DURA dentro da janela da Fase 1). Este profile existe para NÃO
+# deixar usuários Gemini órfãos no meio do épico, MAS o caminho recomendado é o `agy`
+# (ver `antigravity.toml`). A UI de criação de agente exibe um aviso leigo de transição
+# (cópia pendente de aprovação — ver .entrega-f1-1-9). Spike de hooks (que migram para
+# `.agents/hooks.json`) ADIADO; reavaliar ~fim de jul/2026.
+#
+# ⚠️ CALIBRAÇÃO PENDENTE (mesma situação do antigravity.toml — sem o binário aqui):
+# os campos de timing/prontidão/observabilidade são pontos de partida conservadores.
+
+# Identificador estável (chave no registry). Rótulo amigável "Gemini CLI" vive na UI.
+id = "gemini"
+
+# Único ponto que conhece o binário: `gemini` (KNOWN_CLIS em lina-core/cli_discovery.rs;
+# instalado via `@google/gemini-cli`, ver recipes.toml). `engines_from` casa por
+# `program == id_descoberto`.
+program = "gemini"
+
+# ⚠️ Flags de não-interatividade / saída estruturada do `gemini` não calibradas aqui.
+# Vazio até validar contra o binário — entra por TOML, sem recompilar.
+args = []
+
+# Entrega A2A faseada (CLAUDE.md §A2A), como os demais terminais.
+delivery = "pty_inject"
+
+# ⚠️ Ponto de partida = claude-code (400ms); calibrar contra o paste real do `gemini`.
+submit_delay_ms = 400
+
+# ⚠️ Ponto de partida = regex do claude-code (cobre `>`/`❯`); calibrar contra a TUI do `gemini`.
+prompt_ready_regex = '(?m)^\s*[>❯]\s'
+
+# Timeout do wait_ready -> NÃO injeta no estouro (nunca "injeta mesmo assim"). Ponto de partida.
+ready_timeout_ms = 30000
+
+# ⚠️ Vazio: sem grids REAIS do `gemini` para extrair marcadores de ocupado. Calibrar.
+busy_markers = []
+
+idle_ms = 1500
+ask_timeout_ms = 120000
+
+# Onde o `gemini` grava session-files (camada 3 — F1-1-2): ~/.gemini (distinto do
+# ~/.antigravity do sucessor). ⚠️ Glob/extensão internos não confirmados — palpite
+# conservador; watch degrada gracioso se não casar. Calibrar contra ~/.gemini real.
+session_dir_pattern = "~/.gemini/*/*.jsonl"
+
+# ⚠️ Vazio: banner/markers reais do `gemini` não caracterizados aqui.
+output_markers = []
+
+# Capabilities HONESTAS (story "NÃO entra: assumir paridade"). Gemini EoL: não se promete
+# paridade de hooks/OTel/permissão/handoff — `false` explícito documenta a decisão.
+[capabilities]
+hooks = false               # hooks migram para `.agents/hooks.json` (spike adiado) — não fingir suporte
+otel = false
+permission_detection = false
+handoff_support = false
+
+# ⚠️ DEFAULT CONSERVADOR (sem PTY real do `gemini` p/ sondar a semântica do diálogo de permissão).
+[approval_keys]
+approve = "y\r"
+deny = "n\r"
+
+# ⚠️ CONSERVADOR: sem stream-json confirmado, fim por QUIETUDE (janela de `idle_ms`).
+[end_signal]
+kind = "idle"

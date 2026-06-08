@@ -1,0 +1,90 @@
+# CLI Profile — Antigravity (Google) · story F1-1-9
+#
+# Toda a especificidade deste CLI vive AQUI (TOML), nunca compilada no core
+# (CLAUDE.md §3 Neutralidade multi-CLI). Trocar de CLI = trocar de profile.
+#
+# CONTEXTO: o `agy` (antigravity.google/cli) é o SUCESSOR do Gemini CLI, que o Google
+# aposenta em 2026-06-18 (ver `gemini.toml`, marcado transitional/EoL). É um binário Go
+# standalone — `agy`, NÃO `gemini` (instalação em recipes.toml → ~/.local/bin/agy).
+#
+# ⚠️ CALIBRAÇÃO PENDENTE (não temos o binário `agy` nesta máquina): submit_delay_ms,
+# prompt_ready_regex, busy_markers, session_dir_pattern, output_markers e end_signal
+# são PONTOS DE PARTIDA conservadores (herdados do claude-code.toml ou do que é público
+# do Antigravity), a ajustar contra o grid REAL do `agy` — sem recompilar (invariante #3).
+# Critério de aceite (1) da story (golden transcript num Mac com `agy`) fecha a calibração.
+
+# Identificador estável (chave no registry). O rótulo amigável "Antigravity" vive na UI
+# (app/lina-gpui `engine_label`); aqui é o id do profile.
+id = "antigravity"
+
+# Único ponto que conhece o binário. O `agy` É o nome no PATH que a descoberta procura
+# (KNOWN_CLIS em lina-core/cli_discovery.rs). `engines_from` casa este profile ao achado
+# por `program == id_descoberto`, então `program` PRECISA ser exatamente "agy".
+program = "agy"
+
+# ⚠️ Flags de não-interatividade / saída estruturada do `agy` NÃO são públicas (13.10: sem
+# docs). Vazio até calibrar contra o binário — não se inventa `--output-format` que pode
+# não existir. Entra por TOML quando conhecido, sem recompilar.
+args = []
+
+# Entrega A2A faseada (CLAUDE.md §A2A): bracketed-paste -> submit_delay -> Enter (0x0D)
+# separado, em fila serial por terminal. Estratégia primária, igual aos demais terminais.
+delivery = "pty_inject"
+
+# ⚠️ Ponto de partida = o valor calibrado do claude-code (400ms). Calibrar contra o paste
+# real do `agy` (a margem certa entre colagem e Enter depende da TUI dele).
+submit_delay_ms = 400
+
+# Heurística "prompt pronto para input": linha começando com o glifo de prompt da TUI.
+# ⚠️ Ponto de partida = o regex do claude-code (cobre `>` e `❯`, glifos de prompt comuns).
+# Calibrar contra a TUI real do `agy` (se ele usar outro glifo/rodapé).
+prompt_ready_regex = '(?m)^\s*[>❯]\s'
+
+# Orçamento do wait_ready da entrega A2A. Timeout -> NÃO injeta (erro explícito; nunca
+# "injeta mesmo assim"). ⚠️ Ponto de partida = claude-code (30s); ajustar ao perfil de
+# latência real do `agy`.
+ready_timeout_ms = 30000
+
+# Marcadores de OCUPADO na região de input — se QUALQUER um casar, o alvo NÃO está pronto
+# mesmo com o glifo de prompt visível. ⚠️ Vazio: não temos grids REAIS do `agy` para
+# extrair os marcadores (o claude-code tem "esc to interrupt" etc. dos grids da baseline).
+# Vazio = só o prompt_ready_regex decide; calibrar com grids do `agy` real.
+busy_markers = []
+
+# Janela de quietude (ms) p/ idle e timeout do `ask` A2A. ⚠️ Pontos de partida do claude-code.
+idle_ms = 1500
+ask_timeout_ms = 120000
+
+# Onde o `agy` grava session-files (camada 3 de observabilidade — F1-1-2). A story F1-1-9
+# fixa o DIRETÓRIO: ~/.antigravity (distinto do ~/.gemini do Gemini CLI). ⚠️ O glob/extensão
+# internos (subdir, .jsonl?) NÃO são públicos — palpite conservador (mesma família do gemini,
+# formato jsonl). Watch degrada gracioso se não casar (sem session-file → só telemetria de
+# grid); calibrar contra ~/.antigravity real antes de confiar na camada 3.
+session_dir_pattern = "~/.antigravity/*/*.jsonl"
+
+# Assinaturas observáveis no grid — telemetria camada 4 (NUNCA decisória; ADR de detecção).
+# ⚠️ Vazio: não temos o banner/markers reais do `agy`. Preencher quando observado.
+output_markers = []
+
+# O que este CLI emite/suporta. Mapa ABERTO (invariante #3): capability nova entra por TOML.
+# HONESTIDADE (story "NÃO entra: assumir paridade de hooks/OTel com o Claude Code" — 13.10):
+# tudo declarado `false` EXPLICITAMENTE (ausente também seria false, mas o `false` explícito
+# documenta a DECISÃO, não a ignorância). Nenhum consumidor espera evento que o CLI não emite.
+[capabilities]
+hooks = false               # spike de `.agents/hooks.json` ADIADO (13.10 item 4; reavaliar ~fim jul/2026)
+otel = false                # sem docs públicas de OTel — não fingir paridade
+permission_detection = false # prompt de permissão do `agy` não caracterizado
+handoff_support = false     # envelope A2A v1.2 do Antigravity não é público (story "NÃO entra")
+
+# Teclas cruas de resposta a prompt de permissão y/n (ADR 0021 §1). ⚠️ DEFAULT CONSERVADOR:
+# não temos PTY real do `agy` para sondar a semântica do diálogo (o claude-code usa "1"/ESC
+# porque foi sondado em PTV REAL nesta máquina). Aqui ficamos no y\r / n\r até calibrar.
+[approval_keys]
+approve = "y\r"
+deny = "n\r"
+
+# Fim-de-resposta (consumido por W0-10). ⚠️ CONSERVADOR: sem `--output-format stream-json`
+# confirmado no `agy`, fim por QUIETUDE (janela de `idle_ms`). Trocar para stream_json/regex
+# quando o formato de saída do `agy` for conhecido — sem recompilar.
+[end_signal]
+kind = "idle"

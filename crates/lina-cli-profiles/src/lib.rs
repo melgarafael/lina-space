@@ -1135,4 +1135,101 @@ mod tests {
             "copilot não pode usar o pacote deprecado"
         );
     }
+
+    // ── F1-1-9: transição Gemini → Antigravity (perfis TOML novos) ──
+
+    /// Caminho de um profile na raiz `profiles/` do repo, robusto ao cwd (mesmo padrão
+    /// dos helpers `claude_code_path`/`profiles_dir` acima).
+    fn repo_profile(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../profiles")
+            .join(name)
+    }
+
+    /// Critério 4 da story: o TOML do Antigravity carrega, expõe os campos estendidos
+    /// (F1-1-1) e declara capabilities **honestas** — `hooks=false` (spike
+    /// `.agents/hooks.json` ADIADO, 13.10 item 4) e SEM fingir paridade de OTel /
+    /// permissão / handoff com o Claude Code (escopo "NÃO entra" da story).
+    #[test]
+    fn f1_1_9_antigravity_profile_loads_with_honest_capabilities() {
+        let agy = CliProfile::load_file(repo_profile("antigravity.toml"))
+            .expect("antigravity.toml deve parsear");
+
+        // id do profile = "antigravity"; o BINÁRIO é `agy` (KNOWN_CLIS), não `gemini` —
+        // `engines_from` casa o profile pelo `program == binário descoberto`.
+        assert_eq!(agy.id, "antigravity");
+        assert_eq!(agy.program, "agy");
+
+        // Entrega faseada (CLAUDE.md §A2A), como os demais CLIs de terminal.
+        assert_eq!(agy.delivery, Delivery::PtyInject);
+        assert!(!agy.prompt_ready_regex.trim().is_empty());
+
+        // Watch da camada 3 (F1-1-2) aponta para ~/.antigravity — distinto do ~/.gemini.
+        let sd = agy.session_dir_pattern.as_deref().unwrap_or_default();
+        assert!(
+            sd.contains("antigravity"),
+            "session_dir_pattern do Antigravity vive sob ~/.antigravity, foi {sd:?}"
+        );
+
+        // Capabilities honestas (story: "NÃO entra: assumir paridade de hooks/OTel").
+        assert!(
+            !agy.capabilities.has("hooks"),
+            "spike .agents/hooks.json ADIADO → hooks=false (ausente=false, não minta)"
+        );
+        assert!(
+            !agy.capabilities.has("otel"),
+            "sem docs públicas de OTel → não fingir paridade"
+        );
+        assert!(!agy.capabilities.has("permission_detection"));
+        assert!(!agy.capabilities.has("handoff_support"));
+
+        // approval_keys: default CONSERVADOR. Não se inventa "1"/ESC como no claude-code
+        // (aquilo veio de sonda REAL em PTY; aqui não temos o binário `agy` para calibrar).
+        assert_eq!(agy.approval_keys.approve, "y\r");
+        assert_eq!(agy.approval_keys.deny, "n\r");
+    }
+
+    /// Critério 4 (perfil Gemini transitional/EoL 18/jun/2026): carrega com a MESMA
+    /// postura conservadora; session-dir distinto (~/.gemini) e sem paridade fingida.
+    #[test]
+    fn f1_1_9_gemini_profile_loads_transitional_and_conservative() {
+        let gemini =
+            CliProfile::load_file(repo_profile("gemini.toml")).expect("gemini.toml deve parsear");
+
+        assert_eq!(gemini.id, "gemini");
+        assert_eq!(gemini.program, "gemini");
+        assert_eq!(gemini.delivery, Delivery::PtyInject);
+
+        let sd = gemini.session_dir_pattern.as_deref().unwrap_or_default();
+        assert!(
+            sd.contains("gemini"),
+            "session_dir_pattern do Gemini vive sob ~/.gemini, foi {sd:?}"
+        );
+        assert!(
+            !gemini.capabilities.has("hooks"),
+            "Gemini EoL: sem fingir paridade de hooks (.agents/hooks.json adiado)"
+        );
+        assert_eq!(gemini.approval_keys.approve, "y\r");
+        assert_eq!(gemini.approval_keys.deny, "n\r");
+    }
+
+    /// Âncora invariante #3 + critério 4: um TOML novo no diretório é SUFICIENTE para o
+    /// registry e o detector camada-1 conhecerem o CLI — zero lista compilada, sem recompilar.
+    #[test]
+    fn f1_1_9_new_profiles_are_discovered_without_recompile() {
+        let registry = ProfileRegistry::load_dir(profiles_dir()).expect("profiles/ carrega");
+        assert!(
+            registry.get("antigravity").is_some(),
+            "antigravity entra por TOML, sem recompilar (invariante #3)"
+        );
+        assert!(
+            registry.get("gemini").is_some(),
+            "gemini entra por TOML, sem recompilar (invariante #3)"
+        );
+        let detector = CliDetector::new(&registry);
+        assert!(
+            detector.detect_spawn("n1", "antigravity").is_ok(),
+            "detector camada-1 conhece o CLI novo só pelo profile carregado"
+        );
+    }
 }
