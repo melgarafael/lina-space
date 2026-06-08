@@ -69,6 +69,11 @@ pub struct NodeView {
     pub status: NodeStatus,
     pub x: f32,
     pub y: f32,
+    /// Rodada 360 (ADR 0022 §4): `true` = agente em pasta própria SEM o kit de integração
+    /// (sem consentimento no modal, ou kit recusado por arquivo pré-existente do usuário) —
+    /// o card pinta o badge "sem doutrina/observabilidade". NUNCA silencioso. Estado de UI
+    /// por sessão (não persistido; nós reconstruídos por replay nascem `false`).
+    pub kit_missing: bool,
 }
 
 impl NodeView {
@@ -79,6 +84,7 @@ impl NodeView {
             status: NodeStatus::Starting,
             x,
             y,
+            kit_missing: false,
         }
     }
 }
@@ -119,7 +125,9 @@ impl SharedModel {
     fn touch(&mut self) {
         self.generation = self.generation.wrapping_add(1);
     }
-    /// Insere um nó com nome/posição (o `main` semeia os 2 terminais).
+    /// Insere um nó com nome/posição. Rodada 360 (ADR 0022): produção semeia SÓ pelo funil
+    /// `admit_node` — este helper sobrevive para os testes headless montarem cenários.
+    #[cfg(test)]
     pub fn seed_node(&mut self, node: NodeId, view: NodeView) {
         self.nodes.entry(node).or_insert(view);
         if !self.order.contains(&node) {
@@ -2264,20 +2272,139 @@ impl BootstrapWriter {
             eprintln!("lina-gpui: bootstrap de {name} falhou: {e}");
         }
         // Instala a skill `lina-agent-bus` no cwd do terminal → A2A automático no turno 0
-        // (idempotente, best-effort com erro visível). Cobre A/B no boot (via `rewrite_all`) E os
-        // nós adicionados em runtime (write-before-spawn do `add_node`). Não duplica lógica.
+        // (idempotente, best-effort com erro visível). Cobre o boot (via `rewrite_bootstrap`) E os
+        // nós adicionados em runtime (write-before-spawn do funil de admissão). Não duplica lógica.
         install_agent_bus_skill(&dir);
     }
 
-    /// Reescreve os arquivos de TODOS os terminais `(key, name)` — o `roster` é o conjunto dos
-    /// nomes. Chamar a cada mudança de roster (add/remove/renomear). Erros de I/O são logados
-    /// (best-effort): o app não trava por causa do bootstrap.
-    pub fn rewrite_all(&self, terminals: &[(String, String)]) {
-        let roster: Vec<String> = terminals.iter().map(|(_, name)| name.clone()).collect();
-        for (key, name) in terminals {
-            self.write_one(key, name, &roster);
+    /// **Rodada 360 (ADR 0022 §4) — kit de integração na pasta REAL do usuário**, com escrita
+    /// MERGE-SAFE: um arquivo pré-existente que NÃO foi gerado pela Lina (sem o marcador) é
+    /// **recusado com aviso** — jamais sobrescrito. Os nossos próprios (marcados) são
+    /// reescritos normalmente a cada mudança de roster. `.lina/` e `.claude/skills/` são
+    /// namespace da Lina (aditivos, sempre escritos). Devolve o que foi recusado, para o
+    /// chamador degradar VISIVELMENTE (badge) — nunca silencioso.
+    pub fn write_user_dir(&self, dir: &Path, name: &str, roster: &[String]) -> KitOutcome {
+        let input = BootstrapInput::new(
+            name.to_string(),
+            roster.to_vec(),
+            self.effective_vault(),
+            self.autonomy,
+        );
+        let wiring = self.hooks.as_ref().map(|h| lina_bootstrap::HookWiring {
+            port: h.port(),
+            token: h.register(name),
+        });
+        let mut refused: Vec<String> = Vec::new();
+        let mut guarded =
+            |rel: &str, is_ours: &dyn Fn(&str) -> bool, content: String| match write_guarded(
+                &dir.join(rel),
+                is_ours,
+                &content,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "lina-gpui: {rel} pré-existente do usuário em {} — NÃO sobrescrevo \
+                         (kit parcial; o card mostra o aviso)",
+                        dir.display()
+                    );
+                    refused.push(rel.to_string());
+                }
+                Err(e) => {
+                    eprintln!("lina-gpui: escrever {rel} em {} falhou: {e}", dir.display());
+                    refused.push(rel.to_string());
+                }
+            };
+        // Doutrina (3 tiers): CARIMBADA com o marcador de máquina na 1ª linha; a posse é
+        // `starts_with` — um arquivo do usuário que apenas CITE a doutrina não vira nosso
+        // (red-team da rodada: `contains` do heading sobrescreveria citação).
+        let ours_md = |existing: &str| existing.starts_with(LINA_MANAGED_MARKER);
+        let stamped = |body: String| format!("{LINA_MANAGED_MARKER}\n{body}");
+        guarded(
+            "CLAUDE.md",
+            &ours_md,
+            stamped(self.bootstrapper.doctrine(&input)),
+        );
+        guarded(
+            "AGENTS.md",
+            &ours_md,
+            stamped(self.bootstrapper.agents_doctrine(&input)),
+        );
+        guarded(
+            "GEMINI.md",
+            &ours_md,
+            stamped(self.bootstrapper.gemini_doctrine(&input)),
+        );
+        // Settings/hooks (observabilidade + gate): JSON não carrega comentário-marcador —
+        // a posse é o comando de hook que só a Lina monta (`whoami --bootstrap`). Um
+        // settings DO USUÁRIO sem o nosso hook é preservado (recusa com aviso).
+        guarded(
+            ".claude/settings.json",
+            &|existing: &str| existing.contains(LINA_SETTINGS_MARKER),
+            lina_bootstrap::hook_settings_json_with_observability(&self.lina_bin, wiring.as_ref()),
+        );
+        // `.lina/bootstrap.json` é namespace da Lina — escrita direta (estado vivo do `lina whoami`).
+        let lina_dir = dir.join(".lina");
+        let json = serde_json::to_string_pretty(&input).unwrap_or_else(|_| String::from("{}"));
+        if let Err(e) = std::fs::create_dir_all(&lina_dir)
+            .and_then(|()| std::fs::write(lina_dir.join("bootstrap.json"), json))
+        {
+            eprintln!(
+                "lina-gpui: .lina/bootstrap.json em {} falhou: {e}",
+                dir.display()
+            );
+        }
+        // Skill A2A turno-0 — namespace `.claude/skills/` (idempotente, best-effort visível).
+        install_agent_bus_skill(dir);
+        if refused.is_empty() {
+            KitOutcome::Full
+        } else {
+            KitOutcome::Partial(refused)
         }
     }
+}
+
+/// Marcador de MÁQUINA carimbado na 1ª linha dos markdown que a Lina escreve em pasta do
+/// usuário (comentário HTML — invisível no render). A posse é `starts_with`: só um arquivo
+/// que COMEÇA com ele é nosso; citações do marcador/doutrina no corpo de um arquivo do
+/// usuário não transferem a posse.
+const LINA_MANAGED_MARKER: &str = "<!-- lina-space:gerado — a Lina reescreve este arquivo a \
+cada mudança de roster; edições manuais serão perdidas -->";
+/// Marcador do settings gerado pela Lina (o comando do hook `SessionStart` que só nós montamos;
+/// JSON não comporta comentário-marcador).
+const LINA_SETTINGS_MARKER: &str = "whoami --bootstrap";
+
+/// Resultado da entrega do kit de integração numa pasta do usuário (ADR 0022 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KitOutcome {
+    /// Tudo entregue (arquivos ausentes ou já nossos).
+    Full,
+    /// Estes arquivos pré-existentes do usuário foram PRESERVADOS (recusa com aviso).
+    Partial(Vec<String>),
+}
+
+/// Escrita guardada (merge-safe): grava `content` em `path` SÓ se o arquivo não existe ou se
+/// `is_ours(conteúdo atual)` (= foi a Lina que o gerou — o critério é do CHAMADOR, por tipo de
+/// arquivo). `Ok(false)` = pré-existente do usuário, preservado. Cria os diretórios-pai
+/// (ex.: `.claude/`).
+fn write_guarded(
+    path: &Path,
+    is_ours: &dyn Fn(&str) -> bool,
+    content: &str,
+) -> std::io::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(existing) if !is_ours(&existing) => return Ok(false),
+        // Nosso (critério do chamador) → segue para a escrita.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Existe mas não deu para ler (binário/permissão): trate como DO USUÁRIO — preserve.
+        Err(_) => return Ok(false),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(true)
 }
 
 /// **F1-2-3 p2 — decode PURO dos papéis custom** (testável headless): filtra os
@@ -2303,6 +2430,103 @@ fn role_templates_from_records(records: &[EventRecord]) -> Vec<crate::agent_moda
         .collect()
 }
 
+/// **Rodada 360 (ADR 0022 §4) — política de pasta de trabalho de uma admissão.**
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CwdPolicy {
+    /// Dir gerenciado `<ws_root>/t{seq}` — kit de integração completo, como sempre.
+    Managed,
+    /// Pasta REAL do usuário (picker do M6). `consent` = o usuário autorizou no modal a
+    /// Lina criar os arquivos de orquestração nela; sem consentimento o nó nasce com a
+    /// degradação VISÍVEL (badge "sem doutrina/observabilidade") — nunca silenciosa.
+    UserDir { path: PathBuf, consent: bool },
+}
+
+/// **Rodada 360 (ADR 0022 §1) — o PLANO de admissão**: a intenção "quero um terminal"
+/// normalizada. Os entry points são tradutores finos de intenção → este plano; quem o
+/// executa é SEMPRE o [`NodeManager::admit_node`]. Toda porta futura (API, CLI,
+/// inteligência da Lina) entra por aqui ou não entra.
+#[derive(Debug, Clone)]
+pub struct NodeAdmission {
+    /// `None` = nome automático "Terminal A/B/C…" derivado do seq alocado no funil (porta ⌘T).
+    pub name: Option<String>,
+    /// O papel canônico do nó — "terminal" também é papel (fim da classe dos 31-sem-papel).
+    pub role: String,
+    /// Motor escolhido no M6 (`None` = fábrica default `shell_cmd`).
+    pub engine: Option<AgentEngine>,
+    pub cwd: CwdPolicy,
+    /// Posição FIXA no canvas (porta seed/demo); `None` = próximo slot livre.
+    pub position: Option<(f64, f64)>,
+}
+
+impl NodeAdmission {
+    /// Porta ⌘T / botão +: terminal default, nome automático, dir gerenciado.
+    #[must_use]
+    pub fn default_terminal() -> Self {
+        Self {
+            name: None,
+            role: "terminal".into(),
+            engine: None,
+            cwd: CwdPolicy::Managed,
+            position: None,
+        }
+    }
+
+    /// Porta seed/demo: terminal NOMEADO em posição fixa do roteiro (LINA_DEMO).
+    #[must_use]
+    pub fn seeded_terminal(name: impl Into<String>, x: f64, y: f64) -> Self {
+        Self {
+            name: Some(name.into()),
+            role: "terminal".into(),
+            engine: None,
+            cwd: CwdPolicy::Managed,
+            position: Some((x, y)),
+        }
+    }
+}
+
+/// **A sequência CANÔNICA e COMPLETA de eventos de uma admissão (ADR 0022 §2)** — função
+/// PURA (testável headless; o teste de paridade das 3 portas assenta aqui): `NodeAdded` +
+/// `TerminalSpawned { cli, cwd REAL }` + `NodeRoleAssigned` SEMPRE + `CliProfileSet`
+/// quando o profile é conhecido. Qualquer porta de admissão produz EXATAMENTE isto,
+/// módulo parâmetros.
+fn admission_events(
+    node: NodeId,
+    x: f64,
+    y: f64,
+    name: &str,
+    role: &str,
+    engine: Option<&AgentEngine>,
+    cwd: Option<&Path>,
+) -> Vec<DomainEvent> {
+    let mut events = vec![
+        DomainEvent::NodeAdded {
+            node,
+            kind: "Terminal".into(),
+            x,
+            y,
+        },
+        DomainEvent::TerminalSpawned {
+            node,
+            // Rótulo do MOTOR quando escolhido no M6 ("Claude Code"); senão o nome (legado M2).
+            cli: engine.map_or_else(|| name.to_string(), |e| e.label.clone()),
+            // O binding node↔cwd persistido (§3): o cwd REAL do spawn. `None` SÓ quando o
+            // spawn herdou o cwd do app (bootstrap desligado) — degradação honesta, sem chute.
+            cwd: cwd.map(|p| p.display().to_string()),
+        },
+        DomainEvent::NodeRoleAssigned {
+            node,
+            role: role.to_string(),
+        },
+    ];
+    if let Some(pid) = engine.and_then(|e| e.profile_id.as_deref()) {
+        events.push(DomainEvent::CliProfileSet {
+            node,
+            profile: pid.to_string(),
+        });
+    }
+    events
+}
+
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
 /// (`PtyManager`, `Supervisor`, `EventStore`), a projeção (`SharedModel`) e os grids, e sabe
 /// ADICIONAR e REMOVER nós-terminal mantendo o **event log como fonte da verdade** (emite
@@ -2315,6 +2539,10 @@ pub struct NodeManager {
     pub model: Model,
     pub grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
     keys: Mutex<BTreeMap<NodeId, String>>,
+    /// Rodada 360 (ADR 0022 §4): a POLÍTICA de cwd de cada nó admitido — o `rewrite_bootstrap`
+    /// itera por ela (kit no cwd REAL para `UserDir` consentido; nada para não-consentido —
+    /// FIM do dir-fantasma `t{seq}`). Nó ausente do mapa (seeds legados de teste) = `Managed`.
+    cwds: Mutex<BTreeMap<NodeId, CwdPolicy>>,
     delta_tx: Sender<GridDelta>,
     cmd_factory: CmdFactory,
     cols: u16,
@@ -2351,6 +2579,7 @@ impl NodeManager {
             model,
             grids,
             keys: Mutex::new(keys),
+            cwds: Mutex::new(BTreeMap::new()),
             delta_tx,
             cmd_factory,
             cols,
@@ -2423,11 +2652,46 @@ impl NodeManager {
             .collect()
     }
 
+    /// Rodada 360: como [`Self::terminals_snapshot`], com a POLÍTICA de cwd de cada nó
+    /// (ausente do mapa = `Managed`, o comportamento histórico dos seeds).
+    fn terminals_snapshot_with_policy(&self) -> Vec<(String, String, CwdPolicy)> {
+        let keys = lock(&self.keys);
+        let cwds = lock(&self.cwds);
+        let m = lock(&self.model);
+        m.order
+            .iter()
+            .filter_map(|n| {
+                let k = keys.get(n)?;
+                let v = m.nodes.get(n)?;
+                let policy = cwds.get(n).cloned().unwrap_or(CwdPolicy::Managed);
+                Some((k.clone(), v.name.clone(), policy))
+            })
+            .collect()
+    }
+
     /// W3-2: reescreve o `CLAUDE.md`/estado de TODOS os terminais (o arquivo é a âncora a cada
     /// mudança de roster). No-op se o bootstrap não está configurado.
+    ///
+    /// Rodada 360 (ADR 0022 §4): itera o binding node→cwd-REAL — nó `UserDir` consentido recebe
+    /// o kit merge-safe NA PASTA DELE; não-consentido não recebe NADA (fim do dir-fantasma
+    /// `<ws_root>/t{seq}` órfão que ninguém lia). `Managed` segue o caminho histórico.
     pub fn rewrite_bootstrap(&self) {
-        if let Some(bw) = &self.bootstrap {
-            bw.rewrite_all(&self.terminals_snapshot());
+        let Some(bw) = &self.bootstrap else { return };
+        let snapshot = self.terminals_snapshot_with_policy();
+        // O roster lista TODOS os colegas (inclusive os sem kit — eles existem no time;
+        // o que lhes falta é a doutrina local, não a cidadania).
+        let roster: Vec<String> = snapshot.iter().map(|(_, n, _)| n.clone()).collect();
+        for (key, name, policy) in &snapshot {
+            match policy {
+                CwdPolicy::Managed => bw.write_one(key, name, &roster),
+                CwdPolicy::UserDir {
+                    path,
+                    consent: true,
+                } => {
+                    let _ = bw.write_user_dir(path, name, &roster);
+                }
+                CwdPolicy::UserDir { consent: false, .. } => {}
+            }
         }
     }
 
@@ -2596,49 +2860,188 @@ impl NodeManager {
     /// correlaciona node↔cwd↔sessão via `ProjectedNode.cwd`. Replay completo (snapshot + tail):
     /// o CHAMADOR cacheia por [`Self::store_event_count`] (padrão `refresh_cost_paused`) —
     /// não chame por frame.
-    // TODO(rodada-360/passo-7): #[allow] transitório — o consumidor (render_dashboard, Dev 03)
-    // liga nesta MESMA rodada e REMOVE os dois allows (bin-crate: pub sem chamador = dead_code).
-    #[allow(dead_code)]
     pub fn projected(&self) -> Option<ProjectedState> {
         lock(&self.store).project().ok()
     }
 
     /// `event_count` do log — chave de cache barata para consumidores de [`Self::projected`]
     /// (re-replay SÓ quando há evento novo).
-    #[allow(dead_code)]
     pub fn store_event_count(&self) -> Option<u64> {
         lock(&self.store).event_count().ok()
     }
 
+    /// **Porta ⌘T / botão + (tradutor fino — ADR 0022 §1).** Terminal default com nome
+    /// automático ("Terminal A/B/C…", derivado do seq DENTRO do funil). Toda a admissão —
+    /// eventos, kit, projeção, compensação — vive no [`Self::admit_node`].
     pub fn add_node(&self) -> Result<NodeId, String> {
+        self.admit_node(NodeAdmission::default_terminal())
+    }
+
+    /// **Porta ⌘N "Novo Agente" (tradutor fino — ADR 0022 §1).** Traduz o `CreatePlan` do
+    /// modal M6 em [`NodeAdmission`]: deriva o PAPEL do nome (role-discovery W3-1) salvo
+    /// `role_override`; `engine`/`cwd` viram plano. `kit_consent` = o usuário autorizou no
+    /// modal a Lina criar os arquivos de orquestração na pasta DELE (ADR 0022 §4) — sem
+    /// efeito quando `cwd = None` (pasta gerenciada sempre recebe o kit completo).
+    pub fn create_agent_with(
+        &self,
+        name: &str,
+        engine: Option<&AgentEngine>,
+        cwd: Option<&std::path::Path>,
+        role_override: Option<&str>,
+        kit_consent: bool,
+    ) -> Result<NodeId, String> {
+        let name = name.trim();
+        let role = match role_override.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => r.to_string(),
+            None => infer_agent_role(name),
+        };
+        self.admit_node(NodeAdmission {
+            name: Some(name.to_string()),
+            role,
+            engine: engine.cloned(),
+            cwd: match cwd {
+                Some(p) => CwdPolicy::UserDir {
+                    path: p.to_path_buf(),
+                    consent: kit_consent,
+                },
+                None => CwdPolicy::Managed,
+            },
+            position: None,
+        })
+    }
+
+    /// **O FUNIL ÚNICO de admissão (ADR 0022 §1) — o único lugar do app que transforma a
+    /// intenção "quero um terminal" em nó vivo.** Encapsula:
+    ///
+    /// - validação de nome + alocação de seq/key;
+    /// - política de cwd (§4): `Managed` = kit completo no dir gerenciado; `UserDir` = kit
+    ///   merge-safe no cwd REAL mediante consentimento, senão badge VISÍVEL (nunca silencioso);
+    /// - write-before-spawn + `wire_terminal`;
+    /// - a sequência CANÔNICA e COMPLETA de eventos (§2): `NodeAdded`, `TerminalSpawned`
+    ///   com o cwd REAL, `NodeRoleAssigned` SEMPRE ("terminal" também é papel) e
+    ///   `CliProfileSet` quando o profile é conhecido;
+    /// - persiste-antes-de-projetar com COMPENSAÇÃO em falha de append (§5): `retire_pty`
+    ///   (unregister + kill) — o nó nunca existe no roster vivo sem existir no log;
+    /// - projeção atômica (model/grids/keys/cwds) + rewrite do roster.
+    ///
+    /// Os entry points ([`Self::add_node`], [`Self::create_agent_with`], o seed do demo no
+    /// `main`) são tradutores finos de intenção → [`NodeAdmission`] — proibidos de apendar
+    /// eventos ou tocar o Supervisor diretamente.
+    pub fn admit_node(&self, plan: NodeAdmission) -> Result<NodeId, String> {
+        // 1) seq/key — a identidade local do PTY (o NodeId canônico nasce no register).
         let seq = {
             let mut s = lock(&self.seq);
             let v = *s;
             *s = s.wrapping_add(1);
             v
         };
-        let name = format!("Terminal {}", node_label(seq));
         let key = format!("t{seq}");
-        // W3-2: o terminal spawna no SEU cwd (<ws_root>/<key>), onde fica o CLAUDE.md dele.
-        let mut cmd = (*self.cmd_factory)(&name);
-        if let Some(dir) = self.ensure_cwd(&key) {
-            cmd = cmd.cwd(dir);
-            // write-before-spawn: a doutrina do nó NOVO é gravada ANTES do PTY subir (o shell já
-            // encontra o CLAUDE.md no cwd). Só o nó novo aqui — os existentes são atualizados no
-            // `rewrite_bootstrap()` ao final; se o spawn falhar, eles não viram um colega fantasma.
-            if let Some(bw) = &self.bootstrap {
-                let mut roster: Vec<String> = self
-                    .terminals_snapshot()
-                    .into_iter()
-                    .map(|(_, n)| n)
-                    .collect();
-                roster.push(name.clone());
-                bw.write_one(&key, &name, &roster);
+
+        // 2) Validação de nome (regra ÚNICA do funil — antes espalhada por entry point).
+        let name = match &plan.name {
+            Some(n) => {
+                let n = n.trim();
+                if n.is_empty()
+                    || n.chars().any(char::is_control)
+                    || n.contains("{{")
+                    || n.contains("}}")
+                {
+                    return Err(format!("nome de agente inválido: {n:?}"));
+                }
+                n.to_string()
             }
+            // Porta ⌘T: nome automático derivado do MESMO seq da key.
+            None => format!("Terminal {}", node_label(seq)),
+        };
+        let role = plan.role.trim().to_string();
+        if role.is_empty() || role.chars().any(char::is_control) {
+            return Err(format!("papel inválido: {role:?}"));
         }
 
-        // Slot calculado ANTES de o nó existir: imune ao placeholder (0,0) que o pump cria.
-        let (x, y) = next_free_slot(&lock(&self.model));
+        // 3) Comando: motor escolhido (M6) ou fábrica default — TODO nó nasce com `VIBE_ROLE`
+        //    no env ("terminal" também é papel; o agente sempre sabe o seu).
+        let mut cmd = match &plan.engine {
+            Some(e) => {
+                let mut c = PtyCommand::new(&e.program);
+                for a in &e.args {
+                    c = c.arg(a);
+                }
+                c
+            }
+            None => (*self.cmd_factory)(&name),
+        }
+        .env("VIBE_ROLE", &role);
+
+        // 4) Política de cwd (§4) + kit write-before-spawn (o shell já encontra o CLAUDE.md).
+        //    `cwd_real` é o que o `TerminalSpawned` persiste — o binding node↔cwd↔sessão (§3).
+        let mut kit_missing = false;
+        let cwd_real: Option<PathBuf> = match &plan.cwd {
+            CwdPolicy::Managed => {
+                let dir = self.ensure_cwd(&key);
+                if let Some(dir) = &dir {
+                    cmd = cmd.cwd(dir.clone());
+                    // Só o nó novo aqui — os existentes são atualizados no `rewrite_bootstrap()`
+                    // ao final; se o spawn falhar, eles não ganham um colega fantasma.
+                    if let Some(bw) = &self.bootstrap {
+                        let mut roster: Vec<String> = self
+                            .terminals_snapshot()
+                            .into_iter()
+                            .map(|(_, n)| n)
+                            .collect();
+                        roster.push(name.clone());
+                        bw.write_one(&key, &name, &roster);
+                    }
+                }
+                dir
+            }
+            CwdPolicy::UserDir { path, consent } => {
+                if let Err(e) = std::fs::create_dir_all(path) {
+                    return Err(format!("não consigo trabalhar nessa pasta: {e}"));
+                }
+                cmd = cmd.cwd(path.clone());
+                if *consent {
+                    match &self.bootstrap {
+                        Some(bw) => {
+                            let mut roster: Vec<String> = self
+                                .terminals_snapshot()
+                                .into_iter()
+                                .map(|(_, n)| n)
+                                .collect();
+                            roster.push(name.clone());
+                            // Kit no cwd REAL, merge-safe: arquivo pré-existente do usuário é
+                            // PRESERVADO (aviso + badge) — jamais sobrescrito (§4).
+                            if bw.write_user_dir(path, &name, &roster) != KitOutcome::Full {
+                                kit_missing = true;
+                            }
+                        }
+                        None => {
+                            // Consentiu mas o bootstrap do boot DEGRADOU → o kit não tem como
+                            // ser entregue. Badge liga do mesmo jeito — nunca silencioso (§4).
+                            kit_missing = true;
+                            eprintln!(
+                                "lina-gpui: agente '{name}' consentiu o kit, mas o bootstrap \
+                                 está desativado neste boot — sem doutrina/observabilidade"
+                            );
+                        }
+                    }
+                } else {
+                    // Sem consentimento → degradação VISÍVEL (badge no card), nunca silenciosa.
+                    kit_missing = true;
+                    eprintln!(
+                        "lina-gpui: agente '{name}' em pasta própria SEM kit de integração \
+                         (sem consentimento) — sem doutrina/observabilidade nesta pasta"
+                    );
+                }
+                Some(path.clone())
+            }
+        };
+
+        // 5) Slot calculado ANTES de o nó existir: imune ao placeholder (0,0) que o pump cria.
+        //    Posição FIXA só na porta seed/demo (roteiro determinístico).
+        let (x, y) = match plan.position {
+            Some((px, py)) => (px as f32, py as f32),
+            None => next_free_slot(&lock(&self.model)),
+        };
 
         let (node, grid) = {
             let mut p = lock(&self.pty);
@@ -2648,44 +3051,49 @@ impl NodeManager {
                 &self.delta_tx,
                 &key,
                 &name,
-                "terminal",
+                &role, // ← o papel entra no roster do Supervisor (agents.json / lina list)
                 cmd,
                 self.cols,
                 self.rows,
             )?
         };
 
-        // PERSISTE antes de tocar o model. Se falhar, desfaz o nó (sem ghost no model/log).
+        // 6) PERSISTE a sequência CANÔNICA (§2) antes de projetar — log = fonte da verdade.
+        //    Falha em QUALQUER append → compensação (§5): `retire_pty` desregistra do roster
+        //    vivo e mata o PTY — nada de nó no agents.json sem rastro no log.
+        let events = admission_events(
+            node,
+            f64::from(x),
+            f64::from(y),
+            &name,
+            &role,
+            plan.engine.as_ref(),
+            cwd_real.as_deref(),
+        );
         let count = {
             let mut s = lock(&self.store);
-            if let Err(e) = s.append(&DomainEvent::NodeAdded {
-                node,
-                kind: "Terminal".into(),
-                x: f64::from(x),
-                y: f64::from(y),
-            }) {
-                drop(s);
-                self.retire_pty(node, key);
-                return Err(e.to_string());
+            let mut appended = Ok(());
+            for ev in &events {
+                if let Err(e) = s.append(ev) {
+                    appended = Err(e.to_string());
+                    break;
+                }
             }
-            if let Err(e) = s.append(&DomainEvent::TerminalSpawned {
-                node,
-                cli: name.clone(),
-                // Rodada 360 (costura events.rs): mecânico — o dono do app liga o cwd real.
-                cwd: None,
-            }) {
+            if let Err(e) = appended {
                 drop(s);
                 self.retire_pty(node, key);
-                return Err(e.to_string());
+                return Err(e);
             }
             s.event_count().ok()
         };
 
-        // Projeção: INSERE sobrescrevendo qualquer placeholder do pump (corrida do Bus).
+        // 7) Projeção ATÔMICA: model (INSERE sobrescrevendo qualquer placeholder do pump) +
+        //    grids + keys + política de cwd (o `rewrite_bootstrap` itera por ela).
         {
             let mut m = lock(&self.model);
-            m.nodes
-                .insert(node, NodeView::new(name.clone(), NodeKind::Terminal, x, y));
+            let mut view = NodeView::new(name.clone(), NodeKind::Terminal, x, y);
+            view.kit_missing = kit_missing;
+            m.nodes.insert(node, view);
             if !m.order.contains(&node) {
                 m.order.push(node);
             }
@@ -2694,174 +3102,19 @@ impl NodeManager {
             }
             m.touch();
         }
-
         // Running (emite NodeStatus → o pump pinta o ponto de status do card).
         let _ = self.sup.set_status(node, CoreStatus::Running);
-
         lock(&self.grids).insert(node, grid);
         lock(&self.keys).insert(node, key);
-        // W3-2: roster mudou → reescreve os CLAUDE.md (o novo nó + os existentes ganham o colega).
-        self.rewrite_bootstrap();
-        Ok(node)
-    }
+        lock(&self.cwds).insert(node, plan.cwd.clone());
 
-    /// **W4-2 · M2 → F1-2-2 · M6 "Novo Agente" — cria um agente PELO NOME.** Deriva o PAPEL do nome
-    /// (role-discovery W3-1: "Revisor" → `reviewer`) salvo `role_override`, spawna um terminal com CLI
-    /// REAL **com `VIBE_ROLE` no env**, e **grava o papel** no roster (Supervisor) + no log
-    /// (`NodeRoleAssigned`) → visível em `lina list --json` e no Inspetor (P4). Mesma disciplina do
-    /// [`Self::add_node`]: persiste ANTES de projetar; falhou a persistência → desfaz o PTY
-    /// (`retire_pty`). Devolve o `NodeId` (p/ focar).
-    /// **F1-2-2 (M6)** — cria um agente com o MOTOR escolhido no modal e a
-    /// pasta de trabalho do usuário:
-    /// - `engine: Some` → spawna `program + args` do CLI Profile/descoberta (em vez do
-    ///   `cmd_factory` default) e, havendo `profile_id`, grava **`CliProfileSet`** no log
-    ///   (projeção `ProjectedNode.cli`). `TerminalSpawned.cli` recebe o RÓTULO do motor.
-    /// - `cwd: Some` → o terminal nasce na pasta escolhida (picker do M6). O `CLAUDE.md` do
-    ///   bootstrap **não** é escrito em pasta do usuário (só nos cwds gerenciados) — o turno-0
-    ///   doutrinado em pasta própria do usuário é assunto da F1-2-4/W3-2, não silencioso aqui.
-    /// - `role_override: Some` → o usuário ESCOLHEU o papel no modal ([Trocar]/galeria) — vale
-    ///   sobre o inferido pelo nome (a sugestão aceita coincide com o inferido; a troca não).
-    pub fn create_agent_with(
-        &self,
-        name: &str,
-        engine: Option<&AgentEngine>,
-        cwd: Option<&std::path::Path>,
-        role_override: Option<&str>,
-    ) -> Result<NodeId, String> {
-        let name = name.trim();
-        if name.is_empty()
-            || name.chars().any(char::is_control)
-            || name.contains("{{")
-            || name.contains("}}")
-        {
-            return Err(format!("nome de agente inválido: {name:?}"));
-        }
-        let role = match role_override.map(str::trim).filter(|r| !r.is_empty()) {
-            Some(r) => r.to_string(),
-            None => infer_agent_role(name),
-        };
-
-        let seq = {
-            let mut s = lock(&self.seq);
-            let v = *s;
-            *s = s.wrapping_add(1);
-            v
-        };
-        let key = format!("t{seq}");
-        // CLI real + cwd próprio (CLAUDE.md) + **VIBE_ROLE no env do PTY** (o agente sabe seu papel).
-        // Motor escolhido (M6) constrói o comando do profile/descoberta; sem motor, fábrica default.
-        let mut cmd = match engine {
-            Some(e) => {
-                let mut c = PtyCommand::new(&e.program);
-                for a in &e.args {
-                    c = c.arg(a);
-                }
-                c
-            }
-            None => (*self.cmd_factory)(name),
-        }
-        .env("VIBE_ROLE", &role);
-        if let Some(dir) = cwd {
-            // Pasta escolhida pelo usuário (M6): best-effort de existência; SEM CLAUDE.md aqui.
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                return Err(format!("não consigo trabalhar nessa pasta: {e}"));
-            }
-            cmd = cmd.cwd(dir.to_path_buf());
-        } else if let Some(dir) = self.ensure_cwd(&key) {
-            cmd = cmd.cwd(dir);
-            if let Some(bw) = &self.bootstrap {
-                let mut roster: Vec<String> = self
-                    .terminals_snapshot()
-                    .into_iter()
-                    .map(|(_, n)| n)
-                    .collect();
-                roster.push(name.to_string());
-                bw.write_one(&key, name, &roster);
-            }
-        }
-
-        let (x, y) = next_free_slot(&lock(&self.model));
-        let (node, grid) = {
-            let mut p = lock(&self.pty);
-            wire_terminal(
-                &mut p,
-                &self.sup,
-                &self.delta_tx,
-                &key,
-                name,
-                &role, // ← o papel derivado entra no roster do Supervisor
-                cmd,
-                self.cols,
-                self.rows,
-            )?
-        };
-
-        // PERSISTE (log = fonte da verdade) ANTES de projetar: NodeAdded + TerminalSpawned + o PAPEL.
-        let count = {
-            let mut s = lock(&self.store);
-            if let Err(e) = s.append(&DomainEvent::NodeAdded {
-                node,
-                kind: "Terminal".into(),
-                x: f64::from(x),
-                y: f64::from(y),
-            }) {
-                drop(s);
-                self.retire_pty(node, key);
-                return Err(e.to_string());
-            }
-            if let Err(e) = s.append(&DomainEvent::TerminalSpawned {
-                node,
-                // Rótulo do MOTOR quando escolhido no M6 ("Claude Code"); senão o nome (M2, legado).
-                cli: engine.map_or_else(|| name.to_string(), |e| e.label.clone()),
-                // Rodada 360 (costura events.rs): mecânico — o dono do app liga o cwd real.
-                cwd: None,
-            }) {
-                drop(s);
-                self.retire_pty(node, key);
-                return Err(e.to_string());
-            }
-            // O PAPEL gravado no log (projeção `ProjectedNode.role`; sobrevive a replay/crash).
-            if let Err(e) = s.append(&DomainEvent::NodeRoleAssigned {
-                node,
-                role: role.clone(),
-            }) {
-                drop(s);
-                self.retire_pty(node, key);
-                return Err(e.to_string());
-            }
-            // F1-2-2: motor com CLI Profile → `CliProfileSet` (projeção `ProjectedNode.cli`;
-            // o Inspetor P4 e o `lina list --json` enxergam o profile do nó).
-            if let Some(pid) = engine.and_then(|e| e.profile_id.as_deref()) {
-                if let Err(e) = s.append(&DomainEvent::CliProfileSet {
-                    node,
-                    profile: pid.to_string(),
-                }) {
-                    drop(s);
-                    self.retire_pty(node, key);
-                    return Err(e.to_string());
-                }
-            }
-            s.event_count().ok()
-        };
-
-        {
-            let mut m = lock(&self.model);
-            m.nodes
-                .insert(node, NodeView::new(name, NodeKind::Terminal, x, y));
-            if !m.order.contains(&node) {
-                m.order.push(node);
-            }
-            if let Some(c) = count {
-                m.event_count = c;
-            }
-            m.touch();
-        }
-        let _ = self.sup.set_status(node, CoreStatus::Running);
-        lock(&self.grids).insert(node, grid);
-        lock(&self.keys).insert(node, key);
+        // 8) Roster mudou → reescreve as doutrinas (os existentes ganham o colega novo).
         self.rewrite_bootstrap();
         eprintln!(
-            "lina-gpui: M2 — agente '{name}' criado (papel {role}, VIBE_ROLE no env). node {node}"
+            "lina-gpui: admissão — agente '{name}' criado (papel {role}, cwd {}). node {node}",
+            cwd_real
+                .as_deref()
+                .map_or_else(|| "herdado".to_string(), |p| p.display().to_string())
         );
         Ok(node)
     }
@@ -2899,6 +3152,7 @@ impl NodeManager {
         }
         lock(&self.grids).remove(&node);
         lock(&self.keys).remove(&node);
+        lock(&self.cwds).remove(&node);
 
         // Encerra o PTY em background (não bloqueia o thread de UI por até 2s) — SÓ se houver (um
         // nó-artefato Note/Folder não tem PTY).
@@ -4431,8 +4685,10 @@ mod tests {
     }
 
     /// **GATE de ADD (headless, determinístico):** `add_node` sobe a contagem 2→3, dá um grid
-    /// ao novo nó, persiste NodeAdded+TerminalSpawned, e o event log RECONSTRÓI o novo nó
-    /// (`project()`) — provando "todo nó é shell real + o log é a fonte da verdade".
+    /// ao novo nó, persiste a sequência CANÔNICA (ADR 0022 §2: NodeAdded + TerminalSpawned +
+    /// NodeRoleAssigned — "terminal" também é papel, fim da classe dos 31-sem-papel), e o
+    /// event log RECONSTRÓI o novo nó COM papel (`project()`) — "todo nó é shell real + o
+    /// log é a fonte da verdade".
     #[test]
     fn add_node_grows_count_persists_and_reconstructs() {
         let (nm, store, model) = test_manager("add", None);
@@ -4456,13 +4712,18 @@ mod tests {
         );
         assert_eq!(
             lock(&store).event_count().expect("count"),
-            before + 2,
-            "persiste NodeAdded + TerminalSpawned"
+            before + 3,
+            "persiste a sequência canônica: NodeAdded + TerminalSpawned + NodeRoleAssigned"
         );
         let projected = lock(&store).project().expect("project");
         assert!(
             projected.nodes.contains_key(&id),
             "o event log reconstrói o novo nó (fonte da verdade)"
+        );
+        assert_eq!(
+            projected.nodes.get(&id).and_then(|n| n.role.clone()),
+            Some("terminal".to_string()),
+            "⌘T também grava papel no log (ADR 0022 §2 — nunca mais nó-órfão de papel)"
         );
     }
 
@@ -4696,7 +4957,7 @@ mod tests {
         assert_eq!(lock(&model).order.len(), 2, "começa com 2 nós");
 
         let id = nm
-            .create_agent_with("Revisor", None, None, None)
+            .create_agent_with("Revisor", None, None, None, false)
             .expect("M2/M6 cria o agente");
         assert_eq!(lock(&model).order.len(), 3, "o agente entra no canvas");
         assert!(
@@ -4724,11 +4985,12 @@ mod tests {
 
         // Nome inválido → recusado, canvas inalterado.
         assert!(
-            nm.create_agent_with("  ", None, None, None).is_err(),
+            nm.create_agent_with("  ", None, None, None, false).is_err(),
             "nome vazio recusado"
         );
         assert!(
-            nm.create_agent_with("a{{b}}", None, None, None).is_err(),
+            nm.create_agent_with("a{{b}}", None, None, None, false)
+                .is_err(),
             "nome com sentinela recusado"
         );
         assert_eq!(lock(&model).order.len(), 3, "recusas não criam nó");
@@ -5760,5 +6022,321 @@ mod tests {
         assert_eq!(got[0].name, "Só Nome");
         assert_eq!(got[0].description, "", "ausente → default vazio");
         assert_eq!(got[1].name, "", "payload vazio não quebra");
+    }
+
+    // ─────────────── Rodada 360 (ADR 0022) · admissão canônica de nó ───────────────
+
+    /// Os KINDS dos eventos apendados no store DEPOIS de `mark` (na ordem do log).
+    fn kinds_since(store: &Arc<Mutex<EventStore>>, mark: usize) -> Vec<String> {
+        lock(store)
+            .events()
+            .expect("eventos")
+            .into_iter()
+            .skip(mark)
+            .map(|r| r.kind)
+            .collect()
+    }
+
+    /// **TESTE DE PARIDADE (ADR 0022 §2):** as TRÊS portas de admissão — ⌘T (`add_node`),
+    /// ⌘N (`create_agent_with`) e seed/demo (`admit_node(seeded_terminal)`) — produzem a
+    /// MESMA sequência canônica de eventos módulo parâmetros: `NodeAdded` +
+    /// `TerminalSpawned{cwd REAL}` + `NodeRoleAssigned`; `CliProfileSet` entra QUANDO o
+    /// profile é conhecido. Fim das três portarias com fichas diferentes.
+    #[test]
+    fn admissao_paridade_tres_portas_mesma_sequencia() {
+        let ws = std::env::temp_dir().join(format!("lina-paridade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, store, _model) = test_manager("paridade", Some(bw));
+        let canonical = ["NodeAdded", "TerminalSpawned", "NodeRoleAssigned"];
+
+        // Porta 1 — ⌘T / botão +.
+        let mark = lock(&store).events().expect("eventos").len();
+        let t = nm.add_node().expect("⌘T");
+        let seq_t = kinds_since(&store, mark);
+        assert_eq!(seq_t, canonical, "⌘T emite a sequência canônica");
+
+        // Porta 2 — ⌘N sem motor (M2 legado).
+        let mark = lock(&store).events().expect("eventos").len();
+        let n = nm
+            .create_agent_with("Revisor", None, None, None, false)
+            .expect("⌘N");
+        assert_eq!(
+            kinds_since(&store, mark),
+            seq_t,
+            "⌘N (sem profile) = MESMA sequência do ⌘T, módulo parâmetros"
+        );
+
+        // Porta 3 — seed/demo (posição fixa do roteiro).
+        let mark = lock(&store).events().expect("eventos").len();
+        let s = nm
+            .admit_node(NodeAdmission::seeded_terminal("Terminal Demo", 30.0, 96.0))
+            .expect("seed");
+        assert_eq!(
+            kinds_since(&store, mark),
+            seq_t,
+            "seed/demo = MESMA sequência, módulo parâmetros"
+        );
+        // Payloads do seed (não só os kinds): papel "terminal" e a posição FIXA do roteiro.
+        let seed_events: Vec<_> = lock(&store)
+            .events()
+            .expect("eventos")
+            .into_iter()
+            .skip(mark)
+            .collect();
+        assert!(
+            seed_events
+                .iter()
+                .any(|r| r.kind == "NodeRoleAssigned" && r.payload["role"] == "terminal"),
+            "seed grava o papel 'terminal' (também é papel — ADR 0022 §2)"
+        );
+        assert!(
+            seed_events
+                .iter()
+                .any(|r| r.kind == "NodeAdded" && r.payload["x"] == 30.0 && r.payload["y"] == 96.0),
+            "seed preserva a posição fixa do roteiro"
+        );
+
+        // ⌘N com MOTOR de profile conhecido → a sequência ganha `CliProfileSet` no fim.
+        let mark = lock(&store).events().expect("eventos").len();
+        let engine = AgentEngine {
+            program: "cat".to_string(),
+            args: vec![],
+            profile_id: Some("claude-code".to_string()),
+            label: "Claude Code".to_string(),
+        };
+        let e = nm
+            .create_agent_with("Motorizado", Some(&engine), None, None, false)
+            .expect("⌘N com motor");
+        assert_eq!(
+            kinds_since(&store, mark),
+            [
+                "NodeAdded",
+                "TerminalSpawned",
+                "NodeRoleAssigned",
+                "CliProfileSet"
+            ],
+            "profile conhecido → CliProfileSet SEMPRE que houver"
+        );
+        // Payloads do motor: o RÓTULO no TerminalSpawned.cli e o id no CliProfileSet.
+        let engine_events: Vec<_> = lock(&store)
+            .events()
+            .expect("eventos")
+            .into_iter()
+            .skip(mark)
+            .collect();
+        assert!(
+            engine_events
+                .iter()
+                .any(|r| r.kind == "TerminalSpawned" && r.payload["cli"] == "Claude Code"),
+            "motor escolhido → TerminalSpawned.cli leva o RÓTULO"
+        );
+        assert!(
+            engine_events
+                .iter()
+                .any(|r| r.kind == "CliProfileSet" && r.payload["profile"] == "claude-code"),
+            "CliProfileSet leva o id do profile"
+        );
+
+        // O binding node↔cwd (§3): TODA porta persistiu o cwd REAL do spawn na projeção.
+        let projected = lock(&store).project().expect("project");
+        for (id, key) in [(t, "t2"), (n, "t3"), (s, "t4"), (e, "t5")] {
+            assert_eq!(
+                projected.nodes.get(&id).and_then(|nd| nd.cwd.clone()),
+                Some(ws.join(key).display().to_string()),
+                "cwd REAL persistido p/ {key}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// **COMPENSAÇÃO (ADR 0022 §5):** o NodeId nasce no `register` (antes do append), então
+    /// uma FALHA de persistência compensa com `retire_pty` (unregister + kill) — o nó NUNCA
+    /// fica no roster vivo (Supervisor → agents.json) nem no model sem existir no log.
+    /// Falha forçada: o espelho `log.jsonl` vira DIRETÓRIO → todo append erra em I/O.
+    /// (A atomicidade SQLite↔JSONL dentro do store é assunto do core, não deste funil.)
+    #[test]
+    fn falha_de_append_compensa_e_nada_fica_no_roster() {
+        let dir = std::env::temp_dir().join(format!("lina-compensa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("open store")));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let cmd_factory: CmdFactory = Arc::new(|_n: &str| PtyCommand::new("cat"));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let nm = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            Arc::clone(&grids),
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            cmd_factory,
+            None,
+            dir.join(".lina"),
+        );
+
+        // Sabotagem determinística do espelho: `log.jsonl` vira diretório → append falha.
+        let jsonl = dir.join("log.jsonl");
+        let _ = std::fs::remove_file(&jsonl);
+        std::fs::create_dir_all(&jsonl).expect("log.jsonl como dir");
+
+        let before_roster = sup.list().len();
+        let result = nm.add_node();
+
+        assert!(result.is_err(), "append falhou → admissão devolve Err");
+        assert_eq!(
+            sup.list().len(),
+            before_roster,
+            "COMPENSAÇÃO: o nó foi DESREGISTRADO do roster vivo (nada no agents.json)"
+        );
+        assert!(lock(&model).order.is_empty(), "nada projetado no model");
+        assert!(lock(&grids).is_empty(), "nenhum grid registrado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **UserDir SEM consentimento (ADR 0022 §4):** o agente nasce na pasta do usuário SEM
+    /// nenhum arquivo escrito nela (a Lina não toca a pasta sem o toque no modal), com a
+    /// degradação VISÍVEL (`kit_missing` → badge no card) — e SEM o dir-fantasma
+    /// `<ws_root>/t{seq}` órfão (nem na admissão, nem no rewrite de roster).
+    #[test]
+    fn userdir_sem_consentimento_degrada_visivel_sem_dir_fantasma() {
+        let ws = std::env::temp_dir().join(format!("lina-noconsent-{}", std::process::id()));
+        let user = std::env::temp_dir().join(format!("lina-userdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&user);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, store, model) = test_manager("noconsent", Some(bw));
+
+        let id = nm
+            .create_agent_with("Free Lancer", None, Some(&user), None, false)
+            .expect("⌘N pasta própria sem consentimento");
+
+        assert!(
+            !user.join("CLAUDE.md").exists() && !user.join(".claude").exists(),
+            "SEM consentimento a Lina não escreve NADA na pasta do usuário"
+        );
+        assert!(
+            lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
+            "degradação VISÍVEL: kit_missing liga o badge no card"
+        );
+        // Fim do dir-fantasma: o seq deste nó é 2 (seeds A/B = 0/1 no test_manager).
+        assert!(
+            !ws.join("t2").exists(),
+            "nenhum <ws_root>/t2 órfão criado na admissão"
+        );
+        nm.rewrite_bootstrap();
+        assert!(
+            !ws.join("t2").exists(),
+            "o rewrite de roster também NÃO cria o dir-fantasma"
+        );
+        // O binding node↔cwd persiste a pasta REAL (correlação custo/sessão futura).
+        let projected = lock(&store).project().expect("project");
+        assert_eq!(
+            projected.nodes.get(&id).and_then(|n| n.cwd.clone()),
+            Some(user.display().to_string()),
+            "TerminalSpawned.cwd = pasta REAL do usuário"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// **UserDir COM consentimento + merge-safe (ADR 0022 §4):** (a) numa pasta com
+    /// `CLAUDE.md` PRÓPRIO do usuário, o kit entra SEM tocá-lo (recusa com aviso → badge),
+    /// mas settings/skill (aditivos) entram; (b) numa pasta limpa, o kit COMPLETO entra
+    /// (doutrina marcada + settings com hook da Lina) e o nó nasce SEM badge; o rewrite
+    /// de roster REESCREVE o nosso (marcado) sem virar recusa.
+    #[test]
+    fn userdir_consentido_kit_merge_safe_jamais_sobrescreve_usuario() {
+        let ws = std::env::temp_dir().join(format!("lina-consent-{}", std::process::id()));
+        let user_a = std::env::temp_dir().join(format!("lina-consent-a-{}", std::process::id()));
+        let user_b = std::env::temp_dir().join(format!("lina-consent-b-{}", std::process::id()));
+        for d in [&ws, &user_a, &user_b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, _store, model) = test_manager("consent", Some(bw));
+
+        // (a) CLAUDE.md PRÉ-EXISTENTE do usuário — jamais sobrescrito.
+        std::fs::create_dir_all(&user_a).expect("user_a");
+        // O arquivo do usuário até CITA a doutrina da Lina no corpo (red-team da rodada):
+        // citação NÃO transfere posse — só o marcador de máquina na 1ª linha transferiria.
+        let user_doctrine =
+            "# Meu projeto\n\nRegras minhas.\n\n> citando: # Você está no Lina Space\n";
+        std::fs::write(user_a.join("CLAUDE.md"), user_doctrine).expect("CLAUDE.md do usuário");
+        let a = nm
+            .create_agent_with("Convidado", None, Some(&user_a), None, true)
+            .expect("⌘N consentido");
+        assert_eq!(
+            std::fs::read_to_string(user_a.join("CLAUDE.md")).expect("re-read"),
+            user_doctrine,
+            "o CLAUDE.md do usuário fica BYTE-IDÊNTICO (recusa, nunca overwrite)"
+        );
+        assert!(
+            user_a.join(".claude").join("settings.json").exists(),
+            "settings (aditivo, ausente antes) entra mesmo com a doutrina recusada"
+        );
+        assert!(
+            lock(&model).nodes.get(&a).is_some_and(|v| v.kit_missing),
+            "kit PARCIAL → badge avisa (nunca silencioso)"
+        );
+
+        // (b) pasta LIMPA → kit completo, sem badge; rewrite re-escreve o NOSSO arquivo.
+        let b = nm
+            .create_agent_with("Anfitrião", None, Some(&user_b), None, true)
+            .expect("⌘N consentido, pasta limpa");
+        let written = std::fs::read_to_string(user_b.join("CLAUDE.md")).expect("kit escrito");
+        assert!(
+            written.starts_with("<!-- lina-space:gerado"),
+            "doutrina NOSSA nasce CARIMBADA com o marcador de máquina na 1ª linha"
+        );
+        assert!(
+            written.contains("# Você está no Lina Space"),
+            "o corpo é a doutrina canônica do template"
+        );
+        let settings =
+            std::fs::read_to_string(user_b.join(".claude").join("settings.json")).expect("hooks");
+        assert!(
+            settings.contains("whoami --bootstrap"),
+            "settings com o hook da Lina (observabilidade ligada)"
+        );
+        assert!(
+            lock(&model).nodes.get(&b).is_some_and(|v| !v.kit_missing),
+            "kit completo → sem badge"
+        );
+        // Rewrite de roster: o NOSSO CLAUDE.md (marcado) é re-escrito (roster muda), não recusado.
+        nm.rename_node(b, "Anfitrião Renomeado").expect("rename");
+        let rewritten = std::fs::read_to_string(user_b.join("CLAUDE.md")).expect("re-read");
+        assert!(
+            rewritten.contains("Anfitrião Renomeado"),
+            "merge-safe re-escreve o arquivo NOSSO a cada mudança de roster"
+        );
+        for d in [&ws, &user_a, &user_b] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

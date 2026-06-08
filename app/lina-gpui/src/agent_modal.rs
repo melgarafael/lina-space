@@ -85,6 +85,15 @@ pub fn copy_tpl_dup_name(label: &str) -> String {
 pub const COPY_CWD_LABEL: &str = "Pasta de trabalho";
 pub const COPY_CWD_DEFAULT: &str = "a pasta deste Espaço";
 pub const COPY_CWD_PICK: &str = "Trocar…";
+// Rodada 360 (ADR 0022 §4) — consentimento do kit em pasta própria. RASCUNHO: o texto
+// final passa pelo fundador no gate (escrever na pasta do usuário é decisão de produto).
+pub const COPY_CONSENT_LABEL: &str = "Deixar a Lina preparar esta pasta para o time";
+pub const COPY_CONSENT_DETAIL: &str =
+    "Cria arquivos de orientação (como o CLAUDE.md) que apresentam os colegas ao agente e \
+     ligam o acompanhamento de atividade. Um arquivo que já for seu nunca é alterado.";
+pub const COPY_CONSENT_OFF_WARN: &str =
+    "Sem isso, o agente não conhece o time e não aparece no acompanhamento — o card dele \
+     mostra um aviso.";
 pub const COPY_ADVANCED: &str = "▸ Avançado";
 pub const COPY_ADVANCED_OPEN: &str = "▾ Avançado";
 pub const COPY_CMD_LABEL: &str = "Comando do motor (modo técnico)";
@@ -730,6 +739,10 @@ pub struct CreatePlan {
     pub cwd: Option<PathBuf>,
     /// Papel CANÔNICO escolhido/aceito (None = inferir do nome, comportamento M2).
     pub role: Option<String>,
+    /// Rodada 360 (ADR 0022 §4): o usuário AUTORIZOU a Lina a criar os arquivos de
+    /// orquestração na pasta própria escolhida. Só tem efeito com `cwd: Some` — sem
+    /// consentimento o agente nasce com o badge "sem doutrina/observabilidade".
+    pub kit_consent: bool,
 }
 
 /// O plano de SALVAR do modo edição (M6-E): aplica nome/papel agora; motor fica p/ F1-2-4.
@@ -757,6 +770,9 @@ pub struct AgentModal {
     selected_engine: usize,
     /// Pasta escolhida (None = default leigo "a pasta deste Espaço").
     cwd: Option<PathBuf>,
+    /// Rodada 360 (ADR 0022 §4): consentimento p/ a Lina criar os arquivos de orquestração
+    /// na pasta própria. Opt-in EXPLÍCITO (nasce `false`); irrelevante com `cwd: None`.
+    kit_consent: bool,
     advanced: bool,
     /// Override do comando (Avançado). None = derivado do motor selecionado.
     command: Option<String>,
@@ -792,6 +808,7 @@ impl AgentModal {
             engines: EngineScan::Scanning,
             selected_engine: 0,
             cwd: None,
+            kit_consent: false,
             advanced: false,
             command: None,
             focus: FocusField::Name,
@@ -1173,6 +1190,24 @@ impl AgentModal {
         self.cwd = Some(p);
     }
 
+    /// Rodada 360 (ADR 0022 §4): há pasta PRÓPRIA escolhida? (gate da linha de consentimento —
+    /// a pasta gerenciada do Espaço sempre recebe o kit, sem pergunta).
+    #[must_use]
+    pub fn user_cwd_chosen(&self) -> bool {
+        self.cwd.is_some()
+    }
+
+    /// Consentimento corrente do kit de integração (opt-in explícito; nasce desligado).
+    #[must_use]
+    pub fn kit_consent(&self) -> bool {
+        self.kit_consent
+    }
+
+    /// Liga/desliga o consentimento do kit (clique na linha do modal).
+    pub fn toggle_kit_consent(&mut self) {
+        self.kit_consent = !self.kit_consent;
+    }
+
     /// Esc: com conteúdo digitado, ARMA a confirmação («Descartar este Agente?»); sem conteúdo
     /// (ou já armado), devolve `true` = fechar agora. (Mapa de cliques #11.)
     pub fn escape(&mut self) -> bool {
@@ -1218,6 +1253,7 @@ impl AgentModal {
             },
             cwd: self.cwd.clone(),
             role: self.role.as_ref().map(|r| r.role.clone()),
+            kit_consent: self.kit_consent,
         })
     }
 
@@ -1881,6 +1917,44 @@ pub fn render(
             ),
     );
 
+    // ── Consentimento do kit (ADR 0022 §4) — SÓ com pasta própria escolhida; a pasta
+    //    gerenciada do Espaço sempre recebe o kit, sem pergunta. Opt-in explícito: a Lina
+    //    nunca escreve na pasta do usuário sem este toque; recusado → o card avisa.
+    if !is_edit && modal.user_cwd_chosen() {
+        let on = modal.kit_consent();
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .id("m6-kit-consent")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_color(rgb(th.text.primary))
+                        .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                            v.modal_toggle_kit_consent(cx);
+                        }))
+                        .child(text!(if on { "☑" } else { "☐" }))
+                        .child(text!(COPY_CONSENT_LABEL)),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(if on { th.text.muted } else { th.state.warning }))
+                        .child(text!(if on {
+                            COPY_CONSENT_DETAIL
+                        } else {
+                            COPY_CONSENT_OFF_WARN
+                        })),
+                ),
+        );
+    }
+
     // ── ▸ Avançado (divulgação progressiva — o comando NUNCA é controle primário) ──
     col = col.child(
         div()
@@ -2394,6 +2468,32 @@ mod tests {
             args: vec!["--flag".into()],
             profile_id: Some("claude-code".into()),
         }]
+    }
+
+    /// Rodada 360 (ADR 0022 §4): o consentimento do kit é OPT-IN explícito — nasce
+    /// desligado, o toggle liga, e o `CreatePlan` carrega o valor para o funil de admissão.
+    #[test]
+    fn kit_consent_explicit_optin_flows_into_plan() {
+        let mut m = modal();
+        type_str(&mut m, "Free Lancer");
+        m.set_engines(engines_one());
+        assert!(
+            !m.user_cwd_chosen(),
+            "sem pasta própria, a linha nem aparece"
+        );
+        m.set_cwd(PathBuf::from("/tmp/projeto-do-usuario"));
+        assert!(m.user_cwd_chosen());
+        assert!(!m.kit_consent(), "opt-in explícito: nasce DESLIGADO");
+        let plan = m.create_plan().expect("plano");
+        assert!(
+            !plan.kit_consent,
+            "sem toque, o plano vai sem consentimento"
+        );
+
+        m.toggle_kit_consent();
+        assert!(m.kit_consent());
+        let plan = m.create_plan().expect("plano consentido");
+        assert!(plan.kit_consent, "o toggle do modal chega ao plano");
     }
 
     /// M6-E2: o co-piloto dispara na PAUSA (~600ms = SUGGEST_DEBOUNCE_TICKS), nunca a cada tecla.

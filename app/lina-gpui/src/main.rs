@@ -60,10 +60,7 @@ use gpui::{
 };
 use gpui_platform::application;
 
-use lina_core::{
-    build_paste, DomainEvent, EventStore, NodeStatus as CoreStatus, PtyManager, Supervisor, VtRgb,
-    VtScreen,
-};
+use lina_core::{build_paste, DomainEvent, EventStore, PtyManager, Supervisor, VtRgb, VtScreen};
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
 use lina_bootstrap::Autonomy;
@@ -71,9 +68,9 @@ use lina_bootstrap::Autonomy;
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
     normalize_sel, screen_to_cell, scrub_foreign_orchestrator_env, scrub_pty_secret_env, shell_cmd,
-    spawn_pump, wire_terminal, A2aTrigger, AttentionHub, BootstrapWriter, BrokerPump, Camera,
-    CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model,
-    NodeManager, NodeView, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    spawn_pump, A2aTrigger, AttentionHub, BootstrapWriter, BrokerPump, Camera, CmdFactory,
+    CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model, NodeAdmission,
+    NodeManager, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -899,20 +896,22 @@ impl WorkspaceView {
             .unwrap_or(0);
         let today = dashboard::utc_day_prefix(now_ms);
         let sessions = lock(&self.dash.sessions).clone();
-        let total = dashboard::workspace_cost_today(&sessions, &self.dash.ws_root, &today);
         let engine = dashboard::EngineBadge::from_cli(Some(&self.dash.cli_id));
 
-        // Linhas por terminal: nome + estado canônico + atividade da timeline.
+        // Linhas por terminal: nome + estado canônico (VIVO, do pump — o log não persiste
+        // toda transição) + atividade da timeline. O custo POR NÓ entra abaixo, dos cards.
         struct Row {
+            node: NodeId,
             name: String,
             state: dashboard::UiState,
             activity: String,
         }
         let mut rows: Vec<Row> = Vec::new();
+        let mut activities: BTreeMap<NodeId, crate::inspector::Activity> = BTreeMap::new();
         {
             let tl = lock(&self.dash.timeline);
             let model = lock(&self.nodes.model);
-            for view in model.nodes.values() {
+            for (node, view) in model.nodes.iter() {
                 if !matches!(view.kind, NodeKind::Terminal) {
                     continue;
                 }
@@ -930,7 +929,14 @@ impl WorkspaceView {
                     Some(status_str),
                     view.status == NodeStatus::Crashed,
                 );
-                let activity = match tl.activity(&view.name, now_ms) {
+                let live = tl.activity(&view.name, now_ms);
+                activities.insert(
+                    *node,
+                    live.as_ref()
+                        .map(|(a, _)| *a)
+                        .unwrap_or(crate::inspector::Activity::Idle),
+                );
+                let activity = match live {
                     Some((_, Some(tool))) => format!("rodando: {tool}"),
                     Some((crate::inspector::Activity::Idle, None)) => {
                         "terminou a resposta".to_owned()
@@ -950,12 +956,39 @@ impl WorkspaceView {
                     }
                 }
                 rows.push(Row {
+                    node: *node,
                     name: view.name.clone(),
                     state,
                     activity,
                 });
             }
         }
+
+        // Rodada 360 (passo 7): custo POR NÓ pelo binding node↔cwd do LOG (ADR 0022 §3).
+        // Replay do log SÓ quando há evento novo (cache por `event_count`, padrão
+        // `refresh_cost_paused`) — NUNCA por frame; store ilegível conserva o snapshot.
+        let (cards, adopted) = {
+            let mut cache = lock(&self.dash.projected);
+            let count = self.nodes.store_event_count();
+            if dashboard::projection_cache_is_stale(cache.as_ref().map(|(c, _)| *c), count) {
+                if let (Some(c), Some(st)) = (count, self.nodes.projected()) {
+                    *cache = Some((c, st));
+                }
+            }
+            match cache.as_ref() {
+                Some((_, st)) => (
+                    dashboard::build_cards(st, &sessions, &self.dash.ws_root, &activities, &today),
+                    dashboard::adopted_cwds(st),
+                ),
+                None => (Vec::new(), std::collections::BTreeSet::new()),
+            }
+        };
+        let cards_by_node: BTreeMap<NodeId, dashboard::AgentCard> =
+            cards.into_iter().map(|c| (c.node, c)).collect();
+        // Total "Hoje:": sessões sob o ws_root + sessões dos cwds ADOTADOS pelos nós do
+        // Espaço (parcela de fora rotulada no próprio texto — honesto, nunca soma muda).
+        let total =
+            dashboard::workspace_cost_today(&sessions, &self.dash.ws_root, &adopted, &today);
 
         let state_color = |s: dashboard::UiState| -> u32 {
             match s.color_token() {
@@ -990,12 +1023,13 @@ impl WorkspaceView {
                     .child("Atividade e custos do time"),
             )
             .child(
-                // Custo do Espaço HOJE — dinheiro primeiro, com o marcador honesto.
+                // Custo do Espaço HOJE — dinheiro primeiro, com o marcador honesto
+                // (inclui a parcela ADOTADA fora da pasta do Espaço, rotulada).
                 div()
                     .id("dash-total")
                     .text_size(px(15.))
                     .text_color(rgb(th.text.primary))
-                    .child(format!("Hoje: {}", total.text)),
+                    .child(format!("Hoje: {}", total.line.text)),
             )
             .child(
                 div()
@@ -1013,6 +1047,22 @@ impl WorkspaceView {
         let mut rows_box = div().flex().flex_col().gap_2();
         for (i, row) in rows.into_iter().enumerate() {
             let color = state_color(row.state);
+            // Custo do NÓ (hierarquia P6: estado → custo → atividade): valor + ressalva
+            // de atribuição na MESMA linha (fora do Espaço/compartilhado/não rastreável);
+            // sem projeção do log para o nó → "—" honesto, nunca chute.
+            let card = cards_by_node.get(&row.node);
+            let cost_text = match card {
+                Some(c) => match c.attribution.note() {
+                    Some(note) => format!("{} · {}", c.cost_today.text, note),
+                    None => c.cost_today.text.clone(),
+                },
+                None => "—".to_owned(),
+            };
+            let cost_color = if card.is_some_and(|c| c.cost_today.has_data) {
+                th.text.primary
+            } else {
+                th.text.muted
+            };
             rows_box = rows_box.child(
                 div()
                     .id(("dash-row", i as u64))
@@ -1026,6 +1076,12 @@ impl WorkspaceView {
                             .text_size(px(12.))
                             .text_color(rgb(th.text.primary))
                             .child(format!("{}  ● {}", row.name, row.state.label())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(cost_color))
+                            .child(cost_text),
                     )
                     .child(
                         div()
@@ -1193,6 +1249,15 @@ impl WorkspaceView {
         }
     }
 
+    /// Rodada 360 (ADR 0022 §4): liga/desliga o CONSENTIMENTO do kit de integração na
+    /// pasta própria escolhida no modal (a Lina só escreve na pasta do usuário com isto).
+    fn modal_toggle_kit_consent(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.toggle_kit_consent();
+            cx.notify();
+        }
+    }
+
     fn modal_focus(&mut self, f: agent_modal::FocusField, cx: &mut Context<Self>) {
         if let Some(m) = self.agent_modal.as_mut() {
             m.set_focus(f);
@@ -1274,6 +1339,9 @@ impl WorkspaceView {
                     Some(&p.engine),
                     p.cwd.as_deref(),
                     p.role.as_deref(),
+                    // ADR 0022 §4: consentimento explícito do modal — sem ele, pasta própria
+                    // nasce SEM kit e o card mostra o badge (degradação visível).
+                    p.kit_consent,
                 )
                 .map(Some),
             Plan::Save(p) => self
@@ -2133,6 +2201,19 @@ impl Render for WorkspaceView {
                         .text_color(rgb(th.text.muted))
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
+            // Rodada 360 (ADR 0022 §4): degradação VISÍVEL — agente em pasta própria SEM o kit
+            // de integração (sem consentimento no modal, ou arquivo do usuário preservado).
+            if nv.kit_missing {
+                title = title.child(
+                    div()
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .text_size(px(10.0 * z))
+                        .text_color(rgb(th.state.warning))
+                        .child(text!("⚠ sem doutrina/observabilidade")),
+                );
+            }
             // O ✕ só aparece quando há >1 card: o ÚLTIMO nó nunca pode ser fechado (o canvas
             // jamais fica em branco), então não mostramos um botão que recusaria a ação.
             if cards.len() > 1 {
@@ -2812,7 +2893,8 @@ fn resolve_ws_root(demo: bool) -> PathBuf {
 
 /// inv#6 (nunca tela em branco): quando o canvas não tem nenhum terminal (workspace fresco/produção, ou
 /// o raro caso de spawn que falhou), uma guia centralizada substitui o vazio — o aluno sabe o próximo
-/// passo (⌘T). Some sozinho assim que o 1º card existe.
+/// passo (⌘N, a porta RICA: modal com papel+motor; ⌘T continua funcionando, só não é ensinado —
+/// quick win da rodada 360: UMA porta na superfície). Some sozinho assim que o 1º card existe.
 fn empty_canvas_hint() -> impl IntoElement {
     let th = theme::active();
     div()
@@ -2835,7 +2917,7 @@ fn empty_canvas_hint() -> impl IntoElement {
             div()
                 .text_size(px(15.0))
                 .text_color(rgb(th.text.secondary))
-                .child(text!("Pressione ⌘T para criar seu primeiro agente")),
+                .child(text!("Pressione ⌘N para criar seu primeiro agente")),
         )
 }
 
@@ -3244,99 +3326,70 @@ fn main() {
     let model: Model = Arc::new(Mutex::new(SharedModel::default()));
     let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
 
-    #[allow(clippy::type_complexity)]
-    let (focused, a2a, seq_start, keys): (
-        NodeId,
-        Option<Arc<A2aTrigger>>,
-        u32,
-        BTreeMap<NodeId, String>,
-    ) = if demo {
+    // Rodada 360 (ADR 0022): o NodeManager — dono dos nós em runtime E o FUNIL ÚNICO de
+    // admissão — nasce ANTES do seed do demo, para as TRÊS portas (⌘T, ⌘N e o seed) entrarem
+    // pelo MESMO `admit_node`. `seq_start = 0`: o demo admite A/B pelo funil (seq 0/1 → keys
+    // t0/t1); em produção o 1º ⌘T do aluno nasce como "Terminal A".
+    let nodes = NodeManager::new(
+        Arc::clone(&pty),
+        Arc::clone(&sup),
+        Arc::clone(&store),
+        Arc::clone(&model),
+        Arc::clone(&grids),
+        BTreeMap::new(),
+        delta_tx,
+        cols,
+        rows,
+        0,
+        cmd_factory,
+        bootstrap,
+        mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
+    );
+
+    let (focused, a2a): (NodeId, Option<Arc<A2aTrigger>>) = if demo {
         let _ = lock(&store).append(&DomainEvent::WorkspaceCreated {
             name: "walking-skeleton".into(),
             // W4-5: o walking-skeleton não passa pela galeria de Foco → preset não-setado (`""`).
             focus_preset: String::new(),
         });
-        // Spawna+fia um terminal demo; em SUCESSO persiste NodeAdded+TerminalSpawned, projeta no model e
-        // registra o grid. Devolve `(NodeId, Grid)` ou `None` (spawn falhou → degrada, sem panic).
-        let seed_one = |key: &str, name: &str, x: f64, y: f64| -> Option<(NodeId, Grid)> {
-            let mut cmd = (*cmd_factory)(name);
-            if let Some(bw) = &bootstrap {
-                let d = bw.dir_for(key);
-                let _ = std::fs::create_dir_all(&d);
-                cmd = cmd.cwd(d);
-            }
-            let wired = {
-                let mut p = lock(&pty);
-                wire_terminal(
-                    &mut p, &sup, &delta_tx, key, name, "terminal", cmd, cols, rows,
-                )
-            };
-            match wired {
-                Ok((node, grid)) => {
-                    let _ = sup.set_status(node, CoreStatus::Running);
-                    {
-                        let mut s = lock(&store);
-                        let _ = s.append(&DomainEvent::NodeAdded {
-                            node,
-                            kind: "Terminal".into(),
-                            x,
-                            y,
-                        });
-                        let _ = s.append(&DomainEvent::TerminalSpawned {
-                            node,
-                            cli: name.into(),
-                            // Rodada 360 (costura events.rs): mecânico — o dono do app liga o cwd real.
-                            cwd: None,
-                        });
-                    }
-                    lock(&model).seed_node(
-                        node,
-                        NodeView::new(name, NodeKind::Terminal, x as f32, y as f32),
-                    );
-                    lock(&grids).insert(node, Arc::clone(&grid));
-                    Some((node, grid))
-                }
+        // Porta seed/demo (tradutor fino — ADR 0022 §1): admissão pelo funil canônico, em
+        // posição FIXA do roteiro. Um spawn que falhe DEGRADA (loga e segue) — nunca panica
+        // (inv#6): o `Err` do funil vira aviso e o demo segue sem o nó.
+        let seed_one = |name: &str, x: f64, y: f64| -> Option<NodeId> {
+            match nodes.admit_node(NodeAdmission::seeded_terminal(name, x, y)) {
+                Ok(node) => Some(node),
                 Err(e) => {
                     eprintln!("lina-gpui: DEMO — spawn de '{name}' falhou ({e}); seguindo sem ele");
                     None
                 }
             }
         };
-        let a = seed_one("A", "Terminal A", 30.0, 96.0);
-        let b = seed_one("B", "Terminal B", 740.0, 96.0);
-        let mut keys: BTreeMap<NodeId, String> = BTreeMap::new();
-        if let Some((na, _)) = &a {
-            keys.insert(*na, "A".to_string());
-        }
-        if let Some((nb, _)) = &b {
-            keys.insert(*nb, "B".to_string());
-        }
-        let seq = keys.len() as u32;
-        // O ⚡ A2A A→B só faz sentido com AMBOS vivos; senão fica `None` (o botão some via `ready()`).
+        let a = seed_one("Terminal A", 30.0, 96.0);
+        let b = seed_one("Terminal B", 740.0, 96.0);
+        // O ⚡ A2A A→B só faz sentido com AMBOS vivos; senão fica `None` (o botão some via
+        // `ready()`). O grid de B vem do mapa vivo — o funil o registrou na admissão.
         let a2a = match (&a, &b) {
-            (Some((na, _)), Some((nb, grid_b))) => Some(Arc::new(A2aTrigger::new(
-                Arc::clone(&sup),
-                *na,
-                *nb,
-                Arc::clone(grid_b),
-                // F1-0-2: o ⚡ demo usa o MESMO perfil real carregado no boot (sem demo hardcoded).
-                injection_profile.clone(),
-                Arc::clone(&store),
-                Arc::clone(&model),
-            ))),
+            (Some(na), Some(nb)) => lock(&grids).get(nb).cloned().map(|grid_b| {
+                Arc::new(A2aTrigger::new(
+                    Arc::clone(&sup),
+                    *na,
+                    *nb,
+                    grid_b,
+                    // F1-0-2: o ⚡ demo usa o MESMO perfil real carregado no boot (sem demo hardcoded).
+                    injection_profile.clone(),
+                    Arc::clone(&store),
+                    Arc::clone(&model),
+                ))
+            }),
             _ => None,
         };
         // O foco arranca no 1º terminal vivo (A, ou B se A falhou); o render reaponta sozinho depois.
-        let focused = a
-            .as_ref()
-            .or(b.as_ref())
-            .map(|(n, _)| *n)
-            .unwrap_or_default();
-        (focused, a2a, seq, keys)
+        let focused = a.or(b).unwrap_or_default();
+        (focused, a2a)
     } else {
         // PRODUÇÃO: sem nós. `focused` é a sentinela nil (`NodeId::default()`); o render reaponta ao 1º
         // card assim que o aluno cria um com ⌘T. `a2a = None` → o botão ⚡ nem aparece (gate `ready()`).
-        (NodeId::default(), None, 0u32, BTreeMap::new())
+        (NodeId::default(), None)
     };
 
     let event_count = lock(&store).event_count().unwrap_or(0);
@@ -3397,24 +3450,8 @@ fn main() {
 
     let input: Arc<dyn InputSink> = Arc::new(CoreInput::new(Arc::clone(&sup)));
 
-    // O dono dos nós em runtime (add/remove): reusa pty/sup/store/model/grids. `seq_start` é o nº de nós
-    // semeados (2 no demo A/B; 0 em produção) → o 1º ⌘T do aluno em produção nasce como "Terminal A".
-    let nodes = NodeManager::new(
-        Arc::clone(&pty),
-        Arc::clone(&sup),
-        Arc::clone(&store),
-        Arc::clone(&model),
-        Arc::clone(&grids),
-        keys,
-        delta_tx,
-        cols,
-        rows,
-        seq_start,
-        cmd_factory,
-        bootstrap,
-        mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
-    );
-    // W3-2: escreve o CLAUDE.md/estado inicial do roster semeado (vazio em produção — best-effort).
+    // W3-2: garante o CLAUDE.md/estado do roster do boot (vazio em produção — best-effort).
+    // (O NodeManager nasce ANTES do seed, lá em cima — rodada 360/ADR 0022.)
     nodes.rewrite_bootstrap();
 
     // W3-4: sobe o SUPERVISOR que observa a mailbox (`<ws_root>/.lina/outbox/`). A partir daqui,

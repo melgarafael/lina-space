@@ -25,10 +25,15 @@
 //! (zero seria mentira). Fonte distinta do teto (`cost.rs` super-conta por bytes de
 //! propósito — anti-runaway); este módulo NUNCA alimenta o teto.
 //!
-//! ## Sessão↔nó sem chute (doutrina da camada 3 — 13.9)
-//! Match por `cwd` exato contra os hints do app (que CONHECE o cwd de cada spawn);
-//! 2+ nós no mesmo cwd → ambíguo → card SEM números (honesto). "Hoje" é decidido por
-//! prefixo de data INJETADO (função pura — lição wall-clock do projeto).
+//! ## Sessão↔nó sem chute (doutrina da camada 3 — 13.9 · rodada 360, passo 7)
+//! Match por `cwd` exato contra o binding node↔cwd PERSISTIDO no log (`ProjectedNode.cwd`
+//! ← `TerminalSpawned.cwd`, ADR 0022 §3) — a era dos "hints" paralelos acabou: o log é a
+//! fonte. Estados HONESTOS da linha de custo ([`CostAttribution`]): sem `cwd` no log
+//! (histórico) → "—" não rastreável; `cwd` fora do `ws_root` → custo REAL rotulado
+//! "trabalhando fora da pasta do Espaço"; 2+ nós no MESMO cwd → total exibido como
+//! COMPARTILHADO (jamais dividido arbitrariamente); sem sessão de hoje → "sem sessão
+//! hoje" (≠ não rastreável). "Hoje" é decidido por prefixo de data INJETADO (função
+//! pura — lição wall-clock do projeto).
 //!
 //! ## A11y (critério 5)
 //! Cada card expõe `a11y_label` com OS VALORES por extenso (leitor de tela lê estado,
@@ -36,11 +41,14 @@
 //! text!-colide-id) e `line_height` explícita — asserções aqui são da LÓGICA (a label),
 //! não do TreeUpdate.
 
-// Módulo-biblioteca aguardando o WIRING do render gpui (mesmo padrão de `inspector.rs`:
-// API consumida pelo render a cabear; por ora exercida pelos testes). Remover ao wirar.
+// Rodada 360 (passo 7): o caminho de CUSTO (build_cards/adopted_cwds/workspace_cost_today/
+// cache de projeção) está WIRADO no render_dashboard. O allow permanece pela superfície
+// restante do card (estado/atividade/a11y do `AgentCard`, `totals` do B1): o painel mantém
+// o ESTADO vivo do pump — que NÃO é persistido no log a cada transição — e trocar essa
+// fonte é a dimensão [PARCIAL] Estado do 360°, de outra rodada.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lina_core::{NodeId, ProjectedNode, ProjectedState};
 use lina_session_watch::{CostSource, Session};
@@ -173,6 +181,28 @@ impl CostLine {
         }
     }
 
+    /// Nó COM pasta no log, mas NENHUMA sessão de IA de hoje nela — distinto de "não
+    /// rastreável" (rodada 360: distinguir os dois é critério, não polish).
+    fn no_session_today() -> Self {
+        Self {
+            text: "sem sessão hoje".to_owned(),
+            usd: 0.0,
+            estimated: false,
+            has_data: false,
+        }
+    }
+
+    /// Nó SEM pasta no log (registro anterior ao ADR 0022 §3) — a correlação nó↔sessão
+    /// é irreconstituível para sempre: "—" honesto, nunca chute.
+    fn untrackable() -> Self {
+        Self {
+            text: "—".to_owned(),
+            usd: 0.0,
+            estimated: false,
+            has_data: false,
+        }
+    }
+
     fn from_today(cost_usd: f64, estimated: bool) -> Self {
         if cost_usd <= 0.0 {
             return Self::without_data(); // zero exibido seria mentira (subcontagem)
@@ -250,6 +280,10 @@ pub struct DashWiring {
     pub cli_id: String,
     /// Raiz do workspace (string) — recorte honesto do custo do Espaço.
     pub ws_root: String,
+    /// Rodada 360 (passo 7): cache do replay node↔cwd — `(event_count, projeção)`. O
+    /// render re-replaya SÓ quando o log tem evento novo ([`projection_cache_is_stale`],
+    /// padrão `refresh_cost_paused`); NUNCA por frame.
+    pub projected: std::sync::Mutex<Option<(u64, ProjectedState)>>,
 }
 
 impl DashWiring {
@@ -260,7 +294,20 @@ impl DashWiring {
             sessions: std::sync::Arc::default(),
             cli_id,
             ws_root,
+            projected: std::sync::Mutex::new(None),
         }
+    }
+}
+
+/// Decisão PURA do cache de projeção (rodada 360, passo 7): re-replay SÓ com evento
+/// NOVO no log. `current = None` (store ilegível neste tick) → conserva o snapshot que
+/// houver — degradação honesta, nunca um replay às cegas nem um painel zerado.
+#[must_use]
+pub fn projection_cache_is_stale(cached: Option<u64>, current: Option<u64>) -> bool {
+    match (cached, current) {
+        (Some(c), Some(n)) => c != n,
+        (None, Some(_)) => true,
+        (_, None) => false,
     }
 }
 
@@ -289,30 +336,94 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Custo TOTAL do Espaço hoje (sessões cujo `cwd` vive sob o `ws_root` e cujo último
-/// movimento é de hoje) — v1 da tela: o total é atribuível com certeza ao Espaço; a
-/// atribuição POR NÓ continua exigindo hint não-ambíguo (sem chute — doutrina 13.9).
+/// `cwd` vive sob `root`? Consciente da FRONTEIRA de path: `/wsfoo` NÃO está sob `/ws`
+/// (o `starts_with` cru diria que sim — sobre-atribuição seria chute). Raiz com `/`
+/// final é normalizada; raiz `/` cobre qualquer caminho absoluto.
+fn under_root(cwd: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    cwd == root || (cwd.starts_with(root) && cwd[root.len()..].starts_with('/'))
+}
+
+/// Pastas ADOTADAS pelos nós do Espaço — o binding node↔cwd do log (ADR 0022 §3).
+/// Alimenta o total "Hoje:": sessão na pasta própria de um nó do Espaço CONTA (rotulada
+/// como parcela de fora), mesmo sem viver sob o prefixo do `ws_root`.
 #[must_use]
-pub fn workspace_cost_today(sessions: &[Session], ws_root: &str, today_prefix: &str) -> CostLine {
-    let mut cost = 0.0f64;
+pub fn adopted_cwds(state: &ProjectedState) -> BTreeSet<String> {
+    state
+        .nodes
+        .values()
+        .filter(|pn| pn.kind == "Terminal")
+        .filter_map(|pn| pn.cwd.clone())
+        .collect()
+}
+
+/// Total do Espaço hoje + parcela de FORA rotulada (rodada 360, passo 7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceCost {
+    /// Texto pronto da superfície (inclui "· inclui …US$ X fora da pasta do Espaço"
+    /// quando a parcela existe e é exibível).
+    pub line: CostLine,
+    /// Parcela (USD, de hoje) atribuída por ADOÇÃO: cwd de nó do Espaço fora do `ws_root`.
+    pub outside_usd: f64,
+}
+
+/// Custo TOTAL do Espaço hoje: sessões sob o `ws_root` (fronteira de path REAL — `/wsfoo`
+/// não é `/ws`) **+** sessões nos cwds ADOTADOS pelos nós do Espaço (binding do log),
+/// com a parcela de fora rotulada honestamente no próprio texto. Cada sessão conta NO
+/// MÁXIMO uma vez (2+ nós no mesmo cwd não duplicam o total — `adopted` é conjunto).
+#[must_use]
+pub fn workspace_cost_today(
+    sessions: &[Session],
+    ws_root: &str,
+    adopted: &BTreeSet<String>,
+    today_prefix: &str,
+) -> WorkspaceCost {
+    let mut inside = 0.0f64;
+    let mut outside = 0.0f64;
     let mut estimated = false;
     let mut any = false;
     for s in sessions {
-        let in_ws = s.cwd.as_deref().is_some_and(|c| c.starts_with(ws_root));
         let today = s
             .last_ts
             .as_deref()
             .is_some_and(|ts| ts.starts_with(today_prefix));
-        if in_ws && today {
+        let Some(cwd) = s.cwd.as_deref() else {
+            continue;
+        };
+        if !today {
+            continue;
+        }
+        if under_root(cwd, ws_root) {
             any = true;
-            cost += s.cost_usd;
+            inside += s.cost_usd;
+            estimated |= s.cost_estimated || s.source == CostSource::Jsonl;
+        } else if adopted.contains(cwd) {
+            any = true;
+            outside += s.cost_usd;
             estimated |= s.cost_estimated || s.source == CostSource::Jsonl;
         }
     }
     if !any {
-        return CostLine::without_data();
+        return WorkspaceCost {
+            line: CostLine::without_data(),
+            outside_usd: 0.0,
+        };
     }
-    CostLine::from_today(cost, estimated)
+    let mut line = CostLine::from_today(inside + outside, estimated);
+    // Rotula a parcela de fora SÓ quando ela é exibível (≥ 1 centavo após arredondar) —
+    // "inclui US$ 0,00" seria ruído, não honestidade.
+    let valor = format!("{outside:.2}");
+    if line.has_data && valor != "0.00" {
+        let marker = if estimated { "~" } else { "" };
+        let valor = valor.replace('.', ",");
+        line.text.push_str(&format!(
+            " · inclui {marker}US$ {valor} fora da pasta do Espaço"
+        ));
+    }
+    WorkspaceCost {
+        line,
+        outside_usd: outside,
+    }
 }
 
 /// Breakdown de tokens — mora nos "Detalhes técnicos" (dobrado; jargão fora da superfície).
@@ -326,6 +437,49 @@ pub struct TokenBreakdown {
     pub thinking_warning: bool,
 }
 
+/// COMO o custo da linha foi atribuído ao nó — honestidade do painel (rodada 360,
+/// passo 7): a ressalva acompanha o número; nunca número pelado quando há ressalva.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostAttribution {
+    /// `cwd` do log, único entre os nós, dentro do Espaço: o custo é dele.
+    Exclusive,
+    /// `cwd` do log FORA do `ws_root` (pasta própria) — custo REAL, rotulado.
+    OutsideWorkspace,
+    /// 2+ nós no MESMO cwd: o total do cwd é exibido como compartilhado — JAMAIS
+    /// dividido arbitrariamente (não há base para o rateio; dividir seria chute).
+    Shared { agents: usize, outside: bool },
+    /// `cwd` no log, mas nenhuma sessão de IA de hoje nele (≠ não rastreável).
+    NoSessionToday,
+    /// Log histórico sem `cwd` (anterior ao ADR 0022 §3): irreconstituível p/ sempre.
+    Untrackable,
+}
+
+impl CostAttribution {
+    /// Ressalva textual que acompanha o número (`None` = número sem ressalva).
+    #[must_use]
+    pub fn note(self) -> Option<String> {
+        match self {
+            CostAttribution::Exclusive | CostAttribution::NoSessionToday => None,
+            CostAttribution::OutsideWorkspace => {
+                Some("trabalhando fora da pasta do Espaço".to_owned())
+            }
+            CostAttribution::Shared {
+                agents,
+                outside: false,
+            } => Some(format!("compartilhado: {agents} agentes na mesma pasta")),
+            CostAttribution::Shared {
+                agents,
+                outside: true,
+            } => Some(format!(
+                "compartilhado: {agents} agentes na mesma pasta, fora do Espaço"
+            )),
+            CostAttribution::Untrackable => {
+                Some("custo não rastreável aqui (registro antigo)".to_owned())
+            }
+        }
+    }
+}
+
 /// Card de UM terminal — a LÓGICA do P6 §Atividade que o render consome.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentCard {
@@ -335,6 +489,8 @@ pub struct AgentCard {
     pub state: UiState,
     pub activity: Activity,
     pub cost_today: CostLine,
+    /// COMO o custo foi atribuído (rodada 360) — o render exibe a ressalva junto do número.
+    pub attribution: CostAttribution,
     pub tokens: TokenBreakdown,
     /// Frase completa p/ o leitor de tela — contém OS VALORES (critério 5).
     pub a11y_label: String,
@@ -342,15 +498,17 @@ pub struct AgentCard {
 
 /// Monta os cards POR TERMINAL a partir das projeções (inv#4: tudo deriva do log).
 ///
-/// - `hints`: `(node, cwd)` dos spawns — o app CONHECE o cwd; match por cwd EXATO,
-///   2+ nós no mesmo cwd = ambíguo → sem números (doutrina camada 3: nunca chutar).
-/// - `activities`: atividade por nó derivada do damage (ausente → `Idle`).
-/// - `today_prefix`: `YYYY-MM-DD` INJETADO (função pura; lição wall-clock).
+/// Correlação sessão↔nó pelo binding `ProjectedNode.cwd` PERSISTIDO no log
+/// (`TerminalSpawned.cwd`, ADR 0022 §3) — match por cwd EXATO; subpasta não herda
+/// (atribuir por prefixo seria chute). 2+ nós no mesmo cwd → total COMPARTILHADO,
+/// nunca dividido. Sem cwd no log (histórico) → "—" não rastreável; cwd fora do
+/// `ws_root` → custo real rotulado. `today_prefix` é `YYYY-MM-DD` INJETADO (função
+/// pura; lição wall-clock).
 #[must_use]
 pub fn build_cards(
     state: &ProjectedState,
     sessions: &[Session],
-    hints: &[(NodeId, String)],
+    ws_root: &str,
     activities: &BTreeMap<NodeId, Activity>,
     today_prefix: &str,
 ) -> Vec<AgentCard> {
@@ -358,15 +516,36 @@ pub fn build_cards(
         .nodes
         .iter()
         .filter(|(_, pn)| pn.kind == "Terminal")
-        .map(|(node, pn)| build_card(*node, pn, sessions, hints, activities, today_prefix))
+        .map(|(node, pn)| {
+            // Outros TERMINAIS no mesmo cwd: a atribuição vira compartilhada (nunca rateio).
+            let peers = pn.cwd.as_deref().map_or(0, |cwd| {
+                state
+                    .nodes
+                    .iter()
+                    .filter(|(n2, p2)| {
+                        **n2 != *node && p2.kind == "Terminal" && p2.cwd.as_deref() == Some(cwd)
+                    })
+                    .count()
+            });
+            build_card(
+                *node,
+                pn,
+                peers,
+                sessions,
+                ws_root,
+                activities,
+                today_prefix,
+            )
+        })
         .collect()
 }
 
 fn build_card(
     node: NodeId,
     pn: &ProjectedNode,
+    peers: usize,
     sessions: &[Session],
-    hints: &[(NodeId, String)],
+    ws_root: &str,
     activities: &BTreeMap<NodeId, Activity>,
     today_prefix: &str,
 ) -> AgentCard {
@@ -375,20 +554,46 @@ fn build_card(
     let state = UiState::from_projection(pn.status.as_deref(), pn.stalled);
     let activity = activities.get(&node).copied().unwrap_or(Activity::Idle);
 
-    // Sessões do nó: cwd do hint, único entre os nós (ambíguo → sem números).
-    let my_cwd = hints.iter().find(|(n, _)| *n == node).map(|(_, c)| c);
-    let unambiguous =
-        my_cwd.is_some_and(|cwd| hints.iter().filter(|(n, c)| c == cwd && *n != node).count() == 0);
-    let (cost_today, tokens) = match (my_cwd, unambiguous) {
-        (Some(cwd), true) => aggregate_today(sessions, cwd, today_prefix),
-        _ => (CostLine::without_data(), TokenBreakdown::default()),
+    // Honestidade da atribuição (rodada 360): sem cwd no log → irreconstituível ("—");
+    // com cwd → soma das sessões DE HOJE daquele cwd exato; compartilhado/fora rotulados.
+    let (cost_today, tokens, attribution) = match pn.cwd.as_deref() {
+        None => (
+            CostLine::untrackable(),
+            TokenBreakdown::default(),
+            CostAttribution::Untrackable,
+        ),
+        Some(cwd) => match aggregate_today(sessions, cwd, today_prefix) {
+            None => (
+                CostLine::no_session_today(),
+                TokenBreakdown::default(),
+                CostAttribution::NoSessionToday,
+            ),
+            Some((line, tk)) => {
+                let outside = !under_root(cwd, ws_root);
+                let attribution = if peers > 0 {
+                    CostAttribution::Shared {
+                        agents: peers + 1,
+                        outside,
+                    }
+                } else if outside {
+                    CostAttribution::OutsideWorkspace
+                } else {
+                    CostAttribution::Exclusive
+                };
+                (line, tk, attribution)
+            }
+        },
     };
 
+    // A ressalva de atribuição acompanha o valor TAMBÉM no leitor de tela (critério 5).
+    let cost_phrase = match attribution.note() {
+        Some(n) => format!("{} ({n})", cost_today.text),
+        None => cost_today.text.clone(),
+    };
     let mut a11y_label = format!(
-        "{name}: {}. Motor: {}. Custo de hoje: {}. Atividade: {}.",
+        "{name}: {}. Motor: {}. Custo de hoje: {cost_phrase}. Atividade: {}.",
         state.label(),
         engine.label,
-        cost_today.text,
         activity.label()
     );
     if tokens.thinking_warning {
@@ -402,17 +607,20 @@ fn build_card(
         state,
         activity,
         cost_today,
+        attribution,
         tokens,
         a11y_label,
     }
 }
 
-/// Agrega as sessões DE HOJE do `cwd` (um nó pode ter várias sessões num dia — soma).
+/// Agrega as sessões DE HOJE do `cwd` exato (um nó pode ter várias num dia — soma).
+/// `None` = NENHUMA sessão de hoje nesse cwd ("sem sessão hoje" — distinto de sessão
+/// de hoje SEM custo apurável, que devolve a `CostLine` honesta "sem estimativa").
 fn aggregate_today(
     sessions: &[Session],
     cwd: &str,
     today_prefix: &str,
-) -> (CostLine, TokenBreakdown) {
+) -> Option<(CostLine, TokenBreakdown)> {
     let mut cost = 0.0f64;
     let mut estimated = false;
     let mut tk = TokenBreakdown::default();
@@ -434,11 +642,11 @@ fn aggregate_today(
         tk.tokens_cache += s.tokens_cache;
         tk.tokens_thinking += s.tokens_thinking;
     }
-    tk.thinking_warning = tk.tokens_thinking > tk.tokens_out;
     if !matched {
-        return (CostLine::without_data(), TokenBreakdown::default());
+        return None;
     }
-    (CostLine::from_today(cost, estimated), tk)
+    tk.thinking_warning = tk.tokens_thinking > tk.tokens_out;
+    Some((CostLine::from_today(cost, estimated), tk))
 }
 
 // ═══════════ Clamp do painel aos bounds da janela — LÓGICA pura (gpui não roda headless) ═══════════
@@ -522,7 +730,10 @@ mod tests {
     use lina_core::{apply, DomainEvent};
     use uuid::Uuid;
 
-    fn term_node(state: &mut ProjectedState, cli: Option<&str>) -> NodeId {
+    /// Nó-terminal sintético. `cwd: Some` emite o `TerminalSpawned` com o binding
+    /// node↔cwd PERSISTIDO (ADR 0022 §3 — o caminho real da correlação); `cwd: None`
+    /// reproduz o LOG HISTÓRICO (nó sem spawn registrado ou spawn sem o campo).
+    fn term_node(state: &mut ProjectedState, cli: Option<&str>, cwd: Option<&str>) -> NodeId {
         let node = Uuid::now_v7();
         apply(
             state,
@@ -546,6 +757,16 @@ mod tests {
                 &DomainEvent::CliProfileSet {
                     node,
                     profile: cli.into(),
+                },
+            );
+        }
+        if let Some(cwd) = cwd {
+            apply(
+                state,
+                &DomainEvent::TerminalSpawned {
+                    node,
+                    cli: cli.unwrap_or("claude-code").into(),
+                    cwd: Some(cwd.into()),
                 },
             );
         }
@@ -615,15 +836,15 @@ mod tests {
     }
 
     /// Critério 2 da story: log sintético → projeção → card com EXATAMENTE estes números.
+    /// Rodada 360: o binding node↔cwd vem do `TerminalSpawned.cwd` do LOG, não de hints.
     #[test]
     fn cards_from_synthetic_log_field_by_field() {
         let mut state = ProjectedState::default();
-        let node = term_node(&mut state, Some("claude-code"));
+        let node = term_node(&mut state, Some("claude-code"), Some("/work/projeto-a"));
         status(&mut state, node, "Busy");
 
         let sessions = [session("/work/projeto-a", "2026-06-06T14:02:00.000Z")];
-        let hints = [(node, "/work/projeto-a".to_string())];
-        let cards = build_cards(&state, &sessions, &hints, &busy(node), TODAY);
+        let cards = build_cards(&state, &sessions, "/work", &busy(node), TODAY);
 
         assert_eq!(cards.len(), 1);
         let c = &cards[0];
@@ -639,6 +860,9 @@ mod tests {
         assert!(c.cost_today.has_data);
         assert!(c.cost_today.estimated);
         assert_eq!(c.cost_today.text, "~US$ 0,01 (estimado)");
+        // Dentro do Espaço, cwd único → atribuição exclusiva, número SEM ressalva.
+        assert_eq!(c.attribution, CostAttribution::Exclusive);
+        assert_eq!(c.attribution.note(), None);
         // Detalhes técnicos: breakdown campo a campo (13.5 item 5).
         assert_eq!(c.tokens.tokens_in, 155);
         assert_eq!(c.tokens.tokens_out, 105);
@@ -665,13 +889,12 @@ mod tests {
     #[test]
     fn thinking_warning_when_thinking_dominates() {
         let mut state = ProjectedState::default();
-        let node = term_node(&mut state, Some("claude-code"));
+        let node = term_node(&mut state, Some("claude-code"), Some("/w"));
         status(&mut state, node, "Busy");
         let mut s = session("/w", "2026-06-06T10:00:00.000Z");
         s.tokens_thinking = 900;
         s.tokens_out = 100;
-        let hints = [(node, "/w".to_string())];
-        let cards = build_cards(&state, &[s], &hints, &busy(node), TODAY);
+        let cards = build_cards(&state, &[s], "/w", &busy(node), TODAY);
         assert!(cards[0].tokens.thinking_warning);
         assert!(
             cards[0].a11y_label.contains("pensando"),
@@ -681,16 +904,15 @@ mod tests {
     }
 
     /// Honestidade: sessão sem custo apurável (ex.: modelo fora da tabela de preço)
-    /// → "sem estimativa ainda", NUNCA "US$ 0,00".
+    /// → "sem estimativa ainda", NUNCA "US$ 0,00" — e DISTINTO de "sem sessão hoje".
     #[test]
     fn cost_without_data_is_honest() {
         let mut state = ProjectedState::default();
-        let node = term_node(&mut state, Some("claude-code"));
+        let node = term_node(&mut state, Some("claude-code"), Some("/w"));
         status(&mut state, node, "Idle");
         let mut s = session("/w", "2026-06-06T10:00:00.000Z");
         s.cost_usd = 0.0;
-        let hints = [(node, "/w".to_string())];
-        let cards = build_cards(&state, &[s], &hints, &BTreeMap::new(), TODAY);
+        let cards = build_cards(&state, &[s], "/w", &BTreeMap::new(), TODAY);
         let cost = &cards[0].cost_today;
         assert!(!cost.has_data);
         assert!(
@@ -699,67 +921,172 @@ mod tests {
             cost.text
         );
         assert!(cost.text.contains("sem estimativa"));
+        // A sessão EXISTE hoje (só não tem preço apurável) → atribuição segue exclusiva.
+        assert_eq!(cards[0].attribution, CostAttribution::Exclusive);
     }
 
-    /// Sem chute (doutrina camada 3): sem sessão correlacionada OU cwd ambíguo → sem números.
+    /// Distinção honesta (rodada 360): cwd no log SEM sessão de hoje → "sem sessão
+    /// hoje" — que NÃO é o "—" de não-rastreável nem o "sem estimativa" do sem-preço.
     #[test]
-    fn unmatched_or_ambiguous_session_yields_no_numbers() {
+    fn no_session_today_is_distinct_from_untrackable() {
         let mut state = ProjectedState::default();
-        let a = term_node(&mut state, Some("claude-code"));
+        let a = term_node(&mut state, Some("claude-code"), Some("/w"));
         status(&mut state, a, "Busy");
 
-        // Sem sessão nenhuma → fallback honesto do motor + sem custo.
-        let cards = build_cards(&state, &[], &[(a, "/w".into())], &BTreeMap::new(), TODAY);
+        // Sem sessão nenhuma → "sem sessão hoje".
+        let cards = build_cards(&state, &[], "/w", &BTreeMap::new(), TODAY);
         assert!(!cards[0].cost_today.has_data);
+        assert_eq!(cards[0].cost_today.text, "sem sessão hoje");
+        assert_eq!(cards[0].attribution, CostAttribution::NoSessionToday);
+    }
 
-        // 2 nós no MESMO cwd → ambíguo → nenhum dos dois ganha os números.
-        let b = term_node(&mut state, Some("claude-code"));
+    /// Atribuição ambígua (rodada 360, tarefa 4): 2+ nós no MESMO cwd → o total do cwd
+    /// aparece como COMPARTILHADO nos dois cards — jamais dividido arbitrariamente
+    /// (e o total do Espaço conta a sessão UMA vez, não duas).
+    #[test]
+    fn shared_cwd_shows_aggregate_never_split() {
+        let mut state = ProjectedState::default();
+        let a = term_node(&mut state, Some("claude-code"), Some("/w"));
+        status(&mut state, a, "Busy");
+        let b = term_node(&mut state, Some("claude-code"), Some("/w"));
         status(&mut state, b, "Busy");
-        let hints = [(a, "/w".to_string()), (b, "/w".to_string())];
-        let cards = build_cards(
-            &state,
-            &[session("/w", "2026-06-06T10:00:00.000Z")],
-            &hints,
-            &BTreeMap::new(),
-            TODAY,
-        );
+
+        let sessions = [session("/w", "2026-06-06T10:00:00.000Z")];
+        let cards = build_cards(&state, &sessions, "/w", &BTreeMap::new(), TODAY);
         assert_eq!(cards.len(), 2);
         for c in &cards {
-            assert!(!c.cost_today.has_data, "ambíguo nunca chuta números");
+            assert!(c.cost_today.has_data, "o agregado do cwd é FATO — exibido");
+            assert!(
+                (c.cost_today.usd - 0.0123).abs() < 1e-9,
+                "total do cwd, nunca rateio: {}",
+                c.cost_today.usd
+            );
+            assert_eq!(
+                c.attribution,
+                CostAttribution::Shared {
+                    agents: 2,
+                    outside: false
+                }
+            );
+            let note = c.attribution.note().expect("ressalva obrigatória");
+            assert!(note.contains("compartilhado: 2 agentes"), "{note}");
+            assert!(c.a11y_label.contains("compartilhado"), "{}", c.a11y_label);
         }
+        // Total do Espaço: a sessão compartilhada conta UMA vez.
+        let total = workspace_cost_today(&sessions, "/w", &adopted_cwds(&state), TODAY);
+        assert!((total.line.usd - 0.0123).abs() < 1e-9, "sem dupla contagem");
     }
 
     /// "Hoje" é prefixo INJETADO: sessão de ontem não entra no custo de hoje.
     #[test]
     fn today_filter_is_injected_not_wall_clock() {
         let mut state = ProjectedState::default();
-        let node = term_node(&mut state, Some("claude-code"));
+        let node = term_node(&mut state, Some("claude-code"), Some("/w"));
         status(&mut state, node, "Idle");
-        let hints = [(node, "/w".to_string())];
         let yesterday = session("/w", "2026-06-05T23:00:00.000Z");
-        let cards = build_cards(&state, &[yesterday], &hints, &BTreeMap::new(), TODAY);
+        let cards = build_cards(&state, &[yesterday], "/w", &BTreeMap::new(), TODAY);
         assert!(
             !cards[0].cost_today.has_data,
             "sessão de ontem não é 'hoje'"
         );
+        assert_eq!(cards[0].attribution, CostAttribution::NoSessionToday);
     }
 
     /// Motor desconhecido → fallback honesto (13.9 item 6), nunca chute.
     #[test]
     fn unknown_engine_has_honest_fallback() {
         let mut state = ProjectedState::default();
-        let node = term_node(&mut state, None);
+        let node = term_node(&mut state, None, None);
         status(&mut state, node, "Ready");
-        let cards = build_cards(&state, &[], &[(node, "/w".into())], &BTreeMap::new(), TODAY);
+        let cards = build_cards(&state, &[], "/w", &BTreeMap::new(), TODAY);
         assert_eq!(cards[0].engine.label, "Terminal (motor desconhecido)");
         assert!(!cards[0].engine.via_spawn);
+    }
+
+    /// Log HISTÓRICO (rodada 360, tarefa 6): nó sem `cwd` no log → "—" NÃO rastreável,
+    /// mesmo havendo sessões de hoje no disco (correlação irreconstituível — ADR 0022 §3).
+    #[test]
+    fn old_log_node_without_cwd_is_untrackable() {
+        let mut state = ProjectedState::default();
+        // Caminho 1 do histórico: nó sem TerminalSpawned algum.
+        let a = term_node(&mut state, Some("claude-code"), None);
+        status(&mut state, a, "Busy");
+        // Caminho 2: spawn ANTIGO sem o campo cwd (replay projeta None).
+        let b = term_node(&mut state, Some("claude-code"), None);
+        apply(
+            &mut state,
+            &DomainEvent::TerminalSpawned {
+                node: b,
+                cli: "claude-code".into(),
+                cwd: None,
+            },
+        );
+        status(&mut state, b, "Busy");
+
+        let sessions = [session("/qualquer/lugar", "2026-06-06T10:00:00.000Z")];
+        let cards = build_cards(&state, &sessions, "/ws", &BTreeMap::new(), TODAY);
+        assert_eq!(cards.len(), 2);
+        for c in &cards {
+            assert!(!c.cost_today.has_data);
+            assert_eq!(c.cost_today.text, "—", "traço honesto, nunca chute");
+            assert_eq!(c.attribution, CostAttribution::Untrackable);
+            let note = c.attribution.note().expect("o '—' vem com explicação");
+            assert!(note.contains("não rastreável"), "{note}");
+        }
+    }
+
+    /// Pasta própria (rodada 360, tarefa 2): cwd do log FORA do ws_root + sessão de hoje
+    /// lá → custo REAL rotulado "trabalhando fora da pasta do Espaço" (fim do invisível).
+    #[test]
+    fn node_outside_workspace_shows_real_cost_with_label() {
+        let mut state = ProjectedState::default();
+        let node = term_node(
+            &mut state,
+            Some("claude-code"),
+            Some("/Users/maria/projeto"),
+        );
+        status(&mut state, node, "Busy");
+
+        let sessions = [session("/Users/maria/projeto", "2026-06-06T09:00:00.000Z")];
+        let cards = build_cards(&state, &sessions, "/ws", &BTreeMap::new(), TODAY);
+        let c = &cards[0];
+        assert!(
+            c.cost_today.has_data,
+            "custo de pasta própria agora APARECE"
+        );
+        assert_eq!(c.cost_today.text, "~US$ 0,01 (estimado)");
+        assert_eq!(c.attribution, CostAttribution::OutsideWorkspace);
+        let note = c.attribution.note().expect("ressalva obrigatória");
+        assert_eq!(note, "trabalhando fora da pasta do Espaço");
+        assert!(c.a11y_label.contains("fora da pasta"), "{}", c.a11y_label);
+    }
+
+    /// Fronteira de path REAL: `/wsfoo` NÃO está sob `/ws` (o starts_with cru mentiria).
+    #[test]
+    fn ws_root_boundary_is_path_aware() {
+        assert!(under_root("/ws/a", "/ws"));
+        assert!(under_root("/ws", "/ws"));
+        assert!(
+            under_root("/ws/a", "/ws/"),
+            "raiz com barra final normaliza"
+        );
+        assert!(under_root("/qualquer/abs", "/"), "raiz '/' cobre absolutos");
+        assert!(!under_root("/wsfoo", "/ws"), "prefixo cru sobre-atribuiria");
+
+        // Na prática: nó em /wsfoo com sessão lá → rotulado como FORA do Espaço /ws.
+        let mut state = ProjectedState::default();
+        let node = term_node(&mut state, Some("claude-code"), Some("/wsfoo"));
+        status(&mut state, node, "Busy");
+        let sessions = [session("/wsfoo", "2026-06-06T09:00:00.000Z")];
+        let cards = build_cards(&state, &sessions, "/ws", &BTreeMap::new(), TODAY);
+        assert_eq!(cards[0].attribution, CostAttribution::OutsideWorkspace);
     }
 
     /// Nó-nota não vira card (cards são POR TERMINAL).
     #[test]
     fn note_nodes_do_not_become_cards() {
         let mut state = ProjectedState::default();
-        let _t = term_node(&mut state, Some("claude-code"));
+        let _t = term_node(&mut state, Some("claude-code"), None);
         let note = Uuid::now_v7();
         apply(
             &mut state,
@@ -770,7 +1097,7 @@ mod tests {
                 y: 1.0,
             },
         );
-        let cards = build_cards(&state, &[], &[], &BTreeMap::new(), TODAY);
+        let cards = build_cards(&state, &[], "/ws", &BTreeMap::new(), TODAY);
         assert_eq!(cards.len(), 1, "só o terminal vira card");
     }
 
@@ -823,13 +1150,78 @@ mod tests {
         outside_ws.session_id = "s2".into();
         let mut yesterday = session("/ws/terminal-b", "2026-06-05T10:00:00.000Z");
         yesterday.session_id = "s3".into();
-        let cost = workspace_cost_today(&[inside, outside_ws, yesterday], "/ws", "2026-06-06");
-        assert!(cost.has_data);
+        let sessions = [inside, outside_ws, yesterday];
+
+        // Sem cwds adotados: só a sessão do ws E de hoje (comportamento clássico).
+        let cost = workspace_cost_today(&sessions, "/ws", &BTreeSet::new(), "2026-06-06");
+        assert!(cost.line.has_data);
         assert!(
-            (cost.usd - 0.0123).abs() < 1e-9,
+            (cost.line.usd - 0.0123).abs() < 1e-9,
             "só a sessão do ws E de hoje"
         );
-        assert!(cost.estimated && cost.text.contains("estimado"));
+        assert!(cost.line.estimated && cost.line.text.contains("estimado"));
+        assert_eq!(cost.outside_usd, 0.0);
+        assert!(
+            !cost.line.text.contains("fora da pasta"),
+            "sem parcela de fora, sem rótulo: {}",
+            cost.line.text
+        );
+    }
+
+    /// Total "Hoje:" (rodada 360, tarefa 3): sessão no cwd ADOTADO por nó do Espaço
+    /// (binding do log) SOMA no total — com a parcela de fora rotulada honestamente.
+    #[test]
+    fn total_includes_adopted_cwds_with_labeled_outside_parcel() {
+        let mut state = ProjectedState::default();
+        let a = term_node(&mut state, Some("claude-code"), Some("/ws/terminal-a"));
+        status(&mut state, a, "Busy");
+        let b = term_node(&mut state, Some("claude-code"), Some("/outro/lugar"));
+        status(&mut state, b, "Busy");
+
+        let inside = session("/ws/terminal-a", "2026-06-06T10:00:00.000Z");
+        let mut adopted_out = session("/outro/lugar", "2026-06-06T11:00:00.000Z");
+        adopted_out.session_id = "s2".into();
+        adopted_out.cost_usd = 0.0277;
+        let mut alheia = session("/de/outra/pessoa", "2026-06-06T12:00:00.000Z");
+        alheia.session_id = "s3".into();
+        let sessions = [inside, adopted_out, alheia];
+
+        let adopted = adopted_cwds(&state);
+        assert!(adopted.contains("/outro/lugar"), "binding do log adotado");
+        let total = workspace_cost_today(&sessions, "/ws", &adopted, "2026-06-06");
+        // 0.0123 (dentro) + 0.0277 (adotada fora) — a alheia NÃO entra (não adotada).
+        assert!((total.line.usd - 0.04).abs() < 1e-9, "{}", total.line.usd);
+        assert!((total.outside_usd - 0.0277).abs() < 1e-9);
+        assert!(
+            total.line.text.contains("~US$ 0,04 (estimado)"),
+            "{}",
+            total.line.text
+        );
+        assert!(
+            total
+                .line
+                .text
+                .contains("inclui ~US$ 0,03 fora da pasta do Espaço"),
+            "parcela de fora rotulada: {}",
+            total.line.text
+        );
+    }
+
+    /// Cache do replay (rodada 360, tarefa 1): re-replay SÓ com evento novo; contador
+    /// ilegível conserva o snapshot (nunca replay por frame, nunca painel zerado).
+    #[test]
+    fn projection_cache_replays_only_on_new_events() {
+        assert!(projection_cache_is_stale(None, Some(7)), "1º uso: popula");
+        assert!(projection_cache_is_stale(Some(7), Some(9)), "evento novo");
+        assert!(
+            !projection_cache_is_stale(Some(9), Some(9)),
+            "sem evento novo"
+        );
+        assert!(
+            !projection_cache_is_stale(Some(9), None),
+            "store ilegível: conserva o que há"
+        );
+        assert!(!projection_cache_is_stale(None, None), "nada a fazer");
     }
 
     /// Clamp do painel: janela confortável usa a geometria preferida, exata.
@@ -893,9 +1285,9 @@ mod tests {
     #[test]
     fn workspace_totals_aggregate() {
         let mut state = ProjectedState::default();
-        let a = term_node(&mut state, Some("claude-code"));
+        let a = term_node(&mut state, Some("claude-code"), Some("/wa"));
         status(&mut state, a, "Busy");
-        let b = term_node(&mut state, Some("codex"));
+        let b = term_node(&mut state, Some("codex"), Some("/wb"));
         status(&mut state, b, "Idle");
 
         let mut s_b = session("/wb", "2026-06-06T11:00:00.000Z");
@@ -904,8 +1296,7 @@ mod tests {
         s_b.tokens_thinking = 500;
         s_b.tokens_out = 10;
         let sessions = [session("/wa", "2026-06-06T10:00:00.000Z"), s_b];
-        let hints = [(a, "/wa".to_string()), (b, "/wb".to_string())];
-        let cards = build_cards(&state, &sessions, &hints, &BTreeMap::new(), TODAY);
+        let cards = build_cards(&state, &sessions, "/", &BTreeMap::new(), TODAY);
 
         let t = totals(&cards);
         assert_eq!(t.cards, 2);
@@ -914,5 +1305,135 @@ mod tests {
         assert_eq!(t.thinking_warnings, 1);
         assert!(t.summary_text.contains("~US$ 0,04"));
         assert!(t.summary_text.contains("estimado"));
+    }
+
+    /// Varredura COMBINATÓRIA da correlação node↔cwd↔sessão (matemática pura):
+    /// 3 cwds × 2 lotações × 4 cenários de sessão = 24 combos; os invariantes de
+    /// honestidade valem em TODOS — nunca chute, nunca rateio, nunca dupla contagem.
+    #[test]
+    fn attribution_grid_invariants() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Cwd {
+            Absent,
+            Inside,
+            Outside,
+        }
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Sess {
+            None,
+            Today,
+            Yesterday,
+            TodayZeroCost,
+        }
+        const WS: &str = "/ws";
+
+        for cwd_kind in [Cwd::Absent, Cwd::Inside, Cwd::Outside] {
+            for peer in [false, true] {
+                for sess in [
+                    Sess::None,
+                    Sess::Today,
+                    Sess::Yesterday,
+                    Sess::TodayZeroCost,
+                ] {
+                    let ctx = format!("cwd={cwd_kind:?} peer={peer} sess={sess:?}");
+                    let cwd = match cwd_kind {
+                        Cwd::Absent => None,
+                        Cwd::Inside => Some("/ws/a"),
+                        Cwd::Outside => Some("/fora/b"),
+                    };
+                    let mut state = ProjectedState::default();
+                    let node = term_node(&mut state, Some("claude-code"), cwd);
+                    status(&mut state, node, "Busy");
+                    if peer {
+                        let p = term_node(&mut state, Some("claude-code"), cwd);
+                        status(&mut state, p, "Busy");
+                    }
+                    // A sessão mora no cwd do nó (ou num canto alheio, p/ o caso Absent).
+                    let sess_cwd = cwd.unwrap_or("/alheio");
+                    let sessions: Vec<Session> = match sess {
+                        Sess::None => vec![],
+                        Sess::Today => vec![session(sess_cwd, "2026-06-06T10:00:00.000Z")],
+                        Sess::Yesterday => vec![session(sess_cwd, "2026-06-05T10:00:00.000Z")],
+                        Sess::TodayZeroCost => {
+                            let mut s = session(sess_cwd, "2026-06-06T10:00:00.000Z");
+                            s.cost_usd = 0.0;
+                            vec![s]
+                        }
+                    };
+                    let cards = build_cards(&state, &sessions, WS, &BTreeMap::new(), TODAY);
+                    assert_eq!(cards.len(), if peer { 2 } else { 1 }, "{ctx}");
+
+                    let matched_today =
+                        cwd.is_some() && matches!(sess, Sess::Today | Sess::TodayZeroCost);
+                    let priced = cwd.is_some() && matches!(sess, Sess::Today);
+                    for c in &cards {
+                        // 1) Número exibido ⇔ cwd no log + sessão de hoje + custo apurável.
+                        assert_eq!(c.cost_today.has_data, priced, "{ctx}");
+                        // 2) "—" ⇔ não rastreável ⇔ sem cwd no log.
+                        assert_eq!(
+                            c.attribution == CostAttribution::Untrackable,
+                            cwd.is_none(),
+                            "{ctx}"
+                        );
+                        assert_eq!(c.cost_today.text == "—", cwd.is_none(), "{ctx}");
+                        // 3) "sem sessão hoje" ⇔ cwd no log e nenhuma sessão de hoje nele.
+                        assert_eq!(
+                            c.attribution == CostAttribution::NoSessionToday,
+                            cwd.is_some() && !matched_today,
+                            "{ctx}"
+                        );
+                        // 4) A atribuição certa para cada quadrante; compartilhado = TOTAL.
+                        match c.attribution {
+                            CostAttribution::Shared { agents, outside } => {
+                                assert!(peer && matched_today, "{ctx}");
+                                assert_eq!(agents, 2, "{ctx}");
+                                assert_eq!(outside, cwd_kind == Cwd::Outside, "{ctx}");
+                                if priced {
+                                    assert!(
+                                        (c.cost_today.usd - 0.0123).abs() < 1e-9,
+                                        "{ctx}: rateio seria chute"
+                                    );
+                                }
+                            }
+                            CostAttribution::OutsideWorkspace => {
+                                assert!(
+                                    cwd_kind == Cwd::Outside && matched_today && !peer,
+                                    "{ctx}"
+                                );
+                            }
+                            CostAttribution::Exclusive => {
+                                assert!(cwd_kind == Cwd::Inside && matched_today && !peer, "{ctx}");
+                            }
+                            CostAttribution::NoSessionToday | CostAttribution::Untrackable => {}
+                        }
+                        // 5) Toda ressalva chega ao leitor de tela (critério 5).
+                        if let Some(note) = c.attribution.note() {
+                            assert!(c.a11y_label.contains(&note), "{ctx}: {}", c.a11y_label);
+                        }
+                    }
+                    // 6) Total do Espaço: cada sessão conta NO MÁXIMO uma vez; parcela de
+                    //    fora rotulada exatamente quando há custo adotado fora do ws_root.
+                    let total = workspace_cost_today(&sessions, WS, &adopted_cwds(&state), TODAY);
+                    let expect_total = if priced { 0.0123 } else { 0.0 };
+                    let expect_outside = if priced && cwd_kind == Cwd::Outside {
+                        0.0123
+                    } else {
+                        0.0
+                    };
+                    assert!(
+                        (total.line.usd - expect_total).abs() < 1e-9,
+                        "{ctx}: {}",
+                        total.line.usd
+                    );
+                    assert!((total.outside_usd - expect_outside).abs() < 1e-9, "{ctx}");
+                    assert_eq!(
+                        total.line.text.contains("fora da pasta do Espaço"),
+                        expect_outside > 0.0,
+                        "{ctx}: {}",
+                        total.line.text
+                    );
+                }
+            }
+        }
     }
 }
