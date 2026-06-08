@@ -130,6 +130,8 @@ mod tests {
             x: 0.0,
             y: 0.0,
             cli: cli.map(str::to_string),
+            // Costura rodada 360 (ADR 0022): campo novo da projeção; fixture sem cwd.
+            cwd: None,
             // Costura F1-0-3 (coordenada via Maestro): campo novo da projeção; fixture sem WARN.
             stalled: false,
         }

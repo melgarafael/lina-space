@@ -26,9 +26,9 @@ use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 use lina_core::{
     deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence, AlacrittyBackend,
     BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome, DomainEvent,
-    EventRecord, EventStore, GridDelta, MailMessage, Mailbox, NodeStatus as CoreStatus, PtyCommand,
-    PtyManager, Recipient, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor, VtBackend,
-    WorkspaceTrust,
+    EventRecord, EventStore, GridDelta, MailMessage, Mailbox, NodeStatus as CoreStatus,
+    ProjectedState, PtyCommand, PtyManager, Recipient, RolePolicy, RouteOutcome, Router,
+    RouterConfig, Supervisor, VtBackend, WorkspaceTrust,
 };
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
@@ -2592,6 +2592,24 @@ impl NodeManager {
     /// Ordem: spawna o PTY → **persiste primeiro** (event log = fonte da verdade) → só então
     /// projeta no model. Se a persistência falhar, **desfaz** o PTY recém-criado (`retire_pty`)
     /// e devolve `Err` — nada de nó visível sem evento no log.
+    /// Rodada 360 (ADR 0022): estado projetado do log para consumidores de UI — o painel P6
+    /// correlaciona node↔cwd↔sessão via `ProjectedNode.cwd`. Replay completo (snapshot + tail):
+    /// o CHAMADOR cacheia por [`Self::store_event_count`] (padrão `refresh_cost_paused`) —
+    /// não chame por frame.
+    // TODO(rodada-360/passo-7): #[allow] transitório — o consumidor (render_dashboard, Dev 03)
+    // liga nesta MESMA rodada e REMOVE os dois allows (bin-crate: pub sem chamador = dead_code).
+    #[allow(dead_code)]
+    pub fn projected(&self) -> Option<ProjectedState> {
+        lock(&self.store).project().ok()
+    }
+
+    /// `event_count` do log — chave de cache barata para consumidores de [`Self::projected`]
+    /// (re-replay SÓ quando há evento novo).
+    #[allow(dead_code)]
+    pub fn store_event_count(&self) -> Option<u64> {
+        lock(&self.store).event_count().ok()
+    }
+
     pub fn add_node(&self) -> Result<NodeId, String> {
         let seq = {
             let mut s = lock(&self.seq);
@@ -2653,6 +2671,8 @@ impl NodeManager {
             if let Err(e) = s.append(&DomainEvent::TerminalSpawned {
                 node,
                 cli: name.clone(),
+                // Rodada 360 (costura events.rs): mecânico — o dono do app liga o cwd real.
+                cwd: None,
             }) {
                 drop(s);
                 self.retire_pty(node, key);
@@ -2793,6 +2813,8 @@ impl NodeManager {
                 node,
                 // Rótulo do MOTOR quando escolhido no M6 ("Claude Code"); senão o nome (M2, legado).
                 cli: engine.map_or_else(|| name.to_string(), |e| e.label.clone()),
+                // Rodada 360 (costura events.rs): mecânico — o dono do app liga o cwd real.
+                cwd: None,
             }) {
                 drop(s);
                 self.retire_pty(node, key);

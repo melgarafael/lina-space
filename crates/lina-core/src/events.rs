@@ -221,6 +221,12 @@ pub enum DomainEvent {
     TerminalSpawned {
         node: NodeId,
         cli: String,
+        /// Rodada 360 (ADR 0022 §3): cwd REAL do spawn — o binding node↔cwd↔sessão que
+        /// toda correlação de custo/atividade consome. ADITIVO via `serde(default)` —
+        /// logs antigos (shape `{node,cli}`) replayam com `None`, sem upcast; as
+        /// projeções degradam honestamente ("custo não rastreável aqui"), nunca chutam.
+        #[serde(default)]
+        cwd: Option<String>,
     },
     TerminalExited {
         node: NodeId,
@@ -758,6 +764,12 @@ pub struct ProjectedNode {
     pub x: f64,
     pub y: f64,
     pub cli: Option<String>,
+    /// Rodada 360 (ADR 0022 §3): cwd REAL do último `TerminalSpawned` do nó — o binding
+    /// node↔cwd que o painel de custo correlaciona (passo 7 do blueprint). `None` = log
+    /// histórico sem o campo (degradação honesta, nunca chute). `serde(default)` →
+    /// snapshots antigos desserializam com `None`.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// F1-0-3: WARN de travamento (`NodeStalled`) consultável; limpo na PRÓXIMA transição de
     /// status do nó (conservador — recuperação sem mudança de estado mantém o WARN até o estado
     /// confirmar saúde). `serde(default)` → snapshots antigos desserializam com `false`.
@@ -827,6 +839,7 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
                     x: *x,
                     y: *y,
                     cli: None,
+                    cwd: None,
                     stalled: false,
                 },
             );
@@ -865,9 +878,12 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::NodeRemoved { node } => {
             state.nodes.remove(node);
         }
-        DomainEvent::TerminalSpawned { node, cli } => {
+        DomainEvent::TerminalSpawned { node, cli, cwd } => {
             if let Some(n) = state.nodes.get_mut(node) {
                 n.cli = Some(cli.clone());
+                // Rodada 360 (ADR 0022 §3): o último spawn vence; `None` (log antigo)
+                // projeta `None` — degradação honesta, nunca chute.
+                n.cwd = cwd.clone();
                 n.status = Some("Running".into());
             }
         }
@@ -1499,6 +1515,7 @@ mod tests {
             .append(&DomainEvent::TerminalSpawned {
                 node: dev,
                 cli: "claude".into(),
+                cwd: None,
             })
             .unwrap();
         store
@@ -2085,6 +2102,61 @@ mod tests {
             before.nodes.get(&node),
             after.nodes.get(&node),
             "CliDetected é meta — não muda a projeção do nó"
+        );
+    }
+
+    /// Rodada 360 (ADR 0022 §3): `TerminalSpawned.cwd` é ADITIVO — (a) payload antigo
+    /// (sem o campo `cwd`) desserializa com `None`, sem upcast (replay de log antigo
+    /// nunca quebra); (b) evento novo COM cwd round-trips pelo store e a projeção
+    /// expõe o binding node↔cwd que o painel de custo consome (passo 7).
+    #[test]
+    #[serial]
+    fn terminal_spawned_cwd_aditivo_replay_antigo_e_projecao() {
+        // (a) Log antigo: payload v1 sem `cwd` → default `None`. O payload persistido
+        // carrega a tag interna `event` (enum `#[serde(tag = "event")]`) — este é o
+        // shape byte-fiel de um registro pré-rodada-360 no disco.
+        let node = Uuid::now_v7();
+        let old = DomainEvent::from_record(
+            "TerminalSpawned",
+            1,
+            serde_json::json!({ "event": "TerminalSpawned", "node": node, "cli": "claude" }),
+        )
+        .expect("payload antigo sem cwd desserializa");
+        assert_eq!(
+            old,
+            DomainEvent::TerminalSpawned {
+                node,
+                cli: "claude".into(),
+                cwd: None,
+            },
+            "replay de log antigo projeta cwd ausente como None"
+        );
+
+        // (b) Evento novo COM cwd: round-trip pelo store + binding na projeção.
+        let tmp = TempDir::new("cwd-aditivo");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+            })
+            .expect("append NodeAdded");
+        store
+            .append(&DomainEvent::TerminalSpawned {
+                node,
+                cli: "claude".into(),
+                cwd: Some("/Users/founder/projeto".into()),
+            })
+            .expect("append TerminalSpawned");
+        let state = store.project().expect("project");
+        let n = state.nodes.get(&node).expect("nó projetado");
+        assert_eq!(n.cli.as_deref(), Some("claude"));
+        assert_eq!(
+            n.cwd.as_deref(),
+            Some("/Users/founder/projeto"),
+            "a projeção expõe o binding node↔cwd"
         );
     }
 

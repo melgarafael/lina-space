@@ -224,6 +224,7 @@ fn main() -> Result<()> {
                 &DomainEvent::TerminalSpawned {
                     node,
                     cli: "claude-code".into(),
+                    cwd: None,
                 },
             )?;
         }

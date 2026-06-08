@@ -303,6 +303,7 @@ fn onda2_exit_gate_end_to_end() {
             .append(&DomainEvent::TerminalSpawned {
                 node,
                 cli: cli.into(),
+                cwd: None,
             })
             .expect("append TerminalSpawned");
     }

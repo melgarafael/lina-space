@@ -3285,6 +3285,8 @@ fn main() {
                         let _ = s.append(&DomainEvent::TerminalSpawned {
                             node,
                             cli: name.into(),
+                            // Rodada 360 (costura events.rs): mecânico — o dono do app liga o cwd real.
+                            cwd: None,
                         });
                     }
                     lock(&model).seed_node(
