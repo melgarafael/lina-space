@@ -64,6 +64,66 @@ impl HookOutput {
     }
 }
 
+// ─────────────── R2c-2: guard de skill de orquestrador ESTRANGEIRO ───────────────
+//
+// A skill GLOBAL de outro orquestrador (Maestri) existe na máquina do fundador
+// (power-user, 60+ skills globais standalone) e o Claude Code 2.1.x NÃO tem config de
+// projeto p/ escondê-la nem deny por nome de skill. O env-scrub já matou `MAESTRI_*`
+// (a skill agora SÓ FALHA), mas o modelo ainda a CARREGA e INVOCA. Aqui o gate
+// PreToolUse intercepta a tool `Skill` e NEGA as do Maestri com uma mensagem de
+// REDIRECT — o `deny` vira contexto que o modelo lê e corrige o rumo para os verbos
+// `lina`. ENFORCEMENT real (a skill estrangeira para de funcionar de vez), não só
+// doutrina; defesa em profundidade com env-scrub + ficha + gatilhos pt-br.
+//
+// **Doutrina de segurança (registrada):** o nome da skill no input NÃO é autoridade de
+// identidade — é só o GATILHO do bloqueio defensivo (mesma família "campo escrito pelo
+// agente não decide autorização", ADRs 0004/0006/0021). Por isso o bloqueio é
+// CONSERVADOR e CIRÚRGICO: nega `maestri*` (alvo conhecido), libera todo o resto —
+// NUNCA uma allow-list que mataria skills legítimas do papel. Payload sem nome legível
+// ⇒ allow (não quebrar skill legítima por degradação), diferente do Bash (dúvida = ask).
+
+/// Prefixos de skills de orquestradores estrangeiros (extensível — novos orquestradores
+/// entram aqui). Uma skill cujo nome (sem namespace de plugin, lowercased) começa com um
+/// destes — em fronteira de palavra — é bloqueada com redirect.
+pub const FOREIGN_SKILL_PREFIXES: &[&str] = &["maestri"];
+
+/// Nomes EXATOS conhecidos de skills do Maestri (documenta o alvo; permite, no futuro,
+/// nomes que NÃO compartilhem um prefixo limpo). Hoje todos casam o prefixo também.
+pub const FOREIGN_SKILL_EXACT: &[&str] = &[
+    "maestri",
+    "maestri-manager",
+    "maestri-orchestrator",
+    "maestri-portal",
+];
+
+/// `true` se `name` é uma skill de orquestrador estrangeiro. Normaliza defensivamente:
+/// lowercased, sem namespace de plugin (`plugin:skill` → testa ambos), e o prefixo casa
+/// só em FRONTEIRA (`maestri` puro ou seguido de `-`/`:`/`_`) — `"maestria-de-vendas"`
+/// (palavra que contém "maestri") NÃO é o orquestrador. PURA — testável.
+#[must_use]
+pub fn is_foreign_skill(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let bare = lower.rsplit(':').next().unwrap_or(&lower);
+    let matches = |s: &str| {
+        FOREIGN_SKILL_EXACT.contains(&s)
+            || FOREIGN_SKILL_PREFIXES.iter().any(|p| {
+                // Prefixo em fronteira de palavra: `<p>` puro OU `<p>` + separador.
+                s.strip_prefix(p)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', ':', '_']))
+            })
+    };
+    matches(&lower) || matches(bare)
+}
+
+/// Mensagem de REDIRECT do `deny` — o modelo lê isto e é empurrado para o caminho certo.
+fn foreign_skill_redirect(name: &str) -> String {
+    format!(
+        "A skill \"{name}\" pertence a outro orquestrador e NAO funciona neste Espaco. \
+         Para falar com outro terminal use os verbos lina: lina ask \"@Nome\" \"...\" / \
+         lina handoff \"@Nome\" \"...\". Veja a skill lina-agent-bus."
+    )
+}
+
 /// Mapa [`Decision`] → `permissionDecision` do Claude Code (allow→allow, ask→ask, deny→deny).
 fn decision_str(d: Decision) -> &'static str {
     match d {
@@ -140,6 +200,34 @@ pub fn pretooluse_output(input_json: &str, autonomy: &str) -> String {
                     "ask",
                     String::from(
                         "tool Bash sem 'command' no payload — confirmação humana solicitada por segurança",
+                    ),
+                )
+                .render(),
+            }
+        }
+        // R2c-2: a tool `Skill` carrega/roda uma agent skill. Intercepta as de
+        // orquestrador ESTRANGEIRO (Maestri) e NEGA com redirect; o resto (lina-agent-bus,
+        // skills do papel) passa. O nome é o gatilho do bloqueio, NÃO autoridade.
+        Some("Skill") => {
+            // Defensivo: o campo exato do 2.1.x não é 100% confirmado — `skill` é o mais
+            // provável; `name`/`skillName`/`skillId` cobrem variações sem regressão.
+            let skill_name = value.get("tool_input").and_then(|ti| {
+                ["skill", "name", "skillName", "skillId"]
+                    .iter()
+                    .find_map(|k| ti.get(*k).and_then(|v| v.as_str()))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            });
+            match skill_name {
+                Some(name) if is_foreign_skill(name) => {
+                    HookOutput::new("deny", foreign_skill_redirect(name)).render()
+                }
+                // Skill legítima OU nome ausente → allow. CIRÚRGICO: payload degradado
+                // jamais mata uma skill do papel (a defesa é a denylist, não o fail-safe).
+                _ => HookOutput::new(
+                    "allow",
+                    String::from(
+                        "skill permitida neste Espaço (não é de orquestrador estrangeiro)",
                     ),
                 )
                 .render(),
@@ -270,5 +358,101 @@ mod tests {
         // feature push em assistido = ask; se caísse em autônomo seria allow.
         let v = parse(&pretooluse_output(input, "ludico-invalido"));
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "ask");
+    }
+
+    // ─────────────── R2c-2: guard de skill de orquestrador ESTRANGEIRO ───────────────
+
+    fn decision(out: &str) -> String {
+        parse(out)["hookSpecificOutput"]["permissionDecision"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn reason(out: &str) -> String {
+        parse(out)["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A skill `maestri` (orquestrador estrangeiro) → **deny** com mensagem de REDIRECT
+    /// que ENSINA o caminho certo (verbos `lina` + skill `lina-agent-bus`).
+    #[test]
+    fn foreign_skill_maestri_is_denied_with_redirect() {
+        let input = r#"{"tool_name":"Skill","tool_input":{"skill":"maestri"}}"#;
+        let out = pretooluse_output(input, "assistido");
+        assert_eq!(decision(&out), "deny", "maestri é bloqueada");
+        let r = reason(&out);
+        assert!(r.contains("maestri"), "cita a skill negada: {r}");
+        assert!(r.contains("lina ask"), "ensina o verbo lina: {r}");
+        assert!(r.contains("lina-agent-bus"), "aponta a skill certa: {r}");
+    }
+
+    /// Variantes do Maestri (prefixo + nomes conhecidos) também são negadas.
+    #[test]
+    fn foreign_skill_maestri_variants_are_denied() {
+        for name in [
+            "maestri-orchestrator",
+            "maestri-manager",
+            "maestri-portal",
+            "MAESTRI",           // case-insensitive
+            "maestri:algum-sub", // namespaced defensivo
+        ] {
+            let input = format!(r#"{{"tool_name":"Skill","tool_input":{{"skill":"{name}"}}}}"#);
+            assert_eq!(
+                decision(&pretooluse_output(&input, "assistido")),
+                "deny",
+                "{name} deveria ser negada"
+            );
+        }
+    }
+
+    /// O campo do nome da skill é tratado defensivamente: `name` (além de `skill`)
+    /// também dispara o bloqueio — o formato exato do 2.1.x não é 100% confirmado.
+    #[test]
+    fn foreign_skill_via_name_field_is_denied() {
+        let input = r#"{"tool_name":"Skill","tool_input":{"name":"maestri-orchestrator"}}"#;
+        assert_eq!(decision(&pretooluse_output(input, "assistido")), "deny");
+    }
+
+    /// Skill LEGÍTIMA do Lina (lina-agent-bus) → **allow** (a denylist é cirúrgica).
+    #[test]
+    fn lina_agent_bus_skill_is_allowed() {
+        let input = r#"{"tool_name":"Skill","tool_input":{"skill":"lina-agent-bus"}}"#;
+        assert_eq!(decision(&pretooluse_output(input, "assistido")), "allow");
+    }
+
+    /// Skill de PAPEL legítimo (frontend-design) → **allow** (nunca matar skill do papel).
+    #[test]
+    fn role_skill_frontend_design_is_allowed() {
+        let input = r#"{"tool_name":"Skill","tool_input":{"skill":"frontend-design"}}"#;
+        assert_eq!(decision(&pretooluse_output(input, "assistido")), "allow");
+        // Palavra que CONTÉM "maestri" no meio não é um falso-positivo? Não há skill
+        // assim, mas o match por boundary evita pegar "maestria-de-vendas".
+        let input2 = r#"{"tool_name":"Skill","tool_input":{"skill":"maestria-de-vendas"}}"#;
+        assert_eq!(
+            decision(&pretooluse_output(input2, "assistido")),
+            "allow",
+            "boundary: 'maestria' (palavra) não é o orquestrador 'maestri'"
+        );
+    }
+
+    /// Skill SEM nome legível (payload degradado) → **allow** (deny cirúrgico: payload
+    /// ruim NUNCA mata uma skill legítima do papel; a defesa é a denylist, não o
+    /// fail-safe — diferente do Bash, onde a dúvida vira `ask`).
+    #[test]
+    fn skill_without_name_is_allowed_not_blocked() {
+        let input = r#"{"tool_name":"Skill","tool_input":{}}"#;
+        assert_eq!(decision(&pretooluse_output(input, "assistido")), "allow");
+    }
+
+    /// **ZERO regressão do gate W3-6:** a cobertura nova de Skill não toca o gate de
+    /// execução Bash — `rm -rf /` segue não-allow; `cargo test` segue allow.
+    #[test]
+    fn bash_execution_gate_unchanged_by_skill_guard() {
+        let danger = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
+        assert_ne!(decision(&pretooluse_output(danger, "autonomo")), "allow");
+        let routine = r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#;
+        assert_eq!(decision(&pretooluse_output(routine, "assistido")), "allow");
     }
 }

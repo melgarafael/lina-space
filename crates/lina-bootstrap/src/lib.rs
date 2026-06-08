@@ -433,13 +433,18 @@ impl Bootstrapper {
 
 /// JSON do `<cwd>/.claude/settings.json` com os DOIS hooks do Claude Code:
 /// - `SessionStart` → `<lina_bin> whoami --bootstrap` (estado vivo turno-0, W3-2);
-/// - `PreToolUse` (matcher `Bash`) → `<lina_bin> guard --pretooluse` (gate de execução DURO,
-///   W3-6 AC-6.3 — o harness obriga toda chamada `Bash` a passar pelo gate antes de rodar).
+/// - `PreToolUse` (matcher `Bash|Skill`) → `<lina_bin> guard --pretooluse`:
+///   - **`Bash`** = o gate de execução DURO (W3-6 AC-6.3 — toda chamada `Bash` passa
+///     pelo gate antes de rodar; classify+decide pela matriz, ZERO LLM);
+///   - **`Skill`** (R2c-2) = o guard de skill ESTRANGEIRA — `Skill(maestri*)` é NEGADA
+///     com redirect aos verbos `lina` (a skill global do Maestri existe na máquina do
+///     fundador e o 2.1.x não tem deny por nome de skill; o `deny` do PreToolUse é o
+///     enforcement). Skills legítimas (lina-agent-bus, do papel) passam.
 ///
 /// O caminho do bin é **single-quoted** (paths podem ter espaços, ex.: `.../einstein workspace/...`)
-/// com escape de aspas — neutraliza metacaracteres de shell. O matcher é `Bash` porque o gate mira
-/// o **comando real**; Write/Edit são `local-reversible` (a matriz os libera) e o handler do
-/// `--pretooluse` já devolve `allow` para qualquer tool não-Bash, se o matcher for alargado depois.
+/// com escape de aspas — neutraliza metacaracteres de shell. O matcher casa `Bash|Skill`
+/// (regex do Claude Code); o `pretooluse_output` roteia por `tool_name` e devolve `allow`
+/// para qualquer outra tool não-coberta (Write/Edit são `local-reversible`).
 #[must_use]
 pub fn hook_settings_json(lina_bin: &str) -> String {
     hook_settings_json_with_observability(lina_bin, None)
@@ -524,8 +529,10 @@ pub fn hook_settings_json_with_mode(
             "SessionStart": [
                 { "hooks": [ { "type": "command", "command": session_cmd } ] }
             ],
+            // R2c-2: matcher alargado p/ `Bash|Skill` — o MESMO gate cobre o gate de
+            // execução Bash (W3-6) E o guard de skill estrangeira (Skill(maestri*) → deny).
             "PreToolUse": [
-                { "matcher": "Bash", "hooks": [ { "type": "command", "command": pretooluse_cmd } ] }
+                { "matcher": "Bash|Skill", "hooks": [ { "type": "command", "command": pretooluse_cmd } ] }
             ]
         }
     });
@@ -774,6 +781,39 @@ mod tests {
 
     // ── F1-1-3: hooks de observabilidade (handlers HTTP → listener do lina-hooks) ──
 
+    /// **R2c-2: o matcher PreToolUse cobre `Bash|Skill`** — o gate de execução (Bash) e
+    /// o guard de skill estrangeira (Skill) na MESMA entry, apontando para o mesmo
+    /// `guard --pretooluse`. Vale com e sem wiring de observabilidade.
+    #[test]
+    fn pretooluse_matcher_covers_bash_and_skill() {
+        for wiring in [
+            None,
+            Some(HookWiring {
+                port: 1,
+                token: "t".into(),
+            }),
+        ] {
+            let j = hook_settings_json_with_observability("/abs/lina", wiring.as_ref());
+            let v: serde_json::Value = serde_json::from_str(&j).expect("json");
+            let pre = v["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
+            let guarded = pre.iter().any(|e| {
+                e["matcher"] == "Bash|Skill"
+                    && e["hooks"].as_array().is_some_and(|hs| {
+                        hs.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .is_some_and(|c| c.contains("guard --pretooluse"))
+                        })
+                    })
+            });
+            assert!(
+                guarded,
+                "matcher Bash|Skill com o guard (wiring={:?}): {j}",
+                wiring.is_some()
+            );
+        }
+    }
+
     /// Sem fiação (porta/token ausentes — app sem listener, CLI sem hooks, testes
     /// antigos): o settings é BYTE-IDÊNTICO ao histórico — degradação por omissão.
     #[test]
@@ -826,14 +866,19 @@ mod tests {
         }
 
         // Os handlers históricos seguem lá: o gate é o guard, não o hook HTTP.
+        // R2c-2: o matcher agora cobre `Bash|Skill` na MESMA entry (gate de execução +
+        // guard de skill estrangeira) — o gate command do W3-6 segue intacto.
         let pre = v["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
         let still_gated = pre.iter().any(|e| {
-            e["matcher"] == "Bash"
+            e["matcher"] == "Bash|Skill"
                 && e["hooks"][0]["command"]
                     .as_str()
                     .is_some_and(|c| c.contains("guard --pretooluse"))
         });
-        assert!(still_gated, "o gate command do W3-6 permanece: {j}");
+        assert!(
+            still_gated,
+            "o gate command do W3-6 (matcher Bash|Skill) permanece: {j}"
+        );
         assert!(
             v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
                 .as_str()
