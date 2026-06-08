@@ -18,6 +18,7 @@
 //! não roda headless). O render gpui é uma casca fina sobre elas. Cores 100% em tokens
 //! de [`crate::theme`] (o lint anti-hardcode varre este arquivo).
 
+use lina_core::attention::PromptKind;
 use lina_core::{AttentionEvidence, AttentionItem, AttentionKind};
 
 // ═══════════════════════════ toast: qual item + countdown (PURO) ═══════════════════════════
@@ -73,6 +74,16 @@ pub fn badge_view(items: &[AttentionItem]) -> BadgeView {
 
 // ═══════════════════════════ copy (PURA — zero jargão, comando visível) ═══════════════════════════
 
+/// R2b: a ação primária do item é IR ATÉ O TERMINAL? `true` exatamente para permissão
+/// **não-Yn** (`Choice`/`Trust` — tela 20:30 do fundador): injetar `y` numa caixa de
+/// escolha seria input errado e injeção remota de escolha NÃO existe nesta fase — o
+/// gesto resolve no terminal (o core reforça: `resolve` devolve `None` p/ não-Yn).
+/// Custódia nunca é goto-only (o gate dela é o ⌘⏎ da pump; o campo é nominal).
+#[must_use]
+pub fn is_goto_only(item: &AttentionItem) -> bool {
+    item.kind == AttentionKind::Permission && item.prompt_kind != PromptKind::Yn
+}
+
 /// Copy do toast (story F1-1-7, com a **ARBITRAGEM do Maestro**: ux-flows vence —
 /// «Esc nunca decide», então a copy promete só o que o gesto FAZ: ⌘⏎ aprova; Esc
 /// deixa para depois — recusar é clique explícito na fila). Sem `detail` (payload
@@ -80,26 +91,51 @@ pub fn badge_view(items: &[AttentionItem]) -> BadgeView {
 /// FP medido) ganha o rótulo «conteúdo não verificado» (ADR 0021 R1 — confiabilidade
 /// não-uniforme é EXIBIDA, nunca escondida). Custódia reusa o `display` do gate
 /// existente INTACTO (zero regressão — o copy é do broker).
+///
+/// **R2b (direção do fundador — todo bloqueante alerta):** `Choice`/`Trust` NÃO são
+/// aprováveis daqui — a copy convida a ir até o terminal e NUNCA promete aprovação.
 #[must_use]
 pub fn toast_copy(item: &AttentionItem) -> String {
     match item.kind {
         AttentionKind::Custody => item.detail.clone().unwrap_or_default(),
-        AttentionKind::Permission => {
-            let tag = match item.evidence {
-                AttentionEvidence::Grid => " · conteúdo não verificado",
-                _ => "",
-            };
-            match &item.detail {
-                Some(d) => format!(
-                    "{} aguarda [{d}] — ⌘⏎ aprova · Esc deixa para depois{tag}",
-                    item.node_id
-                ),
-                None => format!(
-                    "{} aguarda sua aprovação — ⌘⏎ aprova · Esc deixa para depois{tag}",
-                    item.node_id
-                ),
+        AttentionKind::Permission => match item.prompt_kind {
+            PromptKind::Choice => format!(
+                "{} fez uma pergunta e aguarda sua escolha — vá até o terminal",
+                item.node_id
+            ),
+            PromptKind::Trust => format!(
+                "{} pede uma confirmação de segurança — vá até o terminal",
+                item.node_id
+            ),
+            PromptKind::Yn => {
+                let tag = match item.evidence {
+                    AttentionEvidence::Grid => " · conteúdo não verificado",
+                    _ => "",
+                };
+                match &item.detail {
+                    Some(d) => format!(
+                        "{} aguarda [{d}] — ⌘⏎ aprova · Esc deixa para depois{tag}",
+                        item.node_id
+                    ),
+                    None => format!(
+                        "{} aguarda sua aprovação — ⌘⏎ aprova · Esc deixa para depois{tag}",
+                        item.node_id
+                    ),
+                }
             }
-        }
+        },
+    }
+}
+
+/// R2b 1b: copy do estado vazio da fila — só afirma «sem precisar de você» quando
+/// NENHUM terminal está ocupado (um nó Blocked projeta como ocupado na UI; nunca
+/// mentir sobre ele — direção do fundador). Com trabalho em curso a frase é neutra.
+#[must_use]
+pub fn empty_state_copy(busy_terminals: usize) -> String {
+    match busy_terminals {
+        0 => "Tudo em dia ✓ — seu time está trabalhando sem precisar de você.".to_string(),
+        1 => "Nenhuma pendência agora — 1 terminal trabalhando.".to_string(),
+        n => format!("Nenhuma pendência agora — {n} terminais trabalhando."),
     }
 }
 
@@ -430,7 +466,9 @@ pub fn render_badge(
             badge.count
         )
     } else {
-        "Fila de atenção: tudo em dia".to_string()
+        // R2b 1b: neutro — "tudo em dia" pleno é afirmação do painel (que conhece os
+        // terminais ocupados); o sino sem contagem só diz que não há pendências.
+        "Fila de atenção: sem pendências".to_string()
     };
     let mut el = div()
         .id("att-badge")
@@ -522,19 +560,33 @@ pub fn render_toast(
                         ),
                 )
                 .child(div().text_color(rgb(th.text.primary)).child(text!(copy)));
+            // R2b: pergunta (Choice/Trust) → a ação primária é IR ATÉ O TERMINAL
+            // (o gesto resolve lá; aprovar/recusar não existem p/ esse formato).
+            let primary: AnyElement = if is_goto_only(item) {
+                let node = item.node_id.clone();
+                btn(
+                    cx,
+                    "att-toast-goto",
+                    "→ Ir até o terminal",
+                    (th.accent.action, th.text.on_accent),
+                    move |v, w, cx| v.attention_goto_node(&node, w, cx),
+                )
+            } else {
+                btn(
+                    cx,
+                    "att-toast-open",
+                    "Ver e decidir",
+                    (th.accent.action, th.text.on_accent),
+                    |v, _w, cx| v.attention_open_panel(cx),
+                )
+            };
             let mut actions = div()
                 .flex()
                 .flex_row()
                 .flex_wrap()
                 .items_center()
                 .gap_2()
-                .child(btn(
-                    cx,
-                    "att-toast-open",
-                    "Ver e decidir",
-                    (th.accent.action, th.text.on_accent),
-                    |v, _w, cx| v.attention_open_panel(cx),
-                ))
+                .child(primary)
                 .child(btn(
                     cx,
                     "att-toast-later",
@@ -611,10 +663,12 @@ pub fn render_toast(
 /// round-robin), idade, entrada Escalated persistente, e as ações por classe —
 /// permissão decide AQUI (registra evento; zero PTY); custódia mostra o gesto
 /// EXISTENTE (⌘⏎/⌘⇧⏎ na frente do gate — nenhum caminho novo de decisão).
+#[allow(clippy::too_many_arguments)] // render de fiação: os fios da view entram aqui (idioma do construtor do root).
 pub fn render_panel(
     items: &[lina_core::AttentionItem],
     muted_nodes: &std::collections::BTreeSet<String>,
     desk_front: Option<&str>,
+    busy_terminals: usize,
     viewport: (f32, f32),
     now_ms: u64,
     th: &Theme,
@@ -624,15 +678,14 @@ pub fn render_panel(
     let h = (viewport.1 - 120.0).max(160.0);
     let mut rows = div().flex().flex_col().gap_2();
     if items.is_empty() {
-        // Estado vazio é RECOMPENSA (ux-flows): calmo, sem alarme.
+        // Estado vazio é RECOMPENSA (ux-flows) — mas HONESTO (R2b 1b): só promete
+        // «sem precisar de você» quando nenhum terminal está ocupado/bloqueado.
         rows = rows.child(
             div()
                 .p_3()
                 .text_color(rgb(th.text.secondary))
                 .line_height(px(18.0))
-                .child(text!(
-                    "Tudo em dia ✓ — seu time está trabalhando sem precisar de você."
-                )),
+                .child(text!(empty_state_copy(busy_terminals))),
         );
     }
     for (i, item) in items.iter().enumerate() {
@@ -722,6 +775,47 @@ pub fn render_panel(
                     .text_color(rgb(th.text.muted))
                     .text_size(px(11.0))
                     .child(text!(hint)),
+            );
+        } else if is_goto_only(item) {
+            // R2b: pergunta (Choice/Trust) — o gesto resolve NO TERMINAL; aqui só
+            // navegação + mitigação de FP + mute (nunca aprovar/recusar — o core
+            // devolve None p/ não-Yn, defesa em profundidade).
+            let node_go = item.node_id.clone();
+            let node = item.node_id.clone();
+            let node_muted = muted_nodes.contains(&node);
+            let sid_fp = item.stable_id.clone();
+            row = row.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(btn(
+                        cx,
+                        ("att-goto", i64id),
+                        "→ Ir até o terminal",
+                        (th.accent.action, th.text.on_accent),
+                        move |v, w, cx| v.attention_goto_node(&node_go, w, cx),
+                    ))
+                    .child(btn(
+                        cx,
+                        ("att-fp", i64id),
+                        "Não era um pedido",
+                        (th.surface.raised, th.text.primary),
+                        move |v, _w, cx| v.attention_dismiss(&sid_fp, cx),
+                    ))
+                    .child(btn(
+                        cx,
+                        ("att-mute", i64id),
+                        if node_muted {
+                            "🔔 Reativar detecção deste terminal"
+                        } else {
+                            "🔕 Silenciar detecção deste terminal"
+                        },
+                        (th.surface.raised, th.text.primary),
+                        move |v, _w, cx| v.attention_toggle_mute(&node, cx),
+                    )),
             );
         } else {
             let node = item.node_id.clone();
@@ -839,6 +933,84 @@ mod tests {
             },
             created_ts: ts,
             state: AttentionState::Pending,
+            prompt_kind: lina_core::attention::PromptKind::Yn,
+            vt_snapshot_hash: None,
+        }
+    }
+
+    /// Item de PERGUNTA (R2b): permissão com `prompt_kind` não-Yn.
+    fn question(id: &str, node: &str, pk: lina_core::attention::PromptKind) -> AttentionItem {
+        let mut it = item(id, node, AttentionKind::Permission, 100);
+        it.prompt_kind = pk;
+        it
+    }
+
+    // ─────────────────── R2b: Question/Choice — copy + ação primária ───────────────────
+
+    /// R2b (tela 20:30 do fundador): `choice`/`trust` NÃO são aprováveis remotamente —
+    /// a copy convida a IR ATÉ O TERMINAL e NUNCA promete aprovar/recusar (injetar `y`
+    /// numa caixa de escolha seria input errado; injeção de escolha não existe na fase).
+    #[test]
+    fn toast_copy_choice_and_trust_invite_to_terminal_never_approve() {
+        use lina_core::attention::PromptKind;
+        let c = question("q1", "Terminal A", PromptKind::Choice);
+        assert_eq!(
+            toast_copy(&c),
+            "Terminal A fez uma pergunta e aguarda sua escolha — vá até o terminal"
+        );
+        let t = question("q2", "Terminal B", PromptKind::Trust);
+        let copy = toast_copy(&t);
+        assert!(
+            copy.contains("confirmação de segurança") && copy.contains("vá até o terminal"),
+            "{copy}"
+        );
+        for it in [c, t] {
+            let copy = toast_copy(&it);
+            assert!(
+                !copy.contains("aprova") && !copy.contains("⌘⏎"),
+                "pergunta nunca promete aprovação remota: {copy}"
+            );
+        }
+    }
+
+    /// A ação primária é GOTO (foco no terminal) exatamente p/ permissão não-Yn;
+    /// y/n e custódia mantêm seus gestos atuais.
+    #[test]
+    fn goto_only_for_non_yn_permission() {
+        use lina_core::attention::PromptKind;
+        assert!(!is_goto_only(&item("p", "A", AttentionKind::Permission, 1)));
+        assert!(is_goto_only(&question("q", "A", PromptKind::Choice)));
+        assert!(is_goto_only(&question("q", "A", PromptKind::Trust)));
+        // Custódia nunca é goto-only (gate ⌘⏎ da pump), mesmo com o campo nominal.
+        let mut c = item("c", "B", AttentionKind::Custody, 1);
+        c.prompt_kind = PromptKind::Choice;
+        assert!(!is_goto_only(&c));
+    }
+
+    // ─────────────────── R2b 1b: empty-state honesto ───────────────────
+
+    /// O estado vazio só afirma «sem precisar de você» quando NENHUM terminal está
+    /// ocupado/bloqueado; com trabalho em curso a copy é neutra e conta os terminais
+    /// (nunca mentir sobre um nó possivelmente Blocked — direção do fundador).
+    #[test]
+    fn empty_state_copy_is_honest_about_busy_terminals() {
+        assert_eq!(
+            empty_state_copy(0),
+            "Tudo em dia ✓ — seu time está trabalhando sem precisar de você."
+        );
+        assert_eq!(
+            empty_state_copy(1),
+            "Nenhuma pendência agora — 1 terminal trabalhando."
+        );
+        assert_eq!(
+            empty_state_copy(3),
+            "Nenhuma pendência agora — 3 terminais trabalhando."
+        );
+        for n in 1..5 {
+            assert!(
+                !empty_state_copy(n).contains("sem precisar de você"),
+                "com trabalho em curso, nunca prometer 'sem precisar de você'"
+            );
         }
     }
 

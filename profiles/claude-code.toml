@@ -60,6 +60,34 @@ otel = true                 # exporta OTel (F1-1-4)
 permission_detection = true # prompt de permissão detectável (hook Notification)
 handoff_support = true      # aceita envelope A2A completo c/ --await (13.9 item 5)
 
+# ── R2b (F1-1-8): bytes REAIS do diálogo de permissão do Claude Code 2.1.168 ──
+#
+# O diálogo NÃO é um "(y/n)": é um SELECT NUMERADO —
+#     ❯ 1. Yes
+#       2. Yes, and always allow access to <dir>/ from this project
+#       3. No
+# (fonte: 2 sondas em PTY real nesta máquina, 2026-06-07, logs em
+# /tmp/lina-r2b-keys/approve*.raw.log — claude 2.1.168, cwd fresco com
+# permissions.defaultMode=default; o rodapé dos selects da TUI confirma a semântica:
+# "Enter to select · ↑↓ to navigate · Esc to cancel", visível na tela do fundador).
+#
+# approve = "1": a tecla `1` SOZINHA (sem Enter) seleciona "Yes" — nas 2 sondas o
+#   diálogo foi dismissado e o turno prosseguiu no instante do keypress. Preferida a
+#   `\r` (Enter selecionaria o DESTACADO, que hoje é o 1, mas é sensível a mudança de
+#   destaque em versões futuras; `1` aponta pela OPÇÃO).
+# deny = ESC (0x1B): "Esc to cancel" — cancela o diálogo sem executar e sem entrar no
+#   sub-estado de feedback da opção 3 ("No, and tell Claude…", que abre input de texto
+#   e travaria uma recusa automatizada).
+#
+# Ressalva honesta: no ambiente de sonda (claude aninhado em outro harness) a tool
+# Bash interna travou pós-aprovação, então o EFEITO-disco do approve não foi
+# reproduzível ali — o dismissal do diálogo foi. A prova fim-a-fim é o gate da onda
+# (AC-0021.7: aprovar pelo toast destrava um Claude REAL na tela).
+# O default conservador do CÓDIGO segue "y\r"/"n\r" (ADR 0021 §1) — intocado.
+[approval_keys]
+approve = "1"
+deny = "\u001B"
+
 # Fim-de-resposta (consumido por W0-10): no modo stream-json o Claude Code encerra
 # a resposta com uma linha JSON de tipo "result" ({"type":"result","subtype":...}).
 [end_signal]

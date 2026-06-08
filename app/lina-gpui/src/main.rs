@@ -754,6 +754,46 @@ impl WorkspaceView {
         }
     }
 
+    /// R2b: «Ir até o terminal» — ação primária de pergunta (`Choice`/`Trust`): foca e
+    /// REVELA o nó pelo NOME (o `node_id` da fila é o nome do roster). O gesto resolve
+    /// LÁ (escolher no próprio terminal); nada é decidido/injetado daqui. Nome que não
+    /// resolve (nó fechou entre o toast e o clique) → no-op logado, nunca panic.
+    fn attention_goto_node(&mut self, node_name: &str, window: &Window, cx: &mut Context<Self>) {
+        let found = lock(&self.nodes.model)
+            .nodes
+            .iter()
+            .find(|(_, v)| v.name == node_name)
+            .map(|(id, _)| *id);
+        match found {
+            Some(id) => {
+                self.focus(id);
+                self.reveal(id, window);
+                // O convite foi aceito: recolhe o toast (o item segue na fila/badge
+                // até o bloqueio resolver no terminal — sinal de resolução é do
+                // detector, F1-1-6/Dev 01).
+                self.attention_machine.snooze(&self.attention_items);
+                cx.notify();
+                eprintln!("lina-gpui: [ATT] goto — foco/zoom no nó {node_name:?}");
+            }
+            None => eprintln!(
+                "lina-gpui: [ATT] goto — nó {node_name:?} não está mais no canvas (fechou?)"
+            ),
+        }
+    }
+
+    /// R2b: nº de terminais TRABALHANDO agora (Busy/Running — `Blocked` do core projeta
+    /// como Busy na UI) — alimenta o empty-state honesto da fila (1b).
+    fn busy_terminal_count(&self) -> usize {
+        lock(&self.nodes.model)
+            .nodes
+            .values()
+            .filter(|v| {
+                matches!(v.kind, NodeKind::Terminal)
+                    && matches!(v.status, NodeStatus::Busy | NodeStatus::Running)
+            })
+            .count()
+    }
+
     // === IME (W2-4): a composição do SO (dead-keys ´~^, cedilha, CJK) entra por estes ganchos, ===
     // === chamados pelo `ImeHandler` no `paint`. Espelham os helpers do terminal do Zed.         ===
 
@@ -1685,6 +1725,15 @@ impl WorkspaceView {
                     None => {
                         let now = lina_core::now_ms();
                         match self.attention_machine.visible(&self.attention_items, now) {
+                            // R2b: pergunta (Choice/Trust) no toast — ⌘⏎ NÃO aprova
+                            // (não há o que aprovar): executa a ação primária, IR ATÉ
+                            // O TERMINAL (navegação, não decisão).
+                            Some(attention_ui::ToastView::Single(idx))
+                                if attention_ui::is_goto_only(&self.attention_items[idx]) =>
+                            {
+                                let node = self.attention_items[idx].node_id.clone();
+                                self.attention_goto_node(&node, window, cx);
+                            }
                             Some(attention_ui::ToastView::Single(idx))
                                 if self.attention_items[idx].kind
                                     == lina_core::AttentionKind::Permission =>
@@ -2683,10 +2732,13 @@ impl Render for WorkspaceView {
                 .collect();
             let desk_front = lock(&self.desk).front().map(|p| p.id().to_string());
             let vp = window.viewport_size();
+            // R2b 1b: empty-state honesto — o painel sabe quantos terminais trabalham.
+            let busy = self.busy_terminal_count();
             root = root.child(attention_ui::render_panel(
                 &self.attention_items,
                 &muted_set,
                 desk_front.as_deref(),
+                busy,
                 (f32::from(vp.width), f32::from(vp.height)),
                 att_now,
                 &th,
@@ -3287,10 +3339,31 @@ fn main() {
         .unwrap_or(0);
     let idle_ms = injection_profile.idle_ms.unwrap_or(200);
     let bridge = GpuiBridgeHost::new(Arc::clone(&model));
+    // F1-1-7: a FILA DE ATENÇÃO unificada — a projeção `AttentionQueue` do core cabeada
+    // ao MESMO event log (replay no boot reconstrói pendência pós-crash — critério 5) e
+    // à mesa de custódia. NENHUM byte vai ao PTY por este caminho (ADR 0021 §6).
+    // Criada ANTES do pump (R2b): a varredura viva da detecção usa a projeção de mute
+    // do hub (mesma fonte do log — defesa em profundidade nas duas pontas).
+    let attention = Arc::new(AttentionHub::new(
+        Arc::clone(&store),
+        Arc::clone(&desk),
+        Arc::clone(&model),
+    ));
+    // R2b: `LINA_ATTENTION_DEMO` setado = teatro determinístico do fundador — o loop
+    // VIVO de detecção desliga (demo OU real, nunca os dois; sem duplicar pedidos).
+    let demo_kind = std::env::var("LINA_ATTENTION_DEMO")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|k| !k.is_empty() && k != "0");
+    let live_detection = demo_kind.is_none();
+    if !live_detection {
+        eprintln!("lina-gpui: [ATT] modo DEMO — detecção viva de grid DESLIGADA nesta sessão");
+    }
     // inv#6/no-panic: sem a ponte core→UI o app não renderiza terminais — encerra com mensagem clara
     // em vez de backtrace. (Falha só em condição catastrófica de sistema; instalação nova não cai aqui.)
     // FIX DE GATE F1-0: o pump precisa do Supervisor p/ devolver o nó a Idle no fim-de-resposta
     // (transição event-sourced — destrava a retenção F1-0-4 na 2ª mensagem ao mesmo alvo).
+    // R2b: + grids/hub/flag — a metade-app da detecção viva roda no tick do pump.
     let mut pump = match spawn_pump(
         bridge,
         delta_rx,
@@ -3298,6 +3371,9 @@ fn main() {
         Arc::clone(&store),
         idle_ms,
         Arc::clone(&sup),
+        Arc::clone(&grids),
+        Arc::clone(&attention),
+        live_detection,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -3357,35 +3433,35 @@ fn main() {
     )
     .spawn();
 
-    // F1-1-7: a FILA DE ATENÇÃO unificada — a projeção `AttentionQueue` do core cabeada
-    // ao MESMO event log (replay no boot reconstrói pendência pós-crash — critério 5) e
-    // à mesa de custódia (a fila APRESENTA custódia+permissão juntas; o gesto da
-    // custódia segue o ⌘⏎ existente). NENHUM byte vai ao PTY por este caminho (ADR 0021
-    // §6) — aprovar/recusar só registra a decisão; o write é F1-1-8.
-    let attention = Arc::new(AttentionHub::new(
-        Arc::clone(&store),
-        Arc::clone(&desk),
-        Arc::clone(&model),
-    ));
-    // LINA_ATTENTION_DEMO=1 (roteiro do fundador, idioma de LINA_DEMO/LINA_DASH): semeia
-    // UM pedido de permissão REAL no log → o toast da story aparece sem esperar um
-    // Claude travado de verdade; aprovar/recusar mostra o audit trail no log.
-    if matches!(
-        std::env::var("LINA_ATTENTION_DEMO")
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("1")
-    ) {
+    // LINA_ATTENTION_DEMO (roteiro do fundador, idioma de LINA_DEMO/LINA_DASH): semeia
+    // UM pedido REAL no log → o toast aparece sem esperar um Claude travado de verdade.
+    // `1`|`yn` = permissão y/n (aprovável); `choice` = PERGUNTA de múltipla escolha
+    // (R2b — toast "fez uma pergunta", ação primária IR ATÉ O TERMINAL, sem aprovar).
+    // O hub/flag nasceram ANTES do pump (R2b); aqui só a SEMENTE (demo ⇒ live OFF).
+    if let Some(kind) = demo_kind.as_deref() {
+        let (prompt_kind, detail) = match kind {
+            "choice" => (
+                lina_core::attention::PromptKind::Choice,
+                "Qual opção você quer selecionar?".to_string(),
+            ),
+            _ => (
+                lina_core::attention::PromptKind::Yn,
+                "git push origin/master".to_string(),
+            ),
+        };
         let seeded = lock(&store).append(&lina_core::DomainEvent::PermissionAsked {
             node_id: "Terminal B".into(),
             tool: Some("Bash".into()),
-            detail: Some("git push origin/master".into()),
+            detail: Some(detail),
             evidence: lina_core::PermissionEvidence::Hook,
             stable_id: format!("demo-{}", lina_core::now_ms()),
+            prompt_kind,
+            vt_snapshot_hash: None,
         });
         match seeded {
-            Ok(_) => eprintln!("lina-gpui: [ATT] DEMO — PermissionAsked semeado (toast em <2s)"),
+            Ok(_) => eprintln!(
+                "lina-gpui: [ATT] DEMO — PermissionAsked semeado (kind={prompt_kind:?}; toast em <2s)"
+            ),
             Err(e) => eprintln!("lina-gpui: [ATT] DEMO — falha ao semear: {e}"),
         }
     }

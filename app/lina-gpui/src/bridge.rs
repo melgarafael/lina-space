@@ -2859,6 +2859,152 @@ impl NodeManager {
     }
 }
 
+// ─────────────── R2b · fiação VIVA da detecção (metade-app — grids do APP) ───────────────
+//
+// O `PermissionWatch::scan` do core varre um `lina_core::PtyHost` — mas o APP roda
+// `PtyManager`-direto (`wire_terminal`: reader thread + `Grid` próprios; zero `PtyHost`
+// no app). Esta é a MESMA fiação com o DETECTOR CANÔNICO do core
+// (`PermissionDetector::observe_grid` — padrões/re-arm/cleared/FP, fonte única) sobre o
+// host que o app POSSUI: idle por silêncio de OUTPUT (o `GridDelta.bytes` do reader —
+// sinal do produtor, idêntico ao `metrics.bytes_read` do core), mute pela MESMA
+// projeção do log (via closure — o hub injeta), append no MESMO EventStore e Blocked
+// pela MESMA porta canônica (`LifecycleEngine::transition`). DIVERGÊNCIA DE SEAM
+// regisrada na entrega: quando o app migrar p/ `PtyHost` (ou o core generalizar o host
+// num trait), isto troca 1-para-1 pelo `PermissionWatch::scan`.
+
+/// O que UMA varredura emitiu — espelho da `lina_core::ScanOutcome` da metade-core
+/// (asks novos + prompts respondidos no terminal), AMBOS já apendados no log pela
+/// própria varredura (`PermissionAsked` e `PermissionPromptCleared`). O pump usa as
+/// contagens p/ marcar `worked`; o hub reflete ao vivo no próximo `sync` (re-replay do
+/// log). Alinhar a forma à do core torna o swap p/ `PermissionWatch::scan` (quando o
+/// app migrar p/ `PtyHost`/trait) 1-para-1.
+#[derive(Debug, Default, Clone)]
+pub struct AppScanOutcome {
+    pub asks: Vec<lina_core::PermissionAsk>,
+    pub cleared: Vec<lina_core::ClearedPrompt>,
+}
+
+impl AppScanOutcome {
+    /// Houve algo nesta varredura (asks novos OU prompts respondidos)?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.asks.is_empty() && self.cleared.is_empty()
+    }
+}
+
+/// Metade-app do loop vivo de detecção (caller-driven, sem thread própria — padrão do
+/// módulo do core): o pump chama [`Self::note_output`] a cada `GridDelta` e
+/// [`Self::scan`] no tick (≤1s ⇒ latência ≤ `WATCH_IDLE_MS` + 1 tick < 3s).
+pub struct AppPermissionWatch {
+    det: lina_core::PermissionDetector,
+    /// Por nó: `now_ms` da última MUDANÇA de output (alimentado pelo reader via pump).
+    last_output: BTreeMap<NodeId, u64>,
+    idle_after_ms: u64,
+}
+
+impl Default for AppPermissionWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AppPermissionWatch {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            det: lina_core::PermissionDetector::new(),
+            last_output: BTreeMap::new(),
+            // Mesma calibração da metade-core (silêncio de output que conta como idle).
+            idle_after_ms: lina_core::WATCH_IDLE_MS,
+        }
+    }
+
+    /// O reader emitiu bytes p/ o nó AGORA (chamado no drain dos `GridDelta`).
+    pub fn note_output(&mut self, node: NodeId, now_ms: u64) {
+        self.last_output.insert(node, now_ms);
+    }
+
+    /// UMA varredura dos terminais do APP (espelha `PermissionWatch::scan` da metade-
+    /// core): respeita o mute (projeção do log, injetada pelo hub), deriva idle por
+    /// silêncio de output, roda o detector canônico e apenda no log, na MESMA varredura:
+    /// (1) cada `PermissionAsked` + `Blocked{reason=permission_prompt}` pela porta
+    /// canônica; (2) cada `PermissionPromptCleared{node_id, stable_id}` dos prompts
+    /// respondidos DIRETO no terminal (R2b item 5 — contrato aprovado: remoção no fold,
+    /// SEM decisão fabricada; ≠ dismiss/FP, ≠ resolve). Devolve [`AppScanOutcome`] p/ o
+    /// hub refletir ao vivo (ambos já no log; o `sync` re-projeta). Identidade = NOME
+    /// canônico do roster (ADR 0021 §5).
+    pub fn scan(
+        &mut self,
+        grids: &BTreeMap<NodeId, Grid>,
+        sup: &Supervisor,
+        store: &Arc<Mutex<EventStore>>,
+        lifecycle: &mut lina_core::lifecycle::LifecycleEngine,
+        is_muted: &dyn Fn(&str) -> bool,
+        now_ms: u64,
+    ) -> AppScanOutcome {
+        let mut out = AppScanOutcome::default();
+        for (node, grid) in grids {
+            // Nome CANÔNICO do roster — nó fora do roster (corrida de fechamento) pula.
+            let Some(name) = sup.get(*node).map(|n| n.name) else {
+                continue;
+            };
+            // Mute por nó: nem roda `observe_grid` (defesa em profundidade — a fila
+            // aplica a mesma regra no fold dela).
+            if is_muted(&name) {
+                continue;
+            }
+            let last = self.last_output.entry(*node).or_insert(now_ms);
+            let idle = now_ms.saturating_sub(*last) >= self.idle_after_ms;
+            let ask = {
+                let g = lock(grid);
+                self.det.observe_grid(&name, &**g, idle, now_ms)
+            };
+            let Some(ask) = ask else { continue };
+            // Fato antes do efeito: o pedido entra no log JÁ na varredura.
+            if let Err(e) = lock(store).append(&ask.to_event()) {
+                eprintln!("lina-gpui: [ATT] watch — append do PermissionAsked falhou: {e}");
+                continue;
+            }
+            // Cabeçalho "Idle" parado numa pergunta é estado MENTIROSO (direção do
+            // fundador): Blocked auditado pela porta canônica; falha não derruba a
+            // varredura (o pedido já está no log).
+            if let Err(e) = lifecycle.transition(
+                sup,
+                &mut lock(store),
+                *node,
+                lina_core::NodeStatus::Blocked,
+                lina_core::permission_detect::BLOCKED_REASON_PROMPT,
+            ) {
+                eprintln!("lina-gpui: [ATT] watch — transição p/ Blocked falhou: {e}");
+            }
+            eprintln!(
+                "lina-gpui: [ATT] watch — PermissionAsked emitido (node={name:?} kind={:?})",
+                ask.kind
+            );
+            out.asks.push(ask);
+        }
+        // R2b item 5 (FECHADO): prompts respondidos DIRETO no terminal desde o último
+        // scan → `PermissionPromptCleared` no log (o fold do core remove o item; o hub
+        // reflete no `sync`). Apêndice na PRÓPRIA varredura (como a metade-core), não
+        // mais no pump — forma idêntica ao `ScanOutcome`.
+        for c in self.det.take_cleared() {
+            if let Err(e) = lock(store).append(&DomainEvent::PermissionPromptCleared {
+                node_id: c.node_id.clone(),
+                stable_id: c.stable_id.clone(),
+            }) {
+                eprintln!("lina-gpui: [ATT] watch — append de PermissionPromptCleared falhou: {e}");
+                continue;
+            }
+            eprintln!(
+                "lina-gpui: [ATT] watch — prompt respondido no terminal → PermissionPromptCleared (node={:?} stable_id={})",
+                c.node_id, c.stable_id
+            );
+            out.cleared.push(c);
+        }
+        out
+    }
+}
+
 /// Handle da thread-bomba (background) da ponte; encerra no `stop`/`Drop`.
 pub struct Pump {
     stop: Arc<AtomicBool>,
@@ -2886,6 +3032,7 @@ impl Drop for Pump {
 /// um [`crate::cost::CostMeter`]; ao fim de um turno (idle ≥ `idle_ms`) apenda `TokenUsageReported`
 /// (estimado por bytes) no `store` AUTORITATIVO (ws2) — é o que o `CostLedger` soma p/ o teto. Sem isto,
 /// o teto era INERTE (ninguém emitia uso).
+#[allow(clippy::too_many_arguments)] // fiação única do pump: os fios do app entram aqui.
 pub fn spawn_pump(
     mut bridge: GpuiBridgeHost,
     delta_rx: Receiver<GridDelta>,
@@ -2896,6 +3043,12 @@ pub fn spawn_pump(
     // SUPERVISOR (transição event-sourced do lifecycle F1-0-3) — sem isto o router marca Busy
     // na entrega (F1-0-4) e nada o desfaz em produção: a 2ª msg ao mesmo alvo reteria até a DLQ.
     sup: Arc<Supervisor>,
+    // R2b (fiação viva da detecção): os grids do app (a varredura lê o VT parseado) e a
+    // projeção de mute (hub). `live_detection=false` desliga o loop vivo — modo DEMO
+    // (`LINA_ATTENTION_DEMO`) é teatro determinístico: demo OU real, nunca os dois.
+    grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+    attention: Arc<AttentionHub>,
+    live_detection: bool,
 ) -> std::io::Result<Pump> {
     let stop = Arc::new(AtomicBool::new(false));
     let join = {
@@ -2912,6 +3065,11 @@ pub fn spawn_pump(
                 // transição (não a cada delta → sem busy-loop/churn de render). Idle = "resposta pronta".
                 let mut active: std::collections::HashSet<NodeId> =
                     std::collections::HashSet::new();
+                // R2b: metade-app do loop vivo de detecção (detector canônico do core
+                // sobre os grids do app; tick ≤1s ⇒ claude real bloqueado vira
+                // PermissionAsked no log em <3s — o hub re-projeta e o toast aparece).
+                let mut watch = AppPermissionWatch::new();
+                let mut last_scan_ms = 0u64;
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -2933,6 +3091,9 @@ pub fn spawn_pump(
                     // Mede o output de cada nó (node+bytes do GridDelta) — fonte do teto de custo.
                     while let Ok(delta) = delta_rx.try_recv() {
                         meter.record_output(delta.node, delta.bytes, now);
+                        // R2b: output vivo re-arma o relógio de idle da detecção (sinal
+                        // do PRODUTOR — o mesmo do `metrics.bytes_read` da metade-core).
+                        watch.note_output(delta.node, now);
                         // W4-6 gap2: 1ª saída do turno → Busy (transição) → o `aria_label` do nó e o
                         // status refletem "rodando"; habilita o próximo →Idle a anunciar.
                         if active.insert(delta.node) {
@@ -2942,6 +3103,31 @@ pub fn spawn_pump(
                             });
                         }
                         worked = true;
+                    }
+                    // R2b: varredura viva a cada ~500ms (≤1s da receita): detector
+                    // canônico + mute do hub (projeção do log) + Blocked auditado.
+                    if live_detection && now.saturating_sub(last_scan_ms) >= 500 {
+                        last_scan_ms = now;
+                        // Snapshot raso dos handles (lock do mapa curto; cada grid trava
+                        // individualmente DENTRO do scan — mesma ordem do render).
+                        let snapshot: BTreeMap<NodeId, Grid> = lock(&grids)
+                            .iter()
+                            .map(|(k, v)| (*k, Arc::clone(v)))
+                            .collect();
+                        // A varredura apenda asks E cleared no log (forma do
+                        // `ScanOutcome` da metade-core); o hub reflete ao vivo no
+                        // próximo `sync` (re-replay). Marca `worked` se algo aconteceu.
+                        let outcome = watch.scan(
+                            &snapshot,
+                            &sup,
+                            &store,
+                            &mut lifecycle,
+                            &|name| attention.is_node_muted(name),
+                            now,
+                        );
+                        if !outcome.is_empty() {
+                            worked = true;
+                        }
                     }
                     // Fim-de-turno por idle → apenda TokenUsageReported (estimado) no store autoritativo.
                     for (node, tokens) in meter.poll_finished_turns(now, idle_ms) {
@@ -4167,6 +4353,15 @@ mod tests {
         let (delta_tx, delta_rx) = std::sync::mpsc::channel::<GridDelta>();
         let bus_rx = sup.subscribe();
         let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        // R2b: a varredura viva da detecção é IRRELEVANTE p/ este teste de lifecycle
+        // (sem grids) → `live_detection=false` mantém o foco no fim-de-resposta.
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let desk_t: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let attention_t = Arc::new(AttentionHub::new(
+            Arc::clone(&store),
+            desk_t,
+            Arc::clone(&model),
+        ));
         let mut pump = spawn_pump(
             GpuiBridgeHost::new(Arc::clone(&model)),
             delta_rx,
@@ -4174,6 +4369,9 @@ mod tests {
             Arc::clone(&store),
             50, // idle do perfil: 50ms fecha o turno (sinal de fim-de-resposta do medidor)
             Arc::clone(&sup),
+            grids,
+            attention_t,
+            false,
         )
         .expect("pump");
 
@@ -5015,6 +5213,9 @@ mod tests {
             detail: Some(detail.into()),
             evidence: lina_core::PermissionEvidence::Hook,
             stable_id: sid.into(),
+            // R2b: shape novo do contrato — y/n aprovável; sem Captura 1 (origem hook).
+            prompt_kind: lina_core::attention::PromptKind::Yn,
+            vt_snapshot_hash: None,
         }
     }
 
@@ -5148,6 +5349,175 @@ mod tests {
             .filter(|r| r.kind == "NodeDetectionMuted")
             .count();
         assert_eq!(muted_events, 2, "liga + desliga persistidos no log");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─────────────── R2b · AppPermissionWatch (metade-app da fiação viva) ───────────────
+
+    /// Grid com a CAIXA DE ESCOLHA real da tela do fundador (20:30) + roster com o nó.
+    fn choice_grid_setup(
+        tag: &str,
+    ) -> (
+        Arc<Supervisor>,
+        NodeId,
+        Grid,
+        Arc<Mutex<EventStore>>,
+        PathBuf,
+    ) {
+        let base = std::env::temp_dir().join(format!("lina-appwatch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let sup = Arc::new(Supervisor::new());
+        let node = sup.register("Terminal A", None, Box::new(std::io::sink()));
+        let grid: Grid = Arc::new(Mutex::new(Box::new(AlacrittyBackend::new(80, 24))));
+        lock(&grid).advance(
+            b"Isto e um teste de multipla escolha. Qual opcao voce quer selecionar?\r\n\
+              \xE2\x9D\xAF 1. Opcao A\r\n  2. Opcao B\r\n  3. Opcao C\r\n\
+              Enter to select \xC2\xB7 \xE2\x86\x91\xE2\x86\x93 to navigate \xC2\xB7 Esc to cancel\r\n",
+        );
+        (sup, node, grid, store, base)
+    }
+
+    /// **Metade-app da fiação viva (R2b):** com a caixa de escolha REAL parada no grid
+    /// e silêncio de output ≥1,5s, UM scan apenda `PermissionAsked{prompt_kind:choice}`
+    /// no log com o NOME do roster (ADR 0021 §5) e transiciona o nó p/ Blocked
+    /// (`reason=permission_prompt`); scans seguintes NÃO duplicam (re-arm do detector).
+    /// Output vivo (sem idle) nunca emite.
+    #[test]
+    fn app_watch_appends_choice_ask_blocks_node_without_duplicates() {
+        let (sup, node, grid, store, base) = choice_grid_setup("choice");
+        let mut grids: BTreeMap<NodeId, Grid> = BTreeMap::new();
+        grids.insert(node, Arc::clone(&grid));
+        let mut lifecycle = lina_core::lifecycle::LifecycleEngine::new();
+        let mut watch = AppPermissionWatch::new();
+        let t0 = 1_000_000_u64;
+        watch.note_output(node, t0);
+
+        // Ainda "vivo" (sem 1,5s de silêncio): nada emite.
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 200);
+        assert!(out.is_empty(), "output vivo nunca emite");
+        // Silêncio ≥ idle: emite UMA vez, com kind=choice e nome do roster.
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 1_600);
+        assert_eq!(out.asks.len(), 1, "prompt parado + idle ⇒ 1 pedido");
+        let recs = lock(&store).events().expect("events");
+        let ask = recs
+            .iter()
+            .find(|r| r.kind == "PermissionAsked")
+            .expect("PermissionAsked no log");
+        assert_eq!(ask.payload["prompt_kind"], "choice");
+        assert_eq!(
+            ask.payload["node_id"], "Terminal A",
+            "nome do roster, não uuid"
+        );
+        assert!(
+            ask.payload["vt_snapshot_hash"].as_str().is_some(),
+            "Captura 1 presente (origem grid)"
+        );
+        assert!(
+            recs.iter().any(
+                |r| r.kind == "NodeStatusChanged" && r.payload["reason"] == "permission_prompt"
+            ),
+            "nó Blocked auditado: {recs:?}"
+        );
+        // Re-scan: o re-arm do detector NÃO duplica o mesmo prompt.
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 3_000);
+        assert!(out.is_empty(), "mesmo prompt não re-emite");
+        let asks = lock(&store)
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == "PermissionAsked")
+            .count();
+        assert_eq!(asks, 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **R2b item 5 (contrato aprovado) — ciclo cleared FIM-A-FIM:** Watch detecta →
+    /// item na fila do hub; respondido NO TERMINAL → `PermissionPromptCleared` apendado
+    /// → o item SOME de `items()` SEM evento de decisão (nem Resolved nem Dismissed).
+    /// Distinto do dismiss (FP): a telemetria de FP NÃO é tocada.
+    #[test]
+    fn cleared_event_removes_item_from_queue_without_decision() {
+        let (sup, node, grid, store, base) = choice_grid_setup("e2e-cleared");
+        let mut grids: BTreeMap<NodeId, Grid> = BTreeMap::new();
+        grids.insert(node, Arc::clone(&grid));
+        let mut lifecycle = lina_core::lifecycle::LifecycleEngine::new();
+        let mut watch = AppPermissionWatch::new();
+        // Hub sobre o MESMO store (re-projeta o log a cada sync).
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let hub = AttentionHub::new(Arc::clone(&store), desk, model);
+        let t0 = 3_000_000_u64;
+        watch.note_output(node, t0);
+
+        // Detecta o prompt de escolha → o hub vê 1 item.
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 1_600);
+        assert_eq!(out.asks.len(), 1);
+        let items = hub.sync(t0 + 1_700);
+        assert_eq!(items.len(), 1, "pergunta na fila");
+        assert_eq!(
+            items[0].prompt_kind,
+            lina_core::attention::PromptKind::Choice
+        );
+
+        // Humano responde NO TERMINAL (caixa some do grid) → a PRÓPRIA varredura apenda
+        // PermissionPromptCleared (forma do ScanOutcome — sem etapa extra no caller).
+        lock(&grid).advance(b"\x1b[2J\x1b[H$ rodando o que escolhi...\r\n");
+        watch.note_output(node, t0 + 2_000);
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 4_000);
+        assert_eq!(out.cleared.len(), 1, "1 prompt respondido no terminal");
+        // O item SOME da fila — sem Resolved nem Dismissed no log.
+        let items = hub.sync(t0 + 4_100);
+        assert!(
+            items.is_empty(),
+            "prompt respondido no terminal sai da fila"
+        );
+        let recs = lock(&store).events().expect("events");
+        assert!(
+            recs.iter().any(|r| r.kind == "PermissionPromptCleared"),
+            "o fato 'respondido no terminal' está no log"
+        );
+        assert!(
+            !recs
+                .iter()
+                .any(|r| r.kind == "PermissionResolved" || r.kind == "PermissionDismissed"),
+            "NENHUMA decisão fabricada (cleared ≠ resolve/dismiss)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Mute por nó (projeção injetada — a mesma do hub) DESLIGA a varredura do nó; e o
+    /// prompt RESPONDIDO no terminal (grid mudou) volta em `out.cleared` com o stable_id
+    /// original (apendado como `PermissionPromptCleared` pela própria varredura).
+    #[test]
+    fn app_watch_respects_mute_and_reports_cleared() {
+        let (sup, node, grid, store, base) = choice_grid_setup("mute");
+        let mut grids: BTreeMap<NodeId, Grid> = BTreeMap::new();
+        grids.insert(node, Arc::clone(&grid));
+        let mut lifecycle = lina_core::lifecycle::LifecycleEngine::new();
+        let mut watch = AppPermissionWatch::new();
+        let t0 = 2_000_000_u64;
+        watch.note_output(node, t0);
+
+        // Nó mutado: nem roda o detector (defesa em profundidade com a fila).
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| true, t0 + 1_600);
+        assert!(out.is_empty(), "mutado nunca emite");
+
+        // Desmutado: emite; depois o humano responde NO TERMINAL (grid muda) → cleared.
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 1_700);
+        assert_eq!(out.asks.len(), 1);
+        let sid = out.asks[0].stable_id.clone();
+        // Resposta no terminal: a caixa sai da tela.
+        lock(&grid).advance(b"\x1b[2J\x1b[H$ comando rodando...\r\n");
+        watch.note_output(node, t0 + 2_000);
+        let out = watch.scan(&grids, &sup, &store, &mut lifecycle, &|_| false, t0 + 4_000);
+        assert!(
+            out.cleared.iter().any(|c| c.stable_id == sid),
+            "prompt respondido no terminal volta em out.cleared: {:?}",
+            out.cleared
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
