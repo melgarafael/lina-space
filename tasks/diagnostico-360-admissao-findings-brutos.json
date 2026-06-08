@@ -1,0 +1,424 @@
+{
+  "summary": "Diagnóstico 360° do módulo Novo Agente (⌘N) do Lina: por que o terminal criado pelo modal fica isolado dos mecanismos (custo/atividade/skills/contexto) vs o caminho canônico",
+  "agentCount": 7,
+  "logs": [],
+  "result": {
+    "findings": [
+      {
+        "subsystem": "SPAWN/NASCIMENTO DO NÓ (terminal) — comparação caminho ⌘N (agent_modal) vs. caminho CANÔNICO (onboarding/seed)",
+        "canonical_path": "main.rs:3261-3302 — seed_one() — cria t0/t1 (demo) OU nó vazio (produção); main.rs:3400-3416 — NodeManager CRIADO com seq_start (nºnós semeados); bridge.rs:1453-1504 — wire_terminal() alocada no Supervisor.register()",
+        "newagent_path": "main.rs:1243-1318 — modal_commit() → bridge.rs:2704-2845 — create_agent_with() chama wire_terminal() + persiste 4 eventos (NodeAdded, TerminalSpawned, NodeRoleAssigned, CliProfileSet se motor escolhido)",
+        "divergences": [
+          {
+            "what": "ALOCAÇÃO DO NodeId — ordem NO SUPERVISOR",
+            "evidence": "bridge.rs:1467 (wire_terminal): sup.register(name, role, writer) aloca o NodeId DENTRO do wire_terminal; main.rs:3261-3302 (seed_one): chama wire_terminal DEPOIS de ter o cwd/cmd prontos; VERSUS bridge.rs:2704-2845 (create_agent_with): o wire_terminal é chamado ANTES de persister NodeAdded — o NodeId sai do register mas o SEQ da fila vem DEPOIS",
+            "impact": "o NodeId semeado (t0) nasce COM o papel já NO ROSTER VIA register(role=...) (linha 1467) e DEPOIS persiste NodeAdded; o ⌘N registra no sup via wire_terminal na linha 2766 (dentro de create_agent_with) MAS o SEQ (`seq` linha 2724-2729) NÃO é sincronizado com o Supervisor — o NodeManager usa seu próprio seq; isso causa o NodeId do ⌘N estar 'fora da sequência contígua' que o bootstrap espera",
+            "severity": "MEDIA"
+          },
+          {
+            "what": "EVENTOS PERSISTIDOS — cardinalidade e ORDEM divergem",
+            "evidence": "main.rs:3278-3288 — seed_one() registra SÓ 2 eventos: NodeAdded + TerminalSpawned (sem NodeRoleAssigned nem CliProfileSet); bridge.rs:2782-2821 — create_agent_with() registra OBRIGATORIAMENTE 4 eventos: NodeAdded, TerminalSpawned, NodeRoleAssigned, CliProfileSet (quando motor escolhido) — e sem o motor (linhas 2741) NÃO há CliProfileSet mas os 3 anteriores SEMPRE entram",
+            "impact": "o CostLedger (que re-projeta do log inteiro) e o dashboard (que lê agents.json) veem NodeRoleAssigned OBRIGATORIAMENTE no ⌘N (linha 2802) mas NÃO no seed (t0 vem SEM NodeRoleAssigned — só o papel vai via register(role=...)). Isto quebra a PROJEC~ÃO de `ProjectedNode.role` — o replay falha ou difere entre os dois caminhos",
+            "severity": "ALTA"
+          },
+          {
+            "what": "PAPEL (role) — fluxo de ENTRADA e PERSISTÊNCIA",
+            "evidence": "bridge.rs:1467: seed_one chama wire_terminal(..., role='terminal', ...) HARDCODED em main.rs:3271; versus bridge.rs:2719-2722 (create_agent_with): o papel vem DERIVADO infer_agent_role(name) OU override (role_override), DEPOIS persiste NodeRoleAssigned com esse papel (linhas 2802-2809). O papel DERIVADO entra NO ROSTER via register(Some(role)) (linha 1467) — fonte única = o Supervisor — e TAMBÉM no log via NodeRoleAssigned",
+            "impact": "o seed usa papel HARDCODED 'terminal' para AMBOS os nós (t0 e t1 são idênticos 'Terminal A' e 'Terminal B', papel 'terminal'); o ⌘N DERIVA do nome do usuário (ex.: 'Revisor' → papel 'reviewer' via co-piloto M6-E2). Isto causa DIFERENÇA de observabilidade: o painel de 'Atividade' lista os 2 semeados como papel='terminal' (genéricos) enquanto os ⌘N aparecem com papéis específicos (reviewer/architect/etc.); o agents.json reflecte isso, provocando divergência visual no `lina list`",
+            "severity": "ALTA"
+          },
+          {
+            "what": "MOTOR (engine) — seleção e CLI Profile",
+            "evidence": "main.rs:3262 (seed_one): cmd = (*cmd_factory)(name) — usa o shell PADRÃO (shell_cmd em bridge.rs:1687); bridge.rs:2733-2741 (create_agent_with): engine é ESCOLHIDO no modal (M6) — pode ser motor descoberto (claude/codex/etc.) ou override do Avançado. Linha 2812-2820: se engine.profile_id existe, PERSISTE CliProfileSet; seed NUNCA tem profile_id porque usa shell, logo CliProfileSet NUNCA entra",
+            "impact": "o seed (t0/t1) usa shell GENÉRICO e NUNCA registra CliProfileSet; o ⌘N escolhe motor e registra CliProfileSet com o profile_id (ex.: 'claude-code'). Isto diverge a PROJEÇÃO de `ProjectedNode.cli_profile` — o Inspector (P4) vê o profile do ⌘N mas NÃO do seed. O EventStore replica diferente; o painel de Atividade NÃO tem column 'motor' e PORTANTO não mostra a divergência (é escondida); MAS o log tem 17.607 TokenUsageReported de entrega real → o ⌘N rodou motor de verdade, enquanto o seed rodou shell (BashProfile diferente)",
+            "severity": "ALTA"
+          },
+          {
+            "what": "BOOTSTRAP E CLAUDE.md — escrita e TIMING",
+            "evidence": "main.rs:3261-3266 (seed_one): cria dir via bootstrap.dir_for(key) e cmd.cwd(d); bridge.rs:2750-2761 (create_agent_with): calls ensure_cwd(key) que CRIA o dir E chama bootstrap.write_one(key, name, roster) DENTRO do cwd-setup; main.rs:3416 — após SEED, chama nodes.rewrite_bootstrap() UMA VEZ; bridge.rs:2840 — create_agent_with chama rewrite_bootstrap() TAMBÉM depois de cada criação",
+            "impact": "o seed cria os cwds dos t0/t1 E escreve os CLAUDE.md ANTES do NodeManager.rewrite_bootstrap() (que re-escreve global); o ⌘N chama rewrite_bootstrap() a CADA criação (linha 2840), gerando N gravações e N re-replays do bootstrap em vez de 1. Isto não QUEBRA o painel de Atividade mas causa overhead de I/O e pode deixar CLAUDE.md 'stale' por frames se o ⌘N falha após bootstrap escrito mas ANTES da persistência (linha 2782+)",
+            "severity": "MEDIA"
+          },
+          {
+            "what": "PROJEÇÃO NO SharedModel — timing e visibilidade",
+            "evidence": "main.rs:3290-3294 (seed_one): chama lock(&model).seed_node() APÓS persistência NodeAdded (línha 3279-3284); bridge.rs:2825-2836 (create_agent_with): chama lock(&model).nodes.insert() após persistência (linhas 2782-2823) MAS chama também lock(&self.grids).insert() (linha 2838) E lock(&self.keys).insert() (linha 2839) TODAS as projections JUNTAS após o log",
+            "impact": "o seed projeta seed_node (que faz ordem.push); o ⌘N projeta nodes.insert + grids.insert + keys.insert atomicamente. Ambos DEPOIS do log; PORÉM o seed usa seed_node (método de inicialização) enquanto o ⌘N usa os inserts de máquina de estados (que também faz touch() — bump generation). A cardinalidade é a mesma, MAS o ⌘N GERA MAIS eventos de projeção (3 maps em vez de 1). Isto NÃO é 'bug', é apenas ASSIMETRIA na estrutura; o painel vê ambos aparecerem no canvas",
+            "severity": "BAIXA"
+          },
+          {
+            "what": "ENVS E SCRUBBING — aplicação ANTES vs. DEPOIS do wire_terminal",
+            "evidence": "bridge.rs:1730 (comentário); main.rs:3219-3233 — ANTES de qualquer wire_terminal, scrub_pty_secret_env() e scrub_foreign_orchestrator_env() são CHAMADOS uma vez no boot; bridge.rs:2704-2845 — create_agent_with NUNCA scruba env, pois já foi feito no boot. O env do PTY do ⌘N HERDA o scrubbed env do processo-app",
+            "impact": "o seed nasce com env LIMPO (scrubbed no boot, antes de seed_one); o ⌘N nasce com env LIMPO (herdado do app, já scrubbed no boot). AMBOS têm env limpo — ZERO divergência aqui. O Maestri poderia injetar MAESTRI_* após o scrubbing, mas NÃO — é feito NO INÍCIO (linha 3229) antes de QUALQUER terminal nascer",
+            "severity": "BAIXA"
+          },
+          {
+            "what": "EVENTSTORE — DOIS STORES PARALELOS (onboarding vs. canvas)",
+            "evidence": "onboarding.rs:386-392 — OnboardingModel carrega seu EventStore em onboarding/events (linha 386: store = EventStore::open(dir.join('events'))). main.rs:3273+ — canvas carrega .lina/events. AMBOS os stores existem SEM sincronização — são INDEPENDENTES",
+            "impact": "o onboarding apenda WorkspaceCreated + DiscoveryIndexed em onboarding/events; o canvas apenda NodeAdded/TerminalSpawned/NodeRoleAssigned em .lina/events. O painel de Atividade do canvas lê .lina/events (via lock(&self.store) que é o canvas-store) — NUNCA vê os eventos do onboarding (estão em onboarding/events). Isto explica POR QUE o dashboard diz 'sem estimativa' quando há 17.607 TokenUsageReported — está no STORE CERTO (.lina/events) MAS o dashboard NÃO vê a CRIAÇÃO do nó ⌘N se ela foi ANTES do painel abrir-replicar do log. CRÍTICO: o agents.json é ESCRITO pelo MailboxPump (que lê do canvas-store) e LIDO pelo painel — se o nó foi criado no canvas ANTES do painel, o agents.json JÁ tem a entrada; MAS se a criação é RETARDADA (ex.: modal deixado aberto 10s) o painel VÊ a entrada TARDIA e o 'Status=Ocioso' é correto mas o 'Custo=sem estimativa' é FALSO (há TokenUsageReported, mas o painel SÓ os vê se re-replaya DEPOIS de saber que o nó EXISTS em agents.json)",
+            "severity": "ALTA"
+          }
+        ],
+        "confirms": [
+          "Ambos os caminhos chamam wire_terminal() → Supervisor.register() → alocação de NodeId",
+          "Ambos persistem NO MESMO EventStore (.lina/events) — não há divergência de armazenamento final",
+          "Ambos usam scrubbed-env (segredos e Maestri fora) — herança do app-env",
+          "Ambos criam PTY-reader-threads idênticas (bridge.rs:1474-1501)",
+          "Ambos gravam no log ANTES de projetar no SharedModel (event-sourced corretamente)",
+          "Ambos registram NO ROSTER do Supervisor (via register) — o roster tem autoridade",
+          "Ambos encaixam no bootstrap via NodeManager.rewrite_bootstrap()"
+        ],
+        "open_questions": [
+          "Por que o founder relata 'painel diz Teste=Ocioso' se há TokenUsageReported? — O painel re-projeta o CostLedger a cada tick (bridge.rs:622-636 refresh_cost_paused) MAS o nó pode ter sido criado ANTES do painel abrir replicação; o 'Status=Ocioso' é projeção de agents.json (escrito pelo MailboxPump) e é CORRETO; o 'Custo=sem estimativa' seria correto SE o painel NÃO re-replaya o log inteiro — mas ele faz, logo deveria ver o TokenUsageReported. INVESTIGAR: qual é o _real_ timing de quando o painel começou a ler o log vs. quando o nó ⌘N foi criado?",
+          "Há UM caminho canônico de 'admitir um nó no runtime do Lina' que o ⌘N PULA? — SIM. O caminho é: (1) alocar NodeId via Supervisor.register [feito ✓], (2) persister NodeAdded + TerminalSpawned [feito ✓], (3) persister NodeRoleAssigned [⌘N faz ✓, seed NÃO], (4) se motor com profile, persister CliProfileSet [⌘N faz ✓, seed NÃO]. Os eventos 3–4 são ESSENCIAIS para que o painel veja o nó E saiba seu papel+motor; sem eles, o replay 'pula' a apresentação do nó no dashboard (agents.json está certo, MAS o painel não re-projeta o papel derivado).",
+          "Qual é a FORMA/ARQUITETURA diferente que o ⌘N foi criado? — O ⌘N é criado via MÉTODO PURO (create_agent_with calcula CreatePlan, DEPOIS chama wire_terminal): toda a lógica está num MÉTODO da CLASSE NodeManager, síncrono, no thread de UI (gpui). O seed é criado via LAMBDA (seed_one) também no thread principal MAS **durante o boot (antes de abrir janela)**. A divergência é MAIS ESTRUTURAL: o seed está no **boot-time stanza** (main.rs:3244-3337) com o resto da inicialização (demo-toggle); o ⌘N está na **event-handler** (main.rs:1245 modal_commit, que é keystroke ⌘⏎). Isto faz o seed THREAD-SAFE (boot é serial) enquanto o ⌘N PRECISA de locks (SharedModel, grids, keys, store — todos Arc<Mutex<...>>). Logo a ARQUITETURA é: boot-stanza (serial, sem locks) vs. event-handler (concurrent, com locks)."
+        ]
+      },
+      {
+        "subsystem": "CUSTO E ATIVIDADE → DASHBOARD (Cadeia de correlação sessão↔nó)",
+        "canonical_path": "app/lina-gpui/src/bridge.rs:2704-2845 (create_agent_with) → wire_terminal:1467 (sup.register) + app/lina-gpui/src/bridge.rs:2750 (ensure_cwd → bootstrap.dir_for) → NodeManager.keys armazena NodeId↔key(\"t0\") → render_dashboard:914-918 (itera model.nodes) → dashboard.rs:350 build_cards REQUER hints[(NodeId, cwd)] → dashboard.rs:365-408 aggregate_today(sessions, cwd) CORRELACIONA por cwd EXATO",
+        "newagent_path": "app/lina-gpui/src/agent_modal.rs:784 (AgentModal::new_create) → agent_modal.rs:1189 (create_plan) → main.rs:1270 (Plan::Create p) → main.rs:1272 create_agent_with(name, engine, cwd, role) → bridge.rs:2704 create_agent_with → bridge.rs:2749 cmd.cwd(cwd.to_path_buf()) [cwd CUSTOMIZADO do usuário] → wire_terminal:1467 (sup.register + NodeId gerado) → NÃO insere em NodeManager.keys! [GAP CRÍTICO] → render_dashboard:914 (itera model.nodes SEM hints de cwd) → dashboard.rs:350 build_cards recebe hints=[] VAZIO → dashboard.rs:379 my_cwd=None → dashboard.rs:384 CostLine::without_data() → TOKEN DESCONECTADO",
+        "divergences": [
+          {
+            "what": "NodeManager.keys NUNCA é preenchido para o nó do ⌘N quando cwd é CUSTOMIZADO (Mode::Create com cwd do picker)",
+            "evidence": "bridge.rs:2704-2845 create_agent_with(cwd: Option<&Path>): quando cwd=Some, linha 2749 cmd.cwd(cwd.to_path_buf()); MAS linha 2839 lock(&self.keys).insert(node, key) NUNCA executa porque `key` não existe (é derivado apenas de ensure_cwd→bootstrap.dir_for, que retorna None quando cwd customizado)",
+            "impact": "O render_dashboard NUNCA consegue montar os hints[(NodeId, cwd)] necessários para correlacionar com as sessões no dashboard; sem hints, o build_cards retorna CostLine::without_data() → painel mostra 'sem estimativa' apesar do TokenUsageReported ter sido emitido (17.607 tokens no log)",
+            "severity": "ALTA"
+          },
+          {
+            "what": "render_dashboard(main.rs:914-918) itera model.nodes SEM acessar NodeManager.keys de forma pública → hints NUNCA são construídos",
+            "evidence": "main.rs:914-918 itera model.nodes.values() (SÓ metadados UI); não acessa self.nodes.keys (que é privado/Mutex). dashboard.rs:626 test chama build_cards(..., hints=[(node, cwd)], ...) MAS main.rs:902-1037 render_dashboard NUNCA monta os hints — apenas mostra nome/estado/atividade (linhas 952-956)",
+            "impact": "Dashboard renderiza linhas SEM correlação sessão↔nó. Custos agrupados por cwd (aggregate_today, linha 411-442) exigem hints exatos; sem eles, a atribuição POR NÓ falha completamente",
+            "severity": "ALTA"
+          },
+          {
+            "what": "TokenUsageReported é emitido SEM informação de cwd/sessão — apenas NodeId como string (bridge.rs:3184-3186)",
+            "evidence": "bridge.rs:3184 lock(&store).append(&DomainEvent::TokenUsageReported { node: node.to_string(), tokens }); — o evento SÓ carrega node (UUID), não a sessão-file-path ou cwd associados",
+            "impact": "Correlação na projeção de custo é INDISSOLÚVEL: o dashboard não consegue ligar TokenUsageReported → NodeId → cwd → sessão. O router (core) soma tokens POR NODE para o teto (CostLedger), mas o painel visual depende de sessão JSONL com cwd para atribuição",
+            "severity": "MEDIA"
+          },
+          {
+            "what": "SessionWatch é inicializado UMA VEZ ao boot (main.rs:3181) com pattern fixo do CLI Profile — nó do ⌘N com cwd fora do padrão pode ter sessão-file num lugar DIFERENTE não monitorado",
+            "evidence": "main.rs:3176-3182: if pattern=injection_profile.session_dir_pattern then watch.add_source(cli_id, pattern); padrão típico: '~/.claude/projects/*/*.jsonl' — mas nó do ⌘N com cwd=/custom/path não gera sessão ali (Claude Code usa cwd como REFERÊNCIA)",
+            "impact": "Se o nó ⌘N rodar com cwd=/custom/path e gerar session-files lá, o SessionWatch (que monitora SÓ ~/.claude/projects/*) NUNCA os detecta → zero sessões → zero custo visível (mas TokenUsageReported foi emitido na bomba)",
+            "severity": "MEDIA"
+          }
+        ],
+        "confirms": [
+          "bridge.rs:1467 (sup.register) registra o nó IDÊNTICO para seed E ⌘N",
+          "bridge.rs:3184-3186 TokenUsageReported é emitido corretamente em AMBOS os caminhos — está no log (.lina/events)",
+          "dashboard.rs:350 build_cards função CORRECTA — requer hints que NUNCA são passados",
+          "dashboard.rs:379-385 correlação por cwd EXATA funciona quando hints[cwd] é fornecido (testado nos testes synthesize_log)",
+          "TokenUsageReported contém tokens CORRETOS (17.607 somados no log = 41+61+102+...)",
+          "Rendering do painel estado/atividade funciona (linhas 1014-1037 show row.name/state/activity)"
+        ],
+        "open_questions": [
+          "Quando o ⌘N(Mode::Create, cwd_customizado) chama create_agent_with(cwd=Some), qual é o VALOR de 'key' inserido no keys map (linha 2839)? O código usa `let seq = ...; let key = format!(\"t{seq}\");` (linhas 2724-2730) MAS isso ocorre DENTRO de create_agent_with — se a key é gerada ali, por que o insert(node, key) em linha 2839 não executa?",
+          "O bootstrap.dir_for(key) retorna Some(path) ou None quando há cwd customizado? Verificar BootstrapWriter::dir_for()",
+          "A SessionWatch reconhece múltiplos cwds num MESMO nó, ou monitora apenas UM padrão globalmente? Se Claude Code registra cwd na session-file, por que o SessionWatch não dinamicamente expande o padrão?"
+        ]
+      },
+      {
+        "subsystem": "IDENTIDADE DO NÓ + EVENTSTORE",
+        "canonical_path": "crates/lina-core/src/lib.rs:1149 — Supervisor::register() — `let id = Uuid::now_v7();` aloca UUID v7 único, armazena em roster, retorna ao caller (wire_terminal em bridge.rs:1467)",
+        "newagent_path": "app/lina-gpui/src/bridge.rs:2766 — create_agent_with() chama wire_terminal(&mut p, &self.sup, &self.delta_tx, ...) — usa MESMO Supervisor Arc e MESMO EventStore Arc da NodeManager (estrutura criada em main.rs:3400)",
+        "confirms": [
+          "Supervisor é instância única em produção (main.rs:3101)",
+          "wire_terminal chama sup.register() que é autoridade canônica do NodeId (lib.rs:1149)",
+          "EventStore aberto em main.rs:3060 é .lina/events (mailbox_dir.join('events'))",
+          "⌘N passa pelo mesmo create_agent_with→wire_terminal→sup.register pipeline que seed/onboarding faz (bridge.rs:2704-2777)",
+          "TokenUsageReported usa campo 'node: String' com UUID v7 (events.rs:356-359)",
+          "NodeAdded também usa 'node: NodeId' que serializa como UUID string (events.rs:186-190)",
+          "log.jsonl reflete ambos eventos com mesma identidade UUID v7 (living log linhas 1,3,11,15)"
+        ],
+        "divergences": [
+          {
+            "what": "DOIS EventStores NO DISCO (não no código de produção, mas efeito de onboarding.rs)",
+            "evidence": "onboarding.rs:386 abre dir.join('events') que é onboarding/events/ separado de .lina/events/; walking-skeleton tem ambos: .lina/events/log.jsonl (17.815 eventos) vs onboarding/events/log.jsonl (20 eventos, apenas DiscoveryIndexed+WorkspaceCreated)",
+            "impact": "Onboarding e canvas usam event stores DESACOPLADOS — W4-1 DiscoveryIndexed é gravado em onboarding/events ANTES da criação do primeiro Espaço; ProjectedState, CostLedger, roster se derivam de .lina/events (correto), mas há cérebro-dividido em design (onboarding é separável, não obstante)",
+            "severity": "MEDIA"
+          }
+        ],
+        "open_questions": [
+          "Por que o painel diz 'sem estimativa' com 17.607 TokenUsageReported no log? (Resposta parcial: painel usa SessionWatch lina_session_watch que lê ~/.claude/projects/*/*.jsonl, não TokenUsageReported do log; se nó não escreve sessão, painel não o vê)",
+          "O ⌘N está realmente ISOLADO dos mecanismos ou é sintoma de SessionWatch não encontrar arquivo de sessão?",
+          "Há divergência no LINA_HOME herdado entre canônico e ⌘N? (Improvável: setado em main.rs 3125 uma vez, herdado por todos filhos)",
+          "CostLedger.replay(store, now_ms) DEVE somar TokenUsageReported de .lina/events; por que Maestro viu painel com 'sem estimativa'? Possível: bug na apresentação do CostLedger ou em SessionWatch?"
+        ]
+      },
+      {
+        "subsystem": "HERANÇA DE BOOTSTRAP (ficha/skills/hooks/env/contexto)",
+        "canonical_path": "bridge.rs:2595-2620 (NodeManager::add_node) — sempre chama BootstrapWriter::write_one() que gera CLAUDE.md + settings.json + .claude/skills/lina-agent-bus + HookWiring token",
+        "newagent_path": "bridge.rs:2704-2761 (NodeManager::create_agent_with) — CONDICIONAL: if cwd=Some pula write_one() completamente; else reusa o caminho canônico",
+        "divergences": [
+          {
+            "what": "Bootstrap escrito vs pula conforme cwd",
+            "evidence": "bridge.rs:2744-2761: if let Some(dir) = cwd { ... SEM bw.write_one() } else if let Some(dir) = self.ensure_cwd(&key) { ... WITH bw.write_one() }",
+            "impact": "Terminal criado via ⌘N com pasta do usuário fica ISOLADO: sem CLAUDE.md, sem settings.json, sem .claude/skills/lina-agent-bus, sem HookWiring token registrado",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Arquivo de bootstrap gerado em dir errado quando cwd=Some",
+            "evidence": "bridge.rs:2750-2761: rewrite_bootstrap() chama rewrite_all() que escreve em <ws_root>/t<seq>, não no cwd provided do usuário",
+            "impact": "rewrite_bootstrap() tenta escrever CLAUDE.md em local incorreto (dir gerenciado vs pasta do usuário); arquivo fica 'órfão' e terminal não encontra doutrina no turno-0",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Papel gravado em dois lugares (TerminalSpawned + NodeRoleAssigned) no ⌘N, um só no seed",
+            "evidence": "bridge.rs:2633-2655 (add_node): TerminalSpawned.cli=name, zero NodeRoleAssigned appended; vs 2792-2820 (create_agent_with): TerminalSpawned + NodeRoleAssigned + CliProfileSet appended",
+            "impact": "Estrutura do evento log DIVERGE: seed tem 3 eventos (NodeAdded, TerminalSpawned, nada mais); ⌘N tem 5+ (NodeAdded, TerminalSpawned, NodeRoleAssigned, CliProfileSet). ProjectedNode.role e ProjectedNode.cli lidos diferentemente via replay",
+            "severity": "MEDIA"
+          },
+          {
+            "what": "HookWiring token não registrado no ⌘N com cwd=Some",
+            "evidence": "bridge.rs:2254-2256: write_one() registra token via h.register(name); este código nunca roda se cwd=Some",
+            "impact": "[DASH] timeline não vê terminal: HookListener.register_node() nunca chamado, token nunca existe, eventos do hook não casam com nó no roster",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Agent-bus skill não instalado no ⌘N com cwd=Some",
+            "evidence": "bridge.rs:2269: install_agent_bus_skill(&dir) só chamado via write_one(), que não é chamada se cwd=Some",
+            "impact": "A2A não funciona no turno-0: skill lina-agent-bus ausente no cwd, terminal não faz auto-orquestração no bootstrap",
+            "severity": "ALTA"
+          }
+        ],
+        "confirms": [
+          "event_count rastreado em ambos os caminhos (node_id projeção no model e no SharedModel)",
+          "rewrite_bootstrap() chamado ao final em ambos (linha 2684 vs 2840)",
+          "VIBE_ROLE env var setado em ambos (linha 2743 vs 2633)",
+          "wire_terminal() chama o mesmo handler de A2A em ambos (apenas papel varia)",
+          "NodeAdded, TerminalSpawned appended em ambos (mas payload+ordem differ)"
+        ],
+        "open_questions": [
+          "Por que o comment em bridge.rs:2745 diz 'SEM CLAUDE.md aqui' — foi intencional desabilitar bootstrap para cwd=Some?",
+          "Deve o rewrite_bootstrap() ao final tentar escrever em cwd=Some ou manter-se no <ws_root>/t<seq>?",
+          "O painel 'Atividade e custos do time' lê agents.json e caso-o ao nome no log — sem token registrado, há como recuperar a entrada?",
+          "Por que event stores separados (.lina/events vs onboarding/events) em walking-skeleton — qual é a fonte da verdade?",
+          "O comment em 2699-2701 sugere que turno-0 doutrinado em pasta própria é 'assunto da F1-2-4/W3-2' — quando essa implementação vai chegar?"
+        ]
+      },
+      {
+        "subsystem": "DETECÇÃO/LIFECYCLE/ROSTER/A2A do nó (seed vs ⌘N)",
+        "canonical_path": "app/lina-gpui/src/bridge.rs:2704-2845 (create_agent_with — caminho canonical via seed/onboarding)",
+        "newagent_path": "app/lina-gpui/src/agent_modal.rs:1189-1222 (create_plan) + app/lina-gpui/src/main.rs:1269-1287 (executa via create_agent_with)",
+        "divergences": [
+          {
+            "what": "Registro no Supervisor vs. apendar no log — ORDEM INVERTIDA cria RACE CONDITION",
+            "evidence": "app/lina-gpui/src/bridge.rs:1467 (sup.register ANTES) vs. 2782-2821 (NodeAdded/TerminalSpawned DEPOIS)",
+            "impact": "Nó nasce no roster vivo ANTES de estar no log; painel lê projeção vazia até refresh; agents.json fica correto (roster vivo) mas painel diz 'Ocioso' porque ProjectedNode.status=None até o TerminalSpawned virar Running",
+            "severity": "MEDIA"
+          },
+          {
+            "what": "AppPermissionWatch varre SÓ nós registrados no roster (sup.get) — mas nó ⌘N está VIVO antes de TerminalSpawned no log",
+            "evidence": "app/lina-gpui/src/bridge.rs:2998 (AppPermissionWatch::scan valida sup.get(node))",
+            "impact": "O nó ⌘N participa do AppPermissionWatch desde criação (linha 1467), mas O LOG não tem TerminalSpawned AINDA; a projeção fica INCOMPLETA até sync",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Two EVENT STORES: nó criado pelo ⌘N vai para .lina/events (app), mas a projeção usa .lina/events replay",
+            "evidence": "app/lina-gpui/src/bridge.rs:2780-2823 (append em store local) vs. crates/lina-core/src/events.rs:869-877 (apply TerminalSpawned faz ProjectedNode.status=Running)",
+            "impact": "Se painel sincroniza ANTES do apply, ProjectedNode tem status=None; UiState.from_projection(None) → 'Ocioso' (fallback línea 81); agents.json diz Blocked (roster vivo em sup) mas painel diz Idle (projeção atrasada)",
+            "severity": "ALTA"
+          },
+          {
+            "what": "MailboxPump::refresh_agents lê sup.list() (roster vivo) — por isto agents.json correto — mas dashboard lê ProjectedState (log)",
+            "evidence": "app/lina-gpui/src/bridge.rs:542-559 (refresh_agents via sup.list) vs. app/lina-gpui/src/main.rs:929 (dashboard usa view.status de NodeView que vem do model/pump, não de ProjectedState)",
+            "impact": "agents.json = fonte verdade (sup), painel vê projeção estale; o PARADOXO do fundador (agents.json=Blocked, painel=Idle) confirma: 2 fontes de estado",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Nó ⌘N participa de AppPermissionWatch::scan ANTES de ter EventStore.TerminalSpawned apendado",
+            "evidence": "app/lina-gpui/src/bridge.rs:3010 (watch.scan lê grid do nó registrado sup.get) linha ANTES da conclusão de create_agent_with",
+            "impact": "Nó pode estar 'Busy' no pump (após 1º GridDelta) mas painel não sabe (ProjectedNode.status ainda None até sync); divergência de estado visível",
+            "severity": "MEDIA"
+          }
+        ],
+        "confirms": [
+          "Nó ⌘N E canônico ambos: (1) chamam sup.register() registrando no roster vivo; (2) appendam NodeAdded+TerminalSpawned+NodeRoleAssigned no log; (3) participam do AppPermissionWatch e lifecycle.LifecycleEngine",
+          "agents.json sempre correto — MailboxPump::refresh_agents lê sup.list() VIVO (ambos caminhos)",
+          "AppPermissionWatch.scan() roda para ambos os nós (critério: sup.get() resolve; AppPermissionWatch não diferencia origem)",
+          "lifecycle.transition() funciona (sup.get + store.append via mesma porta)",
+          "Nó ⌘N tem NodeId válido e está no model/grids/keys (NodeView + Grid + reader thread)"
+        ],
+        "open_questions": [
+          "Em qual momento exato o painel sincroniza a projeção? (dashboard::DashWiring::timeline setup vs. pump speed)",
+          "ProjectedState::apply(TerminalSpawned) é imediato no pump ou há delay no hub/attention?",
+          "agents.json é escrito DENTRO de MailboxPump::tick (~120ms)? Se sim, há janela onde roster tem nó mas eventos ainda não apendados",
+          "Por que o log registra 17.607 TokenUsageReported mas painel não vê: é porque o nó nasceu APÓS as primeiras amostras, ou porque a sessão não foi criada na timeline?"
+        ]
+      },
+      {
+        "subsystem": "FORENSE DO LOG VIVO — comparação canonical (add_node) vs ⌘N (agent_modal/create_agent_with)",
+        "canonical_path": "app/lina-gpui/src/bridge.rs:2595-2662 (fn add_node) — emite APENAS NodeAdded (linha 2643) + TerminalSpawned (linha 2653), SEM NodeRoleAssigned nem CliProfileSet. Nó nomeado \"Terminal {seq}\", papel hardcoded \"terminal\", motor default (cmd_factory)",
+        "newagent_path": "app/lina-gpui/src/bridge.rs:2704-2823 (fn create_agent_with) — emite SEQUÊNCIA COMPLETA: NodeAdded (linha 2782) + TerminalSpawned (linha 2792) + NodeRoleAssigned (linha 2802) + CliProfileSet CONDICIONAL (linha 2813). Nó nomeado pelo usuário, papel derivado ou override, motor escolhido no M6 modal",
+        "divergences": [
+          {
+            "what": "NodeRoleAssigned ausente no canonical",
+            "evidence": "app/lina-gpui/src/bridge.rs:2595-2662 add_node() NÃO chama s.append(DomainEvent::NodeRoleAssigned); nó entra com papel 'terminal' hardcoded direto no wire_terminal (linha 2633)",
+            "impact": "Nós criados via teclado ⌘N+clique têm NodeRoleAssigned no log (visível em lina list --json + Inspetor P4); nós criados via botão [+] Novo Terminal NÃO têm. Event store contém prova digital — 5 nós com role, 31+ sem",
+            "severity": "ALTA"
+          },
+          {
+            "what": "CliProfileSet ausente no canonical",
+            "evidence": "app/lina-gpui/src/bridge.rs:2595-2662 add_node() NÃO chama s.append(DomainEvent::CliProfileSet); motor é SEMPRE default (cmd_factory, linha 2605). Em create_agent_with (linhas 2812-2821), CliProfileSet é emitido SÓ se engine.profile_id existe",
+            "impact": "Painel 'Atividade e custos do time' projeta custo via TokenUsageReported + CliProfileSet correlacionado. Nós sem CliProfileSet ficam desacoplados do painel mesmo emitindo TokenUsageReported. Evidence: 5 nós com CliProfileSet+role (019ea4be-c570 etc), 31+ sem = custo invisível ou atribuído a nó genérico",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Ordem de eventos diferente entre paths",
+            "evidence": "Canonical: NodeAdded → TerminalSpawned (fim, linha 2661). Modal: NodeAdded → TerminalSpawned → NodeRoleAssigned → [CliProfileSet] (linhas 2782-2821). Logs walking-skeleton confirmam: primeiros nós (seq 1-28) = 2 eventos; últimos nós (seq 17769+) = 4-5 eventos",
+            "impact": "Replay do log reconstrói state divergente: canonical nodes projetam {role: 'terminal', cli: name}; modal nodes projetam {role: derivado/override, cli: profile_label}. Roster visível varia por ordem de replay",
+            "severity": "MEDIA"
+          },
+          {
+            "what": "Motor (CLI Profile) NUNCA gravado para canonical path",
+            "evidence": "add_node() invoca cmd_factory default (linha 2605), nenhuma referência a ProfileRegistry ou AgentEngine. TerminalSpawned.cli recebe name.clone() (linha 2655), não profile_id. Onboarding log VAZIO de CliProfileSet (19 linhas, nenhuma CliProfileSet)",
+            "impact": "Módulo cost.rs do painel projeta custo por CliProfileSet + TokenUsageReported. Nós canonical emitem TokenUsageReported mas SEM profile correlato = custo 'orfão' ou colapsado em 'Sem estimativa'. Nós modal com profile_id têm custod rastreável",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Two event stores, onboarding STALE (não recebe eventos novos)",
+            "evidence": "walking-skeleton/.lina/events/log.jsonl: 17,816 linhas, mtime 2026-06-07 22:02 UTC. walking-skeleton/onboarding/events/log.jsonl: 19 linhas, mtime 2026-06-04 11:54 UTC. Nenhum NodeAdded/TerminalSpawned no onboarding log após 2026-06-04 16:52 (onboarding.json escrito). Main log tem burst 2026-06-05 00:42 (seq 68-90: Maestro/Teste do old-path) → 2026-06-06 22:53+ (new-path, agent_modal)",
+            "impact": "Se código de custo projeta APENAS onboarding/events, vê ZERO atividade desde 2026-06-04. Se projeta APENAS .lina/events, vê 17.6k tokens mas sem contexto role (nós 1-28 canonical, nós 68-90 old-path sem role, nós 17549+ new-path com role). Painel 'Atividade e custos do time' não sabe qual store ler.",
+            "severity": "ALTA"
+          },
+          {
+            "what": "Maestro/Teste (high-token nodes) estão na brecha entre canonical e new-path",
+            "evidence": "019e95e0-7666-7560-bfae-30668e62d7c3 (759k tokens, seq=68) e 019e95e0-995a-77e1-be4d-f52ae63bcf71 (201k tokens, seq=90) criados 2026-06-05 00:42-43 (ANTES de new-path agent_modal em seq 17595+). Ambos emitem TokenUsageReported (3200 e 2657 events) mas NENHUM tem NodeRoleAssigned ou CliProfileSet. agents.json lista ambos como Idle/QA, bootstrap.json em t0/t1 aponta ambos, mas log não os marca",
+            "impact": "Painel 'Atividade e custos do time' mostra roster.json (Maestro=Idle, Teste=Idle) e vê 17.6k TokenUsageReported, mas NÃO consegue correlacionar os 759k tokens a Maestro ou os 201k a Teste porque nenhum event NodeRoleAssigned/CliProfileSet los une ao log. Relatório contém 'sem estimativa' onde deveria dizer 'Maestro: R$ XXX'",
+            "severity": "ALTA"
+          }
+        ],
+        "confirms": [
+          "Ambos os paths (canonical e agent_modal) emitem NodeAdded corretamente e no mesmo formato (arquivo:2643 vs 2782)",
+          "Ambos emitem TerminalSpawned com sucesso (arquivo:2653 vs 2792)",
+          "TokenUsageReported é independente do path usado para criar o nó — os 5 nós agent_modal (seq 17769+) emitem tokens normalmente",
+          "Event store é append-only e nunca reescreve: tanto canonical quanto modal eventos coexistem no mesmo .lina/events/log.jsonl",
+          "wire_terminal (shared entre add_node e create_agent_with) produz o mesmo PTY e grid para ambos — diferença é APENAS na metadados persistidos no log"
+        ],
+        "open_questions": [
+          "Qual módulo lê o cost.rs para projetar o painel? Está lendo .lina/events ou onboarding/events ou ambos?",
+          "Existe deduplic de CliProfileSet? Se um nó creator_agent_with emite CliProfileSet('claude-code') e depois o usuário roda 'lina role-set <node> <newrole>', qual campo vence em lina list --json?",
+          "Por que bootstrap.json em t0/t1 aponta para Maestro/Teste mas nenhuma CLI rodia _setup_ para esses nós específicos? Foram criados via harness externo (não UI)?",
+          "A session.jsonl em ~/.claude/projects/-private-tmp-lina-baseline-* mapeia para qual nó do walking-skeleton? Existe correção de mtime para saber se é t0 ou t1?",
+          "Se cost.rs projeta APENAS (NodeRoleAssigned ∪ CliProfileSet) AND TokenUsageReported, os 31 nós sem role assignment são invisíveis no painel — é intencional?"
+        ]
+      }
+    ],
+    "synthesis": {
+      "root_cause": "A admissão de um terminal no Lina não existe como UMA função — são três implementações paralelas escritas em épocas diferentes (seed_one main.rs:3261, add_node bridge.rs:2595, create_agent_with bridge.rs:2704), cada uma persistindo um subconjunto diferente do contrato de admissão (papel, motor, doutrina, hooks, skill A2A), enquanto cada consumidor downstream correlaciona por uma CHAVE diferente (custo por cwd-da-sessão, atividade por nome+token, teto por UUID, bootstrap por key t{seq}). A chave mais crítica — o cwd REAL do spawn — nunca é persistida no event log (TerminalSpawned não tem campo cwd; o mapa keys aponta para <ws_root>/t{seq} mesmo quando o agente roda na pasta do usuário), então o ramo \"pasta própria\" do ⌘N desliga silenciosamente todos os consumidores chaveados por cwd: custo, doutrina, skills e observabilidade.",
+      "arquitetura_explicada": "Imagine que o seu Espaço é um prédio com TRÊS portarias diferentes, construídas em momentos diferentes, cada uma com a sua própria ficha de cadastro incompleta — e não existe uma recepção central. A portaria antiga (⌘T / botão +) cadastra o funcionário só com nome, sem cargo nem crachá de ponto: por isso 31 dos 36 agentes do seu log histórico não têm papel nem motor registrados — incluindo o Maestro (759 mil tokens) e o Teste (201 mil), que são exatamente os que você queria ver no painel de custos. A portaria nova (⌘N) é a MAIS completa no cadastro — registra nome, cargo E motor — então a sua hipótese está certa no efeito, mas invertida num detalhe importante: o ⌘N não \"pula o pipeline canônico\", porque NÃO EXISTE pipeline canônico; ele é a terceira cópia paralela, e por acaso a mais rica. O que isola o agente do ⌘N é outra coisa: quando você escolhe uma PASTA PRÓPRIA no modal, o código pula de propósito a entrega do \"kit de integração\" (o CLAUDE.md com a doutrina, a skill de comunicação entre agentes e o arquivo de settings que liga a observabilidade) — há até um comentário no código dizendo \"SEM CLAUDE.md aqui\" — e ainda escreve esse kit numa pasta-fantasma t{N} que o agente nunca lê. E o dinheiro do painel tem um segundo problema, independente do ⌘N: o número \"Hoje:\" NÃO vem dos 17.608 eventos de tokens do seu log (esses alimentam só o freio de teto interno); vem dos arquivos de sessão do Claude Code, filtrados por \"a sessão aconteceu DENTRO da pasta do Espaço?\". Agente em pasta própria = sessão fora do Espaço = dinheiro invisível. Sua conclusão final está certa: enquanto existirem três portarias com fichas diferentes, cada nova forma de criar agente vai esquecer alguma obrigação e nascer um novo bug desta mesma família.",
+      "dimensoes": [
+        {
+          "nome": "Identidade (NodeId)",
+          "status": "OK",
+          "gap": "Nenhum. Todos os três caminhos passam por wire_terminal → Supervisor::register, que é a autoridade única do UUID v7.",
+          "evidencia": "crates/lina-core/src/lib.rs:1149 (Uuid::now_v7 no register); app/lina-gpui/src/bridge.rs:1453-1467 (wire_terminal usado por add_node:2627, create_agent_with:2766 e seed_one main.rs:3270)"
+        },
+        {
+          "nome": "Custo (painel 'Atividade e custos do time')",
+          "status": "QUEBRADO",
+          "gap": "O dinheiro do painel NUNCA lê TokenUsageReported (que alimenta só o teto do core, router.rs:1842): vem de workspace_cost_today sobre arquivos de sessão JSONL do SessionWatch, filtrados por cwd.starts_with(ws_root). Agente ⌘N em pasta própria → sessão fora do prefixo → excluída do total. E o custo POR NÓ (build_cards + hints) é código morto: render_dashboard nunca monta hints — nenhum nó, de nenhum caminho, tem custo individual na tela.",
+          "evidencia": "app/lina-gpui/src/main.rs:902 (workspace_cost_today com dash.ws_root); app/lina-gpui/src/dashboard.rs:296-305 (filtro starts_with(ws_root)); main.rs:895-1046 (render_dashboard sem hints/build_cards); crates: router.rs:1842-1881 (único consumidor de TokenUsageReported)"
+        },
+        {
+          "nome": "Atividade (timeline de hooks)",
+          "status": "PARCIAL",
+          "gap": "O ponto de estado (GridDelta) funciona para todos. Mas a linha 'rodando: X' depende do settings.json com token de hook escrito no cwd do agente via write_one. Com pasta própria, esse settings nunca chega ao cwd real (pulado no spawn; o rewrite_bootstrap escreve no dir-fantasma t{seq}) → CLI roda sem hooks → atividade eternamente '—'.",
+          "evidencia": "bridge.rs:2241-2257 (write_one + HookWiring token via dir_for); bridge.rs:2744-2749 (ramo cwd=Some pula write_one); bridge.rs:2224-2226 (dir_for = ws_root.join(key), nunca a pasta do usuário); main.rs:933-939 (activity por tl.activity(&view.name))"
+        },
+        {
+          "nome": "Skills (A2A turno-0)",
+          "status": "QUEBRADO",
+          "gap": "install_agent_bus_skill só roda dentro de write_one. ⌘N com pasta própria: pulado no spawn e desviado para a pasta-fantasma no rewrite_bootstrap → o agente nasce sem a skill lina-agent-bus no cwd real → não participa da auto-orquestração no turno-0.",
+          "evidencia": "bridge.rs:2266-2269 (install_agent_bus_skill dentro de write_one); bridge.rs:2744-2761 (skip quando cwd=Some); bridge.rs:2428-2432 + 2275-2279 (rewrite_bootstrap → rewrite_all → write_one no dir_for, não no cwd real)"
+        },
+        {
+          "nome": "Contexto (doutrina CLAUDE.md)",
+          "status": "QUEBRADO",
+          "gap": "Intencional-mas-silencioso: comentário 'SEM CLAUDE.md aqui' (bridge.rs:2745) e doc 2699-2701 adiando para F1-2-4/W3-2. O agente em pasta própria nasce sem doutrina, sem roster, sem vault — e o rewrite_bootstrap ainda cria um <ws_root>/t{seq} órfão com a doutrina completa que ninguém lê (efeito colateral: tokens de hook re-registrados apontando para o nada).",
+          "evidencia": "bridge.rs:2744-2749 (ramo Some sem write_one + comentário); bridge.rs:2699-2701 (adiamento documentado); bridge.rs:2840 (rewrite_bootstrap pós-criação escreve via dir_for no dir gerenciado)"
+        },
+        {
+          "nome": "Estado (Ocioso vs Blocked)",
+          "status": "PARCIAL",
+          "gap": "Duas fontes vivas de estado sem reconciliação: agents.json é escrito do roster do Supervisor (sup.list), enquanto as linhas do painel leem NodeView.status do model alimentado pelo pump — podem divergir por janelas de timing. Agrava: sup.register acontece ANTES do append de NodeAdded (bridge.rs:2766 vs 2782) — o nó existe no roster vivo antes de existir no log.",
+          "evidencia": "bridge.rs:53 + 540-555 (refresh_agents via sup.list); main.rs:914-932 (painel via view.status do NodeView); bridge.rs:2764-2777 (wire antes) vs 2780-2823 (persistência depois)"
+        },
+        {
+          "nome": "Log de admissão / Event stores",
+          "status": "QUEBRADO",
+          "gap": "Cardinalidade de eventos diverge por porta de entrada: add_node/seed emitem só NodeAdded+TerminalSpawned (papel hardcoded 'terminal' fora do log); ⌘N emite 4-5 eventos. Resultado no log vivo: 36 NodeAdded mas só 5 NodeRoleAssigned/CliProfileSet — os 2 nós de maior gasto (759k e 201k tokens) não têm papel nem motor no log, irrecuperáveis por replay. Além disso há dois stores no disco: .lina/events (17.817 linhas) vs onboarding/events (19 linhas, parado desde 06-04).",
+          "evidencia": "Verificado no log vivo (~/Library/Application Support/Lina/walking-skeleton): 36 NodeAdded, 5 NodeRoleAssigned, 5 CliProfileSet, 17.608 TokenUsageReported; nó 019e95e0-7666=759.004 tokens e 019e95e0-995a=201.506, ambos sem role-event; bridge.rs:2643-2653 (add_node só 2 eventos) vs 2782-2821 (⌘N 4-5); onboarding.rs:386 (store separado)"
+        }
+      ],
+      "contradicoes_entre_auditores": [
+        "Auditor 1 (SPAWN) vs Auditores 2/4 sobre bootstrap no create_agent_with: o Auditor 1 afirma que o ⌘N 'chama ensure_cwd que cria o dir E chama bootstrap.write_one' e confirma 'ambos encaixam no bootstrap'. O código mostra que isso vale SÓ para o ramo cwd=None; com pasta escolhida no modal, write_one é pulado por inteiro (bridge.rs:2744-2761, comentário 'SEM CLAUDE.md aqui'). O Auditor 4 está certo; o Auditor 1 não viu o condicional.",
+        "Auditor 2 (CUSTO) vs o código e vs Auditor 5: o Auditor 2 alega que 'lock(&self.keys).insert(node, key) NUNCA executa porque key não existe' com cwd customizado. FALSO: a key t{seq} é computada incondicionalmente (bridge.rs:2730) e inserida incondicionalmente (2839) — o próprio Auditor 5 confirma que o nó ⌘N 'está no model/grids/keys'. O gap real de custo é outro: a key aponta para o dir gerenciado <ws_root>/t{seq} enquanto o agente roda na pasta do usuário, e render_dashboard nem usa hints/build_cards (código morto no painel).",
+        "Auditor 2 vs Auditor 3 sobre o 'sem estimativa': o Auditor 2 culpa hints/keys ausentes e diz que o SessionWatch 'nunca detecta' sessões de cwd customizado. O Auditor 3 (na open question) suspeita corretamente que o painel usa SessionWatch e não TokenUsageReported. O código confirma o Auditor 3: o glob é global (~/.claude/projects/*/*.jsonl — o watch VÊ todas as sessões, inclusive de pasta própria); a exclusão acontece no filtro cwd.starts_with(ws_root) de workspace_cost_today (dashboard.rs:301). Os 17.608 TokenUsageReported nunca foram lidos pelo painel — alimentam só o teto do core (router.rs:1842).",
+        "Auditores discordam sobre QUAL é o caminho canônico: Auditor 1 trata seed_one como canônico; Auditores 4/6 tratam add_node; Auditores 3/5 chamam o próprio create_agent_with de 'canonical path'. A discordância é o próprio diagnóstico: não existe caminho canônico — são três cópias paralelas, e por isso cada auditor elegeu uma referência diferente.",
+        "Auditor 1 vs Auditor 6 sobre a direção da deficiência: o Auditor 1 enquadra o NodeRoleAssigned do ⌘N como divergência que 'quebra a projeção'. Os dados do Auditor 6 (confirmados no log vivo: 5 nós com role, 31 sem) mostram o oposto — o ⌘N é o comportamento CORRETO e os caminhos legados (seed/add_node) são os deficientes. A hipótese do fundador está certa no efeito (isolamento), mas invertida nesta dimensão: o ⌘N é o que MAIS registra.",
+        "Auditor 4 sobre o token de hook ('h.register(name) nunca roda se cwd=Some'): impreciso — o rewrite_bootstrap final (bridge.rs:2840) chama write_one para TODOS os terminais do snapshot, incluindo o novo, então o token É registrado; mas o settings.json que o carrega é escrito no dir-fantasma t{seq}, não no cwd real — o efeito prático (CLI sem hooks, timeline cega) está certo, o mecanismo descrito está errado.",
+        "Auditor 5 afirma que 'dashboard lê ProjectedState (replay do log)': o código mostra que as linhas do painel leem NodeView.status do model vivo alimentado pelo pump (main.rs:921-932), não replay de ProjectedState. O ponto válido que sobrevive é o de duas fontes vivas (sup.list para agents.json vs model para o painel)."
+      ],
+      "fix_blueprint": [
+        {
+          "passo": "ADR curto: 'Admissão canônica de nó' — define o contrato único de admissão (sequência completa de eventos, binding node↔cwd persistido, política de kit de integração por tipo de pasta). O CLAUDE.md do projeto exige ADR antes de mudança de forma — e esta é uma.",
+          "arquivos": "docs/adr/ (novo)",
+          "dono_sugerido": "Maestro (decisão arquitetural, gate antes de qualquer worker tocar código)",
+          "risco": "Baixo — só documento; destrava os passos seguintes com critério."
+        },
+        {
+          "passo": "Criar NodeAdmission (plano) + NodeManager::admit_node(plan) em bridge.rs: validação de nome, seq/key, política de cwd (Managed(key) | UserDir(path)), bootstrap, wire_terminal, sequência CANÔNICA de eventos (NodeAdded + TerminalSpawned + NodeRoleAssigned SEMPRE — 'terminal' também é papel — + CliProfileSet sempre que o profile é conhecido), projeção atômica e rewrite. Toda a disciplina persiste-antes-de-projetar/retire_pty em UM lugar.",
+          "arquivos": "app/lina-gpui/src/bridge.rs",
+          "dono_sugerido": "Worker do app (bridge.rs é território do app; um dono só nesta rodada)",
+          "risco": "Médio — é o coração da criação de nós; mitigar reaproveitando os testes existentes (add_node_grows_count_persists_and_reconstructs, bridge.rs:4415) e adicionando teste de paridade: os 3 fluxos produzem a MESMA sequência de eventos módulo parâmetros."
+        },
+        {
+          "passo": "Redirecionar os três entry points para admit_node: add_node() vira admit_node(NodeAdmission::default_terminal()); create_agent_with() vira tradutor do CreatePlan do modal para NodeAdmission; seed_one (demo) vira admit_node com flag de seed. Nenhum entry point apenda evento diretamente nunca mais.",
+          "arquivos": "app/lina-gpui/src/bridge.rs (add_node, create_agent_with), app/lina-gpui/src/main.rs (seed_one ~3261, modal_commit ~1245)",
+          "dono_sugerido": "Mesmo worker do passo anterior (mesma fatia, mesma fronteira)",
+          "risco": "Médio — regressão em três fluxos de UI; validar com o teatro do fundador no dist/Lina.app reempacotado (lição registrada: o fundador testa o .app, não o dev build)."
+        },
+        {
+          "passo": "Persistir o cwd REAL do spawn: campo aditivo `cwd` no TerminalSpawned (serde(default) — replay de log antigo não quebra, doutrina de eventos aditivos do CLAUDE.md). Isso dá a TODA projeção futura o binding node↔cwd↔sessão que hoje não existe em lugar nenhum do log.",
+          "arquivos": "crates/lina-core/src/events.rs (COSTURA — dono único por rodada, pedir ao Maestro)",
+          "dono_sugerido": "Dono da costura events.rs designado pelo Maestro (protocolo multi-terminal do projeto)",
+          "risco": "Baixo — aditivo por construção; risco residual é call-sites de teste que constroem o evento (atualizar com autorização, lição 'fidelidade > contorno')."
+        },
+        {
+          "passo": "Política de pasta do usuário DENTRO do admit_node: UserDir(path) escreve o kit de integração (CLAUDE.md + settings/hooks + skill lina-agent-bus) no cwd REAL com consentimento explícito no modal ('a Lina vai criar arquivos de orquestração nesta pasta') OU degrada VISIVELMENTE (badge 'agente sem doutrina/observabilidade' no card) — nunca silencioso. rewrite_bootstrap passa a iterar o mapa node→cwd-real, eliminando o dir-fantasma t{seq}.",
+          "arquivos": "app/lina-gpui/src/bridge.rs (write_one/rewrite_all/dir_for, admit_node), app/lina-gpui/src/agent_modal.rs (consent no M6)",
+          "dono_sugerido": "Worker do app + revisão do fundador no copy do consentimento (escrever na pasta do usuário é decisão de produto, gate humano)",
+          "risco": "Médio-alto — escrever em pasta do usuário é sensível (sobrescrita de CLAUDE.md pré-existente do usuário!); exigir merge-safe/append ou recusa com aviso, jamais overwrite cego."
+        },
+        {
+          "passo": "Fechar a race roster-antes-do-log: dentro do admit_node, persistir NodeAdded antes (ou compensar o register no Supervisor em falha de persistência), para o nó nunca existir no roster vivo (agents.json, AppPermissionWatch) sem existir no log.",
+          "arquivos": "app/lina-gpui/src/bridge.rs (ordem wire_terminal vs appends, hoje 2766 vs 2782)",
+          "dono_sugerido": "Mesmo worker do admit_node",
+          "risco": "Médio — inverter a ordem muda o tratamento de falha de spawn; o NodeId nasce no register, então a alternativa prática é a compensação (unregister em falha de append), já meio-existente via retire_pty."
+        },
+        {
+          "passo": "Religar o custo por nó no painel: projetar node↔cwd do log (agora que TerminalSpawned carrega cwd) e ligar o build_cards/hints que hoje é código morto; no total 'Hoje:', distinguir 'sem sessão hoje' de 'agente trabalhando fora da pasta do Espaço' (e somar opt-in as sessões dos cwds adotados pelos nós do Espaço, não só prefixo de ws_root).",
+          "arquivos": "app/lina-gpui/src/main.rs (render_dashboard ~895-1046), app/lina-gpui/src/dashboard.rs (build_cards/workspace_cost_today)",
+          "dono_sugerido": "Worker de dashboard/observabilidade (fronteira separável do admit_node)",
+          "risco": "Baixo-médio — build_cards já existe e é testado; o risco é UX de atribuição ambígua (2+ nós no mesmo cwd), que a doutrina 'nunca chutar' do próprio dashboard.rs já resolve."
+        },
+        {
+          "passo": "Demarcar os dois event stores: declarar .lina/events como única fonte da verdade do Espaço e o onboarding/events como scratch descartável do fluxo de onboarding (ou migrar WorkspaceCreated/DiscoveryIndexed para o store principal no fechamento do onboarding). Documentar no ADR do passo 1.",
+          "arquivos": "app/lina-gpui/src/onboarding.rs (~386), docs/adr/",
+          "dono_sugerido": "Maestro decide no ADR; implementação trivial por qualquer worker",
+          "risco": "Baixo — hoje já são desacoplados; o fix é tornar a fronteira intencional em vez de acidental."
+        }
+      ],
+      "quick_wins": [
+        "add_node (⌘T / botão +) passa a emitir também NodeRoleAssigned('terminal') + CliProfileSet(profile default): ~10 linhas reaproveitando o bloco do create_agent_with — fecha, para nós novos, a classe dos 31-sem-papel que deixou Maestro (759k tokens) e Teste (201k) órfãos no log.",
+        "Campo aditivo `cwd` no payload do TerminalSpawned (serde(default)): barato, não quebra replay antigo, e é o pré-requisito de quase todo o resto — sem ele a correlação nó↔sessão é irreconstituível para sempre.",
+        "⌘N com pasta própria: instalar pelo menos a skill lina-agent-bus + settings de hooks no cwd real (são dirs .claude/ aditivos, menos invasivos que o CLAUDE.md) — devolve A2A turno-0 e timeline de atividade sem decidir ainda a política do CLAUDE.md.",
+        "Parar de criar o dir-fantasma: rewrite_bootstrap pular keys cujo cwd real difere do dir_for(key) (guard de 3 linhas até o mapa node→cwd existir) — elimina os <ws_root>/t{seq} órfãos com doutrina e tokens de hook que apontam para o nada.",
+        "Honestidade no painel: quando houver TokenUsageReported recente de um nó sem sessão correlacionada, trocar 'sem estimativa' por 'trabalhando fora da pasta do Espaço — custo não rastreável aqui' (o dado para distinguir já existe no log).",
+        "Unificar o atalho na superfície: o empty-state ensina '⌘T' (caminho pobre em metadados) enquanto o atalho canônico documentado é ⌘N (modal completo) — apontar o aluno para UMA porta, a rica, até o admit_node igualar as duas."
+      ],
+      "refactor_estrutural": "UM funil de admissão: criar NodeManager::admit_node(NodeAdmission) como o ÚNICO lugar do app que transforma a intenção 'quero um terminal' em nó vivo — encapsulando validação, alocação de identidade, política de cwd (gerenciado OU pasta do usuário, com kit de integração entregue no cwd REAL ou degradação explícita e visível), a sequência canônica e COMPLETA de eventos (NodeAdded + TerminalSpawned com cwd + NodeRoleAssigned sempre + CliProfileSet quando há profile), a ordem persiste-antes-de-projetar com compensação de falha, e a projeção atômica (model/grids/keys/rewrite). Os três entry points atuais (seed_one do demo, add_node do ⌘T/botão, create_agent_with do ⌘N) viram tradutores finos de intenção → NodeAdmission, proibidos de apendar eventos ou tocar o Supervisor diretamente; um teste de paridade garante que qualquer porta produz a mesma sequência de eventos módulo parâmetros. Isso fecha a classe inteira do bug: hoje cada nova forma de criar agente (a próxima será API, CLI ou a inteligência da Lina) precisa LEMBRAR de N obrigações implícitas espalhadas; depois, ela não tem como esquecer, porque a obrigação mora no único caminho que existe — exatamente o padrão que o próprio código já consagrou para a identidade (Supervisor.register como autoridade única do NodeId, a única dimensão hoje OK), estendido para todas as outras dimensões da admissão."
+    }
+  }
+}
