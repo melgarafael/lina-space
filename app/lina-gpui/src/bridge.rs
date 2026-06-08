@@ -1473,42 +1473,77 @@ pub fn wire_terminal(
     let writer = pty.take_writer(key).map_err(|e| e.to_string())?;
     // W4-2 (M2): o nó nasce com o PAPEL no roster do Supervisor → flui para `agents.json` (lina list).
     let node = sup.register(name, Some(role.to_string()), writer);
-    let mut reader = pty.clone_reader(key).map_err(|e| e.to_string())?;
+
+    // ADR 0022 §5 / inv#4 (ATOMICIDADE): a partir do `register` o nó JÁ está no roster vivo
+    // (agents.json / `lina list` / AppPermissionWatch). Toda falha ANTES do `Ok` desta função
+    // tem que COMPENSAR (unregister + kill do PTY meio-criado) — senão sobra um nó no roster
+    // com ZERO eventos no log (a compensação do `admit_node` só envolve o append-loop, que roda
+    // DEPOIS daqui; e o NodeId nasce nesta função, o caller não o recebe em erro). Red-team 360
+    // (inv 4, ALTA): `clone_reader`/spawn-da-thread podiam falhar pós-register sem compensar.
+    #[cfg(test)]
+    if tests::take_wire_fault() {
+        compensate_wire(pty, sup, node, key);
+        return Err("wire_terminal: falha injetada após register (teste)".to_string());
+    }
+
+    let mut reader = match pty.clone_reader(key) {
+        Ok(r) => r,
+        Err(e) => {
+            compensate_wire(pty, sup, node, key);
+            return Err(e.to_string());
+        }
+    };
 
     let grid: Grid = Arc::new(Mutex::new(Box::new(AlacrittyBackend::new(cols, rows))));
-    {
-        let grid = Arc::clone(&grid);
-        let delta_tx = delta_tx.clone();
-        thread::Builder::new()
-            .name(format!("lina-reader-{key}"))
-            .spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let dirty = {
-                                let mut g = lock(&grid);
-                                g.advance(&buf[..n]);
-                                let d = g.damaged_rows();
-                                g.reset_damage();
-                                d
-                            };
-                            if !dirty.is_empty() {
-                                let _ = delta_tx.send(GridDelta {
-                                    node,
-                                    rows: dirty,
-                                    bytes: n,
-                                    seq: 0,
-                                });
-                            }
+    let reader_grid = Arc::clone(&grid);
+    let reader_tx = delta_tx.clone();
+    let spawned = thread::Builder::new()
+        .name(format!("lina-reader-{key}"))
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let dirty = {
+                            let mut g = lock(&reader_grid);
+                            g.advance(&buf[..n]);
+                            let d = g.damaged_rows();
+                            g.reset_damage();
+                            d
+                        };
+                        if !dirty.is_empty() {
+                            let _ = reader_tx.send(GridDelta {
+                                node,
+                                rows: dirty,
+                                bytes: n,
+                                seq: 0,
+                            });
                         }
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            }
+        });
+    if let Err(e) = spawned {
+        compensate_wire(pty, sup, node, key);
+        return Err(e.to_string());
     }
     Ok((node, grid))
+}
+
+/// **COMPENSAÇÃO da janela de [`wire_terminal`] (ADR 0022 §5 / inv#4).** Após `sup.register`
+/// o nó está no roster vivo; se uma operação seguinte falha, desfaz a meia-fiação ANTES de
+/// propagar o erro: `unregister` (tira do roster/`agents.json`) + `kill`+`remove` do PTY
+/// meio-criado. Síncrono — é caminho de erro raro (exaustão de FD/threads do SO), não há UI a
+/// não-bloquear. Erros da própria limpeza são logados (best-effort): não há mais o que fazer.
+fn compensate_wire(pty: &mut PtyManager, sup: &Supervisor, node: NodeId, key: &str) {
+    if let Err(e) = sup.unregister(node) {
+        eprintln!("lina-gpui: compensação wire_terminal — unregister do nó {node} falhou: {e}");
+    }
+    if let Err(e) = pty.kill(key, Duration::from_secs(2)) {
+        eprintln!("lina-gpui: compensação wire_terminal — kill do PTY {key} falhou: {e}");
+    }
+    let _ = pty.remove(key);
 }
 
 /// Layout do card no canvas (fonte única — o render em `main` reusa estes valores).
@@ -2335,13 +2370,18 @@ impl BootstrapWriter {
             &ours_md,
             stamped(self.bootstrapper.gemini_doctrine(&input)),
         );
-        // Settings/hooks (observabilidade + gate): JSON não carrega comentário-marcador —
-        // a posse é o comando de hook que só a Lina monta (`whoami --bootstrap`). Um
-        // settings DO USUÁRIO sem o nosso hook é preservado (recusa com aviso).
+        // Settings/hooks (observabilidade + gate): posse por CHAVE ESTRUTURADA
+        // (`_lina_managed: true`, parseada e checada por VALOR — não substring do comando do
+        // hook, que o usuário poderia legitimamente ter). Um settings DO USUÁRIO sem a chave é
+        // preservado (recusa + badge). Red-team 360 (inv 1, MÉDIA): `contains("whoami --bootstrap")`
+        // sobrescreveria um settings do usuário que apenas contivesse aquela substring.
         guarded(
             ".claude/settings.json",
-            &|existing: &str| existing.contains(LINA_SETTINGS_MARKER),
-            lina_bootstrap::hook_settings_json_with_observability(&self.lina_bin, wiring.as_ref()),
+            &settings_is_ours,
+            stamped_settings_json(&lina_bootstrap::hook_settings_json_with_observability(
+                &self.lina_bin,
+                wiring.as_ref(),
+            )),
         );
         // `.lina/bootstrap.json` é namespace da Lina — escrita direta (estado vivo do `lina whoami`).
         let lina_dir = dir.join(".lina");
@@ -2370,9 +2410,37 @@ impl BootstrapWriter {
 /// usuário não transferem a posse.
 const LINA_MANAGED_MARKER: &str = "<!-- lina-space:gerado — a Lina reescreve este arquivo a \
 cada mudança de roster; edições manuais serão perdidas -->";
-/// Marcador do settings gerado pela Lina (o comando do hook `SessionStart` que só nós montamos;
-/// JSON não comporta comentário-marcador).
-const LINA_SETTINGS_MARKER: &str = "whoami --bootstrap";
+/// Chave estruturada de posse do `settings.json` gerado pela Lina (top-level, parseada e
+/// checada por VALOR `true`). JSON não comporta comentário-marcador como os markdown; uma
+/// CHAVE dedicada é inequívoca (o usuário não a teria por acaso) e o Claude Code ignora chaves
+/// desconhecidas no settings (lê `permissions`/`hooks`).
+const LINA_MANAGED_KEY: &str = "_lina_managed";
+
+/// O `settings.json` que a Lina escreve, CARIMBADO com [`LINA_MANAGED_KEY`]`: true` no topo —
+/// a marca de posse estruturada (inv 1). Parseia o JSON do crate, insere a chave, re-serializa.
+/// Se o parse/serialize falhar (não deve — o crate gera JSON válido), devolve o JSON cru SEM
+/// carimbo: degradação honesta (na pior hipótese um rewrite futuro recusa por achá-lo do
+/// usuário — nunca o contrário, que apagaria dado).
+fn stamped_settings_json(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert(LINA_MANAGED_KEY.to_string(), serde_json::Value::Bool(true));
+            serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                .unwrap_or_else(|_| raw.to_string())
+        }
+        _ => raw.to_string(),
+    }
+}
+
+/// `true` se o `settings.json` existente é GERENCIADO pela Lina: a chave estruturada
+/// [`LINA_MANAGED_KEY`] está presente e é `true` (parse + checagem por valor, jamais
+/// substring). JSON ilegível/sem a chave → do usuário (preserve).
+fn settings_is_ours(existing: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(existing)
+        .ok()
+        .and_then(|v| v.get(LINA_MANAGED_KEY).and_then(serde_json::Value::as_bool))
+        == Some(true)
+}
 
 /// Resultado da entrega do kit de integração numa pasta do usuário (ADR 0022 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2978,18 +3046,31 @@ impl NodeManager {
         let cwd_real: Option<PathBuf> = match &plan.cwd {
             CwdPolicy::Managed => {
                 let dir = self.ensure_cwd(&key);
-                if let Some(dir) = &dir {
-                    cmd = cmd.cwd(dir.clone());
-                    // Só o nó novo aqui — os existentes são atualizados no `rewrite_bootstrap()`
-                    // ao final; se o spawn falhar, eles não ganham um colega fantasma.
-                    if let Some(bw) = &self.bootstrap {
-                        let mut roster: Vec<String> = self
-                            .terminals_snapshot()
-                            .into_iter()
-                            .map(|(_, n)| n)
-                            .collect();
-                        roster.push(name.clone());
-                        bw.write_one(&key, &name, &roster);
+                match &dir {
+                    Some(dir) => {
+                        cmd = cmd.cwd(dir.clone());
+                        // Só o nó novo aqui — os existentes são atualizados no `rewrite_bootstrap()`
+                        // ao final; se o spawn falhar, eles não ganham um colega fantasma.
+                        if let Some(bw) = &self.bootstrap {
+                            let mut roster: Vec<String> = self
+                                .terminals_snapshot()
+                                .into_iter()
+                                .map(|(_, n)| n)
+                                .collect();
+                            roster.push(name.clone());
+                            bw.write_one(&key, &name, &roster);
+                        }
+                    }
+                    None => {
+                        // inv#6 (red-team 360, MÉDIA): `ensure_cwd == None` ⟺ `self.bootstrap`
+                        // é `None` — boot degradado (`BootstrapWriter::new` falhou no main, `.ok()`).
+                        // O nó nasce sem kit e com cwd herdado do app; o fundador PRECISA ver isso
+                        // (mesmo badge dos ramos UserDir), nunca um Espaço meio-degradado invisível.
+                        kit_missing = true;
+                        eprintln!(
+                            "lina-gpui: agente '{name}' (pasta gerenciada) sem bootstrap neste \
+                             boot — sem doutrina/observabilidade; o card mostra o aviso"
+                        );
                     }
                 }
                 dir
@@ -3498,6 +3579,27 @@ pub fn spawn_pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// **Fault-injection da janela pós-`register` de [`wire_terminal`]** (red-team 360, inv 4).
+        /// `clone_reader`/spawn-da-thread só falham por exaustão de FD/threads do SO — não
+        /// forçável de forma determinística pela API pública. Este seam (pattern do projeto:
+        /// "injetável p/ teste determinístico") força a falha logo após o `register`, exercitando
+        /// o caminho REAL de COMPENSAÇÃO em `wire_terminal` (não um substituto). Consumido na 1ª
+        /// checada (replace→false): nunca vaza entre testes na mesma thread.
+        static WIRE_FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arma a próxima [`wire_terminal`] para falhar logo após o `register` (consumido 1×).
+    pub(super) fn arm_wire_fault() {
+        WIRE_FAULT.with(|f| f.set(true));
+    }
+
+    /// `wire_terminal` consulta isto pós-`register` (sob `#[cfg(test)]`): toma-e-limpa a flag.
+    pub(super) fn take_wire_fault() -> bool {
+        WIRE_FAULT.with(|f| f.replace(false))
+    }
 
     // ─────────────── W3-6c última milha: custódia (fios 1 e 3) — unidades gpui-free ───────────────
 
@@ -6325,6 +6427,10 @@ mod tests {
             "settings com o hook da Lina (observabilidade ligada)"
         );
         assert!(
+            settings_is_ours(&settings),
+            "settings NOSSO carrega a chave estruturada de posse _lina_managed (inv 1)"
+        );
+        assert!(
             lock(&model).nodes.get(&b).is_some_and(|v| !v.kit_missing),
             "kit completo → sem badge"
         );
@@ -6338,5 +6444,160 @@ mod tests {
         for d in [&ws, &user_a, &user_b] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// **Fix 1 (red-team 360, inv 4 — ATOMICIDADE):** a janela de `wire_terminal` entre o
+    /// `sup.register` e o `Ok` (`clone_reader`/spawn-da-thread) é COMPENSADA — falha pós-register
+    /// não deixa o nó no roster vivo (agents.json/`lina list`) nem o PTY meio-criado vazado.
+    /// NÃO-VACUOSO: sabota a janela pós-register (via `arm_wire_fault`, não o append); se o
+    /// `compensate_wire` fosse removido do caminho de erro, `sup.list()`/`pty` reteriam o fantasma.
+    #[test]
+    fn wire_terminal_failure_after_register_compensates_roster() {
+        let dir = std::env::temp_dir().join(format!("lina-wirefault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("open store")));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let cmd_factory: CmdFactory = Arc::new(|_n: &str| PtyCommand::new("cat"));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let nm = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            Arc::clone(&grids),
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            cmd_factory,
+            None,
+            dir.join(".lina"),
+        );
+
+        let before_roster = sup.list().len();
+        let before_events = lock(&store).events().expect("eventos").len();
+
+        // Arma a falha da janela pós-register (o append NÃO é tocado — store íntegro).
+        arm_wire_fault();
+        let result = nm.add_node();
+
+        assert!(
+            result.is_err(),
+            "falha pós-register em wire_terminal → admissão devolve Err"
+        );
+        assert_eq!(
+            sup.list().len(),
+            before_roster,
+            "COMPENSAÇÃO: nó DESREGISTRADO do roster vivo (nada no agents.json/lina list)"
+        );
+        assert!(
+            lock(&pty).is_empty(),
+            "COMPENSAÇÃO: PTY meio-criado foi morto+removido (sem vazamento de handle)"
+        );
+        assert!(lock(&model).order.is_empty(), "nada projetado no model");
+        assert!(lock(&grids).is_empty(), "nenhum grid registrado");
+        assert_eq!(
+            lock(&store).events().expect("eventos").len(),
+            before_events,
+            "a falha foi ANTES do append: zero eventos no log (nem NodeAdded órfão)"
+        );
+        // O seam não vaza: a próxima admissão (sem armar) sobe normalmente.
+        let ok = nm
+            .add_node()
+            .expect("admissão seguinte sobe normal (flag consumida)");
+        assert!(sup.list().iter().any(|n| n.id == ok));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Fix 2 (red-team 360, inv 1 — PRESERVAÇÃO):** um `settings.json` do USUÁRIO que apenas
+    /// CONTÉM a substring `whoami --bootstrap` (mas sem a chave estruturada `_lina_managed`) é
+    /// preservado BYTE-IDÊNTICO. NÃO-VACUOSO: regrediria se a posse voltasse a ser `contains`
+    /// do comando do hook (o anti-padrão que o inv 1 proíbe).
+    #[test]
+    fn settings_do_usuario_com_substring_do_hook_e_preservado() {
+        let ws = std::env::temp_dir().join(format!("lina-setsub-ws-{}", std::process::id()));
+        let user = std::env::temp_dir().join(format!("lina-setsub-user-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&user);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, _store, model) = test_manager("setsub", Some(bw));
+
+        // settings do usuário: contém a substring marcadora antiga, mas é DELE (sem a chave).
+        std::fs::create_dir_all(user.join(".claude")).expect("user .claude");
+        let user_settings =
+            "{\n  \"hooks\": {},\n  \"_nota\": \"rodo `lina whoami --bootstrap` no meu shell\"\n}\n";
+        std::fs::write(user.join(".claude").join("settings.json"), user_settings)
+            .expect("settings do usuário");
+
+        let id = nm
+            .create_agent_with("Convidado", None, Some(&user), None, true)
+            .expect("⌘N consentido");
+
+        assert_eq!(
+            std::fs::read_to_string(user.join(".claude").join("settings.json")).expect("re-read"),
+            user_settings,
+            "settings do usuário com a substring do hook fica BYTE-IDÊNTICO (posse por chave, não substring)"
+        );
+        assert!(
+            !settings_is_ours(user_settings),
+            "sem a chave _lina_managed, o settings é do USUÁRIO"
+        );
+        assert!(
+            lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
+            "settings recusado → kit parcial → badge (nunca silencioso)"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    /// **Fix 3 (red-team 360, inv 6 — DEGRADAÇÃO VISÍVEL):** admissão `Managed` num boot
+    /// degradado (`self.bootstrap == None` → `ensure_cwd == None`) ainda sobe o nó, mas LIGA o
+    /// badge (`kit_missing`). NÃO-VACUOSO: sem o `kit_missing = true` no ramo `None`, o nó
+    /// nasceria sem kit E sem aviso — o fundador não veria o Espaço degradado.
+    #[test]
+    fn managed_sem_bootstrap_liga_badge_de_degradacao() {
+        let dir = std::env::temp_dir().join(format!("lina-managed-nb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("open store")));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let cmd_factory: CmdFactory = Arc::new(|_n: &str| PtyCommand::new("cat"));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        // bootstrap = None ⇒ boot degradado (BootstrapWriter::new falhou no main, `.ok()`).
+        let nm = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            Arc::clone(&grids),
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            cmd_factory,
+            None,
+            dir.join(".lina"),
+        );
+
+        // Porta ⌘T (Managed). A admissão SOBE (degradação não impede o nó), mas com o badge.
+        let id = nm.add_node().expect("Managed degradado ainda sobe o nó");
+        assert!(
+            lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
+            "inv#6: Managed + bootstrap=None liga o badge (degradação VISÍVEL)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
