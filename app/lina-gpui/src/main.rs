@@ -67,10 +67,11 @@ use lina_bootstrap::Autonomy;
 
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
-    normalize_sel, screen_to_cell, scrub_foreign_orchestrator_env, scrub_pty_secret_env, shell_cmd,
-    spawn_pump, A2aTrigger, AttentionHub, BootstrapWriter, BrokerPump, Camera, CmdFactory,
-    CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model, NodeAdmission,
-    NodeManager, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    normalize_sel, reinject_dir, screen_to_cell, scrub_foreign_orchestrator_env,
+    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, AttentionHub, BootstrapWriter,
+    BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid,
+    MailboxPump, Model, NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H,
+    CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -889,7 +890,12 @@ impl WorkspaceView {
     /// evento — o Maestro valida por DADOS, o fundador pelo olho.
     /// Geometria: `dashboard::dashboard_panel_rect` (PURA, clampada à janela — bug da
     /// rodada: o painel fixo vazava a borda direita) + clip + scroll interno das linhas.
-    fn render_dashboard(&mut self, th: &theme::Theme, viewport: (f32, f32)) -> impl IntoElement {
+    fn render_dashboard(
+        &mut self,
+        th: &theme::Theme,
+        viewport: (f32, f32),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1063,6 +1069,36 @@ impl WorkspaceView {
             } else {
                 th.text.muted
             };
+            // F1-2-4 (entry point): "✎ Editar" abre a edição de 1ª classe (M6-E) deste Agente. Só
+            // terminais (nota/pasta não têm papel/doutrina). PENDENTE TELA DO FUNDADOR (gpui não-headless).
+            let node_id = row.node;
+            let is_terminal = lock(&self.nodes.model)
+                .nodes
+                .get(&node_id)
+                .is_some_and(|v| matches!(v.kind, NodeKind::Terminal));
+            let mut name_line = div().flex().flex_row().items_center().gap_2().child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(rgb(th.text.primary))
+                    .child(format!("{}  ● {}", row.name, row.state.label())),
+            );
+            if is_terminal {
+                name_line = name_line.child(
+                    div()
+                        .id(("dash-edit", i as u64))
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .text_size(px(11.))
+                        .text_color(rgb(th.accent.primary))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
+                            view.open_agent_modal_edit(node_id, cx);
+                        }))
+                        .child(text!("✎ Editar")),
+                );
+            }
             rows_box = rows_box.child(
                 div()
                     .id(("dash-row", i as u64))
@@ -1071,12 +1107,7 @@ impl WorkspaceView {
                     .gap_1()
                     .p_2()
                     .bg(rgb(th.surface.card))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(th.text.primary))
-                            .child(format!("{}  ● {}", row.name, row.state.label())),
-                    )
+                    .child(name_line)
                     .child(
                         div()
                             .text_size(px(11.))
@@ -1585,22 +1616,19 @@ impl WorkspaceView {
         }
     }
 
-    /// ⌘R: renomeia o terminal focado para o PRÓXIMO nome do ciclo (nomes que o role-discovery
-    /// resolve em papéis distintos). Persiste `NodeRenamed` e reescreve os `CLAUDE.md`.
-    fn rename_focused_cycle(&mut self) {
-        const NAMES: [&str; 5] = ["@Arquiteto", "@Dev Backend", "@QA", "@Frontend", "@Maestro"];
-        let cur = lock(&self.nodes.model)
+    /// **F1-2-4 — ⌘R abre a EDIÇÃO de 1ª classe (M6-E) do Agente focado.** Substitui o stub de dev
+    /// que ciclava 5 nomes fixos: agora o atalho é descobrível e edita nome/papel pelo modal completo
+    /// (re-injeção de doutrina + confirmação no caminho do Salvar). Só para terminais — nota/pasta não
+    /// têm papel/doutrina. Devolve `true` se abriu (foco era um terminal).
+    fn edit_focused_agent(&mut self, cx: &mut Context<Self>) -> bool {
+        let is_terminal = lock(&self.nodes.model)
             .nodes
             .get(&self.focused)
-            .map(|v| v.name.clone());
-        let Some(cur) = cur else { return };
-        let idx = NAMES
-            .iter()
-            .position(|n| *n == cur)
-            .map_or(0, |i| (i + 1) % NAMES.len());
-        if let Err(e) = self.nodes.rename_node(self.focused, NAMES[idx]) {
-            eprintln!("lina-gpui: renomear: {e}");
+            .is_some_and(|v| matches!(v.kind, NodeKind::Terminal));
+        if is_terminal {
+            self.open_agent_modal_edit(self.focused, cx);
         }
+        is_terminal
     }
 
     fn handle_key(&mut self, ev: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
@@ -1831,10 +1859,12 @@ impl WorkspaceView {
             self.paste_clipboard(cx);
             return;
         }
-        // ⌘R renomeia o terminal focado (W3-2): cicla nomes role-suggestivos → o papel é
-        // re-resolvido (W3-1) e o `CLAUDE.md` de TODOS é reescrito, SEM reiniciar o app.
+        // ⌘R (F1-2-4): abre a EDIÇÃO de 1ª classe (M6-E) do Agente focado — editar nome/papel de um
+        // terminal VIVO sem matá-lo (PID preservado), com re-injeção de doutrina no Salvar. Atalho
+        // agora descobrível (substitui o stub que ciclava nomes). Registrado no mapa de atalhos do
+        // ux-flows.md (ver .entrega-f1-2-4.md — ux-flows é de outro dono).
         if ks.modifiers.platform && ks.key == "r" {
-            self.rename_focused_cycle();
+            self.edit_focused_agent(cx);
             return;
         }
         // Atalhos do canvas (NÃO vão para o PTY): ⌘T adiciona (foca+revela); ⌘⌫ fecha o focado;
@@ -2185,6 +2215,7 @@ impl Render for WorkspaceView {
             };
 
             let mut title = div()
+                .id(("title", card_eid))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2243,6 +2274,18 @@ impl Render for WorkspaceView {
                         }))
                         .child(text!("✕")),
                 );
+            }
+            // F1-2-4 (entry point): DUPLO-CLIQUE no cabeçalho de um Agente abre a edição de 1ª classe
+            // (M6-E). Só terminais (nota/pasta não têm papel/doutrina). Clique simples não faz nada
+            // aqui (não rouba o foco/seleção do corpo). PENDENTE TELA DO FUNDADOR (gpui não-headless).
+            if matches!(nv.kind, NodeKind::Terminal) {
+                title = title.cursor_pointer().on_click(cx.listener(
+                    move |view, ev: &ClickEvent, _w, cx| {
+                        if ev.click_count() == 2 {
+                            view.open_agent_modal_edit(node_id, cx);
+                        }
+                    },
+                ));
             }
 
             // Range de seleção (normalizado) para ESTE card, se a seleção pertence a ele.
@@ -2830,7 +2873,7 @@ impl Render for WorkspaceView {
         // Geometria clampada ao viewport REAL (fix: o painel fixo vazava a borda direita).
         let root = if self.dashboard_open {
             let vp = window.viewport_size();
-            let panel = self.render_dashboard(&th, (f32::from(vp.width), f32::from(vp.height)));
+            let panel = self.render_dashboard(&th, (f32::from(vp.width), f32::from(vp.height)), cx);
             root.child(panel)
         } else {
             root
@@ -3463,6 +3506,7 @@ fn main() {
         Arc::clone(&store),
         Arc::clone(&grids),
         Mailbox::new(&mailbox_dir),
+        Mailbox::new(reinject_dir(&mailbox_dir)), // F1-2-4: fila serial de re-injeção de doutrina
         Arc::clone(&model),
         Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
         token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)
