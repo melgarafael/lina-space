@@ -123,6 +123,14 @@ fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
         }
     };
     match key {
+        // Cmd+Delete (mac) / Ctrl+Backspace (windows) → LIMPAR todo o input: `Ctrl+U` (`0x15`), o
+        // kill-line do readline que o shell e o Claude Code respeitam. No Mac, a tecla "delete"
+        // (apaga p/ trás) é reportada pelo gpui como `"backspace"`; cobrimos ambos os nomes sob
+        // `platform`, e `"backspace"` sob `control` p/ o Ctrl+Backspace do Windows. DEVE vir antes
+        // dos ramos `"backspace"`/`"delete"` PUROS (match é top-down). PENDENTE TELA: ver o input
+        // esvaziar num Claude real.
+        "backspace" | "delete" if ks.modifiers.platform => return vec![0x15],
+        "backspace" if ks.modifiers.control => return vec![0x15],
         // BUG A — Shift+Enter insere NOVA LINHA (não submete). Enviamos ESC+CR (`0x1b 0x0D`) num
         // ÚNICO write: parsers de TUI leem `ESC`+char contíguo como Meta/Alt+char, e o Claude Code
         // (Ink) mapeia Meta/Alt+Enter → quebra de linha no input multilinha — é o MESMO byte do
@@ -162,6 +170,30 @@ fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
         _ => {}
     }
     Vec::new()
+}
+
+/// **MODELO B (decisão do fundador) — roteamento do mouse-down sobre o grid de um terminal.** O
+/// destino do arrasto:
+/// - `LocalSelect`: arrasto PURO **sempre** seleciona texto LOCAL — MESMO com o Claude em
+///   mouse-reporting (que ele liga por padrão). Era ESTA a causa raiz REAL do bug: com mouse-reporting
+///   ON, `send_pointer` roubava todo arrasto pro TUI (`report_node`) e `self.sel` nunca nascia → a
+///   "seleção parcial que desseleciona" era o PRÓPRIO Claude desenhando ao receber os eventos.
+/// - `ForwardToTui`: só sob ⌥ Option segurado E quando o TUI aceitou o reporting (`tui_accepted`).
+///
+/// Pura → trava a política por teste (gpui não roda headless).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerRoute {
+    LocalSelect,
+    ForwardToTui,
+}
+
+#[must_use]
+fn pointer_route(option_held: bool, tui_accepted: bool) -> PointerRoute {
+    if option_held && tui_accepted {
+        PointerRoute::ForwardToTui
+    } else {
+        PointerRoute::LocalSelect
+    }
 }
 
 /// W2-4 (dívida IME): texto COMPOSTO pelo IME do SO (dead-keys pt-br ´~^, cedilha, CJK) → bytes UTF-8
@@ -1531,7 +1563,8 @@ impl WorkspaceView {
             .is_some_and(|g| lock(&g).mode().bracketed_paste)
     }
 
-    /// Mouse-down sobre o grid de um nó: reporta ao TUI (se pediu mouse) OU inicia seleção.
+    /// Mouse-down sobre o grid de um nó (MODELO B): arrasto PURO inicia SELEÇÃO local sempre; ⌥
+    /// Option encaminha o mouse ao TUI (se ele pediu reporting). Ver [`pointer_route`].
     fn pointer_down(&mut self, node: NodeId, ev: &MouseDownEvent) {
         let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
         let Some(cell) = self.screen_cell(node, pos) else {
@@ -1541,17 +1574,23 @@ impl WorkspaceView {
         self.focus(node);
         // Toda nova interação no grid zera a seleção anterior (de qualquer card).
         self.clear_selection_state();
-        // `send_pointer` é atômico: se o TUI pediu mouse, reporta o press e devolve `true` (NÃO
-        // seleciona); senão, inicia a seleção neste card.
-        if self.send_pointer(node, PtrAction::Press, cell, mods) {
-            self.report_node = Some(node);
-        } else {
-            self.sel = Some(Sel {
-                node,
-                anchor: cell,
-                head: cell,
-            });
-            self.dragging_sel = true;
+        // MODELO B: arrasto PURO SEMPRE seleciona local; ⌥ Option encaminha o mouse ao agente. Só
+        // consultamos/encaminhamos ao TUI sob Option — `send_pointer` é ATÔMICO (checa reporting +
+        // codifica sob o MESMO lock), então só o invocamos quando Option está segurado (curto-circuito
+        // do `&&`). Sem Option, o arrasto NUNCA vira mouse-report → cai na seleção local, mesmo com o
+        // Claude (mouse-reporting ON). Ver [`pointer_route`] p/ a política (testada).
+        let option_held = ev.modifiers.alt;
+        let tui_accepted = option_held && self.send_pointer(node, PtrAction::Press, cell, mods);
+        match pointer_route(option_held, tui_accepted) {
+            PointerRoute::ForwardToTui => self.report_node = Some(node),
+            PointerRoute::LocalSelect => {
+                self.sel = Some(Sel {
+                    node,
+                    anchor: cell,
+                    head: cell,
+                });
+                self.dragging_sel = true;
+            }
         }
     }
 
@@ -1903,7 +1942,11 @@ impl WorkspaceView {
             }
             return;
         }
-        if ks.modifiers.platform && ks.key == "backspace" {
+        // ⌘W fecha o terminal focado (padrão Mac; o ✕ no card continua). MIGRADO de ⌘Backspace p/
+        // liberar Cmd+Delete/⌘Backspace → LIMPAR o input (decisão do fundador): no Mac a tecla
+        // "delete" é o `"backspace"` do gpui, então ⌘Backspace agora cai no `keystroke_to_bytes`
+        // (Ctrl+U `0x15`). PENDENTE TELA: confirmar que o SO não intercepta ⌘W antes da view.
+        if ks.modifiers.platform && ks.key == "w" {
             self.close_focused(window);
             return;
         }
@@ -3833,15 +3876,36 @@ mod keymap_tests {
     use super::*;
     use gpui::Modifiers;
 
-    fn ks(key: &str, shift: bool) -> Keystroke {
+    fn ks_mod(key: &str, modifiers: Modifiers) -> Keystroke {
         Keystroke {
-            modifiers: Modifiers {
-                shift,
-                ..Default::default()
-            },
+            modifiers,
             key: key.to_string(),
             key_char: None,
         }
+    }
+
+    fn ks(key: &str, shift: bool) -> Keystroke {
+        ks_mod(
+            key,
+            Modifiers {
+                shift,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// **BUG 3 (causa raiz REAL) — MODELO B:** arrasto PURO seleciona LOCAL mesmo com o TUI em
+    /// mouse-reporting; só ⌥ Option + TUI-aceitou encaminha. (Antes, mouse-reporting ON roubava o
+    /// arrasto pro Claude → "seleção que desselecciona". A seleção estendendo ao vivo = PENDENTE TELA.)
+    #[test]
+    fn pointer_route_is_local_unless_option_and_tui_accept() {
+        // Arrasto PURO (sem Option) → LOCAL, mesmo se o TUI quisesse o mouse.
+        assert_eq!(pointer_route(false, false), PointerRoute::LocalSelect);
+        assert_eq!(pointer_route(false, true), PointerRoute::LocalSelect);
+        // ⌥ Option mas TUI NÃO quer mouse (shell puro) → LOCAL.
+        assert_eq!(pointer_route(true, false), PointerRoute::LocalSelect);
+        // ⌥ Option + TUI aceitou o reporting → encaminha ao agente.
+        assert_eq!(pointer_route(true, true), PointerRoute::ForwardToTui);
     }
 
     /// **BUG A — Shift+Enter NÃO submete: emite ESC+CR (`0x1b 0x0D` = Meta/Alt+Enter)**, que o Claude
@@ -3862,5 +3926,47 @@ mod keymap_tests {
         assert_eq!(keystroke_to_bytes(&ks("return", false), false), vec![0x0D]);
         // Não-vacuoso: o ramo do shift é DISTINTO do submit puro.
         assert_ne!(keystroke_to_bytes(&ks("enter", true), false), vec![0x0D]);
+    }
+
+    /// **Cmd+Delete (mac) / Ctrl+Backspace (win) → LIMPAR a linha (`Ctrl+U` = `0x15`).** No Mac a
+    /// tecla "delete" é o `"backspace"` do gpui; cobrimos `"backspace"|"delete"` sob `platform` e
+    /// `"backspace"` sob `control`. Backspace/Delete PUROS inalterados. (Esvaziar na tela = PENDENTE
+    /// TELA; o atalho de fechar terminal migrou p/ ⌘W para liberar esta tecla.)
+    #[test]
+    fn cmd_delete_and_ctrl_backspace_clear_line() {
+        let cmd = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            keystroke_to_bytes(&ks_mod("backspace", cmd), false),
+            vec![0x15]
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks_mod("delete", cmd), false),
+            vec![0x15]
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks_mod("backspace", ctrl), false),
+            vec![0x15]
+        );
+        // PUROS inalterados: backspace = 0x7f; delete = CSI 3~.
+        assert_eq!(
+            keystroke_to_bytes(&ks("backspace", false), false),
+            vec![0x7f]
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("delete", false), false),
+            vec![0x1b, b'[', b'3', b'~']
+        );
+        // Não-vacuoso: limpar != backspace puro.
+        assert_ne!(
+            keystroke_to_bytes(&ks_mod("backspace", cmd), false),
+            vec![0x7f]
+        );
     }
 }
