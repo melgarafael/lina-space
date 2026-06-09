@@ -26,3 +26,11 @@ spikes/*/target/
 *.exit
 /OpenConsole.exe
 /conpty.dll
+
+# Artefatos de runtime do Lina: a ficha/kit que o app gera no cwd de um agente.
+# Quando o MAESTRO roda com cwd = a raiz do repo, estes vazam aqui. A FONTE canônica
+# vive em assets/lina-doctrine/ (versionada). Ancorados na raiz (não afetam assets/).
+/AGENTS.md
+/GEMINI.md
+/.claude/settings.json
+/.claude/skills/lina-agent-bus/
