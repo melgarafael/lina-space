@@ -474,16 +474,19 @@ const OBSERVABILITY_HOOK_KINDS: [&str; 6] = [
     "Stop",
 ];
 
-/// **R2b — allowlist DURA do permission-mode** (proposta `_proposta-permission-mode.md`
-/// §2, aprovada): só `default` (pede como o claude pede — o toast F1-1-7 é a superfície
-/// de aprovação), `plan` (papéis read-only) e `acceptEdits` (opt-in explícito futuro)
-/// passam. **Bypass silencioso (`bypassPermissions`/`dontAsk`/`auto`) e valores
-/// desconhecidos DEGRADAM para `default`** — fio condutor do produto: gate humano,
-/// nunca bypass silencioso; por construção não existe caminho de spawn silencioso.
+/// **ADR 0025 — allowlist do permission-mode EXPLICITAMENTE pedido** (reverte o pin de
+/// produção do R2b). Esta função só governa o caminho de pedido EXPLÍCITO (futuro mapa
+/// por papel / gate-test): `default`, `plan` (papéis read-only), `acceptEdits` (opt-in)
+/// e **`bypassPermissions`** passam — bypass É VÁLIDO **quando explicitamente pedido**,
+/// porque a fonte é a escolha do humano (config do app / flag de teste), **nunca um campo
+/// de agente** (não há caminho de auto-bypass do agente; ver `hook_settings_json_with_mode`).
+/// Valores DESCONHECIDOS (`dontAsk`/`auto`/lixo) degradam para `default` (fail-safe).
+/// `None` (sem pedido) → `default` defensivo, mas o caminho de PRODUÇÃO nem chama esta
+/// função: ele **omite** a chave `permissions` para o `~/.claude` do usuário fluir.
 #[must_use]
 pub fn sanitized_permission_mode(requested: Option<&str>) -> &str {
     match requested.map(str::trim) {
-        Some(m @ ("default" | "plan" | "acceptEdits")) => m,
+        Some(m @ ("default" | "plan" | "acceptEdits" | "bypassPermissions")) => m,
         _ => "default",
     }
 }
@@ -496,9 +499,11 @@ pub fn sanitized_permission_mode(requested: Option<&str>) -> &str {
 /// SEMPRE — observabilidade nunca substitui o gate. `wiring = None` (CLI sem hooks /
 /// app sem listener) → MESMOS hooks do histórico (degradação por omissão).
 ///
-/// **R2b:** o settings também fixa `permissions.defaultMode = "default"` — a sonda C
-/// da proposta provou que o settings por-cwd VENCE o `bypassPermissions` de usuário,
-/// então todo terminal nasce PEDINDO permissão (o gap da tela 20:30 do fundador).
+/// **ADR 0025 (reverte R2b):** este é o caminho de PRODUÇÃO (`permission_mode == None`)
+/// e por isso o settings **NÃO** fixa `permissions` — o `~/.claude/settings.json` do
+/// usuário (incl. `bypassPermissions`, se ele escolheu) FLUI por merge. A segurança
+/// durável do Lina é o guard W3-6 + custódia (ADR 0004/0006), **não** o permission-mode
+/// do claude; o toast F1-1 só se aplica quando o usuário roda um modo que pede permissão.
 #[must_use]
 pub fn hook_settings_json_with_observability(
     lina_bin: &str,
@@ -507,10 +512,13 @@ pub fn hook_settings_json_with_observability(
     hook_settings_json_with_mode(lina_bin, wiring, None)
 }
 
-/// Como [`hook_settings_json_with_observability`], com o permission-mode POR TERMINAL
-/// (R2b): `permission_mode` passa pela allowlist [`sanitized_permission_mode`] — pedido
-/// de bypass silencioso degrada para `default`. `None` = `default` (o default de TODO
-/// terminal). É o seam p/ o mapa por papel (§2 da proposta) quando a UI o expuser.
+/// Como [`hook_settings_json_with_observability`], com o permission-mode POR TERMINAL.
+/// **ADR 0025:** `permission_mode == None` é PRODUÇÃO — **omite** a chave `permissions`
+/// inteira (o `~/.claude` do usuário decide o defaultMode). `permission_mode == Some(m)`
+/// é um pedido EXPLÍCITO (futuro mapa por papel / gate-test): fixa `defaultMode =`
+/// [`sanitized_permission_mode`]`(Some(m))` — `bypassPermissions` é honrado **quando
+/// explícito**; lixo degrada para `default`. O `m` NUNCA vem de campo de agente (vem da
+/// config do app / flag de teste) → não há caminho de auto-bypass do agente.
 #[must_use]
 pub fn hook_settings_json_with_mode(
     lina_bin: &str,
@@ -520,11 +528,7 @@ pub fn hook_settings_json_with_mode(
     let quoted = format!("'{}'", lina_bin.replace('\'', "'\\''"));
     let session_cmd = format!("{quoted} whoami --bootstrap");
     let pretooluse_cmd = format!("{quoted} guard --pretooluse");
-    let mode = sanitized_permission_mode(permission_mode);
     let mut v = serde_json::json!({
-        // R2b: settings por-cwd vence o settings de usuário (sonda C) — nunca bypass
-        // silencioso herdado; o claude pede e o toast F1-1-7 apresenta.
-        "permissions": { "defaultMode": mode },
         "hooks": {
             "SessionStart": [
                 { "hooks": [ { "type": "command", "command": session_cmd } ] }
@@ -536,6 +540,18 @@ pub fn hook_settings_json_with_mode(
             ]
         }
     });
+    // ADR 0025: só um pedido EXPLÍCITO (Some) escreve `permissions`; produção (None) omite
+    // a chave para o `~/.claude/settings.json` do usuário fluir por merge. Os hooks (turno-0
+    // + guard W3-6) já estão acima e ficam SEMPRE — a segurança durável não depende disto.
+    if let Some(requested) = permission_mode {
+        let mode = sanitized_permission_mode(Some(requested));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "permissions".to_string(),
+                serde_json::json!({ "defaultMode": mode }),
+            );
+        }
+    }
     if let Some(w) = wiring {
         if let Some(hooks) = v["hooks"].as_object_mut() {
             for kind in OBSERVABILITY_HOOK_KINDS {
@@ -887,14 +903,17 @@ mod tests {
         );
     }
 
-    // ── R2b: permission-mode por terminal (proposta aprovada — sonda C: settings por-cwd) ──
+    // ── ADR 0025 (reverte R2b): produção respeita o ~/.claude do usuário; modo só por pedido EXPLÍCITO ──
 
-    /// **R2b (fio condutor: gate humano, NUNCA bypass silencioso):** o settings que o
-    /// bootstrap escreve fixa `permissions.defaultMode = "default"` — todo terminal
-    /// nasce PEDINDO permissão como o claude pede (a sonda C provou que o settings
-    /// por-cwd vence o `bypassPermissions` de usuário). Vale com e sem fiação de hooks.
+    /// **ADR 0025 (reverte R2b) — produção RESPEITA o `~/.claude` do usuário:** o settings
+    /// que o bootstrap escreve em PRODUÇÃO (`permission_mode == None`) **NÃO** contém a
+    /// chave `permissions` → o `defaultMode` do usuário (incl. `bypassPermissions`, se ele
+    /// escolheu no próprio `~/.claude/settings.json`) FLUI por merge do Claude Code. E os
+    /// hooks de segurança (SessionStart turno-0 + PreToolUse guard W3-6) seguem SEMPRE — a
+    /// segurança durável é o guard/custódia, **independente** do permission-mode do claude.
+    /// Vale com e sem fiação de hooks.
     #[test]
-    fn settings_pin_permission_mode_default() {
+    fn production_settings_omit_permissions_so_user_choice_flows() {
         for wiring in [
             None,
             Some(HookWiring {
@@ -904,65 +923,110 @@ mod tests {
         ] {
             let j = hook_settings_json_with_observability("/abs/lina", wiring.as_ref());
             let v: serde_json::Value = serde_json::from_str(&j).expect("json válido");
-            assert_eq!(
-                v["permissions"]["defaultMode"],
-                "default",
-                "todo terminal nasce em default (wiring={:?}): {j}",
+            assert!(
+                v.get("permissions").is_none(),
+                "produção NÃO fixa permissions — o defaultMode do usuário flui (wiring={:?}): {j}",
                 wiring.is_some()
+            );
+            // O guard W3-6 (PreToolUse Bash|Skill) e o turno-0 (SessionStart) seguem SEMPRE.
+            let pre = v["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
+            let guarded = pre.iter().any(|e| {
+                e["matcher"] == "Bash|Skill"
+                    && e["hooks"].as_array().is_some_and(|hs| {
+                        hs.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .is_some_and(|c| c.contains("guard --pretooluse"))
+                        })
+                    })
+            });
+            assert!(
+                guarded,
+                "o guard W3-6 (PreToolUse Bash|Skill) permanece mesmo sem permissions: {j}"
+            );
+            assert!(
+                v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("whoami --bootstrap")),
+                "SessionStart turno-0 permanece: {j}"
             );
         }
     }
 
-    /// **R2b:** o seletor de modo é uma allowlist dura — `plan`/`acceptEdits` passam
-    /// (mapa por papel, §2 da proposta); bypass silencioso (`bypassPermissions`/
-    /// `dontAsk`/`auto`) e lixo DEGRADAM para `default`. Não existe caminho de spawn
-    /// silencioso por construção.
+    /// **ADR 0025 — modo EXPLÍCITO ≠ bypass silencioso herdado:** quando o app/teste pede
+    /// um modo EXPLICITAMENTE (futuro mapa por papel / gate-test), a allowlist fixa-o — e
+    /// `bypassPermissions` É VÁLIDO nesse caminho, porque é escolha EXPLÍCITA do humano,
+    /// não a herança silenciosa que o R2b temia. `default/plan/acceptEdits` passam; valores
+    /// DESCONHECIDOS (`dontAsk`/`auto`/lixo) degradam para `default` (fail-safe). Nenhum
+    /// campo de agente alcança este parâmetro → não há caminho de auto-bypass do agente.
     #[test]
-    fn permission_mode_allowlist_never_silent_bypass() {
-        assert_eq!(sanitized_permission_mode(None), "default");
+    fn permission_mode_explicit_request_honored_unknown_degrades() {
+        // Modos válidos passam (incl. bypass EXPLÍCITO do humano).
         assert_eq!(sanitized_permission_mode(Some("default")), "default");
         assert_eq!(sanitized_permission_mode(Some("plan")), "plan");
         assert_eq!(
             sanitized_permission_mode(Some("acceptEdits")),
             "acceptEdits"
         );
-        // Bypass silencioso NUNCA passa (fio condutor do produto).
         assert_eq!(
             sanitized_permission_mode(Some("bypassPermissions")),
-            "default"
+            "bypassPermissions",
+            "bypass EXPLÍCITO do humano é honrado (≠ bypass silencioso herdado que o R2b temia)"
         );
+        assert_eq!(sanitized_permission_mode(Some("  plan  ")), "plan", "trim");
+        // Desconhecido/lixo degrada para default (fail-safe).
         assert_eq!(sanitized_permission_mode(Some("dontAsk")), "default");
         assert_eq!(sanitized_permission_mode(Some("auto")), "default");
-        assert_eq!(sanitized_permission_mode(Some("  plan  ")), "plan", "trim");
         assert_eq!(sanitized_permission_mode(Some("garbage")), "default");
-        // O JSON reflete o modo pedido (quando permitido)…
+        assert_eq!(
+            sanitized_permission_mode(None),
+            "default",
+            "sem pedido → fallback defensivo default (produção nem chama: omite permissions)"
+        );
+        // JSON: pedido explícito fixa o modo (inclusive bypass)…
+        let j = hook_settings_json_with_mode("/abs/lina", None, Some("bypassPermissions"));
+        let v: serde_json::Value = serde_json::from_str(&j).expect("json");
+        assert_eq!(v["permissions"]["defaultMode"], "bypassPermissions");
         let j = hook_settings_json_with_mode("/abs/lina", None, Some("plan"));
         let v: serde_json::Value = serde_json::from_str(&j).expect("json");
         assert_eq!(v["permissions"]["defaultMode"], "plan");
-        // …e degrada bypass para default.
-        let j = hook_settings_json_with_mode("/abs/lina", None, Some("bypassPermissions"));
+        // …lixo degrada para default…
+        let j = hook_settings_json_with_mode("/abs/lina", None, Some("garbage"));
         let v: serde_json::Value = serde_json::from_str(&j).expect("json");
         assert_eq!(v["permissions"]["defaultMode"], "default");
+        // …e PRODUÇÃO (None) NÃO fixa permissions (o ~/.claude do usuário decide).
+        let j = hook_settings_json_with_mode("/abs/lina", None, None);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("json");
+        assert!(
+            v.get("permissions").is_none(),
+            "None = produção: sem pin de permissions (o ~/.claude do usuário flui): {j}"
+        );
     }
 
-    /// **R2b:** o arquivo escrito no disco por `write_terminal_files` carrega o bloco
-    /// de permissões (o mesmo escritor de sempre — 1 arquivo, zero mudança de spawn).
+    /// **ADR 0025:** o arquivo escrito no disco por `write_terminal_files` (caminho de
+    /// PRODUÇÃO) NÃO carrega bloco de `permissions` — o `~/.claude/settings.json` do
+    /// usuário (defaultMode, model, MCP, comandos) flui por merge. Os hooks de segurança
+    /// (turno-0 + guard W3-6) seguem intactos no MESMO arquivo.
     #[test]
-    fn write_terminal_files_settings_carry_permission_mode() {
+    fn write_terminal_files_production_omits_permissions_keeps_hooks() {
         let bs = Bootstrapper::new().expect("registry");
-        let dir = std::env::temp_dir().join(format!("lina-r2b-perm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lina-adr0025-perm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         bs.write_terminal_files(&dir, &sample("@Dev Backend"), "/abs/lina")
             .expect("escreve");
         let settings =
             std::fs::read_to_string(dir.join(".claude/settings.json")).expect("settings");
         let v: serde_json::Value = serde_json::from_str(&settings).expect("json");
-        assert_eq!(
-            v["permissions"]["defaultMode"], "default",
-            "settings por-cwd fixa o modo: {settings}"
+        assert!(
+            v.get("permissions").is_none(),
+            "produção não fixa o modo — o settings do usuário decide: {settings}"
         );
-        // Os hooks históricos seguem intactos no MESMO arquivo (permissions ⊕ hooks).
-        assert!(settings.contains("whoami --bootstrap"));
+        // Os hooks de segurança seguem intactos no MESMO arquivo (turno-0 + guard W3-6).
+        assert!(settings.contains("whoami --bootstrap"), "turno-0 presente");
+        assert!(
+            settings.contains("guard --pretooluse"),
+            "guard W3-6 presente"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
