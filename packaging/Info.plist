@@ -40,5 +40,21 @@
     <string>public.app-category.developer-tools</string>
     <key>NSHumanReadableCopyright</key>
     <string>Lina Space</string>
+    <!--
+      TCC (macOS): sem estas chaves de "usage description", o macOS NEGA EM SILÊNCIO o acesso a
+      ~/Documents (e Desktop/Downloads) — sem nem mostrar o prompt de permissão. O vault do segundo
+      cérebro do usuário costuma morar em ~/Documents/<Vault>; sem o grant, a DETECÇÃO funciona
+      (obsidian.json mora em ~/Library, fora do TCC) mas a LEITURA das notas falha → "conecta mas o
+      contexto não carrega". Com a chave presente, o macOS mostra o prompt na 1ª leitura → o usuário
+      Permite → a Lina lê o vault. O texto é o que o usuário NÃO-TÉCNICO vê no diálogo do sistema.
+    -->
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>A Lina lê as suas anotações (seu "segundo cérebro") para aprender o seu jeito e responder com o seu contexto. Tudo fica no seu computador — nada é enviado para a internet.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>A Lina pode ler anotações que você guarda na Mesa (Desktop), caso seu vault esteja lá. Tudo fica no seu computador.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>A Lina pode ler anotações que você guarda em Downloads, caso seu vault esteja lá. Tudo fica no seu computador.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>A Lina pode ler um vault de anotações guardado num disco externo, se você escolher um. Tudo fica no seu computador.</string>
 </dict>
 </plist>

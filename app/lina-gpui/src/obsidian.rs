@@ -1339,6 +1339,67 @@ pub fn read_primary_vault(lina_dir: &Path) -> Option<String> {
     }
 }
 
+/// Lê o `.lina/vault.json` COMPLETO (todos os vaults conectados). `None` se ausente/inválido.
+#[must_use]
+pub fn read_vault_config(lina_dir: &Path) -> Option<VaultConfig> {
+    let s = std::fs::read_to_string(lina_dir.join("vault.json")).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+/// PURO: lista os vaults conectados cujo índice (PageIndex) está FALTANDO em `<lina_dir>/vault-index/`.
+/// Testável sem I/O de scan — só checa a existência do sidecar `.json` de cada vault do config.
+#[must_use]
+pub fn vaults_missing_index(lina_dir: &Path, cfg: &VaultConfig) -> Vec<VaultLink> {
+    let idx_dir = lina_dir.join("vault-index");
+    cfg.vaults
+        .iter()
+        .filter(|v| {
+            let base = index_filename_base(&v.name, Path::new(&v.path));
+            !idx_dir.join(format!("{base}.json")).exists()
+        })
+        .map(|v| VaultLink {
+            name: v.name.clone(),
+            path: PathBuf::from(&v.path),
+            open: v.path == cfg.primary,
+            added_manually: false,
+        })
+        .collect()
+}
+
+/// **Self-heal do segundo cérebro (boot).** Se `vault.json` existe (vault conectado) mas o índice de
+/// algum vault está FALTANDO, regenera-o FORA da thread de UI (detached, best-effort). Cobre o caso real
+/// em que a thread fire-and-forget do onboarding morreu antes de gravar (janela fechada cedo, permissão
+/// de Documentos/TCC negada na 1ª execução, crash) — sem isso, o usuário não-técnico fica com o segundo
+/// cérebro "conectado mas vazio" e SEM caminho de volta (o onboarding é one-shot). No-op se não há
+/// `vault.json` ou se todos os índices já existem (não re-escaneia à toa). Falha de permissão é LOGADA
+/// alto (não engolida em silêncio) — o sintoma deixa de ser invisível.
+pub fn heal_missing_indices(lina_dir: &Path) {
+    let Some(cfg) = read_vault_config(lina_dir) else {
+        return;
+    };
+    let missing = vaults_missing_index(lina_dir, &cfg);
+    if missing.is_empty() {
+        return;
+    }
+    let lina_dir = lina_dir.to_path_buf();
+    thread::spawn(move || {
+        for v in &missing {
+            match write_vault_index(&lina_dir, v) {
+                Ok(p) => eprintln!(
+                    "obsidian: self-heal regenerou o índice de '{}' → {}",
+                    v.name,
+                    p.display()
+                ),
+                Err(e) => eprintln!(
+                    "obsidian: self-heal NÃO conseguiu indexar '{}' ({e}) — provável falta de \
+                     permissão de acesso à pasta (Documentos/TCC) ou vault movido.",
+                    v.name
+                ),
+            }
+        }
+    });
+}
+
 // ═══════════════════════════ estados da tela + rótulo do rodapé (puro) ═══════════════════════════
 
 /// Os 5 estados da tela (UX §3). Fonte única de verdade do banner E do rótulo do rodapé.
@@ -3209,5 +3270,43 @@ mod tests {
         let b = index_filename_base("Notas", Path::new("/b/Notas"));
         assert_ne!(a, b, "mesmo nome, pastas diferentes → arquivos diferentes");
         assert!(a.starts_with("notas-") && !a.ends_with(".md"));
+    }
+
+    /// **Self-heal (boot):** `vaults_missing_index` detecta o índice FALTANDO e, após gerar, NÃO o
+    /// reporta mais — o gatilho do regen é exatamente "vault conectado mas índice ausente". Controle
+    /// positivo (índice presente → lista vazia) prova não-vacuosidade. Sem corrida de env (dirs temp).
+    #[test]
+    fn self_heal_detects_missing_index_then_clears_after_generation() {
+        let base = std::env::temp_dir().join(format!("lina-heal-{}", std::process::id()));
+        let lina = base.join(".lina");
+        let vault = base.join("Meu Vault");
+        std::fs::create_dir_all(vault.join("sub")).expect("cria vault");
+        std::fs::write(vault.join("a.md"), "# A\n[[b]]\n").expect("a.md");
+        std::fs::write(vault.join("sub").join("b.md"), "# B\n").expect("b.md");
+        let cfg = VaultConfig {
+            primary: vault.display().to_string(),
+            vaults: vec![VaultEntry {
+                name: "Meu Vault".to_string(),
+                path: vault.display().to_string(),
+                writable: vault.join("Lina").display().to_string(),
+            }],
+        };
+        write_vault_config(&lina, &cfg).expect("vault.json");
+
+        // ANTES: vault.json existe, índice NÃO → o self-heal DEVE marcar este vault.
+        let missing = vaults_missing_index(&lina, &cfg);
+        assert_eq!(missing.len(), 1, "índice ausente → 1 vault a curar");
+        assert_eq!(missing[0].path, vault, "aponta pro vault certo");
+
+        // Gera o índice (o que o heal faria na thread).
+        write_vault_index(&lina, &missing[0]).expect("gera índice");
+
+        // DEPOIS: índice presente → lista VAZIA (não re-escaneia à toa).
+        assert!(
+            vaults_missing_index(&lina, &cfg).is_empty(),
+            "índice presente → nada a curar (controle positivo)"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -3389,6 +3389,11 @@ fn main() {
     let vault_path = obsidian::read_primary_vault(&mailbox_dir)
         .or_else(|| std::env::var("LINA_VAULT").ok())
         .unwrap_or_else(|| ws_root.join("vault").display().to_string());
+    // Self-heal do segundo cérebro: se o vault está conectado (vault.json) mas o índice (PageIndex)
+    // sumiu — a thread fire-and-forget do onboarding morreu, ou a 1ª execução foi negada no TCC de
+    // Documentos — regenera-o agora, no contexto do app (já com o grant de Documentos do bundle).
+    // No-op quando os índices já existem. Sem isso, o usuário não-técnico fica "conectado mas vazio".
+    obsidian::heal_missing_indices(&mailbox_dir);
     let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
     let mut bootstrap =
         BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
