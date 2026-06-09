@@ -680,6 +680,8 @@ barra:  [ MeuNegócio ▾ ]   Tudo salvo ✓   R$ 4,20 hoje   🔔(1)
 
 Reusa **T3 — Galeria de Focos** (Fase 0) em modal, idêntica à do onboarding: cards de Foco («Construir um App», «Criar Landing Page», «Pesquisa & Conteúdo», «Automatizar Rotinas», «Espaço em Branco»), nome pré-preenchido, pasta sugerida em `~/EspaçosDeTrabalho/<nome>`. Uma decisão real (o Foco); o resto é default.
 
+> **Diretório de Trabalho — campo de 1ª classe (fundador 2026-06-09).** O modal de criação tem um campo **"Diretório de Trabalho"** explícito (pré-preenchido pelo Foco / `~/EspaçosDeTrabalho/<nome>`, **editável via "Procurar…"** — igual ao do Maestri, mas DENTRO da Galeria de Focos, que o fundador decidiu manter por ser mais completa que o modal simples). Esse diretório é o **`default_cwd` do Espaço**: **todo novo terminal e todo novo agente daquele Espaço nascem nele por padrão** (sem o usuário especificar caminho). Ver F1-4-1 critério 6 e a interação com o ADR 0022 (default_cwd compartilhado = colaboração intencional no mesmo projeto; `n-<uuid>` isolado é o fallback sem default_cwd).
+
 - Ao criar: troca para o novo Espaço já povoado pelos Agentes do Foco (nunca tela em branco) — o mesmo aterrissar de T4.
 - **Free vs. PRO (decisão do fundador, 2026-06-06: Free = 1 Espaço):** o plano Free inclui **1 Espaço**; com ele criado, o card de criação mostra o estado ANTES do clique (ver anti-padrões): «Você já usa o Espaço do plano Free (1 de 1) · [ Conhecer o PRO ]» — sem deixar montar tudo para negar no fim. O gating é o da F1-4-5 (`workspace_limit` assinado na chave; PRO = N) e o bloqueio é gracioso: nada trava, a saída é clara.
 
