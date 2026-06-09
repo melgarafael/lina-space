@@ -3259,6 +3259,25 @@ fn main() {
     // PRIMEIRA coisa: hidrata o PATH ANTES de qualquer varredura de CLI ou spawn de PTY (ver doc da
     // função). Sem isto, um app aberto pelo Finder não acha `claude`/`codex`/`npm` instalados.
     hydrate_path_from_login_shell();
+
+    // **Lina universal (a base do produto):** instala a doutrina + a skill `lina-agent-bus` no config
+    // GLOBAL de cada CLI (`~/.claude`, `~/.codex`, `~/.gemini`) — ADITIVO, IDEMPOTENTE, AUTO-GATED.
+    // Sem isto, só AGENTES (cwd gerenciado) conheciam o Lina; um terminal PURO ou um `claude` rodado
+    // em qualquer pasta ficava cego pro Lina → o leigo tinha de saber "novo agente vs novo terminal".
+    // Agora as capacidades estão acessíveis em TUDO, em qualquer pasta. Best-effort (não aborta o boot).
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        match lina_bootstrap::ensure_lina_globally_available(&home) {
+            Ok(r) => eprintln!(
+                "lina-gpui: Lina universal instalado — doutrina em {} CLIs + {} skills (sob {})",
+                r.doctrine_files.len(),
+                r.skill_dirs.len(),
+                home.display()
+            ),
+            Err(e) => eprintln!(
+                "lina-gpui: instalação global do Lina falhou parcialmente ({e}) — agentes gerenciados seguem com a ficha por-cwd"
+            ),
+        }
+    }
     let (cols, rows) = fit_dims();
     // BUG A (instrumentação de boot): o PTY é spawnado com EXATAMENTE estas `rows`, e o render trava a
     // line-height em CELL_H → as `rows` cabem inteiras no card (a ÚLTIMA = barra de input da TUI). O

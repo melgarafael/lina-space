@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 pub mod pretooluse;
 pub use pretooluse::{autonomy_from_env, pretooluse_output, AUTONOMY_ENV};
 
+/// **Lina universal:** instala doutrina + skill no config GLOBAL de cada CLI (todo terminal/CLI
+/// fica Lina-aware, sem o leigo escolher caminho). Aditivo, idempotente, auto-gated.
+pub mod global_install;
+pub use global_install::{ensure_lina_globally_available, GlobalInstallReport};
+
 /// Templates CANÔNICOS embutidos (fonte da verdade do Spec Writer). Mesmos 13 placeholders; só o
 /// gatilho de bootstrap muda por CLI. Um rebuild re-embute se o Spec Writer atualizar os arquivos.
 const CLAUDE_TEMPLATE: &str = include_str!("../../../assets/lina-doctrine/CLAUDE.md");
