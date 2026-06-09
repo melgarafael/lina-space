@@ -2535,6 +2535,24 @@ pub fn encode_pointer(
     })
 }
 
+/// **BUG B — caminho(s) de arquivo solto(s) no terminal → string CITADA** pronta p/ injetar no PTY
+/// pelo MESMO caminho do teclado humano (`WriteOp::HumanKeys`), espelhando o Maestri. Cada caminho
+/// vai entre aspas SIMPLES (POSIX: tudo é literal dentro de `'…'`, então espaços e metacaracteres
+/// ficam seguros), com a aspa simples INTERNA escapada como `'\''` (fecha-escapa-reabre). Vários
+/// caminhos são separados por espaço; a string TERMINA com um espaço, deixando o cursor pronto p/ o
+/// próximo path/digitação. Sem caminhos → string vazia (o chamador NÃO escreve no PTY). Pura e
+/// testável; o drop VISUAL = PENDENTE TELA DO FUNDADOR (gpui não roda headless).
+#[must_use]
+pub fn quote_dropped_paths(paths: &[std::path::PathBuf]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        out.push('\'');
+        out.push_str(&p.to_string_lossy().replace('\'', "'\\''"));
+        out.push_str("' ");
+    }
+    out
+}
+
 /// **W3-2 · Escritor de bootstrap por terminal (gpui-free).** Mantém o renderer + a config do
 /// workspace (vault, autonomia, caminho do bin `lina`) e escreve, no **cwd de cada terminal**
 /// (`<ws_root>/<key>/`), os arquivos dos DOIS canais do design §1: `CLAUDE.md` (doutrina/8 blocos,
@@ -6295,6 +6313,73 @@ mod tests {
         assert!(
             cell_in_selection(2, 3, sc, sr, ec, er) && !cell_in_selection(3, 3, sc, sr, ec, er)
         );
+    }
+
+    /// **BUG C — coords do arraste estendem CONTÍNUO (sem desselecionar).** Fixa a âncora e arrasta
+    /// linha a linha p/ baixo: cada passo é um SUPERCONJUNTO do anterior (a contagem de células
+    /// membros só cresce) e o head acompanha o cursor 1:1. Isso prova que a LÓGICA de coords sempre
+    /// esteve correta — a causa raiz do bug relatado ("não estende / desselecciona") era de RENDER:
+    /// a view quiescente não repintava o gesto sem `cx.notify()` (corrigido no `on_mouse_move`). A
+    /// confirmação VISUAL ao vivo num Claude = PENDENTE TELA DO FUNDADOR (gpui não roda headless).
+    #[test]
+    fn drag_extends_selection_continuously_in_viewport() {
+        let cam = Camera::default();
+        let card = (30.0_f32, 96.0_f32);
+        let dims = (80usize, 24usize);
+        let z = cam.zoom;
+        let (sx, sy) = cam.world_to_screen(card);
+        let (gx, gy) = (sx + GRID_OX, sy + GRID_OY_FIXED + CELL_H * z);
+        let col_px = |c: f32| gx + (c + 0.5) * CELL_W * z;
+        let row_px = |r: f32| gy + (r + 0.5) * CELL_H * z;
+        // Âncora no MEIO de uma linha (col 10, row 2).
+        let anchor = screen_to_cell(&cam, card, (col_px(10.0), row_px(2.0)), dims);
+        assert_eq!(anchor, (10, 2));
+        let mut prev_members = 0usize;
+        for row in 2..=20u32 {
+            let head = screen_to_cell(&cam, card, (col_px(10.0), row_px(row as f32)), dims);
+            assert_eq!(
+                head,
+                (10, row as usize),
+                "head acompanha o cursor linha a linha"
+            );
+            let (sc, sr, ec, er) = normalize_sel(anchor, head);
+            let members = (0..dims.1)
+                .flat_map(|r| (0..dims.0).map(move |c| (c, r)))
+                .filter(|&(c, r)| cell_in_selection(c, r, sc, sr, ec, er))
+                .count();
+            assert!(
+                members >= prev_members,
+                "estender p/ baixo NUNCA desseleciona (row={row}, members={members}, prev={prev_members})"
+            );
+            prev_members = members;
+        }
+        assert!(
+            prev_members > dims.0,
+            "seleção multi-linha real (não presa a uma sub-região de 1 linha)"
+        );
+    }
+
+    /// **BUG B — caminho(s) solto(s) → string CITADA p/ injeção no PTY** (aspas simples POSIX; aspa
+    /// interna vira `'\''`; vários separados por espaço; termina com 1 espaço). Vazio → string vazia.
+    #[test]
+    fn dropped_paths_are_single_quoted_and_space_safe() {
+        use std::path::PathBuf;
+        assert_eq!(
+            quote_dropped_paths(&[PathBuf::from("/Users/x/SOP CUSTOMER SERVICE FCL.pdf")]),
+            "'/Users/x/SOP CUSTOMER SERVICE FCL.pdf' "
+        );
+        // Aspa simples interna → fecha-escapa-reabre `'\''`.
+        assert_eq!(
+            quote_dropped_paths(&[PathBuf::from("/tmp/it's a file.txt")]),
+            "'/tmp/it'\\''s a file.txt' "
+        );
+        // Vários caminhos → cada um citado, separados por espaço.
+        assert_eq!(
+            quote_dropped_paths(&[PathBuf::from("/a/b.png"), PathBuf::from("/c d/e.mov")]),
+            "'/a/b.png' '/c d/e.mov' "
+        );
+        // Vazio → o chamador NÃO escreve no PTY.
+        assert!(quote_dropped_paths(&[]).is_empty());
     }
 
     /// **GATE W2-4 — seleção por células → `selection_text` correto** (usa a primitiva do core).

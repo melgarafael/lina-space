@@ -53,10 +53,10 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, point, prelude::*, px, rgb, size, text, App, Bounds, ClickEvent, ClipboardItem, Context,
-    Entity, FocusHandle, FontWeight, InputHandler, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Render, Rgba,
-    Role, ScrollDelta, ScrollWheelEvent, TitlebarOptions, UTF16Selection, Window, WindowBounds,
-    WindowOptions,
+    Entity, ExternalPaths, FocusHandle, FontWeight, InputHandler, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
+    Render, Rgba, Role, ScrollDelta, ScrollWheelEvent, TitlebarOptions, UTF16Selection, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -67,10 +67,11 @@ use lina_bootstrap::Autonomy;
 
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
-    normalize_sel, screen_to_cell, scrub_foreign_orchestrator_env, scrub_pty_secret_env, shell_cmd,
-    spawn_pump, A2aTrigger, ApprovalWiring, AttentionHub, BootstrapWriter, BrokerPump, Camera,
-    CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost, Grid, MailboxPump, Model,
-    NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    normalize_sel, quote_dropped_paths, screen_to_cell, scrub_foreign_orchestrator_env,
+    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, ApprovalWiring, AttentionHub,
+    BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost,
+    Grid, MailboxPump, Model, NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W,
+    CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -122,6 +123,16 @@ fn keystroke_to_bytes(ks: &Keystroke, app_cursor: bool) -> Vec<u8> {
         }
     };
     match key {
+        // BUG A — Shift+Enter insere NOVA LINHA (não submete). Enviamos ESC+CR (`0x1b 0x0D`) num
+        // ÚNICO write: parsers de TUI leem `ESC`+char contíguo como Meta/Alt+char, e o Claude Code
+        // (Ink) mapeia Meta/Alt+Enter → quebra de linha no input multilinha — é o MESMO byte do
+        // atalho documentado "Option+Enter" / "Esc depois Enter", e funciona SEM `/terminal-setup`
+        // (a Lina É o emulador: ela sintetiza os bytes do PTY, então manda o que o Meta+Enter manda).
+        // Rejeitados: `\n` (0x0A) puro — muitos editores de linha o tratam como SUBMIT; CSI-u
+        // `\x1b[13;2u` — exigiria o protocolo de teclado Kitty negociado (o Claude Code não liga por
+        // padrão), viraria lixo literal. Enter PURO segue submetendo (`0x0D`). PENDENTE TELA: a
+        // confirmação da quebra de linha num Claude real (gpui não roda headless).
+        "enter" | "return" if ks.modifiers.shift => return vec![0x1b, 0x0D],
         "enter" | "return" => return vec![0x0D],
         "backspace" => return vec![0x7f],
         "tab" => return vec![0x09],
@@ -1473,16 +1484,19 @@ impl WorkspaceView {
 
     /// Estende a seleção em curso até a célula sob `screen_pt` (chamado no arraste). Só toca o
     /// backend quando a CÉLULA muda (o mousemove dispara a ~60Hz, muitas vezes na mesma célula).
-    fn extend_selection(&mut self, screen_pt: (f32, f32)) {
+    /// Devolve `true` se a seleção MUDOU — o chamador então marca a view suja (`cx.notify()`), sem o
+    /// qual a view quiescente (terminal IDLE) NÃO repinta o highlight do arraste (BUG C, ver o
+    /// `on_mouse_move`).
+    fn extend_selection(&mut self, screen_pt: (f32, f32)) -> bool {
         let Some((node, anchor, head)) = self.sel.as_ref().map(|s| (s.node, s.anchor, s.head))
         else {
-            return;
+            return false;
         };
         let Some(cell) = self.screen_cell(node, screen_pt) else {
-            return;
+            return false;
         };
         if cell == head {
-            return;
+            return false;
         }
         if let Some(sel) = self.sel.as_mut() {
             sel.head = cell;
@@ -1490,6 +1504,17 @@ impl WorkspaceView {
         if let Some(g) = self.grid_of(node) {
             lock(&g).set_selection(anchor.0, anchor.1, cell.0, cell.1);
         }
+        // BUG C (instrumentação de-dupada por CÉLULA, não por frame): o fundador grepa `sel ·` no
+        // stderr p/ confirmar, sem ver a tela, que o head ESTENDE contínuo (anchor fixo; norm cresce).
+        eprintln!(
+            "lina-gpui: sel · node={node} anchor=({},{}) head=({},{}) norm={:?}",
+            anchor.0,
+            anchor.1,
+            cell.0,
+            cell.1,
+            normalize_sel(anchor, cell)
+        );
+        true
     }
 
     /// Texto da seleção atual (do backend, respeitando wrap), ou `None`.
@@ -2054,15 +2079,24 @@ impl Render for WorkspaceView {
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, _cx| {
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, cx| {
                 let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
                 if let Some((mouse0, pan0)) = view.drag {
                     if ev.dragging() {
                         view.camera.pan = (pan0.0 + pos.0 - mouse0.0, pan0.1 + pos.1 - mouse0.1);
+                        // BUG C (raiz): o gpui só auto-repinta num mousemove quando há `active_drag`
+                        // NATIVO (window.rs `dispatch_mouse_event`). Pan/seleção aqui usam estado
+                        // MANUAL → sem `cx.notify()` a view quiescente (terminal idle, sem animação)
+                        // não redesenha o gesto: o pan "congela" e a seleção parece não estender /
+                        // desselecionar. Marcar dirty resolve a causa raiz.
+                        cx.notify();
                     }
                 } else if view.dragging_sel {
-                    // Estende a seleção até a célula sob o cursor (mesmo fora do card).
-                    view.extend_selection(pos);
+                    // Estende a seleção até a célula sob o cursor (mesmo fora do card). Só repinta
+                    // quando a célula MUDA (extend devolve `true`) — evita re-render a 60Hz à toa.
+                    if view.extend_selection(pos) {
+                        cx.notify();
+                    }
                 } else if let Some(node) = view.report_node {
                     // Mouse reporting: movimento com botão (drag) → o TUI recebe (se quiser).
                     let mods = (ev.modifiers.shift, ev.modifiers.alt, ev.modifiers.control);
@@ -2073,7 +2107,11 @@ impl Render for WorkspaceView {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|view, ev: &MouseUpEvent, _w, _cx| {
+                cx.listener(|view, ev: &MouseUpEvent, _w, cx| {
+                    // BUG C: o fim do gesto também muda o visual (limpa clique-simples / fixa o
+                    // estado final). Sem `active_drag` nativo o gpui não repinta no mouseup → marca
+                    // dirty se houve gesto ativo.
+                    let was_active = view.drag.is_some() || view.dragging_sel;
                     view.drag = None;
                     if view.dragging_sel {
                         view.dragging_sel = false;
@@ -2088,6 +2126,9 @@ impl Render for WorkspaceView {
                         if let Some(cell) = view.screen_cell(node, pos) {
                             view.send_pointer(node, PtrAction::Release, cell, mods);
                         }
+                    }
+                    if was_active {
+                        cx.notify();
                     }
                 }),
             )
@@ -2231,6 +2272,28 @@ impl Render for WorkspaceView {
                         .text_color(rgb(th.text.muted))
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
+            // BUG D: affordance ✎ DESCOBRÍVEL no próprio CARD (antes só no painel ⌘K → o fundador não
+            // achava). Chip clicável no cabeçalho do Agente que abre a edição de 1ª classe
+            // (`open_agent_modal_edit`). Mantém os entry points existentes (⌘K + duplo-clique no
+            // título). Só terminais (nota/pasta não têm papel/doutrina). Mesma estrutura do chip ✕
+            // (parent `.id()` único por card → sem colisão de ElementId no AccessKit). Layout nos 2
+            // temas = PENDENTE TELA DO FUNDADOR.
+            if matches!(nv.kind, NodeKind::Terminal) {
+                title = title.child(
+                    div()
+                        .id(("card-edit", card_eid))
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .text_size(px(11.0 * z))
+                        .text_color(rgb(th.accent.primary))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
+                            view.open_agent_modal_edit(node_id, cx);
+                        }))
+                        .child(text!("✎ Editar")),
+                );
+            }
             // Rodada 360 (ADR 0022 §4): degradação VISÍVEL — agente em pasta própria SEM o kit
             // de integração (sem consentimento no modal, ou arquivo do usuário preservado).
             if nv.kit_missing {
@@ -2320,9 +2383,12 @@ impl Render for WorkspaceView {
                 .opacity(if dim { 0.82 } else { 1.0 })
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |view, ev: &MouseDownEvent, _w, _cx| {
+                    cx.listener(move |view, ev: &MouseDownEvent, _w, cx| {
                         // Sobre o grid: mouse reporting (se o TUI pediu) OU inicia seleção.
                         view.pointer_down(node_id, ev);
+                        // BUG C: repinta ao iniciar — fixa a âncora e LIMPA qualquer highlight
+                        // anterior (de outro card) na tela quiescente.
+                        cx.notify();
                     }),
                 );
             // W4-2 · M3/M4: nós-ARTEFATO (Note/Folder) não têm PTY/grid — desenham ÍCONE + nome (não a
@@ -2397,6 +2463,23 @@ impl Render for WorkspaceView {
                 // BUG 2 (scroll): o gesto de roda é tratado no handler do ROOT (que sempre dispara),
                 // roteando por `hit_test` — scrollback sobre o terminal, zoom no fundo. (Antes ficava
                 // aqui no card e não pegava o gesto de forma confiável.)
+                // BUG B: arquivo(s)/mídia/PDF solto(s) NESTE card → injeta o(s) caminho(s) CITADO(s)
+                // no PTY do nó, pelo MESMO caminho do teclado humano (fila serial `WriteOp::HumanKeys`,
+                // como `paste_clipboard`/`handle_key`). Só nós com PTY (terminal) recebem; nota/pasta
+                // não têm grid → ignora. O drop VISUAL = PENDENTE TELA DO FUNDADOR.
+                .on_drop(cx.listener(move |view, paths: &ExternalPaths, _w, cx| {
+                    if lock(&view.nodes.grids).get(&node_id).is_none() {
+                        return;
+                    }
+                    let quoted = quote_dropped_paths(paths.paths());
+                    if quoted.is_empty() {
+                        return;
+                    }
+                    view.focus(node_id);
+                    view.input
+                        .submit(node_id, WriteOp::HumanKeys(quoted.into_bytes()));
+                    cx.notify();
+                }))
                 .child(title)
                 .child(body);
 
@@ -3742,5 +3825,42 @@ mod path_tests {
             1,
             "dedup do dir repetido"
         );
+    }
+}
+
+#[cfg(test)]
+mod keymap_tests {
+    use super::*;
+    use gpui::Modifiers;
+
+    fn ks(key: &str, shift: bool) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                shift,
+                ..Default::default()
+            },
+            key: key.to_string(),
+            key_char: None,
+        }
+    }
+
+    /// **BUG A — Shift+Enter NÃO submete: emite ESC+CR (`0x1b 0x0D` = Meta/Alt+Enter)**, que o Claude
+    /// Code interpreta como nova linha. Enter PURO continua sendo submit (`0x0D`). Determinístico, sem
+    /// gpui. A confirmação da quebra de linha num Claude real = PENDENTE TELA DO FUNDADOR.
+    #[test]
+    fn shift_enter_is_newline_not_submit() {
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", true), false),
+            vec![0x1b, 0x0D]
+        );
+        assert_eq!(
+            keystroke_to_bytes(&ks("return", true), false),
+            vec![0x1b, 0x0D]
+        );
+        // Enter / Return PUROS = submit (inalterado).
+        assert_eq!(keystroke_to_bytes(&ks("enter", false), false), vec![0x0D]);
+        assert_eq!(keystroke_to_bytes(&ks("return", false), false), vec![0x0D]);
+        // Não-vacuoso: o ramo do shift é DISTINTO do submit puro.
+        assert_ne!(keystroke_to_bytes(&ks("enter", true), false), vec![0x0D]);
     }
 }
