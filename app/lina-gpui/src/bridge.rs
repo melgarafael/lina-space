@@ -2120,12 +2120,14 @@ fn install_agent_bus_skill(cwd: &Path) {
 }
 
 /// Fábrica do comando de um nó: um **SHELL INTERATIVO REAL** — o do usuário (`$SHELL`, com
-/// fallback `/bin/sh`), idêntico para TODOS os nós (aceita teclado, roda claude/vim/…). Mostra
-/// um banner neutro e dá `exec` no shell (sem mock/`cat`). É gpui-free (vive aqui, não no main).
-/// Prepõe o diretório do `lina` ao `PATH` do filho para o A2A funcionar sem setup manual.
+/// fallback `/bin/sh`), idêntico para TODOS os nós (aceita teclado, roda claude/vim/…). Dá `exec`
+/// direto no shell, **sem banner/intro** (pedido do fundador: o `+ Terminal` deve abrir como o
+/// Terminal.app — shell limpo). É gpui-free (vive aqui, não no main). Prepõe o diretório do `lina`
+/// ao `PATH` do filho para o A2A funcionar sem setup manual. O `_name` é ignorado (o shell puro
+/// não imprime mais o nome); fica na assinatura só pelo contrato da [`CmdFactory`].
 #[must_use]
-pub fn shell_cmd(name: &str) -> PtyCommand {
-    let cmd = platform_shell_cmd(name).env("TERM", "xterm-256color");
+pub fn shell_cmd(_name: &str) -> PtyCommand {
+    let cmd = platform_shell_cmd().env("TERM", "xterm-256color");
     // Garante o `lina` no PATH do shell filho (A2A sem setup manual): prepõe o dir do binário
     // `lina` ao PATH herdado. Best-effort — sem resolução, o shell ainda herda o PATH do pai.
     match lina_path_value() {
@@ -2135,19 +2137,18 @@ pub fn shell_cmd(name: &str) -> PtyCommand {
 }
 
 #[cfg(windows)]
-fn platform_shell_cmd(name: &str) -> PtyCommand {
-    let safe_name = name.replace('&', "^&").replace('|', "^|");
-    PtyCommand::new("cmd.exe").arg("/K").arg(format!(
-        "echo {safe_name} - shell interativo (digite comandos; rode claude/codex/vim/...)"
-    ))
+fn platform_shell_cmd() -> PtyCommand {
+    // Shell interativo limpo, sem a linha de intro (`/K` sem `echo`): o `cmd.exe` já abre
+    // aceitando comandos. Como o Terminal padrão do Windows.
+    PtyCommand::new("cmd.exe")
 }
 
 #[cfg(not(windows))]
-fn platform_shell_cmd(name: &str) -> PtyCommand {
-    PtyCommand::new("sh").arg("-c").arg(format!(
-        "printf '{name} — shell interativo (digite comandos; rode claude/vim/…).\\r\\n'; \
-             exec \"${{SHELL:-/bin/sh}}\" -i"
-    ))
+fn platform_shell_cmd() -> PtyCommand {
+    // `exec` direto no shell de login do usuário (com fallback `/bin/sh`), SEM intro.
+    PtyCommand::new("sh")
+        .arg("-c")
+        .arg("exec \"${SHELL:-/bin/sh}\" -i")
 }
 
 /// **W3-6c fio 3 — env limpo do PTY do agente.** Nomes de variáveis de ambiente portadoras de
@@ -2913,11 +2914,27 @@ fn role_templates_from_records(records: &[EventRecord]) -> Vec<crate::agent_moda
         .collect()
 }
 
+/// O HOME do usuário (`$HOME`, com fallback `$USERPROFILE` no Windows e, em último caso,
+/// `std::env::temp_dir()`) — o cwd do terminal PURO (`+ Terminal`), como o Terminal.app. Nunca
+/// panica (sem `unwrap`/`expect`): se o ambiente não trouxer nenhum, cai num diretório válido.
+#[must_use]
+fn user_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// **Rodada 360 (ADR 0022 §4) — política de pasta de trabalho de uma admissão.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CwdPolicy {
-    /// Dir gerenciado `<ws_root>/t{seq}` — kit de integração completo, como sempre.
+    /// Dir gerenciado `<ws_root>/n-<uuid>` — kit de integração completo, como sempre (AGENTES).
     Managed,
+    /// **Terminal PURO (`+ Terminal` / ⌘T).** cwd = HOME do usuário (`path`), como o
+    /// Terminal.app: abre no `$HOME`, ZERO arquivos do Lina escritos (nunca um `CLAUDE.md`/
+    /// `.lina`/`.claude` no home — não poluir o diretório pessoal). Sem dir gerenciado, sem kit,
+    /// sem badge de degradação (não é agente meio-cidadão: é um shell limpo por design).
+    UserHome { path: PathBuf },
     /// Pasta REAL do usuário (picker do M6). `consent` = o usuário autorizou no modal a
     /// Lina criar os arquivos de orquestração nela; sem consentimento o nó nasce com a
     /// degradação VISÍVEL (badge "sem doutrina/observabilidade") — nunca silenciosa.
@@ -2942,14 +2959,18 @@ pub struct NodeAdmission {
 }
 
 impl NodeAdmission {
-    /// Porta ⌘T / botão +: terminal default, nome automático, dir gerenciado.
+    /// Porta ⌘T / botão +: terminal PURO, nome automático, cwd = HOME do usuário (como o
+    /// Terminal.app). NÃO é agente: não recebe kit/doutrina, e ZERO arquivos do Lina são escritos
+    /// no home (`CwdPolicy::UserHome`). Agentes (motor escolhido no M6) seguem `Managed`/`UserDir`.
     #[must_use]
     pub fn default_terminal() -> Self {
         Self {
             name: None,
             role: "terminal".into(),
             engine: None,
-            cwd: CwdPolicy::Managed,
+            cwd: CwdPolicy::UserHome {
+                path: user_home_dir(),
+            },
             position: None,
         }
     }
@@ -3187,6 +3208,10 @@ impl NodeManager {
                     let _ = bw.write_user_dir(path, name, &roster);
                 }
                 CwdPolicy::UserDir { consent: false, .. } => {}
+                // Terminal PURO: NUNCA escreve no HOME do usuário (nem na admissão, nem aqui no
+                // rewrite por mudança de roster). Continua listado como colega no `roster`, mas
+                // o home dele fica intocado — invariante do `+ Terminal`.
+                CwdPolicy::UserHome { .. } => {}
             }
         }
     }
@@ -3522,6 +3547,16 @@ impl NodeManager {
                     }
                 }
                 dir
+            }
+            CwdPolicy::UserHome { path } => {
+                // Terminal PURO (pedido do fundador): abre no HOME do usuário, como o
+                // Terminal.app. ZERO arquivos do Lina escritos — NÃO cria dir gerenciado,
+                // NÃO escreve kit/doutrina/`.claude`/`settings.json` no home (não poluir o
+                // diretório pessoal). `kit_missing` fica FALSE: não é um agente degradado, é um
+                // shell limpo por design (sem badge "sem doutrina/observabilidade"). O cwd REAL
+                // (= home) ainda persiste no `TerminalSpawned.cwd` (binding §3).
+                cmd = cmd.cwd(path.clone());
+                Some(path.clone())
             }
             CwdPolicy::UserDir { path, consent } => {
                 if let Err(e) = std::fs::create_dir_all(path) {
@@ -6442,8 +6477,12 @@ mod tests {
         );
         assert!(a1.contains("Terminal B"), "A lista B como colega");
 
-        // ADD: novo terminal C → CLAUDE.md próprio (no cwd dele) e o de A REESCRITO com C.
-        let c = nm.add_node().expect("add C");
+        // ADD: novo AGENTE C → CLAUDE.md próprio (no cwd dele) e o de A REESCRITO com C. Pós
+        // terminal-puro, o ⌘T (`add_node`) é PURO (HOME, sem kit); a escrita/reescrita de kit é
+        // invariante de AGENTE gerenciado (⌘N sem pasta = `Managed`), então criamos C por aí.
+        let c = nm
+            .create_agent_with("Terminal C", None, None, None, false)
+            .expect("add C (agente gerenciado)");
         // O cwd de C é um dir gerenciado ÚNICO (`<ws>/n-<uuid>`), não mais o slot reciclável
         // `t{seq}` — lido da projeção (costura canônica), nunca do nome de dir hardcoded.
         let c_cwd = lock(&store)
@@ -7275,7 +7314,9 @@ mod tests {
     /// ⌘N (`create_agent_with`) e seed/demo (`admit_node(seeded_terminal)`) — produzem a
     /// MESMA sequência canônica de eventos módulo parâmetros: `NodeAdded` +
     /// `TerminalSpawned{cwd REAL}` + `NodeRoleAssigned`; `CliProfileSet` entra QUANDO o
-    /// profile é conhecido. Fim das três portarias com fichas diferentes.
+    /// profile é conhecido. Fim das três portarias com fichas diferentes. (Pós terminal-puro,
+    /// a SEQUÊNCIA continua idêntica; o VALOR do cwd diverge: ⌘T puro = HOME `UserHome`,
+    /// agentes = `Managed` `<ws>/n-<uuid>` — verificado no bloco de cwd ao final.)
     #[test]
     fn admissao_paridade_tres_portas_mesma_sequencia() {
         let ws = std::env::temp_dir().join(format!("lina-paridade-{}", std::process::id()));
@@ -7378,12 +7419,26 @@ mod tests {
             "CliProfileSet leva o id do profile"
         );
 
-        // O binding node↔cwd (§3): TODA porta persistiu o cwd REAL do spawn na projeção — e
-        // cada dir-casa gerenciado é ÚNICO por construção (`<ws>/n-<uuid>`, nunca o slot
-        // reciclável `t{seq}` que entre boots herdaria o projeto da sessão passada).
+        // O binding node↔cwd (§3): TODA porta persistiu o cwd REAL do spawn na projeção.
+        // Pós terminal-puro, há DUAS semânticas (a sequência de eventos é a MESMA — provada
+        // acima — mas o cwd difere): o ⌘T puro nasce no HOME do usuário (`UserHome`, sem dir
+        // gerenciado); as 3 portas de AGENTE (⌘N, seed, ⌘N+motor) seguem `Managed` num dir-casa
+        // ÚNICO `<ws>/n-<uuid>` (nunca o slot reciclável `t{seq}`).
         let projected = lock(&store).project().expect("project");
-        let mut cwds: Vec<String> = Vec::new();
-        for (id, porta) in [(t, "⌘T"), (n, "⌘N"), (s, "seed"), (e, "⌘N+motor")] {
+        // ⌘T PURO → HOME do usuário, fora do ws_root.
+        let t_cwd = projected
+            .nodes
+            .get(&t)
+            .and_then(|nd| nd.cwd.clone())
+            .expect("cwd REAL persistido p/ a porta ⌘T (HOME)");
+        assert_eq!(
+            t_cwd,
+            user_home_dir().display().to_string(),
+            "⌘T puro nasce no HOME do usuário (UserHome), não num dir gerenciado"
+        );
+        // As 3 portas de AGENTE → dir-casa gerenciado ÚNICO sob o ws_root.
+        let mut managed: Vec<String> = Vec::new();
+        for (id, porta) in [(n, "⌘N"), (s, "seed"), (e, "⌘N+motor")] {
             let cwd = projected
                 .nodes
                 .get(&id)
@@ -7400,14 +7455,14 @@ mod tests {
                     .is_some_and(|f| f.to_string_lossy().starts_with("n-")),
                 "dir-casa gerenciado é único por construção (n-<uuid>), não slot reciclável ({porta})"
             );
-            cwds.push(cwd);
+            managed.push(cwd);
         }
-        cwds.sort();
-        cwds.dedup();
+        managed.sort();
+        managed.dedup();
         assert_eq!(
-            cwds.len(),
-            4,
-            "as 4 portas nascem em cwds DISTINTOS (slot gerenciado não-reciclável)"
+            managed.len(),
+            3,
+            "as 3 portas de AGENTE nascem em cwds gerenciados DISTINTOS (slot não-reciclável)"
         );
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -7555,8 +7610,13 @@ mod tests {
         .expect("plantar projeto antigo");
 
         // SESSÃO ATUAL: novo boot (seq REINICIA em 0), MESMO ws_root.
+        // Pós terminal-puro: o ⌘T (`add_node`) é PURO (nasce no HOME, sem dir gerenciado). O
+        // root cause do slot reciclável só atinge AGENTES gerenciados (⌘N sem pasta própria =
+        // `CwdPolicy::Managed`) — é essa porta que herdaria o `t{seq}` poluído. Exercitamos ela.
         let (nm, store) = managed_manager(&ws, &store_dir, 0);
-        let id = nm.add_node().expect("⌘T admite um terminal gerenciado");
+        let id = nm
+            .create_agent_with("Agente Novo", None, None, None, false)
+            .expect("⌘N admite um AGENTE gerenciado");
 
         let cwd = {
             let projected = lock(&store).project().expect("project");
@@ -7613,14 +7673,20 @@ mod tests {
                 .expect("cwd persistido")
         };
 
+        // Pós terminal-puro: o ⌘T é PURO (HOME, dir não-gerenciado). O slot reciclável só
+        // ameaça AGENTES gerenciados (⌘N sem pasta = `Managed`) — admitimos essa porta nos 2 boots.
         // Boot 1 (seq=0).
         let (nm1, store1) = managed_manager(&ws, &st1, 0);
-        let id1 = nm1.add_node().expect("boot 1 admite");
+        let id1 = nm1
+            .create_agent_with("Agente", None, None, None, false)
+            .expect("boot 1 admite agente gerenciado");
         let cwd1 = read_cwd(&store1, id1);
 
         // Boot 2 (seq REINICIA em 0), MESMO ws_root.
         let (nm2, store2) = managed_manager(&ws, &st2, 0);
-        let id2 = nm2.add_node().expect("boot 2 admite");
+        let id2 = nm2
+            .create_agent_with("Agente", None, None, None, false)
+            .expect("boot 2 admite agente gerenciado");
         let cwd2 = read_cwd(&store2, id2);
 
         assert_ne!(
@@ -7864,12 +7930,207 @@ mod tests {
             dir.join(".lina"),
         );
 
-        // Porta ⌘T (Managed). A admissão SOBE (degradação não impede o nó), mas com o badge.
-        let id = nm.add_node().expect("Managed degradado ainda sobe o nó");
+        // Porta de AGENTE gerenciado (⌘N sem pasta própria → `CwdPolicy::Managed`). Pós
+        // terminal-puro o ⌘T é PURO (sem kit, sem badge por design); a degradação VISÍVEL é
+        // invariante dos AGENTES, então exercitamos a porta que pede `Managed`. A admissão SOBE
+        // (degradação não impede o nó), mas com o badge.
+        let id = nm
+            .create_agent_with("Agente", None, None, None, false)
+            .expect("Managed degradado ainda sobe o nó");
         assert!(
             lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
             "inv#6: Managed + bootstrap=None liga o badge (degradação VISÍVEL)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Terminal default = PURO, abre no HOME (pedido do fundador):** a porta ⌘T / `+ Terminal`
+    /// (`default_terminal` → `add_node`) usa `CwdPolicy::UserHome` e o nó nasce com o cwd = HOME
+    /// do usuário, SEM badge de degradação (não é agente meio-cidadão — é shell limpo por
+    /// design). NÃO-VACUOSO: no código com `default_terminal` = `Managed`, a porta pediria um dir
+    /// gerenciado (≠ HOME) e a 1ª asserção falha.
+    #[test]
+    fn terminal_default_e_puro_abre_no_home_sem_badge() {
+        // (a) A INTENÇÃO da porta ⌘T: terminal PURO no HOME do usuário (UserHome), não Managed.
+        assert_eq!(
+            NodeAdmission::default_terminal().cwd,
+            CwdPolicy::UserHome {
+                path: user_home_dir()
+            },
+            "⌘T / + Terminal é PURO: cwd = HOME do usuário (UserHome), não dir gerenciado"
+        );
+        // (b) End-to-end: admitir pelo ⌘T persiste o cwd = HOME e NÃO liga o badge de degradação.
+        let (nm, store, model) = test_manager("puro-home", None);
+        let id = nm.add_node().expect("⌘T admite o terminal puro");
+        let cwd = lock(&store)
+            .project()
+            .expect("project")
+            .nodes
+            .get(&id)
+            .and_then(|n| n.cwd.clone())
+            .expect("cwd persistido do terminal puro (TerminalSpawned.cwd = HOME)");
+        assert_eq!(
+            cwd,
+            user_home_dir().display().to_string(),
+            "o terminal puro nasce no HOME do usuário"
+        );
+        assert!(
+            lock(&model).nodes.get(&id).is_some_and(|v| !v.kit_missing),
+            "terminal puro NÃO é agente degradado: sem badge 'sem doutrina/observabilidade'"
+        );
+    }
+
+    /// **Terminal PURO sem a linha de intro (pedido do fundador):** o `+ Terminal` deve ser
+    /// como o Terminal.app — dá `exec` direto no shell de login do usuário, SEM imprimir a
+    /// antiga linha "… — shell interativo (digite comandos; …)". O env útil (TERM + PATH com o
+    /// `lina`) é PRESERVADO (invisível e necessário p/ A2A se o user rodar um agente ali).
+    /// NÃO-VACUOSO: no código com o `printf` de intro, as duas primeiras asserções falham.
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_puro_da_exec_sem_intro_preservando_env() {
+        let dbg = format!("{:?}", shell_cmd("Terminal X"));
+        assert!(
+            !dbg.contains("shell interativo"),
+            "terminal puro não imprime a linha de intro (sem 'shell interativo'): {dbg}"
+        );
+        assert!(
+            !dbg.contains("printf"),
+            "sem o printf da intro — só o exec do shell: {dbg}"
+        );
+        assert!(
+            dbg.contains("exec"),
+            "dá exec no shell de login do usuário ($SHELL, fallback /bin/sh): {dbg}"
+        );
+        assert!(
+            dbg.contains("TERM") && dbg.contains("xterm-256color"),
+            "env TERM preservado (não regrediu junto com a intro): {dbg}"
+        );
+    }
+
+    /// **Terminal PURO não escreve NADA no HOME do usuário (invariante crítico):** mesmo com o
+    /// bootstrap LIGADO (que escreve o kit para os nós `Managed`), admitir um terminal puro
+    /// (`UserHome`) deixa o HOME intocado — nenhum `CLAUDE.md`/`.claude`/`.lina`/`settings.json`,
+    /// nem na admissão nem no rewrite de roster. O cwd persiste = HOME (binding §3) e o nó NÃO
+    /// liga o badge. Usa um HOME TEMPORÁRIO (jamais toca o `~` real do teste-runner). NÃO-VACUOSO:
+    /// se o ramo `UserHome` escrevesse kit, o dir não ficaria vazio.
+    #[test]
+    fn terminal_puro_nao_escreve_nada_no_home() {
+        let ws = std::env::temp_dir().join(format!("lina-puro-ws-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("lina-puro-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("HOME temporário (já existe na vida real)");
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, store, model) = test_manager("puro-nowrite", Some(bw));
+
+        // Mesmo plano do ⌘T (`default_terminal`), com o HOME apontado p/ um dir temporário VAZIO.
+        let id = nm
+            .admit_node(NodeAdmission {
+                name: None,
+                role: "terminal".into(),
+                engine: None,
+                cwd: CwdPolicy::UserHome { path: home.clone() },
+                position: None,
+            })
+            .expect("admite o terminal puro");
+
+        // Mudança de roster também NÃO pode tocar o home (o no-op do rewrite p/ UserHome).
+        nm.rewrite_bootstrap();
+
+        // ZERO arquivos do Lina no home: o dir continua VAZIO após admissão + rewrite.
+        assert!(!home.join("CLAUDE.md").exists(), "nenhum CLAUDE.md no home");
+        assert!(!home.join(".claude").exists(), "nenhum .claude no home");
+        assert!(!home.join(".lina").exists(), "nenhum .lina no home");
+        assert_eq!(
+            std::fs::read_dir(&home).expect("ler home").count(),
+            0,
+            "o HOME do usuário fica intocado (zero arquivos do Lina escritos)"
+        );
+
+        // O cwd REAL persiste = HOME (binding §3) e o nó é shell limpo (sem badge).
+        let cwd = lock(&store)
+            .project()
+            .expect("project")
+            .nodes
+            .get(&id)
+            .and_then(|n| n.cwd.clone())
+            .expect("cwd persistido");
+        assert_eq!(
+            cwd,
+            home.display().to_string(),
+            "TerminalSpawned.cwd = HOME do usuário"
+        );
+        assert!(
+            lock(&model).nodes.get(&id).is_some_and(|v| !v.kit_missing),
+            "terminal puro NÃO liga o badge 'sem doutrina/observabilidade'"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// **Regressão (acceptance do fundador): AGENTE segue `Managed` + kit + dir `n-<uuid>`.**
+    /// Criar um "Novo Agente" (motor escolhido no M6, engine `Some`) NÃO é afetado pelo fix do
+    /// terminal-puro: nasce num dir-casa gerenciado `<ws>/n-<uuid>` COM o kit (`CLAUDE.md`) — o
+    /// isolamento de contexto do ADR 0022 fica intacto onde importa (agentes). NÃO-VACUOSO: se o
+    /// agente virasse `UserHome`, o cwd seria o HOME (sem `n-` sob o ws) e sem `CLAUDE.md`.
+    #[test]
+    fn agente_com_motor_nasce_managed_com_kit() {
+        let ws = std::env::temp_dir().join(format!("lina-agente-managed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, store, model) = test_manager("agente-managed", Some(bw));
+
+        let engine = AgentEngine {
+            program: "cat".to_string(),
+            args: vec![],
+            profile_id: Some("claude-code".to_string()),
+            label: "Claude Code".to_string(),
+        };
+        // "Novo Agente" com motor, sem pasta própria → `CwdPolicy::Managed` (dir gerenciado).
+        let id = nm
+            .create_agent_with("Dev", Some(&engine), None, None, false)
+            .expect("Novo Agente (motor)");
+
+        let cwd = lock(&store)
+            .project()
+            .expect("project")
+            .nodes
+            .get(&id)
+            .and_then(|n| n.cwd.clone())
+            .expect("cwd gerenciado do agente");
+        let p = std::path::Path::new(&cwd);
+        assert_eq!(
+            p.parent(),
+            Some(ws.as_path()),
+            "agente nasce sob o ws_root (Managed), não no HOME"
+        );
+        assert!(
+            p.file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with("n-")),
+            "dir-casa gerenciado único (n-<uuid>)"
+        );
+        assert!(
+            p.join("CLAUDE.md").exists(),
+            "agente recebe o kit (CLAUDE.md no dir gerenciado) — isolamento intacto"
+        );
+        assert!(
+            lock(&model).nodes.get(&id).is_some_and(|v| !v.kit_missing),
+            "kit completo → sem badge de degradação"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
