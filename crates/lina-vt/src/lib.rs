@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode as AlacTermMode;
 use alacritty_terminal::term::{Config, Term, TermDamage};
@@ -71,6 +71,17 @@ pub struct VtScreen {
     pub cursor: VtCursor,
     /// Quantas linhas o viewport está rolado para o passado (0 = no fundo, ao vivo).
     pub display_offset: usize,
+    /// **Seleção de texto projetada para ESTE frame** (coords de viewport 0-based, inclusivas,
+    /// row-major): `(start_col, start_row, end_col, end_row)` com `start ≤ end` em ordem de leitura,
+    /// pronta para [`crate`]-consumidores fazerem membership célula-a-célula. `None` quando não há
+    /// seleção ou ela está **inteiramente fora do viewport** (rolou para fora por cima/baixo).
+    ///
+    /// **Por que viver no snapshot (W2-4 BUG 3):** a seleção do alacritty é ancorada em linhas
+    /// ABSOLUTAS do buffer; este campo a reprojeta pela MESMA conversão `+ display_offset` que as
+    /// células do frame usam, então o highlight acompanha o scroll **colado ao texto** — fonte única,
+    /// recomputada por frame. O shell pinta a partir daqui, nunca de coords de viewport congeladas no
+    /// gesto (que ficariam "uma camada acima" ao rolar o scrollback).
+    pub selection: Option<(usize, usize, usize, usize)>,
 }
 
 impl VtScreen {
@@ -519,6 +530,12 @@ impl VtBackend for AlacrittyBackend {
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
         let cur = content.cursor;
+        // BUG 3: a seleção do alacritty (linhas ABSOLUTAS do buffer) projetada para ESTE frame pela
+        // MESMA conversão `+ display_offset` que as células abaixo usam — fonte única, colada ao texto
+        // no scroll. `SelectionRange` é `Copy`, então copiamos antes de o loop consumir `display_iter`.
+        let selection = content
+            .selection
+            .and_then(|range| project_selection(range, display_offset, rows, cols));
         for indexed in content.display_iter {
             // `point` é terminal-absoluto (linhas negativas = scrollback). Converte p/ viewport.
             let vline = indexed.point.line.0 + display_offset as i32;
@@ -575,6 +592,7 @@ impl VtBackend for AlacrittyBackend {
             cells,
             cursor,
             display_offset,
+            selection,
         }
     }
 
@@ -657,6 +675,44 @@ impl VtBackend for AlacrittyBackend {
     fn scrollback_len(&self) -> usize {
         self.grid().history_size()
     }
+}
+
+/// Projeta a `SelectionRange` do alacritty (coords ABSOLUTAS do buffer — `Line` é negativa no
+/// scrollback) para coords de **viewport** do frame atual, aplicando a MESMA conversão
+/// `vline = line + display_offset` que o loop de células de [`AlacrittyBackend::screen`] usa. É essa
+/// invariante — células e seleção pela mesma projeção — que mantém o highlight COLADO ao texto ao
+/// rolar (BUG 3). `range.start` é topo-esquerda e `range.end` baixo-direita (já ordenados por
+/// `to_range`); devolve `(sc, sr, ec, er)` inclusivo row-major, **clampado à janela visível**, ou
+/// `None` quando a seleção está inteiramente fora do viewport (rolou para fora por cima/baixo).
+fn project_selection(
+    range: SelectionRange,
+    display_offset: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    let off = display_offset as i32;
+    let s_line = range.start.line.0 + off;
+    let e_line = range.end.line.0 + off;
+    // Inteiramente fora do viewport? (acima do topo, ou abaixo do fundo).
+    if e_line < 0 || s_line >= rows as i32 {
+        return None;
+    }
+    let (mut sr, mut sc) = (s_line, range.start.column.0);
+    let (mut er, mut ec) = (e_line, range.end.column.0);
+    // Clampa às bordas. Num span row-major, a 1ª row visível de um span que começa ACIMA do topo é
+    // uma linha "do meio" → selecionada da col 0; idem a última row de um span que passa do fundo.
+    if sr < 0 {
+        sr = 0;
+        sc = 0;
+    }
+    if er > rows as i32 - 1 {
+        er = rows as i32 - 1;
+        ec = cols - 1;
+    }
+    Some((sc.min(cols - 1), sr as usize, ec.min(cols - 1), er as usize))
 }
 
 /// Tabela xterm 256 cores (auto-contida — o `alacritty_terminal` não embarca palette).
@@ -1179,6 +1235,123 @@ mod tests {
     fn no_selection_returns_none() {
         let b = AlacrittyBackend::new(10, 3);
         assert_eq!(b.selection_text(), None);
+    }
+
+    // ───────── BUG 3 (W2-4): seleção PROJETADA por frame — acompanha o scrollback ─────────
+
+    /// No fundo (display_offset == 0), `screen().selection` reflete EXATAMENTE as coords de
+    /// viewport pedidas (identidade) — a base sobre a qual a projeção de scroll se sustenta.
+    #[test]
+    fn screen_selection_is_identity_at_bottom() {
+        let mut b = AlacrittyBackend::new(20, 4);
+        b.advance(b"\x1b[2J\x1b[Hhello world");
+        assert_eq!(b.screen().display_offset, 0);
+        assert_eq!(b.screen().selection, None, "sem seleção → None");
+        b.set_selection(2, 0, 6, 0); // "llo w"
+        assert_eq!(
+            b.screen().selection,
+            Some((2, 0, 6, 0)),
+            "no fundo a projeção é identidade às coords do viewport"
+        );
+    }
+
+    /// CRUX do BUG 3: a seleção fica **colada ao texto** ao rolar o scrollback. Seleciona uma linha
+    /// VISÍVEL com o viewport já rolado, depois rola mais ±1 e prova que (a) as rows da seleção
+    /// projetam pelo `display_offset` atual e (b) as MESMAS células aparecem na nova row — o que a
+    /// pintura a partir de `self.sel` (coords de viewport congeladas no gesto) NÃO faria.
+    #[test]
+    fn screen_selection_tracks_text_through_scroll() {
+        let cols = 20usize;
+        let mut b = AlacrittyBackend::new(cols as u16, 4);
+        // Histórico farto (30 linhas únicas) → há scrollback de sobra p/ rolar.
+        for i in 0..30u32 {
+            b.advance(format!("r{i:02}\r\n").as_bytes());
+        }
+        let k = 5i32;
+        b.scroll(k); // sobe k linhas para o passado
+        let s0 = b.screen();
+        assert_eq!(
+            s0.display_offset, k as usize,
+            "scroll deve atingir offset k"
+        );
+
+        // Seleciona a linha 1 INTEIRA do viewport (no offset k).
+        b.set_selection(0, 1, cols - 1, 1);
+        let s1 = b.screen();
+        assert_eq!(
+            s1.selection,
+            Some((0, 1, cols - 1, 1)),
+            "no MESMO offset a projeção é identidade (row 1)"
+        );
+        let under_sel: Vec<char> = s1.row(1).iter().map(|c| c.c).collect();
+        assert!(
+            under_sel.iter().any(|c| !c.is_whitespace()),
+            "a linha selecionada tem conteúdo real (não é branco)"
+        );
+
+        // Rola +1 para o passado (offset k+1): o conteúdo (e a seleção) DESCEM uma row.
+        b.scroll(1);
+        let s2 = b.screen();
+        assert_eq!(s2.display_offset, (k + 1) as usize);
+        assert_eq!(
+            s2.selection,
+            Some((0, 2, cols - 1, 2)),
+            "a seleção acompanhou o scroll para a row 2"
+        );
+        let now_at_row2: Vec<char> = s2.row(2).iter().map(|c| c.c).collect();
+        assert_eq!(
+            now_at_row2, under_sel,
+            "as MESMAS células agora estão na row 2 — highlight COLADO ao texto, não 'uma camada acima'"
+        );
+
+        // Rola -2 (offset k-1): o conteúdo SOBE para a row 0.
+        b.scroll(-2);
+        let s3 = b.screen();
+        assert_eq!(s3.display_offset, (k - 1) as usize);
+        assert_eq!(
+            s3.selection,
+            Some((0, 0, cols - 1, 0)),
+            "a seleção acompanhou o scroll para a row 0"
+        );
+
+        // Rola até o fundo (offset 0): a linha selecionada é scrollback → sai do viewport por CIMA.
+        b.scroll(-100);
+        let s4 = b.screen();
+        assert_eq!(s4.display_offset, 0);
+        assert_eq!(
+            s4.selection, None,
+            "seleção inteiramente fora do viewport (rolou p/ fora por cima) → None"
+        );
+    }
+
+    /// Span de 2 rows parcialmente fora do viewport: a parte visível é **clampada** à borda. Como é
+    /// um span row-major, a 1ª row visível de um span que começa ACIMA do topo é linha "do meio" →
+    /// selecionada da coluna 0 (não da coluna-âncora original).
+    #[test]
+    fn screen_selection_clamps_partial_span_to_viewport() {
+        let cols = 20usize;
+        let mut b = AlacrittyBackend::new(cols as u16, 4);
+        for i in 0..30u32 {
+            b.advance(format!("r{i:02}\r\n").as_bytes());
+        }
+        b.scroll(5); // offset 5
+                     // Span (col 3, row 0) → (col 7, row 1): duas rows, começando na borda superior do viewport.
+        b.set_selection(3, 0, 7, 1);
+        assert_eq!(
+            b.screen().selection,
+            Some((3, 0, 7, 1)),
+            "no offset 5 a projeção é identidade ao span pedido"
+        );
+        // Rola -1 (offset 4): a row-0 do span sai por cima; sobra só a 2ª row (agora na row 0),
+        // que é continuação do span → começa na col 0, termina na col-fim original (7).
+        b.scroll(-1);
+        let s = b.screen();
+        assert_eq!(s.display_offset, 4);
+        assert_eq!(
+            s.selection,
+            Some((0, 0, 7, 0)),
+            "parte visível clampada: row 0 do meio do span → da col 0 até a col-fim"
+        );
     }
 
     // ─────────────────────────── Mouse reporting (SGR 1006) ───────────────────────────

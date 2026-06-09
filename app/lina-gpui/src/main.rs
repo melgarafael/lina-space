@@ -2393,11 +2393,6 @@ impl Render for WorkspaceView {
                 ));
             }
 
-            // Range de seleção (normalizado) para ESTE card, se a seleção pertence a ele.
-            let card_sel = self
-                .sel
-                .filter(|s| s.node == node_id)
-                .map(|s| normalize_sel(s.anchor, s.head));
             // W4-6 a11y: "precisa de você" anunciável — há um gate de custódia pendente p/ este nó?
             let needs_human = lock(&self.desk)
                 .queue
@@ -2475,7 +2470,13 @@ impl Render for WorkspaceView {
                         let grid = lock(&self.nodes.grids).get(&node_id).cloned();
                         if let Some(g) = grid {
                             let screen = lock(&g).screen();
-                            body = body.child(render_grid(&screen, z, card_sel));
+                            // BUG 3: o highlight vem da SELEÇÃO DO GRID já reprojetada por frame
+                            // (`screen.selection`, scroll-aware), não de `self.sel` (coords de
+                            // viewport congeladas no gesto, que ficariam "uma camada acima" ao rolar).
+                            // É per-node por construção: só o grid focado tem `term.selection` ativa
+                            // (`pointer_down` → `clear_selection_state` zera os demais). `self.sel`
+                            // continua, mas só p/ DIRIGIR o gesto (extend/copy/clear).
+                            body = body.child(render_grid(&screen, z, screen.selection));
                         }
                     }
                     canvas::Zone::Suspended => {}
