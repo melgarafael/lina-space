@@ -32,6 +32,9 @@ use lina_core::{
     Recipient, ResolutionVia, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor,
     SupervisorError, VtBackend, WorkspaceTrust, PROMPT_REGION_ROWS,
 };
+// A2A UNIVERSAL: o registry de TODOS os CLI Profiles — a entrega resolve o profile do ALVO
+// por aqui (CliProfile vem re-exportado do core; ProfileRegistry é o índice por `id`).
+use lina_cli_profiles::ProfileRegistry;
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
 use lina_secrets::{SecretStore, SecretVault};
@@ -368,12 +371,17 @@ pub struct A2aTrigger {
     from: NodeId,
     to: NodeId,
     grid_to: Grid,
+    /// A2A UNIVERSAL: profile de FALLBACK (global); o ⚡ resolve o profile do ALVO pelo `registry`.
     profile: CliProfile,
+    /// A2A UNIVERSAL: registry de todos os profiles — o ⚡ demo também resolve o profile do ALVO.
+    registry: Arc<ProfileRegistry>,
     store: Arc<Mutex<EventStore>>,
     model: Model,
 }
 
 impl A2aTrigger {
+    // A2A UNIVERSAL: +1 arg (registry) levou de 7→8 — mesma natureza do `MailboxPump::new`.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         sup: Arc<Supervisor>,
@@ -381,6 +389,7 @@ impl A2aTrigger {
         to: NodeId,
         grid_to: Grid,
         profile: CliProfile,
+        registry: Arc<ProfileRegistry>,
         store: Arc<Mutex<EventStore>>,
         model: Model,
     ) -> Self {
@@ -390,6 +399,7 @@ impl A2aTrigger {
             to,
             grid_to,
             profile,
+            registry,
             store,
             model,
         }
@@ -403,7 +413,9 @@ impl A2aTrigger {
         let grid_to = Arc::clone(&self.grid_to);
         let store = Arc::clone(&self.store);
         let model = Arc::clone(&self.model);
-        let profile = self.profile.clone();
+        // A2A UNIVERSAL: o ⚡ demo também resolve o profile do ALVO; `profile` global vira o fallback.
+        let registry = Arc::clone(&self.registry);
+        let fallback = self.profile.clone();
         let from = self.from;
         let to = self.to;
         thread::spawn(move || {
@@ -413,7 +425,15 @@ impl A2aTrigger {
             // W5-5: allow-list REAL — pares confiados = membros vivos do mesmo Espaço
             // (default-deny par fora do Espaço); substitui o `InjectPolicy::AllowAll` (dead code).
             let trust = WorkspaceTrust::from_members(&live_member_ids(&sup));
-            match deliver_a2a(&sup, to, from, &text, &profile, &grid_to, trust.policy()) {
+            // A2A UNIVERSAL: profile_id do ALVO pela projeção (`CliProfileSet`) → profile DELE;
+            // fallback ao global se ausente/desconhecido. Projeta ANTES do lock de append abaixo
+            // (o guard do `project` é solto ao fim deste statement — sem double-lock).
+            let to_cli = lock(&store)
+                .project()
+                .ok()
+                .and_then(|st| st.nodes.get(&to).and_then(|n| n.cli.clone()));
+            let profile = target_profile(to_cli.as_deref(), &registry, &fallback);
+            match deliver_a2a(&sup, to, from, &text, profile, &grid_to, trust.policy()) {
                 Ok(DeliveryOutcome::Injected { .. } | DeliveryOutcome::SessionResume) => {}
                 Err(e) => eprintln!("lina-gpui: deliver_a2a falhou: {e}"),
             }
@@ -548,6 +568,30 @@ pub fn load_injection_profile(lina_home: Option<&Path>) -> CliProfile {
     injection_profile_from(&injection_profile_candidates(lina_home))
 }
 
+/// **A2A UNIVERSAL.** Resolve o CLI Profile do **ALVO** para a entrega faseada. Cada nó guarda
+/// seu `profile_id` no campo `cli` da projeção do log (`CliProfileSet`, event-sourced — inv #4);
+/// esse id é procurado no `registry` de TODOS os profiles carregados. Fallback ao `fallback` (o
+/// profile global de injeção) quando o nó não tem profile_id (`None` — shell puro / log antigo) OU
+/// o id é desconhecido no registry: a entrega **NUNCA** falha por falta de profile (degrada para
+/// timings genéricos, jamais para "não entrega").
+///
+/// O bug que isto corrige: a entrega usava UM profile global (`claude-code`) para TODO alvo, então
+/// o `prompt_ready_regex`/`busy_markers` do Claude eram aplicados à TUI do **Codex** (glifo `›`,
+/// não `>`/`❯`) — que nunca casava → o alvo "nunca ficava pronto" → timeout, mensagem não injetada.
+///
+/// **Fronteira de segurança:** o profile decide só *COMO* injetar (prontidão/timing). *QUEM* pode
+/// injetar em *QUEM* continua sendo decidido pela allow-list da [`WorkspaceTrust`] (intocada) —
+/// trocar o profile do alvo não abre nenhuma porta de autorização (doutrina §segurança do CLAUDE.md).
+fn target_profile<'a>(
+    target_cli_id: Option<&str>,
+    registry: &'a ProfileRegistry,
+    fallback: &'a CliProfile,
+) -> &'a CliProfile {
+    target_cli_id
+        .and_then(|id| registry.get(id))
+        .unwrap_or(fallback)
+}
+
 /// **W3-4 · O supervisor OBSERVA a mailbox.** Numa thread de fundo, drena o `.lina/outbox/`
 /// (onde a CLI `lina ask` deposita), roteia pelos guardrails do [`Router`] e ENTREGA ao PTY do
 /// alvo via `deliver_a2a` (faseado) usando o grid+perfil de cada terminal. É o **escritor único**
@@ -558,7 +602,14 @@ pub struct MailboxPump {
     sup: Arc<Supervisor>,
     store: Arc<Mutex<EventStore>>,
     grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
+    /// A2A UNIVERSAL: profile de injeção de FALLBACK (o global, ex.: claude-code) — usado só quando
+    /// o alvo não tem profile_id ou seu id não está no `registry`. A entrega resolve o profile do
+    /// ALVO pelo `registry`; este é a rede de segurança que garante "nunca falhar por falta de profile".
     profile: CliProfile,
+    /// A2A UNIVERSAL: registry de TODOS os CLI Profiles (claude-code, codex, gemini, antigravity, …).
+    /// A entrega resolve o profile do ALVO pelo `profile_id` do nó (projeção `CliProfileSet`) aqui —
+    /// fim do profile global único que aplicava o `prompt_ready` do Claude à TUI do Codex (→ timeout).
+    registry: Arc<ProfileRegistry>,
     model: Model,
     /// W4-3: estado do FREIO compartilhado com a UI (que pede pausa/retoma; a pump aplica no Router).
     brake: crate::wiring::Brake,
@@ -592,7 +643,10 @@ impl MailboxPump {
         token_budget_day: u64,
         // F1-0-2 critério 5: o perfil de INJEÇÃO vem de fora (produção = `load_injection_profile`,
         // o claude-code.toml real; testes = demo/fixture) — fim do `demo_profile()` hardcoded.
+        // A2A UNIVERSAL: agora é o FALLBACK; o profile do ALVO vem do `registry` (abaixo).
         profile: CliProfile,
+        // A2A UNIVERSAL: registry de TODOS os profiles — a entrega resolve o do ALVO por aqui.
+        registry: Arc<ProfileRegistry>,
     ) -> Self {
         // W3-7c (TETO DE CUSTO): `token_budget_day > 0` ARMA o teto no Router (0 = desligado). O
         // `CostLedger` soma os `TokenUsageReported` (emitidos pela bomba) e PAUSA na transição.
@@ -612,6 +666,7 @@ impl MailboxPump {
             store,
             grids,
             profile,
+            registry,
             model,
             brake,
             reinject_queue,
@@ -620,13 +675,42 @@ impl MailboxPump {
         }
     }
 
+    /// **A2A UNIVERSAL.** Projeta o mapa `node → profile_id` do event log (campo `cli` de cada nó,
+    /// vindo de `CliProfileSet`). Chamado UMA vez por tick, **ANTES** de travar o `store` para o
+    /// `pump`/`resume` — o `deliver_fn` roda DENTRO desse lock, então projetar lá dentro re-travaria
+    /// o mesmo `Mutex` (deadlock). Best-effort: falha de projeção → mapa vazio → todo alvo cai no
+    /// fallback (degrada, nunca trava).
+    fn project_cli_by_node(&self) -> BTreeMap<NodeId, String> {
+        match lock(&self.store).project() {
+            Ok(state) => state
+                .nodes
+                .into_iter()
+                .filter_map(|(id, n)| n.cli.map(|cli| (id, cli)))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: A2A — projeção node→profile falhou ({e}); usando fallback global"
+                );
+                BTreeMap::new()
+            }
+        }
+    }
+
     /// Constrói a closure de ENTREGA faseada (reusada por `pump` e `resume`). Captura clones `Arc`
     /// (own → `'static`). **W4-3:** a entrega REAL acende o PULSO efêmero `from→target` no model — a
     /// metáfora "sem fios" dirigida por evento REAL (`lina ask`), não pelo `A2aTrigger` demo.
-    fn deliver_fn(&self) -> impl FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String> {
+    fn deliver_fn(
+        &self,
+        cli_by_node: &BTreeMap<NodeId, String>,
+    ) -> impl FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String> {
         let sup = Arc::clone(&self.sup);
         let grids = Arc::clone(&self.grids);
-        let profile = self.profile.clone();
+        // A2A UNIVERSAL: registry de todos os profiles + fallback global + o mapa node→profile_id
+        // (projetado ANTES do lock do store por `project_cli_by_node` — evita re-travar o `Mutex`
+        // dentro do `pump`/`resume`, que daria deadlock). A resolução per-alvo é abaixo.
+        let registry = Arc::clone(&self.registry);
+        let fallback = self.profile.clone();
+        let cli_by_node = cli_by_node.clone();
         let model = Arc::clone(&self.model);
         move |target, from, text| {
             let Some(g) = lock(&grids).get(&target).cloned() else {
@@ -635,7 +719,15 @@ impl MailboxPump {
             // W5-5: allow-list REAL derivada da topologia viva a cada entrega (o roster muda);
             // default-deny par fora do Espaço. Substitui o `InjectPolicy::AllowAll` (dead code).
             let trust = WorkspaceTrust::from_members(&live_member_ids(&sup));
-            let out = deliver_a2a(&sup, target, from, text, &profile, &g, trust.policy())
+            // A2A UNIVERSAL: o profile do ALVO (o `prompt_ready_regex`/`busy_markers` DELE), não
+            // mais o global — destrava a entrega ao Codex/Gemini/Antigravity sem timeout. A
+            // autorização (QUEM→QUEM) segue na `WorkspaceTrust` acima; o profile só decide o COMO.
+            let profile = target_profile(
+                cli_by_node.get(&target).map(String::as_str),
+                &registry,
+                &fallback,
+            );
+            let out = deliver_a2a(&sup, target, from, text, profile, &g, trust.policy())
                 .map_err(|e| e.to_string())?;
             // Pulso efêmero da entrega real (some sozinho via `Pulse::progress`).
             {
@@ -692,13 +784,18 @@ impl MailboxPump {
     /// Um tick: aplica o freio pedido pela UI, drena a mailbox e roteia. A entrega resolve o grid do
     /// alvo, injeta faseado e acende o pulso (via [`Self::deliver_fn`]).
     fn tick(&mut self) {
+        // A2A UNIVERSAL: projeta `node → profile_id` ANTES de qualquer lock do `store` — o
+        // `deliver_fn` roda DENTRO do lock do `pump`/`resume`, então projetar lá dentro re-travaria
+        // o mesmo `Mutex` (deadlock, pois `std::sync::Mutex` não é reentrante). O mapa é capturado
+        // (clonado) por cada `deliver_fn` e resolve o profile do alvo sem mais I/O no caminho quente.
+        let cli_by_node = self.project_cli_by_node();
         // W4-3 FREIO: a UI pediu para alternar? → pausa OU retoma+DRENA a auto-orquestração no Router.
         let toggle = std::mem::take(&mut lock(&self.brake).toggle_requested);
         if toggle {
             {
                 let mut store = lock(&self.store);
                 if self.router.is_paused() {
-                    let mut deliver = self.deliver_fn();
+                    let mut deliver = self.deliver_fn(&cli_by_node);
                     match self.router.resume(&mut store, now_ms(), &mut deliver) {
                         Ok(_) => eprintln!(
                             "lina-gpui: orquestração RETOMADA (freio solto) — fila represada drenada"
@@ -718,7 +815,7 @@ impl MailboxPump {
             lock(&self.model).touch();
         }
 
-        let mut deliver = self.deliver_fn();
+        let mut deliver = self.deliver_fn(&cli_by_node);
         let results = {
             let mut store = lock(&self.store);
             self.router.pump(&mut store, now_ms(), &mut deliver)
@@ -4968,8 +5065,9 @@ mod tests {
             new_reinject_queue(), // FIX-A3: reinject não exercitado aqui — fila vazia
             Arc::clone(&model),
             Arc::clone(&brake),
-            0,              // teto de custo desligado neste teste (freio/pulso)
+            0,                                // teto de custo desligado neste teste (freio/pulso)
             demo_profile(), // perfil demo: os grids de teste já têm linha-prompt semeada
+            Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
         );
         let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -5134,6 +5232,7 @@ mod tests {
             Arc::clone(&brake),
             0,
             demo_profile(),
+            Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -5339,6 +5438,7 @@ mod tests {
             Arc::clone(&brake),
             0,
             demo_profile(),
+            Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -5443,6 +5543,7 @@ mod tests {
             Arc::clone(&brake),
             100,
             demo_profile(),
+            Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
         );
         let outbox = Mailbox::new(&mailbox_root);
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -5901,6 +6002,108 @@ mod tests {
             "fallback = demo embutido, nunca panic"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ════════════ A2A UNIVERSAL: a entrega usa o profile do ALVO, não um global único ════════════
+
+    /// Registry dos profiles REAIS do repo (claude-code + codex + …) — base não-vacuosa dos testes.
+    fn repo_profile_registry() -> ProfileRegistry {
+        ProfileRegistry::load_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles"),
+        )
+        .expect("profiles/ do repo deve carregar")
+    }
+
+    /// O FIX, provado NÃO-VACUOSAMENTE contra os profiles REAIS: a resolução por-alvo entrega o
+    /// `prompt_ready_regex`/`busy_markers` do ALVO — alvo Claude → regex do Claude; alvo Codex →
+    /// regex do `›` do Codex; os dois DIFEREM (a raiz do bug era usar o do Claude p/ TODO alvo →
+    /// a TUI do Codex nunca casava → timeout de 30s).
+    #[test]
+    fn a2a_resolves_target_profile_not_global() {
+        let reg = repo_profile_registry();
+        let claude = reg
+            .get("claude-code")
+            .expect("claude-code no registry")
+            .clone();
+        let codex = reg.get("codex").expect("codex no registry").clone();
+        assert_ne!(
+            claude.prompt_ready_regex, codex.prompt_ready_regex,
+            "claude e codex têm prompt_ready distintos — a raiz do bug do timeout"
+        );
+
+        // O fallback global é o claude-code (exatamente o que o bug usava p/ TODO alvo).
+        let fallback = claude.clone();
+
+        // Alvo Claude → profile do Claude.
+        assert_eq!(
+            target_profile(Some("claude-code"), &reg, &fallback).prompt_ready_regex,
+            claude.prompt_ready_regex
+        );
+        // Alvo CODEX → profile do CODEX (regex do `›`), NÃO o global do Claude. (O FIX.)
+        let resolved_codex = target_profile(Some("codex"), &reg, &fallback);
+        assert_eq!(resolved_codex.prompt_ready_regex, codex.prompt_ready_regex);
+        assert!(
+            resolved_codex.prompt_ready_regex.contains('\u{203a}'),
+            "alvo codex resolve o prompt_ready do glifo `›`, não o do Claude"
+        );
+        // Roteamento per-alvo: 2 alvos distintos → 2 prompt_ready distintos (fim do global único).
+        assert_ne!(
+            target_profile(Some("claude-code"), &reg, &fallback).prompt_ready_regex,
+            target_profile(Some("codex"), &reg, &fallback).prompt_ready_regex,
+            "cada alvo usa o prompt_ready do SEU profile"
+        );
+    }
+
+    /// A2A UNIVERSAL — a entrega NUNCA falha por falta de profile: nó sem profile_id (shell puro /
+    /// log antigo) ou id desconhecido → fallback global (degrada p/ timings genéricos, jamais "não
+    /// entrega"). Controle positivo: id conhecido → o profile DELE.
+    #[test]
+    fn a2a_target_profile_falls_back_safely() {
+        let reg = repo_profile_registry();
+        let fallback = reg.get("claude-code").expect("claude-code").clone();
+        assert_eq!(
+            target_profile(None, &reg, &fallback).id,
+            "claude-code",
+            "sem profile_id → fallback"
+        );
+        assert_eq!(
+            target_profile(Some("cli-inexistente"), &reg, &fallback).id,
+            "claude-code",
+            "id desconhecido → fallback (nunca panic)"
+        );
+        assert_eq!(
+            target_profile(Some("codex"), &reg, &fallback).id,
+            "codex",
+            "id conhecido → o profile dele (controle positivo)"
+        );
+    }
+
+    /// A2A UNIVERSAL — a cadeia COMPLETA que o `deliver_fn` do pump usa: mapa `node→profile_id`
+    /// (projetado do log, campo `cli` de `CliProfileSet`) → resolução per-alvo. Dois nós com
+    /// profiles distintos resolvem CADA UM o seu; nó sem entrada (terminal puro) cai no fallback.
+    #[test]
+    fn a2a_cli_by_node_routes_each_target_to_its_own_profile() {
+        let reg = repo_profile_registry();
+        let fallback = reg.get("claude-code").expect("claude-code").clone();
+        let na: NodeId = uuid::Uuid::now_v7(); // alvo Claude
+        let nb: NodeId = uuid::Uuid::now_v7(); // alvo Codex
+        let nc: NodeId = uuid::Uuid::now_v7(); // terminal puro (sem profile_id)
+        let mut cli_by_node: std::collections::BTreeMap<NodeId, String> =
+            std::collections::BTreeMap::new();
+        cli_by_node.insert(na, "claude-code".into());
+        cli_by_node.insert(nb, "codex".into());
+
+        // EXATAMENTE o que o `deliver_fn` faz: cli_by_node.get(alvo) → registry → profile.
+        let pa = target_profile(cli_by_node.get(&na).map(String::as_str), &reg, &fallback);
+        let pb = target_profile(cli_by_node.get(&nb).map(String::as_str), &reg, &fallback);
+        let pc = target_profile(cli_by_node.get(&nc).map(String::as_str), &reg, &fallback);
+        assert_eq!(pa.id, "claude-code");
+        assert_eq!(pb.id, "codex");
+        assert_eq!(pc.id, "claude-code", "terminal sem profile_id → fallback");
+        assert_ne!(
+            pa.prompt_ready_regex, pb.prompt_ready_regex,
+            "cada alvo usa o prompt_ready do SEU profile"
+        );
     }
 
     /// A ordem dos candidatos honra a doutrina: override de env → dir do usuário (`<.lina>/

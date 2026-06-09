@@ -1,0 +1,74 @@
+# CLI Profile — Codex CLI (OpenAI) · A2A UNIVERSAL
+#
+# CALIBRADO contra a TUI REAL do `codex-cli 0.138.0` nesta máquina (2026-06-09), via
+# `crates/lina-core/examples/codex_probe.rs` — grid reconstruído por `AlacrittyBackend`
+# (a TUI posiciona com escapes de cursor; só o grid parseado mostra o que o humano vê).
+#
+# Por que existe: a entrega A2A usava o `prompt_ready_regex`/`busy_markers` do CLAUDE para
+# detectar prontidão no ALVO. A TUI do Codex (glifo `›`, não `>`/`❯`) NUNCA casava → o
+# alvo "nunca ficava pronto" → timeout de 30s (mensagem NÃO injetada, 4 retries). Toda a
+# especificidade do CLI vive AQUI (TOML), nunca no core (CLAUDE.md §Neutralidade multi-CLI).
+
+# Identidade. O `id` é a chave no registry e o que `CliProfileSet` projeta em `node.cli`;
+# o `program` casa o binário descoberto ("codex" em KNOWN_CLIS) → o nó ganha este profile.
+id = "codex"
+program = "codex"
+# A TUI interativa do Codex sobe sem args (o "chat" é o terminal — inv #1). Vazio = puro.
+args = []
+
+# Entrega A2A faseada (igual ao Claude): bracketed-paste → submit_delay → Enter separado.
+# OBSERVADO: o composer do Codex liga BRACKETED-PASTE mode (DECSET `ESC[?2004h` no boot do
+# PTY), então `build_paste` embrulha corretamente o bloco e o ÚNICO submit é o Enter separado.
+delivery = "pty_inject"
+# Mesma margem calibrada do Claude (400ms): o probe confirmou paste→400ms→Enter submetendo
+# no composer do Codex. Ajustável por TOML sem recompilar (inv #3).
+submit_delay_ms = 400
+
+# Prompt PRONTO: a linha do composer do Codex começa com o glifo `›` (U+203A) — OBSERVADO
+# (`› Explain this codebase` / `› Write tests for @filename` como placeholder do composer
+# vazio). String literal TOML (aspas simples) p/ não escapar o regex. O glifo SOZINHO não é
+# prontidão (a TUI mostra `›` o tempo todo, inclusive ocupada — exatamente como o `❯` do
+# Claude): o que distingue ocupado é o `busy_markers` abaixo.
+#
+# NOTA (sensor): o `is_prompt_row` do core ancora a região de input em `>`/`❯` (não em `›`),
+# então p/ o Codex a região cai no fallback das últimas 8 linhas não-vazias — que, na TUI do
+# Codex, contêm SEMPRE o composer `›`, a status-line de trabalho e o rodapé juntos (validado
+# no probe). Logo a dupla prompt_ready+busy_markers decide certo sem tocar o core.
+prompt_ready_regex = '(?m)^\s*›'
+
+# Orçamento do wait_ready (igual ao Claude, 30s): timeout → NÃO injeta (erro explícito; a
+# retenção por estado F1-0-4 re-tenta). Turnos de raciocínio longos do Codex (o gpt-5.5 xhigh
+# levou >20s no probe) são tratados pela retenção/retry — NUNCA inflando este teto (doutrina
+# F1-0-2: nunca "injeta mesmo assim" num alvo ocupado).
+ready_timeout_ms = 30000
+
+# Marcador de OCUPADO — OBSERVADO em TODOS os estados ocupados do Codex (boot dos MCP servers
+# E geração de resposta): a status-line `• Working (Ns • esc to interrupt)` e
+# `• Starting MCP servers (…) (0s • esc to interrupt)`. `esc to interrupt` é o sinal
+# UNIVERSAL (presente em todos os frames ocupados do probe); `Working (` reforça. Capturados
+# via codex_probe.rs (grid real, 2026-06-09).
+busy_markers = ["esc to interrupt", "Working ("]
+
+# Janela de quietude p/ idle/ask. A TUI interativa do Codex NÃO emite evento estruturado de
+# fim (sem stream-json como o Claude) → o fim-de-resposta é por IDLE (ver [end_signal]).
+idle_ms = 1500
+ask_timeout_ms = 120000
+
+# Session-files do Codex (camada 3 de observabilidade — F1-1-2; NUNCA decisória p/ A2A).
+# OBSERVADO: `~/.codex/sessions/AAAA/MM/DD/rollout-*.jsonl` nesta máquina.
+session_dir_pattern = "~/.codex/sessions/*/*/*/rollout-*.jsonl"
+
+# Assinatura no grid (telemetria camada 4 — NUNCA decisória): o banner do composer do Codex.
+output_markers = ["OpenAI Codex"]
+
+# ── NOTA DE FRONTEIRA (escopo desta story = A2A universal: só prontidão/timing de ENTREGA) ──
+# `[approval_keys]` e `[capabilities]` do Codex NÃO são calibrados aqui de propósito: a
+# APROVAÇÃO é a costura do F1-1-8/seam de approval (OUTRO dono) e está FORA do escopo. Ausentes
+# ⇒ defaults conservadores do core (approve `y\r` / deny `n\r`, ADR 0021 §1; capabilities todas
+# `false`). O diálogo de aprovação do Codex é um SELECT numerado + Esc (observado no trust
+# dialog: `› 1. Yes, continue  2. No, quit`); calibrá-lo é uma story de approval separada.
+
+# Fim-de-resposta: a TUI interativa do Codex encerra por IDLE (silêncio do stream por `idle_ms`),
+# pois não há linha-evento estruturada como o `{"type":"result"}` do Claude em stream-json.
+[end_signal]
+kind = "idle"

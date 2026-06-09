@@ -569,6 +569,11 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/claude-code.toml")
     }
 
+    /// Caminho do `profiles/codex.toml` na raiz do repo, robusto ao cwd (A2A universal).
+    fn codex_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/codex.toml")
+    }
+
     /// Diretório `profiles/` na raiz do repo.
     fn profiles_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles")
@@ -642,6 +647,92 @@ mod tests {
         assert!(
             profile.capabilities.has("handoff_support"),
             "claude-code suporta handoff A2A completo (13.9 item 5)"
+        );
+    }
+
+    // ── A2A UNIVERSAL: o profile do Codex parseia e expõe a calibração da TUI real ──
+
+    /// Guarda da calibração do `codex.toml` (contra a TUI REAL do `codex-cli 0.138.0`,
+    /// observada via `lina-core/examples/codex_probe.rs`). O bug do timeout era usar o
+    /// `prompt_ready_regex`/`busy_markers` do CLAUDE no Codex; este teste prova que o
+    /// profile do Codex declara os campos CALIBRADOS p/ a TUI dele (glifo `›`, não `>`/`❯`).
+    #[test]
+    fn parses_codex_profile_and_exposes_calibrated_fields() {
+        let profile =
+            CliProfile::load_file(codex_path()).expect("o profiles/codex.toml deve parsear");
+
+        // Identidade: `id` é a chave do registry e o que `CliProfileSet` projeta em
+        // `node.cli`; `program` casa o binário "codex" descoberto (KNOWN_CLIS).
+        assert_eq!(profile.id, "codex");
+        assert_eq!(profile.program, "codex");
+
+        // Entrega faseada calibrada (mesma família do Claude — paste→submit_delay→Enter).
+        assert_eq!(profile.delivery, Delivery::PtyInject);
+        assert_eq!(profile.submit_delay_ms, 400);
+        assert_eq!(profile.ready_timeout_ms, Some(30_000));
+
+        // O FIX do bug: o prompt_ready do Codex casa o glifo `›` (U+203A) do composer — NÃO
+        // o `>`/`❯` do Claude (que NUNCA casava a TUI do Codex → timeout). Guarda contra um
+        // copy/paste acidental do regex do Claude.
+        assert!(
+            profile.prompt_ready_regex.contains('\u{203a}'),
+            "prompt_ready_regex do Codex deve mirar o glifo `›` do composer, não o do Claude — got {:?}",
+            profile.prompt_ready_regex
+        );
+
+        // Marcador de OCUPADO observado na status-line do Codex em TODOS os estados de
+        // trabalho (boot de MCP + geração).
+        assert!(
+            profile.busy_markers.iter().any(|m| m == "esc to interrupt"),
+            "busy_markers do Codex devem conter o sinal universal `esc to interrupt` — got {:?}",
+            profile.busy_markers
+        );
+
+        // A TUI interativa do Codex não emite stream-json → fim-de-resposta por IDLE.
+        assert_eq!(profile.end_signal, EndSignal::Idle);
+        // Session-files do Codex p/ a camada-3 (observado: ~/.codex/sessions/.../rollout-*.jsonl).
+        assert_eq!(
+            profile.session_dir_pattern.as_deref(),
+            Some("~/.codex/sessions/*/*/*/rollout-*.jsonl"),
+        );
+    }
+
+    /// NÃO-VACUOSIDADE da calibração: contra LINHAS REAIS do grid do Codex (capturadas pelo
+    /// `codex_probe.rs`, 2026-06-09), exercita a metade `busy_markers` do veredito de prontidão
+    /// (`!region.contains(marker)` em `a2a::ready_now`): a linha do composer OCIOSO casa o glifo
+    /// `›` e NÃO contém marcador de ocupado (⇒ pronto); a status-line de TRABALHO contém o
+    /// marcador (⇒ NÃO-pronto). É o que destrava a entrega A2A ao Codex sem injetar no meio do turno.
+    #[test]
+    fn codex_calibration_matches_observed_real_grid_lines() {
+        let profile =
+            CliProfile::load_file(codex_path()).expect("o profiles/codex.toml deve parsear");
+        // Linhas REAIS capturadas do grid do Codex (composer + status-line de trabalho).
+        let idle_composer = "› Explain this codebase";
+        let busy_status = "• Working (5s • esc to interrupt)";
+
+        // Prompt PRONTO: a linha do composer começa com o glifo que o regex mira (`›`) —
+        // exatamente o que `(?m)^\s*›` casa. (Sem a crate `regex` aqui: a faceta verificada
+        // é a presença do glifo-âncora na linha-prompt observada.)
+        assert!(
+            idle_composer.trim_start().starts_with('\u{203a}'),
+            "a linha do composer OCIOSO do Codex começa com o glifo-âncora `›`"
+        );
+
+        // OCIOSO ⇒ nenhum busy_marker presente ⇒ pronto.
+        assert!(
+            !profile
+                .busy_markers
+                .iter()
+                .any(|m| idle_composer.contains(m.as_str())),
+            "composer ocioso NÃO deve conter busy_marker (senão A2A nunca entregaria)"
+        );
+        // TRABALHO ⇒ algum busy_marker presente ⇒ NÃO-pronto (não injeta no meio do turno).
+        assert!(
+            profile
+                .busy_markers
+                .iter()
+                .any(|m| busy_status.contains(m.as_str())),
+            "status-line de trabalho do Codex DEVE casar um busy_marker (anti texto-colado)"
         );
     }
 

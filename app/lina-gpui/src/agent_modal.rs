@@ -207,6 +207,10 @@ pub enum EngineScan {
 const CLAUDE_PROFILE_SEED: &str = include_str!("../../../profiles/claude-code.toml");
 const ANTIGRAVITY_PROFILE_SEED: &str = include_str!("../../../profiles/antigravity.toml");
 const GEMINI_PROFILE_SEED: &str = include_str!("../../../profiles/gemini.toml");
+/// A2A UNIVERSAL: o profile do Codex (`prompt_ready`/`busy_markers` calibrados p/ a TUI dele)
+/// também precisa chegar ao dir de runtime do usuário, senão a entrega A2A ao Codex usaria o
+/// fallback do Claude e voltaria a dar timeout (o modal/registry só lê o disco).
+const CODEX_PROFILE_SEED: &str = include_str!("../../../profiles/codex.toml");
 
 /// `(nome de arquivo, conteúdo)` de cada profile embutido, semeado **write-if-absent**: o
 /// arquivo do disco, uma vez escrito, é a fonte da verdade (um custom de mesmo `id` no dir
@@ -215,6 +219,7 @@ const SEEDED_PROFILES: &[(&str, &str)] = &[
     ("claude-code.toml", CLAUDE_PROFILE_SEED),
     ("antigravity.toml", ANTIGRAVITY_PROFILE_SEED),
     ("gemini.toml", GEMINI_PROFILE_SEED),
+    ("codex.toml", CODEX_PROFILE_SEED),
 ];
 
 /// Onde os CLI Profiles do usuário moram: `LINA_PROFILES` (override de dev) ou
@@ -2690,8 +2695,9 @@ kind = "idle"
 
         let reg = load_profiles(&dir);
 
-        // Os 3 profiles embutidos foram semeados e carregados na 1ª vez.
-        for id in ["claude-code", "antigravity", "gemini"] {
+        // Os profiles embutidos foram semeados e carregados na 1ª vez (codex entra na A2A
+        // universal — sem o seeding, a entrega A2A ao Codex cairia no fallback do Claude).
+        for id in ["claude-code", "antigravity", "gemini", "codex"] {
             assert!(
                 reg.get(id).is_some(),
                 "{id} deve ser semeado e carregado na 1ª carga"
@@ -2703,6 +2709,11 @@ kind = "idle"
             "antigravity.toml no disco"
         );
         assert!(dir.join("gemini.toml").exists(), "gemini.toml no disco");
+        assert!(dir.join("codex.toml").exists(), "codex.toml no disco");
+        // Identidade do Codex: o binário descoberto "codex" casa o profile → o nó ganha o
+        // profile_id "codex" (via `engines_from`/`CliProfileSet`) e a entrega resolve o perfil DELE.
+        let codex = reg.get("codex").expect("codex carregado");
+        assert_eq!(codex.program, "codex");
 
         // Identidade-chave do sucessor: binário `agy` (não `gemini`) + capability honesta.
         let agy = reg.get("antigravity").expect("antigravity carregado");

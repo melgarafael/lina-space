@@ -3291,6 +3291,14 @@ fn main() {
     // calibrados) substitui o demo hardcoded; fallback-com-warning no loader (nunca panic). O
     // caminho carregado + os campos do fix saem AQUI no log de boot, p/ inspeção.
     let injection_profile = load_injection_profile(Some(&mailbox_dir));
+    // A2A UNIVERSAL: registry de TODOS os CLI Profiles (claude-code, codex, gemini, antigravity —
+    // semeados write-if-absent no dir do usuário). A entrega A2A resolve o profile do ALVO por aqui
+    // (pelo `profile_id` do nó, projetado de `CliProfileSet`), com `injection_profile` como FALLBACK.
+    // Sem isto, a entrega usava o prompt_ready/busy do Claude p/ TODO alvo → a TUI do Codex (glifo
+    // `›`) nunca casava → timeout (msg não injetada). Compartilhado (Arc) com o ⚡ demo e o pump.
+    let profile_registry = Arc::new(agent_modal::load_profiles(&agent_modal::profiles_dir(
+        &mailbox_dir,
+    )));
     // Estado PERSISTENTE do onboarding (progresso + log próprio), co-locado no workspace (subdir, não
     // colide com `.lina/events` do canvas). Sobrevive ao reboot em produção → o onboarding só aparece
     // na 1ª execução de verdade.
@@ -3545,7 +3553,9 @@ fn main() {
                     *nb,
                     grid_b,
                     // F1-0-2: o ⚡ demo usa o MESMO perfil real carregado no boot (sem demo hardcoded).
+                    // A2A UNIVERSAL: este é o FALLBACK; o ⚡ resolve o profile do ALVO pelo registry.
                     injection_profile.clone(),
+                    Arc::clone(&profile_registry),
                     Arc::clone(&store),
                     Arc::clone(&model),
                 ))
@@ -3645,6 +3655,7 @@ fn main() {
         Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
         token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)
         injection_profile,  // F1-0-2: o claude-code.toml real (fallback-com-warning no loader)
+        profile_registry,   // A2A UNIVERSAL: resolve o profile do ALVO (codex/gemini/…) na entrega
     )
     .spawn();
 
