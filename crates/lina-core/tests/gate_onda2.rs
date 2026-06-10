@@ -19,6 +19,9 @@
 //!    é MEDIDA (o master vê EOF na hora; o PID some da tabela após o reap). O estado é
 //!    então reconstruído do **event log (JSONL)** e o fingerprint bate (como o gate_onda0).
 
+// F1-6-8: E2E de PTY real com `cat`/`sh` + `kill -9` (sinais Unix) — runtime-Unix; pendente-windows na tabela ci-3so-triagem.md.
+#![cfg(unix)]
+
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};

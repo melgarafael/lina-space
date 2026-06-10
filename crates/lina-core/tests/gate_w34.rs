@@ -18,6 +18,9 @@
 //! `router` (mesma crate, `cargo test -p lina-core`). Aqui focamos o caminho REAL ponta-a-ponta
 //! (PTY → tela) + dedupe.
 
+// F1-6-8: E2E de PTY real com `cat`/`sh` — runtime-Unix; pendente-windows na tabela ci-3so-triagem.md.
+#![cfg(unix)]
+
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

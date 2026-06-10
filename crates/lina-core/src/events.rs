@@ -713,6 +713,43 @@ pub enum DomainEvent {
         node: NodeId,
         skill: String,
     },
+    /// F1-4-1: identidade DURÁVEL do Espaço, atribuída na criação (`Workspace::create`).
+    /// Variante NOVA em vez de campo aditivo em [`DomainEvent::WorkspaceCreated`]: o campo
+    /// quebraria os 13 construtores existentes fora da fronteira desta rodada (gates, app,
+    /// bootstrap); a variante preserva replay E compilação alheia. Logs legados não a
+    /// contêm → a projeção degrada para `None` e o registry usa o path como id (honesto,
+    /// nunca chuta). O registry global (`~/.lina/workspaces.json`) é PONTEIRO desta
+    /// identidade (mini-ADR F1-4-1).
+    ///
+    /// ⚠️ Escopo da "identidade" (red-team F1-4-1): este evento é a verdade do *fato*
+    /// "qual id este Espaço carrega" (invariante #4) — ele NÃO é, e nunca deve virar,
+    /// autoridade de AUTORIZAÇÃO: o namespace de trust cross-Espaço do ADR 0010 deriva
+    /// do roster VIVO do Supervisor (autenticação em 2 camadas, ADR 0006), nunca de um
+    /// campo gravado em arquivo local que quem tem acesso de disco pode adulterar.
+    WorkspaceIdAssigned {
+        workspace_id: String,
+    },
+    /// F1-4-1 (fundador 2026-06-09; precedência do ADR 0022 §4): o **Diretório de
+    /// Trabalho** do Espaço foi definido/trocado — vira o cwd PADRÃO de todo NOVO
+    /// terminal/agente (nós vivos não migram — F1-2-4). `""` LIMPA (volta ao fallback
+    /// gerenciado virgem `n-<key>`). Último vence (padrão de `WorkspaceFocusSet`).
+    /// Evento-set em vez de campo num `WorkspaceCreated` v3: o critério 6 da story exige
+    /// TROCAR depois da criação — o set cobre criação E edição com um só mecanismo.
+    /// Consumidor: o seam único `workspace::resolve_spawn_cwd` (que NUNCA assume
+    /// cwd-único-por-nó — N nós no mesmo projeto é o padrão; identidade vem do spawn,
+    /// ADR 0026 em rascunho).
+    WorkspaceDefaultCwdSet {
+        cwd: String,
+    },
+    /// F1-4-1 (ciclo de vida): o Espaço foi renomeado. Último vence; o cabeçalho do
+    /// plano espelha o nome corrente (mesma regra da criação).
+    WorkspaceRenamed {
+        name: String,
+    },
+    /// F1-4-1 (ciclo de vida): o Espaço foi ARQUIVADO — sai da contagem ATIVA do gating
+    /// free/PRO (a vaga libera; ver `workspace::can_create_workspace`). Desarquivar, se a
+    /// Fase 1 precisar, é evento aditivo futuro — o log preserva a história inteira.
+    WorkspaceArchived,
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -784,6 +821,10 @@ impl DomainEvent {
             DomainEvent::SpawnDeclined { .. } => "SpawnDeclined",
             DomainEvent::SkillInvoked { .. } => "SkillInvoked",
             DomainEvent::SkillCreated { .. } => "SkillCreated",
+            DomainEvent::WorkspaceIdAssigned { .. } => "WorkspaceIdAssigned",
+            DomainEvent::WorkspaceDefaultCwdSet { .. } => "WorkspaceDefaultCwdSet",
+            DomainEvent::WorkspaceRenamed { .. } => "WorkspaceRenamed",
+            DomainEvent::WorkspaceArchived => "WorkspaceArchived",
         }
     }
 
@@ -888,6 +929,21 @@ pub struct ProjectedState {
     /// (inclui logs v1 upcasted). `#[serde(default)]` → snapshots antigos desserializam como `None`.
     #[serde(default)]
     pub focus_preset: Option<String>,
+    /// F1-4-1: identidade durável do Espaço (do `WorkspaceIdAssigned`). `None` = log
+    /// legado sem o evento — o registry degrada para o path como id (honesto, nunca
+    /// chuta). `#[serde(default)]` → snapshots antigos desserializam como `None`.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// F1-4-1 (fundador 2026-06-09 / ADR 0022): Diretório de Trabalho do Espaço — cwd
+    /// PADRÃO de todo novo terminal/agente (do último `WorkspaceDefaultCwdSet`; `""`
+    /// limpou). `None` = sem default → fallback dir gerenciado virgem `n-<key>` (seam
+    /// único `workspace::resolve_spawn_cwd`). `#[serde(default)]` → snapshots antigos OK.
+    #[serde(default)]
+    pub default_cwd: Option<String>,
+    /// F1-4-1: o Espaço foi arquivado (`WorkspaceArchived`) — fora da contagem ativa do
+    /// gating free/PRO. `#[serde(default)]` → snapshots antigos desserializam `false`.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 impl ProjectedState {
@@ -1012,6 +1068,30 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // W4-4 (T6): o foco de workspace é projetado (último vence).
         DomainEvent::WorkspaceFocusSet { workspace } => {
             state.focused_workspace = Some(workspace.clone());
+        }
+        // F1-4-1: identidade durável do Espaço (a criação emite 1×; último vence).
+        DomainEvent::WorkspaceIdAssigned { workspace_id } => {
+            state.workspace_id = Some(workspace_id.clone());
+        }
+        // F1-4-1: Diretório de Trabalho do Espaço — último vence; `""` limpa (volta ao
+        // fallback gerenciado do ADR 0022, via o seam `workspace::resolve_spawn_cwd`).
+        DomainEvent::WorkspaceDefaultCwdSet { cwd } => {
+            state.default_cwd = if cwd.is_empty() {
+                None
+            } else {
+                Some(cwd.clone())
+            };
+        }
+        // F1-4-1: rename projeta o nome corrente (e espelha o cabeçalho do plano, como
+        // na criação — o `plan.md` derivado nunca fica com nome velho).
+        DomainEvent::WorkspaceRenamed { name } => {
+            state.workspace_name = Some(name.clone());
+            state.plan.workspace = name.clone();
+        }
+        // F1-4-1: arquivado — sai da contagem ATIVA do gating free/PRO (o registry
+        // re-deriva este flag do log; nunca o inverso).
+        DomainEvent::WorkspaceArchived => {
+            state.archived = true;
         }
         // Handshake/entrega/recusa/notas/snapshot são META (observabilidade no log) — sem efeito
         // na projeção do canvas; o roster vivo é do Supervisor, não da projeção.

@@ -15,19 +15,27 @@
 //! contrato; o conteúdo semântico (o schema em si) é honrado pelo agente destino.
 
 use std::collections::BTreeMap;
+// F1-6-8: imports `#[cfg(unix)]` = exclusivos do teste de PTY real (gateado abaixo); no Windows viram unused.
+#[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread::{self, JoinHandle};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use lina_core::{deliver_a2a, AlacrittyBackend, CliProfile, PtyCommand, PtyManager, VtBackend};
 use lina_core::{
-    deliver_a2a, now_ms, AlacrittyBackend, AutonomyLevel, CliProfile, DeliveryOutcome, DomainEvent,
-    EventStore, HandoffContract, MailMessage, Mailbox, NodeId, PtyCommand, PtyManager,
-    RouteOutcome, Router, RouterConfig, Supervisor, VtBackend, CANONICAL_INTENTS_V2,
+    now_ms, AutonomyLevel, DeliveryOutcome, DomainEvent, EventStore, HandoffContract, MailMessage,
+    Mailbox, NodeId, RouteOutcome, Router, RouterConfig, Supervisor, CANONICAL_INTENTS_V2,
     MAIL_SCHEMA_V1, MAIL_SCHEMA_V2,
 };
 
+// F1-6-8: T e poll_until são usados só pelo teste de PTY real (gateado) — cfg(unix) evita dead_code no Windows.
+#[cfg(unix)]
 const T: Duration = Duration::from_secs(5);
 
 // ───────────────────────── helpers (molde do gate_w34) ─────────────────────────
@@ -36,6 +44,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(unix)]
 fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     loop {
@@ -397,6 +406,8 @@ fn d_upcasting_log_v1_replaya_sem_erro_e_fingerprint_estavel() {
 
 /// Golden transcript de terminal REAL (molde gate_w34): um handoff `@2` com constraint
 /// de autonomia chega ao PTY do destino com a constraint LEGÍVEL no bloco injetado.
+#[cfg(unix)]
+// F1-6-8: PTY real com `cat`/`sh -c` — runtime-Unix; pendente-windows na tabela ci-3so-triagem.md.
 #[test]
 fn e_constraint_transfer_legivel_em_pty_real() {
     let sup = Arc::new(Supervisor::new());
@@ -531,7 +542,9 @@ fn f_redteam_contrato_nao_decide_identidade_nem_autorizacao() {
 }
 
 // ───────────────────────── infra de PTY real (cópia fiel do gate_w34) ─────────────────────────
+// F1-6-8: infra usada SÓ pelo teste `e_constraint_transfer_legivel_em_pty_real` (gateado) — cfg(unix) evita dead_code no Windows.
 
+#[cfg(unix)]
 struct Wired {
     grid: Arc<Mutex<Box<dyn VtBackend>>>,
     stop: Arc<AtomicBool>,
@@ -539,6 +552,7 @@ struct Wired {
     pty_key: String,
 }
 
+#[cfg(unix)]
 fn screen_text(grid: &Arc<Mutex<Box<dyn VtBackend>>>) -> String {
     let g = lock(grid);
     let (_cols, rows) = g.dims();
@@ -548,6 +562,7 @@ fn screen_text(grid: &Arc<Mutex<Box<dyn VtBackend>>>) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 fn wire_node(
     pty: &mut PtyManager,
     sup: &Supervisor,
@@ -593,6 +608,7 @@ fn wire_node(
     )
 }
 
+#[cfg(unix)]
 fn teardown(pty: &mut PtyManager, mut wired: Wired) {
     wired.stop.store(true, Ordering::Relaxed);
     let _ = pty.kill(wired.pty_key.as_str(), Duration::from_secs(2));
@@ -601,6 +617,7 @@ fn teardown(pty: &mut PtyManager, mut wired: Wired) {
     }
 }
 
+#[cfg(unix)]
 fn fake_profile() -> CliProfile {
     let src = r#"
         id = "gate-fake"

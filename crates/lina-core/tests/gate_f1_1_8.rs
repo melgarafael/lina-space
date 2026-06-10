@@ -26,10 +26,15 @@ use lina_core::{
     check_screen, prompt_snapshot_hash, AbortReason, AlacrittyBackend, ApprovalDecision,
     ApprovalExecutor, ApprovalGesture, ApprovalKeys, ApprovalOutcomeKind, ApprovalPort,
     AttentionEvidence, AttentionQueue, AttentionState, DomainEvent, PermissionEvidence, PortError,
-    PortOutcome, PromptKind, PtyCommand, PtyHost, ResolutionVia, ScreenCheck, VtBackend,
-    ESCALATE_AFTER_MS, PROMPT_REGION_ROWS,
+    PortOutcome, PromptKind, ResolutionVia, ScreenCheck, VtBackend, ESCALATE_AFTER_MS,
+    PROMPT_REGION_ROWS,
 };
+// F1-6-8: exclusivos do AC-0021.7 (PTY real, gateado #[cfg(unix)] abaixo); no Windows viram unused.
+#[cfg(unix)]
+use lina_core::{PtyCommand, PtyHost};
 use std::collections::HashMap;
+// F1-6-8: Duration/Instant são usados só pelo AC-0021.7 (gateado) — cfg(unix) evita unused no Windows.
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 const T0: u64 = 1_750_000_000_000;
@@ -537,6 +542,7 @@ fn ac_0021_6_only_the_executor_touches_the_pty_writer() {
 
 // ───────────────── AC-0021.7 (mecanismo, headless) · executor → PtyHost ─────────────────
 
+#[cfg(unix)] // F1-6-8: helper exclusivo do AC-0021.7 (gateado) — dead_code no Windows.
 fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     loop {
@@ -556,6 +562,8 @@ fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 /// vazado bytes, o `read` teria consumido outra coisa e este passo falharia (prova
 /// positiva do zero-byte). É o mecanismo do AC-0021.7 (a validação na tela pelo fundador
 /// é o gate manual da onda).
+#[cfg(unix)]
+// F1-6-8: spawna `sh -c` num PTY real — runtime-Unix; pendente-windows na tabela ci-3so-triagem.md.
 #[test]
 fn ac_0021_7_executor_through_pty_host_unblocks_real_prompt() {
     const T: Duration = Duration::from_secs(5);

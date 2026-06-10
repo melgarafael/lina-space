@@ -70,6 +70,13 @@ pub use router::{
 mod plan;
 pub use plan::{ItemState, Plan, PlanError, PlanItem, PLAN_SCHEMA_V1};
 
+/// F1-4-1: multi-Espaço — um store por Espaço + registry-ponteiro + seam único de cwd.
+mod workspace;
+pub use workspace::{
+    can_create_workspace, default_registry_path, resolve_spawn_cwd, workspace_limit, LicenseTier,
+    ResolvedCwd, Workspace, WorkspaceEntry, WorkspaceError, WorkspaceRegistry,
+};
+
 /// W3-6: núcleo determinístico do gate de execução (classe de ação × autonomia → decisão).
 mod guard;
 pub use guard::{
@@ -1997,6 +2004,7 @@ mod bus_tests {
     /// e o programa destrava com EXATAMENTE `xy` — se o abort tivesse vazado bytes, o `read` teria
     /// consumido outra coisa e o passo final falharia (prova positiva do zero-byte). Coexistência
     /// provada: `write_human` (fila) e `deliver_approval_with_grid` (síncrono) no MESMO writer.
+    #[cfg(unix)] // F1-6-8: spawna `sh -c` num PTY real — runtime-Unix (tabela ci-3so-triagem.md).
     #[test]
     #[serial]
     fn deliver_approval_with_grid_unblocks_real_prompt_via_supervisor() {
@@ -2087,6 +2095,8 @@ mod bus_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // F1-6-8: os únicos `#[serial]` deste mod são os testes de PTY real (gateados) — unused no Windows.
+    #[cfg(unix)]
     use serial_test::serial;
 
     /// Timeout generoso para toda espera-por-condição — robusto a contenção de CPU.
@@ -2110,6 +2120,7 @@ mod tests {
     /// por CONDIÇÃO, não por timing absoluto, que o reader parou de drenar. Deve ser
     /// chamado só depois de `inflight >= high` (aí o reader está entrando na pausa, e
     /// `bytes_read` congela de verdade). Devolve o valor estável (ou o último, no timeout).
+    #[cfg(unix)] // F1-6-8: helper exclusivo do flood-test Unix abaixo (dead_code no Windows).
     fn wait_until_drained_stops(host: &PtyHost, node: NodeId, timeout: Duration) -> u64 {
         let start = Instant::now();
         let mut prev = host.metrics(node).map_or(0, |m| m.bytes_read);
@@ -2123,6 +2134,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // F1-6-8: helper exclusivo dos testes de PTY real Unix abaixo (dead_code no Windows).
     fn last_line(host: &PtyHost, node: NodeId) -> Option<String> {
         host.with_grid(node, |vt| vt.last_nonempty_line())
     }
@@ -2131,6 +2143,8 @@ mod tests {
     /// bytes não-consumidos a um teto e o reader PARA de drenar (backpressure); outro
     /// terminal segue sendo servido. Mede o COMPORTAMENTO do watermark por condição,
     /// não timing absoluto. `#[serial]`: não compete por CPU com o outro flood-test.
+    #[cfg(unix)]
+    // F1-6-8: spawna `yes`/`sh` em PTY real — hang histórico de ~70min no Windows (tabela ci-3so-triagem.md).
     #[test]
     #[serial]
     fn flow_control_caps_memory_under_flood_and_others_stay_responsive() {
@@ -2199,6 +2213,7 @@ mod tests {
     /// Critério de aceite (b): um panic no loop de um terminal é CONTIDO (estado
     /// `Crashed`) sem derrubar o processo; outro terminal segue lendo e respondendo a
     /// writes. `cat` é controlado por write (sem netos/`sleep`), cleanup determinístico.
+    #[cfg(unix)] // F1-6-8: spawna `yes`/`cat` em PTY real — runtime-Unix (tabela ci-3so-triagem.md).
     #[test]
     #[serial]
     fn panic_in_one_loop_is_contained_and_others_survive() {
@@ -2243,6 +2258,7 @@ mod tests {
 
     /// A saída de um comando chega ao grid parseado via a thread de leitura.
     /// `printf` one-shot (sem `sleep`/netos): cleanup determinístico.
+    #[cfg(unix)] // F1-6-8: spawna `sh -c printf` em PTY real — runtime-Unix (tabela ci-3so-triagem.md).
     #[test]
     fn output_lands_in_parsed_grid() {
         let mut host = PtyHost::new();

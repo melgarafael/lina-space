@@ -1170,6 +1170,7 @@ mod tests {
     /// byte chegou); (3) entrega com hash FRESCO ⇒ `Written` e o programa destrava com
     /// EXATAMENTE o input esperado — se o abort tivesse vazado bytes, o `read` teria
     /// consumido outra coisa e este passo falharia (prova positiva do zero-byte).
+    #[cfg(unix)] // F1-6-8: spawna `sh -c` em PTY real — runtime-Unix (tabela ci-3so-triagem.md).
     #[test]
     fn pty_port_screen_changed_writes_nothing_then_fresh_hash_delivers() {
         use std::time::{Duration, Instant};

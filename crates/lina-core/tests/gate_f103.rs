@@ -14,6 +14,9 @@
 //! aqui ele é disparado direto no engine — a fiação real `EndDetector`/W0-10 → engine pertence
 //! ao caminho de entrega (F1-0-4+).
 
+// F1-6-8: lifecycle com PTY real (`sh -c printf/sleep`) — runtime-Unix; pendente-windows na tabela ci-3so-triagem.md.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

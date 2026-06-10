@@ -12,6 +12,9 @@
 //!   na ordem, sem gap (o invariante #4 — "o event log é a fonte da verdade", scrollback é
 //!   projeção durável, nada some).
 
+// F1-6-8: cabo PTY→scrollback com `sh -c` (loop POSIX) — runtime-Unix; pendente-windows na tabela ci-3so-triagem.md.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

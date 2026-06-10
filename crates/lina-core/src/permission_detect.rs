@@ -1251,6 +1251,7 @@ mod tests {
     /// `prompt_kind=choice` no EventStore em < 3s (do prompt visível ao append),
     /// transiciona o nó para `Blocked` via lifecycle (cabeçalho "Idle" parado na
     /// pergunta é estado mentiroso) e o nó MUTADO no log nunca emite.
+    #[cfg(unix)] // F1-6-8: spawna `sh -c` em PTY real — runtime-Unix (tabela ci-3so-triagem.md).
     #[test]
     fn watch_appends_choice_ask_within_sla_blocks_node_and_respects_mute() {
         use std::time::{Duration, Instant};
@@ -1389,6 +1390,7 @@ mod tests {
     /// prompt some do grid ⇒ o próximo scan apenda `PermissionPromptCleared` no
     /// EventStore com o `stable_id` original. (Só a EMISSÃO — o fold de remoção na
     /// fila é do Arquiteto, provado lá.)
+    #[cfg(unix)] // F1-6-8: spawna `sh -c` em PTY real — runtime-Unix (tabela ci-3so-triagem.md).
     #[test]
     fn watch_emits_prompt_cleared_when_answered_in_terminal() {
         use std::time::{Duration, Instant};
