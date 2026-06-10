@@ -202,6 +202,7 @@ fn w34_ask_routes_through_mailbox_and_b_receives_lina_msg() {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("NodeAdded");
         store

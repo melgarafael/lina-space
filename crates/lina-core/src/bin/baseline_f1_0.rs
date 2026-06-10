@@ -210,6 +210,7 @@ fn main() -> Result<()> {
                     kind: "terminal".into(),
                     x: f64::from(u32::try_from(i).unwrap_or(0)) * 100.0,
                     y: 0.0,
+                    requested_by: None,
                 },
             )?;
             append(

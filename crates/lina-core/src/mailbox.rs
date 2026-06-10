@@ -40,6 +40,11 @@ pub const CANONICAL_INTENTS_V2: &[&str] = &[
     "plan.claim",
     "plan.check",
     "permission",
+    // F1-3-6 (ADR 0019 §6): `lina spawn` — capacidade SENSÍVEL = verbo estruturado (doutrina
+    // InsForge), interceptado no router como gate inforjável (NÃO entregue a PTY). Canônico aqui
+    // para o `validate_envelope_v2` do `lina/msg@2` não recusá-lo como `InvalidIntent` (e p/
+    // forward-compat — o caminho v1 do bin já passa intacto).
+    "spawn",
 ];
 
 /// Teto de tamanho de uma mensagem da mailbox (guarda anti-DoS no `drain`). Uma `MailMessage`

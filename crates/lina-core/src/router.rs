@@ -28,6 +28,10 @@ pub const DEDUPE_WINDOW_MS: u64 = 60_000;
 pub const MAX_DEPTH: u8 = 4;
 /// Teto de delegações por `root_cause_id` por agente (orçamento/turno).
 pub const DELEGATION_BUDGET: u32 = 8;
+/// F1-3-6 (ADR 0019 §6): teto de spawns (`lina spawn`) por `(root_cause_id, agente)` por turno.
+/// Mora AO LADO de [`DELEGATION_BUDGET`] (Maestro decisão 1: "onde `max_delegations` vive", sem
+/// parser de `workspace.json`). Espelhado em `lina_bootstrap::Autonomy::max_spawns` p/ a doutrina.
+pub const MAX_SPAWNS_PER_TURN: u32 = 2;
 /// Acima de N alvos, um `broadcast` exige confirmação humana (gate de fan-out).
 pub const FANOUT_GATE: usize = 3;
 /// W3-7b (ADR 0002): teto de tempo (ms) de um `await` sem reply antes de fechar por Timeout (sweep
@@ -68,6 +72,11 @@ pub struct RouterConfig {
     pub dedupe_window_ms: u64,
     pub max_depth: u8,
     pub delegation_budget: u32,
+    /// F1-3-6 (ADR 0019 §6): teto de spawns por `(root_cause_id, agente)`/turno. Plugado AO LADO de
+    /// `delegation_budget` (Maestro decisão 1). Enforçado em [`Router::handle_spawn`] (origem, pós-
+    /// cascata). O nível por-workspace nasce de `Autonomy::max_spawns` — a fiação do `autonomy`
+    /// REAL no `RouterConfig` (hoje `..default()` em `bridge.rs`) é o GAP escalado (decisão 2).
+    pub max_spawns_per_turn: u32,
     pub fanout_gate: usize,
     pub autonomy: AutonomyLevel,
     /// W3-7b: teto de tempo de um `await` sem reply (fecha por `Timeout` no sweep do `pump`).
@@ -121,6 +130,7 @@ impl Default for RouterConfig {
             dedupe_window_ms: DEDUPE_WINDOW_MS,
             max_depth: MAX_DEPTH,
             delegation_budget: DELEGATION_BUDGET,
+            max_spawns_per_turn: MAX_SPAWNS_PER_TURN,
             fanout_gate: FANOUT_GATE,
             autonomy: AutonomyLevel::Assisted,
             await_timeout_ms: AWAIT_TIMEOUT_MS,
@@ -205,6 +215,26 @@ pub enum RouteOutcome {
     /// motivo legível — desfecho DEFINITIVO (o pump ackeia o `.inflight`; o arquivo da
     /// DLQ persiste para retry MANUAL). Nada some em silêncio.
     DeadLettered { reason: String },
+    /// F1-3-6 (ADR 0019 §6): `lina spawn` de ORIGEM APROVADO pelo gate (sob cap, custo ok, não
+    /// manual). O CORE só DECIDE — a criação física (PTY + `Supervisor::register` + bootstrap +
+    /// `NodeAdded`) é do APP via o funil `admit_node` (ADR 0022), seam SEPARADO casado à tela
+    /// (Maestro decisão 4). Nesta rodada é verificado como VALOR DE RETORNO (o nó NÃO é criado).
+    SpawnApproved {
+        name: String,
+        role: String,
+        prompt: String,
+        requested_by: NodeId,
+        root_cause_id: String,
+    },
+    /// F1-3-6 (ADR 0019 §6): o spawn precisa de CONFIRMAÇÃO HUMANA — `reason` ∈
+    /// {`cascade`,`over_cap`,`cost`} (cascata SEMPRE gateia; cap estourado; workspace cost-paused).
+    /// O app mostra um banner pt-br; NADA é criado sem o gesto humano. DISTINTO de `SpawnBlocked`
+    /// (recusa terminal por autonomia `manual`).
+    SpawnGated { reason: String },
+    /// F1-3-6 (ADR 0019 §6): spawn RECUSADO pela autonomia `manual` (paridade com
+    /// `BlockedByAutonomy` do handoff) — sem banner de confirmação (o humano deve subir a
+    /// autonomia). O EVENTO `SpawnGated{reason:"manual"}` registra o fato no log.
+    SpawnBlocked,
 }
 
 /// Erro de uma operação de plano feita DIRETO pelo supervisor (semeadura via `seed_plan_*`):
@@ -227,9 +257,13 @@ fn is_delegation(intent: &str) -> bool {
 
 /// Entrada do orçamento de delegação: contagem + carimbo (ms) do último toque. O carimbo habilita a
 /// poda temporal (A5), simétrica à de `seen`, para o mapa não crescer sem limite numa sessão longa.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct BudgetEntry {
     count: u32,
+    /// F1-3-6 (ADR 0019 §6): contagem de SPAWNS (`lina spawn`) desta cadeia/agente — SEPARADA de
+    /// `count` (delegação budget 8 vs spawn cap 2: semânticas distintas). Reusa a MESMA chave
+    /// `(root_cause_id, sender)` e a poda temporal A5 de `prune_expired` (evita um 2º mapa).
+    spawn_count: u32,
     last_ms: u64,
 }
 
@@ -711,6 +745,17 @@ impl Router {
             return self.handle_plan(msg, store);
         }
 
+        // ── F1-3-6 (ADR 0019 §6): `lina spawn` é verbo ESTRUTURADO interceptado AQUI (molde do
+        //    plano, IMEDIATAMENTE depois dele) e DECIDIDO pelo gate inforjável — NÃO entregue a
+        //    PTY. Precede os guardrails de alvo/hop/retenção de propósito: o `@Nome` do spawn NÃO
+        //    existe no roster (cairia em `NoTarget`) e spawn não injeta turno (não passa por
+        //    retenção/close_await/hop-limit). `sender` já está resolvido/autenticado (acima) e o
+        //    envelope já passou no `validate_envelope_v2`. O gate lê origem×cascata REUSANDO
+        //    `derive_root_hops` (binding inforjável — jamais `msg.hops`/`msg.root_cause_id`).
+        if is_spawn_intent(&msg.intent) {
+            return self.handle_spawn(msg, sender, store, now_ms);
+        }
+
         // ── F1-0-4 (P1 — o fix do atropelamento): ENTREGA CIENTE DE ESTADO. Alvo single-node
         //    `Busy` (state-machine F1-0-3, consultada no roster — inclui o Busy carimbado
         //    pelo próprio router na entrega anterior) → NÃO injeta: a msg fica RETIDA no
@@ -1006,6 +1051,7 @@ impl Router {
                 .entry((root.clone(), sender))
                 .or_insert(BudgetEntry {
                     count: 0,
+                    spawn_count: 0,
                     last_ms: now_ms,
                 });
             entry.count += 1;
@@ -1570,6 +1616,138 @@ impl Router {
         }
     }
 
+    /// **F1-3-6 (ADR 0019 §6): gate INFORJÁVEL do `lina spawn`** (molde de [`Router::handle_plan`]).
+    /// NÃO cunha NodeId nem abre PTY (autoridade única do Supervisor/app; fronteira core/shell
+    /// inv#7): **DECIDE** (forma → autonomia → cascata → cap → custo) e devolve o `RouteOutcome` que
+    /// o APP executa via o funil `admit_node` (ADR 0022, seam da tela — Maestro decisão 4). Lê
+    /// origem×cascata REUSANDO [`Router::derive_root_hops`] — o binding `delivered_root` (inforjável),
+    /// JAMAIS `msg.hops`/`msg.root_cause_id` (campos PÚBLICOS/forjáveis do outbox). É o coração da
+    /// não-forjabilidade (ADR 0007): nenhum campo escrito pelo agente decide origem/cap/autorização.
+    ///
+    /// **Livro-razão (igual `handle_plan`):** loga ANTES do efeito; `SpawnRequested` SEMPRE
+    /// (pós-validação de forma); `SpawnGated` em cada ramo barrado; falha de `append` →
+    /// `PersistFailed` (não decidir o que não logamos — invariante #4). `NodeAdded`/`requested_by`
+    /// só na EXECUÇÃO física (app).
+    fn handle_spawn(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        store: &mut EventStore,
+        now_ms: u64,
+    ) -> RouteOutcome {
+        // ── 0) Args do envelope: name = `to` (`@Nome`), role = `ref` (`role:<r>`), prompt = payload.
+        //    Validação de FORMA (name/role não-vazios) → `SpawnBlocked`. O bin recusa antes de
+        //    enfileirar (UX local); este é o backstop durável. Pedido MALFORMADO NÃO vira
+        //    `SpawnRequested` (não é um spawn real, é comando inválido — não polui o livro-razão).
+        let name = msg.to.trim().to_string();
+        let role = msg
+            .ref_id
+            .as_deref()
+            .map(|r| r.strip_prefix("role:").unwrap_or(r).trim())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() || name == "@" || role.is_empty() {
+            return RouteOutcome::SpawnBlocked;
+        }
+        let prompt = msg.payload.clone();
+
+        // ── 1) BINDING INFORJÁVEL (reuso puro): root/hops EFETIVOS — a ÚNICA autoridade de
+        //    origem×cascata. Sem binding (origem) → `(msg.id, 0)`; com binding (recebeu A2A) →
+        //    `(root_herdado, hops+1)`. Ignora por construção `msg.hops`/`msg.root_cause_id`.
+        let (root, hops) = self.derive_root_hops(msg, sender);
+
+        // ── 2) intent-vs-action (13.14 P1): loga o PEDIDO SEMPRE, ANTES da decisão, com a cadeia
+        //    EFETIVA (não a forjada) e o `requested_by` AUTENTICADO (sender, jamais `from`).
+        if let Err(e) = store.append(&DomainEvent::SpawnRequested {
+            id: msg.id.clone(),
+            requested_by: sender,
+            name: name.clone(),
+            role: role.clone(),
+            root_cause_id: root.clone(),
+            hops,
+        }) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+
+        // ── 3) Autonomia `manual` → RECUSA terminal (paridade com `BlockedByAutonomy` do handoff).
+        //    Registra o fato (`SpawnGated{manual}`) e devolve `SpawnBlocked` (UX distinta do banner).
+        //    GOVERNADO pela matriz de autonomia do `RouterConfig` (Maestro decisão 2 — GAP de fiação
+        //    em `bridge.rs` escalado na entrega; sem ele este ramo seria fake em produção).
+        if self.config.autonomy.blocks_delegation() {
+            if let Err(e) = append_spawn_gated(store, &msg.id, sender, "manual") {
+                return RouteOutcome::PersistFailed(e.to_string());
+            }
+            return RouteOutcome::SpawnBlocked;
+        }
+
+        // ── 4) CASCATA (`hops>=1`): spawn-de-spawn pede gesto humano SEMPRE (ADR 0007 — a defesa
+        //    central anti-fork-bomb). Forjar `hops=0` no payload NÃO ajuda: `hops` veio do binding.
+        if hops >= 1 {
+            if let Err(e) = append_spawn_gated(store, &msg.id, sender, "cascade") {
+                return RouteOutcome::PersistFailed(e.to_string());
+            }
+            return RouteOutcome::SpawnGated {
+                reason: "cascade".into(),
+            };
+        }
+
+        // ── 5) CAP por `(root, sender)` (origem sob teto). Reusa o mapa `budget` + a poda A5. Acima
+        //    do cap → banner humano. (Ver entrega: para ORIGEM o root é FRESCO por `lina spawn`, então
+        //    este cap só morde dentro de um root COMPARTILHADO — escalado como gap de origem-burst.)
+        let used = self
+            .budget
+            .get(&(root.clone(), sender))
+            .map(|e| e.spawn_count)
+            .unwrap_or(0);
+        if used >= self.config.max_spawns_per_turn {
+            if let Err(e) = append_spawn_gated(store, &msg.id, sender, "over_cap") {
+                return RouteOutcome::PersistFailed(e.to_string());
+            }
+            return RouteOutcome::SpawnGated {
+                reason: "over_cap".into(),
+            };
+        }
+
+        // ── 6) CUSTO (ADR 0005 / W3-7c): workspace cost-`Paused` → banner humano (o novo terminal
+        //    gastaria sob teto estourado). Reusa o `CostLedger` event-sourced; só quando há teto
+        //    configurado. NÃO transiciona p/ `Paused` (isso é do caminho de delegação) — só barra se
+        //    JÁ pausado. Falha ao LER o log → falha segura (não aprova o que não conseguimos checar).
+        if self.config.token_budget_day > 0 {
+            match CostLedger::replay(store, now_ms) {
+                Ok(ledger) if ledger.paused => {
+                    if let Err(e) = append_spawn_gated(store, &msg.id, sender, "cost") {
+                        return RouteOutcome::PersistFailed(e.to_string());
+                    }
+                    return RouteOutcome::SpawnGated {
+                        reason: "cost".into(),
+                    };
+                }
+                Ok(_) => {}
+                Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+            }
+        }
+
+        // ── 7) ALLOW: contabiliza o spawn em `(root, sender)` (carimba `last_ms` p/ a poda A5) e
+        //    devolve `SpawnApproved` — o APP cria o nó (admit_node), enfileira o 1º prompt e narra.
+        let entry = self
+            .budget
+            .entry((root.clone(), sender))
+            .or_insert(BudgetEntry {
+                count: 0,
+                spawn_count: 0,
+                last_ms: now_ms,
+            });
+        entry.spawn_count += 1;
+        entry.last_ms = now_ms;
+        RouteOutcome::SpawnApproved {
+            name,
+            role,
+            prompt,
+            requested_by: sender,
+            root_cause_id: root,
+        }
+    }
+
     /// **W3-5: semeia um item no plano** (chamado pelo supervisor/app, não pela mailbox): loga
     /// `PlanItemAdded` e reescreve o `plan.md`. O item nasce `status:todo` / `@owner:?`.
     ///
@@ -1612,6 +1790,30 @@ impl Router {
 /// `true` se o intent é uma operação de plano (aplicada ao `plan.md`, nunca entregue a PTY).
 fn is_plan_intent(intent: &str) -> bool {
     matches!(intent, "plan.claim" | "plan.check")
+}
+
+/// F1-3-6 (ADR 0019 §6): `true` se o intent é um pedido de SPAWN (`lina spawn`). Interceptado no
+/// router como verbo estruturado (molde de [`is_plan_intent`]) — DECIDIDO pelo gate
+/// [`Router::handle_spawn`], NUNCA entregue a PTY (o alvo `@Nome` nem existe no roster ainda).
+fn is_spawn_intent(intent: &str) -> bool {
+    intent == "spawn"
+}
+
+/// F1-3-6: loga `SpawnGated{reason}` (livro-razão da decisão do gate, par do `SpawnRequested`).
+/// `reason` ∈ {`cascade`,`over_cap`,`manual`,`cost`}. Free fn (não toca o estado do Router) —
+/// mesmo padrão de [`log_block`].
+fn append_spawn_gated(
+    store: &mut EventStore,
+    id: &str,
+    requested_by: NodeId,
+    reason: &str,
+) -> Result<(), StoreError> {
+    store.append(&DomainEvent::SpawnGated {
+        id: id.to_string(),
+        requested_by,
+        reason: reason.to_string(),
+    })?;
+    Ok(())
 }
 
 /// FIX #22: `true` se a mensagem é um PING DE PRESENÇA (`lina handshake`): `intent == "handshake"` E
@@ -4368,5 +4570,301 @@ mod tests {
             ledger_yest.paused,
             "ontem estava pausado (CostCeilingHit do dia)"
         );
+    }
+
+    // ─────────────── F1-3-6: gate inforjável do `lina spawn` (core, headless) ───────────────
+
+    /// Payloads dos eventos de um `kind` (helper das asserções do gate de spawn).
+    fn spawn_payloads(store: &EventStore, kind: &str) -> Vec<serde_json::Value> {
+        store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| r.payload)
+            .collect()
+    }
+
+    /// **Critério 1 (caminho feliz, ORIGEM).** Um nó SEM binding (`hops==0`, pedido direto do
+    /// humano) → `SpawnApproved` com os args do envelope; `SpawnRequested` logado (intent-vs-action);
+    /// `spawn_count` incrementado em `(root, sender)`; e NADA criado no core (sem `NodeAdded` — a
+    /// criação física é seam da tela, Maestro decisão 4: o gate prova a DECISÃO, não o efeito).
+    #[test]
+    fn spawn_origin_is_approved_and_logs_request() {
+        let (mut router, sup, dir) = router_with("spawn-origin");
+        let a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("spawn-origin");
+        let (_rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("@A", "@QA", "spawn", "valide o checkout").with_ref("role:qa");
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
+
+        match out {
+            RouteOutcome::SpawnApproved {
+                name,
+                role,
+                prompt,
+                requested_by,
+                root_cause_id,
+            } => {
+                assert_eq!(name, "@QA");
+                assert_eq!(role, "qa");
+                assert_eq!(prompt, "valide o checkout");
+                assert_eq!(
+                    requested_by, a,
+                    "requested_by = sender AUTENTICADO (não o `from`)"
+                );
+                assert_eq!(root_cause_id, m.id, "origem: root EFETIVO = msg.id FRESCO");
+            }
+            other => panic!("origem deve aprovar; veio {other:?}"),
+        }
+        // intent-vs-action: o PEDIDO foi logado SEMPRE, com a cadeia EFETIVA.
+        let reqs = spawn_payloads(&ts.store, "SpawnRequested");
+        assert_eq!(reqs.len(), 1, "exatamente 1 SpawnRequested");
+        assert_eq!(reqs[0]["name"].as_str(), Some("@QA"));
+        assert_eq!(reqs[0]["role"].as_str(), Some("qa"));
+        assert_eq!(reqs[0]["hops"].as_u64(), Some(0));
+        assert_eq!(
+            reqs[0]["requested_by"].as_str(),
+            Some(a.to_string().as_str())
+        );
+        // O core NÃO cria o nó (seam da tela): nenhum NodeAdded; origem não é gated.
+        assert!(
+            spawn_payloads(&ts.store, "NodeAdded").is_empty(),
+            "Rodada 3 é CORE-só: o gate NÃO cria o nó (admit_node é seam da tela)"
+        );
+        assert!(
+            spawn_payloads(&ts.store, "SpawnGated").is_empty(),
+            "origem aprovada não gera SpawnGated"
+        );
+        // Cap: o spawn aprovado contabiliza `spawn_count` em (root, sender).
+        let n = router
+            .budget
+            .get(&(m.id.clone(), a))
+            .map(|e| e.spawn_count)
+            .unwrap_or(0);
+        assert_eq!(n, 1, "spawn aprovado incrementa o spawn_count");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Critério 2 (cascata gated).** Um worker que RECEBEU um handoff (tem binding
+    /// `delivered_root`) tenta criar terminal → `SpawnGated{cascade}` SEMPRE; evento logado; nada
+    /// aprovado. É a defesa central anti-fork-bomb (ADR 0007): spawn-de-spawn pede gesto humano.
+    #[test]
+    fn spawn_cascade_requires_human_gate() {
+        let (mut router, sup, dir) = router_with("spawn-casc");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("spawn-casc");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B fixa o binding de B (B agora está numa cadeia → `hops>=1`).
+        let m_ab = MailMessage::new("@A", "@B", "ask", "faça X");
+        router.route_message(&m_ab, &mut ts.store, 1, &mut deliver);
+
+        // B tenta spawnar @Helper → cascata.
+        let m_spawn = MailMessage::new("@B", "@Helper", "spawn", "ajude").with_ref("role:helper");
+        let out = router.route_message(&m_spawn, &mut ts.store, 2, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::SpawnGated {
+                reason: "cascade".into()
+            },
+            "cascata exige gate humano SEMPRE"
+        );
+        let gated = spawn_payloads(&ts.store, "SpawnGated");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0]["reason"].as_str(), Some("cascade"));
+        assert_eq!(
+            gated[0]["requested_by"].as_str(),
+            Some(b.to_string().as_str()),
+            "requested_by autenticado = B (sender), não o campo `from`"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Critério 3 (NÃO-FORJABILIDADE — irmão do `f005324`).** Com binding presente, um worker
+    /// FORJA `hops=0` + `root_cause_id` fresco no envelope (o outbox é canal NÃO-autenticado) →
+    /// AINDA `SpawnGated{cascade}`. **NÃO-VACUOSO:** quebraria se o gate relesse `msg.hops`/
+    /// `msg.root_cause_id` em vez do binding inforjável (`derive_root_hops`).
+    #[test]
+    fn spawn_gate_ignores_forged_hops_and_root() {
+        let (mut router, sup, dir) = router_with("spawn-forge");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("spawn-forge");
+        let (_rec, mut deliver) = recorder();
+
+        let m_ab = MailMessage::new("@A", "@B", "ask", "cadeia");
+        router.route_message(&m_ab, &mut ts.store, 1, &mut deliver);
+
+        // B forja "sou origem fresca" nos campos PÚBLICOS/forjáveis do outbox.
+        let mut m_forge =
+            MailMessage::new("@B", "@Helper", "spawn", "fork").with_ref("role:helper");
+        m_forge.hops = 0; // forjado: "sou origem"
+        m_forge.root_cause_id = Some("msg_forjado_root_fresco".into()); // forjado: root novo
+        let out = router.route_message(&m_forge, &mut ts.store, 2, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::SpawnGated {
+                reason: "cascade".into()
+            },
+            "o gate lê o binding (B recebeu handoff), JAMAIS os campos forjados → segue cascata"
+        );
+        // Prova não-vacuosa: o root/hops EFETIVOS logados vêm do BINDING, não do payload forjado.
+        let last = spawn_payloads(&ts.store, "SpawnRequested")
+            .pop()
+            .expect("SpawnRequested");
+        assert_eq!(
+            last["root_cause_id"].as_str(),
+            Some(m_ab.id.as_str()),
+            "root EFETIVO = id de A (binding), não o forjado"
+        );
+        assert_eq!(
+            last["hops"].as_u64(),
+            Some(1),
+            "hops EFETIVO = 1 (cascata), não o forjado 0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Critério 4 (cap).** Com `max_spawns_per_turn` spawns já contabilizados sob `(root, sender)`,
+    /// o próximo (mesmo root) → `SpawnGated{over_cap}`. Semeado direto no `budget` (mesmo módulo) p/
+    /// provar o cap NO LIMIAR — NÃO-VACUOSO: passa só se o gate consulta `spawn_count` contra
+    /// `max_spawns_per_turn`.
+    #[test]
+    fn spawn_over_cap_is_gated() {
+        let (mut router, sup, dir) = router_with("spawn-cap");
+        let a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("spawn-cap");
+        let (_rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("@A", "@C", "spawn", "terceiro").with_ref("role:helper");
+        // Origem → root = m.id. Pré-semeia o cap (2) sob (m.id, a); last_ms=now p/ não ser podado.
+        router.budget.insert(
+            (m.id.clone(), a),
+            BudgetEntry {
+                count: 0,
+                spawn_count: MAX_SPAWNS_PER_TURN,
+                last_ms: 1000,
+            },
+        );
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::SpawnGated {
+                reason: "over_cap".into()
+            },
+            "spawn no mesmo root acima do cap é gateado"
+        );
+        let gated = spawn_payloads(&ts.store, "SpawnGated");
+        assert_eq!(gated.last().unwrap()["reason"].as_str(), Some("over_cap"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Critério 4b + Maestro decisão 2 (fiação da autonomia, provada HEADLESS).** `RouterConfig`
+    /// com `autonomy=Manual` → `handle_spawn` recusa no CORE com `SpawnBlocked` (sem PTY) e loga
+    /// `SpawnGated{manual}`. Prova que a matriz de autonomia no `RouterConfig` GOVERNA o gate (sem
+    /// ela, manual seria fake — ver GAP em `bridge.rs` na entrega).
+    #[test]
+    fn spawn_manual_autonomy_blocks_in_core() {
+        let dir = std::env::temp_dir().join(format!("lina-spawn-manual-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sup = Arc::new(Supervisor::new());
+        let _a = sup.register("@A", None, sink());
+        let cfg = RouterConfig {
+            autonomy: AutonomyLevel::Manual,
+            ..RouterConfig::default()
+        };
+        let mut router =
+            Router::with_config(Arc::clone(&sup), Mailbox::new(dir.join(".lina")), cfg);
+        let mut ts = TmpStore::new("spawn-manual");
+        let (_rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("@A", "@QA", "spawn", "x").with_ref("role:qa");
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::SpawnBlocked,
+            "manual recusa o spawn no core"
+        );
+        let gated = spawn_payloads(&ts.store, "SpawnGated");
+        assert_eq!(
+            gated.last().unwrap()["reason"].as_str(),
+            Some("manual"),
+            "o fato é registrado no log (SpawnGated{{manual}})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Custo (ADR 0005).** Workspace cost-`Paused` (semeado via `CostCeilingHit` no log) → spawn
+    /// de ORIGEM `SpawnGated{cost}` (o terminal novo gastaria sob teto estourado). Reusa `CostLedger`.
+    #[test]
+    fn spawn_gated_when_cost_paused() {
+        let now: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("lina-spawn-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sup = Arc::new(Supervisor::new());
+        let _a = sup.register("@A", None, sink());
+        let cfg = RouterConfig {
+            token_budget_day: 100,
+            ..RouterConfig::default()
+        };
+        let mut router =
+            Router::with_config(Arc::clone(&sup), Mailbox::new(dir.join(".lina")), cfg);
+        let mut ts = TmpStore::new("spawn-cost");
+        let (_rec, mut deliver) = recorder();
+
+        // Semeia Paused: uso > teto + CostCeilingHit do dia → o ledger reconstrói paused=true.
+        ts.store
+            .append(&DomainEvent::TokenUsageReported {
+                node: "@A".into(),
+                tokens: 150,
+            })
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::CostCeilingHit {
+                day: utc_day(now),
+                tokens: 150,
+            })
+            .unwrap();
+
+        let m = MailMessage::new("@A", "@QA", "spawn", "x").with_ref("role:qa");
+        let out = router.route_message(&m, &mut ts.store, now, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::SpawnGated {
+                reason: "cost".into()
+            },
+            "spawn sob workspace cost-paused é gateado"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Defesa de forma.** Envelope de spawn sem `role` → `SpawnBlocked` (o bin recusa antes de
+    /// enfileirar; este é o backstop do router). NÃO loga SpawnRequested (pedido malformado, não é
+    /// um spawn real).
+    #[test]
+    fn spawn_missing_role_is_blocked() {
+        let (mut router, sup, dir) = router_with("spawn-noargs");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("spawn-noargs");
+        let (_rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("@A", "@QA", "spawn", "x"); // sem `--role` (sem ref)
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::SpawnBlocked,
+            "spawn sem papel é recusado"
+        );
+        assert!(
+            spawn_payloads(&ts.store, "SpawnRequested").is_empty(),
+            "pedido malformado não vira SpawnRequested"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -188,6 +188,16 @@ pub enum DomainEvent {
         kind: String,
         x: f64,
         y: f64,
+        /// F1-3-6 (ADR 0019 §6): NodeId do agente que PEDIU este spawn via `lina spawn`
+        /// (intent=spawn). `None` = criação direta pelo humano (UI/⌘T) — não passou pelo
+        /// gate/cap de agente. Fecha o trio de auditoria intent-vs-action com
+        /// [`DomainEvent::SpawnRequested`]/[`DomainEvent::SpawnGated`]. ADITIVO via
+        /// `serde(default)`: logs antigos (shape `{node,kind,x,y}` v2) replayam com `None`
+        /// SEM bump de versão nem entrada em [`upcast`] (campo `Option<T>` dispensa upcast —
+        /// mesmo padrão de `TerminalSpawned.cwd`, ADR 0001 §2). META/auditoria: NÃO entra em
+        /// [`ProjectedNode`] (consumido por replay — `lina retro`, painel de custo).
+        #[serde(default)]
+        requested_by: Option<NodeId>,
     },
     NodeMoved {
         node: NodeId,
@@ -630,6 +640,56 @@ pub enum DomainEvent {
         #[serde(default)]
         stable_id: String,
     },
+    /// F1-3-6 (ADR 0019 §6): um agente PEDIU criar um terminal via `lina spawn` (intent=spawn).
+    /// META (livro-razão do PEDIDO — intent-vs-action 13.14 P1): registra os args reais + a cadeia
+    /// EFETIVA, SEMPRE e ANTES da decisão do gate (par de [`DomainEvent::SpawnGated`]/
+    /// `NodeAdded.requested_by`). `requested_by` é o sender AUTENTICADO pelo dir-dono do outbox
+    /// (JAMAIS o campo `from`); `root_cause_id`/`hops` vêm do binding inforjável
+    /// (`Router::derive_root_hops`), NUNCA dos campos forjáveis `msg.root_cause_id`/`msg.hops`.
+    /// Consumido por replay (auditoria / `lina retro` / painel de custo); sem efeito na projeção
+    /// do canvas (silêncio no [`apply`]). Variante NOVA → sem `serde(default)` nos campos (replay de
+    /// log antigo nunca a encontra — precedente `AwaitOpened`).
+    SpawnRequested {
+        /// `= msg.id` (dedupe/correlação com `SpawnGated`/`NodeAdded` do mesmo pedido).
+        id: String,
+        /// Sender AUTENTICADO (dir-dono do outbox), NUNCA o campo `from` (forjável).
+        requested_by: NodeId,
+        /// `@Nome` pedido para o novo terminal.
+        name: String,
+        /// Papel pedido (`qa`/`designer`/…).
+        role: String,
+        /// Root EFETIVO da cadeia (do binding `delivered_root`, não do campo forjável).
+        root_cause_id: String,
+        /// Profundidade EFETIVA (`0` = origem; `>=1` = cascata).
+        hops: u8,
+    },
+    /// F1-3-6 (ADR 0019 §6): o gate barrou/adiou um spawn (livro-razão da DECISÃO, par do
+    /// `SpawnRequested`). `reason` ∈ {`cascade`,`over_cap`,`manual`,`cost`} — String (não enum) de
+    /// propósito: razões novas entram sem quebrar replay antigo (mesmo padrão de
+    /// `ApprovalAborted.reason`). META — sem efeito na projeção; o painel de custo/`lina retro` o
+    /// reconstroem varrendo o log.
+    SpawnGated {
+        id: String,
+        requested_by: NodeId,
+        reason: String,
+    },
+    /// F1-3-7 (RESERVADO up-front por Dev 01 — Maestro decisão 3 §12.3: dono único de `events.rs`
+    /// na Rodada 3 batcheia TODAS as variantes da onda, eliminando colisão de merge com F1-3-7).
+    /// Uma skill foi INVOCADA por um nó. META — o `lina retro` conta invocações e deriva "última
+    /// atividade" do `EventRecord.ts` (candidatas a stale >30d / archive >90d). **Shape = placeholder
+    /// do seam §12.3**; o spec de F1-3-7 (Dev 02 / LLM Engineer) confirma os campos finais ANTES de
+    /// consumir — ESCALADO ao Orquestrador (ver `.entrega-f1-3-6.md`). Variante NOVA → sem
+    /// `serde(default)`.
+    SkillInvoked {
+        node: NodeId,
+        skill: String,
+    },
+    /// F1-3-7 (RESERVADO up-front — ver [`DomainEvent::SkillInvoked`]): uma skill foi CRIADA por um
+    /// nó. META. Shape placeholder do seam §12.3 (confirmar com Dev 02 antes de consumir).
+    SkillCreated {
+        node: NodeId,
+        skill: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -695,6 +755,10 @@ impl DomainEvent {
             DomainEvent::PermissionDismissed { .. } => "PermissionDismissed",
             DomainEvent::NodeDetectionMuted { .. } => "NodeDetectionMuted",
             DomainEvent::PermissionPromptCleared { .. } => "PermissionPromptCleared",
+            DomainEvent::SpawnRequested { .. } => "SpawnRequested",
+            DomainEvent::SpawnGated { .. } => "SpawnGated",
+            DomainEvent::SkillInvoked { .. } => "SkillInvoked",
+            DomainEvent::SkillCreated { .. } => "SkillCreated",
         }
     }
 
@@ -828,7 +892,15 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
                 Some(focus_preset.clone())
             };
         }
-        DomainEvent::NodeAdded { node, kind, x, y } => {
+        DomainEvent::NodeAdded {
+            node,
+            kind,
+            x,
+            y,
+            // F1-3-6: META/auditoria (quem pediu o spawn) — NÃO entra na projeção do canvas
+            // (`ProjectedNode`); consumido por replay (`lina retro`/painel de custo).
+            requested_by: _,
+        } => {
             state.nodes.insert(
                 *node,
                 ProjectedNode {
@@ -975,6 +1047,14 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // R2b item 5: prompt respondido direto no terminal é META (livro-razão da
         // fila — remoção sem decisão fabricada); a fila remove no fold.
         | DomainEvent::PermissionPromptCleared { .. }
+        // F1-3-6: pedido/gate de spawn são META (livro-razão intent-vs-action 13.14 P1); a
+        // criação física (`NodeAdded`) é que projeta. O painel de custo/auditoria e `lina retro`
+        // reconstroem o trio varrendo o log — sem efeito na projeção do canvas.
+        | DomainEvent::SpawnRequested { .. }
+        | DomainEvent::SpawnGated { .. }
+        // F1-3-7 (reservado up-front): uso/criação de skill são META (dados do `lina retro`).
+        | DomainEvent::SkillInvoked { .. }
+        | DomainEvent::SkillCreated { .. }
         | DomainEvent::SnapshotTaken { .. } => {}
     }
 }
@@ -1494,6 +1574,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 10.0,
                 y: 20.0,
+                requested_by: None,
             })
             .unwrap();
         store
@@ -1502,6 +1583,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 200.0,
                 y: 50.0,
+                requested_by: None,
             })
             .unwrap();
         store
@@ -1756,6 +1838,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .unwrap();
         store
@@ -1975,6 +2058,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("add");
         // Shape antigo, gravado CRU — como um log pré-F1 teria persistido (o enum é
@@ -2024,6 +2108,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("add");
         store
@@ -2074,6 +2159,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 1.0,
                 y: 2.0,
+                requested_by: None,
             })
             .expect("add");
         let before = store.project().expect("project 1");
@@ -2141,6 +2227,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("append NodeAdded");
         store
@@ -2178,6 +2265,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("add");
         let before = store.project().expect("project 1");
@@ -2497,5 +2585,118 @@ mod tests {
             }
             other => panic!("kind errado: {other:?}"),
         }
+    }
+
+    /// **F1-3-6 (inv#4 / critério 5): `NodeAdded.requested_by` é ADITIVO.** Um payload v2 ANTIGO
+    /// (shape `{node,kind,x,y}`, SEM o campo) replaya com `requested_by: None` via `serde(default)`
+    /// — SEM bump de versão nem entrada em `upcast` — e a projeção do canvas NÃO quebra (campo META,
+    /// fora de `ProjectedNode`). Um payload COM `requested_by:Some` roundtripa.
+    #[test]
+    #[serial]
+    fn node_added_requested_by_is_additive() {
+        let tmp = TempDir::new("reqby");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let node = Uuid::now_v7();
+
+        // Payload v2 ANTIGO (sem o campo) — exatamente o que um log pré-F1-3-6 contém. O enum é
+        // `#[serde(tag = "event")]`, então o payload armazenado carrega a tag `event` (como
+        // `EventStore::append` serializa); só falta `requested_by` (o campo novo).
+        store
+            .insert_raw(
+                "NodeAdded",
+                2,
+                serde_json::json!({ "event": "NodeAdded", "node": node, "kind": "Terminal", "x": 1.0, "y": 2.0 }),
+            )
+            .expect("insert raw v2-antigo");
+
+        // Replaya sem erro: `from_record` desserializa com `requested_by=None` (sem upcast).
+        let recs = store.events().expect("events");
+        let ev = DomainEvent::from_record(&recs[0].kind, recs[0].version, recs[0].payload.clone())
+            .expect("replay de NodeAdded v2 antigo");
+        assert!(
+            matches!(
+                ev,
+                DomainEvent::NodeAdded {
+                    requested_by: None,
+                    ..
+                }
+            ),
+            "log antigo (sem o campo) replaya com requested_by=None"
+        );
+        // A projeção do canvas não quebra e ignora o campo META.
+        let state = store.project().expect("project");
+        assert!(
+            state.nodes.contains_key(&node),
+            "nó projetado mesmo sem o campo (requested_by é META, não entra em ProjectedNode)"
+        );
+
+        // Roundtrip COM `requested_by:Some` — o campo persiste e volta.
+        let with_req = DomainEvent::NodeAdded {
+            node: Uuid::now_v7(),
+            kind: "Terminal".into(),
+            x: 0.0,
+            y: 0.0,
+            requested_by: Some(Uuid::now_v7()),
+        };
+        let back: DomainEvent =
+            serde_json::from_value(serde_json::to_value(&with_req).unwrap()).unwrap();
+        assert_eq!(back, with_req, "NodeAdded com requested_by:Some roundtripa");
+    }
+
+    /// **F1-3-6: roundtrip + `kind()` + META das variantes novas** (SpawnRequested/SpawnGated) e das
+    /// RESERVADAS de F1-3-7 (SkillInvoked/SkillCreated). Variantes novas → replay limpo; silêncio no
+    /// `apply` (não tocam a projeção do canvas).
+    #[test]
+    #[serial]
+    fn spawn_and_skill_events_roundtrip_and_are_meta() {
+        let by = Uuid::now_v7();
+        let cases: Vec<(DomainEvent, &str)> = vec![
+            (
+                DomainEvent::SpawnRequested {
+                    id: "msg_x".into(),
+                    requested_by: by,
+                    name: "@QA".into(),
+                    role: "qa".into(),
+                    root_cause_id: "msg_root".into(),
+                    hops: 1,
+                },
+                "SpawnRequested",
+            ),
+            (
+                DomainEvent::SpawnGated {
+                    id: "msg_x".into(),
+                    requested_by: by,
+                    reason: "cascade".into(),
+                },
+                "SpawnGated",
+            ),
+            (
+                DomainEvent::SkillInvoked {
+                    node: by,
+                    skill: "lina-retro".into(),
+                },
+                "SkillInvoked",
+            ),
+            (
+                DomainEvent::SkillCreated {
+                    node: by,
+                    skill: "nova".into(),
+                },
+                "SkillCreated",
+            ),
+        ];
+        let mut state = ProjectedState::default();
+        let before = state.clone();
+        for (ev, kind) in &cases {
+            assert_eq!(ev.kind(), *kind, "kind() casa a tag serde de {kind}");
+            let back: DomainEvent =
+                serde_json::from_value(serde_json::to_value(ev).unwrap()).unwrap();
+            assert_eq!(&back, ev, "{kind} roundtripa");
+            apply(&mut state, ev); // META: não muda a projeção.
+        }
+        assert_eq!(
+            state, before,
+            "eventos de spawn/skill são META (apply não projeta)"
+        );
     }
 }

@@ -720,6 +720,7 @@ mod tests {
                     kind: "Terminal".into(),
                     x: 0.0,
                     y: 0.0,
+                    requested_by: None,
                 })
                 .expect("NodeAdded");
             eng.transition(&sup, &mut store, n, NodeStatus::Ready, reason::SPAWN)
@@ -794,6 +795,7 @@ mod tests {
                     kind: "Terminal".into(),
                     x: 0.0,
                     y: 0.0,
+                    requested_by: None,
                 })
                 .expect("NodeAdded");
             n
@@ -818,6 +820,7 @@ mod tests {
                     kind: "Note".into(),
                     x: 1.0,
                     y: 1.0,
+                    requested_by: None,
                 })
                 .expect("NodeAdded nota");
         } // kill -9 simulado: nenhum encerramento gracioso de domínio

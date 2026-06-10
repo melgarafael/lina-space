@@ -26,6 +26,9 @@ const BIN_VERBS: &[&str] = &[
     "do",
     "list",
     "vault",
+    // F1-3-6: `lina spawn` (agente-cria-terminal com gate inforjável) — registrado no dispatch +
+    // usage() do bin; a skill `lina-spawn-terminal` (próxima rodada) promete este verbo.
+    "spawn",
 ];
 
 /// Sub-verbos do `lina plan` implementados (`run_plan`).

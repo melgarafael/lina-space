@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         Some("do") => run_do(&args[1..]),
         Some("list") => run_list(args.iter().any(|a| a == "--json")),
         Some("vault") => run_vault(&args[1..]),
+        Some("spawn") => run_spawn(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -48,7 +49,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -565,6 +566,218 @@ fn block_hint(reason: &str) -> &'static str {
              foi o ROTEAMENTO que falhou, nao o colega."
         }
         _ => "→ Veja o estado do Espaco com `lina list`.",
+    }
+}
+
+/// **F1-3-6 — `lina spawn @<Nome> --role <papel> [--prompt "<1º prompt>"]`**: o agente PEDE criar um
+/// terminal novo quando percebe que falta um papel (capacidade SENSÍVEL = VERBO estruturado, doutrina
+/// InsForge — nunca um contorno). `from` é autenticado pelo dir-dono do outbox (não por flag). O
+/// router DECIDE pelo gate INFORJÁVEL (`handle_spawn`): ORIGEM permitida; CASCATA/cap/custo pedem aval
+/// humano; `manual` recusa. A criação física (PTY + register + bootstrap) é do app (seam da tela).
+///
+/// **Manual local (doutrina bloco 5):** em `autonomy=manual` recusa AQUI, antes de enfileirar (UX
+/// imediata); o router é o backstop durável. O nível vem do `bootstrap.json` (`load_input`).
+fn run_spawn(args: &[String]) -> ExitCode {
+    let mut role: Option<String> = None;
+    let mut prompt = String::new();
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--role" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => role = Some(v.clone()),
+                    None => {
+                        eprintln!("lina: --role exige um valor (papel do novo terminal)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--prompt" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => prompt = v.clone(),
+                    None => {
+                        eprintln!("lina: --prompt exige o texto do 1o prompt");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let (Some(raw_name), Some(role)) = (positional.into_iter().next(), role) else {
+        eprintln!("lina: uso: lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]");
+        return ExitCode::from(2);
+    };
+    // Normaliza o `@` (aceita "QA" e "@QA") — o nome do nó no roster inclui o `@`.
+    let name = if raw_name.starts_with('@') {
+        raw_name
+    } else {
+        format!("@{raw_name}")
+    };
+
+    let input = match load_input() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'/autonomia): {e}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let from = input.terminal_name.clone();
+
+    // Manual local: recusa antes de enfileirar (o router é o backstop durável — ver gate).
+    if matches!(input.autonomy, Autonomy::Manual) {
+        eprintln!(
+            "lina: no modo MANUAL voce NAO cria terminais sozinho — sugira a criacao de {name} \
+             ({role}) ao usuario/Maestro (ou peca para subir a autonomia)."
+        );
+        return ExitCode::from(1);
+    }
+
+    // `role` viaja no campo `ref` do envelope (`role:<papel>`) — sem inventar campo novo; o `name`
+    // é o `to`, o `prompt` é o payload. O router (handle_spawn) lê os três.
+    let msg = MailMessage::new(from.clone(), name.clone(), "spawn", prompt)
+        .with_ref(format!("role:{role}"));
+    enqueue_and_report_spawn(&from, &name, &role, msg)
+}
+
+/// Desfecho de um `lina spawn`, lido do espelho `log.jsonl` (eventos do gate, não a PTY).
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnConfirm {
+    /// Gate APROVOU (origem, sob cap, custo ok): `SpawnRequested` presente SEM `SpawnGated`. O app
+    /// cria o terminal (seam da tela).
+    Approved,
+    /// Gate barrou/adiou: `SpawnGated{reason}` (`cascade`/`over_cap`/`cost`/`manual`).
+    Gated { reason: String },
+    /// Sem desfecho no log no tempo de espera.
+    Pending,
+}
+
+/// **PURO** (testável, sem I/O): varre o `log.jsonl` pelo desfecho do spawn `msg_id`. `SpawnGated`
+/// vence (decisão definitiva do gate); senão `SpawnRequested` ⇒ aprovado; senão `Pending`. O gate
+/// loga `SpawnRequested` SEMPRE e `SpawnGated` SÓ quando barra — então "requested sem gated" = aprovado.
+fn scan_spawn_outcome(content: &str, msg_id: &str) -> SpawnConfirm {
+    let mut requested = false;
+    let mut gated: Option<String> = None;
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        if p.get("id").and_then(serde_json::Value::as_str) != Some(msg_id) {
+            continue;
+        }
+        match v.get("kind").and_then(serde_json::Value::as_str) {
+            Some("SpawnGated") => {
+                gated = p
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+            Some("SpawnRequested") => requested = true,
+            _ => {}
+        }
+    }
+    match gated {
+        Some(reason) => SpawnConfirm::Gated { reason },
+        None if requested => SpawnConfirm::Approved,
+        None => SpawnConfirm::Pending,
+    }
+}
+
+/// Aguarda (poll bounded ~3s) o desfecho do spawn no `log.jsonl`. `Gated` é definitivo (retorna já);
+/// `Approved` só conclui no prazo (evita ler entre o append de `SpawnRequested` e o de `SpawnGated`,
+/// que são sequenciais no MESMO roteamento). Lógica de parse em [`scan_spawn_outcome`] (pura/testada).
+fn poll_spawn_outcome(msg_id: &str) -> SpawnConfirm {
+    use std::time::{Duration, Instant};
+    let path = event_log_path();
+    let deadline = Instant::now() + Duration::from_millis(3000);
+    loop {
+        let outcome = std::fs::read_to_string(&path)
+            .ok()
+            .map(|c| scan_spawn_outcome(&c, msg_id))
+            .unwrap_or(SpawnConfirm::Pending);
+        match outcome {
+            SpawnConfirm::Gated { .. } => return outcome, // decisão definitiva do gate
+            SpawnConfirm::Approved if Instant::now() >= deadline => return outcome,
+            _ if Instant::now() >= deadline => return SpawnConfirm::Pending,
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+}
+
+/// Enfileira o pedido de spawn (`from` autenticado por dir-dono) e reporta o desfecho REAL do gate.
+fn enqueue_and_report_spawn(from: &str, name: &str, role: &str, msg: MailMessage) -> ExitCode {
+    let mailbox = Mailbox::new(mailbox_root());
+    if let Err(e) = enqueue_per_node(&mailbox, from, &msg) {
+        eprintln!("lina: falha ao enfileirar o pedido de spawn na mailbox: {e}");
+        return ExitCode::from(1);
+    }
+    match poll_spawn_outcome(&msg.id) {
+        SpawnConfirm::Approved => {
+            println!(
+                "ok: pedido de criar {name} ({role}) APROVADO e enviado ao Espaco (id {}). O \
+                 canvas traz o especialista; o 1o prompt ja vai na fila dele.",
+                msg.id
+            );
+            ExitCode::SUCCESS
+        }
+        SpawnConfirm::Gated { reason } => {
+            eprintln!(
+                "lina: a criacao de {name} ({role}) NAO foi automatica — {}.\n{}",
+                explain_spawn_gate(&reason),
+                spawn_gate_hint(&reason)
+            );
+            // `manual` é recusa terminal (exit 1); os demais são GATE humano legítimo (pedido válido,
+            // aguardando aval) — exit 0 (não é erro do agente).
+            if reason == "manual" {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        SpawnConfirm::Pending => {
+            println!(
+                "ok: pedido de criar {name} ({role}) enviado (id {}); ainda SEM desfecho apos a \
+                 espera (o Espaco pode estar ocupado). Confirme com `lina list`.",
+                msg.id
+            );
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Tradução acionável do motivo do gate de spawn (o leitor é um agente — texto claro, sem jargão).
+fn explain_spawn_gate(reason: &str) -> String {
+    match reason {
+        "cascade" => "voce recebeu uma tarefa de outro agente e quer criar um terminal; \
+             criar-a-partir-de-uma-cadeia exige o aval do usuario (defesa anti-fork-bomb)"
+            .to_string(),
+        "over_cap" => {
+            "o limite de criacoes por turno foi atingido; a proxima precisa do aval do usuario"
+                .to_string()
+        }
+        "cost" => "o teto de custo do Espaco foi atingido; retome o custo antes de criar mais \
+             terminais"
+            .to_string(),
+        "manual" => "o Espaco esta em modo manual — voce nao cria terminais sozinho".to_string(),
+        other => format!("motivo: {other}"),
+    }
+}
+
+/// Dica de recuperação por motivo do gate de spawn.
+fn spawn_gate_hint(reason: &str) -> &'static str {
+    match reason {
+        "cost" => "→ peca ao usuario para retomar o custo (`lina resume --confirm`); nao insista.",
+        "manual" => "→ sugira a criacao ao usuario/Maestro (ou peca para subir a autonomia).",
+        _ => "→ explique ao usuario POR QUE falta o papel e aguarde o aval; nao recrie em loop.",
     }
 }
 
@@ -1291,5 +1504,40 @@ mod vault_tests {
         // id ausente → None (ainda sem desfecho); linha parcial/lixo é tolerada.
         assert_eq!(scan_log_outcome(blocked, "msg_INEXISTENTE"), None);
         assert_eq!(scan_log_outcome("{lixo parcial\n", "msg_X"), None);
+    }
+
+    /// **F1-3-6: `scan_spawn_outcome` (puro).** `SpawnRequested` sem `SpawnGated` ⇒ aprovado;
+    /// `SpawnGated{reason}` ⇒ gated (vence o requested); nenhum dos dois ⇒ pending. Tolera lixo.
+    #[test]
+    fn scan_spawn_outcome_maps_gate_events() {
+        let approved = concat!(
+            r#"{"kind":"SpawnRequested","payload":{"id":"msg_A","name":"@QA","role":"qa"}}"#,
+            "\n"
+        );
+        assert_eq!(
+            scan_spawn_outcome(approved, "msg_A"),
+            SpawnConfirm::Approved
+        );
+
+        let gated = concat!(
+            r#"{"kind":"SpawnRequested","payload":{"id":"msg_B","name":"@H","role":"h"}}"#,
+            "\n",
+            r#"{"kind":"SpawnGated","payload":{"id":"msg_B","reason":"cascade"}}"#,
+            "\n"
+        );
+        assert_eq!(
+            scan_spawn_outcome(gated, "msg_B"),
+            SpawnConfirm::Gated {
+                reason: "cascade".into()
+            },
+            "SpawnGated vence o SpawnRequested do mesmo id"
+        );
+
+        // id sem desfecho ⇒ Pending; linha-lixo tolerada.
+        assert_eq!(scan_spawn_outcome(approved, "msg_X"), SpawnConfirm::Pending);
+        assert_eq!(
+            scan_spawn_outcome("{lixo\n", "msg_A"),
+            SpawnConfirm::Pending
+        );
     }
 }

@@ -81,6 +81,18 @@ impl Autonomy {
             _ => 8,
         }
     }
+
+    /// F1-3-6 (ADR 0019 §6): teto de SPAWNS (`lina spawn`)/turno — espelha `max_delegations` (mora AO
+    /// LADO dele, Maestro decisão 1): **0 em manual** (não cria terminal sozinho), **2** nos demais.
+    /// É a fonte do placeholder `{{max_spawns_per_turn}}` da doutrina (skill F1-3-6) e casa com a
+    /// const `lina_core::MAX_SPAWNS_PER_TURN` do gate do router.
+    #[must_use]
+    pub fn max_spawns(&self) -> u32 {
+        match self {
+            Autonomy::Manual => 0,
+            _ => 2,
+        }
+    }
 }
 
 /// Estado do workspace para o bootstrap de **UM** terminal. Serializável: o app escreve
@@ -307,13 +319,16 @@ impl Bootstrapper {
             .join("; ")
     }
 
-    /// Preenche os **13 placeholders** canônicos de um `template`. O `{{placeholder}}` LITERAL do
+    /// Preenche os **14 placeholders** canônicos de um `template`. O `{{placeholder}}` LITERAL do
     /// corpo (exemplo) NÃO está na lista → permanece (é exemplo, não preenchimento).
     fn render_template(&self, template: &str, input: &BootstrapInput) -> String {
         let me = self.registry.infer_role(&input.terminal_name);
         let name = sanitize_name(&input.terminal_name);
         let max_deleg = input.autonomy.max_delegations().to_string();
+        // F1-3-6: a doutrina da skill `lina-spawn-terminal` usa `{{max_spawns_per_turn}}`.
+        let max_spawns = input.autonomy.max_spawns().to_string();
         template
+            .replace("{{max_spawns_per_turn}}", &max_spawns)
             .replace("{{workspace_name}}", &sanitize_name(&input.workspace_name))
             .replace(
                 "{{focus_preset_label}}",

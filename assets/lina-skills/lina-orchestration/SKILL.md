@@ -30,8 +30,9 @@ da Fase 0 (`CLAUDE.md` → "Protocolo multi-terminal").
 ## O loop do orquestrador
 
 1. **LIDERAR** — assuma o objetivo e mantenha-o. Você responde pelo RESULTADO, não por uma fatia.
-2. **DECOMPOR** — quebre no `plan.md` em itens com **`parents:` EXPLÍCITOS** (`lina plan add ... --parents T1`).
-   Dependência é dado estruturado, **nunca** prosa "espere o T1" — prosa não é verificável no instante do despacho.
+2. **DECOMPOR** — escreva os itens no `plan.md` com **`parents:` EXPLÍCITOS** (confira com `lina plan read`;
+   o worker reivindica com `lina plan claim`). Dependência é dado estruturado, **nunca** prosa "espere o T1" —
+   prosa não é verificável no instante do despacho.
 3. **DEFINIR FUNÇÕES** — mapeie papel→item pelo roster (`lina list`). Falta um papel que a tarefa exige?
    → crie o terminal com **`lina-spawn-terminal`** (F1-3-6). *(Enquanto o spawn não existe: faça o possível
    e avise o usuário que falta o papel — regra de 3 passos da doutrina, bloco 4.)*

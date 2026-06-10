@@ -240,6 +240,7 @@ fn onda0_exit_gate_end_to_end() {
                 kind: "Terminal".into(),
                 x,
                 y: 50.0,
+                requested_by: None,
             })
             .expect("append NodeAdded");
         store
