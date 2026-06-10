@@ -1,0 +1,45 @@
+/* Direção: Swiss / editorial técnico (ver DIRECAO-ESTETICA.md).
+   Tipografia como estrutura; zero gradiente; um acento (ocre de sinalização de via). */
+.hero {
+  --paper: #f4f1ea;
+  --ink: #1a1714;
+  --accent: #b45309; /* ocre — sinalização de via */
+  background: var(--paper);
+  color: var(--ink);
+  padding: 6rem 2rem 5rem;
+  max-width: 64ch;
+}
+
+.hero__headline {
+  font-family: "Newsreader", "Iowan Old Style", Georgia, serif;
+  font-size: clamp(2.5rem, 5vw, 4rem);
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-weight: 500;
+  margin: 0;
+}
+
+.hero__subhead {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 1rem;
+  line-height: 1.6;
+  max-width: 48ch;
+  margin-top: 1.5rem;
+  color: #3b352e;
+}
+
+.hero__cta {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  margin-top: 2.5rem;
+  background: var(--ink);
+  color: var(--paper);
+  border: none;
+  border-bottom: 3px solid var(--accent);
+  padding: 0.85rem 1.5rem;
+  cursor: pointer;
+}
+
+.hero__cta:hover {
+  background: var(--accent);
+  color: var(--paper);
+}
