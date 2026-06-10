@@ -6,8 +6,9 @@
 //!   ANSI** (via `VtBackend::row_text`, helper do W0-2) — a "Accessible View" legível por leitor de tela.
 //! - **Live-region "resposta pronta"**: [`LiveRegion`] computa o anúncio **uma vez por turno** — pela
 //!   transição de status **→Idle** (fim-de-resposta, W0-10), **NUNCA a cada byte**. ⚠️ o AUTO-anúncio
-//!   ao leitor de tela depende de uma API `set_live` AUSENTE no gpui deste SHA — ver [`live_region_element`]
-//!   e `.entrega-w46.md` (hoje é banner VISÍVEL + legível ao focar; auto-anúncio é gap pendente do gpui).
+//!   ao leitor de tela não sai dos builders builtin (`div()` não expõe `set_live`) — o spike F1-2-7
+//!   ([`live`], caminho (a) do ADR 0028) seta `live=Polite` via custom `Element`; validação na tela
+//!   pendente (roteiro `spike-a11y-roteiro.md`) — até lá NÃO afirmar auto-anúncio como fato.
 //! - **Rótulo anunciável**: [`node_label`] junta nome + o badge do W4-2 (`canvas::Badge`: "💤 dormindo",
 //!   "precisa de você", "rodando") → o leitor de tela fala o estado do nó.
 //! - **Contraste WCAG**: a maquinaria ([`wcag::contrast_ratio`]/[`wcag::meets_aa`]) mora aqui; o
@@ -21,12 +22,17 @@
 
 use std::collections::BTreeMap;
 
-use gpui::{div, prelude::*, rgb, text, AnyElement, Role};
+use gpui::{prelude::*, AnyElement};
 use lina_core::VtBackend;
 use lina_host::{NodeId, NodeStatus};
 
 use crate::canvas::aggregate_badge;
-use crate::theme;
+
+/// SPIKE F1-2-7 (caminho (a) do ADR 0028): live-region via custom `Element` com `set_live`.
+/// O registro do módulo vive AQUI (e não em `main.rs`, dono único de outro worker nesta
+/// rodada) via `#[path]` — promover para `mod a11y_live;` no crate root é costura futura.
+#[path = "a11y_live.rs"]
+pub mod live;
 
 // ═══════════════════════════ AccessibleBuffer (W0-2: linearização sem ANSI) ═══════════════════════════
 
@@ -189,27 +195,19 @@ pub fn reduce_motion_effective(user_override: bool) -> bool {
 
 // ═══════════════════════════ elemento gpui da live-region ═══════════════════════════
 
-/// Elemento da live-region: `Role::Status` + `aria_label` + texto VISÍVEL (contraste verde/painel ≥ AA).
+/// Elemento da live-region: `Role::Status` + label + texto VISÍVEL (contraste verde/painel ≥ AA).
 ///
 /// ⚠️ **GAP CONHECIDO (red-team):** no gpui DESTE SHA, `Role::Status` **NÃO** torna o nó uma live-region —
-/// o gpui não expõe `set_live(Live::Polite)` (o `write_a11y_info` nunca seta `live`), então `live()`
-/// é `Off` em toda a árvore e os adaptadores (VoiceOver/NVDA/Orca) **NÃO auto-anunciam** ao mudar o
-/// texto. O que FUNCIONA hoje: o nó é **legível ao FOCAR** (role+label) e VISÍVEL na tela (banner). O
-/// **auto-anúncio sem foco** exige uma API `set_live` no gpui (patch do gpui pinado — fora do escopo do
-/// W4-6). Ver `.entrega-w46.md`. NÃO afirmar que o leitor de tela anuncia sozinho até a API existir.
+/// o BUILDER `div()` não expõe `set_live(Live::Polite)` (a `Interactivity::write_a11y_info` nunca seta
+/// `live`), então com os builders builtin os adaptadores (VoiceOver/NVDA/Orca) **NÃO auto-anunciam**.
+/// **Status do gap (spike F1-2-7):** o caminho (a) do ADR 0028 está implementado em [`live`] — um
+/// `Element` custom que sobrescreve `Element::write_a11y_info` (hook que EXISTE neste SHA, default
+/// vazio) e seta `live=Polite` + `value` (o texto que o adapter anuncia). A lógica do nó é provada
+/// por teste headless; o auto-anúncio NA TELA (VoiceOver falando sem foco) aguarda a validação do
+/// roteiro `tasks/epico-f1/spike-a11y-roteiro.md`. NÃO afirmar "conforme ARIA live-region" até a
+/// tela confirmar. O que já era fato segue: nó **legível ao FOCAR** e VISÍVEL na tela (banner).
 pub fn live_region_element(msg: &str) -> AnyElement {
-    let th = theme::active();
-    div()
-        .id("a11y-live")
-        .role(Role::Status)
-        .aria_label(msg.to_string())
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .bg(rgb(th.surface.panel))
-        .text_color(rgb(th.state.success))
-        .child(text!(format!("🔊 {msg}")))
-        .into_any_element()
+    live::live_announce(msg).into_any_element()
 }
 
 #[cfg(test)]
