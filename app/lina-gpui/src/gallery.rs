@@ -163,6 +163,7 @@ pub fn apply_preset(
             kind: "Terminal".to_string(),
             x,
             y: 96.0,
+            requested_by: None,
         })?;
         store.append(&DomainEvent::NodeRoleAssigned {
             node: agent.node,

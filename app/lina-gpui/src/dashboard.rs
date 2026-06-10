@@ -742,6 +742,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             },
         );
         apply(
@@ -1095,6 +1096,7 @@ mod tests {
                 kind: "Note".into(),
                 x: 1.0,
                 y: 1.0,
+                requested_by: None,
             },
         );
         let cards = build_cards(&state, &[], "/ws", &BTreeMap::new(), TODAY);

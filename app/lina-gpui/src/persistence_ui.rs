@@ -1144,6 +1144,7 @@ mod tests {
                 kind: "Terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("node");
         store

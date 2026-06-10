@@ -132,6 +132,7 @@ pub fn create_note(
         kind: "Note".to_string(),
         x: pos.0,
         y: pos.1,
+        requested_by: None,
     })?;
     store.append(&DomainEvent::NoteCreated {
         name: title.to_string(),
@@ -171,6 +172,7 @@ pub fn create_folder(
         kind: "Folder".to_string(),
         x: pos.0,
         y: pos.1,
+        requested_by: None,
     })?;
     store.append(&DomainEvent::FolderCreated {
         name: name.to_string(),

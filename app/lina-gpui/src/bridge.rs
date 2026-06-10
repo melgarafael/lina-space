@@ -3105,6 +3105,8 @@ fn admission_events(
             kind: "Terminal".into(),
             x,
             y,
+            // Admissão de ORIGEM HUMANA (UI/admit_node) — `requested_by` é só p/ spawn agente-pede (F1-3-6).
+            requested_by: None,
         },
         DomainEvent::TerminalSpawned {
             node,
@@ -5305,6 +5307,7 @@ mod tests {
                 kind: "terminal".into(),
                 x: 0.0,
                 y: 0.0,
+                requested_by: None,
             })
             .expect("added");
         store
