@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use lina_bootstrap::{
-    autonomy_from_env, pretooluse_output, Autonomy, BootstrapInput, Bootstrapper,
+    autonomy_from_env, classify_retro_args, pretooluse_output, project_retro, render_report,
+    Autonomy, BootstrapInput, Bootstrapper, RetroInvocation,
 };
 use lina_core::{
     check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, HandoffContract,
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
         Some("list") => run_list(args.iter().any(|a| a == "--json")),
         Some("vault") => run_vault(&args[1..]),
         Some("spawn") => run_spawn(&args[1..]),
+        Some("retro") => run_retro(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -49,7 +51,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -869,6 +871,69 @@ fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
 /// aqui — mesmo log que o supervisor projeta (invariante #4: log = fonte da verdade).
 fn events_dir() -> PathBuf {
     mailbox_root().join("events")
+}
+
+/// Wall-clock em millis para o `now_ms` de produção do `lina retro` (`--now-ms` o sobrescreve).
+/// O wall-clock vive SÓ aqui (na casca); a projeção (`retro.rs`) é pura sobre `now_ms` injetado
+/// (lição `feature-filtra-ts-wallclock`). Espelha `events::now_millis` (privado ao core).
+fn retro_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// **F1-3-7 — `lina retro [--json] [--now-ms <ms>]`**: auto-aprimoramento v0. Lê o event log
+/// (SÓ-LEITURA via `EventStore::events()`) e emite um RELATÓRIO de projeções determinísticas
+/// (skills/coordenação/custos/pedidos/lacunas), ZERO LLM — quem pensa é o agente (inv#1).
+///
+/// **Gate inviolável (critério 4):** [`classify_retro_args`] é a porta única; este verbo NÃO tem
+/// subcomando de mutação — qualquer `archive`/`apply`/`pin`/… é recusado ANTES de tocar o log. Não
+/// há, neste verbo, nenhum `append`: toda manutenção (arquivar/fixar skill, papel, preset) passa
+/// por gate humano, fora daqui. O agente lê o relatório (skill `lina-retro`) e PROPÕE; o humano decide.
+fn run_retro(args: &[String]) -> ExitCode {
+    match classify_retro_args(args) {
+        RetroInvocation::Refused {
+            offending,
+            mutation,
+        } => {
+            if mutation {
+                eprintln!(
+                    "lina retro SO observa e sugere -- '{offending}' tentaria APLICAR uma mudanca, e \
+                     isso NAO existe aqui (nao ha `lina retro apply`). Arquivar/fixar skill, mudar papel \
+                     ou preset passa SEMPRE por GATE HUMANO. Rode `lina retro` (sem argumentos) para ver \
+                     o relatorio e PROPONHA ao humano citando a evidencia (numero/evento)."
+                );
+            } else {
+                eprintln!(
+                    "lina retro: argumento desconhecido '{offending}'. Uso: lina retro [--json] [--now-ms <ms>]"
+                );
+            }
+            ExitCode::from(2)
+        }
+        RetroInvocation::Report { json, now_ms } => {
+            let now = now_ms.unwrap_or_else(retro_now_ms);
+            // SÓ-LEITURA: lê o espelho `log.jsonl` (mesma escolha de `check`/`spawn` — NUNCA abre o
+            // SQLite do app, p/ não disputar lock na troca de WAL). Sem log ⇒ string vazia ⇒
+            // first-run honesto. Zero `append`: nenhuma escrita parte deste verbo.
+            let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+            let records = lina_bootstrap::parse_log_records(&content);
+            let report = project_retro(&records, now);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("lina retro: falha ao serializar o relatorio: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                print!("{}", render_report(&report));
+            }
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// `lina guard --check-action --cmd "<comando>" --autonomy <manual|assistido|autonomo>` (W3-6,

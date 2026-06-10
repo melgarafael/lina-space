@@ -24,6 +24,14 @@ pub use pretooluse::{autonomy_from_env, pretooluse_output, AUTONOMY_ENV};
 pub mod global_install;
 pub use global_install::{ensure_lina_globally_available, GlobalInstallReport};
 
+/// **F1-3-7 — auto-aprimoramento v0:** projeções puras do `lina retro` (Curator a event-sourcing,
+/// ZERO LLM). Lê o log e SUGERE; o agente decide, o humano aprova. Nunca aplica (gate inviolável).
+pub mod retro;
+pub use retro::{
+    classify_retro_args, parse_log_records, project_retro, render_report, RetroInvocation,
+    RetroReport,
+};
+
 /// Templates CANÔNICOS embutidos (fonte da verdade do Spec Writer). Mesmos 13 placeholders; só o
 /// gatilho de bootstrap muda por CLI. Um rebuild re-embute se o Spec Writer atualizar os arquivos.
 const CLAUDE_TEMPLATE: &str = include_str!("../../../assets/lina-doctrine/CLAUDE.md");

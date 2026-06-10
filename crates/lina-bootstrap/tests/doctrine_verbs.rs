@@ -29,6 +29,10 @@ const BIN_VERBS: &[&str] = &[
     // F1-3-6: `lina spawn` (agente-cria-terminal com gate inforjável) — registrado no dispatch +
     // usage() do bin; a skill `lina-spawn-terminal` (próxima rodada) promete este verbo.
     "spawn",
+    // F1-3-7: `lina retro` (auto-aprimoramento v0 — relatório determinístico, ZERO LLM; SÓ observa
+    // e sugere, sem subcomando de mutação). Registrado no dispatch + usage(); a skill `lina-retro`
+    // promete este verbo.
+    "retro",
 ];
 
 /// Sub-verbos do `lina plan` implementados (`run_plan`).
