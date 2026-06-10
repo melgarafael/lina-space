@@ -687,7 +687,7 @@ Reusa **T3 — Galeria de Focos** (Fase 0) em modal, idêntica à do onboarding:
 
 ### T7§P — Ajustes › Plano (ativação PRO)
 
-> **T7§P — Tamanho:** S · **Dependências:** F1-4-5 (`lina-license`, ed25519); esta superfície é o wireframe/copy da F1-4-6 · **Critério de aceite:** colar uma chave válida ativa o PRO com a lista do que mudou, com um monitor de rede provando **zero conexão** durante todo o ciclo (gate da onda F1-4).
+> **T7§P — Tamanho:** S · **Dependências:** F1-4-5 (`lina-license`, ed25519); esta superfície é o wireframe da F1-4-6 (**strings literais: `copy-f1-4.md`** — este doc mantém wireframes/estados) · **Critério de aceite:** colar uma chave válida ativa o PRO com a lista do que mudou, com um monitor de rede provando **zero conexão** durante todo o ciclo (gate da onda F1-4).
 
 **Pontos de entrada:** `Cmd+,` → Plano · `Cmd-K` → "ativar PRO", "licença", "plano" · link «Conhecer o PRO» em qualquer limite do Free.
 
@@ -706,7 +706,7 @@ Reusa **T3 — Galeria de Focos** (Fase 0) em modal, idêntica à do onboarding:
 │                                  pricing — ADR 0011)         │
 │                                                              │
 │  Já tem uma chave?                                           │
-│  ( cole aqui a sua Chave do Lina PRO_______________ )        │
+│  ( cole aqui a chave do seu e-mail de compra_______ )        │
 │                                       [[ Ativar ]]          │
 │                                                              │
 │  Ainda não tem? [ Conhecer o Lina PRO ↗ ]  «abre o site»     │
@@ -737,8 +737,9 @@ Celebração discreta (sem confete invasivo) e lista do que mudou **agora** (nã
 
 | O que houve | Mensagem | Saída |
 |---|---|---|
-| Chave incompleta ou incorreta (malformada OU assinatura ed25519 não confere — indistinguíveis para o leigo, mesma ação) | «Essa chave não parece válida — confira se copiou tudo, incluindo os traços.» | campo mantém o texto para corrigir |
-| Chave expirada (o `expiry` está assinado dentro da chave — lido localmente) | «Essa chave expirou em 03/2026.» | `[ Renovar no site ↗ ]` (abre o navegador; o app segue sem tocar a rede) |
+| Chave incompleta/malformada (truncada, faltando pedaço) | «Essa chave está incompleta — confira no e-mail de compra se copiou tudo, do começo ao fim.» | campo mantém o texto para corrigir |
+| Assinatura não confere (chave alterada ou não emitida para o Lina) | «Essa chave não confere — copie de novo do e-mail de compra, sem mudar nada no texto.» | campo mantém o texto para corrigir |
+| Chave vencida (o `expiry` está assinado dentro da chave — lido localmente) | «Essa chave venceu em 03/2026.» | `[ Renovar no site ↗ ]` (abre o navegador; o app segue sem tocar a rede; a renovação chega como chave **nova** por e-mail) |
 
 **Estados que NÃO existem nesta tela, por decisão de arquitetura** (gate 100% offline da onda F1-4; ADR 0011; 13.6 — sem phone-home, sem node-locking na F1, sem revogação/blocklist): «chave já ativa em outro computador», «sem internet», «chave revogada». Se um estado novo de licença exigir rede, ele está errado por definição — volta para o ADR antes de virar UI.
 
