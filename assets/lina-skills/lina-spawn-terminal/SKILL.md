@@ -2,16 +2,14 @@
 name: lina-spawn-terminal
 description: >-
   O 4º passo da regra de 3 da doutrina: quando NINGUÉM no workspace tem o papel que a tarefa
-  exige, o agente traz o especialista criando um terminal novo com `lina spawn` — sempre dentro
-  dos gates. Use SEMPRE que perceber um papel FALTANTE no roster e a tarefa exigi-lo — e
-  reconheça: "falta um QA no time", "ninguém aqui é backend/revisor/pesquisador", "cria/spawna
-  um terminal de X", "traz um especialista de Y pro time", "o plano pede um papel que o roster
-  não tem", "precisamos de alguém de X e não temos". Cobre QUANDO spawnar (e quando NÃO), COMO
-  nomear o papel, o 1º prompt (= template lina-dispatch), os GATES como física do mundo
-  (cascata → aval humano SEMPRE; teto de 2/turno; manual bloqueia; conta no custo) e a
-  narração obrigatória ao leigo. NÃO é para falar com terminais que JÁ existem (lina-agent-bus)
-  nem para redigir o conteúdo de um despacho (lina-dispatch). Agnóstica de CLI (Claude Code,
-  Codex, Gemini).
+  exige, o agente traz o especialista criando um terminal novo com lina spawn — sempre dentro
+  dos gates. Gatilhos: "falta um QA no time", "ninguém aqui é backend/revisor", "cria/spawna um
+  terminal de X", "traz um especialista de Y", "o plano pede um papel que o roster não tem".
+  Cobre QUANDO spawnar (e quando não), como nomear o papel, o 1º prompt (= template
+  lina-dispatch; use caminhos ABSOLUTOS — o terminal novo nasce em pasta própria, não no seu
+  cwd), os GATES como física (cascata → aval humano SEMPRE; teto 2/turno; manual bloqueia; conta
+  no custo) e a narração ao leigo. NÃO é para falar com terminais existentes (lina-agent-bus)
+  nem redigir o despacho (lina-dispatch). Agnóstica de CLI.
 ---
 
 # Lina Spawn — o time se completa sozinho (dentro dos gates)

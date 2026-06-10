@@ -1,20 +1,16 @@
 ---
 name: lina-cold-review
 description: >-
-  Revisor ISOLADO (cold-review / revisão cega) que avalia um artefato SEM o contexto do
-  autor e devolve PASS/FAIL com evidência apontável (arquivo:linha). Use SEMPRE que precisar
-  REVISAR, AVALIAR, AUDITAR ou DAR PARECER sobre uma entrega — código, design (CSS/UI/layout),
-  copy/texto, ou arquitetura — e reconheça estes pedidos: "revisa/revise isto", "avalia a
-  entrega", "isso está bom?", "faz um cold-review", "revisão cega", "passa pela rubrica",
-  "detecta slop", "isso tem cara de IA?", "confere a qualidade antes de entregar", "o
-  orquestrador me mandou revisar o artefato do colega". Aplica a RUBRICA ANTI-SLOP
-  (references/rubrica.md): detecta marcadores duros de AI-slop — nomes genéricos (handleData),
-  comentário óbvio, cast `any`, erro engolido/unwrap, fonte Inter default, gradiente roxo,
-  glassmorphism genérico, copy de template/filler, abstração especulativa, complexidade não
-  pedida. É calibrada nos DOIS sentidos: contra o revisor OTIMISTA (que assina "ok" sem
-  desafiar se o critério está enforced) e contra o PARANOICO (que rateia a feature pedida como
-  bug). NÃO confunda com testes automáticos nem com hook de runtime — quem julga é VOCÊ, o
-  agente, lendo a rubrica (inv#1). Agnóstica de CLI (Claude Code, Codex, Gemini).
+  Revisor ISOLADO (revisão cega) que avalia um artefato SEM o contexto do autor e devolve
+  PASS/FAIL com evidência arquivo:linha. Use SEMPRE que precisar revisar, avaliar, auditar ou
+  dar parecer sobre uma entrega — código, design, copy ou arquitetura. Gatilhos: "revisa isto",
+  "avalia a entrega", "isso está bom?", "cold-review", "revisão cega", "detecta slop", "isso tem
+  cara de IA?", "confere a qualidade antes de entregar". Aplica a RUBRICA ANTI-SLOP
+  (references/rubrica.md) com marcadores duros: nomes genéricos, comentário óbvio, any, erro
+  engolido, Inter default, gradiente roxo, copy de template, abstração especulativa. Calibrada
+  contra o revisor OTIMISTA (existência de check ≠ propriedade enforced) e o PARANOICO (não
+  ratear a feature pedida como bug). Quem julga é o agente lendo a rubrica, não um parser.
+  Agnóstica de CLI.
 ---
 
 # Lina Cold-Review — o revisor isolado anti-slop

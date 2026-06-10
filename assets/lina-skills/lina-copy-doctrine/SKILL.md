@@ -1,17 +1,15 @@
 ---
 name: lina-copy-doctrine
 description: >-
-  Anti-slop ao ESCREVER texto que uma pessoa vai ler — copy, manchete, subtítulo, CTA, e-mail, post,
-  anúncio, bio, descrição de produto, microcopy, mensagem. Use SEMPRE que for redigir ou melhorar
-  texto voltado ao usuário/cliente, e reconheça: "escreve a headline", "faz a copy da landing",
-  "melhora esse texto", "escreve o e-mail/post", "qual CTA uso?", "deixa isso mais persuasivo",
-  "escreve a descrição do produto", "ajusta o tom", "como falo isso pro cliente", "faz um anúncio".
-  Encarna a dimensão COPY da rubrica anti-slop (COP-1..4): zero filler/preâmbulo vazio ("Certainly!",
-  "In today's fast-paced world", "Welcome to the future", "Unlock your potential"), zero genericidade
-  de template (se trocar o nome do produto o texto continua "verdadeiro", é genérico), CTA com voz que
-  diz o que acontece, e a VOZ do usuário lida do vault quando existir — além de UMA recomendação
-  decisiva em vez de um menu de opções. NÃO é para texto de UI puramente visual/layout (use
-  lina-design-doctrine) nem para comentários de código (use lina-code-doctrine). Agnóstica de CLI.
+  Anti-slop ao escrever texto que uma pessoa vai ler — copy, manchete, CTA, e-mail, post,
+  anúncio, microcopy. Use SEMPRE que for redigir ou melhorar texto voltado ao usuário/cliente —
+  gatilhos: "escreve a headline", "faz a copy da landing", "melhora esse texto", "qual CTA
+  uso?", "escreve o e-mail/post", "como falo isso pro cliente". Encarna a dimensão COPY da
+  rubrica anti-slop (COP-1..4): zero filler/preâmbulo vazio ("In today's fast-paced world");
+  zero genericidade de template (trocou o nome do produto e segue "verdadeiro" = genérico); CTA
+  que diz o que acontece; a VOZ do usuário lida do vault quando existir; UMA recomendação
+  decisiva em vez de menu. NÃO é para layout visual (lina-design-doctrine) nem comentários de
+  código (lina-code-doctrine). Agnóstica de CLI.
 ---
 
 # Lina Copy Doctrine — texto com voz, não enchimento

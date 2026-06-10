@@ -2,18 +2,15 @@
 name: lina-orchestration
 description: >-
   O PAPEL de orquestrador — o método Maestro internalizado. Use SEMPRE que a tarefa exigir
-  COORDENAR vários terminais de uma vez (não um único handoff), e reconheça: "constrói/faz X
-  usando 3 terminais", "monta a landing com o time", "coordena o time pra entregar isso",
-  "toca esse projeto com os terminais", "distribui esse épico/essa tarefa grande", "divide isso
-  entre o pessoal", "lidera essa entrega", "alguém travou?", "como está o andamento do time",
-  "garante que isso fica bom antes de entregar". Ensina o LOOP: liderar → decompor (itens no
-  plan.md com parents: explícitos) → definir funções (papel→item; falta papel → spawn) →
-  despachar (template lina-dispatch + lina-agent-bus, fire-and-forget) → intermediar → monitorar
-  (2 projeções do event log: evento-de-progresso e timeout-de-travamento, defs do ADR 0019) →
-  corrigir trajeto (re-despacho com tentativas anteriores; breaker sticky após 2 falhas → escala
-  ao humano) → garantir objetivo (cold-review PASS antes de narrar "pronto"). NÃO é o conteúdo de
-  UM despacho (use lina-dispatch) nem o transporte das mensagens (use lina-agent-bus) — é o papel
-  que USA os dois. O preset Maestro a carrega por padrão. Agnóstica de CLI.
+  coordenar vários terminais (não um único handoff) — gatilhos: "constrói X usando 3 terminais",
+  "coordena o time", "distribui esse épico", "lidera essa entrega", "alguém travou?", "como está
+  o andamento?". Ensina o LOOP: liderar → decompor (plan.md com parents:) → definir funções
+  (falta papel → spawn) → despachar (lina-dispatch via lina-agent-bus, fire-and-forget) →
+  intermediar → monitorar (projeções do event log; defs do ADR 0019) → corrigir trajeto
+  (re-despacho informado; breaker sticky após 2 falhas do mesmo item → escala ao humano) →
+  garantir objetivo (cold-review PASS antes de narrar "pronto"). NÃO é o conteúdo de UM despacho
+  (lina-dispatch) nem o transporte (lina-agent-bus) — é o papel que usa os dois. Agnóstica de
+  CLI.
 ---
 
 # Lina Orchestration — o método Maestro internalizado

@@ -1,18 +1,15 @@
 ---
 name: lina-dispatch
 description: >-
-  O template RICO de despacho: como o orquestrador monta o prompt de uma tarefa para um
-  terminal worker de modo que ele execute SOZINHO, sem nenhuma pergunta de esclarecimento.
-  Use SEMPRE que for DESPACHAR, DELEGAR ou TRANSFERIR trabalho de verdade a outro terminal
-  (não um "oi" curto) — e reconheça: "monta o despacho pra ...", "manda o Fulano
-  IMPLEMENTAR/REVISAR/PESQUISAR/CONSERTAR X", "o que eu escrevo no handoff?", "prepara o
-  prompt do worker", "delega essa story/tarefa", "passa isso pro time", "distribui o épico",
-  "re-despacha o que falhou", "esse despacho tá bom?". Cobre os 5 campos canônicos (CONTEXTO ·
-  FUNÇÃO · DIRECIONAMENTO · OBJETIVO · RESULTADO ESPERADO), o marcador de conclusão
-  PRONTO:/BLOCKED: (sem ele = falha de protocolo), o padrão pull-then-context (a mensagem leva
-  o PONTEIRO + o essencial; o worker PUXA o pesado) e o re-despacho informado (a seção
-  "tentativas anteriores"). É o CONTEÚDO do payload — quem escolhe o verbo `lina` e protege o
-  leigo (antídoto de eco) é a lina-agent-bus. Agnóstica de CLI (Claude Code, Codex, Gemini).
+  O template RICO de despacho: como o orquestrador monta o prompt de uma tarefa para um worker
+  executar SOZINHO, sem perguntas de esclarecimento. Use SEMPRE que for despachar, delegar ou
+  transferir trabalho de verdade a outro terminal — gatilhos: "monta o despacho", "manda o
+  Fulano implementar/revisar/pesquisar X", "o que escrevo no handoff?", "delega essa story",
+  "distribui o épico", "re-despacha o que falhou". Cobre os 5 campos canônicos (CONTEXTO ·
+  FUNÇÃO · DIRECIONAMENTO · OBJETIVO · RESULTADO ESPERADO), o marcador PRONTO:/BLOCKED:, o
+  padrão pull-then-context (a mensagem leva o ponteiro + o essencial; o worker puxa o pesado) e
+  o re-despacho informado ("tentativas anteriores"). É o CONTEÚDO do payload — o verbo lina e a
+  proteção do leigo são da lina-agent-bus. Agnóstica de CLI.
 ---
 
 # Lina Dispatch — o template RICO de despacho (worker autossuficiente)

@@ -1,18 +1,16 @@
 ---
 name: lina-design-doctrine
 description: >-
-  Opinião estética explícita para QUALQUER trabalho visual — UI, página, tela, componente,
-  landing, hero, dashboard, e-mail, slide, identidade. Use SEMPRE que for desenhar, estilizar,
-  escolher fonte/cor/paleta/tipografia/espaçamento, montar layout ou "deixar bonito", e
-  reconheça pedidos como: "faz a tela de X", "estiliza esse componente", "qual fonte/paleta eu
-  uso?", "monta a landing", "deixa isso mais bonito", "escolhe as cores", "design do dashboard",
-  "tema claro/escuro", "como deixar com a nossa cara". BANE os marcadores duros de slop visual
-  (fonte Inter/Roboto/Arial/system-ui como escolha, gradiente roxo→branco "de IA",
-  glassmorphism genérico, look shadcn-default sem opinião) e EXIGE uma direção estética
-  declarada por projeto antes de estilizar, tokens semânticos em vez de hex solto, escala
-  tipográfica deliberada e motion subordinado a prefers-reduced-motion. Encarna a dimensão
-  DESIGN da rubrica anti-slop (DES-1..5). NÃO é para escrever texto/copy (use lina-copy-doctrine)
-  nem para dar veredito de revisão (use lina-cold-review). Agnóstica de CLI.
+  Opinião estética explícita para qualquer trabalho visual — UI, página, componente, landing,
+  dashboard, slide. Use SEMPRE que for desenhar, estilizar, escolher
+  fonte/cor/paleta/tipografia/espaçamento ou "deixar bonito" — gatilhos: "faz a tela de X",
+  "estiliza esse componente", "qual fonte/paleta?", "monta a landing", "escolhe as cores", "tema
+  claro/escuro". BANE marcadores duros de slop visual (Inter/Roboto/Arial como escolha,
+  gradiente roxo de IA, glassmorphism genérico, shadcn-default sem opinião) e EXIGE direção
+  estética declarada antes de estilizar, tokens semânticos, escala tipográfica deliberada e
+  motion subordinado a reduce-motion. Encarna a dimensão DESIGN da rubrica anti-slop (DES-1..5).
+  NÃO é para copy (lina-copy-doctrine) nem veredito de revisão (lina-cold-review). Agnóstica de
+  CLI.
 ---
 
 # Lina Design Doctrine — design tem opinião

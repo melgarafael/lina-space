@@ -1,15 +1,14 @@
 ---
 name: lina-verification
 description: >-
-  Nunca declarar trabalho "pronto" sem evidência OBSERVADA. Use SEMPRE que estiver prestes a afirmar
-  que algo está concluído, funcionando ou corrigido, e ANTES de entregar/commitar/marcar um item como
-  feito — e reconheça: "está pronto?", "isso funciona?", "acho que resolvi", "deve funcionar",
-  "terminei a feature", "pode marcar como concluído", "o bug foi corrigido?", "tá tudo certo?",
-  "posso entregar isso?", "já testei mentalmente". Exige a prova antes da afirmação: rodou de fato,
-  leu o output, viu o comportamento — e a régua "um staff engineer aprovaria isto?". Espelha a
-  calibração de enforcement da rubrica anti-slop (§6.2: existência de um mecanismo ≠ a propriedade
-  vale; PASS é afirmação com evidência, não ausência de objeção). NÃO é para revisar a entrega de um
-  colega de fora (use lina-cold-review) — é para você não se auto-enganar. Agnóstica de CLI.
+  Nunca declarar trabalho "pronto" sem evidência OBSERVADA. Use SEMPRE que estiver prestes a
+  afirmar que algo está concluído, funcionando ou corrigido, e ANTES de entregar/commitar/marcar
+  item como feito — gatilhos: "está pronto?", "isso funciona?", "acho que resolvi", "deve
+  funcionar", "terminei", "pode marcar como concluído?". Exige a prova antes da afirmação: rodou
+  de fato, leu o output, viu o comportamento — e a régua "um staff engineer aprovaria?". Espelha
+  a calibração de enforcement da rubrica anti-slop (§6.2: existência de mecanismo ≠ propriedade
+  vale; PASS é afirmação com evidência, não ausência de objeção). NÃO é para revisar entrega de
+  colega (lina-cold-review) — é para você não se auto-enganar. Agnóstica de CLI.
 ---
 
 # Lina Verification — evidência antes da afirmação

@@ -214,4 +214,54 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Portabilidade 3-CLI (critério F1-3-3): o Codex REJEITA skill com `description`
+    /// acima de 1024 caracteres ("invalid description: exceeds maximum length of 1024
+    /// characters" — transcript real do codex-cli 0.138, 2026-06-10; 6/11 skills da
+    /// safra não carregavam). Medimos em BYTES (mais estrito que chars) por folga.
+    #[test]
+    fn descriptions_fit_codex_limit_of_1024_chars() {
+        for skill in LINA_SKILLS {
+            let skill_md = skill
+                .files
+                .iter()
+                .find(|(rel, _)| *rel == "SKILL.md")
+                .expect("toda skill embute SKILL.md")
+                .1;
+            let mut in_desc = false;
+            let mut desc = String::new();
+            for line in skill_md.lines() {
+                if let Some(resto) = line.strip_prefix("description:") {
+                    in_desc = true;
+                    let inline = resto.trim();
+                    if inline != ">-" && inline != ">" && inline != "|" && !inline.is_empty() {
+                        desc.push_str(inline);
+                    }
+                    continue;
+                }
+                if in_desc {
+                    if let Some(cont) = line.strip_prefix("  ") {
+                        if !desc.is_empty() {
+                            desc.push(' ');
+                        }
+                        desc.push_str(cont.trim_end());
+                    } else {
+                        break; // próxima chave do frontmatter ou fim do bloco
+                    }
+                }
+            }
+            assert!(
+                !desc.is_empty(),
+                "{}: description ausente no frontmatter do SKILL.md",
+                skill.name
+            );
+            let n = desc.len();
+            assert!(
+                n <= 1024,
+                "{}: description com {n} bytes (>1024 — o Codex recusa a skill inteira; \
+                 encurte mantendo os gatilhos de ativação)",
+                skill.name
+            );
+        }
+    }
 }

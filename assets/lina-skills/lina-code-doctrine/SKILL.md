@@ -1,16 +1,14 @@
 ---
 name: lina-code-doctrine
 description: >-
-  Anti-slop ao ESCREVER ou alterar código. Use SEMPRE que for implementar, codar ou corrigir — e
-  reconheça: "implementa essa função", "escreve o código de X", "como nomeio essa variável/função?",
-  "posso silenciar esse erro?", "esse try/catch tá ok?", "tem código repetido aqui", "adiciona um
-  comentário", "conserta esse bug", "esse fix resolve?", "como trato esse erro". Encarna a dimensão
-  CÓDIGO da rubrica anti-slop (COD-1..5): nomes que dizem o QUÊ (nada de handleData/processData/
-  manager/temp), comentário só para o PORQUÊ não-óbvio, ZERO cast/escape de tipo (any/@ts-ignore/
-  type:ignore), ZERO erro engolido (catch vazio, except:pass, unwrap/expect em produção), causa raiz
-  acima de fix temporário, e duplicação tratada como dívida. NÃO é para decisão de estrutura/abstração
-  (use lina-architecture-doctrine) nem para dar veredito de revisão de uma entrega alheia (use
-  lina-cold-review). Agnóstica de linguagem e de CLI.
+  Anti-slop ao escrever ou alterar código. Use SEMPRE que for implementar, codar ou corrigir —
+  gatilhos: "implementa essa função", "como nomeio isso?", "posso silenciar esse erro?", "esse
+  try/catch tá ok?", "conserta esse bug", "como trato esse erro". Encarna a dimensão CÓDIGO da
+  rubrica anti-slop (COD-1..5): nomes que dizem o QUÊ (nada de handleData/manager/temp);
+  comentário só para o PORQUÊ não-óbvio; zero cast/escape de tipo (any/@ts-ignore); zero erro
+  engolido (catch vazio, except:pass, unwrap em produção); causa raiz acima de fix temporário;
+  duplicação é dívida. NÃO é para decisão de estrutura (lina-architecture-doctrine) nem veredito
+  sobre entrega alheia (lina-cold-review). Agnóstica de linguagem e de CLI.
 ---
 
 # Lina Code Doctrine — código com intenção, não slop

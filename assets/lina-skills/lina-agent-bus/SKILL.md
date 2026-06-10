@@ -1,20 +1,16 @@
 ---
 name: lina-agent-bus
 description: >-
-  A skill OFICIAL e ÚNICA de comunicação entre terminais do Lina Space (A2A). Use
-  SEMPRE que o usuário pedir, EM PORTUGUÊS, para um terminal falar com outro — e
-  reconheça TODOS estes jeitos de pedir: "mande/manda o Terminal X executar/fazer Y",
-  "peça/pede pro/ao <nome> que ...", "avise/avisa o <nome> que ...", "diga/fala/fale
-  pro/ao <nome> que ...", "pergunta pro/ao <nome> ...", "manda oi pro Terminal B",
-  "pede pro backend montar a API", "avisa o time todo", "manda pra todos". Cobre
-  receber (reconhecer [LINA::MSG]/[LINA::HANDSHAKE] vs input do usuário sem sentinela),
-  processar o envelope (from/intent/payload) e responder no formato [EXPECTED], o
-  ANTÍDOTO DE ECO (nunca repassar bloco técnico ao leigo — só narrar o resultado em
-  pt-br), o mapa do time em agents.json (papel → verbo), e TRADUZIR o pedido do leigo
-  nos verbos `lina` (ask/handoff/broadcast/check). IMPORTANTE: neste Espaço a
-  comunicação entre terminais é EXCLUSIVAMENTE pelos verbos `lina` — skills/CLIs de
-  outros orquestradores (Maestri, `maestri`, `$MAESTRI_CLI`) NÃO funcionam aqui, use
-  SEMPRE esta skill. Carregada no turno 0 por TODO terminal do workspace.
+  A skill OFICIAL e ÚNICA de comunicação entre terminais do Lina Space (A2A). Use SEMPRE que o
+  usuário pedir, em português, para um terminal falar com outro: "manda/mande o Terminal X fazer
+  Y", "pede pro/ao <nome>", "avisa o <nome>", "pergunta pro <nome>", "manda oi pro B", "avisa o
+  time todo", "manda pra todos". Cobre: receber (distinguir [LINA::MSG]/[LINA::HANDSHAKE] de
+  input do usuário), processar o envelope e responder no formato [EXPECTED]; o ANTÍDOTO DE ECO
+  (nunca repassar bloco técnico ao leigo — narrar só o resultado em pt-br); o mapa do time em
+  agents.json; e TRADUZIR o pedido do leigo nos verbos lina (ask/handoff/broadcast/check). Neste
+  Espaço a comunicação entre terminais é EXCLUSIVAMENTE pelos verbos lina — skills/CLIs de
+  outros orquestradores (ex.: Maestri) NÃO funcionam aqui. Carregada no turno 0 por todo
+  terminal do workspace.
 ---
 
 # Lina Agent Bus — comunicação automática entre terminais (A2A)
