@@ -44,7 +44,11 @@ mod dashboard;
 // F1-1-7: fila de atenção UNIFICADA + toast (permissão + custódia). Lógica de apresentação em
 // funções puras (gpui-free, testável headless); render fina. ZERO write no PTY (ADR 0021 §6).
 mod attention_ui;
+// F1-5-1: sonda [PROF] — decompõe o frametime que a [FPS] mede agregado (poll/assemble por
+// painel/chrome + layout_paint/present via sentinela de paint). Lógica gpui-free, testável.
+mod prof;
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -68,10 +72,10 @@ use lina_bootstrap::Autonomy;
 use bridge::{
     card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
     normalize_sel, quote_dropped_paths, screen_to_cell, scrub_foreign_orchestrator_env,
-    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, ApprovalWiring, AttentionHub,
-    BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk, Desk, GpuiBridgeHost,
-    Grid, MailboxPump, Model, NodeAdmission, NodeManager, PtrAction, SharedModel, CARD_H, CARD_W,
-    CELL_H, CELL_W,
+    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, AgentEngine, ApprovalWiring,
+    AttentionHub, BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk,
+    CwdPolicy, Desk, GpuiBridgeHost, Grid, MailboxPump, Model, NodeAdmission, NodeManager,
+    PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
 };
 use lina_core::Mailbox;
 // W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
@@ -321,11 +325,14 @@ fn rgba(c: VtRgb) -> Rgba {
 
 /// Pinta UMA linha do grid: agrupa células de mesmo estilo em runs (flex-row de spans),
 /// com a célula do cursor como bloco invertido (accent). Monoespaçado → tudo alinha.
+/// F1-5-1: `runs_out` (sonda [PROF] ligada) acumula quantos runs a linha montou — proxy de
+/// quads no shell (cada run ≈ 1 quad de fundo + 1 run de texto). `None` = custo zero.
 fn render_line(
     cells: &[lina_core::VtCell],
     cursor_col: Option<usize>,
     row: usize,
     sel: Option<(usize, usize, usize, usize)>,
+    runs_out: Option<&Cell<usize>>,
 ) -> impl IntoElement {
     struct Run {
         fg: VtRgb,
@@ -363,6 +370,9 @@ fn render_line(
             }),
         }
     }
+    if let Some(c) = runs_out {
+        c.set(c.get() + runs.len());
+    }
     div().flex().flex_row().children(runs.into_iter().map(|r| {
         let span = div()
             .bg(rgba(r.bg))
@@ -391,6 +401,7 @@ fn render_grid(
     screen: &VtScreen,
     scale: f32,
     sel: Option<(usize, usize, usize, usize)>,
+    runs_out: Option<&Cell<usize>>,
 ) -> impl IntoElement {
     let cur = screen.cursor;
     div()
@@ -405,7 +416,7 @@ fn render_grid(
         .line_height(px(CELL_H * scale))
         .children((0..screen.rows).map(move |r| {
             let cursor_col = (cur.visible && cur.line == r).then_some(cur.col);
-            render_line(screen.row(r), cursor_col, r, sel)
+            render_line(screen.row(r), cursor_col, r, sel, runs_out)
         }))
 }
 
@@ -437,15 +448,8 @@ const FPS_WINDOW_MS: f64 = 2000.0;
 /// FPS *enquanto desenha*). 250ms = 4fps; abaixo disto é desenho contínuo real.
 const IDLE_GAP_MS: f64 = 250.0;
 
-/// Percentil (nearest-rank) de um slice **já ordenado** de ms. `p` em `[0.0, 100.0]`; slice vazio →
-/// `0.0`. Barato e sem alocar: índice = `round(p/100 · (n-1))`, saturado em `[0, n-1]` (sem panic).
-fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let rank = (p / 100.0 * (sorted.len() as f64 - 1.0)).round() as usize;
-    sorted[rank.min(sorted.len() - 1)]
-}
+// O percentil nearest-rank vive em [`prof::percentile_sorted`] (F1-5-1: fonte única — as
+// sondas [FPS] e [PROF] usam a MESMA aritmética, testada headless lá).
 
 /// O canvas gpui — a ÚNICA parte que conhece o toolkit. O estado dos nós (add/remove, model,
 /// grids) vive no [`NodeManager`] gpui-free; a view só renderiza, roteia input e foca.
@@ -540,6 +544,9 @@ struct WorkspaceView {
     attention_diag_last: String,
     /// F1-1-7: onde settings.json mora (o MESMO dir do event log — padrão T7).
     settings_dir: PathBuf,
+    /// F1-5-1: sonda [PROF] (decomposição do frametime). `LINA_PROF=1` liga; desligada, o
+    /// custo por frame é UM check de bool (o protocolo de overhead compara o [FPS] 0×1).
+    prof: prof::Probe,
 }
 
 impl WorkspaceView {
@@ -666,6 +673,7 @@ impl WorkspaceView {
             attention_settings_at: None,
             attention_diag_last: String::new(),
             settings_dir,
+            prof: prof::Probe::from_env(),
         }
     }
 
@@ -2030,6 +2038,16 @@ impl Render for WorkspaceView {
         // Intervalo > IDLE_GAP_MS = janela ociosa (sem redraw pedido), NÃO frame lento: descarta p/ os
         // percentis medirem FPS *enquanto desenha*. `Instant` monotônico (lição: NUNCA `SystemTime`).
         let frame_now = Instant::now();
+        // F1-5-1 ([PROF]): fecha o frame ANTERIOR (só agora o frametime e o carimbo do sentinela
+        // de paint existem) e emite o bloco da janela quando ela fecha (~120 frames). Sonda
+        // desligada (`LINA_PROF` ausente/0) = um check de bool e nada mais. Atribuição
+        // DELIBERADA: como `frame_now` (t0) já foi capturado, o custo de fechar a janela
+        // (sort+format+eprintln, 1×/~120 frames) cai na fase `poll` DESTE frame — 1 amostra
+        // inflada por janela (p100; p50/p95 de poll seguem robustos). A alternativa (t0 depois)
+        // vazaria o custo para o present_vsync do frame anterior — pior.
+        for line in self.prof.begin_frame(frame_now) {
+            eprintln!("lina-gpui: {line}");
+        }
         if let Some(prev) = self.last_frame_at {
             let dt_ms = frame_now.saturating_duration_since(prev).as_secs_f64() * 1000.0;
             if dt_ms <= IDLE_GAP_MS {
@@ -2266,7 +2284,14 @@ impl Render for WorkspaceView {
         // W5-1 (instrumentação de FPS): paineis DESENHADOS = os não-suspensos (mesma classificação de
         // zona da sonda de cards). Conta no loop; `cards.len()` dá os VIVOS.
         let mut panels_drawn = 0usize;
+        // F1-5-1 ([PROF]): fronteira poll→assemble (tudo acima é poll/update do model) + total
+        // de runs de grid montados no frame (proxy de quads). Desligada → None, custo zero.
+        let prof_poll_end = self.prof.enabled.then(Instant::now);
+        let mut prof_frame_runs = 0usize;
         for (idx, (id, nv)) in cards.iter().enumerate() {
+            // F1-5-1: cronômetro POR PAINEL da fase assemble (inclui lock do grid + screen()).
+            let prof_panel_start = self.prof.enabled.then(Instant::now);
+            let prof_panel_runs = Cell::new(0usize);
             let node_id = *id;
             // ID de elemento ESTÁVEL por nó (não o idx do loop, que muda com cull/z-order).
             let card_eid = eid.get(&node_id).copied().unwrap_or(idx);
@@ -2489,7 +2514,12 @@ impl Render for WorkspaceView {
                             // É per-node por construção: só o grid focado tem `term.selection` ativa
                             // (`pointer_down` → `clear_selection_state` zera os demais). `self.sel`
                             // continua, mas só p/ DIRIGIR o gesto (extend/copy/clear).
-                            body = body.child(render_grid(&screen, z, screen.selection));
+                            body = body.child(render_grid(
+                                &screen,
+                                z,
+                                screen.selection,
+                                self.prof.enabled.then_some(&prof_panel_runs),
+                            ));
                         }
                     }
                     canvas::Zone::Suspended => {}
@@ -2541,7 +2571,16 @@ impl Render for WorkspaceView {
                 .child(body);
 
             root = root.child(card);
+            // F1-5-1: amostra por-painel (só painéis DESENHADOS chegam aqui — suspensos deram
+            // `continue` acima e não geram amostra; o custo deles fica na fase assemble total).
+            if let Some(t) = prof_panel_start {
+                prof_frame_runs += prof_panel_runs.get();
+                self.prof
+                    .panel_done(&nv.name, t.elapsed(), prof_panel_runs.get());
+            }
         }
+        // F1-5-1: fronteira assemble→chrome (daqui até o fim do render é chrome da cena).
+        let prof_assemble_end = self.prof.enabled.then(Instant::now);
 
         // inv#6 (nunca tela em branco): workspace SEM terminais (produção fresca, ou o raro spawn que
         // falhou) → guia centralizada (⌘T) em vez de canvas vazio. Adicionada ANTES do topbar (que vem
@@ -2569,9 +2608,9 @@ impl Render for WorkspaceView {
                 sorted.sort_by(f64::total_cmp);
                 let n = sorted.len() as f64;
                 let mean = active_ms / n;
-                let p50 = percentile_sorted(&sorted, 50.0);
-                let p95 = percentile_sorted(&sorted, 95.0);
-                let p99 = percentile_sorted(&sorted, 99.0);
+                let p50 = prof::percentile_sorted(&sorted, 50.0);
+                let p95 = prof::percentile_sorted(&sorted, 95.0);
+                let p99 = prof::percentile_sorted(&sorted, 99.0);
                 let fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
                 let panels_live = cards.len();
                 eprintln!(
@@ -3024,11 +3063,43 @@ impl Render for WorkspaceView {
             None => root,
         };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
-        if self.palette.is_open() {
+        let root = if self.palette.is_open() {
             root.child(self.palette.render())
         } else {
             root
+        };
+        // F1-5-1 ([PROF]): SENTINELA de paint — canvas de tamanho ZERO como ÚLTIMO filho da
+        // cena: seu closure de paint roda DENTRO da fase de paint do gpui (depois do layout,
+        // ao fim do paint em ordem de árvore) e carimba o instante no slot atômico. É o que
+        // separa `layout_paint` de `present_vsync` — a melhor aproximação do custo pós-render
+        // disponível no gpui sem forkar o framework. Só existe com a sonda LIGADA.
+        let root = if self.prof.enabled {
+            let slot = self.prof.paint_slot();
+            root.child(
+                gpui::canvas(
+                    move |_bounds, _window, _cx| {},
+                    move |_bounds, _prepaint, _window, _cx| slot.stamp(),
+                )
+                .absolute()
+                .size(px(0.0)),
+            )
+        } else {
+            root
+        };
+        // F1-5-1: registra as marcas de CPU deste frame (fechado no próximo begin_frame, quando
+        // o frametime e o carimbo do sentinela existirem).
+        if let (Some(poll_end), Some(assemble_end)) = (prof_poll_end, prof_assemble_end) {
+            self.prof.finish_frame(prof::RenderMarks {
+                t0: frame_now,
+                poll_end,
+                assemble_end,
+                end: Instant::now(),
+                live: cards.len(),
+                drawn: panels_drawn,
+                runs: prof_frame_runs,
+            });
         }
+        root
     }
 }
 
@@ -3621,6 +3692,75 @@ fn main() {
         (NodeId::default(), None)
     };
 
+    // ── F1-5-1 · CENÁRIO DE CARGA REPRODUTÍVEL da sonda [PROF] (dev/medição; opt-in por env).
+    // `LINA_LOAD=N` sobe N painéis pelo MESMO funil canônico (`admit_node`, ADR 0022), cada um
+    // rodando o GERADOR `tools/loadgen.sh` (shell + script — SEM CLI de IA real): os primeiros
+    // `LINA_LOAD_ACTIVE` (default: todos) alternam rajada/spinner ANSI; o resto fica em silêncio
+    // (cenário-alvo do produto: 8-12 ativos + resto ocioso). Matriz da story: N∈{4,16,28}.
+    // Como rodar: tasks/epico-f1/prof-baseline.md (rodar SEM LINA_DEMO — posições colidem).
+    // Spawn que falha DEGRADA (loga e segue — inv#6), nunca panica. O gerador é `sh` (unix);
+    // no Windows o spawn degrada com log — a sessão de medição da F1-5-1 é no Mac do fundador.
+    let load_n: usize = std::env::var("LINA_LOAD")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if load_n > 0 {
+        let n = load_n.min(64); // backstop anti-dedo-gordo (64 shells já passa da matriz)
+        if n < load_n {
+            eprintln!("lina-gpui: [PROF] carga LINA_LOAD={load_n} clampada em {n}");
+        }
+        let active: usize = std::env::var("LINA_LOAD_ACTIVE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(n)
+            .min(n);
+        // O gerador: override por env (`LINA_LOADGEN`) ou o do repo (caminho de COMPILE-TIME —
+        // ferramenta de dev/medição, roda na máquina que compilou).
+        let script = std::env::var("LINA_LOADGEN").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tools/loadgen.sh").to_string()
+        });
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        for i in 0..n {
+            let mode = if i >= active {
+                "silence"
+            } else if i % 2 == 0 {
+                "burst"
+            } else {
+                "spinner"
+            };
+            // Grade de 7 colunas; o NOME carrega o modo (legível no top-K do [PROF]).
+            let x = 30.0 + (i % 7) as f64 * f64::from(CARD_W + 30.0);
+            let y = 96.0 + (i / 7) as f64 * f64::from(CARD_H + 30.0);
+            let admission = NodeAdmission {
+                name: Some(format!("Carga {:02} ({mode})", i + 1)),
+                role: "terminal".into(),
+                engine: Some(AgentEngine {
+                    program: "/bin/sh".into(),
+                    args: vec![script.clone(), mode.into(), format!("{}", i + 1)],
+                    profile_id: None,
+                    label: "loadgen".into(),
+                }),
+                // Como o ⌘T (terminal puro): NENHUM kit/arquivo do Lina escrito (não é agente).
+                cwd: CwdPolicy::UserHome { path: home.clone() },
+                position: Some((x, y)),
+                requested_by: None,
+            };
+            if let Err(e) = nodes.admit_node(admission) {
+                eprintln!(
+                    "lina-gpui: [PROF] carga — spawn do painel {} falhou ({e}); seguindo",
+                    i + 1
+                );
+            }
+        }
+        eprintln!(
+            "lina-gpui: [PROF] carga semeada: N={n} ativos={active} (burst/spinner alternados) ociosos={} · gerador {script}",
+            n - active
+        );
+    }
+
     let event_count = lock(&store).event_count().unwrap_or(0);
     lock(&model).event_count = event_count;
 
@@ -3757,6 +3897,14 @@ fn main() {
             ),
             Err(e) => eprintln!("lina-gpui: [ATT] DEMO — falha ao semear: {e}"),
         }
+    }
+
+    // F1-5-1: estado da sonda [PROF] no boot — o Maestro confirma por log que a rodada de
+    // medição (LINA_PROF=1) e a de CONTROLE do overhead (LINA_PROF=0) são as que ele pediu.
+    if prof::enabled_from_env() {
+        eprintln!("lina-gpui: [PROF] sonda LIGADA (LINA_PROF=1) — janela ~120 frames; fases poll/assemble/chrome + layout_paint/present_vsync; overhead: compare o [FPS] com LINA_PROF=0");
+    } else if std::env::var_os("LINA_PROF").is_some() {
+        eprintln!("lina-gpui: [PROF] sonda DESLIGADA — rodada de CONTROLE do overhead (só [FPS])");
     }
 
     eprintln!(
