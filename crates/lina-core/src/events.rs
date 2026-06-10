@@ -662,6 +662,12 @@ pub enum DomainEvent {
         root_cause_id: String,
         /// Profundidade EFETIVA (`0` = origem; `>=1` = cascata).
         hops: u8,
+        /// SEAM-1: 1º prompt do spawn (payload do envelope). Logado AQUI para o banner de um spawn
+        /// GATED (cascata) ser recuperável do log (a fila de atenção reconstrói o pedido pendente do
+        /// `SpawnRequested` no replay/pós-crash — o `RouteOutcome` é efêmero). ADITIVO via
+        /// `serde(default)`: `SpawnRequested` de logs F1-3-6 (sem o campo) replaya com `""`.
+        #[serde(default)]
+        prompt: String,
     },
     /// F1-3-6 (ADR 0019 §6): o gate barrou/adiou um spawn (livro-razão da DECISÃO, par do
     /// `SpawnRequested`). `reason` ∈ {`cascade`,`over_cap`,`manual`,`cost`} — String (não enum) de
@@ -672,6 +678,23 @@ pub enum DomainEvent {
         id: String,
         requested_by: NodeId,
         reason: String,
+    },
+    /// SEAM-1 (ADR 0022): o spawn `id` foi EXECUTADO — o app admitiu o terminal (`node`) via o funil
+    /// `admit_node`. É a chave de DEDUPE DURÁVEL (M3): antes de admitir, o app varre o log por
+    /// `SpawnAdmitted{id}`; presente → no-op (replay/re-drain/crash-recovery → 1 terminal só). Também
+    /// RESOLVE o item de banner (`SpawnGated{cascade}` deixa de ser pendente). META — a criação
+    /// física projeta via `NodeAdded` (este só correlaciona spawn↔nó, que `NodeAdded` não carrega).
+    SpawnAdmitted {
+        /// `= SpawnRequested.id` (== `root_cause_id` na origem) — o id durável do pedido de spawn.
+        id: String,
+        node: NodeId,
+    },
+    /// SEAM-1: o humano RECUSOU um spawn gated (cascata) na fila de atenção — NADA nasce. RESOLVE o
+    /// item de banner (par de `SpawnAdmitted` para o ramo deny), para o pedido não reaparecer no
+    /// replay/pós-crash. META.
+    SpawnDeclined {
+        /// `= SpawnRequested.id` do pedido recusado.
+        id: String,
     },
     /// F1-3-7 (RESERVADO up-front por Dev 01 — Maestro decisão 3 §12.3: dono único de `events.rs`
     /// na Rodada 3 batcheia TODAS as variantes da onda, eliminando colisão de merge com F1-3-7).
@@ -757,6 +780,8 @@ impl DomainEvent {
             DomainEvent::PermissionPromptCleared { .. } => "PermissionPromptCleared",
             DomainEvent::SpawnRequested { .. } => "SpawnRequested",
             DomainEvent::SpawnGated { .. } => "SpawnGated",
+            DomainEvent::SpawnAdmitted { .. } => "SpawnAdmitted",
+            DomainEvent::SpawnDeclined { .. } => "SpawnDeclined",
             DomainEvent::SkillInvoked { .. } => "SkillInvoked",
             DomainEvent::SkillCreated { .. } => "SkillCreated",
         }
@@ -1052,6 +1077,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // reconstroem o trio varrendo o log — sem efeito na projeção do canvas.
         | DomainEvent::SpawnRequested { .. }
         | DomainEvent::SpawnGated { .. }
+        // SEAM-1: admissão/recusa de spawn são META (correlação spawn↔nó p/ dedupe M3 + resolução do
+        // banner); a criação física projeta via `NodeAdded`.
+        | DomainEvent::SpawnAdmitted { .. }
+        | DomainEvent::SpawnDeclined { .. }
         // F1-3-7 (reservado up-front): uso/criação de skill são META (dados do `lina retro`).
         | DomainEvent::SkillInvoked { .. }
         | DomainEvent::SkillCreated { .. }
@@ -2659,6 +2688,7 @@ mod tests {
                     role: "qa".into(),
                     root_cause_id: "msg_root".into(),
                     hops: 1,
+                    prompt: "valide o checkout".into(),
                 },
                 "SpawnRequested",
             ),
@@ -2683,6 +2713,17 @@ mod tests {
                     skill: "nova".into(),
                 },
                 "SkillCreated",
+            ),
+            (
+                DomainEvent::SpawnAdmitted {
+                    id: "msg_x".into(),
+                    node: by,
+                },
+                "SpawnAdmitted",
+            ),
+            (
+                DomainEvent::SpawnDeclined { id: "msg_x".into() },
+                "SpawnDeclined",
             ),
         ];
         let mut state = ProjectedState::default();

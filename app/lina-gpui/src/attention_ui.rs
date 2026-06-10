@@ -98,6 +98,12 @@ pub fn is_goto_only(item: &AttentionItem) -> bool {
 pub fn toast_copy(item: &AttentionItem) -> String {
     match item.kind {
         AttentionKind::Custody => item.detail.clone().unwrap_or_default(),
+        // SEAM-1: banner de spawn (cascata) — copy leiga; ⌘⏎ deixa nascer, Esc recusa (gate humano).
+        AttentionKind::Spawn => match &item.detail {
+            Some(d) => format!("Um agente quer {d} — ⌘⏎ deixa nascer · Esc recusa",),
+            None => "Um agente quer trazer um especialista pro time — ⌘⏎ deixa nascer · Esc recusa"
+                .to_string(),
+        },
         AttentionKind::Permission => match item.prompt_kind {
             PromptKind::Choice => format!(
                 "{} fez uma pergunta e aguarda sua escolha — vá até o terminal",
@@ -928,7 +934,7 @@ mod tests {
             kind,
             detail: Some(format!("detalhe {id}")),
             evidence: match kind {
-                AttentionKind::Custody => AttentionEvidence::Custody,
+                AttentionKind::Custody | AttentionKind::Spawn => AttentionEvidence::Custody,
                 AttentionKind::Permission => AttentionEvidence::Hook,
             },
             created_ts: ts,

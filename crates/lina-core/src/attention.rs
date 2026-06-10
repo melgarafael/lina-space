@@ -75,7 +75,7 @@ const _: () = assert!(ESCALATE_AFTER_MS < AUTO_DENY_AFTER_MS);
 /// da janela exigiria o primeiro ainda não-respondido — não acontece num TUI serial.
 pub const LAYER_MERGE_WINDOW_MS: u64 = 10_000;
 
-/// Classe do item na fila — define a precedência (custódia > permissão).
+/// Classe do item na fila — define a precedência (custódia > permissão > spawn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionKind {
     /// Gate duro de custódia/resume (`lina do`/`lina resume`, ADR 0004) — espelhado
@@ -83,6 +83,11 @@ pub enum AttentionKind {
     Custody,
     /// Pedido de permissão y/n detectado (F1-1-6).
     Permission,
+    /// SEAM-1 (ADR 0019 §6): um agente em CASCATA pediu criar um terminal (`SpawnGated{cascade}`) —
+    /// gate humano (anti-fork-bomb). Aprovar = o terminal nasce (1×, dedupe durável M3); recusar =
+    /// nada nasce. Precedência ABAIXO de permissão (criar processo pode esperar; um bloqueante de
+    /// permissão trava um turno em curso).
+    Spawn,
 }
 
 /// Camada de origem da evidência — confiabilidade NÃO-uniforme por design: `Hook` é
@@ -189,6 +194,23 @@ struct PendingCustody {
     created_ts: u64,
 }
 
+/// SEAM-1: pendência de SPAWN gateado (cascata) aguardando o gate humano. Reconstruída do log
+/// (`SpawnRequested` traz name/role/requested_by; `SpawnGated{cascade}` promove a pendente) — então
+/// um banner pendente SOBREVIVE a crash/reabrir (replay). `requested_by` é `String` (NodeId
+/// serializado), como os demais ids da fila; o app re-lê o `SpawnRequested` TIPADO ao executar.
+#[derive(Debug, Clone)]
+struct PendingSpawn {
+    /// `= SpawnRequested.id` (== `root_cause_id` na origem) — a chave do gesto/dedupe.
+    id: String,
+    /// Quem pediu (sender AUTENTICADO do gate), para exibição/identidade.
+    requested_by: String,
+    /// `@Nome` do terminal pedido.
+    name: String,
+    /// Papel pedido.
+    role: String,
+    created_ts: u64,
+}
+
 /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
 #[derive(Debug, Default)]
 pub struct AttentionQueue {
@@ -196,6 +218,13 @@ pub struct AttentionQueue {
     permissions: Vec<PendingPermission>,
     /// Pendências de custódia espelhadas, em ordem de chegada.
     custody: Vec<PendingCustody>,
+    /// SEAM-1: spawns gateados (cascata) aguardando o gate humano (banner). Pendente = `SpawnGated
+    /// {cascade}` sem `SpawnAdmitted`/`SpawnDeclined` posterior.
+    spawns: Vec<PendingSpawn>,
+    /// SEAM-1: detalhes de TODO `SpawnRequested` visto (id → (requested_by, name, role, ts)) — o
+    /// `SpawnGated{cascade}` posterior promove a pendente usando-os (os dois são apendados em
+    /// sequência por `handle_spawn`). Removido quando o spawn resolve (admitido/recusado).
+    spawn_requests: HashMap<String, (String, String, String, u64)>,
     /// Allowlist por nó (`NodeDetectionMuted`, último vence): `true` = fallback de
     /// grid DESLIGADO para o nó.
     muted: HashMap<String, bool>,
@@ -248,6 +277,41 @@ impl AttentionQueue {
                         p.node_id != *node_id || p.evidence != PermissionEvidence::Grid
                     });
                 }
+            }
+            // SEAM-1: captura os args de TODO pedido de spawn (precede o gate). Origem (que vira
+            // SpawnApproved, sem SpawnGated) nunca é promovida a banner; só a CASCATA abaixo.
+            DomainEvent::SpawnRequested {
+                id,
+                requested_by,
+                name,
+                role,
+                ..
+            } => {
+                self.spawn_requests.insert(
+                    id.clone(),
+                    (requested_by.to_string(), name.clone(), role.clone(), ts),
+                );
+            }
+            // SEAM-1: só a CASCATA vira banner (gate humano anti-fork-bomb). Outros motivos
+            // (manual/over_cap/cost) são recusas/limites, não pedidos human-gated nesta rodada.
+            DomainEvent::SpawnGated { id, reason, .. } if reason == "cascade" => {
+                if self.spawns.iter().any(|s| s.id == *id) {
+                    return; // replay defensivo: não re-entra
+                }
+                if let Some((requested_by, name, role, req_ts)) = self.spawn_requests.get(id) {
+                    self.spawns.push(PendingSpawn {
+                        id: id.clone(),
+                        requested_by: requested_by.clone(),
+                        name: name.clone(),
+                        role: role.clone(),
+                        created_ts: *req_ts,
+                    });
+                }
+            }
+            // SEAM-1: spawn resolvido (admitido pelo app OU recusado pelo humano) → sai do banner.
+            DomainEvent::SpawnAdmitted { id, .. } | DomainEvent::SpawnDeclined { id } => {
+                self.spawns.retain(|s| s.id != *id);
+                self.spawn_requests.remove(id);
             }
             // Pós-decisão do executor (F1-1-8): sem efeito na fila — o item já saiu
             // no `PermissionResolved`. Um abort (`screen_changed`) reapresenta via
@@ -464,9 +528,40 @@ impl AttentionQueue {
             prompt_kind: p.prompt_kind,
             vt_snapshot_hash: p.vt_snapshot_hash.clone(),
         });
+        // SEAM-1: banners de spawn (cascata) — precedência ABAIXO de permissão. `detail` = copy leiga
+        // ("trazer um especialista de <role>"); a UI enriquece com o nome do solicitante (model).
+        let spawns = self.spawns.iter().map(|s| AttentionItem {
+            stable_id: s.id.clone(),
+            node_id: s.requested_by.clone(),
+            kind: AttentionKind::Spawn,
+            detail: Some(format!("trazer um especialista de {} ({})", s.role, s.name)),
+            evidence: AttentionEvidence::Custody, // request estruturado (não-heurístico), como custódia
+            created_ts: s.created_ts,
+            state: state_of(s.created_ts),
+            prompt_kind: PromptKind::Yn, // y/n: deixar nascer? (gate humano)
+            vt_snapshot_hash: None,
+        });
         let mut out = round_robin_by_node(custody.collect());
         out.extend(round_robin_by_node(perms.collect()));
+        out.extend(round_robin_by_node(spawns.collect()));
         out
+    }
+
+    /// SEAM-1: comando de RECUSA de um banner de spawn pendente. Devolve o `SpawnDeclined` a apendar
+    /// (`None` se id desconhecido/já resolvido — idempotência). A APROVAÇÃO NÃO mora aqui: criar o
+    /// terminal é do app (`admit_node` + `SpawnAdmitted`, fora do core); o app ramifica por
+    /// `kind == Spawn` e re-lê o `SpawnRequested` TIPADO do log para executar.
+    #[must_use]
+    pub fn decline_spawn(&self, id: &str) -> Option<DomainEvent> {
+        self.spawns.iter().find(|s| s.id == id)?;
+        Some(DomainEvent::SpawnDeclined { id: id.to_string() })
+    }
+
+    /// SEAM-1: `true` se `id` é um banner de spawn PENDENTE (o app ramifica o gesto: aprovar → admite;
+    /// recusar → [`AttentionQueue::decline_spawn`]).
+    #[must_use]
+    pub fn is_pending_spawn(&self, id: &str) -> bool {
+        self.spawns.iter().any(|s| s.id == id)
     }
 
     /// **Driver de auto-deny (ADR 0021 §3)** — as pendências de PERMISSÃO **Yn** sem
@@ -1059,5 +1154,116 @@ mod tests {
             .map(|i| i.stable_id)
             .collect();
         assert_eq!(ids, vec!["p2"], "só a pendência não-resolvida sobrevive");
+    }
+
+    /// **SEAM-1: banner de spawn cascata.** `SpawnRequested`+`SpawnGated{cascade}` → item `Spawn`
+    /// pendente; ORIGEM (sem `SpawnGated`) NÃO vira banner; `decline_spawn` devolve `SpawnDeclined`
+    /// e, observado, tira o banner.
+    #[test]
+    fn spawn_cascade_becomes_pending_banner_and_declines() {
+        let by = uuid::Uuid::from_u128(1);
+        let mut q = AttentionQueue::new();
+
+        // ORIGEM: SpawnRequested SEM SpawnGated → NÃO é banner (auto-admite, sem gate humano).
+        q.observe(
+            &DomainEvent::SpawnRequested {
+                id: "msg_orig".into(),
+                requested_by: by,
+                name: "@A".into(),
+                role: "qa".into(),
+                root_cause_id: "msg_orig".into(),
+                hops: 0,
+                prompt: "x".into(),
+            },
+            T0,
+        );
+        assert!(
+            q.items(T0).iter().all(|i| i.kind != AttentionKind::Spawn),
+            "origem (sem SpawnGated) não vira banner"
+        );
+
+        // CASCATA: SpawnRequested + SpawnGated{cascade} → 1 banner pendente.
+        q.observe(
+            &DomainEvent::SpawnRequested {
+                id: "msg_casc".into(),
+                requested_by: by,
+                name: "@Helper".into(),
+                role: "helper".into(),
+                root_cause_id: "R".into(),
+                hops: 1,
+                prompt: "ajude".into(),
+            },
+            T0 + 1,
+        );
+        q.observe(
+            &DomainEvent::SpawnGated {
+                id: "msg_casc".into(),
+                requested_by: by,
+                reason: "cascade".into(),
+            },
+            T0 + 2,
+        );
+        let spawn: Vec<_> = q
+            .items(T0 + 3)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::Spawn)
+            .collect();
+        assert_eq!(spawn.len(), 1, "cascata → 1 banner pendente");
+        assert_eq!(spawn[0].stable_id, "msg_casc");
+        assert!(
+            spawn[0]
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("helper"),
+            "copy leiga traz o papel pedido"
+        );
+        assert!(q.is_pending_spawn("msg_casc"));
+
+        // RECUSA: decline_spawn → SpawnDeclined; observado, sai do banner.
+        let decl = q.decline_spawn("msg_casc").expect("declinável");
+        assert!(matches!(&decl, DomainEvent::SpawnDeclined { id } if id == "msg_casc"));
+        q.observe(&decl, T0 + 4);
+        assert!(!q.is_pending_spawn("msg_casc"), "recusado → sai do banner");
+    }
+
+    /// Aprovação: `SpawnAdmitted` (apendado pelo app no admit) tira o banner (resolução + dedupe M3).
+    #[test]
+    fn spawn_admitted_clears_banner() {
+        let by = uuid::Uuid::from_u128(1);
+        let node = uuid::Uuid::from_u128(2);
+        let mut q = AttentionQueue::new();
+        q.observe(
+            &DomainEvent::SpawnRequested {
+                id: "m".into(),
+                requested_by: by,
+                name: "@H".into(),
+                role: "h".into(),
+                root_cause_id: "R".into(),
+                hops: 1,
+                prompt: "p".into(),
+            },
+            T0,
+        );
+        q.observe(
+            &DomainEvent::SpawnGated {
+                id: "m".into(),
+                requested_by: by,
+                reason: "cascade".into(),
+            },
+            T0 + 1,
+        );
+        assert!(q.is_pending_spawn("m"));
+        q.observe(
+            &DomainEvent::SpawnAdmitted {
+                id: "m".into(),
+                node,
+            },
+            T0 + 2,
+        );
+        assert!(
+            !q.is_pending_spawn("m"),
+            "admitido → sai do banner (resolvido)"
+        );
     }
 }

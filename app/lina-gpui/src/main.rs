@@ -450,7 +450,10 @@ fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
 /// O canvas gpui — a ÚNICA parte que conhece o toolkit. O estado dos nós (add/remove, model,
 /// grids) vive no [`NodeManager`] gpui-free; a view só renderiza, roteia input e foca.
 struct WorkspaceView {
-    nodes: NodeManager,
+    // SEAM-1: `Arc` — o `NodeManager` (funil de admissão) é COMPARTILHADO com a `MailboxPump`/
+    // `AttentionHub` (threads gpui-free) para `SpawnApproved`/banner criarem terminais pelo MESMO
+    // funil (ADR 0022). `admit_node` é `&self`/gpui-free (estado `Arc<Mutex>`) — sharing seguro.
+    nodes: Arc<NodeManager>,
     input: Arc<dyn InputSink>,
     // `None` em produção (sem A/B semeados) → o botão ⚡ A2A nem renderiza. `Some` no demo (A→B).
     a2a: Option<Arc<A2aTrigger>>,
@@ -543,7 +546,7 @@ impl WorkspaceView {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)] // construtor único do root; os fios entram aqui.
     fn new(
-        nodes: NodeManager,
+        nodes: Arc<NodeManager>,
         input: Arc<dyn InputSink>,
         a2a: Option<Arc<A2aTrigger>>,
         focused: NodeId,
@@ -759,6 +762,11 @@ impl WorkspaceView {
     /// — nenhum byte vai ao PTY (ADR 0021 §6; o write é F1-1-8). Custódia nunca passa
     /// por aqui (o hub/core devolvem `false` — o gesto dela é o ⌘⏎ existente).
     fn attention_approve(&mut self, stable_id: &str, cx: &mut Context<Self>) {
+        // SEAM-1: um banner de SPAWN (cascata) → deixa o terminal nascer (funil único, dedupe M3).
+        if self.attention.resolve_spawn(stable_id, true) {
+            self.attention_refresh_now(cx);
+            return;
+        }
         if self.attention.resolve(
             stable_id,
             lina_core::ApprovalDecision::Approve,
@@ -770,6 +778,11 @@ impl WorkspaceView {
 
     /// Recusa uma PERMISSÃO (registro apenas — simetria do aprovar).
     fn attention_deny(&mut self, stable_id: &str, cx: &mut Context<Self>) {
+        // SEAM-1: recusar um banner de SPAWN → nada nasce (`SpawnDeclined`).
+        if self.attention.resolve_spawn(stable_id, false) {
+            self.attention_refresh_now(cx);
+            return;
+        }
         if self.attention.resolve(
             stable_id,
             lina_core::ApprovalDecision::Deny,
@@ -3414,10 +3427,21 @@ fn main() {
     // No-op quando os índices já existem. Sem isso, o usuário não-técnico fica "conectado mas vazio".
     obsidian::heal_missing_indices(&mailbox_dir);
     let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
-    let mut bootstrap =
-        BootstrapWriter::new(ws_root.clone(), vault_path, Autonomy::Assisted, lina_bin)
-            .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
-            .ok();
+    // SEAM-1 (M2): FONTE ÚNICA da autonomia do workspace — passada AO MESMO TEMPO ao `BootstrapWriter`
+    // (doutrina do bin) E ao `RouterConfig` da `MailboxPump` (enforcement do gate). `LINA_AUTONOMY`
+    // (default `assistido`, sem regressão); origem futura = `bootstrap.json`/workspace.
+    let autonomy = match std::env::var("LINA_AUTONOMY")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("manual") => Autonomy::Manual,
+        Some("autonomo" | "autonomous") => Autonomy::Autonomous,
+        _ => Autonomy::Assisted,
+    };
+    let mut bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, autonomy, lina_bin)
+        .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
+        .ok();
 
     // ── F1-1-3/F1-1-5 (wiring) · HOOKS + TIMELINE + SESSÕES — antes de qualquer write/spawn. ──
     // Listener 1x no boot; cada terminal ganha token no settings SE o perfil declarar a
@@ -3531,7 +3555,9 @@ fn main() {
     // admissão — nasce ANTES do seed do demo, para as TRÊS portas (⌘T, ⌘N e o seed) entrarem
     // pelo MESMO `admit_node`. `seq_start = 0`: o demo admite A/B pelo funil (seq 0/1 → keys
     // t0/t1); em produção o 1º ⌘T do aluno nasce como "Terminal A".
-    let nodes = NodeManager::new(
+    // SEAM-1: `Arc` — compartilhado com a `MailboxPump`/`AttentionHub` (SpawnApproved/banner criam
+    // pelo MESMO funil `admit_node`, ADR 0022). O gpui View detém um clone; as pumps, outro.
+    let nodes = Arc::new(NodeManager::new(
         Arc::clone(&pty),
         Arc::clone(&sup),
         Arc::clone(&store),
@@ -3545,7 +3571,7 @@ fn main() {
         cmd_factory,
         bootstrap,
         mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
-    );
+    ));
 
     let (focused, a2a): (NodeId, Option<Arc<A2aTrigger>>) = if demo {
         let _ = lock(&store).append(&DomainEvent::WorkspaceCreated {
@@ -3625,6 +3651,8 @@ fn main() {
             Arc::clone(&grids),
             injection_profile.approval_keys.clone(),
         ),
+        // SEAM-1: aprovar um banner de spawn na fila cria o terminal pelo MESMO funil (admit_node).
+        Arc::clone(&nodes),
     ));
     // R2b: `LINA_ATTENTION_DEMO` setado = teatro determinístico do fundador — o loop
     // VIVO de detecção desliga (demo OU real, nunca os dois; sem duplicar pedidos).
@@ -3680,6 +3708,8 @@ fn main() {
         token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)
         injection_profile,  // F1-0-2: o claude-code.toml real (fallback-com-warning no loader)
         profile_registry,   // A2A UNIVERSAL: resolve o profile do ALVO (codex/gemini/…) na entrega
+        autonomy, // SEAM-1 (M2): autonomia REAL fiada no RouterConfig (manual bloqueia spawn)
+        Arc::clone(&nodes), // SEAM-1: funil de admissão — SpawnApproved cria o terminal
     )
     .spawn();
 

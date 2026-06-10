@@ -622,6 +622,36 @@ pub struct MailboxPump {
     /// W3-7c: último `event_count` em que reconstruímos o `CostLedger` — só re-replaya quando há eventos
     /// novos (evita replay por tick quando nada mudou).
     last_cost_ec: u64,
+    /// SEAM-1: o funil de admissão (ADR 0022) — `SpawnApproved` chama `nodes.execute_spawn` aqui.
+    /// `Arc` compartilhado com o gpui View (escritor único de nós; `admit_node` é gpui-free e usa só
+    /// estado `Arc<Mutex>`, como o `deliver_fn` já muta o model cross-thread).
+    nodes: Arc<NodeManager>,
+    /// SEAM-1: spawns cujo binding de cascata (M4) + 1º prompt o pump JÁ fiou nesta sessão (keyed em
+    /// `spawn_id`). Em memória — no restart, re-fiar é idempotente (seed via P1; 1º prompt com id
+    /// determinístico → dedupe durável do ledger).
+    seeded_spawns: std::collections::HashSet<String>,
+    /// SEAM-1: `event_count` do último `post_process_spawns` — só re-varre o log quando há evento
+    /// novo (padrão do `last_cost_ec`; evita ler o log a cada tick sem mudança).
+    last_spawn_ec: u64,
+}
+
+/// SEAM-1: detalhes INFORJÁVEIS de um pedido de spawn (do `SpawnRequested`), usados por
+/// `post_process_spawns` p/ fiar o binding de cascata (M4) + o 1º prompt.
+struct SpawnReq {
+    root: String,
+    hops: u8,
+    prompt: String,
+    requested_by: Option<NodeId>,
+}
+
+/// SEAM-1 (M2): tradução `lina_bootstrap::Autonomy` → `lina_core::AutonomyLevel`. O core NÃO depende
+/// do bootstrap (o app traduz, por design — `router.rs` deixa explícito). Mapeamento 1:1.
+fn autonomy_to_level(a: lina_bootstrap::Autonomy) -> lina_core::AutonomyLevel {
+    match a {
+        lina_bootstrap::Autonomy::Manual => lina_core::AutonomyLevel::Manual,
+        lina_bootstrap::Autonomy::Assisted => lina_core::AutonomyLevel::Assisted,
+        lina_bootstrap::Autonomy::Autonomous => lina_core::AutonomyLevel::Autonomous,
+    }
 }
 
 impl MailboxPump {
@@ -647,11 +677,18 @@ impl MailboxPump {
         profile: CliProfile,
         // A2A UNIVERSAL: registry de TODOS os profiles — a entrega resolve o do ALVO por aqui.
         registry: Arc<ProfileRegistry>,
+        // SEAM-1 (M2): a autonomia REAL do workspace, FIADA no `RouterConfig` (mata o `..default()`→
+        // Assisted que deixava o ramo manual/cascata do gate de spawn FAKE em produção).
+        autonomy: lina_bootstrap::Autonomy,
+        // SEAM-1: o funil de admissão (ADR 0022) — `SpawnApproved` cria o terminal por aqui.
+        nodes: Arc<NodeManager>,
     ) -> Self {
         // W3-7c (TETO DE CUSTO): `token_budget_day > 0` ARMA o teto no Router (0 = desligado). O
         // `CostLedger` soma os `TokenUsageReported` (emitidos pela bomba) e PAUSA na transição.
+        // SEAM-1 (M2): `autonomy` REAL fiada — `Manual` agora bloqueia spawn/delegação DE FATO.
         let config = RouterConfig {
             token_budget_day,
+            autonomy: autonomy_to_level(autonomy),
             ..RouterConfig::default()
         };
         let mut router = Router::with_config(Arc::clone(&sup), mailbox, config);
@@ -672,6 +709,115 @@ impl MailboxPump {
             reinject_queue,
             last_roster: Vec::new(),
             last_cost_ec: 0,
+            nodes,
+            seeded_spawns: std::collections::HashSet::new(),
+            last_spawn_ec: 0,
+        }
+    }
+
+    /// **SEAM-1 — fia o binding de cascata (M4) + entrega o 1º prompt de spawns recém-admitidos.**
+    /// Observa `SpawnAdmitted{id, node}` no log (origem admitida pelo pump OU banner-aprovado na
+    /// thread de UI) e, para cada um ainda não fiado nesta sessão:
+    /// - **M4:** `router.seed_delivered_root(node, root, hops)` (do `SpawnRequested{id}` — INFORJÁVEL)
+    ///   → o filho NASCE com cadeia → seu `lina spawn` é CASCATA (anti-fork-bomb end-to-end);
+    /// - **1º prompt:** enfileira (do solicitante p/ o filho) com id DETERMINÍSTICO — entregue com
+    ///   segurança no próximo tick (retenção ACHADO-2 se o CLI do filho ainda não estiver pronto);
+    ///   o id determinístico + o ledger durável evitam 1º-prompt duplicado num restart.
+    ///
+    /// Só re-varre o log quando o `event_count` muda (gate `last_spawn_ec`). O `seeded_spawns`
+    /// em-memória evita re-trabalho no mesmo processo; o seed é idempotente (P1) e o 1º prompt é
+    /// deduplicado pelo ledger — re-fiar pós-restart é seguro.
+    fn post_process_spawns(&mut self, now_ms: u64) {
+        let ec = lock(&self.store).event_count().unwrap_or(0);
+        if ec == self.last_spawn_ec {
+            return; // sem evento novo → nada a fiar
+        }
+        self.last_spawn_ec = ec;
+        let recs = match lock(&self.store).events() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("lina-gpui: post_process_spawns não leu o log (re-tenta): {e}");
+                return;
+            }
+        };
+        // Indexa os pedidos por id (a fonte INFORJÁVEL de root/hops/prompt/solicitante).
+        let mut req: std::collections::HashMap<String, SpawnReq> = std::collections::HashMap::new();
+        for r in &recs {
+            if r.kind == "SpawnRequested" {
+                if let (Some(id), Some(root), Some(prompt)) = (
+                    r.payload.get("id").and_then(serde_json::Value::as_str),
+                    r.payload
+                        .get("root_cause_id")
+                        .and_then(serde_json::Value::as_str),
+                    r.payload.get("prompt").and_then(serde_json::Value::as_str),
+                ) {
+                    let hops = r
+                        .payload
+                        .get("hops")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as u8;
+                    let requested_by = r
+                        .payload
+                        .get("requested_by")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|s| s.parse().ok());
+                    req.insert(
+                        id.to_string(),
+                        SpawnReq {
+                            root: root.to_string(),
+                            hops,
+                            prompt: prompt.to_string(),
+                            requested_by,
+                        },
+                    );
+                }
+            }
+        }
+        for r in &recs {
+            if r.kind != "SpawnAdmitted" {
+                continue;
+            }
+            let Some(id) = r.payload.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if self.seeded_spawns.contains(id) {
+                continue;
+            }
+            let Some(node): Option<NodeId> = r
+                .payload
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse().ok())
+            else {
+                continue;
+            };
+            let Some(info) = req.get(id) else {
+                // SpawnAdmitted sem o SpawnRequested correspondente (log truncado?) — não fia às
+                // cegas; marca como visto p/ não re-tentar em loop.
+                self.seeded_spawns.insert(id.to_string());
+                continue;
+            };
+            // M4: binding de cascata (root/hops EFETIVOS do gate — inforjáveis).
+            self.router
+                .seed_delivered_root(node, info.root.clone(), info.hops, now_ms);
+            // 1º prompt: do solicitante p/ o filho, id determinístico (dedupe durável no ledger).
+            if let (Some(spawner), Some(child_name)) = (
+                info.requested_by.and_then(|rb| self.sup.get(rb)),
+                self.sup.get(node),
+            ) {
+                let prompt_id = format!("msg_spawn1st-{}", id.strip_prefix("msg_").unwrap_or(id));
+                let mut msg = MailMessage::new(
+                    spawner.name.clone(),
+                    child_name.name.clone(),
+                    "ask",
+                    info.prompt.clone(),
+                );
+                msg.id = prompt_id;
+                if let Err(e) = self.router.mailbox().enqueue_as(&spawner.name, &msg) {
+                    eprintln!("lina-gpui: 1º prompt do spawn {id} não enfileirado: {e}");
+                }
+            }
+            self.seeded_spawns.insert(id.to_string());
         }
     }
 
@@ -830,6 +976,32 @@ impl MailboxPump {
                 RouteOutcome::Delivered { .. } | RouteOutcome::Duplicate => routed = true,
                 RouteOutcome::Queued => {} // freio ativo: enfileirada de propósito, sem ruído
                 RouteOutcome::Presence => {} // ping de presença (handshake/broadcast): absorvido, sem ruído
+                // F1-0-4/ACHADO-2: alvo ocupado/retry é ESPERADO (não-erro) — sem ruído de "não roteada".
+                RouteOutcome::Retained { .. } | RouteOutcome::RetryBackoff { .. } => {}
+                // SEAM-1: spawn APROVADO (origem) → cria o terminal pelo FUNIL ÚNICO (idempotente M3).
+                // O binding de cascata (M4) + 1º prompt são fiados em `post_process_spawns` (abaixo),
+                // ao OBSERVAR o `SpawnAdmitted` que `execute_spawn` apenda — desacopla da thread.
+                RouteOutcome::SpawnApproved {
+                    name,
+                    role,
+                    requested_by,
+                    root_cause_id,
+                    ..
+                } => {
+                    match self
+                        .nodes
+                        .execute_spawn(root_cause_id, name, role, *requested_by)
+                    {
+                        Ok(child) => eprintln!(
+                            "lina-gpui: spawn aprovado — terminal '{name}' ({role}) NASCEU: {child}"
+                        ),
+                        Err(e) => eprintln!("lina-gpui: spawn '{name}' falhou ao admitir: {e}"),
+                    }
+                    routed = true;
+                }
+                // SEAM-1: CASCATA já está no log (`SpawnGated{cascade}`) → a fila de atenção projeta o
+                // banner (gate humano). Bloqueado (manual) é recusa terminal. Sem ruído de "não roteada".
+                RouteOutcome::SpawnGated { .. } | RouteOutcome::SpawnBlocked => {}
                 other => eprintln!("lina-gpui: mensagem {id} não roteada: {other:?}"),
             }
         }
@@ -841,6 +1013,9 @@ impl MailboxPump {
             }
             m.touch();
         }
+        // SEAM-1: fia o binding de cascata (M4) + o 1º prompt de spawns recém-admitidos (origem aqui
+        // OU banner-aprovado na thread de UI) — pelo router/mailbox, dos quais o pump é dono único.
+        self.post_process_spawns(now_ms());
         // F1-2-4: entrega as re-injeções de doutrina represadas (respeita o freio: pausado = não drena).
         self.drain_reinject();
         self.refresh_cost_paused();
@@ -1623,6 +1798,10 @@ pub struct AttentionHub {
     /// F1-1-8 (ADR 0024): a porta de escrita validada. O executor é reconstruído do LOG a cada
     /// gesto/auto-deny (binding `node_of` + dedup vêm do log, JAMAIS de campo da UI/fila).
     approval: ApprovalWiring,
+    /// SEAM-1: o funil de admissão (ADR 0022). APROVAR um banner de spawn → `nodes.execute_spawn`
+    /// (cria o terminal, idempotente M3); a `MailboxPump` fia o binding + 1º prompt ao observar o
+    /// `SpawnAdmitted`. `Arc` compartilhado com o gpui View/pump.
+    nodes: Arc<NodeManager>,
 }
 
 impl AttentionHub {
@@ -1634,6 +1813,8 @@ impl AttentionHub {
         desk: Desk,
         model: Model,
         approval: ApprovalWiring,
+        // SEAM-1: o funil de admissão — aprovar um banner de spawn cria o terminal por aqui.
+        nodes: Arc<NodeManager>,
     ) -> Self {
         let (queue, ec) = {
             let s = lock(&store);
@@ -1651,7 +1832,68 @@ impl AttentionHub {
             last_ec: Mutex::new(ec),
             custody_seen: Mutex::new(BTreeMap::new()),
             approval,
+            nodes,
         }
+    }
+
+    /// **SEAM-1 — decisão humana sobre um BANNER de spawn (cascata).** `approve` → cria o terminal
+    /// pelo funil único (`execute_spawn`, idempotente M3); a `MailboxPump` fia o binding de cascata
+    /// (M4) + 1º prompt ao observar o `SpawnAdmitted`. `!approve` → apenda `SpawnDeclined` (nada
+    /// nasce). `false` se `id` não é um banner de spawn pendente (idempotência: 2º clique é no-op).
+    /// O nome/papel/solicitante vêm do `SpawnRequested{id}` no LOG (INFORJÁVEL — nunca campo da UI).
+    pub fn resolve_spawn(&self, id: &str, approve: bool) -> bool {
+        // Só age sobre um banner de spawn PENDENTE (a fila é a autoridade do que está aberto).
+        if !lock(&self.queue).is_pending_spawn(id) {
+            return false;
+        }
+        if !approve {
+            if let Err(e) = lock(&self.store).append(&DomainEvent::SpawnDeclined { id: id.into() })
+            {
+                eprintln!("lina-gpui: SpawnDeclined({id}) não logado: {e}");
+                return false;
+            }
+            return true;
+        }
+        // APROVA: re-lê o pedido TIPADO do log (name/role/requested_by inforjáveis) e admite.
+        let Some((name, role, requested_by)) = self.spawn_request_of(id) else {
+            eprintln!(
+                "lina-gpui: banner de spawn {id} sem SpawnRequested no log — não admito às cegas"
+            );
+            return false;
+        };
+        match self.nodes.execute_spawn(id, &name, &role, requested_by) {
+            Ok(child) => {
+                eprintln!(
+                    "lina-gpui: banner aprovado — terminal '{name}' ({role}) NASCEU: {child}"
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("lina-gpui: banner de spawn '{name}' falhou ao admitir: {e}");
+                false
+            }
+        }
+    }
+
+    /// SEAM-1: `(name, role, requested_by)` do `SpawnRequested{id}` no log (último vence). INFORJÁVEL
+    /// — a identidade do solicitante é o `requested_by` carimbado pelo gate, nunca um campo da UI.
+    fn spawn_request_of(&self, id: &str) -> Option<(String, String, NodeId)> {
+        let recs = lock(&self.store).events().ok()?;
+        recs.iter().rev().find_map(|r| {
+            if r.kind != "SpawnRequested"
+                || r.payload.get("id").and_then(serde_json::Value::as_str) != Some(id)
+            {
+                return None;
+            }
+            let name = r.payload.get("name").and_then(serde_json::Value::as_str)?;
+            let role = r.payload.get("role").and_then(serde_json::Value::as_str)?;
+            let rb = r
+                .payload
+                .get("requested_by")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse().ok())?;
+            Some((name.to_string(), role.to_string(), rb))
+        })
     }
 
     /// Sincroniza e devolve a fila ORDENADA para exibição: (1) evento novo no log →
@@ -3053,6 +3295,10 @@ pub struct NodeAdmission {
     pub cwd: CwdPolicy,
     /// Posição FIXA no canvas (porta seed/demo); `None` = próximo slot livre.
     pub position: Option<(f64, f64)>,
+    /// SEAM-1 (F1-3-6): NodeId do agente que PEDIU este spawn (`lina spawn`). `None` nas portas de
+    /// ORIGEM HUMANA (⌘T/seed). `Some(spawner)` na admissão de spawn agente-pede → carimba
+    /// `NodeAdded.requested_by` (auditoria intent-vs-action + base do anti-fork-bomb).
+    pub requested_by: Option<NodeId>,
 }
 
 impl NodeAdmission {
@@ -3069,6 +3315,7 @@ impl NodeAdmission {
                 path: user_home_dir(),
             },
             position: None,
+            requested_by: None,
         }
     }
 
@@ -3081,6 +3328,27 @@ impl NodeAdmission {
             engine: None,
             cwd: CwdPolicy::Managed,
             position: Some((x, y)),
+            requested_by: None,
+        }
+    }
+
+    /// **SEAM-1: porta de SPAWN agente-pede** (`lina spawn` aprovado, origem OU banner-aprovado). O
+    /// terminal nasce gerenciado (cwd `Managed` → kit/doutrina do papel), com `requested_by` =
+    /// spawner (carimba `NodeAdded.requested_by` p/ auditoria + anti-fork-bomb). O `engine` default
+    /// (`None`) usa a fábrica do workspace — mesma do ⌘T.
+    #[must_use]
+    pub fn spawned_agent(
+        name: impl Into<String>,
+        role: impl Into<String>,
+        requested_by: NodeId,
+    ) -> Self {
+        Self {
+            name: Some(name.into()),
+            role: role.into(),
+            engine: None,
+            cwd: CwdPolicy::Managed,
+            position: None,
+            requested_by: Some(requested_by),
         }
     }
 }
@@ -3090,6 +3358,7 @@ impl NodeAdmission {
 /// `TerminalSpawned { cli, cwd REAL }` + `NodeRoleAssigned` SEMPRE + `CliProfileSet`
 /// quando o profile é conhecido. Qualquer porta de admissão produz EXATAMENTE isto,
 /// módulo parâmetros.
+#[allow(clippy::too_many_arguments)] // espelho 1:1 dos campos da admissão (sequência canônica ADR 0022)
 fn admission_events(
     node: NodeId,
     x: f64,
@@ -3098,6 +3367,8 @@ fn admission_events(
     role: &str,
     engine: Option<&AgentEngine>,
     cwd: Option<&Path>,
+    // SEAM-1: quem PEDIU o spawn (`Some` na porta agente-pede; `None` na origem humana ⌘T/seed).
+    requested_by: Option<NodeId>,
 ) -> Vec<DomainEvent> {
     let mut events = vec![
         DomainEvent::NodeAdded {
@@ -3105,8 +3376,8 @@ fn admission_events(
             kind: "Terminal".into(),
             x,
             y,
-            // Admissão de ORIGEM HUMANA (UI/admit_node) — `requested_by` é só p/ spawn agente-pede (F1-3-6).
-            requested_by: None,
+            // SEAM-1 (F1-3-6): `Some(spawner)` p/ spawn agente-pede; `None` p/ origem humana.
+            requested_by,
         },
         DomainEvent::TerminalSpawned {
             node,
@@ -3429,7 +3700,9 @@ impl NodeManager {
     /// biblioteca varrendo o log). Idioma de erro do [`Self::create_agent_with`]: mensagem
     /// LEIGA no `Err`, detalhe técnico no stderr.
     pub fn save_role_template(
-        &mut self,
+        // SEAM-1: `&self` (era `&mut self` desnecessário) — só apenda via `store` (Arc<Mutex>,
+        // mutabilidade interior); destrava o uso por `Arc<NodeManager>` compartilhado.
+        &self,
         name: &str,
         description: &str,
         doctrine: &str,
@@ -3537,6 +3810,7 @@ impl NodeManager {
                 None => CwdPolicy::Managed,
             },
             position: None,
+            requested_by: None, // criação pelo modal humano (⌘N) — não é spawn agente-pede
         })
     }
 
@@ -3732,6 +4006,7 @@ impl NodeManager {
             &role,
             plan.engine.as_ref(),
             cwd_real.as_deref(),
+            plan.requested_by, // SEAM-1: carimba quem pediu o spawn (None na origem humana)
         );
         let count = {
             let mut s = lock(&self.store);
@@ -3780,6 +4055,57 @@ impl NodeManager {
                 .map_or_else(|| "herdado".to_string(), |p| p.display().to_string())
         );
         Ok(node)
+    }
+
+    /// **SEAM-1 (M3) — executa um spawn aprovado pelo funil único, idempotente por `spawn_id`.**
+    /// Admite o terminal com `requested_by` carimbado (auditoria + anti-fork-bomb) e apenda
+    /// `SpawnAdmitted{spawn_id, node}` (a chave de DEDUPE DURÁVEL). Se o spawn JÁ foi admitido
+    /// (replay/re-drain/banner re-aprovado), devolve o nó existente SEM criar um 2º terminal. O
+    /// binding de cascata (M4 `seed_delivered_root`) e o 1º prompt são fiados pela `MailboxPump`
+    /// (dona do router/mailbox) ao OBSERVAR o `SpawnAdmitted` — desacopla a criação (qualquer thread)
+    /// da fiação do router (thread do pump).
+    ///
+    /// # Errors
+    /// Propaga o `Err` do funil `admit_node` (nome/papel inválido, falha de PTY/persistência).
+    pub fn execute_spawn(
+        &self,
+        spawn_id: &str,
+        name: &str,
+        role: &str,
+        requested_by: NodeId,
+    ) -> Result<NodeId, String> {
+        // M3 — dedupe DURÁVEL: este spawn já virou terminal? (SpawnAdmitted no log) → no-op.
+        if let Some(existing) = self.admitted_node_for_spawn(spawn_id) {
+            return Ok(existing);
+        }
+        let child = self.admit_node(NodeAdmission::spawned_agent(name, role, requested_by))?;
+        if let Err(e) = lock(&self.store).append(&DomainEvent::SpawnAdmitted {
+            id: spawn_id.to_string(),
+            node: child,
+        }) {
+            // O terminal já nasceu (irreversível); sem o marcador durável o dedupe degrada para o
+            // tick — ALTO e VISÍVEL, nunca silencioso (inv #4).
+            eprintln!(
+                "lina-gpui: CRÍTICO — spawn {spawn_id} admitido (node {child}) mas SpawnAdmitted NÃO logado: {e}"
+            );
+        }
+        Ok(child)
+    }
+
+    /// M3: o `NodeId` já admitido para `spawn_id` (varre `SpawnAdmitted` no log), se houver.
+    fn admitted_node_for_spawn(&self, spawn_id: &str) -> Option<NodeId> {
+        let recs = lock(&self.store).events().ok()?;
+        recs.iter().rev().find_map(|r| {
+            if r.kind != "SpawnAdmitted"
+                || r.payload.get("id").and_then(serde_json::Value::as_str) != Some(spawn_id)
+            {
+                return None;
+            }
+            r.payload
+                .get("node")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| s.parse().ok())
+        })
     }
 
     /// REMOVE um nó: **persiste `NodeRemoved` primeiro** (event log = fonte da verdade; se
@@ -5070,6 +5396,8 @@ mod tests {
             0,                                // teto de custo desligado neste teste (freio/pulso)
             demo_profile(), // perfil demo: os grids de teste já têm linha-prompt semeada
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
+            Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
+            test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
         );
         let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -5235,6 +5563,8 @@ mod tests {
             0,
             demo_profile(),
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
+            Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
+            test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -5442,6 +5772,8 @@ mod tests {
             0,
             demo_profile(),
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
+            Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
+            test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -5547,6 +5879,8 @@ mod tests {
             100,
             demo_profile(),
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
+            Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
+            test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
         );
         let outbox = Mailbox::new(&mailbox_root);
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -5726,6 +6060,33 @@ mod tests {
         (nm, store, model)
     }
 
+    /// SEAM-1: `Arc<NodeManager>` de teste compartilhando o `store` dado — para os testes do
+    /// `AttentionHub` (permissão/custódia, que NÃO exercitam spawn): só satisfaz o tipo. Se um teste
+    /// chamar `resolve_spawn`, o `execute_spawn` opera sobre o MESMO log do hub (store compartilhado).
+    fn test_nodes(store: Arc<Mutex<EventStore>>) -> Arc<NodeManager> {
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _rx) = std::sync::mpsc::channel::<GridDelta>();
+        let cmd_factory: CmdFactory = Arc::new(|_n: &str| PtyCommand::new("cat"));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        Arc::new(NodeManager::new(
+            pty,
+            sup,
+            store,
+            model,
+            grids,
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            cmd_factory,
+            None,
+            std::env::temp_dir().join("lina-test-nodes"),
+        ))
+    }
+
     /// **Harness do funil de cwd ÚNICO (ADR 0022 §4 / fix do slot reciclável):** um
     /// `NodeManager` com `ws_root`, `store_dir` e `seq_start` EXPLÍCITOS — para simular DOIS
     /// boots (duas "sessões") sobre o MESMO workspace, ambos com `seq` reiniciado em 0 (como
@@ -5864,6 +6225,7 @@ mod tests {
                 Arc::clone(&grids),
                 ApprovalKeys::default(),
             ),
+            test_nodes(Arc::clone(&store)),
         ));
         let mut pump = spawn_pump(
             GpuiBridgeHost::new(Arc::clone(&model)),
@@ -6911,8 +7273,130 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             ApprovalKeys::default(),
         );
-        let hub = AttentionHub::new(store, Arc::clone(&desk), model, wiring);
+        let nodes = test_nodes(Arc::clone(&store));
+        let hub = AttentionHub::new(store, Arc::clone(&desk), model, wiring, nodes);
         (hub, desk, base)
+    }
+
+    /// SEAM-1 (M2): a tradução `Autonomy → AutonomyLevel` é 1:1 (o que fia o gate manual/cascata no
+    /// `RouterConfig` de produção; o core já prova `RouterConfig{Manual} → SpawnBlocked`).
+    #[test]
+    fn autonomy_conversion_is_one_to_one() {
+        assert_eq!(
+            autonomy_to_level(Autonomy::Manual),
+            lina_core::AutonomyLevel::Manual
+        );
+        assert_eq!(
+            autonomy_to_level(Autonomy::Assisted),
+            lina_core::AutonomyLevel::Assisted
+        );
+        assert_eq!(
+            autonomy_to_level(Autonomy::Autonomous),
+            lina_core::AutonomyLevel::Autonomous
+        );
+    }
+
+    /// **SEAM-1 (banner + M3, app-side end-to-end):** um spawn CASCATA (`SpawnRequested`+`SpawnGated
+    /// {cascade}` no log) vira banner pendente; APROVAR → 1 terminal NASCE (NodeAdded{requested_by}+
+    /// SpawnAdmitted) pelo funil único; RE-APROVAR → dedupe DURÁVEL (M3) → SEM 2º terminal; um outro
+    /// spawn RECUSADO → `SpawnDeclined`, nada nasce.
+    #[test]
+    fn attention_hub_spawn_banner_approves_once_and_declines() {
+        let base = std::env::temp_dir().join(format!("lina-spawn-banner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let wiring = ApprovalWiring::new(
+            Arc::new(Supervisor::new()),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            ApprovalKeys::default(),
+        );
+        let nodes = test_nodes(Arc::clone(&store));
+        let hub = AttentionHub::new(
+            Arc::clone(&store),
+            Arc::clone(&desk),
+            Arc::clone(&model),
+            wiring,
+            Arc::clone(&nodes),
+        );
+        let spawner = uuid::Uuid::from_u128(1);
+        let push = |id: &str, name: &str| {
+            let mut s = lock(&store);
+            s.append(&DomainEvent::SpawnRequested {
+                id: id.into(),
+                requested_by: spawner,
+                name: name.into(),
+                role: "qa".into(),
+                root_cause_id: "R".into(),
+                hops: 1,
+                prompt: "valide o checkout".into(),
+            })
+            .unwrap();
+            s.append(&DomainEvent::SpawnGated {
+                id: id.into(),
+                requested_by: spawner,
+                reason: "cascade".into(),
+            })
+            .unwrap();
+        };
+        let admitted = |id: &str| {
+            lock(&store)
+                .events()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.kind == "SpawnAdmitted" && r.payload["id"].as_str() == Some(id))
+                .count()
+        };
+
+        // Cascata → banner pendente (após sync).
+        push("msg_a", "@QA");
+        assert!(
+            hub.sync(1000)
+                .iter()
+                .any(|i| i.kind == lina_core::AttentionKind::Spawn && i.stable_id == "msg_a"),
+            "SpawnGated{{cascade}} vira banner pendente"
+        );
+
+        // APROVA → 1 terminal nasce (SpawnAdmitted + NodeAdded com requested_by).
+        assert!(
+            hub.resolve_spawn("msg_a", true),
+            "aprovação executa o spawn"
+        );
+        assert_eq!(admitted("msg_a"), 1, "1 SpawnAdmitted (1 terminal)");
+        let req_by_stamped = lock(&store).events().unwrap().into_iter().any(|r| {
+            r.kind == "NodeAdded"
+                && r.payload.get("requested_by").and_then(|v| v.as_str())
+                    == Some(spawner.to_string().as_str())
+        });
+        assert!(
+            req_by_stamped,
+            "NodeAdded carimba requested_by = solicitante"
+        );
+
+        // RE-APROVA (queue ainda acha pendente sem re-sync) → M3 dedupe DURÁVEL: SEM 2º terminal.
+        let _ = hub.resolve_spawn("msg_a", true);
+        assert_eq!(admitted("msg_a"), 1, "M3: re-aprovar NÃO cria 2º terminal");
+
+        // Outro spawn → RECUSA → SpawnDeclined, nada admitido.
+        push("msg_b", "@Helper");
+        hub.sync(2000);
+        assert!(
+            hub.resolve_spawn("msg_b", false),
+            "recusa registra a decisão"
+        );
+        assert!(
+            lock(&store)
+                .events()
+                .unwrap()
+                .into_iter()
+                .any(|r| r.kind == "SpawnDeclined" && r.payload["id"].as_str() == Some("msg_b")),
+            "recusa apenda SpawnDeclined"
+        );
+        assert_eq!(admitted("msg_b"), 0, "recusado → nada nasce");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn ask_event(sid: &str, node: &str, detail: &str) -> DomainEvent {
@@ -7040,7 +7524,8 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             ApprovalKeys::default(),
         );
-        let hub2 = AttentionHub::new(store, desk, model, wiring);
+        let nodes = test_nodes(Arc::clone(&store));
+        let hub2 = AttentionHub::new(store, desk, model, wiring, nodes);
         let items = hub2.sync(2_000);
         assert_eq!(items.len(), 1, "pendência reconstruída do log");
         assert_eq!(items[0].stable_id, "s1");
@@ -7117,7 +7602,8 @@ mod tests {
         lock(&grids).insert(node, Arc::clone(&grid));
 
         let wiring = ApprovalWiring::new(Arc::clone(&sup), grids, ApprovalKeys::default());
-        let hub = AttentionHub::new(store, desk, model, wiring);
+        let nodes = test_nodes(Arc::clone(&store));
+        let hub = AttentionHub::new(store, desk, model, wiring, nodes);
         (hub, buf, captura1, grid, base)
     }
 
@@ -7358,7 +7844,13 @@ mod tests {
             Arc::new(Mutex::new(BTreeMap::new())),
             ApprovalKeys::default(),
         );
-        let hub = AttentionHub::new(Arc::clone(&store), desk, model, wiring);
+        let hub = AttentionHub::new(
+            Arc::clone(&store),
+            desk,
+            model,
+            wiring,
+            test_nodes(Arc::clone(&store)),
+        );
         let t0 = 3_000_000_u64;
         watch.note_output(node, t0);
 
@@ -8243,6 +8735,7 @@ mod tests {
                 engine: None,
                 cwd: CwdPolicy::UserHome { path: home.clone() },
                 position: None,
+                requested_by: None,
             })
             .expect("admite o terminal puro");
 

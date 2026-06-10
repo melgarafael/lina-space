@@ -605,6 +605,62 @@ impl Router {
                             },
                         );
                     }
+                    // SEAM-2 (R1): roteada + RETIDA por not-ready, sem entrega/DLQ/falha → RE-RETÉM
+                    // (inv#4: mensagem viva não evapora num restart). Re-semeia a entrada de RETENÇÃO
+                    // (`attempts:0`) no motor de re-entrega e RESTAURA o relógio de retenção do LOG
+                    // (`retained_at`) → o backstop de 600 s conta o tempo TOTAL (não reinicia). Em
+                    // produção o `ts` do log e o `now_ms` do pump são o MESMO relógio (wall-clock), então
+                    // a contagem é correta. `process_due_retries` re-checa a prontidão e entrega 1×
+                    // (dedupe via `MessageDelivered`) ou DLQ no teto. (Vem ANTES do `Some(_)`
+                    // assume-entregue — é o que fecha o R1.)
+                    Some(l) if l.retained_at.is_some() => {
+                        let Some(target) = l.to_node else {
+                            // Sem alvo single-node reconstruível → conservador (D1): ack.
+                            let _ = self.mailbox.ack_inflight(&m.id);
+                            return (m.id, RouteOutcome::Duplicate);
+                        };
+                        let Some(from) = self.sup.node_by_name(&m.from) else {
+                            // Remetente saiu do roster — sem atribuição correta: DLQ legível (nada some).
+                            let out = self.dead_letter_now(
+                                &m,
+                                store,
+                                "remetente fora do roster ao retomar a retencao pos-restart"
+                                    .to_string(),
+                            );
+                            if matches!(out, RouteOutcome::DeadLettered { .. }) {
+                                let _ = self.mailbox.ack_inflight(&m.id);
+                            }
+                            return (m.id, out);
+                        };
+                        let block = render_message_block_v2(
+                            &m.id,
+                            &m.from,
+                            &m.to,
+                            &m.intent,
+                            &m.payload,
+                            &l.root,
+                            l.hops,
+                            m.contract.as_ref(),
+                        );
+                        // Relógio de retenção DURÁVEL: do log (instante original), não de `now_ms` —
+                        // assim o teto conta o tempo TOTAL e não reinicia a cada restart.
+                        self.retained_since
+                            .entry(m.id.clone())
+                            .or_insert_with(|| l.retained_at.unwrap_or(now_ms));
+                        self.retries.insert(
+                            m.id.clone(),
+                            RetryState {
+                                from,
+                                target,
+                                block,
+                                root: l.root.clone(),
+                                hops: l.hops,
+                                attempts: 0, // RETENÇÃO (não falha) — jamais strike
+                                next_ms: now_ms.saturating_add(NOT_READY_BACKOFF_MS),
+                            },
+                        );
+                        return (m.id, RouteOutcome::Retained { to: target });
+                    }
                     // Roteada SEM evento de entrega/falha (a janela A6 original: crash
                     // entre rotear e o desfecho da injeção) → CONSERVADOR como o D1
                     // histórico: assume entregue (re-injetar é irreversível; documentado).
@@ -1603,6 +1659,27 @@ impl Router {
         }
     }
 
+    /// **SEAM-1 (M4) — semeia o binding `delivered_root` de um nó RECÉM-ADMITIDO** (o filho de um
+    /// `lina spawn`), para o anti-fork-bomb valer END-TO-END. Sem isto, `admit_node` (que NÃO passa
+    /// por `route_message`) cria o filho SEM binding → seu próprio `lina spawn @neto` seria ORIGEM
+    /// (`derive_root_hops` devolve `(msg.id, 0)`) e escaparia do gate de cascata. Com o binding
+    /// semeado pelo `(root, hops)` EFETIVOS do spawn (de `SpawnApproved.root_cause_id`/`SpawnRequested.hops`
+    /// — INFORJÁVEIS, do gate), `derive_root_hops(filho)` devolve `hops+1 >= 1` → CASCATA → gate humano.
+    ///
+    /// **Segurança:** o app passa `root`/`hops` que NASCERAM no binding inforjável do gate (jamais
+    /// campo de agente) — não reabre forja. Respeita a defesa P1 (anti-envenenamento, igual
+    /// `route_message`): NÃO sobrescreve um binding VIVO de root DIFERENTE. Para um nó recém-criado
+    /// não há binding → insere; o guard é defesa em profundidade (re-seed idempotente).
+    pub fn seed_delivered_root(&mut self, node: NodeId, root: String, hops: u8, now_ms: u64) {
+        let keep_existing = matches!(
+            self.delivered_root.get(&node),
+            Some((existing, _, _)) if *existing != root
+        );
+        if !keep_existing {
+            self.delivered_root.insert(node, (root, hops, now_ms));
+        }
+    }
+
     /// **W3-7b (ADR 0002) + Round 4: fecha o `await` se `msg` é o REPLY AUTENTICADO casado.** Devolve
     /// `true` SE e só se: (1) `msg.reply_to` casou um ticket REAL em `pending`, (2) o `sender` (já
     /// resolvido pelo supervisor) é o `target` que o waiter aguardava, e (3) o `to` da resposta é o
@@ -1785,6 +1862,8 @@ impl Router {
             role: role.clone(),
             root_cause_id: root.clone(),
             hops,
+            // SEAM-1: o 1º prompt entra no log para o banner de um spawn GATED ser reconstruível.
+            prompt: prompt.clone(),
         }) {
             return RouteOutcome::PersistFailed(e.to_string());
         }
@@ -1998,6 +2077,13 @@ struct LedgerEntry {
     dead: bool,
     /// Última falha: (attempt, next_retry_ms) — o agendamento sobrevive ao restart.
     failed: Option<(u32, u64)>,
+    /// **SEAM-2 (R1):** `ts` do 1º `MessageRetained{prompt_not_ready}` desta msg (instante REAL
+    /// da retenção, do log) — `Some` ⇒ roteada+retida-por-not-ready. Torna a retenção DURÁVEL: o
+    /// pump re-semeia o motor de re-entrega (em vez de "roteada-sem-entrega ⇒ assume entregue"),
+    /// e o backstop de retenção conta o tempo TOTAL desde aqui (não reinicia no restart). A
+    /// retenção por `target_busy` retorna ANTES do `MessageRouted` (sem entrada no ledger → não
+    /// afetada). `Option` (não `bool`) porque o instante é necessário para restaurar o relógio.
+    retained_at: Option<u64>,
 }
 
 fn delivery_ledger(store: &EventStore) -> HashMap<String, LedgerEntry> {
@@ -2040,7 +2126,21 @@ fn delivery_ledger(store: &EventStore) -> HashMap<String, LedgerEntry> {
                     delivered: false,
                     dead: false,
                     failed: None,
+                    retained_at: None,
                 });
+            }
+            // SEAM-2 (R1): retenção por not-ready (logada DEPOIS do `MessageRouted`) marca a entrada
+            // como PENDENTE-RETIDA com o instante REAL — sem isto o restart cairia no braço
+            // "roteada-sem-entrega ⇒ assume entregue" e DROPARIA a msg viva. Só `prompt_not_ready`
+            // (a retenção `target_busy` retorna antes do `MessageRouted` ⇒ sem entrada aqui). 1º vence
+            // (anti-amplificação A4 já garante 1× no log; `or` defensivo se houver replays).
+            "MessageRetained"
+                if rec.payload.get("reason").and_then(|v| v.as_str())
+                    == Some("prompt_not_ready") =>
+            {
+                if let Some(e) = out.get_mut(&id) {
+                    e.retained_at.get_or_insert(rec.ts);
+                }
             }
             "MessageDelivered" => {
                 if let Some(e) = out.get_mut(&id) {
@@ -5164,6 +5264,284 @@ mod tests {
             .filter(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
             .count();
         assert_eq!(delivered, 1, "entregue exatamente 1× quando o turno acabou");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────── SEAM-2 (R1): retenção por not-ready é DURÁVEL no restart (inv#4) ───────
+
+    /// **SEAM-2 (R1) — critério (a), NÃO-VACUOSO.** Roteia → retém (not-ready) → "restart"
+    /// (Router NOVO sobre o MESMO store+mailbox, `self.retries` em memória zerado) → a mensagem VIVA
+    /// é RE-RETIDA (não cai no braço "roteada-sem-entrega ⇒ assume entregue ⇒ ack ⇒ DROP" do ledger)
+    /// e, quando o alvo fica pronto, entregue EXATAMENTE 1× (dedupe). RED (pré-fix): o restart
+    /// retornava `Duplicate` (assumia entregue) e ackeava o `.inflight` — a msg evaporava.
+    #[test]
+    fn retained_not_ready_survives_restart_and_delivers_once() {
+        let (mut router, sup, dir) = router_with("seam2-a");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b); // lifecycle Idle; o grid (deliver) é quem diz não-pronto
+        let mut ts = TmpStore::new("seam2-a");
+        let mut not_ready = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: false,
+                bracketed: false,
+            })
+        };
+
+        let m = MailMessage::new("@A", "@B", "ask", "viva no crash");
+        router.mailbox().enqueue_as("@A", &m).expect("enqueue");
+        let out1 = router.pump(&mut ts.store, 1000, &mut not_ready);
+        assert_eq!(
+            out1,
+            vec![(m.id.clone(), RouteOutcome::Retained { to: b })],
+            "pré-restart: retida (not-ready)"
+        );
+        let infl = router
+            .mailbox()
+            .inflight_dir()
+            .join(format!("{}.json", m.id));
+        assert!(
+            infl.exists(),
+            "retida fica DURÁVEL no .inflight (não ackeada)"
+        );
+
+        // "Restart": descarta o Router (perde self.retries em memória); um NOVO sobre o MESMO log+mailbox.
+        drop(router);
+        let mut router2 = Router::new(Arc::clone(&sup), Mailbox::new(dir.join(".lina")));
+        let r1 = router2.pump(&mut ts.store, 2000, &mut not_ready);
+        assert_eq!(
+            r1,
+            vec![(m.id.clone(), RouteOutcome::Retained { to: b })],
+            "pós-restart: RE-RETIDA (NÃO 'Duplicate'=assume-entregue=dropada) — o fix do R1"
+        );
+        assert!(
+            router2.retries.contains_key(&m.id),
+            "re-semeada no motor de re-entrega a partir do ledger"
+        );
+        assert!(
+            infl.exists(),
+            "segue DURÁVEL no .inflight pós-restart (NÃO ackeada/dropada)"
+        );
+        assert!(
+            records_of_kind(&ts.store, "MessageDelivered").is_empty(),
+            "ainda não entregue (alvo segue não-pronto)"
+        );
+
+        // Alvo fica pronto após o backoff → entrega 1× e limpa (o ciclo retoma exatamente como sem crash).
+        let mut ready = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true,
+            })
+        };
+        router2.process_due_retries(&mut ts.store, 2000 + NOT_READY_BACKOFF_MS + 1, &mut ready);
+        assert!(
+            !router2.retries.contains_key(&m.id),
+            "entregue → entrada removida do motor"
+        );
+        let delivered = records_of_kind(&ts.store, "MessageDelivered")
+            .into_iter()
+            .filter(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "entregue EXATAMENTE 1× após o restart (sem duplicar)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **SEAM-2 (R1) — critério (b), CONTROLE de não-regressão + ordem dos braços.** Uma msg cuja
+    /// entrega JÁ foi LOGADA (`MessageDelivered`) — mesmo que o `.inflight` ainda exista (crash entre
+    /// logar e ackear) — NÃO é re-retida nem re-entregue no restart: o braço "entregue" do ledger
+    /// vence o de "retida". Garante que o fix do R1 não ressuscita mensagem já entregue (anti
+    /// re-injeção irreversível, D1).
+    #[test]
+    fn delivered_before_restart_is_not_re_retained() {
+        let (mut router, sup, dir) = router_with("seam2-b");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b);
+        let mut ts = TmpStore::new("seam2-b");
+        let mut not_ready = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: false,
+                bracketed: false,
+            })
+        };
+
+        // Retém (MessageRouted + MessageRetained no log; msg DURÁVEL no .inflight).
+        let m = MailMessage::new("@A", "@B", "ask", "ja entregue");
+        router.mailbox().enqueue_as("@A", &m).expect("enqueue");
+        let _ = router.pump(&mut ts.store, 1000, &mut not_ready);
+        let infl = router
+            .mailbox()
+            .inflight_dir()
+            .join(format!("{}.json", m.id));
+        assert!(infl.exists(), "retida no .inflight");
+        // Simula: o alvo ficou pronto, a entrega foi LOGADA, mas o crash veio ANTES do ack
+        // (a msg segue no .inflight com `MessageDelivered` no log — o estado-limite do ledger).
+        ts.store
+            .append(&DomainEvent::MessageDelivered {
+                id: m.id.clone(),
+                to: b,
+            })
+            .expect("append delivered");
+
+        drop(router);
+        let mut router2 = Router::new(Arc::clone(&sup), Mailbox::new(dir.join(".lina")));
+        let calls = Rc::new(RefCell::new(0u32));
+        let c2 = Rc::clone(&calls);
+        let mut counting = move |_t: NodeId, _f: NodeId, _x: &str| {
+            *c2.borrow_mut() += 1;
+            Ok(DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true,
+            })
+        };
+        let r = router2.pump(&mut ts.store, 2000, &mut counting);
+        assert_eq!(
+            r,
+            vec![(m.id.clone(), RouteOutcome::Duplicate)],
+            "entregue-no-log ⇒ no-op (ack), NÃO re-retida (braço 'entregue' vence 'retida')"
+        );
+        assert!(
+            router2.retries.is_empty(),
+            "NÃO re-semeia uma msg já entregue (ordem dos braços do ledger)"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            0,
+            "ZERO re-entrega (anti re-injeção irreversível)"
+        );
+        assert!(!infl.exists(), "resolvida no restart → .inflight ackeado");
+        let delivered = records_of_kind(&ts.store, "MessageDelivered")
+            .into_iter()
+            .filter(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
+            .count();
+        assert_eq!(delivered, 1, "segue 1 entrega (sem duplicar pós-restart)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **SEAM-2 (R1) — critério (c), NÃO-VACUOSO.** O backstop de 600 s (DLQ) conta o tempo TOTAL
+    /// desde a retenção ORIGINAL (restaurado do `ts` do `MessageRetained` no log), NÃO reinicia no
+    /// restart. Sem isso, uma sequência de restarts adiaria a DLQ para sempre. Distingue da escolha
+    /// "reseta no restart": se o relógio reiniciasse, no instante testado NÃO haveria DLQ.
+    #[test]
+    fn retention_backstop_counts_total_time_across_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-router-mb-seam2c-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sup = Arc::new(Supervisor::new());
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b);
+        let mk_cfg = || RouterConfig {
+            retention_timeout_ms: 5_000, // > NOT_READY_BACKOFF_MS (2s) para a re-checagem ficar devida
+            ..RouterConfig::default()
+        };
+        let mut router =
+            Router::with_config(Arc::clone(&sup), Mailbox::new(dir.join(".lina")), mk_cfg());
+        let mut ts = TmpStore::new("seam2-c");
+        let mut not_ready = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: false,
+                bracketed: false,
+            })
+        };
+
+        let m = MailMessage::new("@A", "@B", "ask", "espera longa");
+        router.mailbox().enqueue_as("@A", &m).expect("enqueue");
+        let _ = router.pump(&mut ts.store, 1000, &mut not_ready);
+        // `ts` do MessageRetained = instante REAL (wall-clock) da retenção original — a âncora durável.
+        let rt = records_of_kind(&ts.store, "MessageRetained")
+            .into_iter()
+            .find(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
+            .expect("MessageRetained logado")
+            .ts;
+
+        // "Restart" ~4 s após a retenção original (tempo PASSOU antes do crash).
+        drop(router);
+        let mut router2 =
+            Router::with_config(Arc::clone(&sup), Mailbox::new(dir.join(".lina")), mk_cfg());
+        let r = router2.pump(&mut ts.store, rt + 4_000, &mut not_ready);
+        assert_eq!(
+            r,
+            vec![(m.id.clone(), RouteOutcome::Retained { to: b })],
+            "re-retida no restart (relógio de retenção restaurado do log)"
+        );
+
+        // Re-checagem fica devida (next_ms = rt+4000+backoff); o backstop mede do `rt` ORIGINAL:
+        // total = (rt+6001) - rt = 6001 ms >= 5000 → DLQ. Se o relógio tivesse RESETADO no restart,
+        // o total seria 6001-4000 = 2001 ms < 5000 → SEM DLQ (o que provaria a regressão).
+        router2.process_due_retries(
+            &mut ts.store,
+            rt + 4_000 + NOT_READY_BACKOFF_MS + 1,
+            &mut not_ready,
+        );
+        let dlq = records_of_kind(&ts.store, "MessageDeadLettered")
+            .into_iter()
+            .filter(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
+            .count();
+        assert_eq!(
+            dlq, 1,
+            "backstop conta o TEMPO TOTAL desde a retenção original (não reinicia no restart)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **SEAM-1 / M4 (NÃO-VACUOSO):** um nó cujo binding foi SEMEADO (`seed_delivered_root` — o filho
+    /// de um spawn) tem seus PRÓPRIOS spawns tratados como CASCATA (gate humano), não origem. Sem o
+    /// seed, seria origem (aprovado direto) — derrotando o anti-fork-bomb end-to-end. Controle
+    /// positivo (sem seed → aprovado) + prova (com seed → gated) na MESMA execução.
+    #[test]
+    fn seeded_binding_makes_child_spawn_cascade() {
+        let (mut router, sup, dir) = router_with("seed-cascade");
+        let c = sup.register("@C", None, sink()); // o "filho" spawnado
+        let mut ts = TmpStore::new("seed-cascade");
+        let (_rec, mut deliver) = recorder();
+
+        // CONTROLE (não-vacuosidade): SEM binding semeado, @C é ORIGEM → spawn de @neto é APROVADO.
+        let m0 = MailMessage::new("@C", "@neto", "spawn", "trabalhe").with_ref("role:helper");
+        assert!(
+            matches!(
+                router.route_message(&m0, &mut ts.store, 1000, &mut deliver),
+                RouteOutcome::SpawnApproved { .. }
+            ),
+            "controle: sem binding, @C é origem → aprovado (hoje seria assim p/ TODO filho)"
+        );
+
+        // COM o seed (o filho nasceu de um spawn de root R, hops 0 — o app semeia na admissão):
+        router.seed_delivered_root(c, "msg_root_do_pai".into(), 0, 2000);
+        let m1 = MailMessage::new("@C", "@neto2", "spawn", "trabalhe").with_ref("role:helper");
+        assert_eq!(
+            router.route_message(&m1, &mut ts.store, 3000, &mut deliver),
+            RouteOutcome::SpawnGated {
+                reason: "cascade".into()
+            },
+            "com binding semeado, @C é CASCATA → gate humano (anti-fork-bomb END-TO-END)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1 (anti-envenenamento) preservado na porta: `seed_delivered_root` NÃO sobrescreve um binding
+    /// VIVO de root DIFERENTE (mesma defesa de `route_message`); mesmo root re-semeia (idempotente).
+    #[test]
+    fn seed_delivered_root_respects_p1() {
+        let (mut router, sup, dir) = router_with("seed-p1");
+        let c = sup.register("@C", None, sink());
+        router.seed_delivered_root(c, "R1".into(), 0, 1000);
+        router.seed_delivered_root(c, "R2".into(), 0, 2000); // root diferente, vivo → recusa (P1)
+        let (root, _h) = router.derive_root_hops(&MailMessage::new("@C", "@x", "ask", ""), c);
+        assert_eq!(
+            root, "R1",
+            "P1: binding vivo de root diferente NÃO é sobrescrito"
+        );
+        router.seed_delivered_root(c, "R1".into(), 0, 3000); // mesmo root → idempotente
+        let (root2, _h2) = router.derive_root_hops(&MailMessage::new("@C", "@x", "ask", ""), c);
+        assert_eq!(root2, "R1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
