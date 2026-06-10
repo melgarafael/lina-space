@@ -56,12 +56,10 @@ pub enum A2aError {
     /// Política de injeção negou este par (allow-list por nó).
     #[error("injeção de {from} em {target} negada pela allow-list")]
     InjectionDenied { from: NodeId, target: NodeId },
-    /// F1-0-2: o prompt do alvo NÃO ficou pronto dentro do orçamento — a mensagem **não
-    /// foi injetada** (zero write na fila). Quem decide re-tentar é o chamador (F1-0-4
-    /// retém por estado; até lá o desfecho é visível no log como entrega falhada, nunca
-    /// texto-colado silencioso).
-    #[error("prompt de {target} não ficou pronto em {waited_ms}ms; mensagem NÃO injetada")]
-    NotReady { target: NodeId, waited_ms: u64 },
+    // ACHADO-2: o antigo `NotReady` (prompt não-pronto = FALHA) FOI REMOVIDO. Prompt-não-pronto
+    // deixou de ser erro — virou sinal de OCUPADO, devolvido como `Ok(DeliveryOutcome::Injected
+    // { ready: false })` para o router RETER (não strike/DLQ). Erros aqui são só falhas REAIS
+    // (regex inválida, allow-list, supervisor — PTY morto/lock/alvo inexistente).
     /// Erro vindo do supervisor (alvo inexistente, lock, etc.).
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
@@ -216,11 +214,29 @@ fn wait_ready(
 /// Resultado da entrega A2A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryOutcome {
-    /// Injetado no PTY vivo (faseado). `ready` = prompt detectado; `bracketed` = modo do alvo.
+    /// Resultado da TENTATIVA de injeção faseada. `ready: true` = prompt estava pronto e o texto
+    /// **foi injetado**; `ready: false` (ACHADO-2) = a fase de prontidão NÃO passou → **NADA foi
+    /// escrito** (alvo OCUPADO) e o chamador deve RETER/re-tentar (o router reclassifica como
+    /// retenção via [`DeliveryOutcome::injected`], jamais falha/DLQ). `bracketed` = modo do alvo
+    /// (irrelevante quando `ready:false`, pois nada foi colado).
     Injected { ready: bool, bracketed: bool },
     /// `delivery = session_resume`: fallback headless (stub W0-9; em produção seria
     /// `claude --resume <id>` / `codex exec resume`).
     SessionResume,
+}
+
+impl DeliveryOutcome {
+    /// `true` se a entrega EFETIVAMENTE colocou a mensagem no alvo (texto injetado ou sessão
+    /// retomada). `false` SÓ para `Injected{ready:false}` — a fase de prontidão falhou, NADA foi
+    /// escrito, o alvo está ocupado. O router usa isto para distinguir entrega-feita de
+    /// reter-e-re-tentar (ACHADO-2), sem confundir OCUPADO com FALHA de entrega.
+    #[must_use]
+    pub fn injected(&self) -> bool {
+        match self {
+            DeliveryOutcome::Injected { ready, .. } => *ready,
+            DeliveryOutcome::SessionResume => true,
+        }
+    }
 }
 
 /// Política de allow-list de injeção (gancho de segurança — A2A é vetor de
@@ -314,18 +330,23 @@ pub fn deliver_a2a(
 
     // 1) wait_ready: espera o prompt REAL do alvo dentro do orçamento do perfil
     //    (`ready_timeout_ms`, default 2s). F1-0-2: timeout → **NÃO injeta** — injetar
-    //    "mesmo assim" num alvo ocupado era o mecanismo do texto-colado (18/20 na
-    //    baseline). O desfecho é erro EXPLÍCITO; F1-0-4 evolui para retenção por estado.
+    //    "mesmo assim" num alvo ocupado era o mecanismo do texto-colado (18/20 na baseline).
+    //    ACHADO-2 (a evolução prometida "para retenção por estado"): prompt-não-pronto NÃO é
+    //    FALHA — é sinal de OCUPADO (a TUI está num turno, mesmo que o lifecycle a julgue Idle).
+    //    Devolve `Ok(Injected{ready:false})` (= ATTEMPT que NADA escreveu) para o router RETER
+    //    (`MessageRetained`/reter→drain), JAMAIS strike→DLQ. A não-injeção (anti-texto-colado)
+    //    é PRESERVADA: zero write. `ready` carrega a verdade (era vestigial/sempre-true; ninguém
+    //    o lia). A reclassificação retenção-vs-falha mora no router (`DeliveryOutcome::injected`).
     let prompt =
         Regex::new(&profile.prompt_ready_regex).map_err(|e| A2aError::BadRegex(e.to_string()))?;
     let budget = profile.ready_timeout();
     if !wait_ready(grid, &prompt, &profile.busy_markers, budget) {
-        return Err(A2aError::NotReady {
-            target,
-            waited_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        return Ok(DeliveryOutcome::Injected {
+            ready: false,
+            bracketed: false,
         });
     }
-    let ready = true; // invariante pós-fix: só se injeta com prontidão verificada
+    let ready = true; // só se injeta com prontidão verificada (ready:false acima = não injetou)
 
     // 2) bracketed só se o alvo está em BRACKETED_PASTE mode.
     let bracketed = grid.mode().bracketed_paste;
@@ -1091,14 +1112,16 @@ mod tests {
             &busy,
             InjectPolicy::AllowAll,
         );
+        // ACHADO-2: prompt-não-pronto NÃO é falha — é sinal de OCUPADO. Devolve
+        // `Ok(Injected{ready:false})` (NADA injetado) para o router RETER (não strike/DLQ).
         assert!(
-            matches!(res, Err(A2aError::NotReady { .. })),
-            "timeout de prontidão deve ser erro explícito, obteve {res:?}"
+            matches!(res, Ok(DeliveryOutcome::Injected { ready: false, .. })),
+            "prompt não-pronto = OCUPADO (Ok ready:false, retenção), obteve {res:?}"
         );
         std::thread::sleep(Dur::from_millis(50));
         assert!(
             sup.applied_ops(target).is_empty(),
-            "alvo não-pronto NUNCA recebe write (era o mecanismo do texto-colado)"
+            "alvo não-pronto NUNCA recebe write (era o mecanismo do texto-colado — preservado)"
         );
     }
 

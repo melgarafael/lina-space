@@ -123,6 +123,12 @@ pub const DELIVERY_MAX_ATTEMPTS: u32 = 5;
 pub const DELIVERY_BACKOFF_BASE_MS: u64 = 1_000;
 /// F1-0-7: default do limiar do circuit breaker (falhas consecutivas por nó).
 pub const BREAKER_THRESHOLD: u32 = 5;
+/// **ACHADO-2:** backoff entre re-tentativas de uma entrega RETIDA por prompt-não-pronto (alvo
+/// ocupado). Throttla o re-`wait_ready` (cada re-tentativa custa ~`ready_timeout`): sem ele, o
+/// re-drain re-rodaria `wait_ready` a cada tick (busy-loop + head-of-line blocking). 2 s ≈ um
+/// orçamento de prontidão — re-checa com folga, sem martelar. Backstop final: `retention_timeout`
+/// (600 s) → DLQ (o alvo nunca ficou pronto = mensagem morta de verdade).
+pub const NOT_READY_BACKOFF_MS: u64 = 2_000;
 
 impl Default for RouterConfig {
     fn default() -> Self {
@@ -521,16 +527,22 @@ impl Router {
         };
         msgs.into_iter()
             .map(|m| {
-                // F1-0-7: msg com retry em curso NESTE processo → segura (o motor de retry
-                // é quem entrega; o arquivo segue durável no `.inflight`).
+                // F1-0-7: msg com retry em curso NESTE processo → segura (o motor de retry/retenção
+                // é quem entrega; o arquivo segue durável no `.inflight`). Este check é PRÉ-LEDGER:
+                // intercepta ANTES do "roteada-sem-entrega ⇒ assume entregue" — é o que torna a
+                // retenção por not-ready (ACHADO-2) durável sem ser dropada pelo ledger.
                 if let Some(r) = self.retries.get(&m.id) {
-                    return (
-                        m.id,
+                    // ACHADO-2: `attempts==0` = entrada de RETENÇÃO (prompt não-pronto), não falha →
+                    // reporta `Retained` (não `RetryBackoff`); ambos são `hold` (não ackeiam).
+                    let out = if r.attempts == 0 {
+                        RouteOutcome::Retained { to: r.target }
+                    } else {
                         RouteOutcome::RetryBackoff {
                             to: r.target,
                             attempt: r.attempts,
-                        },
-                    );
+                        }
+                    };
+                    return (m.id, out);
                 }
                 match ledger.get(&m.id) {
                     // Entregue ou já na DLQ → no-op com resultado conhecido (ack).
@@ -1077,7 +1089,10 @@ impl Router {
         let single_target = targets.len() == 1; // F1-0-4: gate pós-entrega só em rota 1-a-1
         for target in targets {
             match deliver(target, sender, &block) {
-                Ok(_) => {
+                // ACHADO-2: `injected()` distingue entrega FEITA (texto colado / sessão retomada)
+                // de OCUPADO (`Injected{ready:false}` = prompt não-pronto, NADA escrito). Só a
+                // entrega de fato segue o caminho de "entregue"; o ocupado RETÉM (arm abaixo).
+                Ok(outcome) if outcome.injected() => {
                     delivered.push(target);
                     // F1-0-4: o alvo recebeu um turno → está `Busy` AGORA (transição feita
                     // pelo router, determinística — é o que serializa a próxima entrega ao
@@ -1086,6 +1101,8 @@ impl Router {
                         self.mark_busy_after_delivery(store, target);
                     }
                     self.retained_since.remove(&msg.id);
+                    // ACHADO-2: entrega real limpa qualquer retenção pendente desta msg.
+                    self.retries.remove(&msg.id);
                     // A2: registra que `target` recebeu esta cadeia → futuras submissões dele herdam
                     //     o root e ganham hops+1 (binding do supervisor, não confiança no campo).
                     // FRONTEIRA DE SEGURANÇA (P1 vs Round 5 #8 migração):
@@ -1118,6 +1135,18 @@ impl Router {
                         eprintln!(
                             "lina-core: CRÍTICO — entregue mas NÃO logado (MessageDelivered {} → {target}): {e}",
                             msg.id
+                        );
+                    }
+                }
+                // ACHADO-2: prompt-NÃO-pronto (`Ok(Injected{ready:false})`) = alvo OCUPADO, NÃO
+                // falha. O lifecycle pode julgá-lo Idle (turno longo cuja saída a state-machine
+                // ainda não fechou), mas o grid é a verdade no instante da entrega. RETÉM (sinal de
+                // ocupado), JAMAIS strike/DLQ — mensagem viva não morre por o colega trabalhar. Só
+                // rota 1-a-1 retém (broadcast é best-effort, ADR 0007 — alvo não-pronto é pulado).
+                Ok(_) => {
+                    if single_target {
+                        return self.retain_not_ready(
+                            msg, target, sender, &block, &root, hops, store, now_ms,
                         );
                     }
                 }
@@ -1265,6 +1294,62 @@ impl Router {
     /// jitter determinístico, alimenta o circuit breaker do nó, e — esgotadas as
     /// tentativas — manda à DLQ.
     #[allow(clippy::too_many_arguments)]
+    /// **ACHADO-2 — a entrega descobriu o alvo OCUPADO** (`deliver` devolveu
+    /// `Ok(Injected{ready:false})`: prompt não-pronto, NADA escrito). NÃO é falha — é o mesmo
+    /// destino que a retenção por estado (`MessageRetained`), só que descoberto NA entrega (o
+    /// lifecycle julgava Idle). Registra `MessageRetained{prompt_not_ready}` 1× (via
+    /// `retained_since`, anti-amplificação A4) e enfileira a msg no MOTOR de re-entrega
+    /// (`self.retries`) com `attempts:0` (= RETENÇÃO, não falha) e backoff `NOT_READY_BACKOFF_MS`.
+    ///
+    /// **Por que o motor de re-entrega (e não só re-drenar):** `MessageRouted` JÁ foi logado (antes
+    /// do loop de entrega), então re-drenar cairia no ledger "roteada-sem-entrega ⇒ assume entregue
+    /// ⇒ ack" (perderia a msg). O check pré-ledger do pump (`self.retries`) intercepta ANTES disso e
+    /// `process_due_retries` re-checa a prontidão REAL com backoff — SEM re-rotear (sem
+    /// `MessageRouted` spam) e SEM strike. Backstop: `retention_timeout` (600 s) → DLQ.
+    fn retain_not_ready(
+        &mut self,
+        msg: &MailMessage,
+        target: NodeId,
+        from: NodeId,
+        block: &str,
+        root: &str,
+        hops: u8,
+        store: &mut EventStore,
+        now_ms: u64,
+    ) -> RouteOutcome {
+        if !self.retained_since.contains_key(&msg.id) {
+            self.retained_since.insert(msg.id.clone(), now_ms);
+            if let Err(e) = store.append(&DomainEvent::MessageRetained {
+                id: msg.id.clone(),
+                to: target,
+                reason: "prompt_not_ready".to_string(),
+            }) {
+                eprintln!(
+                    "lina-core: falha ao logar MessageRetained(prompt_not_ready {}): {e}",
+                    msg.id
+                );
+            }
+        }
+        // Entrada de RETENÇÃO no motor de re-entrega (`attempts:0` = ocupado, JAMAIS strike). O pump
+        // a intercepta no check pré-ledger; `process_due_retries` re-tenta a prontidão com backoff.
+        self.retries.insert(
+            msg.id.clone(),
+            RetryState {
+                from,
+                target,
+                block: block.to_string(),
+                root: root.to_string(),
+                hops,
+                attempts: 0,
+                next_ms: now_ms.saturating_add(NOT_READY_BACKOFF_MS),
+            },
+        );
+        // Espelho do retry transiente/Hold: desmarca o dedupe (o check pré-ledger é a guarda real).
+        self.seen.remove(&msg.id);
+        RouteOutcome::Retained { to: target }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn on_delivery_failure(
         &mut self,
         msg: &MailMessage,
@@ -1394,7 +1479,10 @@ impl Router {
                 (s.block.clone(), s.root.clone(), s.hops)
             };
             match deliver(target, from, &block) {
-                Ok(_) => {
+                // ACHADO-2: só conta como ENTREGUE se de fato injetou (`injected()`) — uma
+                // re-tentativa que reencontra o alvo ocupado (`Ok(Injected{ready:false})`) NÃO é
+                // entrega (cairia em "entregue mas nada escrito"): cai no arm de retenção abaixo.
+                Ok(o) if o.injected() => {
                     self.node_failures.insert(target, 0);
                     self.retries.remove(&id);
                     if let Err(e) = store.append(&DomainEvent::MessageDelivered {
@@ -1414,6 +1502,38 @@ impl Router {
                     self.mark_busy_after_delivery(store, target);
                     if let Err(e) = self.mailbox.ack_inflight(&id) {
                         eprintln!("lina-core: retry entregue mas ack falhou ({id}): {e}");
+                    }
+                }
+                // ACHADO-2: a re-tentativa achou o alvo AINDA ocupado (prompt não-pronto) → segue
+                // RETIDO (re-agenda backoff), SEM strike nem incremento de `attempts`. DLQ só pelo
+                // teto de retenção (alvo nunca ficou pronto = mensagem morta de verdade).
+                Ok(_) => {
+                    let first = self.retained_since.get(&id).copied().unwrap_or(now_ms);
+                    if now_ms.saturating_sub(first) >= self.config.retention_timeout_ms {
+                        let msg = self
+                            .mailbox
+                            .inflight_message(&id)
+                            .unwrap_or_else(|| minimal_msg_for_dlq(&id, &target.to_string()));
+                        let out = self.dead_letter_now(
+                            &msg,
+                            store,
+                            format!(
+                                "retencao por prompt-nao-pronto estourou o teto ({} ms) — alvo nunca ficou pronto",
+                                self.config.retention_timeout_ms
+                            ),
+                        );
+                        if matches!(out, RouteOutcome::DeadLettered { .. }) {
+                            self.retries.remove(&id);
+                            if let Err(e) = self.mailbox.ack_inflight(&id) {
+                                eprintln!(
+                                    "lina-core: DLQ (retencao) ok mas ack falhou ({id}): {e}"
+                                );
+                            }
+                        }
+                    } else if let Some(s) = self.retries.get_mut(&id) {
+                        // Re-agenda: o backoff throttla o re-`wait_ready` (sem busy-loop); `attempts`
+                        // permanece 0 (retenção). `MessageRetained` já foi logado 1× (retained_since).
+                        s.next_ms = now_ms.saturating_add(NOT_READY_BACKOFF_MS);
                     }
                 }
                 Err(e) => {
@@ -4865,6 +4985,185 @@ mod tests {
             spawn_payloads(&ts.store, "SpawnRequested").is_empty(),
             "pedido malformado não vira SpawnRequested"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────── ACHADO-2: prompt-não-pronto = OCUPADO (retenção), nunca falha (strike/DLQ) ───────
+
+    /// **Critério ACHADO-2 (não-vacuoso).** Alvo Idle no lifecycle MAS grid não-pronto (a TUI está
+    /// num turno longo) → o `deliver` devolve `Ok(Injected{ready:false})` (NADA injetado). O router
+    /// RETÉM (`MessageRetained{prompt_not_ready}` + `Retained`): ZERO `MessageDeliveryFailed`/
+    /// `MessageDeadLettered`/`CircuitOpened`, ZERO strike. Mensagem VIVA não morre por o colega
+    /// estar trabalhando (o bug: seqs 32-40 do log do gate eram retry→5-strikes→DLQ).
+    #[test]
+    fn delivery_not_ready_is_retained_not_failed() {
+        let (mut router, sup, dir) = router_with("a2-nr-retain");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b); // lifecycle Idle (exatamente o caso do bug)
+        let mut ts = TmpStore::new("a2-nr-retain");
+        let calls = Rc::new(RefCell::new(0u32));
+        let c2 = Rc::clone(&calls);
+        let mut deliver = move |_t: NodeId, _f: NodeId, _x: &str| {
+            *c2.borrow_mut() += 1;
+            Ok(DeliveryOutcome::Injected {
+                ready: false,
+                bracketed: false,
+            })
+        };
+
+        let m = MailMessage::new("@A", "@B", "ask", "viva");
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
+
+        assert_eq!(
+            out,
+            RouteOutcome::Retained { to: b },
+            "não-pronto = RETIDA, não falha"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "tentou entregar 1× (descobriu o ocupado REAL)"
+        );
+        let ret = records_of_kind(&ts.store, "MessageRetained");
+        assert_eq!(
+            ret.len(),
+            1,
+            "exatamente 1 MessageRetained (anti-amplificação A4)"
+        );
+        assert_eq!(ret[0].payload["reason"].as_str(), Some("prompt_not_ready"));
+        assert!(
+            records_of_kind(&ts.store, "MessageDeliveryFailed").is_empty(),
+            "prompt-não-pronto NÃO é falha de entrega"
+        );
+        assert!(
+            records_of_kind(&ts.store, "MessageDeadLettered").is_empty(),
+            "sem DLQ"
+        );
+        assert!(
+            records_of_kind(&ts.store, "CircuitOpened").is_empty(),
+            "sem breaker"
+        );
+        assert!(
+            !router.node_failures.contains_key(&b),
+            "prompt-não-pronto NÃO conta strike (era o bug)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Grid pronto → entrega 1×, sem retenção. (O caminho feliz não regride.)
+    #[test]
+    fn delivery_ready_delivers_once() {
+        let (mut router, sup, dir) = router_with("a2-nr-ready");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b);
+        let mut ts = TmpStore::new("a2-nr-ready");
+        let calls = Rc::new(RefCell::new(0u32));
+        let c2 = Rc::clone(&calls);
+        let mut deliver = move |_t: NodeId, _f: NodeId, _x: &str| {
+            *c2.borrow_mut() += 1;
+            Ok(DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true,
+            })
+        };
+
+        let m = MailMessage::new("@A", "@B", "ask", "ok");
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "pronto → entregue"
+        );
+        assert_eq!(*calls.borrow(), 1);
+        assert_eq!(records_of_kind(&ts.store, "MessageDelivered").len(), 1);
+        assert!(records_of_kind(&ts.store, "MessageRetained").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Regressão NÃO-VACUOSA:** uma falha REAL de entrega (escritor morto/erro de escrita) AINDA
+    /// vira strike (`MessageDeliveryFailed` + `node_failures`), NÃO retenção. Quebraria se o fix
+    /// reclassificasse TODO problema de entrega como retenção (o oposto do bug).
+    #[test]
+    fn real_delivery_failure_still_strikes() {
+        let (mut router, sup, dir) = router_with("a2-nr-fail");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b);
+        let mut ts = TmpStore::new("a2-nr-fail");
+        let mut deliver = |_t: NodeId, _f: NodeId, _x: &str| -> Result<DeliveryOutcome, String> {
+            Err("escritor morto".into())
+        };
+
+        let m = MailMessage::new("@A", "@B", "ask", "vai falhar");
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::RetryBackoff { .. }),
+            "falha REAL entra no motor de retry/strike, obteve {out:?}"
+        );
+        assert_eq!(
+            records_of_kind(&ts.store, "MessageDeliveryFailed").len(),
+            1,
+            "falha real é STRIKE (livro-razão)"
+        );
+        assert_eq!(
+            router.node_failures.get(&b).copied(),
+            Some(1),
+            "strike contabilizado"
+        );
+        assert!(
+            records_of_kind(&ts.store, "MessageRetained").is_empty(),
+            "falha REAL não é retenção (não confundir com ocupado)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// O ciclo reter→drain: um not-ready retido vira entrada no motor de re-entrega e, quando o grid
+    /// fica pronto (após o backoff), `process_due_retries` ENTREGA 1× e limpa a entrada — SEM strike.
+    #[test]
+    fn retained_not_ready_delivers_when_ready_via_retry_engine() {
+        let (mut router, sup, dir) = router_with("a2-nr-cycle");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        turn_done(&sup, b);
+        let mut ts = TmpStore::new("a2-nr-cycle");
+
+        // 1) not-ready → retém (entrada no motor de re-entrega, backoff agendado).
+        let mut not_ready = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: false,
+                bracketed: false,
+            })
+        };
+        let m = MailMessage::new("@A", "@B", "ask", "espera o turno");
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut not_ready);
+        assert_eq!(out, RouteOutcome::Retained { to: b });
+        assert!(
+            router.retries.contains_key(&m.id),
+            "retenção por not-ready vira entrada no motor de re-entrega (bypassa o ledger)"
+        );
+        assert!(
+            !router.node_failures.contains_key(&b),
+            "retenção não strike enquanto espera"
+        );
+
+        // 2) grid pronto após o backoff → process_due_retries ENTREGA e limpa.
+        let mut ready = |_t: NodeId, _f: NodeId, _x: &str| {
+            Ok(DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true,
+            })
+        };
+        router.process_due_retries(&mut ts.store, 1000 + NOT_READY_BACKOFF_MS + 1, &mut ready);
+        assert!(
+            !router.retries.contains_key(&m.id),
+            "entregue quando pronto → entrada removida"
+        );
+        let delivered = records_of_kind(&ts.store, "MessageDelivered")
+            .into_iter()
+            .filter(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
+            .count();
+        assert_eq!(delivered, 1, "entregue exatamente 1× quando o turno acabou");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
