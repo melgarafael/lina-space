@@ -341,10 +341,267 @@ async fn flood_bruto_por_ip_barra_antes_do_hmac() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// W5-4-MED-b (durabilidade primeiro): no caminho feliz o `WebhookReceived` é apendado de forma
-/// SÍNCRONA ANTES do `202` (invariante #4 — o log é a fonte da verdade; nada se perde num crash
-/// entre o `202` e o append). Prova: assim que o cliente recebe o 202, o evento JÁ está no log —
-/// SEM nenhuma espera. (Se o append fosse async, o log estaria vazio neste exato instante.)
+/// F1-6-1 / MEDIA-5 (replay no boot): configura hook → derruba e re-sobe o engine →
+/// (1) SEM replay, HMAC válido toma **404** (o gap que a story fecha — prova não-vacuosa);
+/// (2) COM [`WebhookEngine::replay_configured`], o MESMO `curl` toma **202 sem reconfigurar**;
+/// (3) HMAC inválido pós-replay → **401 sem publicar** (o replay não afrouxou nada).
+/// O vault (keyring) sobrevive ao restart na vida real — aqui o MESMO `vault` atravessa as vidas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_no_boot_religa_hook_apos_restart() {
+    let tmp = unique_tmp("replay");
+    let vault = SecretVault::with_store("lina-space/test-replay", MockStore::new());
+
+    // ── Vida 1: configura o hook e "morre" (drop). O fato fica no log; o secret, no vault.
+    let store1 = Arc::new(Mutex::new(EventStore::open(&tmp).expect("open store")));
+    let sup1 = Arc::new(Supervisor::new());
+    let trigger1 = sup1.register(
+        "@Trigger",
+        Some("trigger".into()),
+        Box::new(std::io::sink()),
+    );
+    let engine1 = WebhookEngine::new(store1.clone(), sup1);
+    let cfg = engine1
+        .configure_hook(&vault, trigger1, "@Dev")
+        .expect("configurar hook");
+    drop(engine1);
+    drop(store1);
+
+    let body = br#"{"order":42}"#;
+    let sig = sign_hex(&cfg.secret, body);
+    let path = format!("/hook/{}", cfg.hook_id);
+
+    // ── Vida 2 SEM replay: o gap de hoje — o hook "sumiu" (404) mesmo com HMAC válido.
+    {
+        let store2 = Arc::new(Mutex::new(EventStore::open(&tmp).expect("reabrir store")));
+        let sup2 = Arc::new(Supervisor::new());
+        let _trigger2 = sup2.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        let engine2 = WebhookEngine::new(store2, sup2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(engine2.serve(listener));
+
+        let (status, _) = http_post(addr, &path, Some(&sig), body).await;
+        assert_eq!(
+            status, 404,
+            "sem replay o hook some após restart — é o MEDIA-5 que a story fecha (prova não-vacuosa)"
+        );
+    }
+
+    // ── Vida 3 COM replay: o MESMO curl agora toma 202, sem reconfigurar nada.
+    let store3 = Arc::new(Mutex::new(EventStore::open(&tmp).expect("reabrir store")));
+    let sup3 = Arc::new(Supervisor::new());
+    let trigger3 = sup3.register(
+        "@Trigger",
+        Some("trigger".into()),
+        Box::new(std::io::sink()),
+    );
+    let dev3 = sup3.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+    let engine3 = WebhookEngine::new(store3.clone(), sup3.clone());
+
+    let summary = engine3
+        .replay_configured(&vault, trigger3)
+        .expect("replay de boot");
+    assert_eq!(summary.rebound, 1, "1 hook religado a partir do log");
+    assert_eq!(summary.skipped_no_secret, 0);
+
+    let mut rx = sup3.subscribe();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(engine3.serve(listener));
+
+    let before = count_webhook_received(&store3);
+    let (status, _) = http_post(addr, &path, Some(&sig), body).await;
+    assert_eq!(
+        status, 202,
+        "pós-replay o HMAC válido volta a 202 SEM reconfigurar (critério a da F1-6-1)"
+    );
+    assert!(
+        wait_for_webhook_received(&store3, before + 1).await,
+        "o disparo pós-replay vira WebhookReceived no log"
+    );
+
+    // O efeito no bus segue vivo: mensagem do nó-Gatilho chega endereçada ao alvo religado.
+    let got = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Ok(BusEvent::Message { from, to, .. }) => return Some((from, to)),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    let (from, to) = got.expect("BusEvent::Message deve chegar ao bus pós-replay");
+    assert_eq!(from, trigger3, "from = nó-Gatilho DESTE boot");
+    match to {
+        Recipient::Node(id) => assert_eq!(id, dev3, "target_ref religado resolve no @Dev vivo"),
+        other => panic!("esperava Recipient::Node(@Dev), veio {other:?}"),
+    }
+
+    // (b) HMAC inválido pós-replay → 401 sem publicar (o replay não afrouxou o gate).
+    let count_before_bad = count_webhook_received(&store3);
+    let bad_sig = "00".repeat(32);
+    let (status, _) = http_post(addr, &path, Some(&bad_sig), body).await;
+    assert_eq!(status, 401, "HMAC inválido pós-replay → 401 (não-vacuoso)");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        count_webhook_received(&store3),
+        count_before_bad,
+        "401 pós-replay não pode apendar WebhookReceived"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "401 pós-replay não pode publicar mensagem no bus (\"sem publicar\" literal)"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F1-6-1 (perda de secret sinalizada): se o secret sumiu do vault (keyring zerado), o replay
+/// NÃO religa o hook (sem secret não há verificação HMAC) e NÃO recria secret em silêncio —
+/// recriar mascararia a perda e quebraria a assinatura do integrador. O hook responde 404 e o
+/// [`lina_webhooks::ReplaySummary`] conta o pulo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_sem_secret_no_vault_nao_religa_nem_recria() {
+    let tmp = unique_tmp("replay-nosecret");
+
+    // Vida 1 configura com um vault que MORRE junto (secret perdido — keyring zerado).
+    let cfg = {
+        let vault_perdido = SecretVault::with_store("lina-space/test-replay-ns1", MockStore::new());
+        let store = Arc::new(Mutex::new(EventStore::open(&tmp).expect("open store")));
+        let sup = Arc::new(Supervisor::new());
+        let trigger = sup.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        let engine = WebhookEngine::new(store, sup);
+        engine
+            .configure_hook(&vault_perdido, trigger, "@Dev")
+            .expect("configurar hook")
+    };
+
+    // Vida 2: vault NOVO (vazio). O replay deve pular o hook — e jamais inventar secret novo.
+    let vault_novo = SecretVault::with_store("lina-space/test-replay-ns2", MockStore::new());
+    let store = Arc::new(Mutex::new(EventStore::open(&tmp).expect("reabrir store")));
+    let sup = Arc::new(Supervisor::new());
+    let trigger = sup.register(
+        "@Trigger",
+        Some("trigger".into()),
+        Box::new(std::io::sink()),
+    );
+    let engine = WebhookEngine::new(store, sup);
+    let summary = engine
+        .replay_configured(&vault_novo, trigger)
+        .expect("replay de boot");
+    assert_eq!(summary.rebound, 0, "sem secret não há religação");
+    assert_eq!(
+        summary.skipped_no_secret, 1,
+        "a perda é CONTADA (sinalizada), nunca silenciosa"
+    );
+    assert!(
+        vault_novo
+            .get("webhook", &cfg.hook_id)
+            .expect("consultar vault")
+            .is_none(),
+        "o replay NÃO pode recriar secret em silêncio no vault"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(engine.serve(listener));
+
+    let body = br#"{"order":42}"#;
+    let sig = sign_hex(&cfg.secret, body);
+    let (status, _) = http_post(addr, &format!("/hook/{}", cfg.hook_id), Some(&sig), body).await;
+    assert_eq!(
+        status, 404,
+        "hook com secret perdido NÃO renasce — responde 404 até reconfiguração explícita"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F1-6-1 critério (c): nenhum secret em claro nos ARTEFATOS do log (SQLite + espelho
+/// `log.jsonl` + WAL). Configura E dispara (cobre `WebhookConfigured` e `WebhookReceived`) e
+/// então varre os bytes de TODO arquivo do diretório do store atrás do secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nenhum_secret_em_claro_nos_artefatos_do_log() {
+    fn arquivos(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    arquivos(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    fn contem(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    let tmp = unique_tmp("scan");
+    let vault = SecretVault::with_store("lina-space/test-scan", MockStore::new());
+    let store = Arc::new(Mutex::new(EventStore::open(&tmp).expect("open store")));
+    let sup = Arc::new(Supervisor::new());
+    let trigger = sup.register(
+        "@Trigger",
+        Some("trigger".into()),
+        Box::new(std::io::sink()),
+    );
+    let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+
+    let engine = WebhookEngine::new(store.clone(), sup);
+    let cfg = engine
+        .configure_hook(&vault, trigger, "@Dev")
+        .expect("configurar hook");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(engine.serve(listener));
+
+    let body = br#"{"order":42}"#;
+    let sig = sign_hex(&cfg.secret, body);
+    let (status, _) = http_post(addr, &format!("/hook/{}", cfg.hook_id), Some(&sig), body).await;
+    assert_eq!(status, 202);
+    assert!(wait_for_webhook_received(&store, 1).await);
+
+    // Varredura nos ARTEFATOS: o secret (hex, 256 bits) não pode aparecer em byte algum.
+    let mut paths = Vec::new();
+    arquivos(&tmp, &mut paths);
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == "log.jsonl")),
+        "o espelho log.jsonl deve existir — sem ele este scan seria vácuo (nome mudou?)"
+    );
+    for p in &paths {
+        let bytes = std::fs::read(p).unwrap_or_default();
+        assert!(
+            !contem(&bytes, cfg.secret.as_bytes()),
+            "secret em claro encontrado no artefato {} — invariante 'nada em claro no disco' violada",
+            p.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// W5-4-MED-b (durabilidade primeiro): no caminho feliz o `WebhookReceived` é apendado — e
+/// AGUARDADO (a semântica síncrona-pré-202; desde F1-6-2 o disco roda em `spawn_blocking`, mas o
+/// handler espera o resultado) — ANTES do `202` (invariante #4 — o log é a fonte da verdade; nada
+/// se perde num crash entre o `202` e o append). Prova: assim que o cliente recebe o 202, o
+/// evento JÁ está no log — SEM nenhuma espera. (Se o append fosse fire-and-forget, o log poderia
+/// estar vazio neste exato instante.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_e_sincrono_o_evento_esta_no_log_antes_do_202() {
     let tmp = unique_tmp("sync");

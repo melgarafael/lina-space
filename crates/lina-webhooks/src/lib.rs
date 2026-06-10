@@ -8,10 +8,14 @@
 //! - **#2 Local-first.** O listener faz bind SOMENTE em `127.0.0.1` (o chamador cria o
 //!   [`tokio::net::TcpListener`]; recomenda-se `127.0.0.1:0`). Nunca `0.0.0.0`.
 //! - **#4 O event log é a fonte da verdade.** Cada disparo válido vira um
-//!   [`DomainEvent::WebhookReceived`] no [`EventStore`] — apendado de forma **SÍNCRONA ANTES do
-//!   `202`** (durabilidade primeiro: se o append falha, respondemos `5xx`, nunca `202`). Só o efeito
-//!   NÃO-durável (publicar no bus) roda fora do caminho da resposta. A config de cada hook é um
-//!   [`DomainEvent::WebhookConfigured`] (event-sourcing).
+//!   [`DomainEvent::WebhookReceived`] no [`EventStore`] — o handler **AGUARDA o append ANTES do
+//!   `202`** (durabilidade primeiro: se o append falha, respondemos `5xx`, nunca `202`; o append
+//!   roda numa thread de bloqueio via `spawn_blocking` para não prender a worker async — MEDIA-2,
+//!   F1-6-2). Só o efeito NÃO-durável (publicar no bus) roda fora do caminho da resposta. A config
+//!   de cada hook é um [`DomainEvent::WebhookConfigured`] (event-sourcing) e, **no boot,
+//!   [`WebhookEngine::replay_configured`] reconstrói as ligações varrendo o log** (F1-6-1 /
+//!   MEDIA-5): restart não derruba hooks — a sequência de boot é `new` → `replay_configured` →
+//!   `serve`.
 //! - **Secret fora do disco.** O secret HMAC vive no Secret Vault (W0-7,
 //!   [`SecretVault::ensure_webhook_secret`]) — nunca no log nem em claro.
 //!
@@ -134,6 +138,20 @@ pub struct HookConfig {
     pub secret: String,
 }
 
+/// Resumo do replay de boot ([`WebhookEngine::replay_configured`]): quantos hooks foram religados
+/// e quantos foram pulados por secret ausente no vault (perda sinalizada, nunca silenciosa).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaySummary {
+    /// Hooks religados (rota + `target_ref` reconstruídos do log; secret relido do vault).
+    pub rebound: usize,
+    /// Hooks NÃO religados porque o secret sumiu do vault (warn no log de tracing; o replay não
+    /// recria secret em silêncio — isso mascararia a perda e quebraria o integrador externo).
+    pub skipped_no_secret: usize,
+    /// Hooks NÃO religados por ERRO do backend do vault (keyring indisponível etc.) — por hook,
+    /// para um erro transitório num hook não derrubar o boot inteiro (warn no log de tracing).
+    pub skipped_vault_error: usize,
+}
+
 /// Ligação interna de um hook: secret (cache em memória do que está no Vault), identidade de
 /// origem (`from` = nó-Gatilho, alocado pelo Supervisor) e `target_ref` (endereço A2A do destino).
 #[derive(Debug, Clone)]
@@ -150,13 +168,26 @@ struct RateWindow {
     count: u32,
 }
 
-/// Fronteira de durabilidade: o que o engine precisa de um log de eventos durável. Abstrair o
-/// [`EventStore`] concreto aqui mantém o append do caminho da resposta **síncrono e falível** (o
-/// handler decide `202` vs `5xx` pelo `Result`) e permite, nos testes, um log que falha de propósito
-/// (prova observável do caminho `5xx` sem socket). Produção usa [`EventStoreLog`].
+/// Config de hook lida do log no replay de boot (projeção de um `WebhookConfigured`).
+#[derive(Debug, Clone)]
+struct ConfiguredHook {
+    hook_id: String,
+    target_ref: String,
+}
+
+/// Fronteira do log de eventos: o que o engine precisa de um log durável — apendar fatos
+/// (caminho da resposta) e reler as configs no boot (replay F1-6-1). Abstrair o [`EventStore`]
+/// concreto aqui mantém o append do caminho da resposta **bloqueante e falível** (o handler decide
+/// `202` vs `5xx` pelo `Result`) e permite, nos testes, um log que falha ou demora de propósito
+/// (prova observável dos caminhos `5xx`/worker-livre sem disco real). Produção usa [`EventStoreLog`].
 trait DurableLog: Send + Sync {
-    /// Apende um evento de domínio de forma durável e SÍNCRONA. `Err` aborta o efeito (sem `202`).
+    /// Apende um evento de domínio de forma durável e BLOQUEANTE. `Err` aborta o efeito (sem `202`).
+    /// O chamador async deve envolver em `spawn_blocking` (MEDIA-2) — a função em si pode tocar disco.
     fn append(&self, event: &DomainEvent) -> Result<(), WebhookError>;
+
+    /// Relê do log, em ordem de `seq`, as configs de hook (`WebhookConfigured`) para o replay de
+    /// boot. Só leitura — replay nunca apenda.
+    fn configured_hooks(&self) -> Result<Vec<ConfiguredHook>, WebhookError>;
 }
 
 /// Ligação de produção: o [`EventStore`] real (escritor único do log, serializado pelo `Mutex`).
@@ -168,6 +199,36 @@ impl DurableLog for EventStoreLog {
             .append(event)
             .map(|_seq| ())
             .map_err(|e| WebhookError::Store(e.to_string()))
+    }
+
+    fn configured_hooks(&self) -> Result<Vec<ConfiguredHook>, WebhookError> {
+        let records = lock(&self.0)
+            .events()
+            .map_err(|e| WebhookError::Store(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in records {
+            if r.kind != "WebhookConfigured" {
+                continue;
+            }
+            // Parse tolerante (degradação honesta): um payload de shape inesperado vira warn+skip,
+            // nunca derruba o boot inteiro. NOTA DE COSTURA: o upcast tipado do core
+            // (`DomainEvent::from_record`) é `pub(crate)` — quando o core expuser um helper
+            // público de replay, este parse manual migra para lá (hoje `WebhookConfigured` é v1,
+            // sem upcast definido, então os caminhos são equivalentes).
+            let hook_id = r.payload.get("hook_id").and_then(|v| v.as_str());
+            let target_ref = r.payload.get("target_ref").and_then(|v| v.as_str());
+            match (hook_id, target_ref) {
+                (Some(h), Some(t)) => out.push(ConfiguredHook {
+                    hook_id: h.to_string(),
+                    target_ref: t.to_string(),
+                }),
+                _ => tracing::warn!(
+                    seq = r.seq,
+                    "WebhookConfigured com payload inesperado; ignorado no replay"
+                ),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -204,16 +265,103 @@ impl WebhookEngine {
         supervisor: Arc<Supervisor>,
         rate_cfg: RateLimitConfig,
     ) -> Self {
+        Self::with_log(Arc::new(EventStoreLog(store)), supervisor, rate_cfg)
+    }
+
+    /// Construtor interno sobre a fronteira [`DurableLog`] — caminho único de produção
+    /// (`with_config`) e dos testes que injetam um log que falha/demora de propósito.
+    fn with_log(
+        store: Arc<dyn DurableLog>,
+        supervisor: Arc<Supervisor>,
+        rate_cfg: RateLimitConfig,
+    ) -> Self {
         Self {
             state: AppState {
                 hooks: Arc::new(RwLock::new(HashMap::new())),
-                store: Arc::new(EventStoreLog(store)),
+                store,
                 supervisor,
                 rate_ip: Arc::new(Mutex::new(HashMap::new())),
                 rate_hook: Arc::new(Mutex::new(HashMap::new())),
                 rate_cfg,
             },
         }
+    }
+
+    /// **Replay de boot (F1-6-1 / MEDIA-5).** Reconstrói as ligações de hook varrendo os
+    /// `WebhookConfigured` do event log (fonte da verdade, invariante #4) — chame **uma vez no
+    /// boot, antes de [`WebhookEngine::serve`]**: após um restart os hooks voltam a responder
+    /// `202` sem reconfigurar (antes deste replay, sumiam até alguém reconfigurar → `404`).
+    ///
+    /// Semântica:
+    /// - **Fold last-wins por `hook_id`** em ordem de log: re-configurar um hook atualiza o
+    ///   `target_ref`. (Ponto único preparado para um futuro evento de remoção — hoje o schema
+    ///   não tem remoção de hook, então nada "renasce" porque nada morre.)
+    /// - **O secret NUNCA vem do log** (lá não está — invariante "nada em claro no disco"): é
+    ///   relido do Secret Vault por `hook_id`. Secret ausente no vault → o hook **NÃO é religado**
+    ///   (sem ele não há verificação HMAC possível) e **NÃO criamos secret novo em silêncio**
+    ///   (mascararia a perda e quebraria a assinatura do integrador) — vira `warn` + contagem em
+    ///   [`ReplaySummary::skipped_no_secret`].
+    /// - Replay é só-leitura: não apenda evento algum.
+    ///
+    /// `from` é o nó-Gatilho DESTE boot (o `NodeId` muda a cada processo — quem chama registra o
+    /// nó no Supervisor e o passa aqui, como em [`WebhookEngine::configure_hook`]).
+    ///
+    /// **Contrato de erro:** `Err` SÓ vem da leitura do log (`configured_hooks`) — e nesse caso
+    /// nada foi religado (sem estado parcial). Problema de vault é POR HOOK (mesma filosofia
+    /// skip-e-conta do secret ausente): warn + contagem em
+    /// [`ReplaySummary::skipped_vault_error`] — um keyring transitoriamente indisponível num
+    /// hook não derruba o boot inteiro; o chamador decide pelo summary.
+    pub fn replay_configured<S: SecretStore>(
+        &self,
+        vault: &SecretVault<S>,
+        from: NodeId,
+    ) -> Result<ReplaySummary, WebhookError> {
+        let configured = self.state.store.configured_hooks()?;
+
+        // Fold last-wins por hook_id (ordem de seq do log).
+        let mut latest: HashMap<String, String> = HashMap::new();
+        for c in configured {
+            latest.insert(c.hook_id, c.target_ref);
+        }
+
+        // Resolve os secrets ANTES de tocar o lock de hooks: o vault de produção é keyring
+        // (IPC com o SO, potencialmente lento) — nunca segurar write-lock através de IPC.
+        let mut summary = ReplaySummary::default();
+        let mut rebound = Vec::new();
+        for (hook_id, target_ref) in latest {
+            match vault.get(SECRET_SCOPE, &hook_id) {
+                Ok(Some(secret)) => rebound.push((
+                    hook_id,
+                    HookBinding {
+                        secret,
+                        from,
+                        target_ref,
+                    },
+                )),
+                Ok(None) => {
+                    tracing::warn!(
+                        hook_id = %hook_id,
+                        "replay: secret ausente no vault; hook NÃO religado (não recriamos secret em silêncio)"
+                    );
+                    summary.skipped_no_secret += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hook_id = %hook_id,
+                        error = %e,
+                        "replay: erro do vault; hook NÃO religado (perda sinalizada, não silenciosa)"
+                    );
+                    summary.skipped_vault_error += 1;
+                }
+            }
+        }
+
+        let mut hooks = wlock(&self.state.hooks);
+        for (hook_id, binding) in rebound {
+            hooks.insert(hook_id, binding);
+            summary.rebound += 1;
+        }
+        Ok(summary)
     }
 
     /// Configura um hook: gera um `hook_id` base32 não-enumerável, garante o secret HMAC no Secret
@@ -296,9 +444,11 @@ fn ensure_local(addr: std::net::SocketAddr) -> Result<(), WebhookError> {
 /// 3. `401` HMAC ausente/inválido — prova posse do secret; sem ela, NÃO se publica nada.
 /// 4. `429` **budget por hook** (camada 2) — SÓ APÓS o HMAC; corpo-lixo sem o secret (que toma 401)
 ///    nunca consome o budget do dono, então o vazamento do `hook_id` na URL não vira DoS de budget.
-/// 5. **Append SÍNCRONO** do `WebhookReceived` (W5-4-MED-b — durabilidade primeiro, invariante #4):
-///    se falha → `5xx` sem publicar; só com o fato durável é que respondemos `202` e disparamos o
-///    efeito NÃO-durável (publicar no bus) fora do caminho da resposta.
+/// 5. **Append AGUARDADO** do `WebhookReceived` (W5-4-MED-b — durabilidade primeiro, invariante
+///    #4; o disco roda em `spawn_blocking`, MEDIA-2): se falha → `5xx` sem publicar; só com o
+///    fato durável é que respondemos `202` e disparamos o efeito NÃO-durável (publicar no bus)
+///    fora do caminho da resposta. Append + disparo rodam numa task PRÓPRIA que sobrevive à
+///    desconexão do cliente — sem janela "durável-mas-não-publicado" por drop do handler.
 async fn handle_hook(
     State(state): State<AppState>,
     Path(hook_id): Path<String>,
@@ -332,27 +482,62 @@ async fn handle_hook(
         return StatusCode::TOO_MANY_REQUESTS;
     }
 
-    // 5. DURABILIDADE PRIMEIRO (#4): apende o FATO de forma SÍNCRONA, ANTES de responder. O disco é
-    //    local; segurar o request até o append durável é o preço da promessa do 202. Se o append
-    //    falha, respondemos 5xx (NUNCA 202) e nada é publicado — sem perda silenciosa.
+    // 5. DURABILIDADE PRIMEIRO (#4): o handler AGUARDA o append do FATO ANTES de responder. O
+    //    append toca disco (bloqueante), então roda em `spawn_blocking` — thread de bloqueio do
+    //    Tokio — para NÃO prender a worker async sob disco lento/cheio/NFS (MEDIA-2, F1-6-2). A
+    //    SEMÂNTICA não muda, só a thread: 202 SÓ após o append durável; falha (ou abort da tarefa
+    //    de append) → 5xx (NUNCA 202) e nada é publicado — sem perda silenciosa.
+    //
+    //    O DESFECHO (append + disparo do efeito) roda numa task PRÓPRIA que o handler aguarda:
+    //    `.await` é ponto de cancelamento — se o cliente desconectar durante o append (provável
+    //    exatamente sob disco lento: timeout do integrador), o future do handler é dropado, mas a
+    //    task sobrevive e completa append E publicação. Sem ela, o estado "durável-mas-não-
+    //    publicado" seria alcançável por mera desconexão, não só por crash.
     let ts = now_millis();
     let ev = DomainEvent::WebhookReceived {
         hook_id: hook_id.clone(),
         ts,
         target_ref: binding.target_ref.clone(),
     };
-    if let Err(e) = state.store.append(&ev) {
-        tracing::error!(hook_id = %hook_id, error = %e, "append de WebhookReceived falhou; respondendo 5xx, nada publicado");
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    // 6. Só o efeito NÃO-durável (publicar no bus) corre fora do caminho da resposta. Se ELE se
-    //    perder num crash, o replay do log (fonte da verdade, #4) reconstrói — por isso pode ser
-    //    assíncrono; a durabilidade já foi garantida no passo 5.
-    tokio::spawn(async move {
-        state.publish(&binding);
+    let hook_for_log = hook_id.clone();
+    let outcome = tokio::spawn(async move {
+        let store = Arc::clone(&state.store);
+        let appended = match tokio::task::spawn_blocking(move || store.append(&ev)).await {
+            Ok(res) => res,
+            // Tarefa de append abortada (panic no pool de bloqueio): trate como falha de
+            // durabilidade — o fato NÃO está garantido no log, então nunca 202.
+            Err(join_err) => Err(WebhookError::Store(format!(
+                "tarefa de append abortada: {join_err}"
+            ))),
+        };
+        match appended {
+            Ok(()) => {
+                // 6. Só o efeito NÃO-durável (publicar no bus) corre fora do caminho da resposta —
+                //    a durabilidade já foi garantida no passo 5: o FATO está no log. Se este efeito
+                //    se perder num crash, o log durável é a PROVA do disparo e permite
+                //    reconstrução; a re-entrega automática (retries/dead-letter) é Fase 2 (W5-4) —
+                //    hoje ninguém re-publica sozinho.
+                tokio::spawn(async move {
+                    state.publish(&binding);
+                });
+                Ok(())
+            }
+            Err(e) => {
+                // Log AQUI (na task), não no handler: se o cliente já desconectou, o handler
+                // morreu — a falha de durabilidade precisa de rastro mesmo sem ninguém ouvindo.
+                tracing::error!(hook_id = %hook_for_log, error = %e, "append de WebhookReceived falhou; respondendo 5xx, nada publicado");
+                Err(e)
+            }
+        }
     });
-    StatusCode::ACCEPTED
+    match outcome.await {
+        Ok(Ok(())) => StatusCode::ACCEPTED,
+        Ok(Err(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(join_err) => {
+            tracing::error!(hook_id = %hook_id, error = %join_err, "tarefa de desfecho do webhook abortada; respondendo 5xx");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 impl AppState {
@@ -644,6 +829,9 @@ mod tests {
             fn append(&self, _event: &DomainEvent) -> Result<(), WebhookError> {
                 Err(WebhookError::Store("falha simulada de IO no append".into()))
             }
+            fn configured_hooks(&self) -> Result<Vec<ConfiguredHook>, WebhookError> {
+                Ok(Vec::new())
+            }
         }
 
         let sup = Arc::new(Supervisor::new());
@@ -703,6 +891,260 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "append falho não pode publicar mensagem no bus (sem 202, sem efeito)"
+        );
+    }
+
+    /// F1-6-2 / MEDIA-2: append LENTO (2s, bloqueante — disco lento/cheio/NFS simulado) com **UMA
+    /// única worker thread** no runtime:
+    /// (a) um request a OUTRO hook responde normal DURANTE a espera — a worker não fica presa
+    ///     (é o ponto do MEDIA: sem `spawn_blocking`, o `thread::sleep` do append congelaria a
+    ///     única worker e TUDO — inclusive este cliente — só andaria após os 2s);
+    /// (b) o 202 do hook lento SÓ chega APÓS o append concluir (a semântica síncrona-pré-202 de
+    ///     `a993340` é preservada — só a thread muda).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn append_lento_nao_prende_a_worker_e_o_202_so_chega_apos_o_append() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SLOW_HOOK: &str = "SLOWHOOKAAAAAAAAAAAAAAAAAAAAAAAA";
+        const FAST_HOOK: &str = "FASTHOOKAAAAAAAAAAAAAAAAAAAAAAAA";
+        const APPEND_DELAY: Duration = Duration::from_secs(2);
+
+        /// Log durável cujo append do hook lento BLOQUEIA a thread por `APPEND_DELAY` (como um
+        /// disco real travado faria) e registra cada append concluído.
+        struct SlowLog {
+            entered_slow: Arc<AtomicBool>,
+            appended: Arc<Mutex<Vec<String>>>,
+        }
+        impl DurableLog for SlowLog {
+            fn append(&self, event: &DomainEvent) -> Result<(), WebhookError> {
+                if let DomainEvent::WebhookReceived { hook_id, .. } = event {
+                    if hook_id == SLOW_HOOK {
+                        self.entered_slow.store(true, Ordering::SeqCst);
+                        std::thread::sleep(APPEND_DELAY);
+                    }
+                    lock(&self.appended).push(hook_id.clone());
+                }
+                Ok(())
+            }
+            fn configured_hooks(&self) -> Result<Vec<ConfiguredHook>, WebhookError> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// POST HTTP/1.1 cru (como o `curl` do critério). Devolve o status code.
+        async fn post(addr: SocketAddr, hook_id: &str, sig: &str, body: &[u8]) -> u16 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let req = format!(
+                "POST /hook/{hook_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nX-Signature: {sig}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(req.as_bytes()).await.expect("head");
+            stream.write_all(body).await.expect("body");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("resposta");
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .expect("status line")
+        }
+
+        let entered_slow = Arc::new(AtomicBool::new(false));
+        let appended = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(SlowLog {
+            entered_slow: entered_slow.clone(),
+            appended: appended.clone(),
+        });
+
+        let sup = Arc::new(Supervisor::new());
+        let from = sup.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+
+        let engine = WebhookEngine::with_log(log, sup, RateLimitConfig::default());
+        for (id, secret) in [(SLOW_HOOK, "secret-slow"), (FAST_HOOK, "secret-fast")] {
+            wlock(&engine.state.hooks).insert(
+                id.to_string(),
+                HookBinding {
+                    secret: secret.to_string(),
+                    from,
+                    target_ref: "@Dev".to_string(),
+                },
+            );
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(engine.serve(listener));
+
+        let body: &[u8] = br#"{"order":42}"#;
+        let sig_slow = sign_hex("secret-slow", body);
+        let sig_fast = sign_hex("secret-fast", body);
+
+        let t0 = Instant::now();
+        let slow_task = tokio::spawn(async move { post(addr, SLOW_HOOK, &sig_slow, body).await });
+
+        // Espera o request lento ENTRAR no append (aí a thread de bloqueio já está dormindo 2s).
+        // Sem o `spawn_blocking`, este próprio loop congelaria junto com a worker — e o assert de
+        // latência abaixo falharia (tudo só andaria após os 2s).
+        for _ in 0..300 {
+            if entered_slow.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            entered_slow.load(Ordering::SeqCst),
+            "o request lento deve ter entrado no append antes do request rápido (concorrência real)"
+        );
+
+        // (a) Worker LIVRE durante o append lento: outro hook responde normal, bem antes dos 2s.
+        // Margem deliberadamente folgada p/ CI carregada (caminho-feliz ≈ dezenas de ms; caminho
+        // QUEBRADO ≥ 2s — a folga de 500ms ainda discrimina com clareza).
+        let fast_status = post(addr, FAST_HOOK, &sig_fast, body).await;
+        let fast_done = t0.elapsed();
+        assert_eq!(
+            fast_status, 202,
+            "hook rápido deve responder 202 normalmente"
+        );
+        assert!(
+            fast_done < Duration::from_millis(1500),
+            "request a OUTRO hook deve responder DURANTE a espera do append lento (worker não \
+             presa — MEDIA-2); levou {fast_done:?}"
+        );
+        assert!(
+            !slow_task.is_finished(),
+            "o 202 do hook lento NÃO pode chegar antes do append terminar (ordem preservada)"
+        );
+
+        // (b) Semântica síncrona-pré-202 preservada: o 202 lento SÓ chega após o append (≥2s) e,
+        // no instante da resposta, o evento JÁ está no log.
+        let slow_status = slow_task.await.expect("join do request lento");
+        let slow_done = t0.elapsed();
+        assert_eq!(slow_status, 202, "hook lento responde 202 após o append");
+        assert!(
+            slow_done >= APPEND_DELAY,
+            "o handler deve AGUARDAR o append (202 só após durável); levou {slow_done:?}"
+        );
+        assert!(
+            lock(&appended).iter().any(|h| h == SLOW_HOOK),
+            "no instante do 202 o WebhookReceived do hook lento JÁ está no log"
+        );
+    }
+
+    /// F1-6-2 (janela de cancelamento): se o INTEGRADOR desconecta durante o append lento
+    /// (timeout de cliente — provável exatamente sob disco lento), o desfecho NÃO se perde: o
+    /// append completa E a publicação chega ao bus mesmo sem ninguém esperando a resposta.
+    /// (`.await` é ponto de cancelamento: sem a task própria de desfecho, o drop do future do
+    /// handler na desconexão engoliria o `tokio::spawn(publish)` em silêncio — estado
+    /// "durável-mas-não-publicado" por mera desconexão.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desconexao_do_cliente_durante_append_nao_perde_a_publicacao() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        const HOOK: &str = "DROPHOOKAAAAAAAAAAAAAAAAAAAAAAAA";
+        const APPEND_DELAY: Duration = Duration::from_secs(1);
+
+        struct SlowLog {
+            entered: Arc<AtomicBool>,
+            appended: Arc<AtomicBool>,
+        }
+        impl DurableLog for SlowLog {
+            fn append(&self, _event: &DomainEvent) -> Result<(), WebhookError> {
+                self.entered.store(true, Ordering::SeqCst);
+                std::thread::sleep(APPEND_DELAY);
+                self.appended.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn configured_hooks(&self) -> Result<Vec<ConfiguredHook>, WebhookError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let appended = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(SlowLog {
+            entered: entered.clone(),
+            appended: appended.clone(),
+        });
+
+        let sup = Arc::new(Supervisor::new());
+        let from = sup.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+        let mut rx = sup.subscribe();
+
+        let engine = WebhookEngine::with_log(log, sup, RateLimitConfig::default());
+        wlock(&engine.state.hooks).insert(
+            HOOK.to_string(),
+            HookBinding {
+                secret: "secret-drop".to_string(),
+                from,
+                target_ref: "@Dev".to_string(),
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(engine.serve(listener));
+
+        // Cliente: envia o request completo e FECHA o socket assim que o append entra — sem
+        // nunca ler a resposta (simula timeout/desistência do integrador).
+        let body: &[u8] = br#"{"order":42}"#;
+        let sig = sign_hex("secret-drop", body);
+        let req = format!(
+            "POST /hook/{HOOK} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nX-Signature: {sig}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(req.as_bytes()).await.expect("head");
+        stream.write_all(body).await.expect("body");
+        stream.flush().await.expect("flush");
+
+        for _ in 0..300 {
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "o request deve ter entrado no append antes da desconexão"
+        );
+        drop(stream); // desconexão DURANTE o append
+
+        // Dá tempo do append terminar + o desfecho publicar.
+        tokio::time::sleep(APPEND_DELAY + Duration::from_millis(700)).await;
+        assert!(
+            appended.load(Ordering::SeqCst),
+            "o append deve completar mesmo com o cliente desconectado (spawn_blocking é eager)"
+        );
+
+        // O EFEITO não pode se perder: a mensagem do nó-Gatilho tem que chegar ao bus.
+        let mut publicado = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, lina_core::BusEvent::Message { .. }) {
+                publicado = true;
+                break;
+            }
+        }
+        assert!(
+            publicado,
+            "a publicação no bus NÃO pode se perder quando o cliente desconecta durante o \
+             append (desfecho roda em task própria, imune ao drop do handler)"
         );
     }
 }
