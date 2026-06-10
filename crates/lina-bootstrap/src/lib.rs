@@ -19,10 +19,16 @@ use serde::{Deserialize, Serialize};
 pub mod pretooluse;
 pub use pretooluse::{autonomy_from_env, pretooluse_output, AUTONOMY_ENV};
 
-/// **Lina universal:** instala doutrina + skill no config GLOBAL de cada CLI (todo terminal/CLI
+/// **Lina universal:** instala doutrina + skills no config GLOBAL de cada CLI (todo terminal/CLI
 /// fica Lina-aware, sem o leigo escolher caminho). Aditivo, idempotente, auto-gated.
 pub mod global_install;
 pub use global_install::{ensure_lina_globally_available, GlobalInstallReport};
+
+/// **F1-3 (ACHADO-1) — a safra COMPLETA de skills embutida** (`assets/lina-skills/*`, 11 skills
+/// + `references/`). Instalada no kit por-nó ([`Bootstrapper::write_terminal_files_with_hooks`])
+/// E no global por-CLI ([`ensure_lina_globally_available`]).
+pub mod skills;
+pub use skills::{install_skills_into, EmbeddedSkill, LINA_SKILLS};
 
 /// **F1-3-7 — auto-aprimoramento v0:** projeções puras do `lina retro` (Curator a event-sourcing,
 /// ZERO LLM). Lê o log e SUGERE; o agente decide, o humano aprova. Nunca aplica (gate inviolável).
@@ -415,7 +421,8 @@ impl Bootstrapper {
     /// Escreve os arquivos de bootstrap de UM terminal no `dir` (cwd dele), pelos **dois canais**:
     /// - doutrina (canal 1, à prova de falhas): `CLAUDE.md` + `AGENTS.md` + `GEMINI.md` (um por CLI);
     /// - `.lina/bootstrap.json` (estado vivo serializado, lido por `lina whoami`);
-    /// - `.claude/settings.json` (hook `SessionStart`, canal 2 — só Claude Code).
+    /// - `.claude/settings.json` (hook `SessionStart`, canal 2 — só Claude Code);
+    /// - `.claude/skills/` (F1-3 ACHADO-1): a safra COMPLETA de skills ([`LINA_SKILLS`]).
     ///
     /// # Errors
     /// Propaga erros de I/O (criar dirs / escrever arquivos).
@@ -455,6 +462,10 @@ impl Bootstrapper {
             claude.join("settings.json"),
             hook_settings_json_with_observability(lina_bin, wiring),
         )?;
+        // F1-3 (ACHADO-1): a safra COMPLETA de skills no kit por-nó — todo terminal nasce com
+        // a Inteligência da Lina inteira em `.claude/skills/` (antes só a `lina-agent-bus`
+        // chegava, via cópia do app; as 11 + `references/` agora são parte do bootstrap).
+        skills::install_skills_into(&claude.join("skills"))?;
         Ok(())
     }
 }
@@ -1099,6 +1110,41 @@ mod tests {
         assert!(
             settings.contains("SessionStart")
                 && settings.contains("'/abs/lina' whoami --bootstrap")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F1-3 (ACHADO-1):** o kit por-nó instala a safra COMPLETA — todo terminal nasce com
+    /// as 11 skills em `.claude/skills/` (+`references/` da rubrica transversal), não só a
+    /// `lina-agent-bus`. Idempotente: o re-render por mudança de roster não quebra/duplica.
+    #[test]
+    fn write_terminal_files_installs_full_skill_kit() {
+        let bs = Bootstrapper::new().expect("registry");
+        let dir = std::env::temp_dir().join(format!("lina-f13-kit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        bs.write_terminal_files(&dir, &sample("@Dev Backend"), "/abs/lina")
+            .expect("escreve");
+        let skills_root = dir.join(".claude").join("skills");
+        assert_eq!(LINA_SKILLS.len(), 11, "a 1ª safra tem 11 skills");
+        for skill in LINA_SKILLS {
+            assert!(
+                skills_root.join(skill.name).join("SKILL.md").is_file(),
+                "kit por-nó instala {}",
+                skill.name
+            );
+        }
+        assert!(
+            skills_root
+                .join("lina-cold-review/references/rubrica.md")
+                .is_file(),
+            "a rubrica do cold-review chega junto (transversal ao épico)"
+        );
+        // Re-render (mudança de roster) é idempotente no kit de skills.
+        bs.write_terminal_files(&dir, &sample("@Dev Backend"), "/abs/lina")
+            .expect("re-render");
+        assert!(
+            skills_root.join("lina-orchestration/SKILL.md").is_file(),
+            "skills seguem após o re-render"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

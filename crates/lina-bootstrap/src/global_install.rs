@@ -7,8 +7,9 @@
 //! doutrina + os comandos `lina` SEMPRE acessíveis, em tudo.
 //!
 //! Como: instala a **doutrina global auto-gated** (`assets/lina-doctrine/GLOBAL.md`) no config
-//! GLOBAL de cada CLI (memória lida em TODA sessão, qualquer cwd) + a skill `lina-agent-bus` na
-//! pasta de skills global. **ADITIVO + IDEMPOTENTE:** o conteúdo do usuário é preservado; a doutrina
+//! GLOBAL de cada CLI (memória lida em TODA sessão, qualquer cwd) + a **safra completa de skills**
+//! ([`crate::skills::LINA_SKILLS`] — F1-3 ACHADO-1: não só a `lina-agent-bus`) na pasta de skills
+//! global. **ADITIVO + IDEMPOTENTE:** o conteúdo do usuário é preservado; a doutrina
 //! mora num bloco marcado `LINA:START..LINA:END` (re-rodar só atualiza o bloco). **AUTO-GATED:** a
 //! doutrina manda checar `lina whoami` antes de valer — zero efeito no uso do CLI fora do Lina.
 //!
@@ -17,10 +18,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::skills::{install_skills_into, write_atomic};
+
 /// Doutrina global (auto-gated) — fonte da verdade embutida.
 const GLOBAL_DOCTRINE: &str = include_str!("../../../assets/lina-doctrine/GLOBAL.md");
-/// A skill SEMPRE (comunicação A2A) — embutida; copiada pra pasta de skills global de cada CLI.
-const AGENT_BUS_SKILL: &str = include_str!("../../../assets/lina-skills/lina-agent-bus/SKILL.md");
 
 const BLOCK_START: &str = "<!-- LINA:START -->";
 const BLOCK_END: &str = "<!-- LINA:END -->";
@@ -77,10 +78,9 @@ pub fn ensure_lina_globally_available(home: &Path) -> std::io::Result<GlobalInst
                 first_err.get_or_insert(e);
             }
         }
-        // Skill `lina-agent-bus` na pasta de skills do CLI.
-        let skill_dir = config.join("skills").join("lina-agent-bus");
-        match install_skill(&skill_dir) {
-            Ok(()) => report.skill_dirs.push(skill_dir),
+        // A safra COMPLETA de skills na pasta de skills do CLI (F1-3 ACHADO-1).
+        match install_skills_into(&config.join("skills")) {
+            Ok(dirs) => report.skill_dirs.extend(dirs),
             Err(e) => {
                 first_err.get_or_insert(e);
             }
@@ -128,24 +128,6 @@ fn upsert_marked_block(path: &Path, doctrine: &str) -> std::io::Result<()> {
     write_atomic(path, &next)
 }
 
-/// Instala a skill `lina-agent-bus` em `skill_dir/SKILL.md` (cria a pasta; sobrescreve só o SKILL.md
-/// se mudou). Skills são aditivas por natureza (pasta própria) — nunca colide com skills do usuário.
-fn install_skill(skill_dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(skill_dir)?;
-    let skill_md = skill_dir.join("SKILL.md");
-    if std::fs::read_to_string(&skill_md).unwrap_or_default() == AGENT_BUS_SKILL {
-        return Ok(()); // idêntico → não reescreve
-    }
-    write_atomic(&skill_md, AGENT_BUS_SKILL)
-}
-
-/// Escrita atômica (tmp + rename) — robusta a crash/concorrência.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,12 +157,27 @@ mod tests {
                 body.contains("lina whoami"),
                 "{cfg}: doutrina auto-gated presente"
             );
-            let skill = home
-                .join(cfg)
-                .join("skills")
-                .join("lina-agent-bus")
-                .join("SKILL.md");
-            assert!(skill.exists(), "{cfg}: skill instalada");
+            // F1-3 ACHADO-1: a safra COMPLETA chega a cada CLI — não só a lina-agent-bus.
+            let skills_root = home.join(cfg).join("skills");
+            for skill in crate::skills::LINA_SKILLS {
+                let dir = skills_root.join(skill.name);
+                assert!(
+                    dir.join("SKILL.md").is_file(),
+                    "{cfg}: skill {} instalada",
+                    skill.name
+                );
+                assert!(
+                    report.skill_dirs.contains(&dir),
+                    "{cfg}: {} no report",
+                    skill.name
+                );
+            }
+            assert!(
+                skills_root
+                    .join("lina-cold-review/references/rubrica.md")
+                    .is_file(),
+                "{cfg}: a rubrica transversal chega junto"
+            );
             assert!(report.doctrine_files.contains(&mem_path));
         }
         let _ = std::fs::remove_dir_all(&home);
