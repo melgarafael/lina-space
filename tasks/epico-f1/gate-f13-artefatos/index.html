@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Curso de IA para Iniciantes — aprenda IA sem programar</title>
+<meta name="description" content="Curso online em português para quem nunca mexeu com IA. Aprenda a usar inteligência artificial no seu trabalho e negócio, sem código, passo a passo.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%A7%A0%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Albert+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   PAINEL DE DESIGN — direção visual: "caderno editorial quente"
+   Troque a identidade inteira aqui.
+   ============================================================ */
+:root{
+  --papel:        #FAF5EC;   /* fundo geral, papel quente */
+  --papel-escuro: #F1E9DA;   /* faixas alternadas */
+  --tinta:        #21241F;   /* texto principal, quase-preto esverdeado */
+  --tinta-suave:  #565B52;   /* texto secundário */
+  --brasa:        #D4541F;   /* acento único: CTA, grifos */
+  --brasa-escura: #B34114;   /* hover do CTA */
+  --verde:        #2E4B3F;   /* faixa final escura */
+  --fonte-titulo: "Fraunces", Georgia, serif;
+  --fonte-texto:  "Albert Sans", "Helvetica Neue", sans-serif;
+  --raio: 14px;
+  --larg: 1080px;
+}
+
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  background:var(--papel);
+  color:var(--tinta);
+  font-family:var(--fonte-texto);
+  font-size:1.0625rem;
+  line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+/* textura de grão sutil no papel */
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:1;opacity:.35;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+main,header,footer{position:relative;z-index:2}
+
+.wrap{max-width:var(--larg);margin:0 auto;padding:0 24px}
+
+h1,h2,h3{font-family:var(--fonte-titulo);font-weight:600;line-height:1.12;letter-spacing:-.01em}
+h2{font-size:clamp(1.7rem,3.5vw,2.4rem);margin-bottom:.6em}
+.kicker{
+  display:inline-block;font-size:.8rem;font-weight:700;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--brasa-escura);margin-bottom:14px;
+}
+.grifo{
+  background-image:linear-gradient(transparent 62%, rgba(212,84,31,.28) 62%);
+}
+
+/* ---------- topo ---------- */
+.topo{display:flex;justify-content:space-between;align-items:center;padding:22px 0}
+.marca{font-family:var(--fonte-titulo);font-weight:700;font-size:1.15rem}
+.marca em{color:var(--brasa);font-style:normal}
+.topo a.mini-cta{font-weight:600;color:var(--tinta);text-decoration:none;border-bottom:2px solid var(--brasa)}
+
+/* ---------- hero ---------- */
+.hero{padding:64px 0 88px;display:grid;grid-template-columns:minmax(0,7fr) minmax(0,4fr);gap:48px;align-items:center}
+.hero h1{font-size:clamp(2.4rem,5.6vw,3.9rem);margin:14px 0 22px}
+.hero .sub{font-size:1.2rem;color:var(--tinta-suave);max-width:34em;margin-bottom:34px}
+.hero-nota{margin-top:16px;font-size:.92rem;color:var(--tinta-suave)}
+
+/* cartão decorativo do hero — "ficha de caderno" */
+.ficha{
+  background:#fff;border:1.5px solid var(--tinta);border-radius:var(--raio);
+  padding:28px;box-shadow:8px 8px 0 var(--brasa);transform:rotate(1.6deg);
+}
+.ficha p{font-family:var(--fonte-titulo);font-size:1.18rem;line-height:1.45}
+.ficha .ass{margin-top:14px;font-family:var(--fonte-texto);font-size:.85rem;color:var(--tinta-suave)}
+
+.btn{
+  display:inline-block;background:var(--brasa-escura);color:#fff;text-decoration:none;
+  font-weight:700;font-size:1.05rem;padding:16px 34px;border-radius:999px;
+  box-shadow:4px 4px 0 var(--tinta);transition:transform .15s ease, background .15s ease;
+}
+.btn:hover{background:#8F3410;transform:translate(-2px,-2px)}
+.btn:active{transform:translate(2px,2px);box-shadow:none}
+
+/* ---------- seções ---------- */
+section{padding:80px 0}
+.faixa{background:var(--papel-escuro)}
+
+/* pra quem é / não é */
+.duas-colunas{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:36px}
+.cartao{
+  background:#fff;border:1.5px solid var(--tinta);border-radius:var(--raio);padding:30px;
+}
+.cartao.nao{background:transparent;border-style:dashed}
+.cartao h3{font-size:1.25rem;margin-bottom:16px}
+.cartao ul{list-style:none}
+.cartao li{padding:9px 0 9px 32px;position:relative;color:var(--tinta-suave)}
+.cartao li::before{content:"✓";position:absolute;left:0;top:9px;color:var(--brasa);font-weight:700}
+.cartao.nao li::before{content:"✗";color:var(--tinta-suave)}
+
+/* módulos — lista numerada editorial */
+.modulos{margin-top:40px;padding:0;counter-reset:mod;border-top:1.5px solid var(--tinta);list-style:none}
+.modulo{
+  counter-increment:mod;display:grid;grid-template-columns:70px 1fr;gap:20px;
+  padding:26px 8px;border-bottom:1.5px solid var(--tinta);align-items:baseline;
+}
+.modulo::before{
+  content:"0" counter(mod);font-family:var(--fonte-titulo);font-size:1.9rem;
+  font-weight:700;color:var(--brasa);
+}
+.modulo h3{font-size:1.2rem;margin-bottom:6px}
+.modulo p{color:var(--tinta-suave)}
+
+/* como funciona */
+.pilulas{display:flex;flex-wrap:wrap;gap:14px;margin-top:34px}
+.pilula{
+  background:#fff;border:1.5px solid var(--tinta);border-radius:999px;
+  padding:12px 22px;font-weight:600;font-size:.97rem;
+}
+
+/* instrutor */
+.instrutor{display:grid;grid-template-columns:200px 1fr;gap:44px;align-items:center;margin-top:36px}
+.retrato{
+  width:200px;height:200px;border-radius:50%;background:var(--papel-escuro);
+  border:1.5px solid var(--tinta);display:flex;align-items:center;justify-content:center;
+  font-family:var(--fonte-titulo);font-size:3rem;color:var(--tinta-suave);
+  box-shadow:6px 6px 0 var(--brasa);
+}
+.instrutor blockquote{
+  font-family:var(--fonte-titulo);font-size:1.3rem;line-height:1.5;margin-bottom:14px;
+}
+.instrutor cite{font-style:normal;color:var(--tinta-suave)}
+
+/* FAQ */
+.faq{max-width:760px;margin:36px auto 0}
+.faq details{border-bottom:1.5px solid var(--tinta);padding:4px 0}
+.faq summary{
+  cursor:pointer;font-weight:600;font-size:1.08rem;padding:18px 0;list-style:none;
+  display:flex;justify-content:space-between;align-items:center;gap:16px;
+}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+";font-family:var(--fonte-titulo);font-size:1.5rem;color:var(--brasa);flex-shrink:0}
+.faq details[open] summary::after{content:"–"}
+.faq details p{padding:0 0 20px;color:var(--tinta-suave)}
+
+/* CTA final */
+.final{background:var(--verde);color:var(--papel);text-align:center;padding:96px 0}
+.final h2{font-size:clamp(2rem,4.5vw,3rem);color:#fff}
+.final .sub{color:rgba(250,245,236,.75);font-size:1.15rem;margin:18px auto 38px;max-width:32em}
+.final .btn{box-shadow:4px 4px 0 rgba(0,0,0,.4)}
+.final .reasseguro{margin-top:22px;font-size:.92rem;color:rgba(250,245,236,.65)}
+
+footer{padding:34px 0;text-align:center;font-size:.88rem;color:var(--tinta-suave)}
+
+/* entrada suave das seções */
+@media (prefers-reduced-motion: no-preference){
+  .revela{opacity:0;transform:translateY(18px);animation:sobe .7s ease forwards}
+  .hero .revela:nth-child(1){animation-delay:.05s}
+  @keyframes sobe{to{opacity:1;transform:none}}
+}
+
+/* responsivo */
+@media (max-width:820px){
+  .hero{grid-template-columns:1fr;padding:40px 0 64px}
+  .ficha{transform:rotate(0);max-width:440px}
+  .duas-colunas{grid-template-columns:1fr}
+  .instrutor{grid-template-columns:1fr;justify-items:center;text-align:center}
+  .modulo{grid-template-columns:52px 1fr}
+}
+</style>
+</head>
+<body>
+
+<header class="wrap topo">
+  <div class="marca">Curso de IA <em>para Iniciantes</em></div>
+  <a class="mini-cta" href="#inscricao">Inscrever-se</a>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hero wrap">
+    <div class="revela">
+      <span class="kicker">Curso online · em português · zero código</span>
+      <h1>Aprenda a usar IA <span class="grifo">de verdade</span> — sem precisar saber programar</h1>
+      <p class="sub">Em poucas semanas você sai do “não sei nem por onde começar” para usar IA todos os dias no seu trabalho e no seu negócio. Passo a passo, em português claro, sem jargão.</p>
+      <a class="btn" href="#inscricao">Quero começar agora</a>
+      <p class="hero-nota">Feito pra empreendedores, autônomos e curiosos.</p>
+    </div>
+    <aside class="ficha revela">
+      <p>“A IA não vai substituir você. Mas alguém usando IA, talvez sim.”</p>
+      <p class="ass">— a provocação que abre a primeira aula</p>
+    </aside>
+  </section>
+
+  <!-- PRA QUEM É -->
+  <section class="faixa">
+    <div class="wrap">
+      <span class="kicker">Honestidade primeiro</span>
+      <h2>Pra quem é (e pra quem não é)</h2>
+      <div class="duas-colunas">
+        <div class="cartao">
+          <h3>É pra você que…</h3>
+          <ul>
+            <li>Sente que a IA está passando e você está ficando pra trás</li>
+            <li>Já tentou usar o ChatGPT, mas as respostas saem genéricas</li>
+            <li>Quer ganhar tempo nas tarefas repetitivas do dia a dia</li>
+            <li>Prefere aprender fazendo, com exemplos reais</li>
+          </ul>
+        </div>
+        <div class="cartao nao">
+          <h3>Não é pra você que…</h3>
+          <ul>
+            <li>Quer aprender a programar modelos de IA — isso é outro curso</li>
+            <li>Procura fórmula mágica de “renda infinita com IA”</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MÓDULOS -->
+  <section class="wrap">
+    <span class="kicker">O caminho</span>
+    <h2>O que você vai aprender</h2>
+    <ol class="modulos">
+      <li class="modulo">
+        <div><h3>Fundamentos sem enrolação</h3>
+        <p>O que a IA faz bem, o que faz mal — e como pensar nela como uma estagiária brilhante que precisa de instruções claras.</p></div>
+      </li>
+      <li class="modulo">
+        <div><h3>A arte de pedir</h3>
+        <p>Como escrever instruções que transformam respostas genéricas em resultados que parecem feitos por um especialista.</p></div>
+      </li>
+      <li class="modulo">
+        <div><h3>IA no seu dia a dia</h3>
+        <p>E-mails, planilhas, resumos, pesquisa, conteúdo: as 10 tarefas que você nunca mais vai fazer na mão.</p></div>
+      </li>
+      <li class="modulo">
+        <div><h3>IA no seu negócio</h3>
+        <p>Atendimento, propostas, marketing e organização — com modelos prontos pra adaptar à sua realidade.</p></div>
+      </li>
+      <li class="modulo">
+        <div><h3>Montando seu kit</h3>
+        <p>Quais ferramentas valem a pena (e quais são só moda), quanto custam e como escolher sem desperdiçar dinheiro.</p></div>
+      </li>
+      <li class="modulo">
+        <div><h3>Projeto final</h3>
+        <p>Você sai com um fluxo de IA funcionando no <em>seu</em> contexto — não num exemplo de mentira.</p></div>
+      </li>
+    </ol>
+  </section>
+
+  <!-- COMO FUNCIONA -->
+  <section class="faixa">
+    <div class="wrap">
+      <span class="kicker">Formato</span>
+      <h2>Como funciona</h2>
+      <div class="pilulas">
+        <span class="pilula">🎬 Aulas curtas em vídeo, no seu ritmo</span>
+        <span class="pilula">🛠️ Exercícios práticos em cada módulo</span>
+        <span class="pilula">📋 Modelos de instruções prontos pra copiar</span>
+        <span class="pilula">🔁 Acesso por 12 meses, com atualizações</span>
+        <span class="pilula">💬 Comunidade de alunos pra tirar dúvidas</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- INSTRUTOR -->
+  <section class="wrap">
+    <span class="kicker">Quem ensina</span>
+    <h2>Aprenda com quem usa, não com quem só fala</h2>
+    <div class="instrutor">
+      <!-- TROQUE pelo retrato real: <img class="retrato" src="foto.jpg" alt="Foto de Rafael Melgaço"> -->
+      <div class="retrato" aria-hidden="true">RM</div>
+      <div>
+        <blockquote>“Tudo que está no curso foi testado no meu próprio negócio antes de virar aula. Não ensino teoria — ensino o que funciona.”</blockquote>
+        <cite>Rafael Melgaço — empreendedor e praticante de IA no dia a dia</cite>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section class="faixa">
+    <div class="wrap">
+      <span class="kicker">Dúvidas frequentes</span>
+      <h2>Perguntas que todo iniciante faz</h2>
+      <div class="faq">
+        <details>
+          <summary>Preciso saber programar?</summary>
+          <p>Não. O curso é 100% sem código — tudo acontece em ferramentas que funcionam no navegador, em português claro.</p>
+        </details>
+        <details>
+          <summary>Funciona no celular?</summary>
+          <p>Sim. As aulas e as ferramentas usadas funcionam direto no navegador do celular ou do computador.</p>
+        </details>
+        <details>
+          <summary>Quanto tempo leva pra concluir?</summary>
+          <p>Cerca de 6 semanas em ritmo tranquilo, dedicando umas 2 horas por semana. Mas o acesso é seu por 12 meses — vá no seu tempo.</p>
+        </details>
+        <details>
+          <summary>E se eu não gostar?</summary>
+          <p>Garantia incondicional de 7 dias: pediu, devolvemos tudo, sem perguntas.</p>
+        </details>
+        <details>
+          <summary>As ferramentas de IA são pagas?</summary>
+          <p>O curso prioriza versões gratuitas. Quando algo pago vale a pena, a aula mostra o porquê e quanto custa — sem surpresa.</p>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA FINAL -->
+  <section class="final" id="inscricao">
+    <div class="wrap">
+      <h2>A IA não vai esperar você se sentir pronto</h2>
+      <p class="sub">Comece hoje com o passo a passo que fala a sua língua.</p>
+      <!-- TROQUE o mailto abaixo pelo link real do checkout/pagamento antes de publicar -->
+      <a class="btn" href="mailto:rafael@maudibrasil.com.br?subject=Quero%20me%20inscrever%20no%20curso%20de%20IA">Garantir minha vaga</a>
+      <p class="reasseguro">Garantia incondicional de 7 dias · Acesso imediato após a inscrição</p>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">
+  © 2026 Rafael Melgaço · Curso de IA para Iniciantes · contato: <a href="mailto:rafael@maudibrasil.com.br">rafael@maudibrasil.com.br</a>
+</footer>
+
+</body>
+</html>
