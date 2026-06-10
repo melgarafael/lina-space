@@ -5,12 +5,13 @@ name: CI
 # O loop central da Fase 0 está PROVADO e validado na tela no macOS. Esta esteira
 # trava a qualidade do core a cada push e faz o backup remoto do código.
 #
-# Estado dos gates (2026-06-03, HEAD da Onda 5):
+# Estado dos gates (2026-06-10, F1-6-8 — CI 3-SO real):
 #   * core-macos      — gate PRINCIPAL (espelha o canal limpo do Maestro): test + clippy + fmt.
 #   * core-linux      — bônus barato; o core é Mac/Linux-verde (W0). Confirma portabilidade do core.
-#   * core-windows    — portabilidade do core no Windows (x86_64-msvc). INFORMATIVO (continue-on-error)
-#                       enquanto o caminho Windows do core nunca rodou num runner; depois do bring-up
-#                       (W5-3) que liga o ConPTY, REMOVA o continue-on-error → vira gate de verdade.
+#   * core-windows    — GATE BLOQUEANTE (F1-6-8): o bring-up Windows foi mergeado (8d21f55),
+#                       a condição escrita aqui desde a Onda 5 chegou — o job EXECUTA a suíte
+#                       (sem --no-run, sem continue-on-error). Triagem teste×SO (o que roda
+#                       onde e por quê): tasks/epico-f1/ci-3so-triagem.md — zero skip silencioso.
 #   * license-security — W5-5 wire-CI: cargo-deny (licenças) + cargo-audit (RustSec). Verdes localmente.
 #   * app-macos       — build/clippy/fmt do shell gpui (standalone, fora do workspace).
 #
@@ -19,9 +20,9 @@ name: CI
 #     (o core-windows acima cobre só o core headless; a tela do gpui não roda em CI — exige olho humano.)
 #   * Matriz GPU Linux (NVIDIA/AMD/Intel × X11/Wayland) — ver épico W5-3.
 #   * E2E visual golden-render 3-SO + assinatura/notarização (W5-6) → conta Apple + Authenticode.
-# Ao primeiro push: confirme que os gates obrigatórios (core-macos, core-linux, license-security,
-# app-macos) ficam verdes. O core-windows é informativo e NÃO bloqueia merge enquanto for continue-on-error
-# (foram validados localmente, mas o ambiente do runner pode exigir ajuste de toolchain — em especial o gpui).
+# Os 5 jobs são gates obrigatórios. O que SÓ um run real no GitHub prova (não dá pra provar local):
+# duração/estabilidade do core-windows executando (3 runs consecutivos — critério (c) da F1-6-8)
+# e o comportamento do runner (PATH, ConPTY, credential store). Checklist: ci-3so-triagem.md §4.
 
 on:
   push:
@@ -48,8 +49,10 @@ jobs:
       - name: Clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Fmt (por-pacote — fmt --check no nível workspace mascara o exit; ver lição do projeto)
+        # F1-6-8 fechou um furo: lina-session-watch/lina-hooks/lina-otel estavam fora da lista
+        # (fmt-drift neles passava sem gate). Verificados fmt-limpos antes de entrar.
         run: |
-          for c in lina-pty lina-vt lina-core lina-host lina-secrets lina-cli-profiles lina-role-discovery lina-bootstrap lina-webhooks; do
+          for c in lina-pty lina-vt lina-core lina-host lina-secrets lina-cli-profiles lina-session-watch lina-role-discovery lina-bootstrap lina-webhooks lina-hooks lina-otel; do
             cargo fmt -p "$c" -- --check
           done
 
@@ -74,14 +77,15 @@ jobs:
   core-windows:
     name: Core (Windows) — portabilidade do core (x86_64-msvc)
     runs-on: windows-latest
-    # INFORMATIVO até o bring-up ligar o ConPTY (ver WINDOWS-BRINGUP.md). PRÉ-bring-up este job só
-    # COMPILA (não executa): vários testes de PTY-host spawnam comandos Unix (`yes`/`sh`) em terminais
-    # reais e PENDURAM no Windows enquanto o ConPTY não está ligado (visto em CI: hang de ~70min no
-    # teste flow_control_caps_memory_under_flood). `--no-run` valida o que dá pra provar hoje: que o
-    # core (e os test binaries) COMPILA no Windows + clippy. PÓS-BRING-UP: troque `--no-run` por
-    # `-- --test-threads=1` (passa a executar) e remova o `continue-on-error` → vira gate obrigatório.
-    continue-on-error: true
-    timeout-minutes: 25
+    # GATE BLOQUEANTE desde F1-6-8 (a promoção que este arquivo pedia desde a Onda 5): o bring-up
+    # Windows foi mergeado (8d21f55) e a suíte passou a EXECUTAR de verdade — `--no-run` saiu,
+    # `continue-on-error` saiu. Os testes runtime-Unix (spawn de `yes`/`sh`, `kill`, semântica de
+    # PTY Unix) estão atrás de #[cfg(unix)] com o porquê anotado em cada um; a tabela teste×SO
+    # completa (o que roda onde, o que é pendente-windows) vive em tasks/epico-f1/ci-3so-triagem.md.
+    # Se este job estourar o timeout, a causa típica é um teste NOVO sem triagem de SO pendurando
+    # no ConPTY (histórico: hang de ~70min em flow_control_caps_memory_under_flood) — triague o
+    # teste na tabela antes de aumentar o timeout.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       # windows-latest do GitHub é x86_64 → toolchain stable resolve x86_64-pc-windows-msvc
@@ -90,8 +94,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build de testes (compila workspace + test binaries; NÃO executa — testes de PTY penduram pré-ConPTY)
-        run: cargo test --workspace --no-run
+      - name: Test (workspace, serializado — mesma receita dos gates macOS/Linux)
+        run: cargo test --workspace -- --test-threads=1
       - name: Clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
