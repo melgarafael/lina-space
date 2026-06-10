@@ -35,6 +35,19 @@ que o supervisor carimba na ENTREGA (`delivered_root[sender]`), **nunca** do cam
 Como `hops` vem do binding (carimbado numa entrega REAL), **um agente não compra fan-out livre
 forjando `hops=0`** — a defesa anti-forja de W1 é preservada.
 
+### Caveat documentado — janela de liveness do binding (registrado 2026-06-10, conselho F1-3 item M1/R5-L2)
+
+O binding `delivered_root[sender]` tem **janela de liveness de ~60s**: a poda (`prune_expired`,
+`router.rs:1587-1589`) remove bindings de nós sem atividade A2A recente. Implicação honesta: um nó
+que recebeu uma entrega (cascata) e fica ocioso além da janela **"esfria"** — a mensagem seguinte
+dele deriva como ORIGEM (`hops == 0`). É a "lavagem" **by-design** já aceita no red-team da Fase 0
+(B1 do fan-out): a cadeia causal esfria; o ritmo fica limitado a ~1 onda/janela e os backstops
+(orçamento, teto de custo, gate humano em irreversível) seguem valendo. O caveat formal: toda
+afirmação "cascata é SEMPRE gateada" (inclusive o gate de `lina spawn`, ADR 0019 §Decisão-6, que
+deriva do MESMO binding) vale **dentro da janela de liveness** — fora dela a mensagem é, por
+definição do mecanismo, origem. Aceito pelo Maestro (2026-06-10); re-avaliação só se o uso real
+mostrar exploração do esfriamento como vetor (nenhum caso observado até aqui).
+
 ## Decisão
 
 **O gate de fan-out e o orçamento de delegação aplicam-se à CASCATA (`hops >= 1`), não ao fan-out

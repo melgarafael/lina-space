@@ -45,3 +45,18 @@
 12. **R2-L2** — cascata: código mais restritivo que o ADR (gate ANTES do cap) — alinhar texto
 13. **B1** — teto de custo OFF por default (painel/seam decide ligar default)
 14. Ratificar adiamento de `SkillPinned` para F2 (lente 4)
+
+## Fechamento dos itens (atualizado 2026-06-10, sessão de fechamento da F1)
+
+- **Itens 1-5 (SEAM APP):** ✅ fechados na rodada SEAM (`d59283b`) — M4 binding-na-admissão ·
+  M2 autonomia real · M3 dedupe durável · R2 fiação física + banner · R1-L3 retenção no ledger.
+- **Item 9 (repack):** ✅ `dist/Lina.app` 2026-06-10 13:20.
+- **Itens 10-13 (doc):** ✅ fechados pelo Maestro 2026-06-10 — ADR 0007 (caveat janela de
+  liveness 60s) · ADR 0019 §Decisão-6 (texto alinhado ao código: cascata gateada ANTES do cap;
+  gap origem-burst registrado como aceito) · ADR 0005 (nota B1: teto OFF default, decisão de
+  default fica com o painel).
+- **Item 14:** ✅ **RATIFICADO pelo Maestro (2026-06-10):** `SkillPinned`/`absorbed_into`
+  adiados para F2 — consistente com o sugere-nunca-aplica (v0 não tem verbo de mutação; pin é
+  opt-out de mutação que ainda não existe).
+- **Itens 6-8 (pendências de story):** em execução na sessão de fechamento da F1 (A/B doutrina ·
+  3-CLI real · breaker 2×/anti-race).

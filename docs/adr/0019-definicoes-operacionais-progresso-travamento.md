@@ -41,11 +41,20 @@ reproduzir, e a delegação instável dele é o falso-positivo a não reproduzir
    projeção, nunca de view cacheada (13.11 STORY 3: agentes leem log recente).
 6. **Spawn caps (agente-cria-terminal, F1-3 — decisão do fundador):**
    `max_spawns_per_turn = 2` por nó solicitante. A distinção **origem vs cascata** reusa o
-   binding NÃO-forjável do ADR 0007: pedido de spawn nascido em cascata (`hops ≥ 1` efetivo,
-   via `derive_root_hops`) conta contra o cap **e** contra o `DELEGATION_BUDGET`; criação
-   direta pelo humano (UI/comando) não passa pelo cap de agente. Spawn é sempre via
-   Supervisor (**NodeId = autoridade única**); cada spawn conta no teto de custo (ADR 0005);
-   evento: `NodeAdded { requested_by }` (campo aditivo, `serde(default)`).
+   binding NÃO-forjável do ADR 0007 (`derive_root_hops`). **Texto alinhado ao código em
+   2026-06-10 (conselho F1-3, achado R2 — o implementado é MAIS restritivo que a redação
+   original):** pedido de spawn nascido em cascata (`hops ≥ 1` efetivo) é **gateado SEMPRE**
+   (`SpawnGated{cascade}`, `router.rs:1805` — pede aval humano), **ANTES** de consultar o
+   cap — a defesa anti-fork-bomb não depende do contador; o cap `(root, sender) = 2` morde a
+   **origem**. Criação direta pelo humano (UI/comando) não passa pelo cap de agente. Spawn é
+   sempre via Supervisor (**NodeId = autoridade única**); cada spawn conta no teto de custo
+   (ADR 0005); evento: `NodeAdded { requested_by }` (campo aditivo, `serde(default)`).
+   **Gap aceito (Maestro, 2026-06-10 — red-team do spawn INV3/R1-L2):** o cap é por
+   `root_cause_id`; uma ORIGEM que inicia turnos novos ganha root fresco e renova o cap
+   (origem-burst). Aceito porque a origem é ação a mando do humano, a cascata segue gateada,
+   e os backstops (teto de custo quando configurado + gate humano) permanecem; o caveat da
+   janela de liveness do binding está documentado no ADR 0007. Re-avaliar se o retro (F1-3-7)
+   mostrar spawns de origem em rajada sem pedido humano correspondente.
 7. **Direção estética default da doutrina (F1-3, conforme 13.4):** a skill estética da Lina
    carrega **opinião explícita como default** — banir os genéricos (Inter/Roboto/Arial como
    tipografia default, gradiente branco-roxo, layout-padrão-de-template); adotar JetBrains

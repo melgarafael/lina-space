@@ -46,8 +46,13 @@ invariante #4: a soma de uso, o dia e até o flag de pausa são **derivados**, s
 ### 2. Granularidade `(workspace, dia-UTC)` + janela contábil que ZERA na retomada
 
 `RouterConfig.token_budget_day` (`router.rs:67`; **`0` = desligado**, opt-in por
-workspace, `router.rs:79`). O dia é `utc_day(now_ms)` puro (`router.rs:951`), derivado do
-relógio do roteador — sem dependência nova. A **janela contábil** soma os
+workspace, `router.rs:79`). **Nota de status (registrada 2026-06-10, conselho F1-3 item B1):**
+em produção o default segue **OFF** (`0`) — a CONTABILIZAÇÃO (`TokenUsageReported`/`CostLedger`)
+é sempre ativa, mas o GATE só morde quando o operador configura o teto. Consequência honesta:
+em autonomia `autonomo` com teto OFF, ações de origem (ex.: `lina spawn`) ficam limitadas pelos
+caps próprios + arbítrio do humano que origina os turnos. A decisão de ligar um teto default
+pertence ao painel de custos/seam de Ajustes (candidata F1-4/F2) — não ligar silenciosamente
+por trás do usuário. A **janela contábil** soma os
 `TokenUsageReported` apendados **depois do último `CostCeilingResumed`** (`router.rs:900-902`):
 a retomada humana **abre uma nova janela** (zera a soma), ela não "perdoa" retroativamente.
 Sem esse zeramento, a soma anterior **re-pausaria** na próxima delegação e o `lina resume`
