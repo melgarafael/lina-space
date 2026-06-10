@@ -607,7 +607,9 @@ mod tests {
     #[test]
     fn known_names_map_to_role_and_skills() {
         let cases: &[(&str, &str, &[&str])] = &[
-            ("@Maestro", "MAESTRO", &["maestri-orchestrator"]),
+            // BUG-2 dogfood r1: a skill do MAESTRO é a interna `lina-orchestration` —
+            // `maestri-orchestrator` é estrangeira e o guard do Lina a bloqueia.
+            ("@Maestro", "MAESTRO", &["lina-orchestration"]),
             (
                 "@Frontend",
                 "FRONTEND",

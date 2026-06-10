@@ -194,6 +194,15 @@ pub fn sanitize_name(name: &str) -> String {
     cleaned.replace("{{", "{ {").replace("}}", "} }")
 }
 
+/// **Papel CANÔNICO para exibição** (BUG-3 dogfood r1): caixa normalizada, sem inventar rótulo.
+/// O `agents.json` guarda o papel como o app o atribuiu (ex.: `reviewer`, contrato do overlay do
+/// `role_suggester`); as SUPERFÍCIES (whoami × handshake × list) exibem TODAS esta forma única.
+/// Papel desconhecido permanece CRU (apenas uppercased) — jamais vira "DEVELOPER" silencioso.
+#[must_use]
+pub fn canonical_role(raw: &str) -> String {
+    raw.trim().to_uppercase()
+}
+
 /// Frase de missão por papel (placeholder `role_mission`). Fallback genérico para papéis fora do
 /// mapa (o role-discovery pode evoluir sem quebrar o renderer).
 fn role_mission(role: &str) -> &'static str {
@@ -210,6 +219,9 @@ fn role_mission(role: &str) -> &'static str {
         "BUG_FIXER" => "Você investiga e conserta os bugs que aparecem.",
         "CURADOR" => "Você cuida do conhecimento e do vault (e é o único que escreve em `Tino/`).",
         "AUTOMATOR" => "Você cria as automações, webhooks e scripts do time.",
+        // BUG-3 dogfood r1: o papel do overlay do app (`reviewer`) ganha descrição própria —
+        // antes caía no genérico numa superfície e em outro rótulo nas demais.
+        "REVIEWER" => "Você revisa o trabalho dos colegas e aponta o que melhorar antes do aceite.",
         "DEVELOPER" => "Você desenvolve o que for preciso e delega o que for de outro papel.",
         _ => "Você colabora no time conforme o seu papel.",
     }
@@ -230,9 +242,19 @@ fn role_blurb(role: &str) -> &'static str {
         "BUG_FIXER" => "investiga e conserta bugs",
         "CURADOR" => "curadoria de conhecimento e do vault",
         "AUTOMATOR" => "automações, webhooks e scripts",
+        // BUG-3 dogfood r1: descrição própria do papel do overlay do app (`reviewer`).
+        "REVIEWER" => "revisa o trabalho dos colegas e aponta o que melhorar",
         "DEVELOPER" => "desenvolvimento geral",
         _ => "colabora no time",
     }
+}
+
+/// O papel CRU de `name` em `roster_roles` (pares `(nome, papel)` vindos do `agents.json`).
+fn roster_role_of<'a>(roster_roles: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    roster_roles
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, r)| r.as_str())
 }
 
 /// Skills do papel + `lina-agent-bus` (sempre, sem duplicar) — usado no `whoami` (cujo formato NÃO
@@ -293,6 +315,52 @@ impl Bootstrapper {
             .collect()
     }
 
+    /// **Papel + skills RESOLVIDOS de um terminal** (BUG-3 dogfood r1): o papel REAL do roster
+    /// (`agents.json`, autoridade do supervisor) VENCE a inferência por nome — "Automatizador"
+    /// é AUTOMATOR porque o app o admitiu assim, não DEVELOPER porque o regex não casou o nome.
+    /// Sem papel real (terminal puro/standalone, `agents.json` ausente) → inferência (compat).
+    /// As skills do papel real vêm do registry via override `[PAPEL]` (S0); papel fora do
+    /// registry mantém o rótulo CRU canônico e cai nas skills de fallback.
+    fn resolved_assignment(
+        &self,
+        name: &str,
+        roster_role: Option<&str>,
+    ) -> (String, RoleAssignment) {
+        match roster_role.map(str::trim) {
+            Some(raw) if !raw.is_empty() => {
+                let canon = canonical_role(raw);
+                let a = self.registry.infer_role(&format!("[{canon}]"));
+                (canon, a)
+            }
+            _ => {
+                let a = self.registry.infer_role(name);
+                (a.role.clone(), a)
+            }
+        }
+    }
+
+    /// Colegas inline com papéis REAIS do roster (BUG-3): mesma forma do [`Self::colleagues_inline`],
+    /// mas cada papel prefere `roster_roles` (pares `(nome, papel cru)` do `agents.json`).
+    fn colleagues_inline_with_roles(
+        &self,
+        input: &BootstrapInput,
+        roster_roles: &[(String, String)],
+    ) -> String {
+        let entries: Vec<String> = input
+            .roster
+            .iter()
+            .filter(|n| *n != &input.terminal_name)
+            .map(|n| {
+                let (role, _) = self.resolved_assignment(n, roster_role_of(roster_roles, n));
+                format!("{} ({}) — {}", sanitize_name(n), role, role_blurb(&role))
+            })
+            .collect();
+        if entries.is_empty() {
+            return "(nenhum colega ainda)".to_string();
+        }
+        entries.join("; ")
+    }
+
     /// Tabela de colegas em markdown (placeholder `colleagues_table`). Nomes em backticks
     /// (escapam markdown). Linha: `| @Nome | PAPEL | quando delegar |`.
     fn colleagues_table(&self, input: &BootstrapInput) -> String {
@@ -313,25 +381,8 @@ impl Bootstrapper {
         s.trim_end().to_string()
     }
 
-    /// Colegas inline (uma linha; bloco do `whoami`).
-    fn colleagues_inline(&self, input: &BootstrapInput) -> String {
-        let colleagues = self.colleagues(input);
-        if colleagues.is_empty() {
-            return "(nenhum colega ainda)".to_string();
-        }
-        colleagues
-            .iter()
-            .map(|(name, role)| {
-                format!(
-                    "{} ({}) — {}",
-                    sanitize_name(name),
-                    role.role,
-                    role_blurb(&role.role)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
+    // (o inline de colegas do `whoami` vive em `colleagues_inline_with_roles` — papéis reais
+    //  do roster com fallback de inferência; `&[]` reproduz o comportamento histórico.)
 
     /// Preenche os **14 placeholders** canônicos de um `template`. O `{{placeholder}}` LITERAL do
     /// corpo (exemplo) NÃO está na lista → permanece (é exemplo, não preenchimento).
@@ -380,10 +431,26 @@ impl Bootstrapper {
         self.render_template(GEMINI_TEMPLATE, input)
     }
 
-    /// **Bloco de estado vivo** que `lina whoami --bootstrap` imprime (design §1).
+    /// **Bloco de estado vivo** que `lina whoami --bootstrap` imprime (design §1). Sem papéis
+    /// reais do roster — inferência por nome (compat; o bin passa os papéis do `agents.json`).
     #[must_use]
     pub fn whoami(&self, input: &BootstrapInput) -> String {
-        let me = self.registry.infer_role(&input.terminal_name);
+        self.whoami_with_roles(input, &[])
+    }
+
+    /// Como [`Self::whoami`], com os **papéis REAIS do roster** (BUG-3 dogfood r1): pares
+    /// `(nome, papel cru)` do `agents.json`. O próprio papel E o dos colegas preferem o roster
+    /// (canonizados por [`canonical_role`]); nomes fora do roster caem na inferência por nome.
+    #[must_use]
+    pub fn whoami_with_roles(
+        &self,
+        input: &BootstrapInput,
+        roster_roles: &[(String, String)],
+    ) -> String {
+        let (role, me) = self.resolved_assignment(
+            &input.terminal_name,
+            roster_role_of(roster_roles, &input.terminal_name),
+        );
         format!(
             "=== Lina Space BOOTSTRAP ===\n\
              Voce e o terminal \"{name}\" -> papel {role}.\n\
@@ -395,10 +462,10 @@ impl Bootstrapper {
              PRIMEIRO PASSO OBRIGATORIO: 1) carregue skills  2) `lina handshake`  3) `lina plan read` (item @owner:voce?)\n\
              === FIM BOOTSTRAP ===",
             name = sanitize_name(&input.terminal_name),
-            role = me.role,
+            role = role,
             skills = skills_with_bus(&me),
             vault = input.vault_path,
-            colegas = self.colleagues_inline(input),
+            colegas = self.colleagues_inline_with_roles(input, roster_roles),
             plan = input.plan_path,
             auton = input.autonomy.label(),
             auton_desc = input.autonomy.desc(),
@@ -409,10 +476,20 @@ impl Bootstrapper {
     /// bloco de estado vivo. **Nunca stdout cru**.
     #[must_use]
     pub fn whoami_hook_json(&self, input: &BootstrapInput) -> String {
+        self.whoami_hook_json_with_roles(input, &[])
+    }
+
+    /// Como [`Self::whoami_hook_json`], com os papéis REAIS do roster (BUG-3 dogfood r1).
+    #[must_use]
+    pub fn whoami_hook_json_with_roles(
+        &self,
+        input: &BootstrapInput,
+        roster_roles: &[(String, String)],
+    ) -> String {
         let payload = serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": self.whoami(input),
+                "additionalContext": self.whoami_with_roles(input, roster_roles),
             }
         });
         serde_json::to_string(&payload).unwrap_or_else(|_| String::from("{}"))
@@ -752,6 +829,72 @@ mod tests {
             assert!(p >= last);
             last = p;
         }
+    }
+
+    /// **BUG-3 (dogfood r1) — o papel REAL do roster vence a inferência por nome.** O caso
+    /// observado na tela: "Automatizador" não casa nenhum pattern do registry → o whoami dizia
+    /// DEVELOPER, enquanto `agents.json`/`lina list` diziam AUTOMATOR. Com os papéis do roster,
+    /// o whoami exibe AUTOMATOR (e as skills DESSE papel); sem eles, o controle prova que a
+    /// inferência continuaria dizendo DEVELOPER (o teste falha se a preferência for removida).
+    #[test]
+    fn whoami_prefers_real_roster_role_over_name_inference() {
+        let bs = Bootstrapper::new().expect("registry");
+        let mut input = sample("Automatizador");
+        input.roster[0] = "Automatizador".into();
+
+        // Controle: SEM papéis do roster, o nome não casa pattern → fallback DEVELOPER.
+        let inferred = bs.whoami(&input);
+        assert!(
+            inferred.contains("-> papel DEVELOPER"),
+            "controle: sem roster_roles a inferência cai em DEVELOPER: {inferred}"
+        );
+
+        // Com o papel REAL (agents.json): AUTOMATOR, com as skills do AUTOMATOR.
+        let roles = vec![("Automatizador".to_string(), "AUTOMATOR".to_string())];
+        let real = bs.whoami_with_roles(&input, &roles);
+        assert!(
+            real.contains("-> papel AUTOMATOR"),
+            "papel real do roster vence a inferência: {real}"
+        );
+        assert!(
+            real.contains("mcp-builder"),
+            "as skills acompanham o papel REAL (AUTOMATOR), não o inferido: {real}"
+        );
+    }
+
+    /// **BUG-3 — papel DESCONHECIDO não vira DEVELOPER silencioso:** o rótulo CRU canônico
+    /// aparece (caixa normalizada) com a descrição genérica; e `reviewer` (overlay do app,
+    /// minúsculo no `agents.json`) canoniza para REVIEWER com descrição PRÓPRIA.
+    #[test]
+    fn unknown_and_reviewer_roles_are_canonical_never_silent_developer() {
+        let bs = Bootstrapper::new().expect("registry");
+        let mut input = sample("@Dev Backend");
+        input.roster = vec!["@Dev Backend".into(), "Revisor".into(), "Visionária".into()];
+        let roles = vec![
+            ("Revisor".to_string(), "reviewer".to_string()),
+            ("Visionária".to_string(), "PAPEL_NOVO".to_string()),
+        ];
+        let out = bs.whoami_with_roles(&input, &roles);
+        assert!(
+            out.contains("Revisor (REVIEWER) — revisa o trabalho dos colegas"),
+            "reviewer canoniza a caixa e ganha descrição própria: {out}"
+        );
+        assert!(
+            out.contains("Visionária (PAPEL_NOVO) — colabora no time"),
+            "papel desconhecido fica CRU + descrição genérica (nunca DEVELOPER): {out}"
+        );
+        assert!(
+            !out.contains("Visionária (DEVELOPER)"),
+            "papel desconhecido não pode degradar silenciosamente p/ DEVELOPER: {out}"
+        );
+    }
+
+    /// `canonical_role`: normalização de caixa + trim; desconhecido permanece cru.
+    #[test]
+    fn canonical_role_normalizes_case_and_keeps_unknown_raw() {
+        assert_eq!(canonical_role("reviewer"), "REVIEWER");
+        assert_eq!(canonical_role("  AUTOMATOR  "), "AUTOMATOR");
+        assert_eq!(canonical_role("Papel_Novo"), "PAPEL_NOVO");
     }
 
     /// `whoami` lista os COLEGAS REAIS (não o próprio terminal).

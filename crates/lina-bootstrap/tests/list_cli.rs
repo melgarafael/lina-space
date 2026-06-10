@@ -74,7 +74,9 @@ fn lina_list_plain_and_empty() {
     assert!(out_empty.status.success(), "roster vazio é sucesso");
     assert!(String::from_utf8_lossy(&out_empty.stdout).contains("nenhum agente"));
 
-    // Com um agente, a forma legível mostra nome e papel.
+    // Com um agente, a forma legível mostra nome e papel. BUG-3 (dogfood r1): o papel sai
+    // CANÔNICO (REVIEWER) — a MESMA forma do whoami/handshake (paridade de superfícies);
+    // o cru `reviewer` continua no `--json` (espelho fiel do agents.json, teste acima).
     std::fs::write(
         home.path().join("agents.json"),
         r#"[{"name":"Revisor","role":"reviewer","status":"Running"}]"#,
@@ -83,5 +85,12 @@ fn lina_list_plain_and_empty() {
     let out = run_list(&home, &[]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Revisor") && stdout.contains("reviewer"));
+    assert!(
+        stdout.contains("Revisor") && stdout.contains("REVIEWER"),
+        "papel canônico na superfície legível: {stdout}"
+    );
+    assert!(
+        !stdout.contains("· reviewer ·"),
+        "o cru minúsculo não vaza mais na forma legível: {stdout}"
+    );
 }

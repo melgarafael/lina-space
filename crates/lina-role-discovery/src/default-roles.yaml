@@ -22,7 +22,11 @@ fallback:
 roles:
   - role: MAESTRO
     patterns: [maestro, orquest, coord, lider, master]
-    skills: [maestri-orchestrator]
+    # BUG-2 dogfood r1: `maestri-orchestrator` é skill de orquestrador ESTRANGEIRO — o guard
+    # do próprio Lina a bloqueia (pretooluse `is_foreign_skill`), e o bootstrap mandava o
+    # MAESTRO carregá-la no turno 0 (instrução contraditória). A skill do papel é a
+    # `lina-orchestration` (F1-3-4, o método Maestro internalizado na safra embutida).
+    skills: [lina-orchestration]
 
   - role: ARQUITETO
     patterns: [arquiteto, architect, arch]

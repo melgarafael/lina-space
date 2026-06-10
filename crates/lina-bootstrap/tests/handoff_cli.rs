@@ -50,6 +50,9 @@ fn run_handoff(ws: &TempWs, args: &[&str]) -> std::process::Output {
         .args(&argv)
         .current_dir(&ws.cwd)
         .env("LINA_HOME", &ws.home)
+        // ADR 0026: a identidade testada aqui é a da FICHA — isola do env de spawn que um
+        // terminal do Lina injeta (rodar `cargo test` dentro do Espaço não pode mudar o `from`).
+        .env_remove("LINA_NODE_NAME")
         .output()
         .expect("executar o binário lina")
 }

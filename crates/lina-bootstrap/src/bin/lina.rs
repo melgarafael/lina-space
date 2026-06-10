@@ -10,12 +10,12 @@
 //!   colegas do workspace (de `.lina/agents.json` ou do roster do bootstrap).
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lina_bootstrap::{
-    autonomy_from_env, classify_retro_args, pretooluse_output, project_retro, render_report,
-    Autonomy, BootstrapInput, Bootstrapper, RetroInvocation,
+    autonomy_from_env, canonical_role, classify_retro_args, pretooluse_output, project_retro,
+    render_report, Autonomy, BootstrapInput, Bootstrapper, RetroInvocation,
 };
 use lina_core::{
     check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, HandoffContract,
@@ -24,6 +24,15 @@ use lina_core::{
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
 const INPUT_PATH: &str = ".lina/bootstrap.json";
+
+/// **ADR 0026 (BUG-1 dogfood r1) — identidade por ENV DE SPAWN.** O app injeta
+/// `LINA_NODE_NAME` (e `LINA_NODE_ID`) no env do PTY ao admitir o nó — autoridade do APP,
+/// inforjável por conteúdo de mensagem e POR-PROCESSO (não por-diretório). Com N terminais
+/// no MESMO cwd (default da F1-4-1), a ficha `.lina/bootstrap.json` é último-escritor-vence;
+/// o env não colide. Ordem de resolução do nome: (a) env, se presente; (b) ficha (compat
+/// terminal puro/standalone). Os DEMAIS campos (roster/vault/autonomia/plano) continuam
+/// vindo da ficha — só `terminal_name` prefere o env.
+const NODE_NAME_ENV: &str = "LINA_NODE_NAME";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -84,13 +93,48 @@ fn enqueue_per_node(mailbox: &Mailbox, node: &str, msg: &MailMessage) -> std::io
 }
 
 fn load_input() -> Result<BootstrapInput, String> {
-    let data = std::fs::read_to_string(INPUT_PATH).map_err(|e| e.to_string())?;
+    load_input_at(Path::new(INPUT_PATH))
+}
+
+/// Lê a ficha em `path`. Separada de [`load_input`] para os testes provarem o compat:
+/// ficha AUSENTE continua erro com orientação (jamais identidade inventada).
+fn load_input_at(path: &Path) -> Result<BootstrapInput, String> {
+    let data = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_json::from_str(&data).map_err(|e| e.to_string())
+}
+
+/// Valor de [`NODE_NAME_ENV`] (trim; vazio = ausente — env vazio não apaga a ficha).
+fn env_node_name() -> Option<String> {
+    let v = std::env::var(NODE_NAME_ENV).ok()?;
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// **Resolução de nome (ADR 0026, função PURA):** env do spawn vence a ficha por-cwd.
+/// Env ausente/vazio → ficha (compat terminal puro).
+fn resolved_name(env_name: Option<&str>, ficha_name: &str) -> String {
+    match env_name.map(str::trim) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => ficha_name.to_string(),
+    }
+}
+
+/// Ficha com a IDENTIDADE RESOLVIDA (ADR 0026): carrega `.lina/bootstrap.json` e aplica a
+/// preferência de env SÓ em `terminal_name` — whoami/handshake/`enqueue_as` (outbox por-nó)
+/// passam a usar o nome certo mesmo com a ficha sobrescrita por um colega de cwd.
+fn load_identity() -> Result<BootstrapInput, String> {
+    let mut input = load_input()?;
+    input.terminal_name = resolved_name(env_node_name().as_deref(), &input.terminal_name);
+    Ok(input)
 }
 
 /// `hook = true` → JSON do `SessionStart`; `false` → bloco legível.
 fn run_whoami(hook: bool) -> ExitCode {
-    let input = match load_input() {
+    let input = match load_identity() {
         Ok(i) => i,
         Err(e) => {
             eprintln!("lina: nao foi possivel ler {INPUT_PATH}: {e}");
@@ -104,12 +148,29 @@ fn run_whoami(hook: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // BUG-3 (dogfood r1): papéis REAIS do roster (`agents.json`, autoridade do supervisor) —
+    // paridade whoami × handshake × list. Ausente (terminal puro) → inferência por nome.
+    let roles = roster_roles();
     if hook {
-        println!("{}", bs.whoami_hook_json(&input));
+        println!("{}", bs.whoami_hook_json_with_roles(&input, &roles));
     } else {
-        println!("{}", bs.whoami(&input));
+        println!("{}", bs.whoami_with_roles(&input, &roles));
     }
     ExitCode::SUCCESS
+}
+
+/// Papéis REAIS do roster, lidos do `agents.json` (escrito pelo supervisor): pares
+/// `(nome, papel cru)`. Arquivo ausente/ilegível → vazio (o whoami cai na inferência).
+fn roster_roles() -> Vec<(String, String)> {
+    Mailbox::new(mailbox_root())
+        .read_agents()
+        .map(|agents| {
+            agents
+                .into_iter()
+                .filter_map(|a| a.role.map(|r| (a.name, r)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `lina ask` — monta a `MailMessage` e a deposita na mailbox.
@@ -179,7 +240,7 @@ fn run_ask(args: &[String]) -> ExitCode {
         }
     };
 
-    let from = match load_input() {
+    let from = match load_identity() {
         Ok(i) => i.terminal_name,
         Err(e) => {
             eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
@@ -302,7 +363,7 @@ fn run_handoff(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let input = match load_input() {
+    let input = match load_identity() {
         Ok(i) => i,
         Err(e) => {
             eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
@@ -623,7 +684,7 @@ fn run_spawn(args: &[String]) -> ExitCode {
         format!("@{raw_name}")
     };
 
-    let input = match load_input() {
+    let input = match load_identity() {
         Ok(i) => i,
         Err(e) => {
             eprintln!(
@@ -841,7 +902,7 @@ fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
         usage();
         return ExitCode::from(2);
     };
-    let from = match load_input() {
+    let from = match load_identity() {
         Ok(i) => i.terminal_name,
         Err(e) => {
             eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
@@ -1058,7 +1119,10 @@ fn run_pretooluse() -> ExitCode {
 /// confirmação real é a tecla na janela — inforjável pelo PTY do agente).
 fn run_resume(_args: &[String]) -> ExitCode {
     // Origem autenticada pela fila por-nó (não o campo `from`): o requester vem do dir-dono no drain.
-    let from = load_input()
+    // Red-team r1 do ADR 0026: em verbo CUSTODIADO, ficha ausente NÃO cai no env (que o processo
+    // do agente pode exportar) — degrada para "agente-desconhecido", como sempre. O env só entra
+    // via `load_identity()` (ficha presente), onde a autoridade final segue sendo o dir-dono.
+    let from = load_identity()
         .map(|i| i.terminal_name)
         .unwrap_or_else(|_| "agente-desconhecido".to_string());
 
@@ -1112,7 +1176,9 @@ fn run_do(args: &[String]) -> ExitCode {
     };
 
     // Identidade do requisitante: auto-declarada (A3 pendente — autoria NÃO-autenticada, ADR 0004 §4).
-    let requester = load_input()
+    // Red-team r1 do ADR 0026: idem `run_resume` — verbo custodiado não toma identidade do env
+    // com ficha ausente; degrada para "agente-desconhecido" (falha visível > identidade exportável).
+    let requester = load_identity()
         .map(|i| i.terminal_name)
         .unwrap_or_else(|_| "agente-desconhecido".to_string());
 
@@ -1170,7 +1236,7 @@ fn run_do(args: &[String]) -> ExitCode {
 
 /// `lina handshake` — registra presença (0 broadcast) e lista os colegas do workspace.
 fn run_handshake() -> ExitCode {
-    let input = match load_input() {
+    let input = match load_identity() {
         Ok(i) => i,
         Err(e) => {
             eprintln!("lina: nao foi possivel ler {INPUT_PATH}: {e}");
@@ -1198,7 +1264,7 @@ fn run_handshake() -> ExitCode {
         Ok(agents) if !agents.is_empty() => agents
             .into_iter()
             .filter(|a| a.name != from)
-            .map(|a| format!("{} ({})", a.name, a.role.unwrap_or_else(|| "—".into())))
+            .map(|a| handshake_colleague_entry(&a.name, a.role.as_deref()))
             .collect(),
         _ => input
             .roster
@@ -1218,6 +1284,25 @@ fn run_handshake() -> ExitCode {
     println!("(NAO responda — handshake e informativo, nao interrogativo)");
     println!("=== FIM HANDSHAKE ===");
     ExitCode::SUCCESS
+}
+
+/// **BUG-3 (dogfood r1) — paridade de papel nas superfícies.** A linha de colega do
+/// `handshake` exibe o papel CANÔNICO ([`canonical_role`]) — a MESMA forma do `whoami`
+/// (colegas) e do `lina list`. Papel ausente → "—" (como antes).
+fn handshake_colleague_entry(name: &str, role: Option<&str>) -> String {
+    format!(
+        "{name} ({})",
+        role.map(canonical_role).unwrap_or_else(|| "—".into())
+    )
+}
+
+/// **BUG-3 — a linha do `lina list` (modo texto)**: papel CANÔNICO, igual às demais
+/// superfícies. O `--json` segue CRU (espelho fiel do `agents.json` — rastreabilidade).
+fn list_agent_entry(name: &str, role: Option<&str>, status: &str) -> String {
+    format!(
+        "{name} · {} · {status}",
+        role.map(canonical_role).unwrap_or_else(|| "—".into())
+    )
 }
 
 /// `lina list [--json]` (W4-2) — lista os agentes do workspace (NOME · PAPEL · STATUS), lido do
@@ -1250,10 +1335,8 @@ fn run_list(json: bool) -> ExitCode {
         } else {
             for a in &agents {
                 println!(
-                    "{} · {} · {}",
-                    a.name,
-                    a.role.as_deref().unwrap_or("—"),
-                    a.status
+                    "{}",
+                    list_agent_entry(&a.name, a.role.as_deref(), &a.status)
                 );
             }
         }
@@ -1485,6 +1568,153 @@ fn vault_search(termo: Option<&str>) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// **ADR 0026 (BUG-1) — resolução de nome:** env do spawn VENCE a ficha; env
+    /// ausente/vazio/whitespace cai na ficha (controle). Remover a preferência de env
+    /// faz o primeiro assert falhar (não-vacuoso).
+    #[test]
+    fn env_name_wins_over_ficha_and_empty_env_falls_back() {
+        assert_eq!(
+            resolved_name(Some("Bug Finder"), "Automatizador"),
+            "Bug Finder",
+            "env do spawn (autoridade do app) vence a ficha por-cwd"
+        );
+        assert_eq!(
+            resolved_name(None, "Automatizador"),
+            "Automatizador",
+            "controle: sem env, a ficha continua mandando (terminal puro)"
+        );
+        assert_eq!(
+            resolved_name(Some(""), "Automatizador"),
+            "Automatizador",
+            "env vazio não apaga a identidade da ficha"
+        );
+        assert_eq!(
+            resolved_name(Some("   "), "Automatizador"),
+            "Automatizador",
+            "env whitespace idem"
+        );
+        assert_eq!(
+            resolved_name(Some("  Bug Finder  "), "Automatizador"),
+            "Bug Finder",
+            "o nome do env chega aparado"
+        );
+    }
+
+    /// **ADR 0026 — outbox POR-NÓ usa o nome RESOLVIDO:** com env divergente da ficha, a
+    /// mensagem deposita no subdir do NOME DO ENV (e nada no da ficha); controle sem env →
+    /// subdir da ficha. É o caminho real do `lina ask` (`resolved_name` → `enqueue_per_node`).
+    #[test]
+    fn outbox_per_node_uses_resolved_name() {
+        let root = std::env::temp_dir().join(format!(
+            "lina-adr0026-outbox-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mailbox = Mailbox::new(&root);
+
+        // Env setado e ficha divergente → subdir do env.
+        let from = resolved_name(Some("Bug Finder"), "Automatizador");
+        let msg = MailMessage::new(&from, "@QA", "ask", "oi");
+        enqueue_per_node(&mailbox, &from, &msg).expect("enqueue com nome do env");
+        let env_dir = root.join("outbox").join("Bug Finder");
+        let ficha_dir = root.join("outbox").join("Automatizador");
+        assert_eq!(
+            std::fs::read_dir(&env_dir).map(Iterator::count).ok(),
+            Some(1),
+            "a mensagem mora no subdir do NOME DO ENV"
+        );
+        assert!(
+            !ficha_dir.exists(),
+            "nada vaza para o subdir do nome da ficha sobrescrita"
+        );
+
+        // Controle: sem env → subdir da ficha (compat).
+        let from = resolved_name(None, "Automatizador");
+        let msg = MailMessage::new(&from, "@QA", "ask", "oi de novo");
+        enqueue_per_node(&mailbox, &from, &msg).expect("enqueue compat");
+        assert_eq!(
+            std::fs::read_dir(&ficha_dir).map(Iterator::count).ok(),
+            Some(1),
+            "sem env, o subdir da ficha continua sendo o canal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **ADR 0026 — compat preservado:** ficha AUSENTE continua `Err` com a mensagem de
+    /// orientação (nenhuma identidade inventada); ficha presente lê o nome dela.
+    #[test]
+    fn missing_ficha_still_errors_with_orientation() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-adr0026-ficha-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let missing = load_input_at(&dir.join("bootstrap.json"));
+        assert!(
+            missing.is_err(),
+            "ficha ausente → erro/orientação (jamais default silencioso)"
+        );
+
+        let path = dir.join("ok.json");
+        std::fs::write(
+            &path,
+            r#"{"terminal_name":"Automatizador","roster":["Automatizador"],"vault_path":"/v","autonomy":"assisted"}"#,
+        )
+        .expect("ficha");
+        let input = load_input_at(&path).expect("ficha válida parseia");
+        assert_eq!(input.terminal_name, "Automatizador");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **BUG-3 (dogfood r1) — PARIDADE:** para cada papel do roster de teste, whoami
+    /// (colegas) × handshake × list exibem o MESMO papel canônico — inclusive o `reviewer`
+    /// minúsculo do `agents.json` (→ REVIEWER) e um papel desconhecido (fica CRU, jamais
+    /// vira DEVELOPER só numa superfície).
+    #[test]
+    fn role_parity_across_whoami_handshake_and_list() {
+        let roster_roles: Vec<(String, String)> = vec![
+            ("Automatizador".into(), "AUTOMATOR".into()),
+            ("Revisor".into(), "reviewer".into()),
+            ("Especialista em Telas".into(), "FRONTEND".into()),
+            ("Visionária".into(), "PAPEL_NOVO".into()),
+        ];
+        let mut roster: Vec<String> = roster_roles.iter().map(|(n, _)| n.clone()).collect();
+        roster.push("Bug Finder".into());
+        let input = BootstrapInput::new("Bug Finder", roster, "/tmp/v", Autonomy::Assisted);
+        let bs = Bootstrapper::new().expect("registry");
+        let who = bs.whoami_with_roles(&input, &roster_roles);
+
+        for (name, raw) in &roster_roles {
+            let canon = canonical_role(raw);
+            let token = format!("{name} ({canon})");
+            assert!(
+                who.contains(&token),
+                "whoami deve exibir {token:?} (papel real canônico): {who}"
+            );
+            assert_eq!(
+                handshake_colleague_entry(name, Some(raw)),
+                token,
+                "handshake exibe o MESMO papel canônico"
+            );
+            assert!(
+                list_agent_entry(name, Some(raw), "Ready")
+                    .starts_with(&format!("{name} · {canon} ·")),
+                "list exibe o MESMO papel canônico"
+            );
+        }
+        // O caso da tela: "Automatizador" jamais aparece DEVELOPER em superfície alguma.
+        assert!(!who.contains("Automatizador (DEVELOPER)"), "{who}");
+    }
 }
 
 #[cfg(test)]

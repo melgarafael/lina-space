@@ -195,6 +195,59 @@ fn skills_promise_only_verbs_that_exist() {
     }
 }
 
+/// **BUG-2 dogfood r1 — família "promessa ⊆ instalado", agora para SKILLS DE PAPEL:** o
+/// bootstrap ("Skills a carregar AGORA") promete, por papel, SÓ skills que o guard do
+/// próprio Lina NÃO bloqueia (zero instrução contraditória no turno 0 — o caso da tela:
+/// o MAESTRO era mandado carregar `maestri-orchestrator`, que o guard nega). E toda skill
+/// `lina-*` prometida existe na safra EMBUTIDA (`LINA_SKILLS`) — promessa sem instalação
+/// é o mesmo fantasma dos verbos. Varre TODOS os papéis do registry + o fallback.
+#[test]
+fn role_skill_promises_pass_the_guard_and_lina_skills_are_installed() {
+    use lina_bootstrap::{pretooluse::is_foreign_skill, ALWAYS_SKILL, LINA_SKILLS};
+    use lina_role_discovery::RoleRegistry;
+
+    let reg = RoleRegistry::with_defaults().expect("registry default");
+    // `[PAPEL]` (override S0) devolve a atribuição canônica de cada papel declarado;
+    // um nome sem sinal cobre o fallback (DEVELOPER).
+    let mut promises: Vec<(String, Vec<String>)> = reg
+        .role_names()
+        .map(|r| (r.to_string(), reg.infer_role(&format!("[{r}]")).skills))
+        .collect();
+    promises.push((
+        "DEVELOPER(fallback)".to_string(),
+        reg.infer_role("nome-sem-sinal-xyz").skills,
+    ));
+    assert!(
+        promises.len() >= 13,
+        "registry canônico: 12 papéis + fallback"
+    );
+
+    for (role, skills) in &promises {
+        for skill in skills {
+            assert!(
+                !is_foreign_skill(skill),
+                "papel {role} promete a skill ESTRANGEIRA {skill:?} — o guard do próprio \
+                 Lina a bloqueia no turno 0 (instrução contraditória)"
+            );
+            if skill.starts_with("lina-") && skill != ALWAYS_SKILL {
+                assert!(
+                    LINA_SKILLS.iter().any(|s| s.name == skill),
+                    "papel {role} promete {skill:?}, que NÃO está na safra embutida \
+                     (LINA_SKILLS) — promessa sem instalação"
+                );
+            }
+        }
+    }
+
+    // Âncora do fix: o MAESTRO promete a skill INTERNA de orquestração.
+    let maestro = reg.infer_role("[MAESTRO]");
+    assert!(
+        maestro.skills.iter().any(|s| s == "lina-orchestration"),
+        "MAESTRO deve carregar a lina-orchestration (método Maestro internalizado): {:?}",
+        maestro.skills
+    );
+}
+
 /// **F1-0-9 critério 1:** os 3 templates contêm a instrução claim-ANTES-de-ask e ≥2
 /// exemplos concretos de fluxo `lina plan claim` (a doutrina que empurra a coordenação
 /// para o plano — baseline 14h: 0% de adoção).

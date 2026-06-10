@@ -46,6 +46,9 @@ fn run_do(home: &TempHome, action_args: &[&str]) -> std::process::Output {
     Command::new(exe)
         .args(&argv)
         .env("LINA_HOME", home.path())
+        // ADR 0026: estes testes provam o fallback `agente-desconhecido` (sem ficha) — isola
+        // do env de spawn de um terminal do Lina (que agora também identifica o nó).
+        .env_remove("LINA_NODE_NAME")
         .output()
         .expect("executar o binário lina")
 }
@@ -142,6 +145,8 @@ fn run_resume(home: &TempHome, extra: &[&str]) -> std::process::Output {
     Command::new(exe)
         .args(&argv)
         .env("LINA_HOME", home.path())
+        // ADR 0026: idem `run_do` — o fallback sem-ficha é o que está sob teste.
+        .env_remove("LINA_NODE_NAME")
         .output()
         .expect("executar o binário lina")
 }

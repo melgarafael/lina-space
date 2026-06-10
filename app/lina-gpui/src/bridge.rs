@@ -2475,6 +2475,20 @@ pub fn shell_cmd(_name: &str) -> PtyCommand {
     }
 }
 
+/// **ADR 0026 — identidade do nó no ENV do PTY filho (autoridade do APP no spawn).** Único
+/// ponto que carimba `VIBE_ROLE` + `LINA_NODE_NAME` + `LINA_NODE_ID` no comando de um nó —
+/// chamado pelo funil único `admit_node`. `LINA_NODE_ID` leva a `key` durável (`n-<uuidv7>`,
+/// a identidade de filesystem do nó, cunhada ANTES do spawn; o `NodeId` canônico só nasce no
+/// `register`, DEPOIS do PTY subir). O CLI `lina` resolve `terminal_name` por
+/// `LINA_NODE_NAME` antes da ficha por-cwd — ver ADR 0026 §segurança: um agente pode mascarar
+/// o PRÓPRIO whoami exportando a var num subshell, mas o `from` A2A final é re-carimbado pelo
+/// supervisor no drain (dir-dono); nenhuma autoridade nova nasce aqui.
+fn node_identity_env(cmd: PtyCommand, name: &str, role: &str, key: &str) -> PtyCommand {
+    cmd.env("VIBE_ROLE", role)
+        .env("LINA_NODE_NAME", name)
+        .env("LINA_NODE_ID", key)
+}
+
 #[cfg(windows)]
 fn platform_shell_cmd() -> PtyCommand {
     // Shell interativo limpo, sem a linha de intro (`/K` sem `echo`): o `cmd.exe` já abre
@@ -3872,19 +3886,27 @@ impl NodeManager {
             return Err(format!("papel inválido: {role:?}"));
         }
 
-        // 3) Comando: motor escolhido (M6) ou fábrica default — TODO nó nasce com `VIBE_ROLE`
-        //    no env ("terminal" também é papel; o agente sempre sabe o seu).
-        let mut cmd = match &plan.engine {
-            Some(e) => {
-                let mut c = PtyCommand::new(&e.program);
-                for a in &e.args {
-                    c = c.arg(a);
+        // 3) Comando: motor escolhido (M6) ou fábrica default — TODO nó nasce com a IDENTIDADE
+        //    no env (ADR 0026): `VIBE_ROLE` ("terminal" também é papel) + `LINA_NODE_NAME`/
+        //    `LINA_NODE_ID`. O env do spawn é autoridade do APP — com N nós no MESMO cwd
+        //    (F1-4-1 `default_cwd`), a ficha `.lina/bootstrap.json` é último-escritor-vence;
+        //    a identidade POR-PROCESSO do env não colide (bug de dogfooding: o MAESTRO se via
+        //    como "Automatizador" no whoami/outbox).
+        let mut cmd = node_identity_env(
+            match &plan.engine {
+                Some(e) => {
+                    let mut c = PtyCommand::new(&e.program);
+                    for a in &e.args {
+                        c = c.arg(a);
+                    }
+                    c
                 }
-                c
-            }
-            None => (*self.cmd_factory)(&name),
-        }
-        .env("VIBE_ROLE", &role);
+                None => (*self.cmd_factory)(&name),
+            },
+            &name,
+            &role,
+            &key,
+        );
 
         // 4) Política de cwd (§4) + kit write-before-spawn (o shell já encontra o CLAUDE.md).
         //    `cwd_real` é o que o `TerminalSpawned` persiste — o binding node↔cwd↔sessão (§3).
@@ -8703,6 +8725,33 @@ mod tests {
             dbg.contains("TERM") && dbg.contains("xterm-256color"),
             "env TERM preservado (não regrediu junto com a intro): {dbg}"
         );
+    }
+
+    /// **ADR 0026 (BUG-1 dogfood r1) — TODO nó nasce com a identidade no env do PTY:** o
+    /// funil único (`admit_node`) carimba `LINA_NODE_NAME` (nome do nó) e `LINA_NODE_ID`
+    /// (a key durável `n-<uuidv7>`) via [`node_identity_env`] — junto do `VIBE_ROLE`
+    /// histórico. É o que impede a colisão de identidade quando N terminais compartilham o
+    /// MESMO cwd (a ficha `.lina/bootstrap.json` é último-escritor-vence; o env, não).
+    /// NÃO-VACUOSO: remover a injeção de qualquer uma das 3 vars falha o assert dela.
+    #[test]
+    fn admitted_pty_env_carries_node_identity() {
+        let cmd = node_identity_env(
+            PtyCommand::new("cat"),
+            "Bug Finder",
+            "BUG_FIXER",
+            "n-0197-deadbeef",
+        );
+        let dbg = format!("{cmd:?}");
+        for (var, val) in [
+            ("VIBE_ROLE", "BUG_FIXER"),
+            ("LINA_NODE_NAME", "Bug Finder"),
+            ("LINA_NODE_ID", "n-0197-deadbeef"),
+        ] {
+            assert!(
+                dbg.contains(var) && dbg.contains(val),
+                "env de identidade ausente no comando do PTY: {var}={val} em {dbg}"
+            );
+        }
     }
 
     /// **Terminal PURO não escreve NADA no HOME do usuário (invariante crítico):** mesmo com o
