@@ -8,11 +8,26 @@
 //! ## A solução (duas camadas, complementares)
 //! - **Camada VT** (`lina-vt`): o ring-buffer interno do alacritty (`Config::scrolling_history`)
 //!   já descarta linhas antigas da RAM acima do cap — mas as PERDE.
-//! - **Esta camada** (`lina-core`): o disco é o **log append-only autoritativo** de CADA linha
-//!   (SQLite WAL, alinhado ao [`crate::EventStore`]); a RAM mantém só um **cache da cauda** de
-//!   `cap` linhas (a janela viva / viewport rolável sem tocar o disco). Ao rolar além da janela,
-//!   as páginas são **hidratadas do disco sob demanda** — transparente, no core, fora do render.
-//!   Nada se perde (invariante #6).
+//! - **Esta camada** (`lina-core`): o disco é o **log append-only** do scrollback (SQLite WAL,
+//!   alinhado ao [`crate::EventStore`]); a RAM mantém só um **cache da cauda** de `cap` linhas
+//!   (a janela viva / viewport rolável sem tocar o disco). Ao rolar além da janela, as páginas
+//!   são **hidratadas do disco sob demanda** — transparente, no core, fora do render.
+//!
+//! ## Durabilidade: a fronteira honesta (F1-6-5)
+//! A escrita é **write-behind em lote** — a durabilidade tem uma JANELA, não é "cada linha
+//! instantânea no disco". O contrato real (cada item nomeia o teste verde que o prova):
+//! - **Encerramento gracioso** (`Drop` do `ScrollbackStore`) e **sinais educados** (SIGTERM/
+//!   SIGINT/SIGHUP, via `FlushGuard`) drenam TODO o write-behind pendente → **zero perda
+//!   byte-idêntica** (`a_sigterm_com_pendentes_zero_perda_byte_identica`).
+//! - Sob **`kill -9`** (SIGKILL, não-capturável) perde-se **no máximo** o write-behind ainda
+//!   não-flushado; o `FlushGuard` (F1-5-6) encolhe essa janela para ~`idle_for` de output
+//!   (1-2s) drenando os painéis ociosos (`b_idle_drain_persiste_em_ate_2s_visivel_a_leitor_externo`).
+//!   É **cache de terminal**, NÃO estado de domínio — este vive no event log, durável à parte.
+//! - O que JÁ foi flushado nunca se perde e reidrata byte-idêntico na reabertura
+//!   (`paged_lines_hydrate_from_disk_byte_identical`, `reopen_continues_and_recovers_paged_line`).
+//! - **Retenção (F1-5-9):** linhas além de `DEFAULT_RETENTION_DAYS` (30d) expiram no job diário;
+//!   a leitura responde vazio + sinaliza `expired_before`, **nunca erro nem dado fantasma**
+//!   (`ret_d_leitura_pos_expiracao_sinaliza_expirado_nao_erro`).
 //!
 //! ## Modelo de índices (por painel)
 //! Cada linha tem um `idx` GLOBAL monotônico (0-based). Estado:

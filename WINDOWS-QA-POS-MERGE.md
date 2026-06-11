@@ -16,9 +16,11 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\make-win.ps1
 
 Rode o `lina-gpui.exe` de `dist\Lina-win\` (o resolver acha `lina.exe` e `assets\` ao lado, como no seu de-risk).
 
-⚠️ **NÃO rode `cargo test --workspace` esperando verde** — os testes de PTY ainda spawnam
-`yes`/`sh` (Unix) e penduram no Windows (o CI compila com `--no-run` por isso). Esse gate é um
-item futuro, não deste roteiro.
+✅ **`cargo test --workspace -- --test-threads=1` agora roda VERDE no Windows.** Pós-CI-3SO
+(F1-6-8) o `--no-run` saiu e o job `core-windows` EXECUTA a suíte de verdade como gate bloqueante
+a cada push (`.github/workflows/ci.yml`). Os testes de PTY que spawnam `sh`/`yes` são `#[cfg(unix)]`
+— nem compilam no Windows, então não penduram mais. Use sempre `--test-threads=1` (o store/recovery
+exige serialização, idêntico ao CI). Triagem teste×SO completa: `tasks/epico-f1/ci-3so-triagem.md`.
 
 ---
 

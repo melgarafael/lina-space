@@ -273,8 +273,10 @@ impl Dimensions for GridSize {
 /// W5-2: cap **default provisório** de linhas de scrollback mantidas em RAM por painel.
 ///
 /// É o teto do ring-buffer interno do alacritty (`Config::scrolling_history`): ao excedê-lo,
-/// as linhas mais ANTIGAS saem da RAM. O histórico além do cap NÃO se perde — é paginado em
-/// disco pelo `lina_core::scrollback` (invariante #6, "nada se perde num crash").
+/// as linhas mais ANTIGAS saem da RAM. O histórico além do cap é **paginado em disco** pelo
+/// `lina_core::scrollback` (não fica só na RAM). Durabilidade tem fronteira honesta (F1-6-5): o
+/// `ScrollbackStore` é write-behind, então `kill -9` perde no máximo o último lote não-flushado
+/// (cache de terminal, não estado de domínio); encerramento gracioso e sinais educados drenam tudo.
 ///
 /// **Por que capar:** `(#painéis × scrollback)` sem teto é a classe de leak que estourou a RAM
 /// de Ghostty/Warp (~41 GB) sob output torrencial de CLI de IA. O cap fecha essa porta.
