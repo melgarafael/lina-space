@@ -21,8 +21,8 @@ lina history <painel> --export json|txt --from IDX --to IDX
 |---|---|---|
 | `--tail N --offset K` | `history::tail(store, panel, Some(N), K, &limits)` | default quando nenhuma flag de modo |
 | `--search RE --limit N --cursor I` | `history::search(store, panel, RE, Some(N), Some(I), &limits)` | regex inválido → erro legível (`BadRegex`) |
-| `--export FMT --from A --to B` | `history::export(store, panel, FMT, A, B, &limits)` | devolve `(payload, next_cursor)` |
-| leitura de painel de OUTRO terminal | `history::tail_cross(events, members, reader, owner, …)` / `search_cross(…)` | **OBRIGATÓRIO no caminho cross** — audita no log (`HistoryReadCross`); fora do Espaço nega (`CrossDenied`) |
+| `--export FMT --from A --to B` | `history::export(store, panel, FMT, A, B, &limits)` | devolve `(payload, next_cursor)` — SÓ leitura própria |
+| leitura de painel de OUTRO terminal | `history::tail_cross` / `search_cross` / `export_cross` `(events, members, reader, owner, …)` | **OBRIGATÓRIO no caminho cross — as TRÊS ops** — audita no log (`HistoryReadCross`, `query` = `tail`/`search`/`export`); fora do Espaço nega (`CrossDenied`) |
 
 - `limits = HistoryLimits::default()` → página default 200, teto 1000, varredura máx. 10k/chamada.
   **Não exponha flag para subir o teto** — o limite duro é o ponto da story (anti-DoS por agente).
@@ -49,8 +49,10 @@ lina history <painel> --export json|txt --from IDX --to IDX
 
 ## Segurança (inegociável)
 
-- O caminho cross NUNCA chama `tail`/`search` puros: SEMPRE `*_cross` (auditoria é gate, não
-  telemetria — falha ao auditar NEGA a leitura).
+- O caminho cross NUNCA chama `tail`/`search`/`export` puros: SEMPRE a variante `*_cross`
+  correspondente (auditoria é gate, não telemetria — falha ao auditar NEGA a leitura). O
+  `export` é a leitura de MAIOR volume (um bloco inteiro) → a que MAIS precisa de rastro; não
+  há exceção para ele.
 - `query` no evento de auditoria é o TIPO ("tail"/"search"), nunca o conteúdo do payload.
 - Identidade do leitor vem do env injetado pelo app (ADR 0026), jamais de flag/arquivo
   escrito por agente (doutrina: campo de agente não decide autorização).

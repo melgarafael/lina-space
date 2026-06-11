@@ -96,3 +96,28 @@ repack 10:54 com TUDO (inclui o ADR 0026 de vocês — o re-teste do roteiro val
 (d) Spec F2 nova registrada pelo fundador: doc 36 do vault (worktrees por agente + sinal de
 mudança + DevOps integrador) — item 8 do backlog nominal F2 no épico 34; consome lifecycle/
 spawn/claims/fila — leitura recomendada antes de desenhar F1-5-8/history (mesma família).
+
+## FIX-4 hunks (EXTERNO · 2026-06-11) — verbos contam o ESTADO GLOBAL do Espaço
+
+**Motivação (dor real do fundador, hoje):** com o freio de orquestração ATIVO, `lina ask`
+devolvia "ok/enfileirada" e o Maestro pedalou 20+ min contra um estado que SÓ o humano vê no
+canvas. Família do achado #11 (teto de custo invisível). Fix: os verbos projetam o último
+`Orchestration{Paused,Resumed}` / `CostCeiling{Hit,Resumed}` do log e contam a verdade leiga.
+
+**Território:** `crates/lina-bootstrap/src/bin/lina.rs` SOMENTE (lib do bootstrap NÃO tocada).
+`lina-core` = LEITURA apenas (entendi a projeção em `router.restore_orchestration_state`;
+projeto direto do espelho `log.jsonl` p/ não abrir conexão SQLite concorrente — mesmo padrão
+do `scan_log_outcome` já no bin). **ZERO toque em `events.rs`/`router.rs`/`lib.rs`.**
+
+**Hunks (regiões distintas do verbo `lina history` de vocês — que é match novo + run_history):**
+- `enqueue_and_report` (~L270–307): se o Espaço está pausado, narra a verdade e PARA (não o
+  "tente de novo"); a msg AINDA enfileira (mecanismo intacto — só a narração muda).
+- `run_check` (~L433–532) e `run_whoami` (~L136–159, só o ramo HUMANO, não o JSON do hook):
+  ganham 1 linha de ESTADO GLOBAL (cooperação ativa/PAUSADA + teto ok/ATINGIDO).
+- bloco NOVO de projeção perto de `event_log_path`/`scan_log_outcome` (~L545–605):
+  `SpaceState` + `scan_space_state` (puro) + `space_state` (I/O) + consts de copy + linha.
+- módulo de teste novo no fim do arquivo + `tests/space_state_cli.rs` (novo).
+
+**Estado observado ao iniciar:** `bin/lina.rs` LIMPO no working tree (nenhum WIP de `history`
+nele); `events.rs` M e `history.rs` ?? (WIP de vocês no core) — NÃO toco. Se cruzar com o
+`lina history` no bin, são regiões distintas; reporto aqui. NÃO commito (Maestro valida de fora).
