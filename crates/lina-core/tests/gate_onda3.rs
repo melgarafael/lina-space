@@ -266,6 +266,7 @@ fn b_gate_duro_classifica_e_loga() {
                     cmd: cmd.to_string(),
                     class: v.class.as_str().to_string(),
                     decision: v.decision.as_str().to_string(),
+                    node: None, // FIX-2: campo aditivo; este gate de teste não modela um nó.
                 })
                 .expect("ActionGated");
         }

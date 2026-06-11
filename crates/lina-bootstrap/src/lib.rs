@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 
 /// W3-6 (AC-6.3): lógica pura do hook `PreToolUse` do Claude Code (gate de execução tier 1).
 pub mod pretooluse;
-pub use pretooluse::{autonomy_from_env, pretooluse_output, AUTONOMY_ENV};
+pub use pretooluse::{
+    autonomy_from_env, pretooluse_output, pretooluse_result, GatedAsk, PretooluseResult,
+    AUTONOMY_ENV,
+};
 
 /// **Lina universal:** instala doutrina + skills no config GLOBAL de cada CLI (todo terminal/CLI
 /// fica Lina-aware, sem o leigo escolher caminho). Aditivo, idempotente, auto-gated.

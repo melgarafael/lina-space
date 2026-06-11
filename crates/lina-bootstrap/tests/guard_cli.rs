@@ -3,8 +3,9 @@
 //! a decisão não é `allow`. Roda o BINÁRIO real (via `CARGO_BIN_EXE_lina`), num `LINA_HOME`
 //! temporário e isolado por teste, e asserta a decisão (stdout) + o evento (event store).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lina_core::EventStore;
@@ -159,4 +160,91 @@ fn rm_rf_root_is_never_allow_and_logs() {
         );
         assert_eq!(events[0].1, "gated-hard");
     }
+}
+
+// ─────────────── FIX-2: o caminho REAL do hook (`--pretooluse`) apenda p/ a fila ───────────────
+
+/// Roda `lina guard --pretooluse` (o caminho que o app configura no `PreToolUse`) com `LINA_HOME`,
+/// `LINA_NODE_NAME` e `LINA_AUTONOMY` no env e o JSON do hook no stdin; devolve o stdout trimado.
+fn run_pretooluse_hook(home: &TempHome, node: &str, autonomy: &str, input_json: &str) -> String {
+    let exe = env!("CARGO_BIN_EXE_lina");
+    let mut child = Command::new(exe)
+        .args(["guard", "--pretooluse"])
+        .env("LINA_HOME", home.path())
+        .env("LINA_NODE_NAME", node)
+        .env("LINA_AUTONOMY", autonomy)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lina guard --pretooluse");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(input_json.as_bytes())
+        .expect("escrever stdin");
+    let out = child.wait_with_output().expect("aguardar lina");
+    assert!(
+        out.status.success(),
+        "guard --pretooluse deveria sair com sucesso; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("stdout utf-8")
+        .trim()
+        .to_string()
+}
+
+/// **FIX-2 (o fix do dogfooding): o hook decide `ask` E APENDA `ActionGated{ask, node}`.** Era o
+/// buraco: o `--pretooluse` decidia `ask` (bloqueava o agente) mas NUNCA apendava o evento → a fila
+/// de atenção jamais via o bloqueio. Agora o evento entra COM o `LINA_NODE_NAME` (a fila foca por
+/// nome). Prova o circuito do binário ponta-a-ponta até o event log.
+#[test]
+fn pretooluse_ask_logs_action_gated_with_node() {
+    let home = TempHome::new("pretooluse-ask");
+    let input = r#"{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#;
+    let out = run_pretooluse_hook(&home, "Bug Finder", "assistido", input);
+    assert!(
+        out.contains("\"permissionDecision\":\"ask\""),
+        "o hook decide ask: {out}"
+    );
+
+    let store = EventStore::open(home.events_dir()).expect("abrir store");
+    let gated: Vec<_> = store
+        .events()
+        .expect("eventos")
+        .into_iter()
+        .filter(|r| r.kind == "ActionGated")
+        .collect();
+    assert_eq!(
+        gated.len(),
+        1,
+        "1 ActionGated apendado pelo caminho do hook"
+    );
+    let p = &gated[0].payload;
+    assert_eq!(p["decision"].as_str(), Some("ask"));
+    assert_eq!(
+        p["node"].as_str(),
+        Some("Bug Finder"),
+        "carimba o NOME do nó (a fila foca por nome)"
+    );
+    assert_eq!(p["cmd"].as_str(), Some("git push --force origin main"));
+}
+
+/// **FIX-2: rotina (allow) pelo hook NÃO apenda** — não bloqueia o humano, logo não enfileira
+/// atenção (anti-ruído: o log/fila só recebem o que exige você).
+#[test]
+fn pretooluse_allow_logs_nothing() {
+    let home = TempHome::new("pretooluse-allow");
+    let input = r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#;
+    let out = run_pretooluse_hook(&home, "Bug Finder", "assistido", input);
+    assert!(
+        out.contains("\"permissionDecision\":\"allow\""),
+        "rotina = allow: {out}"
+    );
+    assert!(
+        action_gated_events(&home).is_empty(),
+        "allow não apenda ActionGated"
+    );
 }

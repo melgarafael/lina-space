@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lina_bootstrap::{
-    autonomy_from_env, canonical_role, classify_retro_args, pretooluse_output, project_retro,
-    render_report, Autonomy, BootstrapInput, Bootstrapper, RetroInvocation,
+    autonomy_from_env, canonical_role, classify_retro_args, pretooluse_result, project_retro,
+    render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk, RetroInvocation,
 };
 use lina_core::{
     check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, HandoffContract,
@@ -1079,6 +1079,9 @@ fn run_guard(args: &[String]) -> ExitCode {
             cmd,
             class: verdict.class.as_str().to_string(),
             decision: verdict.decision.as_str().to_string(),
+            // FIX-2: guard genérico rodando no PTY do agente → carimba o NOME do nó (env do spawn).
+            // Fora de um terminal admitido (ex.: testes) o env é ausente → `None` (sem item na fila).
+            node: env_node_name(),
         };
         if let Err(e) = store.append(&event) {
             eprintln!("lina: falha ao apendar ActionGated: {e}");
@@ -1098,15 +1101,48 @@ fn run_guard(args: &[String]) -> ExitCode {
 /// falha (stdin ilegível, JSON inválido) emite um JSON fail-safe `ask` e loga em stderr. Sempre
 /// sai com `SUCCESS` — o gate fala pelo conteúdo do JSON, não pelo exit code (o harness lê o JSON).
 fn run_pretooluse() -> ExitCode {
+    let autonomy = autonomy_from_env();
     let mut raw = String::new();
-    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+    let result = if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         // stdin ilegível → fail-safe `ask` (decisão volta ao humano), diagnóstico em stderr.
         eprintln!("lina: falha ao ler stdin do PreToolUse: {e}");
-        println!("{}", pretooluse_output("", &autonomy_from_env()));
-        return ExitCode::SUCCESS;
+        pretooluse_result("", &autonomy)
+    } else {
+        pretooluse_result(&raw, &autonomy)
+    };
+    // O JSON da decisão SEMPRE sai no stdout — o hook fala pelo conteúdo do JSON, não pelo exit code
+    // (fail-safe do guard intacto, mesmo se o append abaixo falhar).
+    println!("{}", result.json);
+    // FIX-2 (dogfood): um `ask` sobre Bash BLOQUEIA o agente, mas o detector F1-1-6 não pegava o
+    // dialog de hook-ask (formato ≠ nativo; em bypass o nativo nem existe). Apenda
+    // `ActionGated{decision:"ask", node:LINA_NODE_NAME}` para a fila de atenção alertar+focar. O
+    // append NUNCA pode quebrar o hook: o JSON já foi emitido; erro de store vai só ao stderr.
+    if let Some(gated) = result.gated_ask {
+        append_guard_ask(&gated);
     }
-    println!("{}", pretooluse_output(&raw, &autonomy_from_env()));
     ExitCode::SUCCESS
+}
+
+/// FIX-2: apenda `ActionGated{decision:"ask"}` carimbando o NOME do nó (env do spawn) para a fila de
+/// atenção. Reusa o `events_dir`/`EventStore::open` do `run_check_action`. Falha SÓ no stderr — o
+/// hook já emitiu a decisão no stdout, então o guard nunca trava o agente por um problema de log.
+fn append_guard_ask(gated: &GatedAsk) {
+    let mut store = match EventStore::open(events_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: ActionGated(ask) nao logado (store indisponivel): {e}");
+            return;
+        }
+    };
+    let event = DomainEvent::ActionGated {
+        cmd: gated.cmd.clone(),
+        class: gated.class.clone(),
+        decision: "ask".to_string(),
+        node: env_node_name(),
+    };
+    if let Err(e) = store.append(&event) {
+        eprintln!("lina: ActionGated(ask) nao logado: {e}");
+    }
 }
 
 /// `lina resume` (W3-7c · ROUND 5 hole 1) — **pedido de retomada do teto; o AGENTE NÃO des-pausa.**
@@ -1195,6 +1231,9 @@ fn run_do(args: &[String]) -> ExitCode {
         cmd: display.clone(),
         class: CLASS_GATED_HARD_EXTERNAL.to_string(),
         decision: "ask".to_string(),
+        // Custódia (`lina do`): já vira item `Custody` na fila — não carimba o nó (evita GuardAsk
+        // duplicado, FIX-2).
+        node: None,
     };
     if let Err(e) = store.append(&gated) {
         eprintln!("lina: falha ao apendar ActionGated: {e}");

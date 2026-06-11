@@ -349,6 +349,15 @@ pub enum DomainEvent {
         cmd: String,
         class: String,
         decision: String,
+        /// FIX-2 (dogfood): NOME do terminal (`LINA_NODE_NAME`) que disparou o gate. A fila de
+        /// atenção consome `ActionGated{decision:"ask", node:Some}` para ALERTAR + FOCAR o terminal
+        /// bloqueado (o foco é POR NOME — `attention_goto_node`/ADR 0026). `None` nos caminhos de
+        /// CUSTÓDIA (broker `run_custody`/`lina do`, que já têm item próprio na fila — `node:Some`
+        /// ali viraria GuardAsk DUPLICANDO a custódia) e no log antigo. ADITIVO via `serde(default)`:
+        /// payload pré-FIX-2 (`{cmd,class,decision}`) replaya com `None` SEM upcast (campo `Option`,
+        /// padrão `NodeAdded.requested_by`). META — sem efeito na projeção.
+        #[serde(default)]
+        node: Option<String>,
     },
     /// W3-6c (ADR 0004): o broker `lina do` EXECUTOU uma ação custodiada (`gated-hard-external`)
     /// após confirmação humana, obtendo o segredo do SecretVault — que o agente NÃO tem no env do
@@ -2750,6 +2759,47 @@ mod tests {
         let back: DomainEvent =
             serde_json::from_value(serde_json::to_value(&with_req).unwrap()).unwrap();
         assert_eq!(back, with_req, "NodeAdded com requested_by:Some roundtripa");
+    }
+
+    /// **FIX-2 (dogfood): `ActionGated.node` é ADITIVO.** Um log pré-FIX-2 (shape
+    /// `{cmd,class,decision}`, SEM `node`) replaya com `node: None` via `serde(default)` — SEM bump
+    /// nem `upcast` (campo `Option`, padrão `NodeAdded.requested_by`). Um payload COM `node:Some`
+    /// roundtripa. É o que garante que a fila de atenção (consumidora de `ActionGated{ask, node:Some}`)
+    /// nunca quebre o replay de um log antigo.
+    #[test]
+    #[serial]
+    fn action_gated_node_is_additive() {
+        let tmp = TempDir::new("agnode");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+
+        // Payload PRÉ-FIX-2 (sem `node`) — exatamente o que um log antigo contém. O enum é
+        // `#[serde(tag = "event")]`, então o payload carrega a tag `event`; só falta `node`.
+        store
+            .insert_raw(
+                "ActionGated",
+                1,
+                serde_json::json!({ "event": "ActionGated", "cmd": "git push --force origin main", "class": "gated-hard", "decision": "ask" }),
+            )
+            .expect("insert raw pré-FIX-2");
+
+        let recs = store.events().expect("events");
+        let ev = DomainEvent::from_record(&recs[0].kind, recs[0].version, recs[0].payload.clone())
+            .expect("replay de ActionGated antigo");
+        assert!(
+            matches!(ev, DomainEvent::ActionGated { node: None, .. }),
+            "log antigo (sem `node`) replaya com node=None"
+        );
+
+        // Roundtrip COM `node:Some` — o campo persiste e volta.
+        let with_node = DomainEvent::ActionGated {
+            cmd: "deploy prod".into(),
+            class: "gated-hard-external".into(),
+            decision: "ask".into(),
+            node: Some("Bug Finder".into()),
+        };
+        let back: DomainEvent =
+            serde_json::from_value(serde_json::to_value(&with_node).unwrap()).unwrap();
+        assert_eq!(back, with_node, "ActionGated com node:Some roundtripa");
     }
 
     /// **F1-3-6: roundtrip + `kind()` + META das variantes novas** (SpawnRequested/SpawnGated) e das

@@ -23,6 +23,7 @@ use gpui::{
     div, prelude::*, px, rgb, text, transparent_black, AnyElement, ClickEvent, Context, FontWeight,
     Pixels, ScrollHandle, Size,
 };
+use lina_bootstrap::Autonomy;
 use lina_cli_profiles::ProfileRegistry;
 use lina_core::DiscoveredCli;
 use lina_host::NodeId;
@@ -95,6 +96,83 @@ pub const COPY_CONSENT_DETAIL: &str =
 pub const COPY_CONSENT_OFF_WARN: &str =
     "Sem isso, o agente não conhece o time e não aparece no acompanhamento — o card dele \
      mostra um aviso.";
+// ── autonomia (FIX-3, dogfooding 2026-06-10): o fundador levou uma tempestade de sim/não sem
+//    saber que vinham dos gates do PRÓPRIO Lina (nível "assistido", default). A seção torna o
+//    nível uma escolha CONSCIENTE: 1 linha leiga por opção, sem mudar o default do produto.
+//    ("terminal" é jargão proibido aqui — a superfície fala "janela dele".)
+pub const COPY_AUTONOMY_LABEL: &str = "Autonomia";
+
+/// Ordem de exibição das opções (da rédea mais curta à mais solta).
+pub const AUTONOMY_OPTIONS: [Autonomy; 3] =
+    [Autonomy::Manual, Autonomy::Assisted, Autonomy::Autonomous];
+
+/// Rótulo de SUPERFÍCIE (leigo, com acento) — não confundir com `Autonomy::label()`, que é o
+/// vocabulário interno da doutrina/env (`autonomo`, sem acento).
+#[must_use]
+pub fn autonomy_surface_label(a: Autonomy) -> &'static str {
+    match a {
+        Autonomy::Manual => "manual",
+        Autonomy::Assisted => "assistido",
+        Autonomy::Autonomous => "autônomo",
+    }
+}
+
+/// A descrição leiga de 1 linha por opção (entrega 1 do FIX-3) — diz o que o nível FAZ no dia a
+/// dia, fiel à matriz real do guard (`lina_core::guard::decide`).
+#[must_use]
+pub fn autonomy_desc(a: Autonomy) -> &'static str {
+    match a {
+        Autonomy::Manual => "só faz o que você mandar, passo a passo.",
+        Autonomy::Assisted => {
+            "trabalha sozinho, mas pede sua confirmação para ações sensíveis \
+             (você verá pedidos de sim/não na janela dele)."
+        }
+        Autonomy::Autonomous => {
+            "trabalha sozinho; só te chama para ações perigosas (apagar, publicar, gastar)."
+        }
+    }
+}
+
+/// Texto do badge do CARD (entrega 2): discreto; no nível assistido carrega o mini-aviso que
+/// responde a dúvida do fundador ("de onde vêm esses sim/não?") sem crescer a barra do card.
+#[must_use]
+pub fn card_autonomy_badge(a: Autonomy) -> String {
+    match a {
+        Autonomy::Assisted => format!("autonomia: {} · pede sim/não", autonomy_surface_label(a)),
+        _ => format!("autonomia: {}", autonomy_surface_label(a)),
+    }
+}
+
+/// Explicação do sim/não (entrega 3) — SÓ no nível assistido (é quando os pedidos aparecem).
+/// Vai no rótulo anunciável do badge; o clique no badge abre o Editar (onde se ajusta).
+pub const COPY_CARD_AUTONOMY_EXPLAIN: &str =
+    "os pedidos de sim/não na janela são o Agente pedindo sua permissão — ajuste a autonomia em Editar";
+
+#[must_use]
+pub fn card_autonomy_explain(a: Autonomy) -> Option<&'static str> {
+    matches!(a, Autonomy::Assisted).then_some(COPY_CARD_AUTONOMY_EXPLAIN)
+}
+
+/// Rótulo anunciável (AccessKit) do badge do card — explica o sim/não quando assistido.
+#[must_use]
+pub fn card_autonomy_aria(a: Autonomy) -> String {
+    match card_autonomy_explain(a) {
+        Some(explain) => format!("autonomia {} — {explain}", autonomy_surface_label(a)),
+        None => format!(
+            "autonomia {} — {}",
+            autonomy_surface_label(a),
+            autonomy_desc(a)
+        ),
+    }
+}
+
+/// Par (texto, fundo) do badge de autonomia — FONTE ÚNICA consumida pelo render do card E pelo
+/// gate WCAG (teste `autonomy_badge_meets_wcag_in_all_themes`): mudar o par aqui re-gateia.
+#[must_use]
+pub fn autonomy_badge_colors(th: &crate::theme::Theme) -> (u32, u32) {
+    (th.text.primary, th.surface.raised)
+}
+
 pub const COPY_ADVANCED: &str = "▸ Avançado";
 pub const COPY_ADVANCED_OPEN: &str = "▾ Avançado";
 pub const COPY_CMD_LABEL: &str = "Comando do motor (modo técnico)";
@@ -769,6 +847,10 @@ pub struct CreatePlan {
     /// orquestração na pasta própria escolhida. Só tem efeito com `cwd: Some` — sem
     /// consentimento o agente nasce com o badge "sem doutrina/observabilidade".
     pub kit_consent: bool,
+    /// FIX-3: nível de autonomia ESCOLHIDO no modal (default do produto: assistido, intocado).
+    /// COSTURA (bridge, dono Dev 01): `create_agent_with`/`NodeAdmission` ainda não recebem o
+    /// campo — o funil precisa carimbar `.env("LINA_AUTONOMY", label)` p/ o guard por-agente.
+    pub autonomy: Autonomy,
 }
 
 /// O plano de SALVAR do modo edição (M6-E): aplica nome/papel agora; motor fica p/ F1-2-4.
@@ -778,6 +860,8 @@ pub struct SavePlan {
     pub name: String,
     /// Papel canônico a gravar (None = não mudou).
     pub role: Option<String>,
+    /// FIX-3: autonomia a aplicar (None = não mudou) — mesma semântica do `role`.
+    pub autonomy: Option<Autonomy>,
 }
 
 /// O modal M6/M6-E — estado puro (nenhum gpui; nenhum evento até Criar/Salvar).
@@ -816,8 +900,10 @@ pub struct AgentModal {
     /// [Trocar] aberto: o seletor de papéis (dropdown — F1-2-3; fundador: "não ciclar").
     gallery: Option<RoleGallery>,
     suggester: Arc<dyn RoleSuggester>,
-    /// (M6-E) nome/papel originais — p/ detectar mudança real no Salvar.
-    original: Option<(String, Option<String>)>,
+    /// (M6-E) nome/papel/autonomia originais — p/ detectar mudança real no Salvar.
+    original: Option<(String, Option<String>, Autonomy)>,
+    /// FIX-3: nível de autonomia selecionado na seção AUTONOMIA (criar E editar).
+    autonomy: Autonomy,
 }
 
 impl AgentModal {
@@ -846,16 +932,21 @@ impl AgentModal {
             gallery: None,
             suggester,
             original: None,
+            // FIX-3: nasce no DEFAULT do produto (decisão do fundador — assistido). O caller
+            // (main.rs) sobrepõe com o nível efetivo do Espaço via `set_autonomy`.
+            autonomy: Autonomy::Assisted,
         }
     }
 
     /// Modal em modo EDITAR (M6-E): pré-preenchido com o estado atual do nó.
+    /// `autonomy` = o nível EFETIVO do Agente hoje (fonte: workspace, até a costura por-agente).
     #[must_use]
     pub fn new_edit(
         suggester: Arc<dyn RoleSuggester>,
         node: NodeId,
         name: &str,
         role_canon: Option<&str>,
+        autonomy: Autonomy,
         existing: Vec<String>,
     ) -> Self {
         let mut m = Self::new_create(suggester, existing);
@@ -872,7 +963,8 @@ impl AgentModal {
         });
         // editar nunca re-sugere por cima do papel vigente sem novo nome (M6-E: pergunta antes).
         m.role_pinned = m.role.is_some();
-        m.original = Some((name.to_string(), role_canon.map(str::to_string)));
+        m.autonomy = autonomy;
+        m.original = Some((name.to_string(), role_canon.map(str::to_string), autonomy));
         m
     }
 
@@ -904,6 +996,15 @@ impl AgentModal {
     #[must_use]
     pub fn selected_engine_idx(&self) -> usize {
         self.selected_engine
+    }
+    #[must_use]
+    pub fn autonomy(&self) -> Autonomy {
+        self.autonomy
+    }
+    /// FIX-3: seleção da seção AUTONOMIA (clique numa opção) e prefill do nível efetivo do
+    /// Espaço ao abrir (criar) — o default do produto continua sendo o do `new_create`.
+    pub fn set_autonomy(&mut self, a: Autonomy) {
+        self.autonomy = a;
     }
     #[must_use]
     pub fn cwd_display(&self) -> String {
@@ -1280,6 +1381,7 @@ impl AgentModal {
             cwd: self.cwd.clone(),
             role: self.role.as_ref().map(|r| r.role.clone()),
             kit_consent: self.kit_consent,
+            autonomy: self.autonomy,
         })
     }
 
@@ -1292,7 +1394,11 @@ impl AgentModal {
         if name.is_empty() {
             return Err(COPY_ERR_EMPTY_NAME.to_string());
         }
-        let (orig_name, orig_role) = self.original.clone().unwrap_or_default();
+        // sem original (estado impossível em Edit) → trata tudo como mudança, nunca panica.
+        let (orig_name, orig_role, orig_autonomy) =
+            self.original
+                .clone()
+                .unwrap_or((String::new(), None, self.autonomy));
         let role_now = self.role.as_ref().map(|r| r.role.clone());
         // dedup ignora o PRÓPRIO nome original (renomear para si mesmo não ganha sufixo).
         let others: Vec<String> = self
@@ -1305,6 +1411,7 @@ impl AgentModal {
             node,
             name: unique_name(&name, &others),
             role: (role_now != orig_role).then_some(role_now).flatten(),
+            autonomy: (self.autonomy != orig_autonomy).then_some(self.autonomy),
         })
     }
 
@@ -1977,6 +2084,86 @@ pub fn render(
                         } else {
                             COPY_CONSENT_OFF_WARN
                         })),
+                ),
+        );
+    }
+
+    // ── Autonomia (FIX-3) — escolha CONSCIENTE do nível, criar E editar. 3 opções com 1 linha
+    //    leiga cada (responde "por que o agente me pede sim/não?" — dogfooding do fundador).
+    //    Geometria uniforme por opção (borda sempre presente, transparente na inativa — idioma
+    //    da galeria de papéis: selecionar não reflui o layout).
+    {
+        let mut options = div().flex().flex_col().gap_1();
+        for (i, a) in AUTONOMY_OPTIONS.into_iter().enumerate() {
+            let active = a == modal.autonomy();
+            let mark = if active { "◉" } else { "○" };
+            options = options.child(
+                div()
+                    .id(("m6-autonomy", i))
+                    .aria_label(format!(
+                        "autonomia {} — {}",
+                        autonomy_surface_label(a),
+                        autonomy_desc(a)
+                    ))
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(if active {
+                        th.surface.raised_alt
+                    } else {
+                        th.surface.panel
+                    }))
+                    .border_2()
+                    .border_color(if active {
+                        rgb(th.focus.ring).into()
+                    } else {
+                        transparent_black()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_set_autonomy(a, cx);
+                    }))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(if active {
+                                th.text.bright
+                            } else {
+                                th.text.primary
+                            }))
+                            .child(text!(format!("{mark} {}", autonomy_surface_label(a)))),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_size(px(12.0))
+                            .text_color(rgb(th.text.secondary))
+                            .child(text!(autonomy_desc(a))),
+                    ),
+            );
+        }
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(ROW_GAP))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(ROW_LABEL_W))
+                        .text_color(rgb(th.text.primary))
+                        .child(text!(COPY_AUTONOMY_LABEL)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(options),
                 ),
         );
     }
@@ -3374,6 +3561,7 @@ kind = "idle"
             node,
             "Ajudante",
             Some("WRITER"),
+            Autonomy::Assisted,
             vec!["Ajudante".into(), "Outro".into()],
         );
         assert_eq!(m.role().unwrap().role, "WRITER");
@@ -3388,6 +3576,132 @@ kind = "idle"
         let role_now = m.role().unwrap().role.clone();
         let p = m.save_plan().expect("plano");
         assert_eq!(p.role.as_deref(), Some(role_now.as_str()));
+    }
+
+    /// FIX-3 (entrega 1, render headless): a seção AUTONOMIA tem as 3 opções na ordem canônica,
+    /// cada uma com descrição leiga de UMA linha, distintas entre si — e a do assistido responde
+    /// a dúvida do fundador (de onde vêm os pedidos de sim/não).
+    #[test]
+    fn autonomy_options_have_one_lay_line_each() {
+        assert_eq!(
+            AUTONOMY_OPTIONS,
+            [Autonomy::Manual, Autonomy::Assisted, Autonomy::Autonomous]
+        );
+        let mut seen = Vec::new();
+        for a in AUTONOMY_OPTIONS {
+            let d = autonomy_desc(a);
+            assert!(!d.trim().is_empty(), "descrição vazia p/ {a:?}");
+            assert!(!d.contains('\n'), "descrição de {a:?} não é 1 linha");
+            assert!(
+                !seen.contains(&d),
+                "descrições devem ser distintas ({a:?} repetiu)"
+            );
+            seen.push(d);
+        }
+        // O conteúdo que o FIX-3 promete (sem acoplar a frase inteira):
+        assert!(autonomy_desc(Autonomy::Manual).contains("passo a passo"));
+        assert!(autonomy_desc(Autonomy::Assisted).contains("sim/não"));
+        assert!(autonomy_desc(Autonomy::Assisted).contains("confirmação"));
+        assert!(autonomy_desc(Autonomy::Autonomous).contains("apagar, publicar, gastar"));
+        // Rótulo de superfície é leigo (com acento) — não o vocabulário interno do env.
+        assert_eq!(autonomy_surface_label(Autonomy::Autonomous), "autônomo");
+    }
+
+    /// FIX-3: a escolha do modal CHEGA ao plano de criação; o DEFAULT do produto (assistido)
+    /// fica intocado — quem nunca tocar na seção cria exatamente como antes do fix.
+    #[test]
+    fn create_plan_carries_selected_autonomy_default_untouched() {
+        let mut m = modal();
+        type_str(&mut m, "Ajudante");
+        m.set_engines(engines_one());
+        assert_eq!(m.autonomy(), Autonomy::Assisted, "default do produto");
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.autonomy, Autonomy::Assisted, "sem toque → default");
+
+        m.set_autonomy(Autonomy::Autonomous);
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(
+            plan.autonomy,
+            Autonomy::Autonomous,
+            "a escolha viaja TIPADA"
+        );
+    }
+
+    /// FIX-3 (M6-E): autonomia segue a semântica role do Salvar — `None` = não mudou; mudar e
+    /// voltar ao original também é `None` (reabrir+Salvar continua no-op observável).
+    #[test]
+    fn edit_mode_save_plan_detects_autonomy_change() {
+        let node = uuid::Uuid::now_v7();
+        let mut m = AgentModal::new_edit(
+            Arc::new(W31Suggester),
+            node,
+            "Ajudante",
+            Some("WRITER"),
+            Autonomy::Assisted,
+            vec!["Ajudante".into()],
+        );
+        assert_eq!(m.autonomy(), Autonomy::Assisted, "prefill do nível efetivo");
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.autonomy, None, "sem mudança → None");
+
+        m.set_autonomy(Autonomy::Manual);
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.autonomy, Some(Autonomy::Manual), "mudança detectada");
+
+        m.set_autonomy(Autonomy::Assisted);
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.autonomy, None, "voltar ao original → no-op de novo");
+    }
+
+    /// FIX-3 (entregas 2+3, projeção do card): badge DISTINTO por nível; o mini-aviso e a
+    /// explicação do sim/não aparecem SÓ no assistido (é quando os pedidos existem); o rótulo
+    /// anunciável aponta o ONDE ajustar (Editar).
+    #[test]
+    fn card_autonomy_badge_projects_per_level() {
+        let badges: Vec<String> = AUTONOMY_OPTIONS
+            .into_iter()
+            .map(card_autonomy_badge)
+            .collect();
+        assert_eq!(badges.len(), 3);
+        for (i, b) in badges.iter().enumerate() {
+            assert!(b.starts_with("autonomia: "), "badge diz o que é: {b:?}");
+            assert!(
+                badges.iter().skip(i + 1).all(|o| o != b),
+                "badges devem variar POR autonomia"
+            );
+        }
+        assert!(card_autonomy_badge(Autonomy::Assisted).contains("pede sim/não"));
+        assert!(!card_autonomy_badge(Autonomy::Manual).contains("pede sim/não"));
+        assert!(!card_autonomy_badge(Autonomy::Autonomous).contains("pede sim/não"));
+
+        assert_eq!(
+            card_autonomy_explain(Autonomy::Assisted),
+            Some(COPY_CARD_AUTONOMY_EXPLAIN)
+        );
+        assert_eq!(card_autonomy_explain(Autonomy::Manual), None);
+        assert_eq!(card_autonomy_explain(Autonomy::Autonomous), None);
+        let aria = card_autonomy_aria(Autonomy::Assisted);
+        assert!(aria.contains("pedindo sua permissão"), "explica o sim/não");
+        assert!(aria.contains("Editar"), "aponta ONDE ajustar");
+    }
+
+    /// FIX-3 (gate WCAG do badge): o par (texto, fundo) da FONTE ÚNICA `autonomy_badge_colors`
+    /// atinge AA (≥4.5:1) nos 2 temas × 8 acentos — quem trocar o par re-passa por aqui.
+    #[test]
+    fn autonomy_badge_meets_wcag_in_all_themes() {
+        use crate::a11y::wcag::{contrast_ratio, meets_aa};
+        use crate::theme::{Mode, Theme, ACCENTS};
+        for mode in [Mode::Dark, Mode::Light] {
+            for (accent, _) in ACCENTS {
+                let th = Theme::build(mode, accent);
+                let (fg, bg) = autonomy_badge_colors(&th);
+                assert!(
+                    meets_aa(fg, bg),
+                    "[modo={mode:?} acento={accent}] badge de autonomia: {:.2}:1 < 4.5:1",
+                    contrast_ratio(fg, bg)
+                );
+            }
+        }
     }
 
     /// **GUARDIÃO (fix de tela)**: nome SEM padrão conhecido ("Teles", o caso do fundador) →
@@ -3441,6 +3755,13 @@ kind = "idle"
             copy_ghost("Revisor"),
             copy_dup_note("Revisor (2)"),
             copy_tpl_dup_name("Revisor"),
+            // FIX-3: toda a copy de autonomia (modal + badge/aria do card) passa pelo guardião.
+            card_autonomy_badge(Autonomy::Manual),
+            card_autonomy_badge(Autonomy::Assisted),
+            card_autonomy_badge(Autonomy::Autonomous),
+            card_autonomy_aria(Autonomy::Manual),
+            card_autonomy_aria(Autonomy::Assisted),
+            card_autonomy_aria(Autonomy::Autonomous),
             engine_label("claude"),
             engine_label("agy"),
         ];
@@ -3489,6 +3810,15 @@ kind = "idle"
             COPY_EDIT_ENGINE_LOCKED,
             COPY_EDIT_APPLY_NOTE,
             COPY_WHY_PREFIX,
+            // FIX-3: seção AUTONOMIA — rótulo, descrições leigas e explicação do card.
+            COPY_AUTONOMY_LABEL,
+            COPY_CARD_AUTONOMY_EXPLAIN,
+            autonomy_surface_label(Autonomy::Manual),
+            autonomy_surface_label(Autonomy::Assisted),
+            autonomy_surface_label(Autonomy::Autonomous),
+            autonomy_desc(Autonomy::Manual),
+            autonomy_desc(Autonomy::Assisted),
+            autonomy_desc(Autonomy::Autonomous),
         ]
         .into_iter()
         .chain(dynamic.iter().map(String::as_str))

@@ -155,26 +155,62 @@ fn reason_for(cmd: &str, class: ActionClass, decision: Decision) -> String {
     }
 }
 
+/// FIX-2 (dogfood): resultado estruturado do hook — o JSON de saída (idêntico ao de
+/// [`pretooluse_output`], byte-estável) MAIS a decisão de gate que o caller (`run_pretooluse`) usa
+/// para apendar `ActionGated{decision:"ask"}` no log e alimentar a fila de atenção. Mantém a decisão
+/// PURA: quem faz IO (apender) é o bin, nunca esta função.
+pub struct PretooluseResult {
+    /// Linha JSON do `hookSpecificOutput` — vai ao stdout do hook.
+    pub json: String,
+    /// `Some` SÓ quando a decisão é `ask` sobre um comando Bash (o bloqueante que o humano vê) — é o
+    /// que vira `ActionGated{decision:"ask"}`. `None` em allow/deny/skill/fail-safe (não enfileiram).
+    pub gated_ask: Option<GatedAsk>,
+}
+
+/// FIX-2: o ASK do guard a registrar para a fila de atenção (sem o nó — o caller carimba o
+/// `LINA_NODE_NAME` do env do PTY).
+pub struct GatedAsk {
+    /// Comando barrado (vira a copy leiga "vá ao terminal aprovar X").
+    pub cmd: String,
+    /// Classe canônica do gate (`gated-soft`/`gated-hard`).
+    pub class: String,
+}
+
 /// **Função pura** do hook: dado o JSON do `PreToolUse` e a string de autonomia, devolve a
-/// LINHA JSON de saída do hook. NUNCA entra em pânico e NUNCA devolve texto não-JSON.
-///
-/// - `Bash` → extrai `tool_input.command`, classifica e decide pela matriz.
-/// - tool não-Bash (Write/Edit/…) → `allow` (ação local reversível; o gate mira o comando real).
-/// - JSON ilegível ou comando ausente → fail-safe `ask` (decisão volta ao humano).
+/// LINHA JSON de saída do hook. NUNCA entra em pânico e NUNCA devolve texto não-JSON. Casca fina
+/// sobre [`pretooluse_result`] — preserva a assinatura e o golden-file existentes.
 #[must_use]
 pub fn pretooluse_output(input_json: &str, autonomy: &str) -> String {
+    pretooluse_result(input_json, autonomy).json
+}
+
+/// FIX-2: núcleo do hook — devolve o JSON E (quando `ask` sobre Bash) o `gated_ask` para a fila de
+/// atenção. PURA (sem IO): o append do `ActionGated` é do caller. Matriz de decisão:
+/// - `Bash` → extrai `tool_input.command`, classifica e decide pela matriz (ask → `gated_ask`).
+/// - tool não-Bash (Write/Edit/…) → `allow` (ação local reversível; o gate mira o comando real).
+/// - `Skill` → guard de orquestrador ESTRANGEIRO (Maestri) com redirect; o resto passa.
+/// - JSON ilegível / comando ausente / sem `tool_name` → fail-safe `ask` (decisão volta ao humano;
+///   sem comando legível, NÃO enfileira na fila — `gated_ask=None`, limitação conhecida v1).
+#[must_use]
+pub fn pretooluse_result(input_json: &str, autonomy: &str) -> PretooluseResult {
+    let no_ask = |json: String| PretooluseResult {
+        json,
+        gated_ask: None,
+    };
     let level = parse_autonomy(autonomy).unwrap_or(AutonomyLevel::Assisted);
 
     let value: serde_json::Value = match serde_json::from_str(input_json) {
         Ok(v) => v,
         Err(_) => {
-            return HookOutput::new(
-                "ask",
-                String::from(
-                    "entrada do hook PreToolUse ilegível — confirmação humana solicitada por segurança",
-                ),
-            )
-            .render();
+            return no_ask(
+                HookOutput::new(
+                    "ask",
+                    String::from(
+                        "entrada do hook PreToolUse ilegível — confirmação humana solicitada por segurança",
+                    ),
+                )
+                .render(),
+            );
         }
     };
 
@@ -190,19 +226,28 @@ pub fn pretooluse_output(input_json: &str, autonomy: &str) -> String {
             match cmd {
                 Some(cmd) => {
                     let verdict = check_action(cmd, level);
-                    HookOutput::new(
+                    let json = HookOutput::new(
                         decision_str(verdict.decision),
                         reason_for(cmd, verdict.class, verdict.decision),
                     )
-                    .render()
+                    .render();
+                    // FIX-2: SÓ o `ask` (bloqueante que o humano vê) enfileira na fila de atenção;
+                    // allow/deny não. A classe acompanha p/ auditoria/copy.
+                    let gated_ask = (verdict.decision == Decision::Ask).then(|| GatedAsk {
+                        cmd: cmd.to_string(),
+                        class: verdict.class.as_str().to_string(),
+                    });
+                    PretooluseResult { json, gated_ask }
                 }
-                None => HookOutput::new(
-                    "ask",
-                    String::from(
-                        "tool Bash sem 'command' no payload — confirmação humana solicitada por segurança",
-                    ),
-                )
-                .render(),
+                None => no_ask(
+                    HookOutput::new(
+                        "ask",
+                        String::from(
+                            "tool Bash sem 'command' no payload — confirmação humana solicitada por segurança",
+                        ),
+                    )
+                    .render(),
+                ),
             }
         }
         // R2c-2: a tool `Skill` carrega/roda uma agent skill. Intercepta as de
@@ -220,33 +265,39 @@ pub fn pretooluse_output(input_json: &str, autonomy: &str) -> String {
             });
             match skill_name {
                 Some(name) if is_foreign_skill(name) => {
-                    HookOutput::new("deny", foreign_skill_redirect(name)).render()
+                    no_ask(HookOutput::new("deny", foreign_skill_redirect(name)).render())
                 }
                 // Skill legítima OU nome ausente → allow. CIRÚRGICO: payload degradado
                 // jamais mata uma skill do papel (a defesa é a denylist, não o fail-safe).
-                _ => HookOutput::new(
-                    "allow",
-                    String::from(
-                        "skill permitida neste Espaço (não é de orquestrador estrangeiro)",
-                    ),
-                )
-                .render(),
+                _ => no_ask(
+                    HookOutput::new(
+                        "allow",
+                        String::from(
+                            "skill permitida neste Espaço (não é de orquestrador estrangeiro)",
+                        ),
+                    )
+                    .render(),
+                ),
             }
         }
-        Some(other) => HookOutput::new(
-            "allow",
-            format!(
-                "ferramenta '{other}' não executa comando de shell — ação local reversível, liberada"
-            ),
-        )
-        .render(),
-        None => HookOutput::new(
-            "ask",
-            String::from(
-                "payload do PreToolUse sem 'tool_name' — confirmação humana solicitada por segurança",
-            ),
-        )
-        .render(),
+        Some(other) => no_ask(
+            HookOutput::new(
+                "allow",
+                format!(
+                    "ferramenta '{other}' não executa comando de shell — ação local reversível, liberada"
+                ),
+            )
+            .render(),
+        ),
+        None => no_ask(
+            HookOutput::new(
+                "ask",
+                String::from(
+                    "payload do PreToolUse sem 'tool_name' — confirmação humana solicitada por segurança",
+                ),
+            )
+            .render(),
+        ),
     }
 }
 
@@ -454,5 +505,41 @@ mod tests {
         assert_ne!(decision(&pretooluse_output(danger, "autonomo")), "allow");
         let routine = r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#;
         assert_eq!(decision(&pretooluse_output(routine, "assistido")), "allow");
+    }
+
+    // ─────────────── FIX-2: o hook expõe o ASK para a fila de atenção ───────────────
+
+    /// `pretooluse_result` devolve o MESMO JSON (golden-file/pureza intactos) e, quando a decisão é
+    /// `ask` sobre Bash, um `gated_ask` com o comando + classe — o que o caller (`run_pretooluse`)
+    /// apenda como `ActionGated{decision:"ask", node}`, fechando o loop até a fila de atenção.
+    #[test]
+    fn pretooluse_result_exposes_gated_ask_on_ask() {
+        let input =
+            r#"{"tool_name":"Bash","tool_input":{"command":"git push --force origin main"}}"#;
+        let r = pretooluse_result(input, "assistido");
+        assert_eq!(
+            r.json,
+            pretooluse_output(input, "assistido"),
+            "JSON idêntico ao da função pura (pureza/golden-file preservados)"
+        );
+        let g = r.gated_ask.expect("um ask gera gated_ask");
+        assert_eq!(g.cmd, "git push --force origin main");
+        assert!(!g.class.is_empty(), "classe preenchida");
+    }
+
+    /// `allow` (rotina) e `deny` (skill estrangeira) NÃO geram `gated_ask` — não bloqueiam o humano,
+    /// logo não viram pendência da fila.
+    #[test]
+    fn pretooluse_result_no_gated_ask_on_allow_or_deny() {
+        let allow = pretooluse_result(
+            r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+            "assistido",
+        );
+        assert!(allow.gated_ask.is_none(), "allow não enfileira atenção");
+        let deny = pretooluse_result(
+            r#"{"tool_name":"Skill","tool_input":{"skill":"maestri"}}"#,
+            "assistido",
+        );
+        assert!(deny.gated_ask.is_none(), "deny não enfileira atenção");
     }
 }

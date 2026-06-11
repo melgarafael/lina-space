@@ -81,7 +81,10 @@ pub fn badge_view(items: &[AttentionItem]) -> BadgeView {
 /// Custódia nunca é goto-only (o gate dela é o ⌘⏎ da pump; o campo é nominal).
 #[must_use]
 pub fn is_goto_only(item: &AttentionItem) -> bool {
-    item.kind == AttentionKind::Permission && item.prompt_kind != PromptKind::Yn
+    // FIX-2: GuardAsk (ask do guard via hook PreToolUse) é SEMPRE goto-only — o y/n é respondido NO
+    // terminal (injeção remota não existe nesta fase). Permissão não-Yn (Choice/Trust) idem.
+    item.kind == AttentionKind::GuardAsk
+        || (item.kind == AttentionKind::Permission && item.prompt_kind != PromptKind::Yn)
 }
 
 /// Copy do toast (story F1-1-7, com a **ARBITRAGEM do Maestro**: ux-flows vence —
@@ -103,6 +106,19 @@ pub fn toast_copy(item: &AttentionItem) -> String {
             Some(d) => format!("Um agente quer {d} — ⌘⏎ deixa nascer · Esc recusa",),
             None => "Um agente quer trazer um especialista pro time — ⌘⏎ deixa nascer · Esc recusa"
                 .to_string(),
+        },
+        // FIX-2: ask do guard (hook PreToolUse) — o agente está BLOQUEADO num y/n que a fila não
+        // pegava (formato ≠ dialog nativo; em bypass o nativo nem existe). Copy leiga + foco; o
+        // gesto resolve NO terminal (sem injeção remota).
+        AttentionKind::GuardAsk => match &item.detail {
+            Some(cmd) => format!(
+                "{} quer rodar: {cmd} — vá até o terminal aprovar",
+                item.node_id
+            ),
+            None => format!(
+                "{} está bloqueado esperando sua aprovação — vá até o terminal",
+                item.node_id
+            ),
         },
         AttentionKind::Permission => match item.prompt_kind {
             PromptKind::Choice => format!(
@@ -600,7 +616,9 @@ pub fn render_toast(
                     (th.surface.raised, th.text.primary),
                     |v, _w, cx| v.attention_snooze(cx),
                 ));
-            if !is_custody {
+            // FIX-2: GuardAsk não é detecção heurística — sem «não era um pedido» (o ask do guard é
+            // determinístico; não há FP a rotular). Custódia também não (gate brokerado).
+            if !is_custody && item.kind != AttentionKind::GuardAsk {
                 let sid = item.stable_id.clone();
                 actions = actions.child(btn(
                     cx,
@@ -783,27 +801,30 @@ pub fn render_panel(
                     .child(text!(hint)),
             );
         } else if is_goto_only(item) {
-            // R2b: pergunta (Choice/Trust) — o gesto resolve NO TERMINAL; aqui só
-            // navegação + mitigação de FP + mute (nunca aprovar/recusar — o core
-            // devolve None p/ não-Yn, defesa em profundidade).
+            // R2b: pergunta (Choice/Trust) e FIX-2 GuardAsk — o gesto resolve NO TERMINAL; aqui só
+            // navegação (nunca aprovar/recusar — o core devolve None p/ não-Yn, defesa em
+            // profundidade). FP/mute só para PERMISSÃO detectada (heurística do grid, sujeita a
+            // falso-positivo); GuardAsk é gate determinístico do guard — não há FP a rotular, e
+            // «silenciar detecção» mutaria o grid de permissão do nó (efeito colateral indevido).
             let node_go = item.node_id.clone();
-            let node = item.node_id.clone();
-            let node_muted = muted_nodes.contains(&node);
-            let sid_fp = item.stable_id.clone();
-            row = row.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(btn(
-                        cx,
-                        ("att-goto", i64id),
-                        "→ Ir até o terminal",
-                        (th.accent.action, th.text.on_accent),
-                        move |v, w, cx| v.attention_goto_node(&node_go, w, cx),
-                    ))
+            let mut acts = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(btn(
+                    cx,
+                    ("att-goto", i64id),
+                    "→ Ir até o terminal",
+                    (th.accent.action, th.text.on_accent),
+                    move |v, w, cx| v.attention_goto_node(&node_go, w, cx),
+                ));
+            if item.kind == AttentionKind::Permission {
+                let node = item.node_id.clone();
+                let node_muted = muted_nodes.contains(&node);
+                let sid_fp = item.stable_id.clone();
+                acts = acts
                     .child(btn(
                         cx,
                         ("att-fp", i64id),
@@ -821,8 +842,9 @@ pub fn render_panel(
                         },
                         (th.surface.raised, th.text.primary),
                         move |v, _w, cx| v.attention_toggle_mute(&node, cx),
-                    )),
-            );
+                    ));
+            }
+            row = row.child(acts);
         } else {
             let node = item.node_id.clone();
             let node_muted = muted_nodes.contains(&node);
@@ -935,7 +957,7 @@ mod tests {
             detail: Some(format!("detalhe {id}")),
             evidence: match kind {
                 AttentionKind::Custody | AttentionKind::Spawn => AttentionEvidence::Custody,
-                AttentionKind::Permission => AttentionEvidence::Hook,
+                AttentionKind::Permission | AttentionKind::GuardAsk => AttentionEvidence::Hook,
             },
             created_ts: ts,
             state: AttentionState::Pending,
@@ -991,6 +1013,28 @@ mod tests {
         let mut c = item("c", "B", AttentionKind::Custody, 1);
         c.prompt_kind = PromptKind::Choice;
         assert!(!is_goto_only(&c));
+    }
+
+    /// FIX-2: o ASK do guard é goto-only (alerta+foco; o y/n é respondido NO terminal) e a copy
+    /// leiga nomeia o nó + convida a ir até o terminal, NUNCA prometendo o gesto de aprovação local.
+    #[test]
+    fn guard_ask_is_goto_only_with_leiga_copy() {
+        let g = item(
+            "guard:Bug Finder",
+            "Bug Finder",
+            AttentionKind::GuardAsk,
+            100,
+        );
+        assert!(is_goto_only(&g), "GuardAsk resolve no terminal (goto-only)");
+        let copy = toast_copy(&g);
+        assert!(
+            copy.contains("Bug Finder") && copy.contains("vá até o terminal"),
+            "copy nomeia o nó e convida ao terminal: {copy}"
+        );
+        assert!(
+            !copy.contains("⌘⏎"),
+            "nunca promete o gesto de aprovação local (resolve no terminal): {copy}"
+        );
     }
 
     // ─────────────────── R2b 1b: empty-state honesto ───────────────────

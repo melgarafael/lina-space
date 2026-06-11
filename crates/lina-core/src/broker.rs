@@ -167,6 +167,9 @@ where
         cmd: req.display.clone(),
         class: CLASS_GATED_HARD_EXTERNAL.to_string(),
         decision: "ask".to_string(),
+        // Custódia: NÃO carimba o nó. A pendência já vira item `Custody` na fila (espelho do desk);
+        // um `node:Some` aqui a duplicaria como GuardAsk (FIX-2). O alerta dela é o canal existente.
+        node: None,
     })?;
 
     // Sem confirmação humana → bloqueia. O cofre nem é consultado; a ação não roda.

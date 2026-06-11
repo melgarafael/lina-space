@@ -485,6 +485,10 @@ struct WorkspaceView {
     /// F1-2-2: resultado da varredura de motores (descoberta W4-1 roda FORA da thread de UI e
     /// deposita aqui; o loop do modal o consome — lição: discovery off-thread + injetável).
     modal_scan: Option<Arc<Mutex<Option<Vec<agent_modal::Engine>>>>>,
+    /// FIX-3: nível de autonomia EFETIVO do Espaço ([`workspace_autonomy`] — a mesma fonte do
+    /// wiring/guard). Alimenta o badge do card e o prefill da seção AUTONOMIA do modal; vira
+    /// por-Agente quando a costura do funil (bridge) carimbar `LINA_AUTONOMY` por nó.
+    ws_autonomy: Autonomy,
     /// W4-3: FREIO da auto-orquestração, compartilhado com a [`MailboxPump`]. A UI lê `paused` p/ o
     /// rótulo do rodapé e sinaliza `toggle_requested` ao clicar.
     brake: wiring::Brake,
@@ -644,6 +648,7 @@ impl WorkspaceView {
             desk,
             agent_modal: None,
             modal_scan: None,
+            ws_autonomy: workspace_autonomy(),
             brake,
             // W4-6 gap3: este campo é o OVERRIDE do usuário (rodapé); o SO/env entra via
             // `a11y::reduce_motion_effective` (fonte única) no pulso/rótulo. Começa sem override.
@@ -1229,10 +1234,12 @@ impl WorkspaceView {
 
     /// Abre o M6 em modo CRIAR.
     fn open_agent_modal_create(&mut self, cx: &mut Context<Self>) {
-        let modal = agent_modal::AgentModal::new_create(
+        let mut modal = agent_modal::AgentModal::new_create(
             Arc::new(role_suggester::W31Suggester),
             self.live_names(),
         );
+        // FIX-3: prefill = o nível EFETIVO do Espaço (honesto: é o que o novo Agente terá hoje).
+        modal.set_autonomy(self.ws_autonomy);
         self.open_agent_modal(modal, cx);
     }
 
@@ -1251,6 +1258,9 @@ impl WorkspaceView {
             node,
             &name,
             role.as_deref(),
+            // FIX-3: o nível EFETIVO do nó hoje = o do Espaço (fonte única; por-Agente entra
+            // com a costura do funil).
+            self.ws_autonomy,
             self.live_names(),
         );
         self.open_agent_modal(modal, cx);
@@ -1304,6 +1314,14 @@ impl WorkspaceView {
     fn modal_select_engine(&mut self, idx: usize, cx: &mut Context<Self>) {
         if let Some(m) = self.agent_modal.as_mut() {
             m.select_engine(idx);
+            cx.notify();
+        }
+    }
+
+    /// FIX-3: clique numa opção da seção AUTONOMIA (criar E editar).
+    fn modal_set_autonomy(&mut self, a: Autonomy, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.set_autonomy(a);
             cx.notify();
         }
     }
@@ -1453,6 +1471,23 @@ impl WorkspaceView {
                     if let Some(note) = &p.dup_note {
                         eprintln!("lina-gpui: M6 — {note}");
                     }
+                }
+                // FIX-3 · COSTURA PENDENTE (funil do bridge): a escolha de autonomia viaja
+                // TIPADA no plano, mas `create_agent_with`/`admit_node` ainda não carimbam
+                // `LINA_AUTONOMY` por-Agente. NUNCA silencioso: divergência do nível efetivo
+                // do Espaço fica registrada no stderr até a costura fechar (entrega FIX-3).
+                let pending = match &plan {
+                    Plan::Create(p) => (p.autonomy != self.ws_autonomy).then_some(p.autonomy),
+                    Plan::Save(p) => p.autonomy,
+                };
+                if let Some(a) = pending {
+                    eprintln!(
+                        "lina-gpui: M6 — autonomia escolhida ({}) registrada no plano; \
+                         aplicação por-Agente aguarda a costura do funil (bridge) — \
+                         efetivo hoje: {} (Espaço).",
+                        agent_modal::autonomy_surface_label(a),
+                        agent_modal::autonomy_surface_label(self.ws_autonomy)
+                    );
                 }
                 self.agent_modal = None;
                 // M6-E3: o foco vai direto pro input do Agente recém-criado (zero cliques).
@@ -2360,6 +2395,30 @@ impl Render for WorkspaceView {
             // (parent `.id()` único por card → sem colisão de ElementId no AccessKit). Layout nos 2
             // temas = PENDENTE TELA DO FUNDADOR.
             if matches!(nv.kind, NodeKind::Terminal) {
+                // FIX-3: a autonomia atual À VISTA no card (badge discreto, tokens do design
+                // system — par de cores na fonte única `autonomy_badge_colors`, gateada por
+                // WCAG). Em "assistido" o texto carrega o mini-aviso "pede sim/não" e o rótulo
+                // anunciável explica de onde vêm os pedidos; o CLIQUE abre o Editar (é lá que
+                // se ajusta — copy da entrega 3). Chip de 1 linha na barra do título: NUNCA uma
+                // linha extra no corpo (encolheria o grid `flex_1` → rows do PTY clipadas).
+                let (auto_fg, auto_bg) = agent_modal::autonomy_badge_colors(&th);
+                title = title.child(
+                    div()
+                        .id(("card-autonomy", card_eid))
+                        .aria_label(agent_modal::card_autonomy_aria(self.ws_autonomy))
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(auto_bg))
+                        .border_1()
+                        .border_color(rgb(th.surface.border))
+                        .text_size(px(10.0 * z))
+                        .text_color(rgb(auto_fg))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
+                            view.open_agent_modal_edit(node_id, cx);
+                        }))
+                        .child(text!(agent_modal::card_autonomy_badge(self.ws_autonomy))),
+                );
                 title = title.child(
                     div()
                         .id(("card-edit", card_eid))
@@ -3105,6 +3164,22 @@ impl Render for WorkspaceView {
 
 /// PRODUÇÃO vs DEMO. `LINA_DEMO` (1/true/on/yes) liga o modo demo do fundador: semeia Terminal A/B,
 /// arma o botão ⚡ A2A A→B e grava o workspace em `temp`. Sem a env → PRODUÇÃO (default do aluno).
+/// FIX-3: a FONTE ÚNICA do nível de autonomia do Espaço (`LINA_AUTONOMY`, default `assistido` —
+/// o default do produto, decisão do fundador). Consumida pelo wiring do `main` (BootstrapWriter +
+/// RouterConfig) E pela UI (badge do card, prefill do modal) — superfície e enforcement nunca
+/// divergem porque leem a mesma função.
+fn workspace_autonomy() -> Autonomy {
+    match std::env::var("LINA_AUTONOMY")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("manual") => Autonomy::Manual,
+        Some("autonomo" | "autonomous") => Autonomy::Autonomous,
+        _ => Autonomy::Assisted,
+    }
+}
+
 fn lina_demo_enabled() -> bool {
     matches!(
         std::env::var("LINA_DEMO").ok().as_deref().map(str::trim),
@@ -3501,15 +3576,9 @@ fn main() {
     // SEAM-1 (M2): FONTE ÚNICA da autonomia do workspace — passada AO MESMO TEMPO ao `BootstrapWriter`
     // (doutrina do bin) E ao `RouterConfig` da `MailboxPump` (enforcement do gate). `LINA_AUTONOMY`
     // (default `assistido`, sem regressão); origem futura = `bootstrap.json`/workspace.
-    let autonomy = match std::env::var("LINA_AUTONOMY")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some("manual") => Autonomy::Manual,
-        Some("autonomo" | "autonomous") => Autonomy::Autonomous,
-        _ => Autonomy::Assisted,
-    };
+    // FIX-3: a MESMA função alimenta a UI (`WorkspaceView.ws_autonomy` — badge do card + prefill
+    // do modal), para a superfície nunca divergir do enforcement.
+    let autonomy = workspace_autonomy();
     let mut bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, autonomy, lina_bin)
         .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
         .ok();

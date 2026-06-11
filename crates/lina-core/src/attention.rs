@@ -75,7 +75,17 @@ const _: () = assert!(ESCALATE_AFTER_MS < AUTO_DENY_AFTER_MS);
 /// da janela exigiria o primeiro ainda não-respondido — não acontece num TUI serial.
 pub const LAYER_MERGE_WINDOW_MS: u64 = 10_000;
 
-/// Classe do item na fila — define a precedência (custódia > permissão > spawn).
+/// FIX-2 (dogfood) — **TTL do ask do guard** (hook `PreToolUse`). Diferente do y/n de permissão, o
+/// hook-ask NÃO emite um evento de resolução quando respondido no terminal, e no core não há sinal
+/// determinístico de "respondido" (o nó fica `Busy` desenhando o próprio dialog — sinal ambíguo;
+/// `recolhe-no-Busy` é follow-up de app). Então o item some por TEMPO desde o ÚLTIMO ask do nó
+/// (renovável). 3 min: generoso para a resposta humana típica (ADR 0020: turnos 200–600 s),
+/// priorizando VISIBILIDADE (direção do fundador: nenhum bloqueio invisível) e abaixo de
+/// [`ESCALATE_AFTER_MS`] (5 min). **Limitação conhecida (v1):** se o humano demora > TTL num único
+/// ask, o item some antes de responder; e pode persistir até o TTL após já respondido.
+pub const GUARD_ASK_TTL_MS: u64 = 180_000;
+
+/// Classe do item na fila — define a precedência (custódia > permissão > spawn > guard-ask).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionKind {
     /// Gate duro de custódia/resume (`lina do`/`lina resume`, ADR 0004) — espelhado
@@ -88,6 +98,14 @@ pub enum AttentionKind {
     /// nada nasce. Precedência ABAIXO de permissão (criar processo pode esperar; um bloqueante de
     /// permissão trava um turno em curso).
     Spawn,
+    /// FIX-2 (dogfood): um ASK do guard do Lina (hook `PreToolUse` → `ActionGated{decision:"ask"}`)
+    /// que BLOQUEIA o agente, mas o detector de permissão (F1-1-6) não pega — o dialog de hook-ask
+    /// tem outro formato que o nativo (e em `bypassPermissions` o nativo nem existe). Era o maior
+    /// buraco de "bloqueio invisível ao usuário". Resolução v1: ALERTA + FOCA o terminal (sem
+    /// injeção remota — espelha a decisão do fundador p/ não-`Yn`: o gesto resolve NO terminal).
+    /// Precedência mais baixa (responder y/n no terminal pode esperar atrás dos gates que travam um
+    /// turno), mas NUNCA invisível (direção do fundador 2026-06-07: todo bloqueante alerta).
+    GuardAsk,
 }
 
 /// Camada de origem da evidência — confiabilidade NÃO-uniforme por design: `Hook` é
@@ -211,6 +229,21 @@ struct PendingSpawn {
     created_ts: u64,
 }
 
+/// FIX-2: pendência de um ASK do guard (hook `PreToolUse`), POR NÓ. Dedup por nó: o guard dispara
+/// 1×/tool gated — um item só; o último ask renova `last_ts`/`cmd`. Some por TTL
+/// ([`GUARD_ASK_TTL_MS`]) desde `last_ts` (resolução v1 por timestamp).
+#[derive(Debug, Clone)]
+struct PendingGuardAsk {
+    /// NOME do terminal (`LINA_NODE_NAME`) — o foco da fila é POR NOME (`attention_goto_node`).
+    node: String,
+    /// Resumo do comando barrado (copy leiga "vá ao terminal aprovar X"); o último ask vence.
+    cmd: String,
+    /// 1ª vez visto (idade exibida; estável no replay).
+    created_ts: u64,
+    /// Último ask do nó — renova o TTL (dedup N→1).
+    last_ts: u64,
+}
+
 /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
 #[derive(Debug, Default)]
 pub struct AttentionQueue {
@@ -225,6 +258,9 @@ pub struct AttentionQueue {
     /// `SpawnGated{cascade}` posterior promove a pendente usando-os (os dois são apendados em
     /// sequência por `handle_spawn`). Removido quando o spawn resolve (admitido/recusado).
     spawn_requests: HashMap<String, (String, String, String, u64)>,
+    /// FIX-2: asks do guard (hook `PreToolUse`) pendentes, um por nó (dedup N→1). Em ordem de
+    /// chegada (= `created_ts`); somem por TTL no [`AttentionQueue::items`].
+    guard_asks: Vec<PendingGuardAsk>,
     /// Allowlist por nó (`NodeDetectionMuted`, último vence): `true` = fallback de
     /// grid DESLIGADO para o nó.
     muted: HashMap<String, bool>,
@@ -313,6 +349,16 @@ impl AttentionQueue {
                 self.spawns.retain(|s| s.id != *id);
                 self.spawn_requests.remove(id);
             }
+            // FIX-2: ASK do guard (hook PreToolUse) COM nó identificado → item GuardAsk (alerta+foco).
+            // SÓ `decision=="ask"` E `node:Some` entram: `deny`/`allow` são terminais/silenciosos (não
+            // bloqueiam o humano) e `node:None` é custódia/log-antigo (sem terminal para focar — a
+            // custódia já tem item próprio). Dedup por NÓ no fold (N→1).
+            DomainEvent::ActionGated {
+                decision,
+                cmd,
+                node: Some(node),
+                ..
+            } if decision == "ask" => self.fold_guard_ask(node, cmd, ts),
             // Pós-decisão do executor (F1-1-8): sem efeito na fila — o item já saiu
             // no `PermissionResolved`. Um abort (`screen_changed`) reapresenta via
             // RE-DETECÇÃO (novo `PermissionAsked`, novo stable_id — ADR 0021 §1).
@@ -396,6 +442,23 @@ impl AttentionQueue {
             aliases: Vec::new(),
             prompt_kind,
             vt_snapshot_hash,
+        });
+    }
+
+    /// FIX-2: funde um ASK do guard no item do nó (dedup N→1: renova `last_ts`/`cmd`; o 1º fixa
+    /// `created_ts`). O guard pode disparar uma vez por tool gated — o mesmo nó nunca empilha dois
+    /// itens. Determinístico no replay (eventos em ordem de `ts`).
+    fn fold_guard_ask(&mut self, node: &str, cmd: &str, ts: u64) {
+        if let Some(existing) = self.guard_asks.iter_mut().find(|g| g.node == node) {
+            existing.last_ts = ts;
+            existing.cmd = cmd.to_string();
+            return;
+        }
+        self.guard_asks.push(PendingGuardAsk {
+            node: node.to_string(),
+            cmd: cmd.to_string(),
+            created_ts: ts,
+            last_ts: ts,
         });
     }
 
@@ -541,9 +604,29 @@ impl AttentionQueue {
             prompt_kind: PromptKind::Yn, // y/n: deixar nascer? (gate humano)
             vt_snapshot_hash: None,
         });
+        // FIX-2: asks do guard (hook PreToolUse) — precedência ABAIXO de spawn. SOMEM por TTL desde o
+        // ÚLTIMO ask (`last_ts`): resolução v1 por timestamp. `detail` = comando barrado (copy leiga;
+        // a UI enriquece com o nome). `prompt_kind = Choice`: alerta + foco, NUNCA aprovável daqui
+        // (defesa em profundidade — `resolve`/`auto_deny_due` só olham as permissões `Yn`).
+        let guard = self
+            .guard_asks
+            .iter()
+            .filter(|g| now_ms.saturating_sub(g.last_ts) < GUARD_ASK_TTL_MS)
+            .map(|g| AttentionItem {
+                stable_id: format!("guard:{}", g.node),
+                node_id: g.node.clone(),
+                kind: AttentionKind::GuardAsk,
+                detail: Some(g.cmd.clone()),
+                evidence: AttentionEvidence::Hook, // ask ESTRUTURAL do gate (não-heurístico)
+                created_ts: g.created_ts,
+                state: state_of(g.created_ts),
+                prompt_kind: PromptKind::Choice,
+                vt_snapshot_hash: None,
+            });
         let mut out = round_robin_by_node(custody.collect());
         out.extend(round_robin_by_node(perms.collect()));
         out.extend(round_robin_by_node(spawns.collect()));
+        out.extend(round_robin_by_node(guard.collect()));
         out
     }
 
@@ -1265,5 +1348,162 @@ mod tests {
             !q.is_pending_spawn("m"),
             "admitido → sai do banner (resolvido)"
         );
+    }
+
+    // ───────────────────────── FIX-2: ask do guard (hook PreToolUse) ─────────────────────────
+
+    /// `ActionGated{decision:"ask", node:Some(nó)}` — o ask do guard que bloqueia o agente.
+    fn guard_ask(node: &str, cmd: &str) -> DomainEvent {
+        DomainEvent::ActionGated {
+            cmd: cmd.into(),
+            class: "gated-hard".into(),
+            decision: "ask".into(),
+            node: Some(node.into()),
+        }
+    }
+
+    /// **FIX-2: o ASK do guard vira item `GuardAsk` (alerta + foco).** Carrega o NÓ (foco POR NOME)
+    /// e o COMANDO (copy leiga "vá ao terminal aprovar X"). É o buraco do dogfooding: o guard
+    /// bloqueia mas o detector F1-1-6 não pega o formato do dialog de hook-ask.
+    #[test]
+    fn guard_ask_becomes_guard_ask_item() {
+        let mut q = AttentionQueue::new();
+        q.observe(&guard_ask("Bug Finder", "git push --force origin main"), T0);
+        let items = q.items(T0 + 1_000);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::GuardAsk);
+        assert_eq!(items[0].node_id, "Bug Finder", "nó p/ foco por nome");
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("git push --force origin main")
+        );
+    }
+
+    /// **FIX-2: dedup por nó (N→1).** O guard dispara 1×/tool gated; o MESMO nó nunca empilha — 1
+    /// item, e o último ask renova o comando exibido.
+    #[test]
+    fn guard_ask_dedups_per_node_keeping_latest_cmd() {
+        let mut q = AttentionQueue::new();
+        q.observe(&guard_ask("A", "rm -rf build"), T0);
+        q.observe(&guard_ask("A", "git push --force"), T0 + 5_000);
+        q.observe(&guard_ask("A", "deploy prod"), T0 + 9_000);
+        let items: Vec<_> = q
+            .items(T0 + 10_000)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::GuardAsk)
+            .collect();
+        assert_eq!(items.len(), 1, "3 asks do mesmo nó → 1 item");
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("deploy prod"),
+            "último comando renova a copy"
+        );
+    }
+
+    /// **FIX-2: só `ask` COM nó alerta.** `deny`/`allow` (não bloqueiam o humano) e `ask` SEM nó
+    /// (custódia/log antigo — sem terminal p/ focar) NUNCA viram item.
+    #[test]
+    fn deny_allow_and_node_less_ask_never_alert() {
+        let mut q = AttentionQueue::new();
+        let mk = |decision: &str, node: Option<&str>| DomainEvent::ActionGated {
+            cmd: "x".into(),
+            class: "gated-hard".into(),
+            decision: decision.into(),
+            node: node.map(str::to_string),
+        };
+        q.observe(&mk("deny", Some("A")), T0);
+        q.observe(&mk("allow", Some("A")), T0 + 1);
+        q.observe(&mk("ask", None), T0 + 2); // custódia / log antigo
+        assert!(
+            q.items(T0 + 1_000)
+                .iter()
+                .all(|i| i.kind != AttentionKind::GuardAsk),
+            "nenhum desses vira GuardAsk"
+        );
+    }
+
+    /// **FIX-2: resolução v1 por TTL.** O item some `GUARD_ASK_TTL_MS` após o ÚLTIMO ask (no core
+    /// não há sinal de resolução determinístico — `recolhe-no-Busy` é follow-up de app). Um novo ask
+    /// antes de expirar RENOVA a janela.
+    #[test]
+    fn guard_ask_expires_by_ttl_and_renews() {
+        let mut q = AttentionQueue::new();
+        q.observe(&guard_ask("A", "deploy"), T0);
+        assert_eq!(
+            q.items(T0 + GUARD_ASK_TTL_MS - 1).len(),
+            1,
+            "vivo dentro do TTL"
+        );
+        assert_eq!(q.items(T0 + GUARD_ASK_TTL_MS).len(), 0, "expira no TTL");
+        // Novo ask 1ms antes de expirar → renova a janela (dedup + renovação do last_ts).
+        q.observe(&guard_ask("A", "deploy"), T0 + GUARD_ASK_TTL_MS - 1);
+        assert_eq!(
+            q.items(T0 + GUARD_ASK_TTL_MS + 100).len(),
+            1,
+            "novo ask renova o TTL"
+        );
+    }
+
+    /// **FIX-2: precedência custódia > permissão > spawn > guard-ask.** O ask do guard fica ABAIXO de
+    /// tudo (um turno travado por permissão/custódia/spawn decide primeiro), mas NUNCA invisível.
+    #[test]
+    fn guard_ask_precedence_is_last() {
+        let by = uuid::Uuid::from_u128(1);
+        let mut q = AttentionQueue::new();
+        q.observe(&guard_ask("G", "deploy"), T0);
+        q.observe(&ask("P", PermissionEvidence::Hook, "p1"), T0 + 1);
+        q.custody_enqueued("c1", "C", "lina do deploy", T0 + 2);
+        q.observe(
+            &DomainEvent::SpawnRequested {
+                id: "s1".into(),
+                requested_by: by,
+                name: "@H".into(),
+                role: "h".into(),
+                root_cause_id: "R".into(),
+                hops: 1,
+                prompt: "p".into(),
+            },
+            T0 + 3,
+        );
+        q.observe(
+            &DomainEvent::SpawnGated {
+                id: "s1".into(),
+                requested_by: by,
+                reason: "cascade".into(),
+            },
+            T0 + 4,
+        );
+        let kinds: Vec<AttentionKind> = q.items(T0 + 5).into_iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                AttentionKind::Custody,
+                AttentionKind::Permission,
+                AttentionKind::Spawn,
+                AttentionKind::GuardAsk,
+            ]
+        );
+    }
+
+    /// **FIX-2: crash + reabrir reconstrói o GuardAsk (replay ≡ live).** O `ActionGated{ask}` está no
+    /// log → reabrir a fila re-mostra o alerta (durabilidade — invariantes #4/#6).
+    #[test]
+    #[serial]
+    fn guard_ask_survives_replay() {
+        let tmp = TempDir::new("guardask");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&guard_ask("Bug Finder", "deploy prod"))
+            .expect("append");
+        let records = store.events().expect("events");
+        let now = records.last().map(|r| r.ts).unwrap_or(T0) + 1_000;
+        let rebuilt = AttentionQueue::replay(&records);
+        let items: Vec<_> = rebuilt
+            .items(now)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::GuardAsk)
+            .collect();
+        assert_eq!(items.len(), 1, "GuardAsk reconstruído do log");
+        assert_eq!(items[0].node_id, "Bug Finder");
     }
 }
