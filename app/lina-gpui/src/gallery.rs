@@ -161,14 +161,16 @@ pub fn apply_preset(
         focus_preset: preset.id().to_string(),
     })?;
 
-    // Coordenadas-semente em linha; o canvas (W4-2) reposiciona — aqui só não nascem sobrepostos.
-    for (i, agent) in team.iter().enumerate() {
-        let x = 30.0 + (i as f64) * 360.0;
+    // FIX-3: coordenadas-semente na MESMA grade do canvas vivo (`bridge::grid_slot` — fonte
+    // única de CARD_W/CARD_H/GAP). A fila linear antiga (passo 360px < card de 710px) fazia
+    // os terminais do template nascerem sobrepostos.
+    for (slot, agent) in (0u32..).zip(team.iter()) {
+        let (x, y) = crate::bridge::grid_slot(slot);
         store.append(&DomainEvent::NodeAdded {
             node: agent.node,
             kind: "Terminal".to_string(),
-            x,
-            y: 96.0,
+            x: f64::from(x),
+            y: f64::from(y),
             requested_by: None,
         })?;
         store.append(&DomainEvent::NodeRoleAssigned {
@@ -654,6 +656,50 @@ mod tests {
         assert_eq!(state.focus_preset.as_deref(), Some("blank"));
         assert!(state.nodes.is_empty(), "Espaco vazio");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX-3: o seed do template posiciona em GRADE com a régua do canvas (`bridge::grid_slot`)
+    /// — para N agentes (2, 4, 6), nenhum par de cards sobrepõe: distam ao menos um passo
+    /// (`CARD_W+GAP` na horizontal ou `CARD_H+GAP` na vertical) e nenhuma coordenada se repete.
+    #[test]
+    fn apply_preset_semeia_grade_sem_sobreposicao() {
+        use crate::bridge::{CARD_GAP, CARD_H, CARD_W};
+        for n in [2usize, 4, 6] {
+            let (mut store, dir) = temp_store(&format!("grade{n}"));
+            let team: Vec<PlacedAgent> = (0..n)
+                .map(|i| PlacedAgent {
+                    node: Uuid::now_v7(),
+                    name: format!("Agente {i}"),
+                    role: "DEVELOPER".to_string(),
+                })
+                .collect();
+
+            apply_preset(FocusPreset::DevApp, "Grade", &team, &mut store).expect("apply");
+
+            let state = store.project().expect("projetar");
+            let pos: Vec<(f64, f64)> = team
+                .iter()
+                .map(|a| {
+                    let node = state.nodes.get(&a.node).expect("no na projecao");
+                    (node.x, node.y)
+                })
+                .collect();
+            let step_x = f64::from(CARD_W + CARD_GAP);
+            let step_y = f64::from(CARD_H + CARD_GAP);
+            for (i, &(x1, y1)) in pos.iter().enumerate() {
+                for &(x2, y2) in &pos[i + 1..] {
+                    assert!(
+                        (x1, y1) != (x2, y2),
+                        "n={n}: dois cards na MESMA coordenada ({x1},{y1})"
+                    );
+                    assert!(
+                        (x1 - x2).abs() >= step_x || (y1 - y2).abs() >= step_y,
+                        "n={n}: cards sobrepostos em ({x1},{y1}) e ({x2},{y2})"
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Local-first (inv #2): o ÚNICO efeito de `apply_preset` é o event log — exatamente

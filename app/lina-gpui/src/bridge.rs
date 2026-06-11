@@ -39,6 +39,9 @@ use lina_cli_profiles::ProfileRegistry;
 // O app é PtyManager-direto (não usa `PtyHost`), então o cabo `append-on-scroll` é replicado
 // em `wire_terminal_capturing` (addendo do Maestro) — a lógica de harvest vive no core (REUSO).
 use lina_core::scrollback::{FlushGuard, FlushGuardConfig, ScrollbackStore};
+// FIX-2 (Criar Espaço): o seam ÚNICO de precedência de cwd do core (F1-4-1/ADR 0022) —
+// `default_cwd` do Espaço vence; sem ele, dir gerenciado virgem. Consumido no funil de admissão.
+use lina_core::{resolve_spawn_cwd, ResolvedCwd};
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
 use lina_secrets::{SecretStore, SecretVault};
@@ -2366,6 +2369,22 @@ fn compensate_wire(pty: &mut PtyManager, sup: &Supervisor, node: NodeId, key: &s
 /// Layout do card no canvas (fonte única — o render em `main` reusa estes valores).
 pub const CARD_W: f32 = 680.0;
 pub const CARD_H: f32 = 500.0;
+/// Respiro entre cards na grade (par de `CARD_W`/`CARD_H` — mesma fonte única).
+pub const CARD_GAP: f32 = 30.0;
+
+/// Coordenada do `k`-ésimo slot da grade do canvas (4 colunas; passo `CARD_W/CARD_H + CARD_GAP`).
+/// FONTE ÚNICA da aritmética de layout: `next_free_slot` (admissão viva) e o seed do template
+/// (`gallery::apply_preset`, FIX-3) calculam pela MESMA régua — números mágicos não se duplicam.
+#[must_use]
+pub fn grid_slot(k: u32) -> (f32, f32) {
+    const MARGIN_X: f32 = 30.0;
+    const MARGIN_Y: f32 = 96.0;
+    const COLS: u32 = 4;
+    (
+        MARGIN_X + (k % COLS) as f32 * (CARD_W + CARD_GAP),
+        MARGIN_Y + (k / COLS) as f32 * (CARD_H + CARD_GAP),
+    )
+}
 
 /// Candidatos a raiz do repo (onde vivem `assets/` e `target/`), em ordem de preferência: o
 /// derivado do `CARGO_MANIFEST_DIR` (resolvido pelo cargo em build — não é literal da máquina) e
@@ -2809,10 +2828,6 @@ fn node_label(seq: u32) -> String {
 /// o invariante "posicionar sem sobrepor"; o pan do canvas revela colunas/linhas além da tela.
 #[must_use]
 fn next_free_slot(model: &SharedModel) -> (f32, f32) {
-    const MARGIN_X: f32 = 30.0;
-    const MARGIN_Y: f32 = 96.0;
-    const GAP: f32 = 30.0;
-    const COLS: u32 = 4;
     let existing: Vec<(f32, f32)> = model
         .order
         .iter()
@@ -2820,19 +2835,18 @@ fn next_free_slot(model: &SharedModel) -> (f32, f32) {
         .map(|v| (v.x, v.y))
         .collect();
     for k in 0u32..10_000 {
-        let x = MARGIN_X + (k % COLS) as f32 * (CARD_W + GAP);
-        let y = MARGIN_Y + (k / COLS) as f32 * (CARD_H + GAP);
+        let (x, y) = grid_slot(k);
         let collides = existing.iter().any(|&(ex, ey)| {
-            x < ex + CARD_W + GAP
-                && x + CARD_W + GAP > ex
-                && y < ey + CARD_H + GAP
-                && y + CARD_H + GAP > ey
+            x < ex + CARD_W + CARD_GAP
+                && x + CARD_W + CARD_GAP > ex
+                && y < ey + CARD_H + CARD_GAP
+                && y + CARD_H + CARD_GAP > ey
         });
         if !collides {
             return (x, y);
         }
     }
-    (MARGIN_X, MARGIN_Y)
+    grid_slot(0)
 }
 
 /// Limites de zoom do canvas (escala). Fora deles o zoom satura.
@@ -4064,6 +4078,23 @@ impl NodeManager {
 /// ADICIONAR e REMOVER nós-terminal mantendo o **event log como fonte da verdade** (emite
 /// `NodeAdded`/`TerminalSpawned`/`NodeRemoved` persistidos e reconstruíveis). Sem `unwrap` em
 /// caminho de produção; sem panic ao remover (o reader fecha sozinho no EOF do PTY morto).
+/// **FIX-2 (puro, testável) — a política EFETIVA de um nó que pediu `Managed`.** Com
+/// Diretório de Trabalho no Espaço (`default_cwd`, F1-4-1), o nó nasce NELE como `UserDir`
+/// consentido — o usuário escolheu a pasta no modal M9; a escolha É o consentimento do kit.
+/// Sem default, fica `Managed` (dir gerenciado virgem — idêntico ao comportamento anterior).
+/// A precedência em si é do seam único do core ([`resolve_spawn_cwd`]); aqui só se traduz o
+/// veredito em [`CwdPolicy`]. A `key` do app entra COM o prefixo `n-` (o seam prefixa
+/// sozinho, então ele é removido na borda).
+fn effective_managed_policy(default_cwd: Option<&Path>, ws_root: &Path, key: &str) -> CwdPolicy {
+    match resolve_spawn_cwd(default_cwd, ws_root, key.strip_prefix("n-").unwrap_or(key)) {
+        ResolvedCwd::WorkspaceDefault(dir) => CwdPolicy::UserDir {
+            path: dir,
+            consent: true,
+        },
+        ResolvedCwd::ManagedVirgin(_) => CwdPolicy::Managed,
+    }
+}
+
 pub struct NodeManager {
     pty: Arc<Mutex<PtyManager>>,
     sup: Arc<Supervisor>,
@@ -4699,8 +4730,38 @@ impl NodeManager {
 
         // 4) Política de cwd (§4) + kit write-before-spawn (o shell já encontra o CLAUDE.md).
         //    `cwd_real` é o que o `TerminalSpawned` persiste — o binding node↔cwd↔sessão (§3).
+        //
+        //    FIX-2 (Criar Espaço, F1-4-1): `Managed` é a intenção "sem pasta própria" — mas o
+        //    Espaço pode ter um Diretório de Trabalho (`WorkspaceDefaultCwdSet`, projetado em
+        //    `default_cwd`). A precedência é do seam único do core (`resolve_spawn_cwd`):
+        //    default do Espaço → o nó nasce NELE (vira `UserDir` consentido: kit merge-safe +
+        //    badge de pasta compartilhada do FIX-1, de graça); sem default → `ManagedVirgin`,
+        //    comportamento idêntico ao anterior (logs antigos sem o evento não mudam). Resolvido
+        //    AQUI, no choke point do funil — cobre o restore E qualquer admissão futura.
+        let plan_cwd = match plan.cwd {
+            CwdPolicy::Managed => {
+                let default_cwd = match lock(&self.store).project() {
+                    Ok(state) => state.default_cwd.map(PathBuf::from),
+                    Err(e) => {
+                        // Degradação honesta (inv#6): sem projeção, o nó nasce no dir
+                        // gerenciado — nunca aborta a admissão por uma leitura de leitura.
+                        eprintln!(
+                            "lina-gpui: projeção indisponível ao resolver o cwd do agente \
+                             ({e}) — usando o diretório gerenciado"
+                        );
+                        None
+                    }
+                };
+                // `lina_dir` = `<ws_root>/.lina`; o ws_root só importa no ramo `ManagedVirgin`
+                // (cujo caminho é descartado em favor de `ensure_cwd`, que cobre o boot
+                // degradado sem bootstrap).
+                let ws_root = self.lina_dir.parent().unwrap_or(&self.lina_dir);
+                effective_managed_policy(default_cwd.as_deref(), ws_root, &key)
+            }
+            other => other,
+        };
         let mut kit_missing = false;
-        let cwd_real: Option<PathBuf> = match &plan.cwd {
+        let cwd_real: Option<PathBuf> = match &plan_cwd {
             CwdPolicy::Managed => {
                 let dir = self.ensure_cwd(&key);
                 match &dir {
@@ -4791,7 +4852,7 @@ impl NodeManager {
         // nunca surpresa silenciosa. (O isolamento por-nó da OBSERVABILIDADE — token HTTP no
         // `.claude/settings.json` lido por cwd — é story dedicada: toca o contrato F1-1-3 + a
         // neutralidade multi-CLI; ver `.entrega-fix1.md`.)
-        let cwd_sharers = self.live_nodes_sharing_cwd(&plan.cwd);
+        let cwd_sharers = self.live_nodes_sharing_cwd(&plan_cwd);
         let cwd_shared = !cwd_sharers.is_empty();
 
         // 5) Slot calculado ANTES de o nó existir: imune ao placeholder (0,0) que o pump cria.
@@ -4876,7 +4937,8 @@ impl NodeManager {
         let _ = self.sup.set_status(node, CoreStatus::Running);
         lock(&self.grids).insert(node, grid);
         lock(&self.keys).insert(node, key);
-        lock(&self.cwds).insert(node, plan.cwd.clone());
+        // A política EFETIVA (pós-resolução FIX-2) — o `rewrite_bootstrap` itera por ela.
+        lock(&self.cwds).insert(node, plan_cwd);
 
         // 8) Roster mudou → reescreve as doutrinas (os existentes ganham o colega novo).
         //    No restore em lote a reescrita é ADIADA para o fim (ver `admit_node_inner`).
@@ -5361,6 +5423,29 @@ mod tests {
     /// `wire_terminal` consulta isto pós-`register` (sob `#[cfg(test)]`): toma-e-limpa a flag.
     pub(super) fn take_wire_fault() -> bool {
         WIRE_FAULT.with(|f| f.replace(false))
+    }
+
+    // ─────────────── FIX-2: política efetiva de cwd `Managed` (puro, gpui-free) ───────────────
+
+    /// Com Diretório de Trabalho no Espaço, `Managed` vira `UserDir` consentido NA pasta
+    /// escolhida; sem ele, segue `Managed` (dir gerenciado — zero regressão p/ logs antigos).
+    #[test]
+    fn effective_managed_policy_honra_o_default_cwd_do_espaco() {
+        let ws_root = Path::new("/tmp/espaco");
+        let projeto = Path::new("/Users/dona/Projetos/App");
+        assert_eq!(
+            effective_managed_policy(Some(projeto), ws_root, "n-abc123"),
+            CwdPolicy::UserDir {
+                path: projeto.to_path_buf(),
+                consent: true,
+            },
+            "default do Espaço vence o dir gerenciado"
+        );
+        assert_eq!(
+            effective_managed_policy(None, ws_root, "n-abc123"),
+            CwdPolicy::Managed,
+            "sem default → comportamento atual (dir gerenciado)"
+        );
     }
 
     // ─────────────── W3-6c última milha: custódia (fios 1 e 3) — unidades gpui-free ───────────────
