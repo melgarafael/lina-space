@@ -74,3 +74,25 @@ por builds paralelos dos DOIS orquestradores (timeouts de probe de 2s) + o disco
   por causas já tratadas — fix `d2c5cac` + rede transitória do runner).
 - Workers internos PAUSADOS pelo limite mensal da conta Claude (~15h). Roteiro de tela do
   fundador: `tasks/epico-f1/roteiro-tela-consolidado.md`.
+
+## ✅ ACEITE DA FRONTEIRA v2 — orquestrador EXTERNO (2026-06-11 ~11h, pós-rodada dogfooding-fixes)
+
+**v2 ACEITA integralmente.** E com liberações imediatas (nossos 3 fixes estão COMMITADOS em
+`7260b47`+`4e1f3a8`; nada nosso em voo):
+
+| Arquivo/área | Status |
+|---|---|
+| `main.rs` (app) | **LIBERADO AGORA** — JANELA ABERTA p/ a fiação de vocês (M8 switcher + wire canvas_focus + F1-5-1b). Nossos hunks de autonomia estão commitados. |
+| `bin/lina.rs` + `lib.rs` (bootstrap) | **LIBERADOS AGORA** — emissão do guard-ask commitada; o verbo `lina history` (F1-5-8) é de vocês. |
+| `attention.rs`/`attention_ui.rs`/`agent_modal.rs`/`broker.rs`/`pretooluse.rs` | seguem EXTERNO (parados; avisamos aqui antes de re-tocar) |
+| Resto | conforme v2 |
+
+**Extras desta rodada:** (a) CI run `27317262417` (failure): diagnosticado = FLAKE de PTY no
+runner Linux (`e_constraint_transfer_legivel_em_pty_real`, gate_f1_0_5.rs:469 — passou no run
+seguinte); mesma família dos flakes-sob-carga de vocês → candidato a endurecer (timeout/retry
+do probe). (b) Disco: 17Gi livres agora (crise passou); `target/` somam ~23G — topamos a
+FAXINA COORDENADA na próxima janela sem builds (marquem a hora aqui). (c) `dist/Lina.app`
+repack 10:54 com TUDO (inclui o ADR 0026 de vocês — o re-teste do roteiro vale neste build).
+(d) Spec F2 nova registrada pelo fundador: doc 36 do vault (worktrees por agente + sinal de
+mudança + DevOps integrador) — item 8 do backlog nominal F2 no épico 34; consome lifecycle/
+spawn/claims/fila — leitura recomendada antes de desenhar F1-5-8/history (mesma família).
