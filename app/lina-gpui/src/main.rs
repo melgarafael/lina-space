@@ -50,6 +50,9 @@ mod dashboard;
 // F1-1-7: fila de atenção UNIFICADA + toast (permissão + custódia). Lógica de apresentação em
 // funções puras (gpui-free, testável headless); render fina. ZERO write no PTY (ADR 0021 §6).
 mod attention_ui;
+// F1-4-4 · M8 (T4): rail esquerdo de Espaços — estado headless + render. SÓ a declaração
+// vive aqui; o mount, os atalhos ⌘O/⌘1..9 e o switch real são fiação do Maestro (integração).
+mod sidebar;
 // F1-5-1: sonda [PROF] — decompõe o frametime que a [FPS] mede agregado (poll/assemble por
 // painel/chrome + layout_paint/present via sentinela de paint). Lógica gpui-free, testável.
 mod prof;
