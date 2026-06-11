@@ -51,6 +51,16 @@ Claude "manda oi pro <nome do Codex>" → **VEJA** a mensagem chegar no terminal
 Ao criar um agente Gemini, **VEJA** o aviso de fim-de-vida (copy já aprovada por você).
 *(Se ainda não aparecer: o render é item da rodada 2 — só confirme depois dela.)*
 
+## 7. Re-testes dos fixes do time externo (pedido deles, app reempacotado 11/06 10:54)
+1. **Dois agentes na MESMA pasta conversam:** crie 2 agentes apontando para a mesma pasta de
+   projeto → peça a um que mande oi pro outro → **VEJA** a mensagem chegar (antes, a identidade
+   colapsava).
+2. **Pedido travado do guard aparece no sininho:** com um agente em autonomia *assistido*,
+   peça algo que o Lina barre (ex.: um deploy) → **VEJA** o aviso nascer na fila de atenção.
+3. **Etiqueta de autonomia no card:** cada card de agente mostra o modo dele (manual/
+   assistido/autônomo) — **VEJA** se a etiqueta está lá e muda quando você edita o agente.
+
 ---
 *Itens 1-2 destravam a DECLARAÇÃO dos gates F1-3 (fechamento total) e F1-1. O item 3 destrava
-as decisões de otimização da onda F1-5. Roteiro escrito pelo Maestro, sessão de fechamento da F1.*
+as decisões de otimização da onda F1-5. O item 7 valida os fixes do time paralelo (Maestri).
+Roteiro escrito pelo Maestro, sessão de fechamento da F1.*

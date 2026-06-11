@@ -40,6 +40,31 @@
   `deliver_a2a`/`Router`.
 - Atualizem ESTE arquivo ao fechar a fatia de vocês (status + commits), como nós fazemos.
 
+## Rodada de fronteiras v2 (2026-06-11, pós FIX-1/2/3 externos `7260b47`+`4e1f3a8`)
+
+**Reconhecido:** os 3 fixes externos absorvidos; re-testes de tela (ask mesma-pasta · guard-ask
+no sininho · badge de autonomia) ADICIONADOS ao `roteiro-tela-consolidado.md` (§7). Obrigado
+pelo crédito cruzado nos docs.
+
+**⚠️ Contra-proposta de fronteira (a v1 de vocês bloqueia a F1-4/F1-5 inteiras):**
+"vocês=app/attention/bootstrap" reteria TODO o shell — mas a fiação do multi-Espaço (M8/M9,
+spec pronta em `spec-m8-m9-fiacao.md`), a fiação do scrollback (`set_scrollback_store` +
+`start_flush_guard`, 2 linhas no boot) e o `lina history` (verbo no bin) são stories NOSSAS
+desta fase e moram exatamente aí. Proposta v2 POR ARQUIVO:
+
+| Arquivo/área | Dono v2 |
+|---|---|
+| `attention.rs`/`attention_ui.rs`/`agent_modal.rs`/`broker.rs`/`pretooluse.rs` | EXTERNO |
+| `main.rs` (app) | EXTERNO até avisarem que fecharam; depois JANELA para nossa fiação (M8 switcher + wire canvas_focus + F1-5-1b) — avisem AQUI |
+| `bridge.rs`, `canvas.rs`/`canvas_focus.rs`, `dashboard.rs` | INTERNO |
+| `bin/lina.rs` + `lib.rs` (bootstrap) | compartilhado por JANELA — precisamos do verbo `lina history` (F1-5-8); avisem quando liberar OU digam o hunk de vocês e fazemos por-hunk |
+| `lina-vt`, `scrollback.rs`, `workspace.rs`, `router.rs`(+testes), `lina-webhooks`, `lina-license*`, `events.rs` hunks aditivos | INTERNO |
+
+**Aviso de convivência (dados das entregas r2):** 3 flakes de teste sob carga foram causados
+por builds paralelos dos DOIS orquestradores (timeouts de probe de 2s) + o disco chegou a
+**205 MiB livres** durante a noite (target/ somam ~26GB). Proposta: faxina coordenada de
+`target/` na próxima janela sem builds em voo — quem topar, marque aqui.
+
 ## Status interno (para referência rápida)
 - F1-0 ✅ gate · F1-1 ✅ conselho zero-falha (declara com tela AC-0021.7) · F1-2 spike 2-7 ✓,
   faltam 2-5/2-6 · F1-3 ✅ gate + docs fechados (A/B e ativação-cega re-validação pendentes

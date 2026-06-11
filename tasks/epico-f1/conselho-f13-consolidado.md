@@ -66,4 +66,12 @@
   cega re-validada pós-encurtamento: **66/66 (100%)**, 3 juízes cegos × 22 frases (workflow
   `wf_e5334b6f`) · transcript Codex COMPLETO pendente de conta OpenAI (volta 09/jul) e Gemini
   pendente de auth — limitação de AMBIENTE, registrada, não de produto.
-- **Item 8 (breaker 2×/anti-race):** em execução (Revisor, rodada 2 — `r2-revisor.md`).
+- **Item 8 (breaker 2×/anti-race):** ✅ **FECHADO COM VEREDITO (2026-06-11, Revisor + aceite
+  do Maestro)** — (b2) claim concorrente EXERCITADO pelo funil real (mailbox→pump) com 2 testes
+  não-vacuosos e prova de mutação (guarda morta → 4 FAILED → restauração → 11/11); (a) breaker
+  sticky 2-falhas-POR-ITEM e (b1) `parents:` no plan.md **NÃO EXISTEM no core** (evidência
+  arquivo:linha — eram contrato comportamental da skill `lina-orchestration`, não mecanismo).
+  **Decisão do Maestro:** os dois viram stories nomeadas do backlog pós-F1 ("breaker-por-item
+  como mecanismo + evento auditável" e "parents: com enforcement no claim") + decisão de
+  conselho se auditoria do CONFLITO de claim deve ir ao log (hoje rejeição em memória é design
+  W3-5(c)). A skill segue válida como contrato; o gate F1-3 não regrediu.
