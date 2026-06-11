@@ -3215,6 +3215,19 @@ impl BootstrapWriter {
         self.ws_root.join(key)
     }
 
+    /// F1-4-3: `true` se `dir` está DIRETAMENTE sob o `ws_root` com o shape das keys
+    /// gerenciadas (`n-<uuid>` atual, `t<seq>` legado) — só a própria Lina cria dirs assim;
+    /// o kit dentro deles é nosso por construção, mesmo sem carimbo (gerações pré-carimbo).
+    fn is_managed_namespace(&self, dir: &Path) -> bool {
+        dir.parent() == Some(self.ws_root.as_path())
+            && dir.file_name().and_then(OsStr::to_str).is_some_and(|s| {
+                s.strip_prefix("n-").is_some_and(|rest| !rest.is_empty())
+                    || s.strip_prefix('t').is_some_and(|rest| {
+                        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                    })
+            })
+    }
+
     /// Vault primário EFETIVO a injetar na doutrina. O que o usuário linkou no onboarding
     /// (`<ws_root>/.lina/vault.json`) tem PRIORIDADE; só cai no `vault_path` do boot (fallback) se ainda
     /// não houver vault linkado. **Re-lido a cada escrita** — corrige o bug de ORDEM: o `vault_path` era
@@ -3270,6 +3283,12 @@ impl BootstrapWriter {
     /// namespace da Lina (aditivos, sempre escritos). Devolve o que foi recusado, para o
     /// chamador degradar VISIVELMENTE (badge) — nunca silencioso.
     pub fn write_user_dir(&self, dir: &Path, name: &str, roster: &[String]) -> KitOutcome {
+        // F1-4-3 (bug da porta morta): um dir DIRETAMENTE sob o `ws_root` com o shape das keys
+        // gerenciadas só pode ter sido criado pela própria Lina — o kit nele é NOSSO por
+        // construção, mesmo sem carimbo (gerações antigas, pré-carimbo). Sem esta migração, o
+        // restore re-entrava nesses dirs como `UserDir` e PRESERVAVA um settings com a porta de
+        // hooks de um boot morto → ECONNREFUSED em todo hook (visto na tela em 2026-06-11).
+        let managed_ns = self.is_managed_namespace(dir);
         let input = BootstrapInput::new(
             name.to_string(),
             roster.to_vec(),
@@ -3303,8 +3322,9 @@ impl BootstrapWriter {
             };
         // Doutrina (3 tiers): CARIMBADA com o marcador de máquina na 1ª linha; a posse é
         // `starts_with` — um arquivo do usuário que apenas CITE a doutrina não vira nosso
-        // (red-team da rodada: `contains` do heading sobrescreveria citação).
-        let ours_md = |existing: &str| existing.starts_with(LINA_MANAGED_MARKER);
+        // (red-team da rodada: `contains` do heading sobrescreveria citação). Em dir
+        // GERENCIADO a posse é por construção (ver `managed_ns` acima).
+        let ours_md = |existing: &str| managed_ns || existing.starts_with(LINA_MANAGED_MARKER);
         let stamped = |body: String| format!("{LINA_MANAGED_MARKER}\n{body}");
         guarded(
             "CLAUDE.md",
@@ -3328,11 +3348,13 @@ impl BootstrapWriter {
         // sobrescreveria um settings do usuário que apenas contivesse aquela substring.
         guarded(
             ".claude/settings.json",
-            &settings_is_ours,
-            stamped_settings_json(&lina_bootstrap::hook_settings_json_with_observability(
-                &self.lina_bin,
-                wiring.as_ref(),
-            )),
+            &|existing: &str| managed_ns || settings_is_ours(existing),
+            lina_bootstrap::stamp_managed_settings(
+                &lina_bootstrap::hook_settings_json_with_observability(
+                    &self.lina_bin,
+                    wiring.as_ref(),
+                ),
+            ),
         );
         // `.lina/bootstrap.json` é namespace da Lina — escrita direta (estado vivo do `lina whoami`).
         let lina_dir = dir.join(".lina");
@@ -3361,35 +3383,17 @@ impl BootstrapWriter {
 /// usuário não transferem a posse.
 const LINA_MANAGED_MARKER: &str = "<!-- lina-space:gerado — a Lina reescreve este arquivo a \
 cada mudança de roster; edições manuais serão perdidas -->";
-/// Chave estruturada de posse do `settings.json` gerado pela Lina (top-level, parseada e
-/// checada por VALOR `true`). JSON não comporta comentário-marcador como os markdown; uma
-/// CHAVE dedicada é inequívoca (o usuário não a teria por acaso) e o Claude Code ignora chaves
-/// desconhecidas no settings (lê `permissions`/`hooks`).
-const LINA_MANAGED_KEY: &str = "_lina_managed";
-
-/// O `settings.json` que a Lina escreve, CARIMBADO com [`LINA_MANAGED_KEY`]`: true` no topo —
-/// a marca de posse estruturada (inv 1). Parseia o JSON do crate, insere a chave, re-serializa.
-/// Se o parse/serialize falhar (não deve — o crate gera JSON válido), devolve o JSON cru SEM
-/// carimbo: degradação honesta (na pior hipótese um rewrite futuro recusa por achá-lo do
-/// usuário — nunca o contrário, que apagaria dado).
-fn stamped_settings_json(raw: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(serde_json::Value::Object(mut map)) => {
-            map.insert(LINA_MANAGED_KEY.to_string(), serde_json::Value::Bool(true));
-            serde_json::to_string_pretty(&serde_json::Value::Object(map))
-                .unwrap_or_else(|_| raw.to_string())
-        }
-        _ => raw.to_string(),
-    }
-}
-
 /// `true` se o `settings.json` existente é GERENCIADO pela Lina: a chave estruturada
-/// [`LINA_MANAGED_KEY`] está presente e é `true` (parse + checagem por valor, jamais
-/// substring). JSON ilegível/sem a chave → do usuário (preserve).
+/// [`lina_bootstrap::LINA_MANAGED_SETTINGS_KEY`] está presente e é `true` (parse + checagem
+/// por valor, jamais substring). JSON ilegível/sem a chave → do usuário (preserve). O carimbo
+/// em si mora no crate (`stamp_managed_settings` — F1-4-3: o kit por-nó também sai carimbado).
 fn settings_is_ours(existing: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(existing)
         .ok()
-        .and_then(|v| v.get(LINA_MANAGED_KEY).and_then(serde_json::Value::as_bool))
+        .and_then(|v| {
+            v.get(lina_bootstrap::LINA_MANAGED_SETTINGS_KEY)
+                .and_then(serde_json::Value::as_bool)
+        })
         == Some(true)
 }
 
@@ -3576,9 +3580,9 @@ impl NodeAdmission {
 
 /// **A sequência CANÔNICA e COMPLETA de eventos de uma admissão (ADR 0022 §2)** — função
 /// PURA (testável headless; o teste de paridade das 3 portas assenta aqui): `NodeAdded` +
-/// `TerminalSpawned { cli, cwd REAL }` + `NodeRoleAssigned` SEMPRE + `CliProfileSet`
-/// quando o profile é conhecido. Qualquer porta de admissão produz EXATAMENTE isto,
-/// módulo parâmetros.
+/// `TerminalSpawned { cli, cwd REAL }` + `NodeRenamed` (F1-4-3: o nome no log, fonte do
+/// restore) + `NodeRoleAssigned` SEMPRE + `CliProfileSet` quando o profile é conhecido.
+/// Qualquer porta de admissão produz EXATAMENTE isto, módulo parâmetros.
 #[allow(clippy::too_many_arguments)] // espelho 1:1 dos campos da admissão (sequência canônica ADR 0022)
 fn admission_events(
     node: NodeId,
@@ -3607,6 +3611,13 @@ fn admission_events(
             // O binding node↔cwd persistido (§3): o cwd REAL do spawn. `None` SÓ quando o
             // spawn herdou o cwd do app (bootstrap desligado) — degradação honesta, sem chute.
             cwd: cwd.map(|p| p.display().to_string()),
+        },
+        // F1-4-3: o NOME resolvido da admissão entra no LOG — `ProjectedNode.name` só nasce de
+        // `NodeRenamed`, e sem ele o restore re-erguia todo mundo como "Terminal N" do contador
+        // (que reinicia a cada boot). Mesmo evento do rename manual; último-vence na projeção.
+        DomainEvent::NodeRenamed {
+            node,
+            name: name.to_string(),
         },
         DomainEvent::NodeRoleAssigned {
             node,
@@ -3710,6 +3721,14 @@ pub fn plan_restore(
         if !info.kind.eq_ignore_ascii_case("terminal") {
             continue;
         }
+        // Geração já FECHADA no log (morte póstuma do `close_previous_generation` em boots
+        // anteriores) fica no passado — a foto do boot é tirada ANTES do fechamento desta
+        // geração, então quem estava vivo no último quit ainda NÃO está `Dead` aqui. Sem este
+        // filtro, cada reabertura re-erguia TODAS as gerações empilhadas na mesma posição
+        // (bug da tela de 2026-06-11: 23 cards em x=30,y=96, shell puro por baixo).
+        if info.status.as_deref() == Some(lina_core::NodeStatus::Dead.as_str()) {
+            continue;
+        }
         let panel = node.to_string();
         // Re-hidrata a janela viva do disco (≥ janela viva, byte-idêntico). Erro de leitura
         // degrada para vazio (= sem histórico → caminho "novo começo"), nunca silencioso.
@@ -3733,9 +3752,19 @@ pub fn plan_restore(
         let has_prior_session = !scrollback_tail.is_empty();
 
         // `info.cli` é o profile id quando houve `CliProfileSet` (reducer: último vence); senão
-        // é o rótulo do motor/nome (sem perfil conhecido) → shell puro / sem resume.
-        let profile = info.cli.as_deref().and_then(|id| registry.get(id));
-        let profile_id = profile.and(info.cli.clone());
+        // é o RÓTULO do motor ("Claude Code", gerações pré-CliProfileSet) ou o nome. Fallback
+        // pelo slug do rótulo ("Claude Code" → "claude-code"): sem ele, um claude de geração
+        // antiga re-erguia como shell puro silencioso (metade do bug "terminal empilhado").
+        let resolved_id = info.cli.as_deref().and_then(|c| {
+            if registry.get(c).is_some() {
+                Some(c.to_string())
+            } else {
+                let slug = c.trim().to_lowercase().replace(' ', "-");
+                registry.get(&slug).is_some().then_some(slug)
+            }
+        });
+        let profile = resolved_id.as_deref().and_then(|id| registry.get(id));
+        let profile_id = resolved_id;
 
         // Badge CONDICIONADO AO OBSERVADO (copy-f1-4 §4): declarar resume é NECESSÁRIO, nunca
         // SUFICIENTE — só «Sessão retomada» se há sessão anterior de fato (scrollback no disco).
@@ -3820,7 +3849,9 @@ impl NodeManager {
                 requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
                 autonomy: Autonomy::Assisted,
             };
-            let node = match self.admit_node(admission) {
+            // Reescrita do kit em LOTE (1× após o loop): com N restores, o rewrite por-admissão
+            // era O(N²) de I/O — o vilão do boot lento medido em 2026-06-11 (~80 nós).
+            let node = match self.admit_node_inner(admission, false) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!(
@@ -3830,6 +3861,17 @@ impl NodeManager {
                     continue;
                 }
             };
+            // SUPERSEDE: o nó da geração anterior é APOSENTADO no log — o re-erguido é um nó
+            // NOVO (Dead é terminal, ADR 0020) e sem o `NodeRemoved` o antigo re-erguia DE NOVO
+            // a cada boot (canvas dobrando, cards empilhados). Auditável: o remove fica no log.
+            if let Err(e) = lock(&self.store).append(&DomainEvent::NodeRemoved { node: plan.node })
+            {
+                eprintln!(
+                    "lina-gpui: CRÍTICO — '{}' re-erguido (node {node}) mas o antigo {} NÃO foi \
+                     aposentado no log: {e} (pode reaparecer duplicado no próximo boot)",
+                    plan.name, plan.node
+                );
+            }
             // Re-hidrata o grid: a janela viva entra ANTES do output novo do shell — o leigo
             // reabre e a conversa está lá. CRLF por linha (o VT trata como output normal).
             if !plan.scrollback_tail.is_empty() {
@@ -3855,6 +3897,11 @@ impl NodeManager {
                 plan.scrollback_tail.len()
             );
             up += 1;
+        }
+        // A reescrita adiada do lote: TODOS os kits ganham o roster completo (e a porta de
+        // hooks DESTE boot) numa passada só — ver nota no `admit_node_inner(…, false)` acima.
+        if up > 0 {
+            self.rewrite_bootstrap();
         }
         up
     }
@@ -4399,6 +4446,17 @@ impl NodeManager {
     /// `main`) são tradutores finos de intenção → [`NodeAdmission`] — proibidos de apendar
     /// eventos ou tocar o Supervisor diretamente.
     pub fn admit_node(&self, plan: NodeAdmission) -> Result<NodeId, String> {
+        self.admit_node_inner(plan, true)
+    }
+
+    /// O corpo do funil. `rewrite_roster=false` SÓ no restore (F1-4-3): N admissões em lote
+    /// adiam a reescrita dos kits para UMA passada ao final (`restore_terminals`) — por-admissão
+    /// era O(N²) de I/O no boot. Qualquer outra porta usa `admit_node` (reescreve sempre).
+    fn admit_node_inner(
+        &self,
+        plan: NodeAdmission,
+        rewrite_roster: bool,
+    ) -> Result<NodeId, String> {
         // 1) seq/key — a identidade local do PTY (o NodeId canônico nasce no register).
         let seq = {
             let mut s = lock(&self.seq);
@@ -4436,8 +4494,27 @@ impl NodeManager {
                 n.to_string()
             }
             // Porta ⌘T: nome automático derivado do seq (rótulo cosmético; a key de
-            // filesystem é única/não-reciclável — ver o bloco da `key` acima).
-            None => format!("Terminal {}", node_label(seq)),
+            // filesystem é única/não-reciclável — ver o bloco da `key` acima). F1-4-3: o seq
+            // reinicia a cada boot, mas o restore re-ergue nós que JÁ se chamam "Terminal X"
+            // (nome persistido no log) — pula os tomados, senão o outbox/A2A ficam ambíguos.
+            None => {
+                let taken: std::collections::BTreeSet<String> = self
+                    .terminals_snapshot()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .collect();
+                let mut candidate = format!("Terminal {}", node_label(seq));
+                while taken.contains(&candidate) {
+                    let next = {
+                        let mut s = lock(&self.seq);
+                        let v = *s;
+                        *s = s.wrapping_add(1);
+                        v
+                    };
+                    candidate = format!("Terminal {}", node_label(next));
+                }
+                candidate
+            }
         };
         let role = plan.role.trim().to_string();
         if role.is_empty() || role.chars().any(char::is_control) {
@@ -4649,7 +4726,10 @@ impl NodeManager {
         lock(&self.cwds).insert(node, plan.cwd.clone());
 
         // 8) Roster mudou → reescreve as doutrinas (os existentes ganham o colega novo).
-        self.rewrite_bootstrap();
+        //    No restore em lote a reescrita é ADIADA para o fim (ver `admit_node_inner`).
+        if rewrite_roster {
+            self.rewrite_bootstrap();
+        }
         eprintln!(
             "lina-gpui: admissão — agente '{name}' criado (papel {role}, cwd {}). node {node}",
             cwd_real
@@ -6774,8 +6854,8 @@ mod tests {
         );
         assert_eq!(
             lock(&store).event_count().expect("count"),
-            before + 3,
-            "persiste a sequência canônica: NodeAdded + TerminalSpawned + NodeRoleAssigned"
+            before + 4,
+            "persiste a sequência canônica: NodeAdded + TerminalSpawned + NodeRenamed + NodeRoleAssigned"
         );
         let projected = lock(&store).project().expect("project");
         assert!(
@@ -8644,7 +8724,12 @@ mod tests {
         )
         .expect("bootstrap writer");
         let (nm, store, _model) = test_manager("paridade", Some(bw));
-        let canonical = ["NodeAdded", "TerminalSpawned", "NodeRoleAssigned"];
+        let canonical = [
+            "NodeAdded",
+            "TerminalSpawned",
+            "NodeRenamed",
+            "NodeRoleAssigned",
+        ];
 
         // Porta 1 — ⌘T / botão +.
         let mark = lock(&store).events().expect("eventos").len();
@@ -8709,6 +8794,7 @@ mod tests {
             [
                 "NodeAdded",
                 "TerminalSpawned",
+                "NodeRenamed",
                 "NodeRoleAssigned",
                 "CliProfileSet"
             ],
@@ -10283,5 +10369,252 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────── F1-4-3 · fixes do restore (3 bugs da tela do fundador, 2026-06-11) ─────────
+
+    /// **Bug "nomes resetados":** o nome dado na ADMISSÃO precisa sobreviver ao quit DENTRO do
+    /// log — o restore só enxerga a projeção, e `ProjectedNode.name` só nasce de `NodeRenamed`.
+    /// Caminho de PRODUÇÃO (funil `admit_node`, não o helper de seed): admite → projeta → plano.
+    #[test]
+    fn admission_persists_name_and_role_into_the_log_for_restore() {
+        let (nm, store, _model) = test_manager("nome-persiste", None);
+        nm.admit_node(NodeAdmission {
+            name: Some("Maestro da Obra".into()),
+            role: "maestro".into(),
+            engine: None,
+            cwd: CwdPolicy::Managed,
+            position: Some((10.0, 20.0)),
+            requested_by: None,
+            autonomy: Autonomy::Assisted,
+        })
+        .expect("admissão");
+        let proj = lock(&store).project().expect("project");
+        let reg = ProfileRegistry::new();
+        let plans = plan_restore(&proj, &reg, None);
+        let plan = plans
+            .iter()
+            .find(|p| (p.x, p.y) == (10.0, 20.0))
+            .expect("nó admitido entra no plano de restore");
+        assert_eq!(
+            plan.name, "Maestro da Obra",
+            "o nome da admissão sobrevive no log — sem isto o restore renomeia tudo para 'Terminal N'"
+        );
+        assert_eq!(plan.role.as_deref(), Some("maestro"));
+    }
+
+    /// **Bug "nomes resetados" (corolário):** o nome AUTOMÁTICO (`⌘T`) não pode colidir com um
+    /// nome já vivo no roster — o seq reinicia a cada boot, mas o restore re-ergue nós que JÁ
+    /// se chamam "Terminal C/D/…" (colisão = outbox/A2A ambíguos). Reproduz: um nó explícito
+    /// ocupa o PRÓXIMO rótulo do contador; o automático seguinte tem de pular para o D.
+    #[test]
+    fn auto_names_skip_names_already_taken_in_the_roster() {
+        let (nm, _store, _model) = test_manager("nome-colisao", None);
+        // Ocupa "Terminal D" — o rótulo que o contador dará ao PRÓXIMO ⌘T (esta admissão
+        // explícita consome o seq do C; deriva real do restore: o nome auto-dado num boot
+        // anterior volta persistido num seq diferente do que o contador novo vai alcançar).
+        nm.admit_node(NodeAdmission {
+            name: Some("Terminal D".into()),
+            role: "terminal".into(),
+            engine: None,
+            cwd: CwdPolicy::Managed,
+            position: None,
+            requested_by: None,
+            autonomy: Autonomy::Assisted,
+        })
+        .expect("nó restaurado com nome 'Terminal D'");
+        let node = nm.add_node().expect("⌘T");
+        let name = lock(&nm.model)
+            .nodes
+            .get(&node)
+            .map(|v| v.name.clone())
+            .expect("nó na projeção");
+        assert_eq!(
+            name, "Terminal E",
+            "nome automático pula os já tomados ('Terminal D' está vivo no roster)"
+        );
+    }
+
+    /// **Bug "terminais empilhados" (metade 1):** gerações já FECHADAS no log (`Dead`, póstumo do
+    /// `close_previous_generation`) não re-erguem — só quem estava vivo no último quit volta.
+    #[test]
+    fn plan_restore_skips_dead_generations() {
+        let base = std::env::temp_dir().join(format!("lina-restore-dead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut store = EventStore::open(base.join("events")).expect("store");
+        let vivo = NodeId::from_u128(1);
+        let morto = NodeId::from_u128(2);
+        seed_terminal(
+            &mut store, vivo, 10.0, 20.0, "Vivo", "terminal", "Shell", None,
+        );
+        seed_terminal(
+            &mut store, morto, 30.0, 40.0, "Fantasma", "terminal", "Shell", None,
+        );
+        store
+            .append(&DomainEvent::NodeStatusChanged {
+                node: morto,
+                status: lina_core::NodeStatus::Dead.as_str().to_string(),
+                from: "Idle".to_string(),
+                reason: "app_reopened".to_string(),
+            })
+            .expect("morte póstuma");
+        let proj = store.project().expect("project");
+        let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
+        assert_eq!(
+            plans.len(),
+            1,
+            "só o vivo re-ergue; o Dead de geração anterior fica no passado"
+        );
+        assert_eq!(plans[0].node, vivo);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Bug "terminais empilhados" (metade 2 — supersede):** o restore re-admite como nó NOVO;
+    /// o nó ANTIGO precisa ser APOSENTADO no log (`NodeRemoved`) — senão cada reabertura dobra o
+    /// canvas (23 cards na MESMA posição na tela do fundador). Auditável: o remove fica no log.
+    #[test]
+    fn restore_terminals_retires_the_superseded_node_in_the_log() {
+        let (nm, store, _model) = test_manager("restore-supersede", None);
+        let antigo = NodeId::from_u128(77);
+        seed_terminal(
+            &mut lock(&store),
+            antigo,
+            30.0,
+            96.0,
+            "Maestro",
+            "maestro",
+            "Shell",
+            None,
+        );
+        let proj = lock(&store).project().expect("project");
+        let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
+        assert_eq!(plans.len(), 1, "o antigo entra no plano");
+        assert_eq!(nm.restore_terminals(&plans), 1, "re-ergueu");
+
+        let proj2 = lock(&store).project().expect("re-project");
+        assert!(
+            !proj2.nodes.contains_key(&antigo),
+            "o nó da geração anterior foi aposentado (NodeRemoved) — não re-ergue de novo no próximo boot"
+        );
+        let novo = proj2
+            .nodes
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("Maestro"));
+        assert!(
+            novo.is_some(),
+            "a geração nova existe na projeção com o MESMO nome"
+        );
+    }
+
+    /// **Bug "shell puro por baixo":** nó de geração antiga sem `CliProfileSet` guarda só o
+    /// RÓTULO do motor ("Claude Code") no `TerminalSpawned.cli`. O plano resolve o perfil pelo
+    /// slug do rótulo em vez de degradar para shell puro — o claude volta como claude.
+    #[test]
+    fn plan_restore_resolves_profile_from_engine_label_when_id_missing() {
+        let base = std::env::temp_dir().join(format!("lina-restore-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut store = EventStore::open(base.join("events")).expect("store");
+        let node = NodeId::from_u128(9);
+        // Geração antiga: TerminalSpawned com o RÓTULO, sem CliProfileSet (profile=None).
+        seed_terminal(
+            &mut store,
+            node,
+            0.0,
+            0.0,
+            "Especialista",
+            "backend",
+            "Claude Code",
+            None,
+        );
+        let mut reg = ProfileRegistry::new();
+        reg.insert(claude_resume_profile());
+        let proj = store.project().expect("project");
+        let plans = plan_restore(&proj, &reg, None);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].profile_id.as_deref(),
+            Some("claude-code"),
+            "rótulo 'Claude Code' resolve para o perfil 'claude-code' (slug)"
+        );
+        assert_eq!(
+            plans[0].command,
+            vec!["claude", "--output-format", "stream-json"],
+            "o claude volta como claude — nunca shell puro silencioso"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Bug "porta morta nos hooks" (ECONNREFUSED):** o kit que a LINA escreveu nos dirs
+    /// GERENCIADOS (`<ws_root>/n-…`) é nosso POR CONSTRUÇÃO — mesmo sem a marca (gerações
+    /// antigas, pré-carimbo). O `write_user_dir` do restore/rewrite REESCREVE o kit nesses dirs
+    /// (a porta efêmera dos hooks muda a cada boot); pasta REAL do usuário segue merge-safe.
+    #[test]
+    fn write_user_dir_refreshes_lina_kit_in_managed_namespace_dirs() {
+        let ws = std::env::temp_dir().join(format!("lina-managed-ns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+
+        // Dir gerenciado de GERAÇÃO ANTIGA: kit sem carimbo (como o app escrevia até hoje).
+        let managed = ws.join("n-0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001");
+        std::fs::create_dir_all(managed.join(".claude")).expect("mkdir");
+        std::fs::write(
+            managed.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"http://127.0.0.1:57545/morto"}]}]}}"#,
+        )
+        .expect("settings velho");
+        std::fs::write(managed.join("CLAUDE.md"), "# doutrina velha sem marcador\n").expect("md");
+
+        let roster = vec!["Maestro".to_string()];
+        let outcome = bw.write_user_dir(&managed, "Maestro", &roster);
+        assert_eq!(
+            outcome,
+            KitOutcome::Full,
+            "kit em dir gerenciado é nosso por construção — reescreve, nunca recusa"
+        );
+        let settings =
+            std::fs::read_to_string(managed.join(".claude/settings.json")).expect("settings novo");
+        assert!(
+            !settings.contains("57545/morto"),
+            "a porta morta foi embora do settings"
+        );
+        assert!(
+            settings.contains("whoami --bootstrap"),
+            "o settings novo tem os hooks atuais"
+        );
+        assert!(
+            settings_is_ours(&settings),
+            "o settings reescrito sai CARIMBADO (próximo boot não depende do namespace)"
+        );
+        let md = std::fs::read_to_string(managed.join("CLAUDE.md")).expect("md novo");
+        assert!(
+            md.starts_with(LINA_MANAGED_MARKER),
+            "a doutrina também é reescrita e carimbada"
+        );
+
+        // CONTROLE: pasta REAL do usuário (fora do namespace) continua merge-safe.
+        let user_dir = std::env::temp_dir().join(format!("lina-userdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_dir);
+        std::fs::create_dir_all(user_dir.join(".claude")).expect("mkdir user");
+        let user_settings = r#"{"meu_setting": true}"#;
+        std::fs::write(user_dir.join(".claude/settings.json"), user_settings).expect("settings");
+        let outcome2 = bw.write_user_dir(&user_dir, "Maestro", &roster);
+        assert!(
+            matches!(&outcome2, KitOutcome::Partial(refused) if refused.iter().any(|r| r.contains("settings.json"))),
+            "settings do USUÁRIO sem a marca é preservado (recusa visível): {outcome2:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user_dir.join(".claude/settings.json")).expect("re-read"),
+            user_settings,
+            "conteúdo do usuário intocado"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&user_dir);
     }
 }

@@ -540,7 +540,7 @@ impl Bootstrapper {
         std::fs::write(lina.join("bootstrap.json"), json)?;
         std::fs::write(
             claude.join("settings.json"),
-            hook_settings_json_with_observability(lina_bin, wiring),
+            stamp_managed_settings(&hook_settings_json_with_observability(lina_bin, wiring)),
         )?;
         // F1-3 (ACHADO-1): a safra COMPLETA de skills no kit por-nó — todo terminal nasce com
         // a Inteligência da Lina inteira em `.claude/skills/` (antes só a `lina-agent-bus`
@@ -567,6 +567,31 @@ impl Bootstrapper {
 #[must_use]
 pub fn hook_settings_json(lina_bin: &str) -> String {
     hook_settings_json_with_observability(lina_bin, None)
+}
+
+/// Chave estruturada de POSSE do `settings.json` que o kit por-nó escreve (`_lina_managed:
+/// true`, top-level). É ela que autoriza um boot futuro (restore/rewrite) a REESCREVER o
+/// arquivo — a porta efêmera dos hooks muda a cada boot e um settings preservado com porta
+/// morta gera ECONNREFUSED em todo hook. O Claude Code ignora chaves desconhecidas.
+pub const LINA_MANAGED_SETTINGS_KEY: &str = "_lina_managed";
+
+/// Carimba [`LINA_MANAGED_SETTINGS_KEY`]`: true` num settings JSON (parse → insert →
+/// re-serialize). Falha de parse (não deve — o gerador produz JSON válido) devolve o cru SEM
+/// carimbo: na pior hipótese um rewrite futuro o preserva por achá-lo do usuário — nunca o
+/// contrário, que apagaria dado do usuário.
+#[must_use]
+pub fn stamp_managed_settings(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert(
+                LINA_MANAGED_SETTINGS_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            );
+            serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                .unwrap_or_else(|_| raw.to_string())
+        }
+        _ => raw.to_string(),
+    }
 }
 
 /// **F1-1-3 — fiação dos hooks de observabilidade** no spawn de um terminal: a porta do
@@ -1291,6 +1316,32 @@ mod tests {
         assert!(
             skills_root.join("lina-orchestration/SKILL.md").is_file(),
             "skills seguem após o re-render"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F1-4-3 (bug da porta morta):** o `settings.json` que o kit por-nó ESCREVE sai
+    /// carimbado com a chave de posse `_lina_managed: true` — é ela que autoriza um boot
+    /// futuro (restore/rewrite) a REESCREVER o arquivo com a porta de hooks nova, sem
+    /// confundi-lo com um settings do usuário. (A função `hook_settings_json_*` crua segue
+    /// sem carimbo: ela também alimenta superfícies que não são o kit por-nó.)
+    #[test]
+    fn terminal_settings_json_is_stamped_as_lina_managed() {
+        let dir = std::env::temp_dir().join(format!("lina-bs-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bs = Bootstrapper::new().expect("bootstrapper");
+        bs.write_terminal_files(&dir, &sample("@Maestro"), "/abs/lina")
+            .expect("kit");
+        let raw = std::fs::read_to_string(dir.join(".claude/settings.json")).expect("settings");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("json válido");
+        assert_eq!(
+            v.get("_lina_managed").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "settings do kit por-nó nasce carimbado como gerenciado pela Lina"
+        );
+        assert!(
+            raw.contains("whoami --bootstrap"),
+            "o conteúdo funcional (hooks) continua intacto"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

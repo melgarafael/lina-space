@@ -3541,9 +3541,11 @@ fn main() {
         }
     }));
 
-    // F1-4-3: foto da geração ANTERIOR — capturada ANTES do fechamento abaixo (depois dele os
-    // nós viram `dead` e saem da projeção). É a fonte do plano de restore (posições/nomes/
-    // papéis/cwd/CLI do log — inv#4); o opt-out por Espaço decide o uso mais adiante.
+    // F1-4-3: foto da geração ANTERIOR — capturada ANTES do fechamento abaixo, então quem
+    // estava vivo no último quit ainda NÃO está `dead` nela (nós `dead` NÃO saem da projeção —
+    // só `NodeRemoved` remove; o `plan_restore` PULA os `dead` de gerações mais antigas e o
+    // executor aposenta cada re-erguido com `NodeRemoved`). É a fonte do plano de restore
+    // (posições/nomes/papéis/cwd/CLI do log — inv#4); o opt-out por Espaço decide o uso adiante.
     let restore_proj = lock(&store).project().ok();
 
     // F1-0-8 (costura coordenada — mecanismo do Dev 02): fecha a GERAÇÃO ANTERIOR no log logo
