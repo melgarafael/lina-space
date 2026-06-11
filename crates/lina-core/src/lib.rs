@@ -147,6 +147,10 @@ pub mod bench;
 /// histórico além do cap hidratado do disco sob demanda (anti-leak `#painéis × scrollback`).
 pub mod scrollback;
 
+/// F1-5-8: consulta PAGINADA do histórico (tail/search/export com limite duro) sobre o
+/// scrollback — leitura cross-terminal auditada pela fronteira de pertencimento (ADR 0006).
+pub mod history;
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para

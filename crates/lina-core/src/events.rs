@@ -478,6 +478,16 @@ pub enum DomainEvent {
     SnapshotTaken {
         seq: u64,
     },
+    /// F1-5-8: um nó leu o histórico de OUTRO painel (`tail`/`search` cross-terminal) —
+    /// livro-razão de auditoria da fronteira de pertencimento (ADR 0006). Toda leitura
+    /// cross é um fato observável; same-owner NÃO entra aqui (alto volume/baixo sinal).
+    /// META — sem efeito na projeção do canvas; `query` é o TIPO da consulta ("tail"/
+    /// "search"), nunca o conteúdo (o payload da busca não vaza ao log).
+    HistoryReadCross {
+        reader: NodeId,
+        panel: String,
+        query: String,
+    },
     /// F1-0-3 (ADR 0019 §3): nó `Busy` acumulou `stall_warn_samples` amostras consecutivas SEM
     /// progresso (tail_hash estagnado E zero evento de domínio atribuível) → WARN. Emitido **uma
     /// única vez, na transição para stalled** (anti-amplificação, ADR 0003/0005) pelo
@@ -813,6 +823,7 @@ impl DomainEvent {
             DomainEvent::WebhookConfigured { .. } => "WebhookConfigured",
             DomainEvent::WebhookReceived { .. } => "WebhookReceived",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
+            DomainEvent::HistoryReadCross { .. } => "HistoryReadCross",
             DomainEvent::NodeStalled { .. } => "NodeStalled",
             DomainEvent::CliDetected { .. } => "CliDetected",
             DomainEvent::PermissionAsked { .. } => "PermissionAsked",
@@ -1173,7 +1184,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // F1-3-7 (reservado up-front): uso/criação de skill são META (dados do `lina retro`).
         | DomainEvent::SkillInvoked { .. }
         | DomainEvent::SkillCreated { .. }
-        | DomainEvent::SnapshotTaken { .. } => {}
+        | DomainEvent::SnapshotTaken { .. }
+        // F1-5-8: leitura cross do histórico é META (livro-razão de auditoria da fronteira
+        // de pertencimento) — sem efeito na projeção do canvas.
+        | DomainEvent::HistoryReadCross { .. } => {}
     }
 }
 
