@@ -9,6 +9,12 @@
 
 use lina_host::NodeStatus;
 
+/// F1-2-6: focus manager do canvas (widget composto + roving tabindex). O registro do módulo
+/// vive AQUI (e não em `main.rs`, do time EXTERNO nesta rodada) via `#[path]` — promover para
+/// `mod canvas_focus;` no crate root é costura futura (mesmo padrão do `a11y::live`).
+#[path = "canvas_focus.rs"]
+pub mod focus;
+
 /// Teto de nós GRANDES no foco. Red-team doc 12: atenção humana sustenta ~2-6; produto mira **1-4
 /// legíveis**. Acima disto a leitura degrada — o excedente vai para a periferia (fila). HOJE o canvas
 /// usa FOCO ÚNICO (o nó focado); reservado para o multi-foco (pin de até MAX_FOCUS) das próximas stories.
