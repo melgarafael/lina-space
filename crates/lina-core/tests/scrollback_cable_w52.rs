@@ -80,6 +80,7 @@ fn pty_host_cables_scrollback_to_store_with_zero_loss() {
             ScrollbackConfig {
                 cap,
                 flush_batch: 8,
+                retention_days: 30,
             },
         )
         .expect("open store"),
@@ -181,6 +182,7 @@ fn pty_host_cables_scrollback_to_store_with_zero_loss() {
         ScrollbackConfig {
             cap,
             flush_batch: 8,
+            retention_days: 30,
         },
     )
     .expect("reopen store");

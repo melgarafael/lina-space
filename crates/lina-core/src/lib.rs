@@ -337,6 +337,10 @@ pub struct PtyHost {
     /// W5-2 FIAÇÃO: Store de scrollback do workspace. Quando presente, todo terminal aberto a
     /// partir daí nasce **capturando** (cap = `store.cap()`) e tem o cabo `append-on-scroll` ligado.
     scrollback: Option<Arc<Mutex<scrollback::ScrollbackStore>>>,
+    /// F1-5-6: o job ÚNICO de durabilidade (idle-drain + sinais + retenção diária F1-5-9).
+    /// Vive aqui porque o `PtyHost` é o dono natural do ciclo de vida do scrollback
+    /// (decisão da story: "idle-drain como job único no PtyHost"). Para no Drop.
+    flush_guard: Option<scrollback::FlushGuard>,
 }
 
 impl Default for PtyHost {
@@ -364,6 +368,7 @@ impl PtyHost {
             delta_rx: Some(delta_rx),
             seq: Arc::new(AtomicU64::new(0)),
             scrollback: None,
+            flush_guard: None,
         }
     }
 
@@ -374,6 +379,26 @@ impl PtyHost {
     /// antes de `spawn`.
     pub fn set_scrollback_store(&mut self, store: Arc<Mutex<scrollback::ScrollbackStore>>) {
         self.scrollback = Some(store);
+    }
+
+    /// F1-5-6: sobe o **job único de durabilidade** sobre o store ligado em
+    /// [`PtyHost::set_scrollback_store`] — idle-drain (painel ocioso 1-2s → flush),
+    /// handlers de sinal (`SIGTERM`/`SIGINT`/`SIGHUP` → `flush_all` antes de morrer) e o
+    /// job diário de retenção (F1-5-9), tudo numa ÚNICA thread (a nota load-bearing do
+    /// 13.16 — nunca uma thread por painel sobre o Mutex global). `Ok(false)` = sem store
+    /// ligado (nada a proteger). Idempotente: re-chamar substitui o guard anterior
+    /// (o velho para no drop).
+    pub fn start_flush_guard(
+        &mut self,
+        cfg: scrollback::FlushGuardConfig,
+    ) -> Result<bool, scrollback::ScrollbackError> {
+        match &self.scrollback {
+            Some(store) => {
+                self.flush_guard = Some(scrollback::FlushGuard::start(Arc::clone(store), cfg)?);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// Toma o receptor de `GridDelta` (uma vez). O consumidor o drena e dá `ack`.

@@ -33,7 +33,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
@@ -46,6 +51,13 @@ pub const DEFAULT_SCROLLBACK_CAP: usize = 10_000;
 /// Linhas não-persistidas acumuladas antes de um flush em LOTE ao disco (1 transação). Limita o
 /// nº de transações (perf) e o pico de RAM ENTRE flushes.
 pub const DEFAULT_FLUSH_BATCH: usize = 2_000;
+
+/// F1-5-9: retenção default do cache de output em DIAS (anti-"Warp 41GB"). `0` = retenção
+/// DESLIGADA (nada expira) — escolha explícita, nunca "apagar tudo".
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+
+/// Um dia em millis (janela do job de retenção).
+const DAY_MS: u64 = 86_400_000;
 
 /// Erros do scrollback store.
 #[derive(Debug, Error)]
@@ -63,6 +75,10 @@ pub struct ScrollbackConfig {
     pub cap: usize,
     /// Linhas não-persistidas acumuladas antes de um flush em lote ao disco.
     pub flush_batch: usize,
+    /// F1-5-9: dias de retenção do cache de output no disco (default 30; configurável
+    /// por workspace). Linhas mais velhas que isto somem no job diário. `0` = desligado.
+    /// O event log do DOMÍNIO nunca passa por aqui (inv. #4 — isto é só o cache).
+    pub retention_days: u32,
 }
 
 impl Default for ScrollbackConfig {
@@ -70,6 +86,7 @@ impl Default for ScrollbackConfig {
         Self {
             cap: DEFAULT_SCROLLBACK_CAP,
             flush_batch: DEFAULT_FLUSH_BATCH,
+            retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 }
@@ -84,6 +101,16 @@ struct PanelBuffer {
     persisted: u64,
     /// Total de linhas já empurradas (= próximo `idx`).
     total: u64,
+    /// F1-5-6: instante do ÚLTIMO `push_line` — o sinal de ociosidade do idle-drain
+    /// (monotônico; `None` = painel reidratado sem output novo, nunca pendente).
+    last_push: Option<Instant>,
+    /// F1-5-9 (revisão): `ts` do último lote flushado — piso do carimbo do próximo
+    /// lote (relógio de parede que recua nunca quebra o prefixo de expiração).
+    /// Reidratado de `MAX(ts)` na abertura.
+    last_ts: u64,
+    /// F1-5-9: piso de expiração — linhas `[0, expired_before)` foram removidas pela
+    /// retenção (leitura responde vazio + a UI/API sinalizam "expirado", nunca erro).
+    expired_before: u64,
 }
 
 impl PanelBuffer {
@@ -101,6 +128,37 @@ pub struct ScrollbackStore {
     db_path: PathBuf,
     cfg: ScrollbackConfig,
     panels: BTreeMap<String, PanelBuffer>,
+    /// F1-5-9: relógio INJETÁVEL (epoch ms) — carimba o `ts` dos lotes e decide o corte
+    /// da retenção. Default: `SystemTime`. Testes injetam um relógio fixo (`set_clock`).
+    clock: Box<dyn Fn() -> u64 + Send>,
+    /// F1-5-9: último instante (ms do `clock`) em que o job de retenção rodou. Em-memória
+    /// (zera no boot → o job roda no 1º tick do guard; um DELETE vazio é barato).
+    last_retention_ms: u64,
+    /// F1-5-6: métricas do drain (janela real de exposição do write-behind).
+    stats: DrainStats,
+}
+
+/// F1-5-6: métricas observáveis do flush de durabilidade — "linhas pendentes no momento
+/// do flush" é a medida da janela real de exposição a um crash duro.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrainStats {
+    /// Nº de flushes disparados pelo idle-drain (1 por painel drenado).
+    pub idle_drains: u64,
+    /// Linhas TOTAIS persistidas pelos drains (idle + sinal).
+    pub lines: u64,
+    /// Linhas pendentes no momento do ÚLTIMO drain (idle ou sinal).
+    pub last_pending: u64,
+    /// Nº de `flush_all` disparados por SINAL (SIGTERM/SIGINT/SIGHUP).
+    pub signal_flushes: u64,
+}
+
+/// F1-5-9: resultado de uma passada do job de retenção.
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionReport {
+    /// Linhas removidas do disco nesta passada.
+    pub deleted: u64,
+    /// O corte usado (`now − retention_days`), em epoch ms.
+    pub cutoff_ms: u64,
 }
 
 const SCHEMA: &str = "
@@ -110,7 +168,45 @@ CREATE TABLE IF NOT EXISTS scrollback (
     text  TEXT    NOT NULL,
     PRIMARY KEY (panel, idx)
 );
+CREATE TABLE IF NOT EXISTS scrollback_meta (
+    panel          TEXT    PRIMARY KEY,
+    next_idx       INTEGER NOT NULL,
+    expired_before INTEGER NOT NULL DEFAULT 0
+);
 ";
+
+/// F1-5-9: migração IDEMPOTENTE do schema W5-2 → F1-5-9. A coluna `ts` (epoch ms, por
+/// LOTE — decisão da story: mais barato e suficiente p/ retenção diária) entra com
+/// `ALTER TABLE` tolerante a re-execução; linhas antigas (fixture/produção pré-F1-5-9)
+/// ganham o `ts` da MIGRAÇÃO — honesto e documentado: elas começam a contar a partir
+/// de agora, nunca expiram retroativamente no 1º boot.
+fn migrate(conn: &Connection, now_ms: u64) -> Result<(), ScrollbackError> {
+    let has_ts: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('scrollback') WHERE name = 'ts'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_ts == 0 {
+        conn.execute_batch("ALTER TABLE scrollback ADD COLUMN ts INTEGER;")?;
+    }
+    // Índice de `ts` (revisão): sem ele, o DELETE diário da retenção e o UPDATE abaixo
+    // são full-scan segurando o Mutex global do store — a BAIXA-iii que a story manda
+    // não piorar. NULLs entram no índice → o `WHERE ts IS NULL` também o usa.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS scrollback_ts ON scrollback(ts);")?;
+    // Idempotente por construção: só carimba quem está NULL (re-execução é no-op).
+    conn.execute(
+        "UPDATE scrollback SET ts = ?1 WHERE ts IS NULL",
+        params![now_ms as i64],
+    )?;
+    // Semeia a META dos painéis legados (revisão): um painel pré-F1-5-9 que expirar
+    // INTEIRO antes de qualquer flush novo precisa do `next_idx` durável para a
+    // sequência não regredir — e do piso `expired_before` para sinalizar "expirado".
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO scrollback_meta (panel, next_idx, expired_before)
+         SELECT panel, MAX(idx) + 1, 0 FROM scrollback GROUP BY panel;",
+    )?;
+    Ok(())
+}
 
 impl ScrollbackStore {
     /// Abre (ou cria) o store em `dir` com a config default.
@@ -132,26 +228,57 @@ impl ScrollbackStore {
         conn.busy_timeout(Duration::from_millis(3000))?;
         enable_wal(&conn)?;
         conn.execute_batch(SCHEMA)?;
+        // F1-5-9: schema antigo (W5-2) ganha `ts` aqui — idempotente, sem perda.
+        migrate(&conn, system_now_ms())?;
 
-        // Reabertura: `total` e `persisted` por painel vêm de MAX(idx)+1 do disco. O cache da
+        // Reabertura: `total` e `persisted` por painel vêm de MAX(idx)+1 do disco,
+        // reconciliado com a META durável (F1-5-9): se a retenção apagou TODAS as linhas
+        // de um painel, `next_idx` preserva a sequência — `idx` nunca regride. O cache da
         // cauda nasce VAZIO (será repovoado pelo stream de output); leituras caem no disco até lá.
-        let mut panels = BTreeMap::new();
+        let mut panels: BTreeMap<String, PanelBuffer> = BTreeMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT panel, COALESCE(MAX(idx), -1) + 1 FROM scrollback GROUP BY panel",
+                "SELECT panel, COALESCE(MAX(idx), -1) + 1, COALESCE(MAX(ts), 0)
+                 FROM scrollback GROUP BY panel",
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
             for row in rows {
-                let (panel, count) = row?;
+                let (panel, count, max_ts) = row?;
                 let c = count.max(0) as u64;
                 panels.insert(
                     panel,
                     PanelBuffer {
                         persisted: c,
                         total: c,
+                        last_ts: max_ts.max(0) as u64,
                         ..Default::default()
                     },
                 );
+            }
+        }
+        {
+            let mut stmt =
+                conn.prepare("SELECT panel, next_idx, expired_before FROM scrollback_meta")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (panel, next_idx, expired_before) = row?;
+                let pb = panels.entry(panel).or_default();
+                let seq = next_idx.max(0) as u64;
+                pb.total = pb.total.max(seq);
+                pb.persisted = pb.persisted.max(seq);
+                pb.expired_before = expired_before.max(0) as u64;
             }
         }
 
@@ -160,7 +287,16 @@ impl ScrollbackStore {
             db_path,
             cfg,
             panels,
+            clock: Box::new(system_now_ms),
+            last_retention_ms: 0,
+            stats: DrainStats::default(),
         })
+    }
+
+    /// F1-5-9: injeta o relógio (epoch ms) usado no carimbo `ts` dos lotes e no corte da
+    /// retenção. Seam de teste/simulação — produção fica no default (`SystemTime`).
+    pub fn set_clock(&mut self, clock: impl Fn() -> u64 + Send + 'static) {
+        self.clock = Box::new(clock);
     }
 
     /// Empurra uma linha de scrollback no painel. Write-behind: a linha vai ao cache da cauda;
@@ -176,6 +312,9 @@ impl ScrollbackStore {
             let pb = self.panels.entry(panel.to_string()).or_default();
             pb.tail_buf.push_back(line.into());
             pb.total += 1;
+            // F1-5-6: o sinal de atividade do idle-drain — sob output contínuo o painel
+            // nunca fica ocioso e o drain não dispara (critério d).
+            pb.last_push = Some(Instant::now());
             pb.total - pb.persisted >= flush_batch
         };
         // Drena o write-behind em lote quando enche (fora do borrow de `pb`, pois toca o disco).
@@ -197,19 +336,25 @@ impl ScrollbackStore {
     /// não-persistido do cache da cauda). As linhas PERMANECEM no cache (são só espelhadas);
     /// em erro, `persisted` não avança → nada se perde e o próximo flush re-tenta.
     pub fn flush(&mut self, panel: &str) -> Result<(), ScrollbackError> {
-        let (start, lines) = match self.panels.get_mut(panel) {
+        let (start, lines, ts_floor) = match self.panels.get_mut(panel) {
             Some(pb) if pb.total > pb.persisted => {
                 let n = (pb.total - pb.persisted) as usize;
                 let from = pb.tail_buf.len() - n; // as últimas `n` linhas do cache são as não-persistidas
                 let lines: Vec<String> = pb.tail_buf.iter().skip(from).cloned().collect();
-                (pb.persisted, lines)
+                (pb.persisted, lines, pb.last_ts)
             }
             _ => return Ok(()),
         };
 
-        write_batch(&mut self.conn, panel, start, &lines)?;
+        // (revisão) `ts` MONOTÔNICO por painel: o relógio de parede pode recuar
+        // (NTP/ajuste manual); um lote novo nunca carimba ts menor que o anterior —
+        // assim o conjunto expirado é sempre um PREFIXO de idx e `expired_before`
+        // nunca mente ("dado fantasma" invertido do critério B-d).
+        let ts = (self.clock)().max(ts_floor);
+        write_batch(&mut self.conn, panel, start, &lines, ts)?;
         if let Some(pb) = self.panels.get_mut(panel) {
             pb.persisted += lines.len() as u64;
+            pb.last_ts = ts;
         }
         Ok(())
     }
@@ -344,13 +489,161 @@ impl ScrollbackStore {
     pub fn cap(&self) -> usize {
         self.cfg.cap
     }
+
+    // ───────────────────── F1-5-6: idle-drain + métricas ─────────────────────
+
+    /// F1-5-6: linhas no write-behind (ainda NÃO duráveis) do painel — a janela de
+    /// exposição a um crash duro neste instante.
+    #[must_use]
+    pub fn pending_lines(&self, panel: &str) -> u64 {
+        self.panels
+            .get(panel)
+            .map_or(0, |pb| pb.total - pb.persisted)
+    }
+
+    /// F1-5-6: soma do write-behind pendente de TODOS os painéis.
+    #[must_use]
+    pub fn pending_total(&self) -> u64 {
+        self.panels.values().map(|pb| pb.total - pb.persisted).sum()
+    }
+
+    /// F1-5-6: métricas do drain de durabilidade (idle + sinal).
+    #[must_use]
+    pub fn drain_stats(&self) -> DrainStats {
+        self.stats
+    }
+
+    /// F1-5-6: drena o write-behind dos painéis OCIOSOS — sem `push_line` há pelo menos
+    /// `idle_for` E com pendência. Sob output torrencial o `last_push` se renova a cada
+    /// linha e o drain NUNCA dispara (não é flush-por-linha disfarçado — critério d).
+    /// Devolve o nº de linhas persistidas nesta passada.
+    pub fn drain_idle(&mut self, idle_for: Duration) -> Result<u64, ScrollbackError> {
+        let now = Instant::now();
+        let idle: Vec<(String, u64)> = self
+            .panels
+            .iter()
+            .filter_map(|(name, pb)| {
+                let pending = pb.total - pb.persisted;
+                let ocioso = pb
+                    .last_push
+                    .is_some_and(|t| now.duration_since(t) >= idle_for);
+                (pending > 0 && ocioso).then(|| (name.clone(), pending))
+            })
+            .collect();
+        let mut drained = 0u64;
+        for (panel, pending) in idle {
+            self.flush(&panel)?;
+            self.stats.idle_drains += 1;
+            self.stats.lines += pending;
+            self.stats.last_pending = pending;
+            drained += pending;
+        }
+        Ok(drained)
+    }
+
+    /// F1-5-6: `flush_all` do caminho de SINAL — registra a métrica (linhas pendentes no
+    /// momento do flush = a janela que o handler salvou) antes de persistir.
+    pub fn flush_all_for_signal(&mut self) -> Result<(), ScrollbackError> {
+        let pending = self.pending_total();
+        self.flush_all()?;
+        self.stats.signal_flushes += 1;
+        self.stats.lines += pending;
+        self.stats.last_pending = pending;
+        Ok(())
+    }
+
+    // ───────────────────── F1-5-9: retenção configurável ─────────────────────
+
+    /// F1-5-9: piso de expiração do painel — linhas `[0, expired_before)` foram removidas
+    /// pela retenção. É O SINAL para UI/API responderem "histórico expirado" (a leitura
+    /// em si devolve vazio/`None`, nunca erro).
+    #[must_use]
+    pub fn expired_before(&self, panel: &str) -> u64 {
+        self.panels.get(panel).map_or(0, |pb| pb.expired_before)
+    }
+
+    /// F1-5-9: roda o job de retenção AGORA: remove do disco linhas com `ts` além de
+    /// `retention_days` (relógio injetável), atualiza os pisos `expired_before` (durável,
+    /// na meta) e evicta do cache em RAM o prefixo expirado — "expirado" some em TODO
+    /// lugar, não só no disco. `retention_days == 0` → desligado (no-op).
+    ///
+    /// A sequência de `idx` NUNCA regride: `next_idx` na meta sobrevive até à expiração
+    /// total do painel (reabertura continua de onde parou). O tamanho do `.db` estabiliza
+    /// por REUSO de páginas livres (freelist) — decisão pelo custo medido: `VACUUM` só
+    /// encolhe o arquivo, não muda a propriedade anti-crescimento, e custa O(db).
+    pub fn run_retention(&mut self) -> Result<RetentionReport, ScrollbackError> {
+        let now = (self.clock)();
+        self.last_retention_ms = now;
+        if self.cfg.retention_days == 0 {
+            return Ok(RetentionReport {
+                deleted: 0,
+                cutoff_ms: 0,
+            });
+        }
+        let cutoff = now.saturating_sub(u64::from(self.cfg.retention_days) * DAY_MS);
+        let deleted = self.conn.execute(
+            "DELETE FROM scrollback WHERE ts IS NOT NULL AND ts < ?1",
+            params![cutoff as i64],
+        )? as u64;
+        if deleted > 0 {
+            // Piso durável por painel: o MIN(idx) sobrevivente — ou `next_idx` quando o
+            // painel expirou INTEIRO (max(x,y) escalar do SQLite preserva pisos antigos).
+            self.conn.execute_batch(
+                "UPDATE scrollback_meta SET expired_before = MAX(expired_before,
+                    COALESCE((SELECT MIN(idx) FROM scrollback
+                              WHERE scrollback.panel = scrollback_meta.panel), next_idx));",
+            )?;
+            // Re-deriva os pisos em memória e evicta do cache o prefixo expirado (só
+            // linhas JÁ persistidas — o invariante do write-behind segue intacto).
+            let floors: Vec<(String, u64)> = {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT panel, expired_before FROM scrollback_meta")?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let (panel, floor) = row?;
+                    out.push((panel, floor.max(0) as u64));
+                }
+                out
+            };
+            for (panel, floor) in floors {
+                if let Some(pb) = self.panels.get_mut(&panel) {
+                    pb.expired_before = floor;
+                    while pb.tail_start() < floor && pb.tail_start() < pb.persisted {
+                        pb.tail_buf.pop_front();
+                    }
+                }
+            }
+        }
+        Ok(RetentionReport {
+            deleted,
+            cutoff_ms: cutoff,
+        })
+    }
+
+    /// F1-5-9: o gatilho DIÁRIO do job (chamado a cada tick do idle-drain — thread única,
+    /// decisão da story): roda a retenção se passou ≥1 dia do relógio injetável desde a
+    /// última passada. No boot (`last_retention_ms == 0`) roda na primeira oportunidade.
+    pub fn maybe_run_retention(&mut self) -> Result<Option<RetentionReport>, ScrollbackError> {
+        if self.cfg.retention_days == 0 {
+            return Ok(None);
+        }
+        let now = (self.clock)();
+        if now.saturating_sub(self.last_retention_ms) >= DAY_MS || self.last_retention_ms == 0 {
+            return Ok(Some(self.run_retention()?));
+        }
+        Ok(None)
+    }
 }
 
 impl Drop for ScrollbackStore {
     fn drop(&mut self) {
         // Close gracioso: persiste o write-behind pendente (invariante #6 — estado salvo). Em
         // crash duro (kill -9) perde-se no máximo o último lote não-flushado de output (cache de
-        // terminal, não estado de domínio — este vive no event log).
+        // terminal, não estado de domínio — este vive no event log). Com o `FlushGuard` ativo
+        // (F1-5-6), a janela real encolhe para ~`idle_for` (1-2s) de output + sinais cobertos.
         let _ = self.flush_all();
     }
 }
@@ -358,22 +651,45 @@ impl Drop for ScrollbackStore {
 // ───────────────────────────── helpers ─────────────────────────────
 
 /// Grava `lines` (índices `start..start+len`) do `panel` em UMA transação (write-behind durável).
+/// F1-5-9: o lote inteiro carimba o MESMO `ts` (decisão da story: por lote, não por linha) e a
+/// META durável (`next_idx`) avança NA MESMA transação — a sequência de `idx` sobrevive até à
+/// expiração TOTAL do painel (o `expired_before` existente é preservado no upsert).
 fn write_batch(
     conn: &mut Connection,
     panel: &str,
     start: u64,
     lines: &[String],
+    ts_ms: u64,
 ) -> Result<(), ScrollbackError> {
     let tx = conn.transaction()?;
     {
-        let mut stmt =
-            tx.prepare("INSERT OR REPLACE INTO scrollback (panel, idx, text) VALUES (?1, ?2, ?3)")?;
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO scrollback (panel, idx, text, ts) VALUES (?1, ?2, ?3, ?4)",
+        )?;
         for (i, line) in lines.iter().enumerate() {
-            stmt.execute(params![panel, (start + i as u64) as i64, line])?;
+            stmt.execute(params![
+                panel,
+                (start + i as u64) as i64,
+                line,
+                ts_ms as i64
+            ])?;
         }
+        tx.execute(
+            "INSERT INTO scrollback_meta (panel, next_idx, expired_before) VALUES (?1, ?2, 0)
+             ON CONFLICT(panel) DO UPDATE SET next_idx = excluded.next_idx",
+            params![panel, (start + lines.len() as u64) as i64],
+        )?;
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Epoch ms do relógio de sistema (o default do `clock` injetável).
+fn system_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `true` se o erro do rusqlite é `SQLITE_BUSY` (disputa de lock transitória).
@@ -431,6 +747,215 @@ pub fn peak_rss_bytes() -> Option<u64> {
     None
 }
 
+// ───────────────────── F1-5-6: FlushGuard (job ÚNICO de durabilidade) ─────────────────────
+
+/// F1-5-6: o último sinal fatal recebido e ainda não tratado (0 = nenhum). O handler SÓ
+/// grava este atômico — único trabalho async-signal-safe possível ali (flush toca SQLite
+/// e Mutex, proibidos em handler); a thread do guard observa e faz o resto.
+#[cfg(unix)]
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+/// Handler instalado para `SIGTERM`/`SIGINT`/`SIGHUP`: grava o nº do sinal e retorna.
+/// O processo NÃO morre aqui — o guard drena o write-behind e re-emite o sinal com a
+/// disposição default (o pai vê a morte pelo sinal correto).
+#[cfg(unix)]
+extern "C" fn flush_signal_handler(sig: libc::c_int) {
+    PENDING_SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// Instala o handler de flush para os três sinais de término "educado".
+#[cfg(unix)]
+/// (revisão) Os três sinais de término "educado" e o bit de cada um na máscara de
+/// instalados (para o último Drop restaurar SÓ o que foi instalado).
+#[cfg(unix)]
+const FLUSH_SIGNALS: [(libc::c_int, u32); 3] = [
+    (libc::SIGTERM, 0b001),
+    (libc::SIGINT, 0b010),
+    (libc::SIGHUP, 0b100),
+];
+
+/// (revisão) Guards vivos que pediram sinais: o ÚLTIMO Drop restaura a disposição
+/// default — sem isso, um guard dropado deixaria o processo "imatável" (o handler
+/// gravaria a flag e ninguém re-emitiria o sinal).
+#[cfg(unix)]
+static SIGNAL_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// (revisão) Bitmask dos sinais cujo handler FOI instalado de fato (`SIG_IGN` herdado
+/// é respeitado — convenção POSIX de `nohup`/background-shell: o bit fica 0).
+#[cfg(unix)]
+static INSTALLED_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(unix)]
+fn install_flush_signal_handlers() {
+    // SAFETY: `signal(2)` com um handler `extern "C"` que só faz um store atômico
+    // (async-signal-safe). O cast fn→ptr→sighandler_t é o contrato da API do libc.
+    // A disposição ANTERIOR é consultada: `SIG_IGN` herdado (nohup, shell sem
+    // job-control) é restaurado na hora — quem pediu para ignorar segue ignorando.
+    unsafe {
+        for (sig, bit) in FLUSH_SIGNALS {
+            let prev = libc::signal(sig, flush_signal_handler as *const () as libc::sighandler_t);
+            if prev == libc::SIG_IGN {
+                libc::signal(sig, libc::SIG_IGN);
+            } else {
+                INSTALLED_MASK.fetch_or(bit, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// (revisão) Restaura `SIG_DFL` para os sinais que NÓS instalamos — chamado pelo
+/// Drop do ÚLTIMO guard com sinais (o processo volta ao comportamento default).
+#[cfg(unix)]
+fn uninstall_flush_signal_handlers() {
+    // SAFETY: restaura a disposição default apenas dos sinais marcados na máscara.
+    unsafe {
+        let mask = INSTALLED_MASK.swap(0, Ordering::SeqCst);
+        for (sig, bit) in FLUSH_SIGNALS {
+            if mask & bit != 0 {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
+    }
+}
+
+/// Configuração do [`FlushGuard`].
+#[derive(Debug, Clone, Copy)]
+pub struct FlushGuardConfig {
+    /// Painel sem `push_line` por este intervalo (e com pendência) → `flush(panel)`.
+    /// A story fixa 1-2s; default 1.5s.
+    pub idle_for: Duration,
+    /// Período do tick do job (latência máxima do caminho de sinal e do idle-check).
+    pub tick: Duration,
+    /// Instala os handlers de `SIGTERM`/`SIGINT`/`SIGHUP` → `flush_all` antes de morrer.
+    /// (Unix; no Windows o equivalente — console ctrl handler — é costura pós-bring-up.)
+    pub handle_signals: bool,
+}
+
+impl Default for FlushGuardConfig {
+    fn default() -> Self {
+        Self {
+            idle_for: Duration::from_millis(1_500),
+            tick: Duration::from_millis(250),
+            handle_signals: true,
+        }
+    }
+}
+
+/// F1-5-6: o job ÚNICO de durabilidade do scrollback — **uma** thread para todos os
+/// painéis (nota load-bearing do 13.16: nunca uma thread por painel disputando o Mutex
+/// global do store — a BAIXA-iii do red-team não piora: este é +1 cliente breve por tick,
+/// pela MESMA serialização de sempre). Responsabilidades, no mesmo loop:
+/// 1. idle-drain: painel ocioso 1-2s com write-behind → `flush(panel)`;
+/// 2. sinais fatais: `SIGTERM`/`SIGINT`/`SIGHUP` → `flush_all` + re-raise (zero perda);
+/// 3. F1-5-9: o job DIÁRIO de retenção (sem segunda thread).
+///
+/// Pare-o dropando (sinaliza e dá join). O `Drop` do store continua cobrindo o
+/// encerramento limpo; o guard cobre o que o `Drop` não vê (sinal fatal, ociosidade).
+pub struct FlushGuard {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+    /// O guard pediu handlers de sinal (participa do contador global e da
+    /// restauração no Drop).
+    handle_signals: bool,
+}
+
+impl FlushGuard {
+    /// Sobe a thread do guard sobre o store COMPARTILHADO do workspace (a mesma
+    /// serialização dos reader-threads do `PtyHost`).
+    ///
+    /// **Contrato de sinais (revisão):** os handlers são INSTALADOS só depois de a
+    /// thread subir (falha de spawn não deixa handler órfão) e são processo-globais —
+    /// no máximo **um caminho de sinal por processo**: com 2+ guards (futuro
+    /// multi-workspace, ADR 0010), o guard que observar o sinal drena só o SEU store
+    /// antes do re-raise; quando isso virar caso real, o caminho de sinal precisa de
+    /// um registro de stores (registrado na entrega da fatia). `SIG_IGN` herdado
+    /// (nohup) é respeitado por sinal.
+    ///
+    /// ⚠️ Nunca drope o guard segurando o lock do store NA MESMA thread: o Drop dá
+    /// `join` numa thread que pega esse lock — deadlock garantido.
+    pub fn start(
+        store: Arc<Mutex<ScrollbackStore>>,
+        cfg: FlushGuardConfig,
+    ) -> Result<Self, ScrollbackError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = std::thread::Builder::new()
+            .name("lina-scrollback-flush-guard".into())
+            .spawn({
+                let stop = Arc::clone(&stop);
+                move || guard_loop(&store, cfg, &stop)
+            })?;
+        #[cfg(unix)]
+        if cfg.handle_signals {
+            SIGNAL_GUARDS.fetch_add(1, Ordering::SeqCst);
+            install_flush_signal_handlers();
+        }
+        Ok(Self {
+            stop,
+            join: Some(join),
+            handle_signals: cfg.handle_signals,
+        })
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        // (revisão) O ÚLTIMO guard com sinais restaura a disposição default — um
+        // processo sem guard nunca fica "imatável" (handler gravando flag que ninguém
+        // consome). Na SUBSTITUIÇÃO (start_flush_guard re-chamado), o guard novo já
+        // incrementou o contador antes deste Drop → nada é desinstalado.
+        #[cfg(unix)]
+        if self.handle_signals && SIGNAL_GUARDS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            uninstall_flush_signal_handlers();
+        }
+    }
+}
+
+/// O loop do guard (ver [`FlushGuard`]). Erros de disco são LOGADOS e a próxima passada
+/// re-tenta (o write-behind não avança em erro — nada se perde em silêncio).
+fn guard_loop(store: &Arc<Mutex<ScrollbackStore>>, cfg: FlushGuardConfig, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        #[cfg(unix)]
+        {
+            let sig = PENDING_SIGNAL.swap(0, Ordering::SeqCst);
+            if sig != 0 {
+                {
+                    let mut s = crate::lock(store);
+                    if let Err(e) = s.flush_all_for_signal() {
+                        tracing::error!(%sig, error = %e, "flush de sinal falhou — write-behind pode se perder");
+                    } else {
+                        tracing::info!(
+                            %sig,
+                            pendentes = s.drain_stats().last_pending,
+                            "scrollback drenado pelo handler de sinal"
+                        );
+                    }
+                }
+                // SAFETY: restaura a disposição DEFAULT e re-emite o MESMO sinal — o
+                // processo morre com a semântica correta (o pai vê SIGTERM/SIGINT/SIGHUP).
+                unsafe {
+                    libc::signal(sig, libc::SIG_DFL);
+                    libc::raise(sig);
+                }
+                return; // inalcançável: a disposição default dos 3 sinais termina o processo
+            }
+        }
+        {
+            let mut s = crate::lock(store);
+            if let Err(e) = s.drain_idle(cfg.idle_for) {
+                tracing::warn!(error = %e, "idle-drain falhou; re-tenta no próximo tick");
+            }
+            if let Err(e) = s.maybe_run_retention() {
+                tracing::warn!(error = %e, "job de retenção falhou; re-tenta no próximo tick");
+            }
+        }
+        std::thread::sleep(cfg.tick);
+    }
+}
+
 // ───────────────────────────────────── testes ─────────────────────────────────────
 
 #[cfg(test)]
@@ -465,6 +990,7 @@ mod tests {
             ScrollbackConfig {
                 cap: 100,
                 flush_batch: 8,
+                retention_days: 30,
             },
         )
         .expect("open");
@@ -489,6 +1015,7 @@ mod tests {
             ScrollbackConfig {
                 cap: 4,
                 flush_batch: 2,
+                retention_days: 30,
             },
         )
         .expect("open");
@@ -528,6 +1055,7 @@ mod tests {
         let cfg = ScrollbackConfig {
             cap: 4,
             flush_batch: 4,
+            retention_days: 30,
         };
         {
             let mut s = ScrollbackStore::open(tmp.path(), cfg).expect("open");
@@ -559,6 +1087,7 @@ mod tests {
             ScrollbackConfig {
                 cap: 2,
                 flush_batch: 2,
+                retention_days: 30,
             },
         )
         .expect("open");
@@ -584,7 +1113,11 @@ mod tests {
         let tmp = TempDir::new("ram");
         let cap = 10_000usize;
         let flush_batch = 4_096usize;
-        let cfg = ScrollbackConfig { cap, flush_batch };
+        let cfg = ScrollbackConfig {
+            cap,
+            flush_batch,
+            retention_days: 30,
+        };
         let mut s = ScrollbackStore::open(tmp.path(), cfg).expect("open");
         let p = "painel-firehose";
 

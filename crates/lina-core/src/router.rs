@@ -3119,6 +3119,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ───────── F1-3-4 pendência (item 8 do conselho F1-3): anti-race do claim, EXERCITADO ─────────
+
+    /// **Anti-race do claim pelo FUNIL REAL dos workers** (pendência do gate F1-3, item 8):
+    /// dois nós com leitura VELHA do plano (ambos viram `T1` livre) depositam `plan.claim`
+    /// do MESMO item nas suas outboxes ANTES de qualquer processamento — a janela de race
+    /// genuína do `lina plan claim`. O `pump` drena os dois na mesma rodada. O mecanismo
+    /// provado: a validação acontece na APLICAÇÃO (`try_claim` contra a projeção ATUAL do
+    /// log), nunca na leitura — exatamente UM vence, o perdedor recebe rejeição estruturada
+    /// nomeando o item, o `plan.md` fica com UM dono e o REPLAY do log reconstrói estado
+    /// idêntico (inv#4 — zero corrupção). Auditável no log: o `PlanClaimed` do vencedor
+    /// (o conflito em si não gera evento — design consagrado no W3-5 (c), teste acima).
+    /// Não-vacuoso: remover a guarda de owner do `try_claim` faz `(applied, rejected)`
+    /// virar `(2, 0)` e duplica `PlanClaimed` — este teste falha (mutação provada na entrega).
+    #[test]
+    fn claim_race_via_mailbox_one_winner_loser_rejected_replay_consistent() {
+        let (mut router, dir, mut ts) = seeded_plan_router("race-claim");
+        let (_rec, deliver) = recorder();
+
+        // Leitura-velha genuína: as DUAS mensagens entram na fila antes do 1º processamento.
+        router
+            .mailbox()
+            .enqueue_as(
+                "@A",
+                &MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1"),
+            )
+            .expect("enqueue claim de @A");
+        router
+            .mailbox()
+            .enqueue_as(
+                "@B",
+                &MailMessage::new("@B", "plan", "plan.claim", "").with_ref("plan:T1"),
+            )
+            .expect("enqueue claim de @B");
+
+        let results = router.pump(&mut ts.store, 1_000, deliver);
+        assert_eq!(results.len(), 2, "o pump drenou os dois claims da janela");
+        let applied = results
+            .iter()
+            .filter(|(_, o)| matches!(o, RouteOutcome::PlanApplied { .. }))
+            .count();
+        let rejected: Vec<&str> = results
+            .iter()
+            .filter_map(|(_, o)| match o {
+                RouteOutcome::PlanRejected(r) => Some(r.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            (applied, rejected.len()),
+            (1, 1),
+            "exatamente UM vence e UM é rejeitado: {results:?}"
+        );
+        assert!(
+            rejected[0].contains("T1"),
+            "a rejeição é estruturada e nomeia o item disputado: {}",
+            rejected[0]
+        );
+
+        // Auditável no log: exatamente 1 `PlanClaimed`; o vencedor é o `by` do evento.
+        let claims: Vec<serde_json::Value> = ts
+            .store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == "PlanClaimed")
+            .map(|r| r.payload)
+            .collect();
+        assert_eq!(claims.len(), 1, "um único PlanClaimed auditável");
+        let winner = claims[0]["by"].as_str().expect("by no payload").to_string();
+
+        // plan.md em disco: o item tem UM dono (o vencedor); o perdedor não aparece.
+        let loser = if winner == "@A" { "@B" } else { "@A" };
+        let live = router.mailbox().read_plan().expect("ler").expect("plan.md");
+        assert!(
+            live.contains(&format!("@owner:{winner} :: status:doing")),
+            "T1 pertence ao vencedor {winner}: {live}"
+        );
+        assert!(
+            !live.contains(&format!("@owner:{loser}")),
+            "o perdedor {loser} não assumiu nada: {live}"
+        );
+
+        // Inv#4: o replay do log reconstrói o MESMO plano — o conflito não sujou o estado.
+        let projected = ts.store.project().expect("project").plan.render();
+        assert_eq!(projected, live, "replay ≡ plan.md em disco");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A posse é STICKY** (complemento da race acima): o perdedor re-tenta DEPOIS de ver a
+    /// derrota (nova mensagem, novo id — não é dedupe) e segue rejeitado; o dono não muda e
+    /// nenhum `PlanClaimed` novo entra no log. A rejeição do conflito não é transiente: não
+    /// existe caminho em que insistência roube o item sem intervenção externa.
+    #[test]
+    fn claim_loser_retry_stays_rejected_and_owner_sticky() {
+        let (mut router, dir, mut ts) = seeded_plan_router("race-sticky");
+        let (_rec, mut deliver) = recorder();
+
+        let first = MailMessage::new("@A", "plan", "plan.claim", "").with_ref("plan:T1");
+        assert!(matches!(
+            router.route_message(&first, &mut ts.store, 1_000, &mut deliver),
+            RouteOutcome::PlanApplied { .. }
+        ));
+
+        // Duas insistências do perdedor (ids novos a cada tentativa) — ambas rejeitadas.
+        for ts_ms in [2_000, 3_000] {
+            let retry = MailMessage::new("@B", "plan", "plan.claim", "").with_ref("plan:T1");
+            assert!(
+                matches!(
+                    router.route_message(&retry, &mut ts.store, ts_ms, &mut deliver),
+                    RouteOutcome::PlanRejected(_)
+                ),
+                "insistência do perdedor em t={ts_ms} segue rejeitada"
+            );
+        }
+
+        let claims = ts
+            .store
+            .events()
+            .expect("events")
+            .into_iter()
+            .filter(|r| r.kind == "PlanClaimed")
+            .count();
+        assert_eq!(claims, 1, "insistência não gera evento de claim");
+        let live = router.mailbox().read_plan().expect("ler").expect("plan.md");
+        assert!(
+            live.contains("@owner:@A :: status:doing"),
+            "o dono original segue intacto: {live}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Aceite W3-5 (d): `check` pelo owner → `done` + evento `plan.check`; `check` por não-owner →
     /// rejeitado (sem mudar o status).
     #[test]
