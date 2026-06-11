@@ -26,6 +26,10 @@ mod cost;
 mod persistence_ui;
 /// F1-4-1 (fiação app): decide qual Espaço o boot abre + auto-inscrição no registry global.
 mod workspace_boot;
+// M8 fatia (i): o boot por-Espaço extraído em construtor reutilizável (`boot_ws_runtime`) —
+// `WsRuntime` (tudo por-Espaço, com dreno próprio) + `SharedInfra` (por-processo). Fundação
+// do switch vivo F1-4-4; com 1 runtime o comportamento é idêntico ao boot inline anterior.
+mod runtime;
 // W4-5: galeria de Focos (T3) — presets que montam o Espaço com time + papéis; gpui-free, testável.
 mod gallery;
 // W4-6: acessibilidade (AccessibleBuffer sem ANSI, live-region "resposta pronta", WCAG, reduce-motion).
@@ -66,22 +70,16 @@ use gpui::{
 };
 use gpui_platform::application;
 
-use lina_core::{build_paste, DomainEvent, EventStore, PtyManager, Supervisor, VtRgb, VtScreen};
+use lina_core::{build_paste, DomainEvent, PtyManager, VtRgb, VtScreen};
 use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 
 use lina_bootstrap::Autonomy;
 
 use bridge::{
-    card_visible, cell_in_selection, encode_pointer, hit_test, load_injection_profile, lock,
-    normalize_sel, quote_dropped_paths, screen_to_cell, scrub_foreign_orchestrator_env,
-    scrub_pty_secret_env, shell_cmd, spawn_pump, A2aTrigger, AgentEngine, ApprovalWiring,
-    AttentionHub, BootstrapWriter, BrokerPump, Camera, CmdFactory, CoreInput, CustodyDesk,
-    CwdPolicy, Desk, GpuiBridgeHost, Grid, MailboxPump, Model, NodeAdmission, NodeManager,
-    PtrAction, SharedModel, CARD_H, CARD_W, CELL_H, CELL_W,
+    card_visible, cell_in_selection, encode_pointer, hit_test, lock, normalize_sel,
+    quote_dropped_paths, screen_to_cell, shell_cmd, A2aTrigger, AgentEngine, AttentionHub, Camera,
+    CwdPolicy, Desk, Grid, NodeAdmission, NodeManager, PtrAction, CARD_H, CARD_W, CELL_H, CELL_W,
 };
-use lina_core::Mailbox;
-// W3-6c (ADR 0004): cofre de segredos (demo: backend em memória `MockStore`).
-use lina_secrets::{MockStore, SecretVault};
 
 /// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
 const FONT_PX: f32 = 13.0;
@@ -3550,328 +3548,69 @@ fn main() {
     } else {
         ws_root
     };
-    let mailbox_dir = ws_root.join(".lina");
-    let dir = mailbox_dir.join("events");
     // F1-2-1: aplica o tema PERSISTIDO (T7 `settings.json`, ao lado do event log) ANTES de abrir
     // qualquer janela — a escolha dark/light + acento sobrevive ao restart, 100% local (inv #2).
+    // (Tema é GLOBAL do processo — aplicado aqui, fora do runtime por-Espaço.)
     {
-        let s = persistence_ui::load_settings(&dir);
+        let s = persistence_ui::load_settings(&ws_root.join(".lina").join("events"));
         theme::apply(s.theme_mode(), &s.accent);
     }
-    // F1-0-2 critério 5: o perfil de injeção REAL (claude-code.toml — ready_timeout/busy_markers
-    // calibrados) substitui o demo hardcoded; fallback-com-warning no loader (nunca panic). O
-    // caminho carregado + os campos do fix saem AQUI no log de boot, p/ inspeção.
-    let injection_profile = load_injection_profile(Some(&mailbox_dir));
-    // A2A UNIVERSAL: registry de TODOS os CLI Profiles (claude-code, codex, gemini, antigravity —
-    // semeados write-if-absent no dir do usuário). A entrega A2A resolve o profile do ALVO por aqui
-    // (pelo `profile_id` do nó, projetado de `CliProfileSet`), com `injection_profile` como FALLBACK.
-    // Sem isto, a entrega usava o prompt_ready/busy do Claude p/ TODO alvo → a TUI do Codex (glifo
-    // `›`) nunca casava → timeout (msg não injetada). Compartilhado (Arc) com o ⚡ demo e o pump.
-    let profile_registry = Arc::new(agent_modal::load_profiles(&agent_modal::profiles_dir(
-        &mailbox_dir,
-    )));
+
+    // M8 fatia (i) · infra POR-PROCESSO (`SharedInfra`): o `PtyManager` (processos do SO), a
+    // fábrica de shell e as dimensões do grid — os Espaços compartilham ESTES handles; todo o
+    // resto nasce POR-Espaço dentro do `boot_ws_runtime`.
+    let pty = Arc::new(Mutex::new(PtyManager::new()));
+    // Fábrica de nós: todo terminal é um SHELL INTERATIVO REAL e COMPLETO — idêntico em
+    // capacidade (o B aceita teclado e roda claude/vim igual ao A). Add/remove em runtime
+    // reusa EXATAMENTE esta fábrica via NodeManager.
+    let shared = runtime::SharedInfra {
+        pty: Arc::clone(&pty),
+        cmd_factory: Arc::new(shell_cmd),
+        cols,
+        rows,
+    };
+
+    // M8 fatia (i): TODO o boot por-Espaço (passos [2]-[17] do mapa) vive no `boot_ws_runtime`;
+    // o main só resolve QUAL Espaço abre (acima) e opera demo/load-gen/janela SOBRE o runtime.
+    // `Err` = o que antes encerrava o processo dentro do boot (inv#6: mensagem clara, nunca
+    // backtrace) — quem encerra é o main, único dono dessa decisão.
+    let rt = match runtime::boot_ws_runtime(ws_root, &shared, demo) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("lina-gpui: {e} — encerrando.");
+            std::process::exit(1);
+        }
+    };
+    let runtime::WsRuntime {
+        ws_root,
+        mailbox_dir,
+        store,
+        sup,
+        nodes,
+        model,
+        grids,
+        input,
+        attention,
+        desk,
+        brake,
+        autonomy: _autonomy,
+        injection_profile,
+        profile_registry,
+        hooks: _hooks,
+        dash,
+        _pump: mut pump,
+        _mailbox_pump,
+        _broker_pump,
+    } = rt;
+    let dir = mailbox_dir.join("events");
     // Estado PERSISTENTE do onboarding (progresso + log próprio), co-locado no workspace (subdir, não
     // colide com `.lina/events` do canvas). Sobrevive ao reboot em produção → o onboarding só aparece
     // na 1ª execução de verdade.
     let onboarding_dir = ws_root.join("onboarding");
-    eprintln!(
-        "lina-gpui: workspace em {} ({})",
-        ws_root.display(),
-        if demo {
-            "DEMO/temp"
-        } else {
-            "produção/persistente"
-        }
-    );
-    // inv#6 (app NUNCA quebrar): um `.db` corrompido NÃO panica o boot. Tenta o store persistente; se
-    // falhar, loga ALTO sem destruir o arquivo (recuperação in-UI é W0-6, fora de escopo) e cai num
-    // store temporário só nesta sessão — garante que o app abre. Instalação nova abre limpo, sem cair
-    // aqui. (`.expect` antigo virava backtrace na cara do aluno.)
-    let store = Arc::new(Mutex::new(match EventStore::open(&dir) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "lina-gpui: não abri seus dados em {} ({e}). Eles estão preservados; abrindo um \
-                 espaço temporário só nesta sessão.",
-                dir.display()
-            );
-            let tmp = std::env::temp_dir()
-                .join("lina-space-fallback")
-                .join(".lina")
-                .join("events");
-            match EventStore::open(&tmp) {
-                Ok(s) => s,
-                Err(e2) => {
-                    eprintln!(
-                        "lina-gpui: o store de fallback também falhou em {} ({e2}) — encerrando.",
-                        tmp.display()
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-    }));
-
-    // F1-4-3: foto da geração ANTERIOR — capturada ANTES do fechamento abaixo, então quem
-    // estava vivo no último quit ainda NÃO está `dead` nela (nós `dead` NÃO saem da projeção —
-    // só `NodeRemoved` remove; o `plan_restore` PULA os `dead` de gerações mais antigas e o
-    // executor aposenta cada re-erguido com `NodeRemoved`). É a fonte do plano de restore
-    // (posições/nomes/papéis/cwd/CLI do log — inv#4); o opt-out por Espaço decide o uso adiante.
-    let restore_proj = lock(&store).project().ok();
-
-    // F1-0-8 (costura coordenada — mecanismo do Dev 02): fecha a GERAÇÃO ANTERIOR no log logo
-    // após abrir o store e ANTES de registrar os nós da sessão nova — sem esta linha o mecanismo
-    // existe mas não roda no caminho real (mesmo padrão da fiação W5-2). Nós da sessão passada
-    // sem morte registrada viram `dead` póstumo (replay = roster vivo, 0 fantasmas — gate F1-0
-    // (e)). Best-effort: falha loga ALTO e o boot segue (inv#6 — o app nunca morre no boot).
-    match lina_core::lifecycle::close_previous_generation(&mut lock(&store)) {
-        Ok(ghosts) => eprintln!(
-            "lina-gpui: F1-0-8 — geração anterior fechada no boot: {} fantasma(s)",
-            ghosts.len()
-        ),
-        Err(e) => eprintln!(
-            "lina-gpui: F1-0-8 — não fechei a geração anterior ({e}); seguindo (replay pode mostrar fantasmas)"
-        ),
-    }
-
-    // F1-4-1 (fiação app): auto-inscrição do Espaço aberto no ponteiro global + carimbo de
-    // foco — é assim que o registry se popula (a lista do switcher M8 nasce daqui) e que o
-    // PRÓXIMO boot sabe qual Espaço abrir. Best-effort: falha loga e o boot segue (inv#6).
-    if !demo {
-        match lina_core::default_registry_path()
-            .map(lina_core::WorkspaceRegistry::load)
-            .transpose()
-        {
-            Ok(Some(mut reg)) => {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                match workspace_boot::register_boot_workspace(
-                    &mut lock(&store),
-                    &ws_root,
-                    &mut reg,
-                    now_ms,
-                ) {
-                    Ok(id) => eprintln!(
-                        "lina-gpui: [WS] Espaço '{id}' inscrito e focado no ponteiro global"
-                    ),
-                    Err(e) => eprintln!(
-                        "lina-gpui: [WS] auto-inscrição no ponteiro global falhou ({e}); seguindo"
-                    ),
-                }
-            }
-            Ok(None) => {
-                eprintln!("lina-gpui: [WS] sem HOME/USERPROFILE — boot segue sem o ponteiro global")
-            }
-            Err(e) => {
-                eprintln!("lina-gpui: [WS] ponteiro global ilegível ({e}); seguindo sem ele");
-            }
-        }
-    }
-
-    let pty = Arc::new(Mutex::new(PtyManager::new()));
-    let sup = Arc::new(Supervisor::new());
-    let bus_rx = sup.subscribe();
-    let (delta_tx, delta_rx) = std::sync::mpsc::channel();
-
-    // Fábrica de nós: todo terminal é um SHELL INTERATIVO REAL e COMPLETO — idêntico em
-    // capacidade (o B aceita teclado e roda claude/vim igual ao A). Add/remove em runtime
-    // reusa EXATAMENTE esta fábrica via NodeManager.
-    let cmd_factory: CmdFactory = Arc::new(shell_cmd);
-
-    // W3-2 · BOOTSTRAP turno-0: o app escreve `<cwd>/CLAUDE.md` (8 blocos) por terminal e o
-    // reescreve a cada mudança de roster. `ws_root`/`mailbox_dir` já foram definidos acima (o event
-    // store do app mora em `<ws_root>/.lina/events`, o MESMO log do bin); vault/autonomia/bin `lina`
-    // configuráveis por env (LINA_VAULT/LINA_BIN). O bootstrap é best-effort (não trava o app).
-    // W3-4: a mailbox compartilhada do workspace (`<ws_root>/.lina`). `LINA_HOME` aponta os
-    // terminais (que herdam o env) para cá → `lina ask`/`handshake` depositam no MESMO outbox que
-    // o supervisor (o `MailboxPump`) observa, e o bin `lina do/guard` apenda no MESMO event log.
-    if let Err(e) = std::fs::create_dir_all(&mailbox_dir) {
-        // Não fatal (o resto do app — canvas, terminais — funciona sem A2A), mas VISÍVEL: sem a
-        // mailbox, `lina ask` não terá para onde escrever.
-        eprintln!(
-            "lina-gpui: não criou a mailbox {} (A2A indisponível): {e}",
-            mailbox_dir.display()
-        );
-    }
-    std::env::set_var("LINA_HOME", &mailbox_dir);
-    // O segundo cérebro (onboarding) grava o vault escolhido em `.lina/vault.json`. Se houver um
-    // `primary`, ele tem prioridade — reflete a escolha REAL do usuário e faz `{{vault_writable_paths}}`/
-    // `{{vault_tino_path}}` apontarem pro vault linkado na próxima reescrita do bootstrap. Senão, cai no
-    // override de dev `LINA_VAULT` e, por fim, no default `<ws_root>/vault`.
-    let vault_path = obsidian::read_primary_vault(&mailbox_dir)
-        .or_else(|| std::env::var("LINA_VAULT").ok())
-        .unwrap_or_else(|| ws_root.join("vault").display().to_string());
-    // Self-heal do segundo cérebro: se o vault está conectado (vault.json) mas o índice (PageIndex)
-    // sumiu — a thread fire-and-forget do onboarding morreu, ou a 1ª execução foi negada no TCC de
-    // Documentos — regenera-o agora, no contexto do app (já com o grant de Documentos do bundle).
-    // No-op quando os índices já existem. Sem isso, o usuário não-técnico fica "conectado mas vazio".
-    obsidian::heal_missing_indices(&mailbox_dir);
-    let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
-    // SEAM-1 (M2): FONTE ÚNICA da autonomia do workspace — passada AO MESMO TEMPO ao `BootstrapWriter`
-    // (doutrina do bin) E ao `RouterConfig` da `MailboxPump` (enforcement do gate). `LINA_AUTONOMY`
-    // (default `assistido`, sem regressão); origem futura = `bootstrap.json`/workspace.
-    // FIX-3: a MESMA função alimenta a UI (`WorkspaceView.ws_autonomy` — badge do card + prefill
-    // do modal), para a superfície nunca divergir do enforcement.
-    let autonomy = workspace_autonomy();
-    let mut bootstrap = BootstrapWriter::new(ws_root.clone(), vault_path, autonomy, lina_bin)
-        .map_err(|e| eprintln!("lina-gpui: bootstrap desativado: {e}"))
-        .ok();
-
-    // ── F1-1-3/F1-1-5 (wiring) · HOOKS + TIMELINE + SESSÕES — antes de qualquer write/spawn. ──
-    // Listener 1x no boot; cada terminal ganha token no settings SE o perfil declarar a
-    // capability (TOML — inv#3). Degradação limpa: sem capability/bind → app como antes.
-    let dash =
-        dashboard::DashWiring::new(injection_profile.id.clone(), ws_root.display().to_string());
-    if injection_profile.capabilities.has("hooks") {
-        if let Some(hooks) = bridge::HooksShared::start() {
-            if let Some(bw) = bootstrap.as_mut() {
-                bw.set_hooks(Arc::clone(&hooks));
-            }
-            let tl = Arc::clone(&dash.timeline);
-            hooks.spawn_drain(move |ev| {
-                // Sonda [DASH]: latência de INGESTÃO (chegada no listener → timeline).
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                eprintln!(
-                    "lina-gpui: [DASH] hook node={} kind={:?} tool={:?} lat_ingest_ms={}",
-                    ev.node_id,
-                    ev.kind,
-                    ev.tool_name,
-                    now.saturating_sub(ev.ts)
-                );
-                if let Ok(mut t) = tl.lock() {
-                    t.note(ev);
-                }
-            });
-        }
-    } else {
-        eprintln!(
-            "lina-gpui: [DASH] perfil '{}' sem capability hooks — settings sem hooks (como antes)",
-            injection_profile.id
-        );
-    }
-    // Sessões (camada 3 — custo~): poll do SessionWatch em thread própria (gpui-free);
-    // o pattern vem do TOML do perfil (F1-1-1); HOME real do usuário (não é teste).
-    if let Some(pattern) = injection_profile.session_dir_pattern.clone() {
-        if let Some(home) = std::env::var_os("HOME") {
-            let out = Arc::clone(&dash.sessions);
-            let cli_id = injection_profile.id.clone();
-            thread::spawn(move || {
-                let mut watch = lina_session_watch::SessionWatch::with_home(PathBuf::from(home));
-                watch.add_source(cli_id, pattern);
-                let mut known: std::collections::BTreeSet<(String, String)> =
-                    std::collections::BTreeSet::new();
-                loop {
-                    if let Ok(o) = watch.poll_once() {
-                        if !o.sessions_updated.is_empty() {
-                            known.extend(o.sessions_updated);
-                            let snapshot: Vec<_> = known
-                                .iter()
-                                .filter_map(|(c, s)| watch.scanner().session(c, s))
-                                .collect();
-                            if let Ok(mut dst) = out.lock() {
-                                *dst = snapshot;
-                            }
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(500));
-                }
-            });
-        }
-    }
-
-    // ── W3-6c (ADR 0004) · COFRE DE SEGREDO + ENV LIMPO (fios 1 e 3) — ANTES de spawnar qualquer PTY.
-    // Cofre do workspace. DEMO: backend em memória (`MockStore`) p/ não tocar o keyring do SO no
-    // teatro do fundador; PRODUÇÃO trocaria por `SecretVault::new("lina-space/<ws>")` (KeyringStore).
-    // Semente OPCIONAL via `LINA_DEPLOY_TOKEN`: com ela, a custódia EXECUTA (segredo do cofre); sem
-    // ela, o cofre fica vazio e a custódia BLOQUEIA (DeniedNoSecret) — ambos provam a blindagem.
-    let custody_vault = SecretVault::with_store("lina-space/walking-skeleton", MockStore::new());
-    if let Ok(token) = std::env::var("LINA_DEPLOY_TOKEN") {
-        match custody_vault.set("deploy", "prod", &token) {
-            Ok(()) => {
-                eprintln!("lina-gpui: cofre semeado (deploy/prod) a partir de LINA_DEPLOY_TOKEN")
-            }
-            Err(e) => eprintln!("lina-gpui: nao semeou o cofre (deploy/prod): {e}"),
-        }
-    }
-    // Fio 3: os PTYs filhos herdam o env do app no spawn → remover as vars de segredo do PRÓPRIO env
-    // AQUI (antes de qualquer `wire_terminal`) garante que nenhum terminal do agente nasça com o token.
-    let scrubbed = scrub_pty_secret_env();
-    if !scrubbed.is_empty() {
-        eprintln!("lina-gpui: env limpo — vars de segredo removidas do env do app (PTYs nao as herdam): {scrubbed:?}");
-    }
-    // R2c (bug de tela 21:40): se o Lina.app foi lançado de um terminal hospedado no
-    // Maestri, `MAESTRI_*` vaza no env → a skill GLOBAL do Maestri vira "funcional" p/ o
-    // agente do ⌘N (maestri list exit 127; "$MAESTRI_CLI" exit 126 — a var EXISTE). Scrub
-    // ANTES de qualquer `wire_terminal`: nenhum agente nasce enxergando plumbing de fora
-    // do Espaço (a comunicação entre terminais é EXCLUSIVA pelos verbos `lina`).
-    let foreign = scrub_foreign_orchestrator_env();
-    if !foreign.is_empty() {
-        eprintln!(
-            "lina-gpui: env limpo — vars de orquestrador estrangeiro removidas (PTYs nao as herdam; comunicacao so via `lina`): {foreign:?}"
-        );
-    }
-    // Mesa de custódia compartilhada: a UI confirma (⌘⏎); a BrokerPump executa COM o segredo do cofre.
-    let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
-    // W4-3: FREIO compartilhado — a UI pede pausa/retoma; a MailboxPump aplica no Router e espelha.
-    let brake: wiring::Brake = wiring::new_brake();
-
     // ── SEED dos nós iniciais. PRODUÇÃO (default do aluno): NENHUM. O workspace nasce limpo e o aluno
     // cria o 1º agente com ⌘T (guiado pelo empty-state) — sem "Terminal A/B fantasma" poluindo o log.
     // DEMO (`LINA_DEMO=1`): semeia Terminal A + B (shells reais, idênticos) e arma o botão ⚡ A2A A→B.
     // Em QUALQUER caso, um spawn que falhe DEGRADA (loga e segue) — nunca panica (inv#6, antes `.expect`).
-    let model: Model = Arc::new(Mutex::new(SharedModel::default()));
-    let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
-
-    // Rodada 360 (ADR 0022): o NodeManager — dono dos nós em runtime E o FUNIL ÚNICO de
-    // admissão — nasce ANTES do seed do demo, para as TRÊS portas (⌘T, ⌘N e o seed) entrarem
-    // pelo MESMO `admit_node`. `seq_start = 0`: o demo admite A/B pelo funil (seq 0/1 → keys
-    // t0/t1); em produção o 1º ⌘T do aluno nasce como "Terminal A".
-    // SEAM-1: `Arc` — compartilhado com a `MailboxPump`/`AttentionHub` (SpawnApproved/banner criam
-    // pelo MESMO funil `admit_node`, ADR 0022). O gpui View detém um clone; as pumps, outro.
-    let nodes = Arc::new(NodeManager::new(
-        Arc::clone(&pty),
-        Arc::clone(&sup),
-        Arc::clone(&store),
-        Arc::clone(&model),
-        Arc::clone(&grids),
-        BTreeMap::new(),
-        delta_tx,
-        cols,
-        rows,
-        0,
-        cmd_factory,
-        bootstrap,
-        mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
-    ));
-
-    // F1-4-3 · RESTORE do quit limpo: reabrir o app = o Espaço volta vivo (posições/nomes/
-    // papéis do log + scrollback re-hidratado + resume do CLI quando o TOML declara + badge
-    // honesto). Opt-out por Espaço (`restore_on_open` no settings.json — «Abrir este Espaço
-    // sem religar os Agentes») e por env (`LINA_NO_RESTORE=1`, escape de emergência). Fora do
-    // demo (o demo semeia A/B fixos) e best-effort: falha degrada com log, nunca trava o boot.
-    if !demo
-        && persistence_ui::load_settings(&dir).restore_on_open
-        && !std::env::var("LINA_NO_RESTORE").is_ok_and(|v| v.trim() == "1")
-    {
-        if let Some(proj) = &restore_proj {
-            let plans = bridge::plan_restore(proj, &profile_registry, nodes.scrollback().as_ref());
-            if plans.is_empty() {
-                eprintln!("lina-gpui: [RESTORE] nada a re-erguer (Espaço novo ou sem terminais)");
-            } else {
-                let up = nodes.restore_terminals(&plans);
-                eprintln!(
-                    "lina-gpui: [RESTORE] {up}/{} terminal(is) re-erguidos do quit limpo",
-                    plans.len()
-                );
-            }
-        }
-    }
-
     let (focused, a2a): (NodeId, Option<Arc<A2aTrigger>>) = if demo {
         let _ = lock(&store).append(&DomainEvent::WorkspaceCreated {
             name: "walking-skeleton".into(),
@@ -3990,117 +3729,20 @@ fn main() {
         );
     }
 
+    // M8 fatia (i): o snapshot fica AQUI (após demo/load-gen, como sempre) para o contador de
+    // boot incluir os eventos do seed. Como as pumps já vivem (sobem no boot do runtime), a
+    // leitura deixou de ser determinística — um tick adiantado pode somar eventos de fundo;
+    // inofensivo (display do boot; o pump re-sincroniza o contador em ≤1 tick).
     let event_count = lock(&store).event_count().unwrap_or(0);
     lock(&model).event_count = event_count;
-
-    // W3-7c · TETO DE CUSTO REAL. `LINA_TOKEN_BUDGET_DAY` (tokens/dia ESTIMADOS ≈ bytes/4 de output;
-    // ver cost.rs) ARMA o teto; 0/ausente = desligado (default, sem regressão). A bomba mede o output
-    // dos PTYs e apenda TokenUsageReported no MESMO store (`<ws_root>/.lina/events`, o log
-    // compartilhado com o bin `lina`) que o CostLedger soma.
-    let token_budget_day: u64 = std::env::var("LINA_TOKEN_BUDGET_DAY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let idle_ms = injection_profile.idle_ms.unwrap_or(200);
-    let bridge = GpuiBridgeHost::new(Arc::clone(&model));
-    // F1-1-7: a FILA DE ATENÇÃO unificada — a projeção `AttentionQueue` do core cabeada
-    // ao MESMO event log (replay no boot reconstrói pendência pós-crash — critério 5) e
-    // à mesa de custódia. NENHUM byte vai ao PTY por este caminho (ADR 0021 §6).
-    // Criada ANTES do pump (R2b): a varredura viva da detecção usa a projeção de mute
-    // do hub (mesma fonte do log — defesa em profundidade nas duas pontas).
-    // F1-1-8 / ADR 0024: o hub ganha a porta de escrita validada (gesto humano + auto-deny do
-    // SLA digitam por aqui). `sup`/`grids` são os MESMOS do app (Arc compartilhado); as
-    // `approval_keys` vêm do CLI Profile de injeção (lido ANTES do move para a MailboxPump).
-    let attention = Arc::new(AttentionHub::new(
-        Arc::clone(&store),
-        Arc::clone(&desk),
-        Arc::clone(&model),
-        ApprovalWiring::new(
-            Arc::clone(&sup),
-            Arc::clone(&grids),
-            injection_profile.approval_keys.clone(),
-        ),
-        // SEAM-1: aprovar um banner de spawn na fila cria o terminal pelo MESMO funil (admit_node).
-        Arc::clone(&nodes),
-    ));
-    // R2b: `LINA_ATTENTION_DEMO` setado = teatro determinístico do fundador — o loop
-    // VIVO de detecção desliga (demo OU real, nunca os dois; sem duplicar pedidos).
-    let demo_kind = std::env::var("LINA_ATTENTION_DEMO")
-        .ok()
-        .map(|v| v.trim().to_lowercase())
-        .filter(|k| !k.is_empty() && k != "0");
-    let live_detection = demo_kind.is_none();
-    if !live_detection {
-        eprintln!("lina-gpui: [ATT] modo DEMO — detecção viva de grid DESLIGADA nesta sessão");
-    }
-    // inv#6/no-panic: sem a ponte core→UI o app não renderiza terminais — encerra com mensagem clara
-    // em vez de backtrace. (Falha só em condição catastrófica de sistema; instalação nova não cai aqui.)
-    // FIX DE GATE F1-0: o pump precisa do Supervisor p/ devolver o nó a Idle no fim-de-resposta
-    // (transição event-sourced — destrava a retenção F1-0-4 na 2ª mensagem ao mesmo alvo).
-    // R2b: + grids/hub/flag — a metade-app da detecção viva roda no tick do pump.
-    let mut pump = match spawn_pump(
-        bridge,
-        delta_rx,
-        bus_rx,
-        Arc::clone(&store),
-        idle_ms,
-        Arc::clone(&sup),
-        Arc::clone(&grids),
-        Arc::clone(&attention),
-        live_detection,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("lina-gpui: não subi a ponte core→UI ({e}); o app não consegue renderizar — encerrando.");
-            std::process::exit(1);
-        }
-    };
-
-    let input: Arc<dyn InputSink> = Arc::new(CoreInput::new(Arc::clone(&sup)));
-
-    // W3-2: garante o CLAUDE.md/estado do roster do boot (vazio em produção — best-effort).
-    // (O NodeManager nasce ANTES do seed, lá em cima — rodada 360/ADR 0022.)
-    nodes.rewrite_bootstrap();
-
-    // W3-4: sobe o SUPERVISOR que observa a mailbox (`<ws_root>/.lina/outbox/`). A partir daqui,
-    // um `lina ask @B "oi"` de qualquer terminal trafega: outbox → guardrails → deliver_a2a → B.
-    // Thread DAEMON (observador de fundo): o app sai via `process::exit`, que encerra a thread —
-    // o handle é mantido só para deixar o ciclo de vida explícito.
-    let _mailbox_pump = MailboxPump::new(
-        Arc::clone(&sup),
-        Arc::clone(&store),
-        Arc::clone(&grids),
-        Mailbox::new(&mailbox_dir),
-        nodes.reinject_queue(), // FIX-A3: fila EM-PROCESSO de re-injeção (sem superfície de filesystem)
-        Arc::clone(&model),
-        Arc::clone(&brake), // W4-3: freio (pausa/retoma a auto-orquestração)
-        token_budget_day,   // W3-7c: arma o teto de custo no Router (0 = desligado)
-        injection_profile,  // F1-0-2: o claude-code.toml real (fallback-com-warning no loader)
-        profile_registry,   // A2A UNIVERSAL: resolve o profile do ALVO (codex/gemini/…) na entrega
-        autonomy, // SEAM-1 (M2): autonomia REAL fiada no RouterConfig (manual bloqueia spawn)
-        Arc::clone(&nodes), // SEAM-1: funil de admissão — SpawnApproved cria o terminal
-    )
-    .spawn();
-
-    // W3-6c (ADR 0004): a BROKER PUMP observa a FILA DE BROKER (`<ws_root>/.lina/broker/`, irmã do
-    // outbox A2A), aplica o gate humano (⌘⏎ na janela) e chama `run_custody` — que obtém o segredo do
-    // cofre e executa. O agente NUNCA tem o token. Thread daemon (encerra com o `process::exit`).
-    let _broker_pump = BrokerPump::new(
-        Mailbox::new(mailbox_dir.join("broker")),
-        Arc::clone(&store),
-        custody_vault,
-        Arc::clone(&desk),
-        Arc::clone(&model),
-        Arc::clone(&sup), // roster vivo: valida que a origem do pedido é um nó REAL (hole 3)
-    )
-    .spawn();
 
     // LINA_ATTENTION_DEMO (roteiro do fundador, idioma de LINA_DEMO/LINA_DASH): semeia
     // UM pedido REAL no log → o toast aparece sem esperar um Claude travado de verdade.
     // `1`|`yn` = permissão y/n (aprovável); `choice` = PERGUNTA de múltipla escolha
     // (R2b — toast "fez uma pergunta", ação primária IR ATÉ O TERMINAL, sem aprovar).
-    // O hub/flag nasceram ANTES do pump (R2b); aqui só a SEMENTE (demo ⇒ live OFF).
-    if let Some(kind) = demo_kind.as_deref() {
+    // O hub/flag nasceram ANTES do pump (R2b); aqui só a SEMENTE (demo ⇒ live OFF) — o
+    // boot do runtime já leu a MESMA env (helper único) p/ desligar a detecção viva.
+    if let Some(kind) = runtime::attention_demo_kind().as_deref() {
         let (prompt_kind, detail) = match kind {
             "choice" => (
                 lina_core::attention::PromptKind::Choice,
