@@ -35,6 +35,10 @@ use lina_core::{
 // A2A UNIVERSAL: o registry de TODOS os CLI Profiles — a entrega resolve o profile do ALVO
 // por aqui (CliProfile vem re-exportado do core; ProfileRegistry é o índice por `id`).
 use lina_cli_profiles::ProfileRegistry;
+// F1-5-2 / F1-4-3: o store durável de scrollback do workspace + o job único de durabilidade.
+// O app é PtyManager-direto (não usa `PtyHost`), então o cabo `append-on-scroll` é replicado
+// em `wire_terminal_capturing` (addendo do Maestro) — a lógica de harvest vive no core (REUSO).
+use lina_core::scrollback::{FlushGuard, FlushGuardConfig, ScrollbackStore};
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
 use lina_secrets::{SecretStore, SecretVault};
@@ -2207,7 +2211,12 @@ pub fn bus_to_host(ev: &BusEvent) -> Option<HostEvent> {
 /// Cabeia um terminal REAL: spawna o PTY no tamanho `cols×rows`, dá o **writer ao
 /// Supervisor** (input + A2A), e sobe a thread leitora que avança o grid e **emite
 /// `GridDelta`** (sinal de "mudou"). Devolve o `NodeId` canônico + o handle do grid.
-#[allow(clippy::too_many_arguments)]
+///
+/// Caminho legado SEM persistência de scrollback (delega a [`wire_terminal_capturing`] com
+/// `None`) — os callers de teste históricos não precisam conhecer o cabo de durabilidade.
+// Consumido só pelos harnesses de teste (produção usa `wire_terminal_capturing` via `admit_node`);
+// mantido como o overload sem-scrollback, daí `dead_code` no build do binário.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn wire_terminal(
     pty: &mut PtyManager,
     sup: &Supervisor,
@@ -2218,6 +2227,29 @@ pub fn wire_terminal(
     cmd: PtyCommand,
     cols: u16,
     rows: u16,
+) -> Result<(NodeId, Grid), String> {
+    wire_terminal_capturing(pty, sup, delta_tx, key, name, role, cmd, cols, rows, None)
+}
+
+/// **F1-5-2 — `wire_terminal` com o cabo `append-on-scroll` ligado.** Quando `scrollback`
+/// é `Some`, o backend nasce CAPTURANDO (cap = `store.cap()`, fonte única do teto da janela
+/// viva) e a thread leitora drena `take_scrollback()` após cada `advance`, persistindo cada
+/// linha que sai do viewport no [`ScrollbackStore`] do workspace sob a chave do `NodeId`
+/// (painel) — o MESMO mecanismo do `PtyHost` do core (addendo do Maestro: o app é
+/// `PtyManager`-direto, então o cabo é replicado aqui, mas a lógica de harvest/persistência
+/// continua no core, sem duplicação). `None` = caminho legado intacto (sem persistência).
+#[allow(clippy::too_many_arguments)]
+pub fn wire_terminal_capturing(
+    pty: &mut PtyManager,
+    sup: &Supervisor,
+    delta_tx: &Sender<GridDelta>,
+    key: &str,
+    name: &str,
+    role: &str,
+    cmd: PtyCommand,
+    cols: u16,
+    rows: u16,
+    scrollback: Option<Arc<Mutex<ScrollbackStore>>>,
 ) -> Result<(NodeId, Grid), String> {
     pty.spawn(key, cmd, cols, rows).map_err(|e| e.to_string())?;
     let writer = pty.take_writer(key).map_err(|e| e.to_string())?;
@@ -2244,9 +2276,22 @@ pub fn wire_terminal(
         }
     };
 
-    let grid: Grid = Arc::new(Mutex::new(Box::new(AlacrittyBackend::new(cols, rows))));
+    // F1-5-2: com store ligado, o backend nasce CAPTURANDO (cap = cap do store) e a chave do
+    // painel é o `NodeId` (estável e derivável da projeção no restore). Senão, caminho legado.
+    let grid: Grid = match &scrollback {
+        Some(store) => {
+            let cap = lock(store).cap();
+            // eprintln ÚNICO por spawn (o Maestro valida o cabo por log) — addendo F1-5-2.
+            eprintln!("[SB] store anexado painel={name}");
+            Arc::new(Mutex::new(Box::new(
+                AlacrittyBackend::with_scrollback_capture(cols, rows, cap),
+            )))
+        }
+        None => Arc::new(Mutex::new(Box::new(AlacrittyBackend::new(cols, rows)))),
+    };
     let reader_grid = Arc::clone(&grid);
     let reader_tx = delta_tx.clone();
+    let sink = scrollback.map(|store| (store, node.to_string()));
     let spawned = thread::Builder::new()
         .name(format!("lina-reader-{key}"))
         .spawn(move || {
@@ -2255,13 +2300,31 @@ pub fn wire_terminal(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let dirty = {
+                        // Drena dentro do lock do grid (não aninha grid↔store); o
+                        // `take_scrollback` vem vazio quando o backend não captura.
+                        let (dirty, scrolled) = {
                             let mut g = lock(&reader_grid);
                             g.advance(&buf[..n]);
                             let d = g.damaged_rows();
                             g.reset_damage();
-                            d
+                            let s = g.take_scrollback();
+                            (d, s)
                         };
+                        // F1-5-2: persiste FORA do lock do grid. Em erro de disco a linha fica
+                        // no cache da cauda do store e o próximo flush re-tenta (nada some).
+                        if let Some((store, panel)) = &sink {
+                            if !scrolled.is_empty() {
+                                let mut s = lock(store);
+                                for line in scrolled {
+                                    if let Err(e) = s.push_line(panel, line) {
+                                        eprintln!(
+                                            "lina-gpui: scrollback push falhou painel={panel}: \
+                                             {e} (linha fica no cache da cauda, re-tenta)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if !dirty.is_empty() {
                             let _ = reader_tx.send(GridDelta {
                                 node,
@@ -3555,6 +3618,158 @@ fn admission_events(
     events
 }
 
+// ─────────────────────────── F1-4-3 · restore de terminais vivos ───────────────────────────
+
+/// **Badge honesto do restore (F1-4-3).** Strings CONGELADAS de `copy-f1-4.md §4`, condicionadas
+/// ao que o sistema OBSERVOU — nunca ao que o perfil prometeu (risco #5 da onda: "restore que
+/// mente destrói a confiança"). O scrollback na tela persiste SEMPRE; o que o badge distingue é
+/// se a MEMÓRIA do agente foi retomada (resume aplicado de fato) ou recomeça do zero.
+//
+// API pública consumida pela FIAÇÃO de boot do `main.rs` (costura externa F1-4-3: chamar
+// `plan_restore` no startup, re-spawnar e renderizar o badge) — daí `dead_code` no binário
+// até a costura entrar. Os testes headless (`bridge::tests`) já exercem todo o caminho.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreBadge {
+    /// A retomada ACONTECEU: o motor declara resume E havia sessão anterior a retomar.
+    Resumed,
+    /// Motor sem resume — OU retomada não-aplicável (sem sessão anterior observável).
+    FreshStart,
+}
+
+#[allow(dead_code)] // ver nota em `RestoreBadge` (consumido pela costura de boot externa).
+impl RestoreBadge {
+    /// String congelada do badge no card (copy-f1-4 §4).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            RestoreBadge::Resumed => "Sessão retomada",
+            RestoreBadge::FreshStart => "Novo começo — o Agente não lembra da conversa anterior",
+        }
+    }
+
+    /// Texto ao passar o mouse (copy-f1-4 §4).
+    #[must_use]
+    pub fn hover(self) -> &'static str {
+        match self {
+            RestoreBadge::Resumed => "O Agente continua de onde vocês pararam.",
+            RestoreBadge::FreshStart => {
+                "A conversa de antes continua guardada aqui na tela — é só rolar para cima."
+            }
+        }
+    }
+}
+
+/// **F1-4-3 — um terminal a re-erguer no quit limpo.** Derivado SÓ de estado durável: posição/
+/// nome/papel/cwd do log (projeção), janela viva re-hidratada do `ScrollbackStore`, comando de
+/// spawn do perfil (com o verbo de resume do TOML quando aplicável) e o badge honesto. Nenhum
+/// PTY é tocado ao construir isto — é a ESPECIFICAÇÃO do restore, executável depois via `admit_node`.
+#[allow(dead_code)] // ver nota em `RestoreBadge` (consumido pela costura de boot externa).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredTerminal {
+    /// `NodeId` canônico do log — chave estável que sobrevive ao quit (mesma do scrollback).
+    pub node: NodeId,
+    pub name: String,
+    pub role: Option<String>,
+    pub x: f64,
+    pub y: f64,
+    pub cwd: Option<String>,
+    /// `id` do CLI Profile resolvido no registry; `None` = shell puro / motor sem perfil.
+    pub profile_id: Option<String>,
+    /// Comando de spawn do restore: `[program, args…, resume_args…]`. Os `resume_args` SÓ
+    /// entram quando `badge == Resumed` (observado). Vazio quando não há perfil (shell puro).
+    pub command: Vec<String>,
+    pub badge: RestoreBadge,
+    /// Janela viva re-hidratada do store (ordem cronológica). Vazia se não havia histórico.
+    pub scrollback_tail: Vec<String>,
+}
+
+/// **F1-4-3 — o PLANO de restore do quit limpo, derivável SÓ de estado durável.** Dado o estado
+/// projetado do log (`proj` = `store.project()`), o registry de perfis e — opcional — o store de
+/// scrollback, devolve os terminais a re-erguer: posições/nomes/papéis do log, scrollback
+/// re-hidratado do disco, comando de spawn (com o verbo de resume do TOML quando o motor declara
+/// E há sessão a retomar) e o badge honesto. **Função PURA** (sem efeito colateral além de leitura
+/// do store): satisfaz "limpar projeções → replay → mesmo restore" (critério 4) e é testável
+/// headless (critérios 1/2/3). A FIAÇÃO no boot (chamar isto e re-spawnar) + o render do badge na
+/// tela moram no `main.rs` (território EXTERNO) — registrados como costura na entrega.
+#[allow(dead_code)] // ver nota em `RestoreBadge` (consumido pela costura de boot externa).
+#[must_use]
+pub fn plan_restore(
+    proj: &ProjectedState,
+    registry: &ProfileRegistry,
+    scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
+) -> Vec<RestoredTerminal> {
+    let mut out = Vec::new();
+    for (node, info) in &proj.nodes {
+        // Só TERMINAIS re-erguem aqui (notas/pastas têm outro ciclo de vida). Case-insensitive:
+        // a admissão de produção grava "Terminal" (ADR 0022 §2), mas o filtro tolera variação.
+        if !info.kind.eq_ignore_ascii_case("terminal") {
+            continue;
+        }
+        let panel = node.to_string();
+        // Re-hidrata a janela viva do disco (≥ janela viva, byte-idêntico). Erro de leitura
+        // degrada para vazio (= sem histórico → caminho "novo começo"), nunca silencioso.
+        let scrollback_tail = match scrollback {
+            Some(s) => {
+                let store = lock(s);
+                let cap = store.cap();
+                match store.tail(&panel, cap) {
+                    Ok(lines) => lines,
+                    Err(e) => {
+                        eprintln!(
+                            "lina-gpui: restore não leu scrollback do painel {panel}: {e} \
+                             (re-hidrata vazio; badge cai para 'novo começo')"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        let has_prior_session = !scrollback_tail.is_empty();
+
+        // `info.cli` é o profile id quando houve `CliProfileSet` (reducer: último vence); senão
+        // é o rótulo do motor/nome (sem perfil conhecido) → shell puro / sem resume.
+        let profile = info.cli.as_deref().and_then(|id| registry.get(id));
+        let profile_id = profile.and(info.cli.clone());
+
+        // Badge CONDICIONADO AO OBSERVADO (copy-f1-4 §4): declarar resume é NECESSÁRIO, nunca
+        // SUFICIENTE — só «Sessão retomada» se há sessão anterior de fato (scrollback no disco).
+        let resumes = profile.is_some_and(CliProfile::can_resume) && has_prior_session;
+        let badge = if resumes {
+            RestoreBadge::Resumed
+        } else {
+            RestoreBadge::FreshStart
+        };
+
+        let command = match profile {
+            Some(p) => {
+                let mut c = vec![p.program.clone()];
+                c.extend(p.args.iter().cloned());
+                if resumes {
+                    c.extend(p.resume_args.iter().cloned());
+                }
+                c
+            }
+            None => Vec::new(),
+        };
+
+        out.push(RestoredTerminal {
+            node: *node,
+            name: info.name.clone().unwrap_or_default(),
+            role: info.role.clone(),
+            x: info.x,
+            y: info.y,
+            cwd: info.cwd.clone(),
+            profile_id,
+            command,
+            badge,
+            scrollback_tail,
+        });
+    }
+    out
+}
+
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
 /// (`PtyManager`, `Supervisor`, `EventStore`), a projeção (`SharedModel`) e os grids, e sabe
 /// ADICIONAR e REMOVER nós-terminal mantendo o **event log como fonte da verdade** (emite
@@ -3587,6 +3802,16 @@ pub struct NodeManager {
     /// #7 dogfooding r2: o MOTOR de spawns agente-pede. Default de produção = discovery
     /// ([`default_spawn_engine`]); os testes injetam fixa via [`Self::set_spawn_engine_factory`].
     spawn_engine: SpawnEngineFactory,
+    /// F1-5-2: o store durável de scrollback do workspace (`<lina_dir>/scrollback.db`). Todo
+    /// terminal admitido a partir daqui nasce capturando — o cabo `append-on-scroll` é ligado
+    /// em [`wire_terminal_capturing`]. `None` = boot degradado (abertura do store falhou; o app
+    /// segue sem persistência de histórico, nunca crasha — degradação honesta como o bootstrap).
+    scrollback: Option<Arc<Mutex<ScrollbackStore>>>,
+    /// F1-5-6: o job ÚNICO de durabilidade sobre o `scrollback` (idle-drain + sinais fatais +
+    /// retenção diária F1-5-9). Vive aqui porque o `NodeManager` é dono do ciclo de vida do
+    /// store no app; para no Drop. `None` quando não há store (nada a proteger).
+    #[allow(dead_code)] // mantido vivo só pelo Drop (RAII): para o job ao encerrar o manager.
+    flush_guard: Option<FlushGuard>,
 }
 
 impl NodeManager {
@@ -3607,6 +3832,40 @@ impl NodeManager {
         bootstrap: Option<BootstrapWriter>,
         lina_dir: PathBuf,
     ) -> Self {
+        // F1-5-2: abre o store durável de scrollback no MESMO lar de dados do workspace
+        // (`<lina_dir>/scrollback.db`, arquivo separado do events log) e sobe o job único de
+        // durabilidade (F1-5-6). Best-effort: falha de disco degrada (sem persistência), nunca
+        // crasha o boot — mesma doutrina do `bootstrap` desligado. Os handlers de sinal só
+        // entram em produção (`!cfg!(test)`): num binário de teste, instalar/desinstalar
+        // handlers processo-globais a cada `NodeManager` é ruído desnecessário.
+        let (scrollback, flush_guard) = match ScrollbackStore::open_default(&lina_dir) {
+            Ok(store) => {
+                let store = Arc::new(Mutex::new(store));
+                let guard = FlushGuard::start(
+                    Arc::clone(&store),
+                    FlushGuardConfig {
+                        handle_signals: !cfg!(test),
+                        ..FlushGuardConfig::default()
+                    },
+                )
+                .map_err(|e| {
+                    eprintln!(
+                        "lina-gpui: scrollback flush-guard não subiu ({e}); histórico ainda \
+                         persiste por flush/drop, mas sem idle-drain/sinais neste boot"
+                    );
+                })
+                .ok();
+                (Some(store), guard)
+            }
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: scrollback store não abriu em {} ({e}); boot sem persistência \
+                     de histórico (degradação honesta)",
+                    lina_dir.display()
+                );
+                (None, None)
+            }
+        };
         Self {
             pty,
             sup,
@@ -3626,6 +3885,8 @@ impl NodeManager {
             // #7: produção resolve o motor do spawn por DISCOVERY no momento do spawn (sem
             // mudança de assinatura — o main não precisa de fiação para o default correto).
             spawn_engine: Arc::new(|| default_spawn_engine(&discover_clis())),
+            scrollback,
+            flush_guard,
         }
     }
 
@@ -4222,7 +4483,7 @@ impl NodeManager {
 
         let (node, grid) = {
             let mut p = lock(&self.pty);
-            wire_terminal(
+            wire_terminal_capturing(
                 &mut p,
                 &self.sup,
                 &self.delta_tx,
@@ -4232,6 +4493,8 @@ impl NodeManager {
                 cmd,
                 self.cols,
                 self.rows,
+                // F1-5-2: o terminal nasce capturando no store do workspace (cabo append-on-scroll).
+                self.scrollback.clone(),
             )?
         };
 
@@ -9521,5 +9784,314 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    // ───────────────────────── F1-4-3 · restore de terminais vivos ─────────────────────────
+
+    /// Semeia no log a sequência canônica de um terminal (ADR 0022 §2) — helper dos testes de
+    /// `plan_restore`. `profile` `Some` apenda `CliProfileSet` (o `cli` da projeção vira o id).
+    #[allow(clippy::too_many_arguments)] // espelha os campos da sequência canônica de admissão
+    fn seed_terminal(
+        store: &mut EventStore,
+        node: NodeId,
+        x: f64,
+        y: f64,
+        name: &str,
+        role: &str,
+        cli_label: &str,
+        profile: Option<&str>,
+    ) {
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x,
+                y,
+                requested_by: None,
+            })
+            .expect("NodeAdded");
+        store
+            .append(&DomainEvent::TerminalSpawned {
+                node,
+                cli: cli_label.into(),
+                cwd: Some("/tmp/proj".into()),
+            })
+            .expect("TerminalSpawned");
+        store
+            .append(&DomainEvent::NodeRenamed {
+                node,
+                name: name.into(),
+            })
+            .expect("NodeRenamed");
+        store
+            .append(&DomainEvent::NodeRoleAssigned {
+                node,
+                role: role.into(),
+            })
+            .expect("NodeRoleAssigned");
+        if let Some(p) = profile {
+            store
+                .append(&DomainEvent::CliProfileSet {
+                    node,
+                    profile: p.into(),
+                })
+                .expect("CliProfileSet");
+        }
+    }
+
+    fn claude_resume_profile() -> CliProfile {
+        CliProfile::from_toml_str(
+            r#"
+                id = "claude-code"
+                program = "claude"
+                args = ["--output-format", "stream-json"]
+                resume_args = ["--resume"]
+                delivery = "session_resume"
+                prompt_ready_regex = "> "
+                session_dir_pattern = "~/.claude/projects/*/*.jsonl"
+                [end_signal]
+                kind = "idle"
+            "#,
+            "<claude>",
+        )
+        .expect("claude profile parseia")
+    }
+
+    /// **F1-4-3 critério 1+2+4:** quit limpo com 3 nós (motor com resume, shell puro, motor SEM
+    /// resume) → o PLANO de restore, derivado SÓ do log + store, recupera posições/nomes/papéis,
+    /// re-hidrata o scrollback BYTE-IDÊNTICO à janela viva, e dá o badge honesto. E é derivável do
+    /// log: re-projetar do mesmo store produz o MESMO plano.
+    #[test]
+    fn plan_restore_recovers_layout_and_rehydrates_scrollback() {
+        let base = std::env::temp_dir().join(format!("lina-restore-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mut reg = ProfileRegistry::new();
+        reg.insert(claude_resume_profile());
+        reg.insert(
+            CliProfile::from_toml_str(
+                r#"
+                    id = "gemini"
+                    program = "gemini"
+                    delivery = "pty_inject"
+                    prompt_ready_regex = "> "
+                    [end_signal]
+                    kind = "idle"
+                "#,
+                "<gemini>",
+            )
+            .expect("gemini profile"),
+        );
+
+        let n_resume = NodeId::from_u128(1);
+        let n_shell = NodeId::from_u128(2);
+        let n_plain = NodeId::from_u128(3);
+
+        let mut store = EventStore::open(base.join("events")).expect("event store");
+        seed_terminal(
+            &mut store,
+            n_resume,
+            10.0,
+            20.0,
+            "Especialista",
+            "backend",
+            "Claude Code",
+            Some("claude-code"),
+        );
+        seed_terminal(
+            &mut store,
+            n_shell,
+            30.0,
+            40.0,
+            "Terminal Puro",
+            "terminal",
+            "Shell",
+            None,
+        );
+        seed_terminal(
+            &mut store,
+            n_plain,
+            50.0,
+            60.0,
+            "Designer",
+            "designer",
+            "Gemini",
+            Some("gemini"),
+        );
+
+        // Scrollback persistido (janela viva) — só os que tiveram conversa.
+        let sb = Arc::new(Mutex::new(
+            ScrollbackStore::open_default(&base).expect("scrollback store"),
+        ));
+        let resume_lines = vec![
+            "linha 1 do claude".to_string(),
+            "linha 2 — com acento çã".to_string(),
+        ];
+        let plain_lines = vec!["saída do gemini".to_string()];
+        {
+            let mut s = lock(&sb);
+            for l in &resume_lines {
+                s.push_line(&n_resume.to_string(), l.clone())
+                    .expect("push resume");
+            }
+            for l in &plain_lines {
+                s.push_line(&n_plain.to_string(), l.clone())
+                    .expect("push plain");
+            }
+        }
+
+        let proj = store.project().expect("project");
+        let plan = plan_restore(&proj, &reg, Some(&sb));
+        assert_eq!(plan.len(), 3, "3 terminais re-erguem");
+        let by = |n: NodeId| plan.iter().find(|r| r.node == n).expect("nó no plano");
+
+        let r = by(n_resume);
+        assert_eq!((r.x, r.y), (10.0, 20.0), "posição vinda do log");
+        assert_eq!(r.name, "Especialista");
+        assert_eq!(r.role.as_deref(), Some("backend"));
+        assert_eq!(
+            r.scrollback_tail, resume_lines,
+            "scrollback re-hidratado byte-idêntico"
+        );
+        assert_eq!(
+            r.badge,
+            RestoreBadge::Resumed,
+            "resume declarado + sessão anterior observada"
+        );
+        assert_eq!(
+            r.command,
+            vec!["claude", "--output-format", "stream-json", "--resume"],
+            "comando do restore carrega o verbo de resume do TOML"
+        );
+
+        let sh = by(n_shell);
+        assert_eq!((sh.x, sh.y), (30.0, 40.0));
+        assert_eq!(sh.name, "Terminal Puro");
+        assert!(sh.scrollback_tail.is_empty(), "shell puro sem histórico");
+        assert_eq!(
+            sh.badge,
+            RestoreBadge::FreshStart,
+            "shell puro → novo começo"
+        );
+        assert!(
+            sh.command.is_empty(),
+            "shell sem perfil → sem comando montado"
+        );
+        assert_eq!(sh.profile_id, None);
+
+        let pl = by(n_plain);
+        assert_eq!(pl.name, "Designer");
+        assert_eq!(
+            pl.scrollback_tail, plain_lines,
+            "gemini re-hidrata o histórico"
+        );
+        assert_eq!(
+            pl.badge,
+            RestoreBadge::FreshStart,
+            "motor SEM resume → novo começo MESMO com histórico (badge segue capacidade, não dado)"
+        );
+        assert_eq!(
+            pl.command,
+            vec!["gemini"],
+            "sem resume_args → comando sem retomada"
+        );
+        assert_eq!(pl.profile_id.as_deref(), Some("gemini"));
+
+        // Critério 4: derivável do log — re-projetar do MESMO store dá o MESMO plano.
+        let proj2 = store.project().expect("re-project");
+        assert_eq!(
+            plan_restore(&proj2, &reg, Some(&sb)),
+            plan,
+            "limpar projeções → replay → mesmo restore"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **F1-4-3 (risco #5, copy-f1-4 §4):** o badge segue o OBSERVADO, nunca o declarado. Um motor
+    /// com resume declarado mas SEM sessão anterior cai para «Novo começo» e o comando NÃO ganha o
+    /// verbo de resume — só se retoma o que existe de fato. Ao surgir a sessão, vira «Sessão retomada».
+    #[test]
+    fn restore_badge_follows_observed_not_declared() {
+        let base =
+            std::env::temp_dir().join(format!("lina-restore-observed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mut reg = ProfileRegistry::new();
+        reg.insert(claude_resume_profile());
+
+        let node = NodeId::from_u128(7);
+        let mut store = EventStore::open(base.join("events")).expect("store");
+        seed_terminal(
+            &mut store,
+            node,
+            0.0,
+            0.0,
+            "Especialista",
+            "backend",
+            "Claude Code",
+            Some("claude-code"),
+        );
+        let proj = store.project().expect("project");
+
+        // SEM store de scrollback → nada a retomar.
+        let plan = plan_restore(&proj, &reg, None);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].badge,
+            RestoreBadge::FreshStart,
+            "resume declarado, mas nada observado a retomar → novo começo"
+        );
+        assert_eq!(
+            plan[0].command,
+            vec!["claude", "--output-format", "stream-json"],
+            "sem retomada observada → comando SEM --resume"
+        );
+
+        // COM store mas painel VAZIO → idem (o observado é vazio).
+        let sb = Arc::new(Mutex::new(
+            ScrollbackStore::open_default(&base).expect("scrollback"),
+        ));
+        let plan2 = plan_restore(&proj, &reg, Some(&sb));
+        assert_eq!(
+            plan2[0].badge,
+            RestoreBadge::FreshStart,
+            "painel vazio → novo começo"
+        );
+
+        // Agora COM sessão anterior → «Sessão retomada» + o verbo de resume entra.
+        {
+            let mut s = lock(&sb);
+            s.push_line(&node.to_string(), "oi de ontem".to_string())
+                .expect("push");
+        }
+        let plan3 = plan_restore(&proj, &reg, Some(&sb));
+        assert_eq!(
+            plan3[0].badge,
+            RestoreBadge::Resumed,
+            "sessão anterior observada → retomada de verdade"
+        );
+        assert_eq!(
+            plan3[0].command,
+            vec!["claude", "--output-format", "stream-json", "--resume"],
+            "agora o verbo de resume entra"
+        );
+
+        // Strings CONGELADAS do badge + hover (copy-f1-4 §4 — fonte autoritativa).
+        assert_eq!(RestoreBadge::Resumed.label(), "Sessão retomada");
+        assert_eq!(
+            RestoreBadge::FreshStart.label(),
+            "Novo começo — o Agente não lembra da conversa anterior"
+        );
+        assert_eq!(
+            RestoreBadge::Resumed.hover(),
+            "O Agente continua de onde vocês pararam."
+        );
+        assert_eq!(
+            RestoreBadge::FreshStart.hover(),
+            "A conversa de antes continua guardada aqui na tela — é só rolar para cima."
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -152,6 +152,15 @@ pub struct CliProfile {
     /// Argumentos fixos passados ao CLI (ex.: `["--output-format", "stream-json"]`).
     #[serde(default)]
     pub args: Vec<String>,
+    /// F1-4-3: argumentos EXTRA do **resume de sessão** — anexados ao spawn SÓ quando o
+    /// Espaço é reaberto (quit limpo → restore) e há sessão anterior a retomar, para o CLI
+    /// continuar a conversa de onde parou (ex.: `["--resume"]` → `claude --resume`). O VERBO
+    /// vive no TOML, nunca no código (invariante #3): trocar aqui muda o comando do restore
+    /// sem recompilar. ADITIVO: ausente ⇒ vazio ⇒ o CLI **não** retoma (nasce do zero, badge
+    /// "novo começo"). Só faz sentido com `session_dir_pattern` declarado (o CLI grava sessão
+    /// em disco); o consumidor (restore) decide a aplicação condicionada ao OBSERVADO.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
     /// Estratégia de entrega de prompt.
     pub delivery: Delivery,
     /// Espera (ms) entre colar o texto e enviar o Enter, na A2A faseada. Default 300.
@@ -219,6 +228,16 @@ impl CliProfile {
     /// histórico de W0-9 para perfis que não declaram `ready_timeout_ms`).
     pub fn ready_timeout(&self) -> Duration {
         Duration::from_millis(self.ready_timeout_ms.unwrap_or(2_000))
+    }
+
+    /// F1-4-3: este CLI sabe RETOMAR a sessão? (`resume_args` não-vazio). `true` habilita o
+    /// restore a anexar [`Self::resume_args`] ao spawn quando o Espaço reabre E há sessão
+    /// anterior a retomar; `false` ⇒ o terminal renasce do zero (badge "novo começo"). É
+    /// condição NECESSÁRIA do badge "Sessão retomada", nunca SUFICIENTE — quem decide é o
+    /// observado no boot (a retomada aplicada de fato), não a mera declaração no perfil.
+    #[must_use]
+    pub fn can_resume(&self) -> bool {
+        !self.resume_args.is_empty()
     }
 
     /// Parseia um profile a partir de uma string TOML.
@@ -950,6 +969,89 @@ mod tests {
         assert_eq!(profile.submit_delay_ms, DEFAULT_SUBMIT_DELAY_MS);
         assert_eq!(profile.end_signal, EndSignal::Idle);
         assert!(profile.args.is_empty());
+    }
+
+    // ── F1-4-3: `resume_args` — campo ADITIVO; o verbo de resume vive no TOML (inv#3) ──
+
+    /// Profile SEM `resume_args` (todos os TOMLs legados) parseia com o default vazio e
+    /// `can_resume() == false` — aditividade provada: o caminho "novo começo" é o default.
+    #[test]
+    fn resume_args_default_when_absent() {
+        let minimal = r#"
+            id = "shell"
+            program = "bash"
+            delivery = "pty_inject"
+            prompt_ready_regex = '\$\s$'
+            [end_signal]
+            kind = "idle"
+        "#;
+        let p = CliProfile::from_toml_str(minimal, "<inline>").expect("shell deve parsear");
+        assert!(p.resume_args.is_empty(), "ausente ⇒ vazio");
+        assert!(
+            !p.can_resume(),
+            "sem resume_args ⇒ não retoma (novo começo)"
+        );
+    }
+
+    /// F1-4-3 critério 3: **trocar o verbo de resume no TOML muda o comando SEM recompilar.**
+    /// Dois TOMLs de MESMO `id`, idênticos a menos do `resume_args`, produzem comandos de
+    /// resume diferentes — a prova de que o verbo é dado de config, não constante de código.
+    #[test]
+    fn resume_verb_comes_from_toml_not_code() {
+        let base = |resume: &str| {
+            format!(
+                r#"
+                    id = "claude-code"
+                    program = "claude"
+                    args = ["--output-format", "stream-json"]
+                    resume_args = [{resume}]
+                    delivery = "session_resume"
+                    prompt_ready_regex = "> "
+                    session_dir_pattern = "~/.claude/projects/*/*.jsonl"
+                    [end_signal]
+                    kind = "idle"
+                "#
+            )
+        };
+        let a = CliProfile::from_toml_str(&base("\"--resume\""), "<a>").expect("a deve parsear");
+        let b = CliProfile::from_toml_str(&base("\"--continue\""), "<b>").expect("b deve parsear");
+
+        assert!(a.can_resume() && b.can_resume());
+        assert_eq!(a.resume_args, vec!["--resume".to_string()]);
+        assert_eq!(b.resume_args, vec!["--continue".to_string()]);
+        // O comando completo de resume = program + args + resume_args (montado pelo restore).
+        let cmd = |p: &CliProfile| {
+            let mut c = vec![p.program.clone()];
+            c.extend(p.args.clone());
+            c.extend(p.resume_args.clone());
+            c
+        };
+        assert_eq!(
+            cmd(&a),
+            vec!["claude", "--output-format", "stream-json", "--resume"]
+        );
+        assert_eq!(
+            cmd(&b),
+            vec!["claude", "--output-format", "stream-json", "--continue"]
+        );
+        assert_ne!(
+            cmd(&a),
+            cmd(&b),
+            "trocar o TOML mudou o comando sem recompilar"
+        );
+    }
+
+    /// O exemplo real `profiles/claude-code.toml` declara o verbo de resume (a fiação de
+    /// produção do restore depende disto) — guarda contra remoção acidental do campo.
+    #[test]
+    fn claude_code_profile_declares_resume() {
+        let profile = CliProfile::load_file(claude_code_path())
+            .expect("o exemplo claude-code.toml deve parsear");
+        assert!(
+            profile.can_resume(),
+            "claude-code declara resume_args (ex.: --resume)"
+        );
+        assert_eq!(profile.resume_args, vec!["--resume".to_string()]);
     }
 
     #[test]

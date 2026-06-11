@@ -12,6 +12,13 @@ program = "claude"
 # Saída estruturada linha-a-linha (parse incremental no PTY vivo).
 args = ["--output-format", "stream-json", "--verbose"]
 
+# F1-4-3: verbo de RESUME de sessão. No quit LIMPO → reabrir, o restore anexa estes args
+# ao spawn (vira `claude --resume`) SÓ quando há sessão anterior a retomar — o Claude Code
+# reabre a última conversa do cwd (sessão gravada em `session_dir_pattern`). O VERBO vive
+# AQUI (TOML), nunca no código (invariante #3): trocar para `--continue` muda o comando do
+# restore sem recompilar. Aditivo: ausente ⇒ sem resume (o terminal renasce do zero).
+resume_args = ["--resume"]
+
 # Entrega A2A faseada (CLAUDE.md §A2A): bracketed-paste -> submit_delay -> Enter
 # (0x0D) enviado SEPARADO, em fila serial por terminal.
 delivery = "pty_inject"
