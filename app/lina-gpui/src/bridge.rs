@@ -9071,7 +9071,10 @@ mod tests {
     #[test]
     fn userdir_sem_consentimento_degrada_visivel_sem_dir_fantasma() {
         let ws = std::env::temp_dir().join(format!("lina-noconsent-{}", std::process::id()));
-        let user = std::env::temp_dir().join(format!("lina-userdir-{}", std::process::id()));
+        // Dir SUFIXADO pelo teste: o mesmo PID roda a suíte inteira — compartilhar
+        // `lina-userdir-{pid}` com outro teste cria corrida de remove_dir_all (flake real).
+        let user =
+            std::env::temp_dir().join(format!("lina-userdir-noconsent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&user);
         let bw = BootstrapWriter::new(
@@ -11025,7 +11028,9 @@ mod tests {
         );
 
         // CONTROLE: pasta REAL do usuário (fora do namespace) continua merge-safe.
-        let user_dir = std::env::temp_dir().join(format!("lina-userdir-{}", std::process::id()));
+        // Dir sufixado pelo teste (anti-flake — ver o teste irmão `userdir_sem_consentimento…`).
+        let user_dir =
+            std::env::temp_dir().join(format!("lina-userdir-refresh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&user_dir);
         std::fs::create_dir_all(user_dir.join(".claude")).expect("mkdir user");
         let user_settings = r#"{"meu_setting": true}"#;
