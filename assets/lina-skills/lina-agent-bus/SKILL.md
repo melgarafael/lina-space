@@ -3,7 +3,7 @@ name: lina-agent-bus
 description: >-
   A skill OFICIAL e ÚNICA de comunicação entre terminais do Lina Space (A2A). Use SEMPRE que o
   usuário pedir, em português, para um terminal falar com outro: "manda/mande o Terminal X fazer
-  Y", "pede pro/ao <nome>", "avisa o <nome>", "pergunta pro <nome>", "manda oi pro B", "avisa o
+  Y", "pede/peça pro/ao <nome>", "avisa/avise o <nome>", "pergunta pro <nome>", "manda oi pro B", "avisa o
   time todo", "manda pra todos". Cobre: receber (distinguir [LINA::MSG]/[LINA::HANDSHAKE] de
   input do usuário), processar o envelope e responder no formato [EXPECTED]; o ANTÍDOTO DE ECO
   (nunca repassar bloco técnico ao leigo — narrar só o resultado em pt-br); o mapa do time em
