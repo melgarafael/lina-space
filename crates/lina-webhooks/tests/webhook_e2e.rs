@@ -228,10 +228,14 @@ async fn hmac_invalido_nao_consome_budget_por_hook() {
     let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
     let vault = SecretVault::with_store("lina-space/test-budget", MockStore::new());
 
-    // Budget POR HOOK pequeno (3) p/ o flood o estourar com folga; teto por IP largo (não é a
-    // barreira aqui — todas as conexões de loopback compartilham o mesmo 127.0.0.1).
+    // Budget POR HOOK pequeno (3) p/ o flood o estourar com folga; camadas pré-auth largas (não
+    // são a barreira deste teste — aqui se prova só o budget pós-HMAC do dono).
     let cfg = RateLimitConfig {
-        ip_burst: WindowLimit {
+        pre_auth_per_route: WindowLimit {
+            max_requests: 10_000,
+            window: Duration::from_secs(60),
+        },
+        pre_auth_global: WindowLimit {
             max_requests: 10_000,
             window: Duration::from_secs(60),
         },
@@ -273,12 +277,12 @@ async fn hmac_invalido_nao_consome_budget_por_hook() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// W5-4-MED-a (CPU): um flood BRUTO por IP é barrado ANTES de calcular o HMAC (camada 1 — protege a
-/// CPU contra forçar o cálculo caro de HMAC em massa). Prova: com o teto por IP = 3, três requests
-/// (mesmo sem assinatura → 401) esgotam a janela; o 4º, AINDA QUE traga um HMAC VÁLIDO, recebe 429
-/// (não 202) — logo o gate de IP precede o HMAC — e nada é processado (nenhum WebhookReceived).
+/// W5-4-MED-a (CPU) reencarnado pós-F1-6-4: o backstop GLOBAL pré-auth barra ANTES de calcular o
+/// HMAC. Prova: com o teto global = 3 (e balde por rota largo), três requests sem assinatura
+/// esgotam a janela global; o 4º, AINDA QUE traga um HMAC VÁLIDO, recebe 429 (não 202) — logo o
+/// gate global precede o HMAC — e nada é processado (nenhum `WebhookReceived`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flood_bruto_por_ip_barra_antes_do_hmac() {
+async fn teto_global_pre_auth_barra_antes_do_hmac() {
     let tmp = unique_tmp("burst");
     let store = Arc::new(Mutex::new(EventStore::open(&tmp).expect("open store")));
     let sup = Arc::new(Supervisor::new());
@@ -290,9 +294,13 @@ async fn flood_bruto_por_ip_barra_antes_do_hmac() {
     let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
     let vault = SecretVault::with_store("lina-space/test-burst", MockStore::new());
 
-    // Teto por IP pequeno (3); budget por-hook largo (não é a barreira deste teste).
+    // Teto GLOBAL pequeno (3); demais camadas largas (não são a barreira deste teste).
     let cfg = RateLimitConfig {
-        ip_burst: WindowLimit {
+        pre_auth_per_route: WindowLimit {
+            max_requests: 10_000,
+            window: Duration::from_secs(60),
+        },
+        pre_auth_global: WindowLimit {
             max_requests: 3,
             window: Duration::from_secs(60),
         },
@@ -313,21 +321,21 @@ async fn flood_bruto_por_ip_barra_antes_do_hmac() {
     let body = br#"{"order":42}"#;
     let path = format!("/hook/{}", hook.hook_id);
 
-    // 3 requests SEM assinatura → cada um passa o teto de IP (1,2,3) mas toma 401 (HMAC ausente).
+    // 3 requests SEM assinatura → passam o balde de rota e o global (1,2,3), mas tomam 401.
     for i in 0..3 {
         let (status, _) = http_post(addr, &path, None, body).await;
         assert_eq!(
             status, 401,
-            "request #{i} sem assinatura → 401 (mas conta no teto bruto por IP)"
+            "request #{i} sem assinatura → 401 (mas conta no teto global pré-auth)"
         );
     }
 
-    // 4º request COM HMAC VÁLIDO: o teto por IP já estourou → 429 ANTES do HMAC (senão seria 202).
+    // 4º request COM HMAC VÁLIDO: o teto global já estourou → 429 ANTES do HMAC (senão seria 202).
     let good_sig = sign_hex(&hook.secret, body);
     let (status, _) = http_post(addr, &path, Some(&good_sig), body).await;
     assert_eq!(
         status, 429,
-        "teto por IP estourado barra ANTES do HMAC — até um request válido recebe 429"
+        "teto global estourado barra ANTES do HMAC — até um request válido recebe 429"
     );
 
     // E nada foi processado: o flood barrado não tocou o caminho de aceitação.
@@ -335,7 +343,177 @@ async fn flood_bruto_por_ip_barra_antes_do_hmac() {
     assert_eq!(
         count_webhook_received(&store),
         0,
-        "flood barrado pelo teto de IP não processa nenhum disparo"
+        "flood barrado pelo teto global não processa nenhum disparo"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F1-6-4 / MEDIA-1, critério (a) — FIM DA STARVATION: flood de corpo-lixo sem secret, tanto em
+/// rota INEXISTENTE quanto na rota EXISTENTE do hook A sem HMAC, **não** derruba para 429 um hook
+/// legítimo CONCORRENTE (B). No design antigo (teto por IP — efetivamente GLOBAL em loopback e
+/// atrás de túnel), este mesmo flood esgotava o orçamento compartilhado e B tomava 429 (auto-DoS).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flood_de_lixo_nao_derruba_hook_legitimo_concorrente() {
+    let tmp = unique_tmp("starv");
+    let store = Arc::new(Mutex::new(EventStore::open(&tmp).expect("open store")));
+    let sup = Arc::new(Supervisor::new());
+    let trigger = sup.register(
+        "@Trigger",
+        Some("trigger".into()),
+        Box::new(std::io::sink()),
+    );
+    let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+    let vault = SecretVault::with_store("lina-space/test-starv", MockStore::new());
+
+    // Balde por rota apertado (5) p/ o flood estourar rápido; global largo o bastante p/ provar
+    // que NÃO é ele quem segura a linha (o lixo barrado na rota nem o consome).
+    let cfg = RateLimitConfig {
+        pre_auth_per_route: WindowLimit {
+            max_requests: 5,
+            window: Duration::from_secs(60),
+        },
+        pre_auth_global: WindowLimit {
+            max_requests: 10_000,
+            window: Duration::from_secs(60),
+        },
+        per_hook: WindowLimit {
+            max_requests: 120,
+            window: Duration::from_secs(60),
+        },
+    };
+    let engine = WebhookEngine::with_config(store.clone(), sup.clone(), cfg);
+    let hook_a = engine
+        .configure_hook(&vault, trigger, "@Dev")
+        .expect("configurar hook A");
+    let hook_b = engine
+        .configure_hook(&vault, trigger, "@Dev")
+        .expect("configurar hook B");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(engine.serve(listener));
+
+    let body = br#"{"order":42}"#;
+
+    // Flood 1: 20 lixos numa rota INEXISTENTE (32 chars, shape de hook_id) — só esgota o balde DELA.
+    let rota_falsa = "/hook/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for _ in 0..20 {
+        let (status, _) = http_post(addr, rota_falsa, None, body).await;
+        assert!(
+            status == 404 || status == 429,
+            "lixo em rota inexistente → 404 (dentro do balde) ou 429 (balde estourado); veio {status}"
+        );
+    }
+
+    // Flood 2: 20 lixos SEM assinatura na rota EXISTENTE de A — só esgota o balde de A.
+    let path_a = format!("/hook/{}", hook_a.hook_id);
+    for _ in 0..20 {
+        let (status, _) = http_post(addr, &path_a, None, body).await;
+        assert!(
+            status == 401 || status == 429,
+            "lixo na rota de A → 401 (dentro do balde) ou 429 (balde de A estourado); veio {status}"
+        );
+    }
+
+    // O CRITÉRIO: o hook B, legítimo e concorrente, passa ileso — 202.
+    let path_b = format!("/hook/{}", hook_b.hook_id);
+    let sig_b = sign_hex(&hook_b.secret, body);
+    let (status, _) = http_post(addr, &path_b, Some(&sig_b), body).await;
+    assert_eq!(
+        status, 202,
+        "40 requests de corpo-lixo NÃO podem derrubar o hook legítimo concorrente (MEDIA-1 fechado)"
+    );
+
+    // Residual DOCUMENTADO (e travado aqui): quem CONHECE a rota de A nega o próprio A na janela
+    // corrente (balde pré-auth de A esgotado) — mas o budget pós-HMAC do dono segue intacto e
+    // nenhuma outra rota é afetada. Mitigação: janela vira / rotacionar o hook.
+    let sig_a = sign_hex(&hook_a.secret, body);
+    let (status, _) = http_post(addr, &path_a, Some(&sig_a), body).await;
+    assert_eq!(
+        status, 429,
+        "residual conhecido: o balde pré-auth da PRÓPRIA rota floodada fica esgotado na janela"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// F1-6-4 critério (b) — SEM ORÁCULO: o orçamento de lixo não revela existência de `hook_id`. O
+/// onset do 429 pré-auth é IDÊNTICO para rota existente e inexistente (mesma janela, mesmo
+/// limite, mesmo caminho O(1)). A diferença 404×401 dentro do balde é o contrato pré-existente
+/// da capability (160 bits não-enumeráveis — provados em `hook_id_e_opaco_…`), não um sinal novo
+/// introduzido pelo rate-limit.
+///
+/// Sobre a dimensão TEMPO do critério: medir timing em CI é flaky por natureza, então a prova
+/// aqui é ESTRUTURAL + comportamental — o rate-limit novo usa o MESMO lookup O(1) no MESMO mapa
+/// para qualquer chave (ver `allow_route_window`), não acrescentando NENHUM ramo dependente de
+/// existência. O diferencial de tempo que sobra (HMAC só roda em rota existente com assinatura
+/// presente) é o contrato 404/401 pré-existente do W5-4 — e atravessá-lo por enumeração exigiria
+/// varrer um espaço de 2^160 capabilities, inviável com ou sem oráculo de timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orcamento_de_lixo_nao_revela_existencia_de_hook() {
+    let tmp = unique_tmp("oracle");
+    let store = Arc::new(Mutex::new(EventStore::open(&tmp).expect("open store")));
+    let sup = Arc::new(Supervisor::new());
+    let trigger = sup.register(
+        "@Trigger",
+        Some("trigger".into()),
+        Box::new(std::io::sink()),
+    );
+    let _dev = sup.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+    let vault = SecretVault::with_store("lina-space/test-oracle", MockStore::new());
+
+    let cfg = RateLimitConfig {
+        pre_auth_per_route: WindowLimit {
+            max_requests: 3,
+            window: Duration::from_secs(60),
+        },
+        pre_auth_global: WindowLimit {
+            max_requests: 10_000,
+            window: Duration::from_secs(60),
+        },
+        per_hook: WindowLimit {
+            max_requests: 10_000,
+            window: Duration::from_secs(60),
+        },
+    };
+    let engine = WebhookEngine::with_config(store.clone(), sup.clone(), cfg);
+    let hook = engine
+        .configure_hook(&vault, trigger, "@Dev")
+        .expect("configurar hook");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(engine.serve(listener));
+
+    let body = br#"{"order":42}"#;
+    let serie = |path: String| async move {
+        let mut out = Vec::new();
+        for _ in 0..6 {
+            let (status, _) = http_post(addr, &path, None, body).await;
+            out.push(status);
+        }
+        out
+    };
+
+    let existente = serie(format!("/hook/{}", hook.hook_id)).await;
+    let inexistente = serie("/hook/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()).await;
+
+    assert_eq!(
+        existente,
+        vec![401, 401, 401, 429, 429, 429],
+        "rota existente: 401 dentro do balde (HMAC ausente), 429 a partir do 4º"
+    );
+    assert_eq!(
+        inexistente,
+        vec![404, 404, 404, 429, 429, 429],
+        "rota inexistente: 404 dentro do balde, 429 a partir do 4º"
+    );
+    let onset = |s: &[u16]| s.iter().position(|&c| c == 429);
+    assert_eq!(
+        onset(&existente),
+        onset(&inexistente),
+        "onset do 429 IDÊNTICO — o orçamento de lixo não discrimina existência (sem oráculo)"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

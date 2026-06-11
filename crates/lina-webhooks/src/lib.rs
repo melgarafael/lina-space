@@ -19,12 +19,18 @@
 //! - **Secret fora do disco.** O secret HMAC vive no Secret Vault (W0-7,
 //!   [`SecretVault::ensure_webhook_secret`]) — nunca no log nem em claro.
 //!
-//! ## Defesa de taxa em DUAS camadas (W5-4-MED-a — ver [`RateLimitConfig`])
+//! ## Defesa de taxa em TRÊS camadas (W5-4-MED-a + F1-6-4/MEDIA-1 — ver [`RateLimitConfig`])
 //! Como o `hook_id` viaja na URL (capability, não segredo), um gate que gaste um recurso escasso
-//! ANTES do HMAC é manipulável por quem só conhece a rota. Por isso:
-//! 1. **Teto bruto por IP** ANTES de tudo — protege a CPU contra flood (inclusive contra forçar o
-//!    cálculo caro de HMAC em massa).
-//! 2. **Budget por hook** SÓ DEPOIS do HMAC passar — protege o budget do dono legítimo; corpo-lixo
+//! COMPARTILHADO antes do HMAC é manipulável por quem só conhece (ou chuta) rotas — e em
+//! loopback/atrás de túnel todo request chega do MESMO IP, então teto "por IP" era na prática
+//! global (starvation, MEDIA-1). Por isso:
+//! 1. **Balde pré-auth POR CHAVE-DE-ROTA** ANTES de tudo — anti-starvation: lixo na rota X só
+//!    esgota o balde de X (contabilidade idêntica p/ rota existente/inexistente; sem oráculo;
+//!    memória O(cap)).
+//! 2. **Teto GLOBAL generoso** em seguida — backstop de CPU contra flood de HMAC em massa
+//!    distribuído por muitas rotas (nenhum campo do cliente decide identidade/orçamento; IP é
+//!    só observabilidade).
+//! 3. **Budget por hook** SÓ DEPOIS do HMAC passar — protege o budget do dono legítimo; corpo-lixo
 //!    sem o secret toma `401` e nunca consome o budget do hook.
 //!
 //! ## Segurança (gate humano — campos controláveis pelo atacante)
@@ -35,7 +41,7 @@
 //! a divergência → **401 sem publicar**. `verify_slice` compara em tempo constante (`subtle`).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,31 +97,51 @@ pub struct WindowLimit {
     pub window: Duration,
 }
 
-/// Rate-limit em **DUAS camadas** (defesa em profundidade — W5-4-MED-a):
-/// - **`ip_burst`** — teto BRUTO por IP de origem, checado ANTES do HMAC. Protege a CPU contra
-///   flood (inclusive contra forçar o cálculo caro de HMAC). Generoso: só barra abuso massivo.
-/// - **`per_hook`** — budget POR `hook_id`, checado SÓ DEPOIS do HMAC passar. Protege o budget do
-///   dono legítimo: como o `hook_id` viaja na URL (não é segredo), corpo-lixo sem o secret toma
-///   `401` e **nunca** consome este budget — caso contrário o vazamento da rota viraria DoS do
-///   budget alheio.
+/// Rate-limit em **TRÊS camadas** (defesa em profundidade — W5-4-MED-a + F1-6-4/MEDIA-1):
+/// - **`pre_auth_per_route`** — balde pré-autenticação **POR CHAVE-DE-ROTA** (o `hook_id` cru da
+///   URL, **exista ou não** — contabilidade idêntica nos dois casos, sem oráculo de existência).
+///   É a camada **anti-starvation** do cenário túnel (F1-6-4): em loopback/atrás de túnel TODO
+///   request chega do mesmo IP, então qualquer teto por-IP é na prática GLOBAL e corpo-lixo
+///   barato derrubaria TODOS os hooks para 429 (MEDIA-1). Particionar o orçamento pela rota
+///   pedida mata a starvation: lixo na rota X só esgota o balde de X. A chave é controlada pelo
+///   cliente, mas isso é seguro POR CONSTRUÇÃO: escolher a chave só decide QUAL balde o próprio
+///   chamador consome — nunca amplia orçamento nem toca o balde de outra rota.
+/// - **`pre_auth_global`** — teto GLOBAL generoso, depois do balde de rota: o backstop de CPU
+///   contra flood massivo de cálculo de HMAC/lookup (herda o papel que o antigo teto "por IP"
+///   exercia de fato). Só conta requests que PASSARAM o balde de rota (os que vão de fato gastar
+///   lookup+HMAC) — lixo já barrado na rota não consome o teto de ninguém.
+/// - **`per_hook`** — budget POR hook, checado SÓ DEPOIS do HMAC passar. Protege o budget do
+///   dono legítimo: corpo-lixo sem o secret toma `401` e **nunca** consome este budget
+///   (W5-4-MED-a, contrato do `a993340`).
 ///
-/// Por construção `ip_burst.max_requests >= per_hook.max_requests` (o teto de CPU é mais largo que
-/// o budget de um hook), mas a corretude não depende disso — as camadas são independentes.
+/// O peer IP segue extraído (observabilidade nos 429 globais) mas NÃO é mais chave de orçamento —
+/// neste listener (loopback-only, invariante #2) ele nunca discriminou clientes.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitConfig {
-    /// Camada 1 (CPU): teto bruto por IP de origem, ANTES do HMAC.
-    pub ip_burst: WindowLimit,
-    /// Camada 2 (budget): teto por hook, DEPOIS do HMAC.
+    /// Camada 1a (anti-starvation): balde pré-auth por chave-de-rota, ANTES do 404/HMAC.
+    pub pre_auth_per_route: WindowLimit,
+    /// Camada 1b (CPU backstop): teto GLOBAL generoso pré-HMAC, após o balde de rota.
+    pub pre_auth_global: WindowLimit,
+    /// Camada 2 (budget do dono): teto por hook, DEPOIS do HMAC.
     pub per_hook: WindowLimit,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            // ~20 req/s por IP: largo para uso local legítimo (vários hooks compartilham o IP de
-            // loopback), estreito o bastante para conter um flood de cálculo de HMAC.
-            ip_burst: WindowLimit {
-                max_requests: 1200,
+            // ~4 req/s sustentados POR ROTA: folga ampla para webhook legítimo (≥2× o budget
+            // pós-HMAC do dono) e teto barato para corpo-lixo numa rota (vazada ou chutada).
+            pre_auth_per_route: WindowLimit {
+                max_requests: 240,
+                window: Duration::from_secs(60),
+            },
+            // Backstop de CPU: só um flood distribuído por MUITAS rotas distintas chega aqui —
+            // e aí o que se protege é a máquina (HMAC em massa), não o orçamento de um hook.
+            // RESIDUAL ASSUMIDO (red-team F1-6-4): quando ESTE teto dispara, TODOS os hooks
+            // tomam 429 na janela — disponibilidade cede para proteger CPU. Volumetria que
+            // atravessa o túnel se mitiga NA camada do túnel (rate-limit do provedor), não aqui.
+            pre_auth_global: WindowLimit {
+                max_requests: 2400,
                 window: Duration::from_secs(60),
             },
             // Budget por hook do dono — preservado mesmo sob flood de corpo-lixo na mesma rota.
@@ -123,6 +149,40 @@ impl Default for RateLimitConfig {
                 max_requests: 120,
                 window: Duration::from_secs(60),
             },
+        }
+    }
+}
+
+/// Cap do mapa de baldes por rota: memória O(cap) INDEPENDENTE do tráfego. Acima do cap (após
+/// reciclar janelas expiradas), chave nova NÃO aloca balde — o request segue só sob o teto
+/// global. Flood de chaves aleatórias não compra alocação ilimitada (e não toca balde alheio).
+const MAX_ROUTE_BUCKETS: usize = 4096;
+
+/// Chave de rota maior que isso não ganha balde próprio (hook_id legítimo tem 32 chars; URLs
+/// gigantes não viram âncora de memória). Regra ESTRUTURAL por tamanho — não revela existência.
+const MAX_ROUTE_KEY_LEN: usize = 64;
+
+/// Throttle da varredura de expirados no mapa de baldes: a varredura O(cap) sob o lock roda no
+/// máximo 1× por este intervalo — o custo POR REQUEST fica O(1) mesmo sob spray de chaves com o
+/// mapa cheio (critério "custo de lookup constante" da F1-6-4). Entre varreduras, chave nova sem
+/// vaga segue ADMITIDA sob o teto global (nunca negada por falta de balde).
+const PURGE_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Baldes pré-auth por chave-de-rota + relógio da última varredura de expirados (throttle).
+struct RouteBuckets {
+    map: HashMap<String, RateWindow>,
+    last_purge: Instant,
+}
+
+impl RouteBuckets {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            // Nasce "vencido" para a 1ª varredura não ser adiada à toa; `checked_sub` cobre
+            // plataformas onde Instant não recua (aí só a 1ª janela de throttle é paga).
+            last_purge: Instant::now()
+                .checked_sub(PURGE_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now),
         }
     }
 }
@@ -238,9 +298,14 @@ struct AppState {
     hooks: Arc<RwLock<HashMap<String, HookBinding>>>,
     store: Arc<dyn DurableLog>,
     supervisor: Arc<Supervisor>,
-    /// Camada 1: contador bruto por IP de origem (protege CPU, antes do HMAC).
-    rate_ip: Arc<Mutex<HashMap<IpAddr, RateWindow>>>,
-    /// Camada 2: budget por `hook_id` (protege o dono, depois do HMAC).
+    /// Camada 1a (anti-starvation, F1-6-4): balde pré-auth por CHAVE-DE-ROTA (exista ou não),
+    /// com cap de entradas ([`MAX_ROUTE_BUCKETS`]) e varredura com throttle — memória O(cap),
+    /// custo por-request O(1), sem oráculo de existência.
+    rate_route: Arc<Mutex<RouteBuckets>>,
+    /// Camada 1b (CPU backstop): janela GLOBAL única pré-HMAC.
+    rate_global: Arc<Mutex<RateWindow>>,
+    /// Camada 2: budget por `hook_id` (protege o dono, depois do HMAC) — só hooks EXISTENTES
+    /// chegam aqui (pós-HMAC), então o mapa é limitado pelo nº de hooks configurados.
     rate_hook: Arc<Mutex<HashMap<String, RateWindow>>>,
     rate_cfg: RateLimitConfig,
 }
@@ -280,7 +345,11 @@ impl WebhookEngine {
                 hooks: Arc::new(RwLock::new(HashMap::new())),
                 store,
                 supervisor,
-                rate_ip: Arc::new(Mutex::new(HashMap::new())),
+                rate_route: Arc::new(Mutex::new(RouteBuckets::new())),
+                rate_global: Arc::new(Mutex::new(RateWindow {
+                    start: Instant::now(),
+                    count: 0,
+                })),
                 rate_hook: Arc::new(Mutex::new(HashMap::new())),
                 rate_cfg,
             },
@@ -400,8 +469,9 @@ impl WebhookEngine {
     /// Router axum do engine (rota `POST /hook/:hook_id` + teto de corpo defensivo de 64 KiB).
     ///
     /// **Sirva via [`WebhookEngine::serve`]** (ou `into_make_service_with_connect_info::<SocketAddr>()`):
-    /// o handler extrai [`ConnectInfo`] para o teto bruto por IP (camada 1). Sem o connect-info o
-    /// extractor falha — por isso o `serve` é o caminho suportado.
+    /// o handler extrai [`ConnectInfo`] do peer para OBSERVABILIDADE dos 429 globais (desde
+    /// F1-6-4 o IP não é mais chave de orçamento — em loopback ele nunca discriminou clientes).
+    /// Sem o connect-info o extractor falha — por isso o `serve` é o caminho suportado.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/hook/:hook_id", post(handle_hook))
@@ -412,7 +482,7 @@ impl WebhookEngine {
     /// Atende o `listener` (criado pelo chamador). Consome o engine. **Enforce do invariante #2**
     /// (local-first): recusa servir se o listener não estiver numa interface loopback — a lib não
     /// confia cegamente no chamador para nunca expor `0.0.0.0`. Injeta o [`ConnectInfo`] do peer
-    /// (IP de origem) para a camada 1 do rate-limit.
+    /// (IP de origem) para observabilidade do rate-limit (não é chave de orçamento — F1-6-4).
     pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<(), WebhookError> {
         if let Ok(addr) = listener.local_addr() {
             ensure_local(addr)?;
@@ -436,10 +506,12 @@ fn ensure_local(addr: std::net::SocketAddr) -> Result<(), WebhookError> {
     }
 }
 
-/// Handler do webhook (`POST /hook/:hook_id`). Ordem das checagens é deliberada (W5-4-MED-a — duas
-/// camadas de rate-limit; ver [`RateLimitConfig`]):
-/// 1. `429` **teto bruto por IP** (camada 1) — ANTES de tudo; protege a CPU contra flood (inclusive
-///    contra forçar o cálculo caro de HMAC em massa).
+/// Handler do webhook (`POST /hook/:hook_id`). Ordem das checagens é deliberada (W5-4-MED-a +
+/// F1-6-4/MEDIA-1 — três camadas de rate-limit; ver [`RateLimitConfig`]):
+/// 1. `429` **balde pré-auth por CHAVE-DE-ROTA** (camada 1a) — ANTES de tudo; anti-starvation:
+///    lixo na rota X só esgota o balde de X; contabilidade idêntica p/ rota existente/inexistente
+///    (sem oráculo); depois `429` **teto GLOBAL generoso** (camada 1b) — backstop de CPU contra
+///    flood de HMAC em massa (nenhum campo do cliente decide identidade/orçamento).
 /// 2. `404` hook desconhecido — rota opaca (capability base32 não-enumerável).
 /// 3. `401` HMAC ausente/inválido — prova posse do secret; sem ela, NÃO se publica nada.
 /// 4. `429` **budget por hook** (camada 2) — SÓ APÓS o HMAC; corpo-lixo sem o secret (que toma 401)
@@ -456,9 +528,19 @@ async fn handle_hook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    // 1. Camada 1 (CPU): teto BRUTO por IP de origem, ANTES de qualquer trabalho caro (lookup,
-    //    cópia do binding, HMAC). É a barreira mais externa contra flood.
-    if !state.allow_ip_burst(peer.ip()) {
+    // 1a. Camada anti-starvation (F1-6-4/MEDIA-1): balde pré-auth POR CHAVE-DE-ROTA, ANTES de
+    //     qualquer trabalho caro (lookup, cópia do binding, HMAC). Contabilidade IDÊNTICA para
+    //     rota existente/inexistente (sem oráculo); custo O(1); lixo na rota X só esgota o balde
+    //     de X — nunca o de um hook legítimo concorrente.
+    if !state.allow_route_budget(&hook_id) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
+    // 1b. Backstop GLOBAL de CPU: só conta o que PASSOU o balde de rota (o que de fato vai gastar
+    //     lookup+HMAC). Estourar aqui exige flood distribuído por muitas rotas — protege a
+    //     máquina, e o peer fica no log (observabilidade; IP NÃO é chave de orçamento).
+    if !state.allow_global_budget() {
+        tracing::warn!(peer = %peer, "teto global pré-auth estourado; 429 (CPU backstop)");
         return StatusCode::TOO_MANY_REQUESTS;
     }
 
@@ -561,9 +643,20 @@ impl AppState {
         }
     }
 
-    /// Camada 1 (CPU): teto BRUTO por IP de origem. `true` se cabe na janela.
-    fn allow_ip_burst(&self, ip: IpAddr) -> bool {
-        allow_window(&self.rate_ip, ip, self.rate_cfg.ip_burst)
+    /// Camada 1a (anti-starvation): balde pré-auth por CHAVE-DE-ROTA. `true` se cabe na janela
+    /// — ou se a chave não ganhou balde (cap/tamanho), caso em que só o teto global freia.
+    fn allow_route_budget(&self, route_key: &str) -> bool {
+        allow_route_window(
+            &self.rate_route,
+            route_key,
+            self.rate_cfg.pre_auth_per_route,
+        )
+    }
+
+    /// Camada 1b (CPU backstop): janela GLOBAL única pré-HMAC. `true` se cabe na janela.
+    fn allow_global_budget(&self) -> bool {
+        let mut w = lock(&self.rate_global);
+        tick_window(&mut w, Instant::now(), self.rate_cfg.pre_auth_global)
     }
 
     /// Camada 2 (budget): teto por hook. `true` se cabe na janela.
@@ -572,8 +665,19 @@ impl AppState {
     }
 }
 
-/// Rate-limit de janela fixa sobre um mapa `chave → janela`. `true` se a requisição cabe na janela
-/// corrente. Genérico sobre a chave para servir as duas camadas (IP e `hook_id`) com uma só lógica.
+/// Avança uma janela fixa: reinicia se expirou, conta a requisição, diz se coube no limite.
+fn tick_window(w: &mut RateWindow, now: Instant, limit: WindowLimit) -> bool {
+    if now.duration_since(w.start) > limit.window {
+        w.start = now;
+        w.count = 0;
+    }
+    w.count += 1;
+    w.count <= limit.max_requests
+}
+
+/// Rate-limit de janela fixa sobre um mapa `chave → janela`. `true` se a requisição cabe na
+/// janela corrente. Usado pela camada pós-HMAC (`rate_hook`), cujo domínio de chaves é limitado
+/// pelos hooks CONFIGURADOS (só rota existente + HMAC válido chega lá) — sem cap necessário.
 fn allow_window<K: Eq + std::hash::Hash>(
     map: &Mutex<HashMap<K, RateWindow>>,
     key: K,
@@ -585,12 +689,47 @@ fn allow_window<K: Eq + std::hash::Hash>(
         start: now,
         count: 0,
     });
-    if now.duration_since(w.start) > limit.window {
-        w.start = now;
-        w.count = 0;
+    tick_window(w, now, limit)
+}
+
+/// Balde pré-auth por chave-de-rota (F1-6-4) com memória LIMITADA — as garantias, em ordem:
+/// 1. **Sem oráculo:** chave existente e inexistente percorrem o MESMO caminho (lookup O(1) no
+///    mapa + mesma janela/limite) — o orçamento de lixo não revela se o hook existe.
+/// 2. **Memória O(cap) e custo por-request O(1):** chave nova só aloca balde se houver vaga
+///    ([`MAX_ROUTE_BUCKETS`]) e se a chave for plausível ([`MAX_ROUTE_KEY_LEN`]); a varredura de
+///    expirados que abre vaga é O(cap), mas roda com THROTTLE ([`PURGE_MIN_INTERVAL`]) — spray
+///    de chaves com o mapa cheio não compra varredura por request. Sem vaga → `true` SEM alocar:
+///    o request segue apenas sob o teto global (backstop) — flood de chaves aleatórias não
+///    compra memória nem toca balde alheio.
+/// 3. **Partição por construção:** a chave é escolhida pelo cliente, mas só decide QUAL balde o
+///    próprio chamador consome — nunca amplia orçamento nem drena o de outra rota.
+fn allow_route_window(buckets: &Mutex<RouteBuckets>, route_key: &str, limit: WindowLimit) -> bool {
+    let now = Instant::now();
+    let mut b = lock(buckets);
+    if let Some(w) = b.map.get_mut(route_key) {
+        return tick_window(w, now, limit);
     }
-    w.count += 1;
-    w.count <= limit.max_requests
+    if route_key.len() > MAX_ROUTE_KEY_LEN {
+        return true; // chave implausível não vira âncora de memória; teto global cobre
+    }
+    if b.map.len() >= MAX_ROUTE_BUCKETS {
+        if now.duration_since(b.last_purge) < PURGE_MIN_INTERVAL {
+            return true; // sem vaga e sem varredura AGORA (throttle): O(1); teto global cobre
+        }
+        b.last_purge = now;
+        b.map
+            .retain(|_, w| now.duration_since(w.start) <= limit.window);
+        if b.map.len() >= MAX_ROUTE_BUCKETS {
+            return true; // mapa cheio de janelas VIVAS: sem balde novo; teto global cobre
+        }
+    }
+    let mut w = RateWindow {
+        start: now,
+        count: 0,
+    };
+    let allowed = tick_window(&mut w, now, limit);
+    b.map.insert(route_key.to_string(), w);
+    allowed
 }
 
 /// Resolve o `target_ref` (endereço A2A) em um [`Recipient`], reusando o parser canônico do core
@@ -861,7 +1000,11 @@ mod tests {
             hooks: Arc::new(RwLock::new(hooks)),
             store: Arc::new(FailingLog),
             supervisor: sup.clone(),
-            rate_ip: Arc::new(Mutex::new(HashMap::new())),
+            rate_route: Arc::new(Mutex::new(RouteBuckets::new())),
+            rate_global: Arc::new(Mutex::new(RateWindow {
+                start: Instant::now(),
+                count: 0,
+            })),
             rate_hook: Arc::new(Mutex::new(HashMap::new())),
             rate_cfg: RateLimitConfig::default(),
         };
@@ -1145,6 +1288,102 @@ mod tests {
             publicado,
             "a publicação no bus NÃO pode se perder quando o cliente desconecta durante o \
              append (desfecho roda em task própria, imune ao drop do handler)"
+        );
+    }
+
+    /// F1-6-4 (memória O(cap) + custo O(1)): o mapa de baldes por rota NUNCA cresce além do cap
+    /// — chave nova com o mapa cheio de janelas vivas NÃO aloca (e é admitida: o teto global é o
+    /// freio dela); janelas EXPIRADAS são recicladas para abrir vaga, mas a varredura O(cap)
+    /// roda com throttle ([`PURGE_MIN_INTERVAL`]). Usa o helper direto (o cap real,
+    /// `MAX_ROUTE_BUCKETS`, só muda a constante — a mecânica é a mesma).
+    #[test]
+    fn baldes_por_rota_tem_memoria_limitada_e_reciclam_expirados() {
+        let buckets = Mutex::new(RouteBuckets::new());
+        // Janela mais curta que o throttle: após dormir > PURGE_MIN_INTERVAL, tudo expirou E a
+        // varredura está liberada — provamos reciclagem sem relógio falso.
+        let limit = WindowLimit {
+            max_requests: 100,
+            window: Duration::from_millis(30),
+        };
+
+        // Enche o mapa até o cap (chaves curtas e distintas).
+        for i in 0..MAX_ROUTE_BUCKETS {
+            assert!(allow_route_window(&buckets, &format!("K{i}"), limit));
+        }
+        assert_eq!(lock(&buckets).map.len(), MAX_ROUTE_BUCKETS, "mapa no cap");
+
+        // Mapa cheio de janelas VIVAS: chave nova é admitida SEM alocar balde (a 1ª tentativa
+        // pode até varrer — throttle nasce vencido — mas nada expirou ainda; as seguintes nem
+        // varrem). Duas tentativas seguidas provam os dois caminhos (com e sem varredura).
+        for tentativa in 0..2 {
+            assert!(
+                allow_route_window(&buckets, "CHAVE-NOVA-SEM-VAGA", limit),
+                "sem vaga (tentativa {tentativa}), a chave nova segue só sob o teto global"
+            );
+        }
+        assert_eq!(
+            lock(&buckets).map.len(),
+            MAX_ROUTE_BUCKETS,
+            "cap respeitado: nada alocado acima do limite (flood de chaves não compra memória)"
+        );
+
+        // Janelas expiram E o throttle libera → a próxima chave nova RECICLA e ganha balde.
+        std::thread::sleep(PURGE_MIN_INTERVAL + Duration::from_millis(100));
+        assert!(allow_route_window(&buckets, "CHAVE-POS-EXPIRACAO", limit));
+        let b = lock(&buckets);
+        assert!(
+            b.map.len() <= MAX_ROUTE_BUCKETS && b.map.contains_key("CHAVE-POS-EXPIRACAO"),
+            "expirados reciclados e a chave nova ganhou balde (len={})",
+            b.map.len()
+        );
+    }
+
+    /// F1-6-4 (âncora de memória): chave de rota implausível (maior que hook_id legítimo) não
+    /// ganha balde — segue admitida sob o teto global. Regra ESTRUTURAL por tamanho, não por
+    /// existência: não há sinal de oráculo aqui.
+    #[test]
+    fn chave_de_rota_gigante_nao_vira_ancora_de_memoria() {
+        let buckets = Mutex::new(RouteBuckets::new());
+        let limit = WindowLimit {
+            max_requests: 3,
+            window: Duration::from_secs(60),
+        };
+        let gigante = "X".repeat(MAX_ROUTE_KEY_LEN + 1);
+        for _ in 0..10 {
+            assert!(
+                allow_route_window(&buckets, &gigante, limit),
+                "chave gigante é admitida (teto global cobre), nunca negada por este balde"
+            );
+        }
+        assert!(
+            lock(&buckets).map.is_empty(),
+            "chave gigante NÃO aloca balde (memória não cresce com URLs enormes)"
+        );
+    }
+
+    /// F1-6-4 (simetria anti-oráculo, nível unitário): a mecânica do balde é IDÊNTICA para
+    /// qualquer chave — mesmo limite, mesmo onset de recusa — não importa se a rota existe no
+    /// engine (o helper nem tem acesso ao roster de hooks; a prova E2E está no teste de
+    /// integração `orcamento_de_lixo_nao_revela_existencia_de_hook`).
+    #[test]
+    fn balde_por_rota_e_simetrico_para_qualquer_chave() {
+        let buckets = Mutex::new(RouteBuckets::new());
+        let limit = WindowLimit {
+            max_requests: 3,
+            window: Duration::from_secs(60),
+        };
+        let onset = |key: &str| -> usize {
+            for i in 1..=10 {
+                if !allow_route_window(&buckets, key, limit) {
+                    return i;
+                }
+            }
+            11
+        };
+        assert_eq!(
+            onset("ROTA-A"),
+            onset("ROTA-B"),
+            "onset de recusa idêntico para chaves distintas (mesma janela/limite)"
         );
     }
 }

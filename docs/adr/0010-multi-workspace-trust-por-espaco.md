@@ -71,3 +71,31 @@ a fonte canônica até lá.
 - **Um processo por workspace** — contraria a stack decidida (processo único Rust, doc `31`).
 - **Allow-list cross-workspace configurável já na F1** — reabre exatamente o buraco que
   este ADR fecha, sem caso de uso que o justifique.
+
+---
+
+## Addendum (2026-06-10) — storage da F1-4-1 supersede o §3 (campo `workspace_id` por-evento)
+
+Pedido pelo dono da F1-4-1 (Especialista em Dados) ao fechar a story em `08bbb92`; registrado
+pelo Arquiteto na rodada 2. O §3 acima previa "eventos com `workspace_id` aditivo". A F1-4-1
+decidiu e implementou **(b) um event store POR Espaço** (`<root>/.lina/events`; mini-ADR de
+storage na entrega da story e na mensagem do commit):
+
+1. **O pertencimento de um evento a um Espaço é dado pelo STORE em que ele vive** (isolamento
+   físico), e não por campo `workspace_id` por-evento. O campo do §3 fica **superseded
+   mecanicamente**: não é introduzido nos eventos; replay de logs antigos segue intacto
+   (nenhum log legado carregava o campo — não há upcast a fazer).
+2. **§1 e §2 PERMANECEM válidos e pendentes de story:** o namespace `workspace_id` no
+   Supervisor/roster (o broker é um por processo — o namespace LÓGICO continua necessário
+   mesmo com stores físicos separados), a `WorkspaceTrust` por Espaço re-derivada a cada
+   entrega e o **default-deny cross-workspace** seguem o desenho aceito deste ADR
+   (operacionalizado no ADR 0027, selado na mesma data).
+3. **Autoridade sobre o ESTADO de cada Espaço = o log do próprio Espaço.** Os fatos (id, nome,
+   path, arquivado) são re-deriváveis do store do Espaço; o registry global
+   (`~/.lina/workspaces.json`) é **ponteiro de boot re-derivável** (merge-por-id + fsync +
+   `open_verified` anti-adulteração — F1-4-1), **nunca autoridade** (invariante #4; mesmo
+   princípio "registry é ponteiro" do `r1-dados.md`/ADR 0027). Precisão honesta: a ESCOLHA de
+   qual Espaço abre primeiro (`last_focus`) é **conveniência exclusiva do ponteiro** ("nasce
+   0", `workspace.rs`) — não há evento de foco no log hoje; perder o registry perde no máximo
+   "qual abre primeiro", nunca um fato de Espaço. Se o foco um dia precisar ser fato auditável,
+   é evento aditivo novo (story própria), não promoção do registry a autoridade.

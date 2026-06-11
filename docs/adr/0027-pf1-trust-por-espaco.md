@@ -1,23 +1,26 @@
 # ADR 0027 — PF-1 operacional: allow-list e fronteira de confiança POR Espaço (F1-4-2)
 
-- **Status:** **Proposto (DRAFT)** — selo final condicionado ao fechamento da F1-4-1 (modelo de
-  Espaço em construção nesta rodada, despacho `r1-dados.md`); os testes dos critérios 2–4 da
-  story são do dono da F1-4-2 (dev02), não deste draft.
+- **Status:** **Aceito** (selado 2026-06-10 — a condição do draft cumpriu-se: a F1-4-1 fechou
+  em `08bbb92` com a decisão de storage **(b) um-store-por-Espaço**, confirmando o desenho;
+  draft revisado adversarialmente na rodada 1, selo na rodada 2 por ordem do Maestro). Os
+  testes dos critérios 2–4 da story F1-4-2 permanecem **critérios da STORY** (dono: dev02) —
+  gate da story, não deste registro.
 - **Onda/Story:** F1-4 · F1-4-2 (porta PF-1 do esqueleto do Épico F1)
 - **Data:** 2026-06-10
 - **Fontes:** ADR 0006 (default-deny por pertencimento) · ADR 0007 (origem vs cascata; `hops`
   não-forjável) · **ADR 0010** (decisão macro: namespace por Espaço, cross-workspace deny-all —
   este ADR a OPERACIONALIZA, não a reabre) · ADR 0004 (gate humano/custódia como backstop) ·
   `tasks/epico-f1/ondas-2-4.md` linhas 183-199 (story F1-4-2) · `tasks/despachos/r1-dados.md`
-  (decisões do Maestro p/ F1-4-1: um-store-por-Espaço como inclinação; registry = ponteiro;
-  pré-aviso do bug de identidade `LINA_NODE_ID`).
+  (decisões do Maestro p/ F1-4-1: um-store-por-Espaço — inclinação no despacho, CONFIRMADA como
+  decisão (b) no fechamento `08bbb92`; registry = ponteiro; pré-aviso do bug de identidade
+  `LINA_NODE_ID`, fechado em `162a15a`/ADR 0026).
 
 ## Contexto
 
 O ADR 0010 já decidiu o **quê**: namespace `workspace_id` no Supervisor/roster, trust derivado
-POR Espaço, **default-deny cross-workspace sem exceções na F1**. A F1-4-1 (em execução paralela)
-constrói o modelo de Espaço. Falta o **como** operacional — e é isso que a porta PF-1 exige
-registrado ANTES de o multi-workspace abrir a superfície nova:
+POR Espaço, **default-deny cross-workspace sem exceções na F1**. A F1-4-1 construiu o modelo de
+Espaço (fechada em `08bbb92` — um store por Espaço). Faltava o **como** operacional — e é isso
+que a porta PF-1 exige registrado ANTES de o multi-workspace abrir a superfície nova:
 
 1. O que exatamente é "trust de um Espaço" e o que sobrevive a fechar/reabrir o app;
 2. Como a allow-list de ações sensíveis de W4-3 ("confirmação humana para A2A sensível")
@@ -64,12 +67,13 @@ registrado ANTES de o multi-workspace abrir a superfície nova:
 - **Não reabre o ADR 0006:** a matriz de pares de injeção continua efêmera e derivada do roster
   vivo — a allow-list por Espaço decide *o que precisa de humano*, nunca *quem pode falar com
   quem* (isso segue sendo pertencimento ao Espaço, por construção).
-- Allow-list de um Espaço **não tem efeito** em nenhum outro Espaço (escopo é o store do Espaço;
-  alinha com a inclinação um-store-por-Espaço do `r1-dados.md` — isolamento físico = isolamento
-  de falha E de política). **Independência de layout:** a decisão de storage da F1-4-1 está
-  ABERTA (a inclinação (b) pode perder para o log único particionado por `workspace_id`); se a
-  F1-4-1 fechar no layout (a), leia "store do Espaço" neste ADR como **partição/namespace do
-  Espaço** — as REGRAS (escopo da allow-list; negação no log do remetente) não mudam.
+- Allow-list de um Espaço **não tem efeito** em nenhum outro Espaço (escopo é o store do
+  Espaço — isolamento físico = isolamento de falha E de política). **Layout DECIDIDO no selo:**
+  a F1-4-1 fechou em `08bbb92` no layout **(b)** — um event store por Espaço
+  (`<root>/.lina/events`), registry `~/.lina/workspaces.json` como ponteiro re-derivável.
+  "Store do Espaço" neste ADR é, portanto, literal. (As REGRAS sempre foram
+  layout-independentes; o campo `workspace_id` por-evento do ADR 0010 §3 ficou superseded —
+  ver Addendum no fim do ADR 0010.)
 
 ### (c) Cross-Espaço: deny-all por default; exceção futura = opt-in explícito auditável
 
@@ -93,10 +97,14 @@ registrado ANTES de o multi-workspace abrir a superfície nova:
   política derivam a matriz **do roster escopado** pelo Espaço do nó remetente. O tipo
   `WorkspaceTrust` em si **não muda** (continua matriz de pares efêmera); muda a FONTE dos
   membros. Re-derivação a cada entrega preservada (ADR 0006).
-- Sequência segura: (1) F1-4-1 introduz `workspace_id` no roster; (2) call-sites trocam
-  `live_member_ids` → `live_members(ws)`; (3) red-team cross-workspace (ADR 0010 §5) roda como
-  gate. Enquanto (1) não fecha, o comportamento atual é o degenerado correto (1 Espaço = roster
-  global ≡ roster do Espaço).
+- Sequência segura: (1) **o namespace `workspace_id` no roster do Supervisor é story PENDENTE**
+  — a F1-4-1 (fechada em `08bbb92`) entregou o STORAGE por Espaço, não o roster com namespace;
+  o ADR 0010 §1 permanece desenho aceito aguardando implementação (ver Addendum do 0010, item
+  2); (2) com o namespace no roster, os call-sites trocam `live_member_ids` →
+  `live_members(ws)`; (3) red-team cross-workspace (ADR 0010 §5) roda como gate. Enquanto (1)
+  não existe, o comportamento atual é o degenerado correto do workspace único (1 Espaço =
+  roster global ≡ roster do Espaço) — e a fiação multi-Espaço no app NÃO deve ligar 2 Espaços
+  simultâneos com terminais vivos antes de (1)+(2) fecharem.
 - `hops`/anti-cascata (ADR 0007) é **ortogonal e por Espaço**: o binding `delivered_root` já é
   interno ao supervisor; com namespace, cadeia causal nunca atravessa Espaços (não há entrega
   cross-Espaço para criar binding).
@@ -135,7 +143,7 @@ não é relaxado por Espaço `trusted` para ações irreversíveis.
 - **Permitir exceção cross-Espaço já na F1** ("só leitura", "só status"): reabre o buraco que o
   ADR 0010 fechou sem caso de uso; qualquer ponte futura exige ADR próprio.
 
-## Evidências pendentes para o selo (saem do DRAFT com a F1-4-1 fechada)
+## Critérios delegados à story F1-4-2 (gate da STORY — o selo deste ADR não os antecipa)
 
 1. Teste: Espaço novo nasce `untrusted`; só gesto humano promove; evento auditável no replay.
 2. Teste adversarial: nenhum campo controlável por agente altera trust/allow-list (INV-1).
