@@ -3897,9 +3897,19 @@ impl NodeManager {
         // `NodeAdded` — a correção é durável, não cosmética.
         let mut taken_slots: std::collections::BTreeSet<(i64, i64)> =
             std::collections::BTreeSet::new();
-        for plan in plans {
-            let slot = (plan.x.round() as i64, plan.y.round() as i64);
-            let position = taken_slots.insert(slot).then_some((plan.x, plan.y));
+        // DUAS PASSADAS (tela do fundador 2026-06-11 ~15h30 — J/S, #27/#29, #32/#33 re-empilhados):
+        // `next_free_slot` lê o MODELO, que só contém os cards já admitidos — realocar um card
+        // ANTES de admitir os que mantêm coordenada deixava o slot "livre" cair exatamente em
+        // cima da coordenada de um card ainda por entrar. Quem MANTÉM posição entra primeiro;
+        // os realocados entram depois, quando todas as coordenadas mantidas já estão no modelo.
+        let (kept, relocated): (Vec<&RestoredTerminal>, Vec<&RestoredTerminal>) = plans
+            .iter()
+            .partition(|p| taken_slots.insert((p.x.round() as i64, p.y.round() as i64)));
+        for (plan, position) in kept
+            .into_iter()
+            .map(|p| (p, Some((p.x, p.y))))
+            .chain(relocated.into_iter().map(|p| (p, None)))
+        {
             // Comando do restore → motor (mesmo caminho do M6): `[program, args…]` do perfil,
             // já com o verbo de resume quando o badge observou sessão anterior. Vazio = shell
             // puro (fábrica do workspace).
@@ -10826,6 +10836,63 @@ mod tests {
         assert!(
             posicoes.contains(&(30, 96)),
             "o primeiro ocupante mantém a coordenada original"
+        );
+    }
+
+    /// **Bug da tela 2026-06-11 ~15h30 (rodada 2 — J/S, #27/#29, #32/#33):** o realocado era
+    /// admitido ANTES dos cards que mantêm coordenada → `next_free_slot` (que só vê o modelo)
+    /// entregava exatamente a coordenada de um card ainda por entrar. Duas passadas: quem
+    /// mantém entra primeiro; realocados depois — nunca caem em coordenada mantida.
+    #[test]
+    fn restore_relayout_never_lands_on_a_kept_coordinate() {
+        let (nm, store, model) = test_manager("restore-colisao-futura", None);
+        // A e B empilhados em (30,96); D — DEPOIS deles no plano — mantém (740,96), que é
+        // exatamente o 1º slot que `next_free_slot` daria a B na ordem antiga.
+        for (id, name, x, y) in [
+            (21_u128, "Card A", 30.0, 96.0),
+            (22, "Card B", 30.0, 96.0),
+            (23, "Card D", 740.0, 96.0),
+        ] {
+            seed_terminal(
+                &mut lock(&store),
+                NodeId::from_u128(id),
+                x,
+                y,
+                name,
+                "terminal",
+                "Shell",
+                None,
+            );
+        }
+        let proj = lock(&store).project().expect("project");
+        let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
+        assert_eq!(plans.len(), 3);
+        assert_eq!(nm.restore_terminals(&plans), 3);
+
+        let m = lock(&model);
+        let mut posicoes: Vec<(i64, i64)> = m
+            .nodes
+            .values()
+            .filter(|v| v.name.starts_with("Card "))
+            .map(|v| (f64::from(v.x).round() as i64, f64::from(v.y).round() as i64))
+            .collect();
+        posicoes.sort_unstable();
+        let antes = posicoes.len();
+        posicoes.dedup();
+        assert_eq!(
+            posicoes.len(),
+            antes,
+            "nenhum realocado caiu em coordenada mantida: {posicoes:?}"
+        );
+        let d = m
+            .nodes
+            .values()
+            .find(|v| v.name == "Card D")
+            .expect("Card D vivo");
+        assert_eq!(
+            (f64::from(d.x).round() as i64, f64::from(d.y).round() as i64),
+            (740, 96),
+            "quem mantém coordenada NÃO é movido pelo realocado"
         );
     }
 
