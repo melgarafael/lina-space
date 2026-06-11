@@ -58,5 +58,12 @@
 - **Item 14:** ✅ **RATIFICADO pelo Maestro (2026-06-10):** `SkillPinned`/`absorbed_into`
   adiados para F2 — consistente com o sugere-nunca-aplica (v0 não tem verbo de mutação; pin é
   opt-out de mutação que ainda não existe).
-- **Itens 6-8 (pendências de story):** em execução na sessão de fechamento da F1 (A/B doutrina ·
-  3-CLI real · breaker 2×/anti-race).
+- **Item 6 (A/B cego da doutrina):** ✅ **FECHADO 2026-06-11** — COM 5×1 SEM, score médio
+  92,2×79,5; o braço SEM reprovou na rubrica em 3/6 (DES-4 ×2, COP-2 ×1); zero ALTA no braço
+  COM. Relatório: `ab-doutrina-resultado.md`.
+- **Item 7 (portabilidade 3-CLI):** ✅ fechado no nível possível — bug REAL achado e corrigido
+  (Codex rejeitava as 11 skills, descriptions >1024 → `63d4e6b` + teste guardião) · ativação
+  cega re-validada pós-encurtamento: **66/66 (100%)**, 3 juízes cegos × 22 frases (workflow
+  `wf_e5334b6f`) · transcript Codex COMPLETO pendente de conta OpenAI (volta 09/jul) e Gemini
+  pendente de auth — limitação de AMBIENTE, registrada, não de produto.
+- **Item 8 (breaker 2×/anti-race):** em execução (Revisor, rodada 2 — `r2-revisor.md`).
