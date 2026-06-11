@@ -40,6 +40,7 @@ use crate::{agent_modal, dashboard, obsidian, persistence_ui, wiring, workspace_
 /// Infra POR-PROCESSO: o que os N runtimes compartilham. `PtyManager` é dono dos processos do
 /// SO (um só por app); a fábrica de shell e as dimensões do grid valem para todo Espaço. O tema
 /// também é global, mas é APLICADO no `main` (antes de qualquer janela) — fica fora daqui.
+#[derive(Clone)]
 pub struct SharedInfra {
     pub pty: Arc<Mutex<PtyManager>>,
     pub cmd_factory: CmdFactory,
@@ -66,18 +67,105 @@ pub struct WsRuntime {
     pub desk: Desk,
     /// W4-3: freio por Espaço (pausa num Espaço não pausa outro — spec M8 §escopo).
     pub brake: wiring::Brake,
+    #[allow(dead_code)] // lido por `point_to_active` (main) quando a sidebar T4 montar.
     pub autonomy: Autonomy,
     /// F1-0-2: o perfil de injeção REAL do boot (fallback dos alvos sem `profile_id`).
     pub injection_profile: CliProfile,
     pub profile_registry: Arc<ProfileRegistry>,
     /// M8 fatia (i) — listener de hooks DO runtime (1 por Espaço, porta efêmera própria);
     /// `None` = perfil sem capability `hooks` ou bind falhou (degradação limpa, como antes).
+    #[allow(dead_code)] // handle de POSSE (mantém o listener vivo) — como os `_pump`s.
     pub hooks: Option<Arc<HooksShared>>,
-    pub dash: dashboard::DashWiring,
+    /// `Arc` (fatia ii): a view re-aponta para o dash do runtime ATIVO no switch — o wiring
+    /// continua sendo alimentado pelas threads do runtime mesmo com o Espaço de fundo.
+    pub dash: Arc<dashboard::DashWiring>,
     /// Dreno por-runtime (veredito §1): consome delta/bus e alimenta meter+watch — VIVO sempre.
     pub _pump: Pump,
     pub _mailbox_pump: JoinHandle<()>,
     pub _broker_pump: JoinHandle<()>,
+}
+
+/// F1-4-4 fatia (ii) — o processo hospeda N runtimes: raiz→runtime + qual está ATIVO.
+/// Compartilhado entre a view (troca/leitura do ativo) e o epílogo do `main` (parada limpa).
+pub struct RuntimeMap {
+    pub map: BTreeMap<PathBuf, WsRuntime>,
+    #[allow(dead_code)] // lido pelo switch da view (sidebar T4 — mesma rodada).
+    pub active: PathBuf,
+}
+
+pub type Runtimes = Arc<Mutex<RuntimeMap>>;
+
+/// Embrulha o runtime do boot como o ATIVO inicial do processo.
+#[must_use]
+pub fn runtimes_with_boot(rt: WsRuntime) -> Runtimes {
+    let active = rt.ws_root.clone();
+    let mut map = BTreeMap::new();
+    map.insert(active.clone(), rt);
+    Arc::new(Mutex::new(RuntimeMap { map, active }))
+}
+
+/// **O switch vivo do M8.** Garante o runtime do alvo MONTADO (boot sob demanda + restore
+/// F1-4-3 dele, dentro do `boot_ws_runtime`) e o marca ATIVO. Os PIDs do Espaço que sai de
+/// cena NÃO são tocados (decisão do fundador: fundos VIVOS — pumps/PTYs seguem). Durável:
+/// apenda `WorkspaceFocusSet` no log do ALVO (F1-4-4 crit 1) + carimba o foco no ponteiro
+/// global (`focus_target_workspace` — o PRÓXIMO boot abre o alvo). `Err` NÃO troca nada —
+/// o Espaço atual segue na tela (inv#6; a sidebar mostra a linha-⚠ do alvo).
+#[allow(dead_code)] // chamado por `WorkspaceView::switch_to_workspace` (sidebar T4 — mesma rodada).
+pub fn activate_workspace(
+    rts: &Runtimes,
+    target_root: PathBuf,
+    shared: &SharedInfra,
+) -> Result<(), String> {
+    let mut r = lock(rts);
+    if r.active == target_root && r.map.contains_key(&target_root) {
+        return Ok(());
+    }
+    if !r.map.contains_key(&target_root) {
+        let rt = boot_ws_runtime(target_root.clone(), shared, false)?;
+        r.map.insert(target_root.clone(), rt);
+    }
+    // Log do ALVO = fonte da verdade da troca (projeção `focused_workspace` daquele Espaço).
+    if let Some(rt) = r.map.get(&target_root) {
+        let name = lock(&rt.store)
+            .project()
+            .ok()
+            .and_then(|p| p.workspace_name)
+            .unwrap_or_else(|| {
+                target_root
+                    .file_name()
+                    .map_or_else(|| "Meu Espaço".into(), |n| n.to_string_lossy().into_owned())
+            });
+        if let Err(e) =
+            lock(&rt.store).append(&lina_core::DomainEvent::WorkspaceFocusSet { workspace: name })
+        {
+            eprintln!("lina-gpui: [WS] troca sem WorkspaceFocusSet no log do alvo ({e}); seguindo");
+        }
+    }
+    // Carimbo durável no ponteiro global — best-effort (inv#6): falha loga e a troca segue.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match lina_core::default_registry_path().map(lina_core::WorkspaceRegistry::load) {
+        Some(Ok(mut reg)) => {
+            if let Err(e) = workspace_boot::focus_target_workspace(&target_root, &mut reg, now_ms) {
+                eprintln!(
+                    "lina-gpui: [WS] carimbo de foco no ponteiro global falhou ({e}); seguindo"
+                );
+            }
+        }
+        _ => eprintln!("lina-gpui: [WS] ponteiro global indisponível na troca; seguindo"),
+    }
+    r.active = target_root;
+    Ok(())
+}
+
+/// Epílogo do processo: para o dreno de TODOS os runtimes (o `main` chama após `app.run`).
+pub fn stop_all(rts: &Runtimes) {
+    let mut r = lock(rts);
+    for rt in r.map.values_mut() {
+        rt._pump.stop();
+    }
 }
 
 /// R2b: `LINA_ATTENTION_DEMO` setado = teatro determinístico do fundador — o loop
@@ -230,10 +318,11 @@ pub fn boot_ws_runtime(
             mailbox_dir.display()
         );
     }
-    // M8 fatia (i): `set_var` GLOBAL mantido (1 runtime = comportamento idêntico ao boot inline).
-    // Costura para N Espaços (veredito §3): LINA_HOME POR spawn via `node_identity_env`, removendo
-    // este global SÓ quando o audit dos leitores in-process zerar — não nesta fatia.
-    std::env::set_var("LINA_HOME", &mailbox_dir);
+    // F1-4-4 fatia (ii) — LINA_HOME é POR SPAWN (`node_identity_env`, veredito §3): cada
+    // terminal nasce apontando para o `.lina` do SEU Espaço. O `set_var` global foi REMOVIDO:
+    // auditoria 2026-06-11 = zero leitores in-process no app (únicas ocorrências eram este
+    // setter e uma allowlist de teste), e com N runtimes o global apontaria sempre para o
+    // último Espaço bootado — spawns do Espaço A nasceriam com o `.lina` de B.
     // O segundo cérebro (onboarding) grava o vault escolhido em `.lina/vault.json`. Se houver um
     // `primary`, ele tem prioridade — reflete a escolha REAL do usuário e faz `{{vault_writable_paths}}`/
     // `{{vault_tino_path}}` apontarem pro vault linkado na próxima reescrita do bootstrap. Senão, cai no
@@ -265,8 +354,10 @@ pub fn boot_ws_runtime(
     // própria; os kits do Espaço apontam pra porta do SEU runtime) — isolamento por OBJETO
     // DISTINTO (princípio da proposta §2); colisão de nome entre Espaços fica impossível por
     // construção. Com 1 runtime, comportamento idêntico ao listener único de antes.
-    let dash =
-        dashboard::DashWiring::new(injection_profile.id.clone(), ws_root.display().to_string());
+    let dash = Arc::new(dashboard::DashWiring::new(
+        injection_profile.id.clone(),
+        ws_root.display().to_string(),
+    ));
     let hooks = if injection_profile.capabilities.has("hooks") {
         if let Some(hooks) = HooksShared::start() {
             if let Some(bw) = bootstrap.as_mut() {

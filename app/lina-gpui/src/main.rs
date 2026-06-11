@@ -502,7 +502,16 @@ struct WorkspaceView {
     /// F1-1-5 (P6/fluxo c): painel "Atividade e custos" aberto? (toggle pela paleta).
     dashboard_open: bool,
     /// F1-1-5: fios vivos do dashboard (timeline de hooks + sessões + identidades).
-    dash: dashboard::DashWiring,
+    /// `Arc` (F1-4-4 fatia ii): re-apontado pelo switch para o dash do runtime ATIVO.
+    dash: Arc<dashboard::DashWiring>,
+    /// F1-4-4 fatia (ii): TODOS os runtimes do processo (fundos VIVOS) + qual está ativo.
+    /// A view cacheia os handles do ativo (campos acima); o switch os re-aponta.
+    /// `dead_code` até a SIDEBAR (T4) montar e chamar `switch_to_workspace` — mesma rodada.
+    #[allow(dead_code)]
+    runtimes: runtime::Runtimes,
+    /// Infra por-processo (PTY/fábrica/dims) para montar runtime sob demanda na troca.
+    #[allow(dead_code)] // ver nota em `runtimes` (consumido pela costura da sidebar T4).
+    shared: runtime::SharedInfra,
     /// F1-1-5 (sonda `[DASH]`): último `ts` de hook reportado por nó — loga a latência
     /// evento→card 1× por evento (na MUDANÇA), sem spammar o stderr a 60fps.
     dash_lat_reported: BTreeMap<String, u64>,
@@ -563,9 +572,11 @@ impl WorkspaceView {
         focused: NodeId,
         desk: Desk,
         brake: wiring::Brake,
-        dash: dashboard::DashWiring,
+        dash: Arc<dashboard::DashWiring>,
         attention: Arc<AttentionHub>,
         settings_dir: PathBuf,
+        runtimes: runtime::Runtimes,
+        shared: runtime::SharedInfra,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -678,8 +689,81 @@ impl WorkspaceView {
             attention_settings_at: None,
             attention_diag_last: String::new(),
             settings_dir,
+            runtimes,
+            shared,
             prof: prof::Probe::from_env(),
         }
+    }
+
+    // ──────────────────── F1-4-4 · troca VIVA de Espaço (fatia ii do M8) ────────────────────
+
+    /// Troca o Espaço ATIVO: monta o alvo sob demanda (boot + restore F1-4-3 dele), carimba o
+    /// foco durável (log do alvo + ponteiro global) e re-aponta a view. Os PIDs do Espaço que
+    /// sai NÃO são tocados (decisão do fundador: fundos VIVOS — pumps/PTYs/threads seguem).
+    /// Falha NÃO troca nada: o Espaço atual segue na tela (inv#6).
+    #[allow(dead_code)] // ver nota em `runtimes` (chamado pela sidebar T4 — mesma rodada).
+    fn switch_to_workspace(&mut self, target_root: PathBuf, cx: &mut Context<Self>) {
+        if lock(&self.runtimes).active == target_root {
+            return;
+        }
+        let t0 = Instant::now();
+        if let Err(e) =
+            runtime::activate_workspace(&self.runtimes, target_root.clone(), &self.shared)
+        {
+            eprintln!(
+                "lina-gpui: [WS] troca para {} falhou ({e}); permanecendo no Espaço atual",
+                target_root.display()
+            );
+            return;
+        }
+        self.point_to_active();
+        // F1-4-4 crit 1 (<1s): o log diz quanto a troca levou — validação por DADOS.
+        eprintln!(
+            "lina-gpui: [WS] troca para {} em {:?} (PIDs preservados — fundos vivos)",
+            target_root.display(),
+            t0.elapsed()
+        );
+        cx.notify();
+    }
+
+    /// Re-aponta os handles cacheados da view para o runtime ATIVO e re-deriva o estado de UI
+    /// POR-Espaço (câmera/z-order/seleção/fila resetam; o render re-aponta o foco ao 1º card —
+    /// "nunca tela em branco"). Ativo ausente do mapa = impossível por construção
+    /// (`runtimes_with_boot`/`activate_workspace` inserem antes de apontar); degrada com log.
+    #[allow(dead_code)] // ver nota em `runtimes` (chamado pela sidebar T4 — mesma rodada).
+    fn point_to_active(&mut self) {
+        {
+            let r = lock(&self.runtimes);
+            let Some(rt) = r.map.get(&r.active) else {
+                eprintln!("lina-gpui: [WS] runtime ativo ausente do mapa — re-aponte abortado");
+                return;
+            };
+            self.nodes = Arc::clone(&rt.nodes);
+            self.input = rt.input.clone() as Arc<dyn InputSink>;
+            self.desk = Arc::clone(&rt.desk);
+            self.brake = Arc::clone(&rt.brake);
+            self.dash = Arc::clone(&rt.dash);
+            self.attention = Arc::clone(&rt.attention);
+            self.settings_dir = rt.mailbox_dir.join("events");
+            self.ws_autonomy = rt.autonomy;
+        }
+        // Estado de UI por-Espaço — re-deriva do runtime novo:
+        self.a2a = None; // o ⚡ demo pertence ao Espaço semeado; fora dele, some (gate ready()).
+        self.focused = NodeId::default();
+        self.camera = Camera::default();
+        self.drag = None;
+        self.sel = None;
+        self.dragging_sel = false;
+        self.report_node = None;
+        self.z_order.clear();
+        self.z_next = 0;
+        self.agent_modal = None;
+        self.modal_scan = None;
+        self.creating = None;
+        self.attention_items.clear();
+        self.attention_machine = attention_ui::ToastMachine::default();
+        self.attention_settings_at = None;
+        self.dash_lat_reported.clear();
     }
 
     // ───────────────────────── F1-1-7 · Fila de Atenção (gestos + heartbeat) ─────────────────────────
@@ -3581,27 +3665,24 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let runtime::WsRuntime {
-        ws_root,
-        mailbox_dir,
-        store,
-        sup,
-        nodes,
-        model,
-        grids,
-        input,
-        attention,
-        desk,
-        brake,
-        autonomy: _autonomy,
-        injection_profile,
-        profile_registry,
-        hooks: _hooks,
-        dash,
-        _pump: mut pump,
-        _mailbox_pump,
-        _broker_pump,
-    } = rt;
+    // F1-4-4 fatia (ii): o runtime do boot NÃO é desmontado — entra INTEIRO no mapa de
+    // runtimes do processo (fundos VIVOS). Demo/load-gen/janela operam por handles CLONADOS
+    // (tudo Arc, barato); a view lê sempre o runtime ATIVO e o switch re-aponta.
+    let ws_root = rt.ws_root.clone();
+    let mailbox_dir = rt.mailbox_dir.clone();
+    let store = Arc::clone(&rt.store);
+    let sup = Arc::clone(&rt.sup);
+    let nodes = Arc::clone(&rt.nodes);
+    let model = Arc::clone(&rt.model);
+    let grids = Arc::clone(&rt.grids);
+    let input: Arc<dyn InputSink> = rt.input.clone();
+    let attention = Arc::clone(&rt.attention);
+    let desk = Arc::clone(&rt.desk);
+    let brake = Arc::clone(&rt.brake);
+    let injection_profile = rt.injection_profile.clone();
+    let profile_registry = Arc::clone(&rt.profile_registry);
+    let dash = Arc::clone(&rt.dash);
+    let runtimes = runtime::runtimes_with_boot(rt);
     let dir = mailbox_dir.join("events");
     // Estado PERSISTENTE do onboarding (progresso + log próprio), co-locado no workspace (subdir, não
     // colide com `.lina/events` do canvas). Sobrevive ao reboot em produção → o onboarding só aparece
@@ -3806,6 +3887,9 @@ fn main() {
     let panel_model = Arc::clone(&model);
     let panel_store = Arc::clone(&store);
     let panel_dir = dir.clone();
+    // F1-4-4 fatia (ii): handle do epílogo (parada limpa de TODOS os drenos pós-app.run).
+    let runtimes_epilogue = Arc::clone(&runtimes);
+    let shared_for_view = shared.clone();
     application().run(move |cx: &mut App| {
         // inv#6: o CANVAS é a base e abre SEMPRE (nunca tela em branco). O onboarding entra como janela
         // SOBREPOSTA na 1ª execução (W4-1) e se fecha sozinho no fim ("Abrir meu Espaço →"), revelando o
@@ -3832,6 +3916,8 @@ fn main() {
                         dash,
                         attention,
                         panel_dir.clone(), // F1-1-7: settings.json mora no dir do event log
+                        runtimes,
+                        shared_for_view,
                         window,
                         cx,
                     )
@@ -3862,7 +3948,8 @@ fn main() {
         cx.activate(true);
     });
 
-    pump.stop();
+    // F1-4-4 fatia (ii): N runtimes vivos → o epílogo para TODOS os drenos (antes: pump único).
+    runtime::stop_all(&runtimes_epilogue);
     drop(sup);
     drop(pty);
 }

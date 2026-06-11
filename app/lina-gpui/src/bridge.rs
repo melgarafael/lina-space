@@ -2605,10 +2605,17 @@ fn node_identity_env(
     role: &str,
     key: &str,
     autonomy: Autonomy,
+    lina_home: &std::path::Path,
 ) -> PtyCommand {
     cmd.env("VIBE_ROLE", role)
         .env("LINA_NODE_NAME", name)
         .env("LINA_NODE_ID", key)
+        // F1-4-4 fatia ii (veredito §3): LINA_HOME POR SPAWN — o terminal nasce apontando
+        // para o `.lina` do SEU Espaço, independente do env global do processo (que, com N
+        // runtimes vivos, apontaria sempre para o último Espaço bootado). Auditoria 2026-06-11:
+        // zero leitores in-process no app; o env global segue setado só por compatibilidade
+        // até o switch remover (runtime.rs, bloco LINA_HOME).
+        .env("LINA_HOME", lina_home.display().to_string())
         // FIX-3 (costura per-Agente): a autonomia ESCOLHIDA no modal vira env por-Agente — o
         // guard (`lina guard --pretooluse`) passa a honrar o nível DESTE nó, não só o do
         // Espaço. O `label()` (`manual`/`assistido`/`autonomo`) casa exatamente com o
@@ -4687,6 +4694,7 @@ impl NodeManager {
             &role,
             &key,
             plan.autonomy,
+            &self.lina_dir, // LINA_HOME por spawn: o `.lina` DESTE Espaço (veredito §3)
         );
 
         // 4) Política de cwd (§4) + kit write-before-spawn (o shell já encontra o CLAUDE.md).
@@ -9572,6 +9580,7 @@ mod tests {
             "BUG_FIXER",
             "n-0197-deadbeef",
             Autonomy::Manual,
+            std::path::Path::new("/tmp/ws-do-no/.lina"),
         );
         let dbg = format!("{cmd:?}");
         for (var, val) in [
@@ -9579,6 +9588,10 @@ mod tests {
             ("LINA_NODE_NAME", "Bug Finder"),
             ("LINA_NODE_ID", "n-0197-deadbeef"),
             ("LINA_AUTONOMY", "manual"),
+            // F1-4-4 fatia ii: LINA_HOME POR SPAWN (veredito §3) — cada terminal nasce
+            // apontando para o `.lina` do SEU Espaço; o env global do processo deixa de
+            // decidir (com N runtimes, o global apontaria sempre pro último Espaço bootado).
+            ("LINA_HOME", "/tmp/ws-do-no/.lina"),
         ] {
             assert!(
                 dbg.contains(var) && dbg.contains(val),
