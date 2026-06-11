@@ -72,9 +72,17 @@ lina-gpui: [PROF] top5 (de N medidos) assemble: <painel> p50=…ms p95=…ms run
 
 | N  | [FPS] fps | frame p50/p95 | cpu_render p50 | poll p50 | assemble p50 | chrome p50 | layout_paint p50 | present_vsync p50 | drawn | runs p50 |
 |----|-----------|---------------|----------------|----------|--------------|------------|------------------|-------------------|-------|----------|
-| 4  | (preencher) | | | | | | | | | |
-| 16 | (preencher) | | | | | | | | | |
-| 28 | (preencher) | | | | | | | | | |
+| 4  | 26 | 40.9/41.7ms | 0.8ms | 0.1 | 0.7 | 0.0 | 11.2ms | 27.3ms | 2 | 92 |
+| 16 | 26 | 40.6/43.0ms | 1.3ms | 0.1 | 1.2 | 0.0 | 14.8ms | 24.3ms | 4 | 184 |
+| 28 | 26 | 40.2/42.2ms | 1.3ms | 0.1 | 1.2 | 0.0 | 14.7ms | 24.0ms | 4 | 184 |
+
+> **Medição 2026-06-10 (Maestro, run autônomo headless-driven: janela default, zoom default,
+> LINA_AUTOQUIT_MS=90000, ≥20 janelas [PROF]/célula, última janela estável; logs /tmp/prof-*.log).**
+> ⚠️ **`drawn` ficou capado a 2-4 pela janela/zoom DEFAULT** (culling correto: só o viewport
+> desenha). A célula decisiva **drawn≥12** (o canvas real do fundador, zoom-out, referência
+> histórica 12fps@28) NÃO foi capturada neste run — fica para a sessão de tela do fundador.
+> Leituras firmes mesmo assim: **live 4→28 não muda NADA** (painéis fora da vista custam ~0 —
+> culling provado por dados) e o frametime fica num **platô de ~40ms (26fps) já com drawn=2**.
 
 Referência histórica (sonda `8ff5728`, fundador 2026-06-03, AGREGADO): ~54fps@N=4 → 18fps@N=16
 → 12fps@N=28, drawn culado a 12-16, ~5ms/painel. A curva acima é a versão DECOMPOSTA disso.
@@ -83,7 +91,7 @@ Referência histórica (sonda `8ff5728`, fundador 2026-06-03, AGREGADO): ~54fps@
 
 | Cenário | [FPS] fps | frame p50/p95 | estágio dominante | top-5 painéis (assemble) |
 |---------|-----------|---------------|-------------------|--------------------------|
-| 28 painéis, 10 ativos | (preencher) | | | |
+| 28 painéis, 10 ativos | 26 | 40.1/42.6ms | trabalho: `layout_paint` 14.8ms · relógio: `present_vsync` 23.6ms (embute espera) | Carga 01 (burst) 0.30ms · Carga 08 (spinner) 0.28 · Carga 02 (spinner) 0.29 · Carga 09 (burst) 0.26 — **top28 listou só "de 4 medidos"**: os 24 ociosos/fora-da-vista NÃO geram amostra de assemble (culling já os poupa por completo) |
 
 ## 4. Diagnóstico assinado: estágio dominante *(preencher na tela)*
 
@@ -95,9 +103,24 @@ Referência histórica (sonda `8ff5728`, fundador 2026-06-03, AGREGADO): ~54fps@
 > otimização — a fonte 13.7 exige separar CPU-layout de GPU-paint antes de escolher técnica.
 > (O smoke da fatia a N=4 já sugere o caso: `layout_paint` ~12× o `cpu_render`.)
 
-- Estágio dominante @N=28: **(preencher)** — dados: (citar linhas `[PROF]`)
-- Estágio dominante @cenário-alvo: **(preencher)** — dados: (citar)
-- Assinado por: (Maestro/fundador, data)
+- Estágio dominante @N=28: **`present_vsync` p50 24.0ms = 60% do frame de 40.2ms — mas é o
+  balde COMPOSTO (present + ESPERA de vsync), então pelo protocolo acima ele NOMEIA um balde,
+  não uma avenida.** A leitura decomposta honesta: o trabalho ativo mensurável =
+  `cpu_render` 1.3 + `layout_paint` 14.7 ≈ **16ms — cabe em 1 ciclo de 60Hz (16.6ms)**; o
+  frame de ~40ms (26fps) constante até com drawn=2 indica que o RELÓGIO é dominado por
+  **cadência/pacing do shell** (espera entre apresentações), não por custo de painel. Dados:
+  `[PROF] frames=53 live=28 drawn=4 | frame p50=40.2 | cpu_render p50=1.3 | layout_paint
+  p50=14.7 | present_vsync p50=24.0` (/tmp/prof-n28.log, idem n4/n16/alvo).
+- Estágio dominante @cenário-alvo: idem (40.1/1.3/14.8/23.6 — /tmp/prof-alvo.log).
+- **Follow-up disparado (estágio composto dominante, conforme o protocolo):** story curta
+  nova **"F1-5-1b — separar trabalho de espera"**: instrumentar a cadência de `notify`/pedidos
+  de frame do shell (ou 1 sessão de Instruments) para responder *por que 16ms de trabalho viram
+  40ms de frame em carga leve* — se for tick de animação/pacing de ~40ms do app, subir a
+  cadência pode render 60fps em carga leve SEM tocar painel; se for vsync adaptativo do SO,
+  documenta-se o teto. **Esta investigação vem ANTES de qualquer otimização por-painel** (é o
+  espírito da decisão do fundador 2026-06-06: medir primeiro, não apostar na alavanca errada).
+- Assinado por: **Maestro (Fable 5), 2026-06-10** — com a ressalva da célula drawn≥12 (§2),
+  que pertence à sessão de tela do fundador.
 
 ## 5. Overhead da sonda — veredito *(preencher na tela)*
 
@@ -106,11 +129,12 @@ Protocolo (critério c): mesma carga (`LINA_LOAD=28`), comparar o `[FPS]` (sempr
 
 | Rodada | [FPS] p50 | [FPS] p95 | fps |
 |--------|-----------|-----------|-----|
-| `LINA_PROF=0` (controle) | (preencher) | | |
-| `LINA_PROF=1` (medição)  | (preencher) | | |
+| `LINA_PROF=0` (controle) | 39.3ms | 43.3ms | 26 |
+| `LINA_PROF=1` (medição)  | 40.2ms | 42.2ms | 26 |
 
 **Veredito explícito (sem número mágico — é parte do diagnóstico):**
-- [ ] A medição é VÁLIDA (a sonda não perturba de forma material o que mede), ou
+- [x] A medição é VÁLIDA — overhead ≈ +0.9ms no p50 (~2%), p95 dentro do ruído entre rodadas,
+  fps idêntico (26). A sonda não perturba de forma material o que mede.
 - [ ] A sonda PERTURBA demais → simplificar a sonda ANTES de o baseline valer (o quê: ______)
 
 ## 6. TABELA DE ATIVAÇÃO das stories condicionais *(preencher na tela — gate de cada story)*
@@ -120,10 +144,11 @@ Protocolo (critério c): mesma carga (`LINA_LOAD=28`), comparar o `[FPS]` (sempr
 
 | Story | Gate de evidência (da peça) | Evidência medida (citar `[PROF]`) | Veredito |
 |-------|------------------------------|-----------------------------------|----------|
-| **F1-5-3** dirty/damage por painel | re-montagem de painéis SEM mudança é fatia relevante do frametime no cenário-alvo (builds/frame ≈ N mesmo com poucos sujos E montagem no estágio dominante) | (preencher) | ATIVADA / DESCARTADA |
-| **F1-5-4a** snapshot congelado (mecanismo) | ≥1 consumidora ativada (F1-5-3 OU F1-5-4b) — mecanismo não se constrói sem consumidor | (derivado das linhas acima/abaixo) | ATIVADA / DESCARTADA |
-| **F1-5-4b** LOD da periferia | custo dos painéis desenhados FORA do conjunto de foco é fatia relevante do frametime no cenário-alvo | (preencher) | ATIVADA / DESCARTADA |
+| **F1-5-3** dirty/damage por painel | re-montagem de painéis SEM mudança é fatia relevante do frametime no cenário-alvo (builds/frame ≈ N mesmo com poucos sujos E montagem no estágio dominante) | `assemble` TOTAL p50 = 1.2-1.3ms com drawn=4 (~0.3ms/painel) num frame de 40ms (**≈3%**); no cenário-alvo com `LINA_PROF_TOPK=28`, só 4 painéis geram amostra — os ociosos fora da vista **nem montam** (culling já os poupa; soma da lista completa ≈ custo dos 4 drawn). A montagem NÃO está no estágio dominante (§4). | **DESCARTADA para o objetivo de FPS desta onda** — confirma a refutação do "3x" (13.7); o ganho residual (latência de input/bateria) fica registrado como candidata de eficiência F2. ⚠️ Reabrir SÓ se a célula drawn≥12 do fundador mostrar `assemble` agregado relevante. |
+| **F1-5-4a** snapshot congelado (mecanismo) | ≥1 consumidora ativada (F1-5-3 OU F1-5-4b) — mecanismo não se constrói sem consumidor | F1-5-3 DESCARTADA; F1-5-4b pendente da célula drawn≥12 | **PENDENTE** (segue a 4b; sem consumidor ativado, não inicia) |
+| **F1-5-4b** LOD da periferia | custo dos painéis desenhados FORA do conjunto de foco é fatia relevante do frametime no cenário-alvo | Evidência parcial A FAVOR: `layout_paint` é o maior trabalho ativo e cresce com drawn/runs (drawn 2→4, runs 92→184: 11.2→14.8ms ≈ +1.8ms/painel desenhado) — reduzir o que a periferia desenha ataca o estágio certo. MAS o run autônomo não capturou drawn≥12 (janela default cula a 4) — a fatia REAL da periferia no canvas do fundador não está medida. | **PENDENTE DA CÉLULA drawn≥12** (sessão de tela do fundador: zoom-out no canvas real, ler `[PROF]`). Nem ativada nem descartada sem o dado — não apostar às cegas é a decisão do fundador. |
 | **F1-5-4c** fila de prioridade + K dinâmico | com as condicionais anteriores ativas (e/ou F1-5-5), a **RE-medição** ainda mostra excesso de painéis acima do budget — última a avaliar; depende da re-medição, NÃO deste baseline | (re-medição posterior) | PENDENTE DE RE-MEDIÇÃO |
+| *(nova, do diagnóstico §4)* **F1-5-1b** separar trabalho de espera | estágio composto dominante no baseline (protocolo §4) | trabalho ativo ≈16ms cabe num ciclo de 60Hz, mas frame=40ms constante até com drawn=2 — cadência/pacing domina o relógio em carga leve | **ATIVADA — investigação ANTES de qualquer otimização por-painel** (story curta: sonda de notify/Instruments) |
 
 Nota de leitura para F1-5-3 (**leia nas DUAS direções**): hoje todo painel desenhado re-monta
 todo frame — builds/frame == `drawn` por construção; o contador explícito `builds por painel`

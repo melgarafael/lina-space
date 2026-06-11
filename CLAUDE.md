@@ -10,7 +10,7 @@
 
 App **desktop Rust-nativo, GPU-first** (Windows/Mac/Linux): um **canvas para múltiplos terminais de IA** voltado a empreendedores **não-técnicos**. Cada agente é um terminal vivo rodando um CLI de IA (Claude Code, Codex…); todos cooperam **automaticamente e sem fios**, com tudo estruturado e nada se perdendo num crash. **Sem LLM/harness/chat próprios** — a inteligência vem do CLI de terceiro; o "chat" é sempre o terminal.
 
-Visão completa, roadmap e features: **vault Obsidian → `Debriefing Vibe Coding/`** (este projeto nasceu de um debriefing completo). Norte canônico: `01 - Visao de Produto e Norte de Continuidade`. SPEC: `30 - SPEC Mestre`. Stack: `31 - Decisao de Stack`. **Backlog atual: `34 - Epico Fase 1`** (a Fase 0/MVP está **fechada e validada na tela** — `32 - Epico Fase 0 (MVP)`).
+Visão completa, roadmap e features: **vault Obsidian → `Ecossistema Labs - Operação/Debriefing Vibe Coding/`** (caminho pós-reorganização do vault em 2026-06-10; este projeto nasceu de um debriefing completo). Norte canônico: `01 - Visao de Produto e Norte de Continuidade`. SPEC: `30 - SPEC Mestre`. Stack: `31 - Decisao de Stack`. **Backlog atual: `34 - Epico Fase 1`** (a Fase 0/MVP está **fechada e validada na tela** — `32 - Epico Fase 0 (MVP)`).
 
 ## Invariantes inegociáveis (valem em TODAS as fases — quebrar é mudar o produto)
 
