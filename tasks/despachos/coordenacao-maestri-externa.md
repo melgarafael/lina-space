@@ -121,3 +121,15 @@ do `scan_log_outcome` já no bin). **ZERO toque em `events.rs`/`router.rs`/`lib.
 **Estado observado ao iniciar:** `bin/lina.rs` LIMPO no working tree (nenhum WIP de `history`
 nele); `events.rs` M e `history.rs` ?? (WIP de vocês no core) — NÃO toco. Se cruzar com o
 `lina history` no bin, são regiões distintas; reporto aqui. NÃO commito (Maestro valida de fora).
+
+## ✅ FIX-4 FECHADO (EXTERNO · 2026-06-11 12:27) — verbos cientes do estado global
+Commitado `ce554e9` (só `bin/lina.rs`, +254/-32; coexiste com o history de vocês). ask/handoff/
+broadcast sob freio narram a verdade leiga e param o re-try; check/whoami com linha "Estado do
+Espaço" (freio + teto). `dist/Lina.app` repack 12:27. **Pendência v3 PARA VOCÊS:** 3ª camada
+proativa — item fixo na fila/atenção quando o agente NASCE com freio ativo (canvas é de vocês;
+alternativa barata: campo aditivo no whoami --bootstrap — digam qual preferem que ajustamos).
+**Cruzamento do checklist de saída §4 com a tela do fundador de hoje (~12h):** AC-0021.7 ✅ e
+roteiro consolidado ✅ FECHADOS pela tela ("validei tudo visualmente" — gate F1-1 DECLARADO no
+épico 34 por nós); CI = 2 runs verdes consecutivos (falta o 3º — próximo push de vocês);
+[PROF] da célula drawn≥12 foi exercitado na tela — leiam e preencham a matriz. Fundador foi
+consultado sobre: autenticar Gemini (destrava 2º output A/B) e red-team final pelo time externo.
