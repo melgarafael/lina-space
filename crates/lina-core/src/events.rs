@@ -498,6 +498,22 @@ pub enum DomainEvent {
         node: NodeId,
         cycle_count: u64,
     },
+    /// F1-5-5: nó ocioso SUSPENSO (overlay de render). O nó segue VIVO e drenando — só a montagem
+    /// no shell pausa; portanto NÃO mexe no status do roster (suspensão ⟂ lifecycle). Projeta um
+    /// flag consultável (`ProjectedNode.suspended`), no mesmo idioma do `stalled`. ADITIVO.
+    NodeSuspended {
+        node: NodeId,
+        /// Por que suspendeu (canônico em `suspend::reason`, ex.: `idle_timeout`).
+        #[serde(default)]
+        reason: String,
+    },
+    /// F1-5-5: nó suspenso que ACORDOU (A2A dirigida, foco, prompt/custódia ou retomada de output).
+    NodeResumed {
+        node: NodeId,
+        /// Por que acordou (canônico em `suspend::reason`, ex.: `a2a_delivered`, `focus`).
+        #[serde(default)]
+        reason: String,
+    },
     /// F1-1-1 (coordenado via Maestro; consumidor: Dev 02): um CLI de IA foi DETECTADO num
     /// terminal — conversão campo-a-campo de `lina_cli_profiles::CliDetection`. A emissão no
     /// supervisor é fiação posterior (esta rodada só reserva o contrato no log). META — sem
@@ -825,6 +841,8 @@ impl DomainEvent {
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
             DomainEvent::HistoryReadCross { .. } => "HistoryReadCross",
             DomainEvent::NodeStalled { .. } => "NodeStalled",
+            DomainEvent::NodeSuspended { .. } => "NodeSuspended",
+            DomainEvent::NodeResumed { .. } => "NodeResumed",
             DomainEvent::CliDetected { .. } => "CliDetected",
             DomainEvent::PermissionAsked { .. } => "PermissionAsked",
             DomainEvent::RoleTemplateSaved { .. } => "RoleTemplateSaved",
@@ -1187,7 +1205,13 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::SnapshotTaken { .. }
         // F1-5-8: leitura cross do histórico é META (livro-razão de auditoria da fronteira
         // de pertencimento) — sem efeito na projeção do canvas.
-        | DomainEvent::HistoryReadCross { .. } => {}
+        | DomainEvent::HistoryReadCross { .. }
+        // F1-5-5: suspensão/retomada são META — overlay de RENDER consultável pelo shell via o
+        // `SuspendController` (estado vivo), não pela projeção do canvas. O log é o livro-razão
+        // (auditoria/retro/[PROF]); o nó NÃO muda de `status` (suspensão ⟂ lifecycle: segue vivo
+        // e endereçável). Mantém ProjectedNode intocado → zero costura no shell (app/inspector.rs).
+        | DomainEvent::NodeSuspended { .. }
+        | DomainEvent::NodeResumed { .. } => {}
     }
 }
 

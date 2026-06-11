@@ -151,6 +151,13 @@ pub mod scrollback;
 /// scrollback — leitura cross-terminal auditada pela fronteira de pertencimento (ADR 0006).
 pub mod history;
 
+/// F1-5-5: suspensão real de ociosos — máquina `Active → Idle → Suspended` (overlay ortogonal ao
+/// [`NodeStatus`]; só o render pausa, a drenagem nunca para).
+pub mod suspend;
+pub use suspend::{
+    SuspendConfig, SuspendController, SuspendGuards, SuspendState, SuspendTransition,
+};
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para
