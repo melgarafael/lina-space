@@ -224,10 +224,19 @@ pub struct Settings {
     /// antigos (sem o campo) seguem carregando sem resetar as demais escolhas.
     #[serde(default)]
     pub attention_sound_muted: bool,
+    /// F1-4-3: opt-out do restore por Espaço — `false` = «Abrir este Espaço sem religar os
+    /// Agentes» (copy-f1-4 §4). `serde(default)` = restore LIGADO (o default do produto é o
+    /// Espaço voltar vivo); settings.json antigos seguem carregando sem reset.
+    #[serde(default = "default_restore_on_open")]
+    pub restore_on_open: bool,
 }
 
 fn default_accent_setting() -> String {
     theme::DEFAULT_ACCENT.to_string()
+}
+
+fn default_restore_on_open() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -238,6 +247,7 @@ impl Default for Settings {
             reduce_motion: false,
             default_cwd: String::new(),
             attention_sound_muted: false,
+            restore_on_open: true,
         }
     }
 }

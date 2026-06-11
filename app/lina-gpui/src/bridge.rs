@@ -255,6 +255,10 @@ pub struct SharedModel {
     /// pela `MailboxPump`; o render mostra o banner "teto atingido — pausado".
     pub cost_paused: bool,
     pub generation: u64,
+    /// F1-4-3: badge honesto do restore por nó RE-ERGUIDO neste boot («Sessão retomada» /
+    /// «Novo começo…», copy-f1-4 §4). Efêmero por sessão (some na 1ª interação — o render
+    /// remove); nós não-restaurados não aparecem aqui.
+    pub restore_badges: BTreeMap<NodeId, RestoreBadge>,
 }
 
 impl SharedModel {
@@ -3768,6 +3772,92 @@ pub fn plan_restore(
         });
     }
     out
+}
+
+/// **F1-4-3 — EXECUTA o plano de restore (a outra metade de [`plan_restore`]).** Para cada
+/// [`RestoredTerminal`]: re-admite pelo funil único (`admit_node` — mesma sequência canônica
+/// de eventos do ⌘T), re-hidrata o grid com a janela viva persistida (a conversa de antes
+/// "continua na tela — é só rolar para cima", copy-f1-4 §4) e registra o badge honesto na
+/// projeção (`SharedModel::restore_badges`). Falha de UM terminal degrada com log e segue
+/// (inv#6 — o restore parcial vale mais que nenhum). Devolve quantos re-ergueram.
+impl NodeManager {
+    /// O store de scrollback do workspace (compartilhado com a fiação de boot — `plan_restore`
+    /// lê a janela viva dele). `None` = boot degradado sem persistência de histórico.
+    #[must_use]
+    pub fn scrollback(&self) -> Option<Arc<Mutex<ScrollbackStore>>> {
+        self.scrollback.clone()
+    }
+
+    pub fn restore_terminals(&self, plans: &[RestoredTerminal]) -> usize {
+        let mut up = 0;
+        for plan in plans {
+            // Comando do restore → motor (mesmo caminho do M6): `[program, args…]` do perfil,
+            // já com o verbo de resume quando o badge observou sessão anterior. Vazio = shell
+            // puro (fábrica do workspace).
+            let engine = plan
+                .command
+                .split_first()
+                .map(|(program, args)| AgentEngine {
+                    program: program.clone(),
+                    args: args.to_vec(),
+                    profile_id: plan.profile_id.clone(),
+                    label: plan.profile_id.clone().unwrap_or_else(|| plan.name.clone()),
+                });
+            let admission = NodeAdmission {
+                name: (!plan.name.is_empty()).then(|| plan.name.clone()),
+                role: plan.role.clone().unwrap_or_else(|| "terminal".into()),
+                engine,
+                // cwd da sessão anterior já foi consentido quando o nó nasceu (o log o guarda);
+                // re-entrar na MESMA pasta não é um consentimento novo.
+                cwd: match &plan.cwd {
+                    Some(p) => CwdPolicy::UserDir {
+                        path: PathBuf::from(p),
+                        consent: true,
+                    },
+                    None => CwdPolicy::Managed,
+                },
+                position: Some((plan.x, plan.y)),
+                requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
+                autonomy: Autonomy::Assisted,
+            };
+            let node = match self.admit_node(admission) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "lina-gpui: restore de '{}' falhou ({e}); seguindo sem ele",
+                        plan.name
+                    );
+                    continue;
+                }
+            };
+            // Re-hidrata o grid: a janela viva entra ANTES do output novo do shell — o leigo
+            // reabre e a conversa está lá. CRLF por linha (o VT trata como output normal).
+            if !plan.scrollback_tail.is_empty() {
+                if let Some(grid) = lock(&self.grids).get(&node) {
+                    let mut bytes = Vec::new();
+                    for line in &plan.scrollback_tail {
+                        bytes.extend_from_slice(line.as_bytes());
+                        bytes.extend_from_slice(b"\r\n");
+                    }
+                    lock(grid).advance(&bytes);
+                }
+            }
+            // Badge honesto na projeção (render lê daqui; chave = nó NOVO re-erguido).
+            {
+                let mut m = lock(&self.model);
+                m.restore_badges.insert(node, plan.badge);
+                m.touch();
+            }
+            eprintln!(
+                "lina-gpui: [RESTORE] '{}' re-erguido ({}; {} linhas re-hidratadas)",
+                plan.name,
+                plan.badge.label(),
+                plan.scrollback_tail.len()
+            );
+            up += 1;
+        }
+        up
+    }
 }
 
 /// **Fábrica de nós em runtime (gpui-free → testável headless).** Detém os handles do core
@@ -10093,5 +10183,105 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **F1-4-3 — a metade EXECUTORA (costura de boot): `restore_terminals` re-ergue o plano.**
+    /// NÃO-VACUOSO: prova que cada `RestoredTerminal` vira nó VIVO pelo funil (nome/posição na
+    /// projeção), que a janela viva re-hidratada APARECE no grid (a conversa "continua na
+    /// tela") e que o badge honesto entra em `SharedModel::restore_badges` sob o nó NOVO.
+    /// Remover qualquer uma das três pernas do executor derruba um assert.
+    #[test]
+    fn restore_terminals_executes_plan_rehydrates_grid_and_badges() {
+        let dir = std::env::temp_dir().join(format!("lina-restore-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let cmd_factory: CmdFactory = Arc::new(|_n: &str| PtyCommand::new("cat"));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let nm = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            Arc::clone(&grids),
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            cmd_factory,
+            None,
+            dir.join(".lina"),
+        );
+
+        let plans = vec![
+            RestoredTerminal {
+                node: NodeId::from_u128(1), // id ANTIGO (do log da sessão passada)
+                name: "Maestro".into(),
+                role: Some("maestro".into()),
+                x: 30.0,
+                y: 96.0,
+                cwd: None,
+                profile_id: None,
+                command: Vec::new(), // shell puro (fábrica do workspace)
+                badge: RestoreBadge::FreshStart,
+                scrollback_tail: vec!["plano da rodada 3 fechado".into(), "até amanhã ✓".into()],
+            },
+            RestoredTerminal {
+                node: NodeId::from_u128(2),
+                name: "Revisor".into(),
+                role: Some("revisor".into()),
+                x: 740.0,
+                y: 96.0,
+                cwd: None,
+                profile_id: None,
+                command: Vec::new(),
+                badge: RestoreBadge::FreshStart,
+                scrollback_tail: Vec::new(), // sem histórico — nada a re-hidratar
+            },
+        ];
+        let up = nm.restore_terminals(&plans);
+        assert_eq!(up, 2, "os dois terminais do plano re-ergueram");
+
+        // Roster vivo: nomes/papéis re-erguidos pelo funil (NodeIds NOVOS desta geração).
+        let roster = sup.list();
+        let names: Vec<&str> = roster.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"Maestro") && names.contains(&"Revisor"));
+
+        // Posições do log na projeção (o canvas volta IGUAL).
+        let m = lock(&model);
+        let maestro = m
+            .nodes
+            .iter()
+            .find(|(_, v)| v.name == "Maestro")
+            .map(|(id, v)| (*id, v.x, v.y))
+            .expect("Maestro na projeção");
+        assert_eq!((maestro.1, maestro.2), (30.0, 96.0));
+
+        // Badge honesto na projeção, sob o nó NOVO.
+        assert_eq!(
+            m.restore_badges.get(&maestro.0),
+            Some(&RestoreBadge::FreshStart),
+            "badge do restore registrado para o render"
+        );
+        drop(m);
+
+        // A janela viva re-hidratada APARECE no grid (antes de output novo do shell).
+        let grid = lock(&grids)
+            .get(&maestro.0)
+            .cloned()
+            .expect("grid do Maestro");
+        let screen = screen_text(&grid);
+        assert!(
+            screen.contains("plano da rodada 3 fechado") && screen.contains("até amanhã ✓"),
+            "a conversa de antes está NA TELA (é só rolar para cima); screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

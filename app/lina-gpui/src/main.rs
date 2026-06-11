@@ -3541,6 +3541,11 @@ fn main() {
         }
     }));
 
+    // F1-4-3: foto da geração ANTERIOR — capturada ANTES do fechamento abaixo (depois dele os
+    // nós viram `dead` e saem da projeção). É a fonte do plano de restore (posições/nomes/
+    // papéis/cwd/CLI do log — inv#4); o opt-out por Espaço decide o uso mais adiante.
+    let restore_proj = lock(&store).project().ok();
+
     // F1-0-8 (costura coordenada — mecanismo do Dev 02): fecha a GERAÇÃO ANTERIOR no log logo
     // após abrir o store e ANTES de registrar os nós da sessão nova — sem esta linha o mecanismo
     // existe mas não roda no caminho real (mesmo padrão da fiação W5-2). Nós da sessão passada
@@ -3734,6 +3739,29 @@ fn main() {
         bootstrap,
         mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
     ));
+
+    // F1-4-3 · RESTORE do quit limpo: reabrir o app = o Espaço volta vivo (posições/nomes/
+    // papéis do log + scrollback re-hidratado + resume do CLI quando o TOML declara + badge
+    // honesto). Opt-out por Espaço (`restore_on_open` no settings.json — «Abrir este Espaço
+    // sem religar os Agentes») e por env (`LINA_NO_RESTORE=1`, escape de emergência). Fora do
+    // demo (o demo semeia A/B fixos) e best-effort: falha degrada com log, nunca trava o boot.
+    if !demo
+        && persistence_ui::load_settings(&dir).restore_on_open
+        && !std::env::var("LINA_NO_RESTORE").is_ok_and(|v| v.trim() == "1")
+    {
+        if let Some(proj) = &restore_proj {
+            let plans = bridge::plan_restore(proj, &profile_registry, nodes.scrollback().as_ref());
+            if plans.is_empty() {
+                eprintln!("lina-gpui: [RESTORE] nada a re-erguer (Espaço novo ou sem terminais)");
+            } else {
+                let up = nodes.restore_terminals(&plans);
+                eprintln!(
+                    "lina-gpui: [RESTORE] {up}/{} terminal(is) re-erguidos do quit limpo",
+                    plans.len()
+                );
+            }
+        }
+    }
 
     let (focused, a2a): (NodeId, Option<Arc<A2aTrigger>>) = if demo {
         let _ = lock(&store).append(&DomainEvent::WorkspaceCreated {
