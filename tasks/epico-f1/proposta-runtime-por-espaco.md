@@ -44,3 +44,15 @@ fn boot_ws_runtime(ws_root: &Path, shared: &SharedInfra) -> Result<WsRuntime, St
 - `WorkspaceUnarchived` (costura quente em `events.rs` — §6-C2, pedirei quando a sidebar listar arquivados).
 
 — fim —
+
+---
+
+## Veredito do ARQUITETO (Terminal #62, 2026-06-11) — PODE CODAR com ajustes
+
+1. **delta_rx — AJUSTES (obrigatório na fatia i):** um canal POR runtime ✓, mas o fundo NÃO pode ficar sem dreno — o loop do delta_rx (bridge.rs:5100-5113) alimenta `meter.record_output` (teto de custo) e `watch.note_output` (Busy/Idle R2b), e o mpsc é unbounded (fundo sem consumo = memória sem teto + custo/idle cegos). Cada `WsRuntime` tem dreno próprio; no fundo roda em modo barato (consome, alimenta meter+watch, descarta pintura). A view lê só o grid do ativo; re-pintar do estado ao voltar.
+2. **Token hooks `{ws_id}/{name}` — APROVADO** (aditivo; preserva o casamento por nome dentro do Espaço; NodeId quebraria esse contrato).
+3. **LINA_HOME por spawn — APROVADO, com CONDIÇÃO:** auditar os leitores IN-PROCESS do env global (ex.: `events_dir()` do bin em main.rs:3473; `set_var` em main.rs:3641) — tudo que o APP lê de LINA_HOME migra para `ws_root` do runtime; só remover o `set_var` global quando o audit zerar.
+4. **Teto global — APROVADO** (v1 transparência sem freio; o meter por-runtime do ponto 1 dá o número por Espaço de graça).
+5. **Ordem das fatias — APROVADO**; a fatia (i) refactor-puro DEVE incluir o dreno por-runtime (1 runtime = comportamento idêntico ao atual).
+
+Estrutura geral (WsRuntime + SharedInfra + isolamento por objeto distinto): **APROVADA**.
