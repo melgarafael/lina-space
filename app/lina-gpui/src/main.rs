@@ -1046,11 +1046,17 @@ impl WorkspaceView {
             }
             f
         };
+        // Clamp à janela: sem teto o form cresce além do viewport e os botões somem
+        // (mesma lição do bugB2 em `agent_modal.rs`); excedente ROLA dentro do painel.
+        let max_h = (f32::from(viewport.height) - 96.0 - 24.0).max(160.0);
         let mut panel = div()
+            .id("m9-panel")
             .absolute()
             .left(px(x.max(60.0)))
             .top(px(96.0))
             .w(px(w))
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .p_4()
             .gap_3()
             .flex()
@@ -1135,20 +1141,44 @@ impl WorkspaceView {
             }
             panel = panel
                 .child(cards)
-                .child(field(
-                    gallery::COPY_M9_NAME_LABEL,
-                    &m.name,
-                    matches!(m.focus, M9Focus::Name),
-                    m.dup_note().map(|n| (n, th.state.warning)),
-                ))
-                .child(field(
-                    gallery::COPY_M9_WORKDIR_LABEL,
-                    &m.workdir,
-                    matches!(m.focus, M9Focus::Workdir),
-                    m.error
-                        .as_ref()
-                        .map(|e| (format!("{} · [ {} ]", e.message, e.exit), th.state.danger)),
-                ));
+                .child(
+                    field(
+                        gallery::COPY_M9_NAME_LABEL,
+                        &m.name,
+                        matches!(m.focus, M9Focus::Name),
+                        m.dup_note().map(|n| (n, th.state.warning)),
+                    )
+                    .id("m9-name")
+                    .cursor_pointer()
+                    .on_click(cx.listener(
+                        |v, _ev: &gpui::ClickEvent, _w, cx| {
+                            if let Some(m) = v.create_space_modal.as_mut() {
+                                m.focus = gallery::M9Focus::Name;
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    field(
+                        gallery::COPY_M9_WORKDIR_LABEL,
+                        &m.workdir,
+                        matches!(m.focus, M9Focus::Workdir),
+                        m.error
+                            .as_ref()
+                            .map(|e| (format!("{} · [ {} ]", e.message, e.exit), th.state.danger)),
+                    )
+                    .id("m9-workdir")
+                    .cursor_pointer()
+                    .on_click(cx.listener(
+                        |v, _ev: &gpui::ClickEvent, _w, cx| {
+                            if let Some(m) = v.create_space_modal.as_mut() {
+                                m.focus = gallery::M9Focus::Workdir;
+                            }
+                            cx.notify();
+                        },
+                    )),
+                );
             // Botões: Procurar… · Criar Espaço · Cancelar (ordem de tab da spec §4).
             let botao = |id: &'static str, rotulo: String, focused: bool, primario: bool| {
                 div()
