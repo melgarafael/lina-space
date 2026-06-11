@@ -24,6 +24,8 @@ mod wiring;
 mod cost;
 // W4-4: chrome de persistência (salvo✓ / recuperação T8 / Espaços T6 / Ajustes T7). Janela própria.
 mod persistence_ui;
+/// F1-4-1 (fiação app): decide qual Espaço o boot abre + auto-inscrição no registry global.
+mod workspace_boot;
 // W4-5: galeria de Focos (T3) — presets que montam o Espaço com time + papéis; gpui-free, testável.
 mod gallery;
 // W4-6: acessibilidade (AccessibleBuffer sem ANSI, live-region "resposta pronta", WCAG, reduce-motion).
@@ -3479,6 +3481,18 @@ fn main() {
     // dados, viola inv#6). Demo/override mantêm o caminho histórico em `temp`.
     let demo = lina_demo_enabled();
     let ws_root = resolve_ws_root(demo);
+    // F1-4-1 (fiação app): em PRODUÇÃO sem override de dev, o ponteiro global
+    // `~/.lina/workspaces.json` decide QUAL Espaço abre — o focado por último (é o que o
+    // switcher M8 carimba ao trocar). Ponteiro vazio/quebrado degrada para o default acima
+    // (inv#6); `LINA_WS_ROOT` e DEMO seguem soberanos (escapes de dev intactos).
+    let ws_root = if !demo && std::env::var("LINA_WS_ROOT").map_or(true, |v| v.trim().is_empty()) {
+        match lina_core::default_registry_path().map(lina_core::WorkspaceRegistry::load) {
+            Some(Ok(reg)) => workspace_boot::pick_production_root(&reg, ws_root),
+            _ => ws_root,
+        }
+    } else {
+        ws_root
+    };
     let mailbox_dir = ws_root.join(".lina");
     let dir = mailbox_dir.join("events");
     // F1-2-1: aplica o tema PERSISTIDO (T7 `settings.json`, ao lado do event log) ANTES de abrir
@@ -3561,6 +3575,42 @@ fn main() {
         Err(e) => eprintln!(
             "lina-gpui: F1-0-8 — não fechei a geração anterior ({e}); seguindo (replay pode mostrar fantasmas)"
         ),
+    }
+
+    // F1-4-1 (fiação app): auto-inscrição do Espaço aberto no ponteiro global + carimbo de
+    // foco — é assim que o registry se popula (a lista do switcher M8 nasce daqui) e que o
+    // PRÓXIMO boot sabe qual Espaço abrir. Best-effort: falha loga e o boot segue (inv#6).
+    if !demo {
+        match lina_core::default_registry_path()
+            .map(lina_core::WorkspaceRegistry::load)
+            .transpose()
+        {
+            Ok(Some(mut reg)) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                match workspace_boot::register_boot_workspace(
+                    &mut lock(&store),
+                    &ws_root,
+                    &mut reg,
+                    now_ms,
+                ) {
+                    Ok(id) => eprintln!(
+                        "lina-gpui: [WS] Espaço '{id}' inscrito e focado no ponteiro global"
+                    ),
+                    Err(e) => eprintln!(
+                        "lina-gpui: [WS] auto-inscrição no ponteiro global falhou ({e}); seguindo"
+                    ),
+                }
+            }
+            Ok(None) => {
+                eprintln!("lina-gpui: [WS] sem HOME/USERPROFILE — boot segue sem o ponteiro global")
+            }
+            Err(e) => {
+                eprintln!("lina-gpui: [WS] ponteiro global ilegível ({e}); seguindo sem ele");
+            }
+        }
     }
 
     let pty = Arc::new(Mutex::new(PtyManager::new()));

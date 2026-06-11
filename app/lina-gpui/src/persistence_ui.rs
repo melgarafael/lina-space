@@ -445,7 +445,9 @@ impl PersistenceModel {
     }
 
     /// T6: troca o foco para `name` — loga `WorkspaceFocusSet` (evento committed do core) no store
-    /// vivo e re-lista. (Abrir o canvas daquele Espaço é o hand-off seguinte — ver `.entrega`.)
+    /// vivo, carimba o foco no PONTEIRO GLOBAL (`~/.lina/workspaces.json` — o próximo boot abre o
+    /// Espaço escolhido, F1-4-1 fiação) e re-lista. (Abrir o canvas daquele Espaço SEM reiniciar é
+    /// o hand-off seguinte — switch M8 "vivos"; ver `.entrega`.)
     pub fn switch_to(&mut self, name: &str) {
         {
             // `lock` (do bridge) recupera de poison — NÃO descarta a escrita silenciosamente.
@@ -454,6 +456,33 @@ impl PersistenceModel {
                 workspace: name.to_string(),
             }) {
                 eprintln!("persistence_ui: falha ao logar WorkspaceFocusSet: {e}");
+            }
+        }
+        // Foco durável no ponteiro global — SÓ para alvo NÃO-vivo (o vivo já é o focado, e
+        // re-registrá-lo abriria o store dele 2× sob a conexão do canvas). Best-effort: falha
+        // loga e a troca vale só nesta sessão.
+        if let Some(target) = self
+            .workspaces
+            .iter()
+            .find(|w| w.name == name && !w.focused)
+        {
+            let root = crate::workspace_boot::ws_root_of_events_dir(&target.events_dir);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match lina_core::default_registry_path()
+                .ok_or_else(|| "sem HOME/USERPROFILE".to_string())
+                .and_then(|p| lina_core::WorkspaceRegistry::load(p).map_err(|e| e.to_string()))
+                .and_then(|mut reg| {
+                    crate::workspace_boot::focus_target_workspace(&root, &mut reg, now_ms)
+                }) {
+                Ok(id) => eprintln!(
+                    "persistence_ui: [WS] foco global carimbado em '{id}' — o próximo boot abre este Espaço"
+                ),
+                Err(e) => eprintln!(
+                    "persistence_ui: [WS] não carimbei o foco global ({e}); a troca vale só nesta sessão"
+                ),
             }
         }
         self.refresh_workspaces();
