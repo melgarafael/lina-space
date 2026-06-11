@@ -9,7 +9,14 @@
 
 use std::path::{Path, PathBuf};
 
-use lina_core::{DomainEvent, EventStore, Workspace, WorkspaceEntry, WorkspaceRegistry};
+use lina_core::{
+    can_create_workspace, DomainEvent, EventStore, LicenseTier, Workspace, WorkspaceEntry,
+    WorkspaceRegistry,
+};
+use lina_role_discovery::RoleRegistry;
+use uuid::Uuid;
+
+use crate::gallery;
 
 /// Decide a raiz do Espaço a abrir em PRODUÇÃO: o focado do registry (último
 /// `last_focus`, não-arquivado) **se o store dele ainda existe no disco**; senão o
@@ -36,6 +43,21 @@ pub fn register_boot_workspace(
     ws_root: &Path,
     registry: &mut WorkspaceRegistry,
     now_ms: u64,
+) -> Result<String, String> {
+    let id = upsert_registry_entry(store, ws_root, registry)?;
+    registry.set_focus(&id, now_ms);
+    registry.save().map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// A inscrição em si, SEM carimbo de foco nem save — o miolo compartilhado entre o boot
+/// ([`register_boot_workspace`], que foca) e a criação de fundo ([`create_workspace`],
+/// que NÃO foca: o carimbo é do switch chamador). Única casa da lógica de id
+/// (`workspace_id` do log; fallback o path) — não duplicar.
+fn upsert_registry_entry(
+    store: &mut EventStore,
+    ws_root: &Path,
+    registry: &mut WorkspaceRegistry,
 ) -> Result<String, String> {
     let mut state = store.project().map_err(|e| e.to_string())?;
     if state.workspace_name.is_none() {
@@ -65,9 +87,183 @@ pub fn register_boot_workspace(
         last_focus: 0,
         archived: state.archived,
     });
-    registry.set_focus(&id, now_ms);
-    registry.save().map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+// ───────────────────────── M9 — criação de Espaço (M8-T3) ─────────────────────────
+
+/// Erro leigo do Diretório de Trabalho (spec-m8-m9 §2, strings congeladas). Cada
+/// variante É a mensagem que a UI mostra — sem tradução intermediária.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkdirError {
+    /// É arquivo, drive ausente ou caminho morto.
+    NotAccessible,
+    /// Existe, é diretório, mas o teste REAL de escrita falhou.
+    NoWritePermission,
+    /// `create_dir_all` falhou na hora de criar (disco cheio, permissão tardia).
+    CreateFailed,
+}
+
+impl std::fmt::Display for WorkdirError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            WorkdirError::NotAccessible => {
+                "Essa pasta não está acessível — escolha outra ou crie uma nova."
+            }
+            WorkdirError::NoWritePermission => "Não consigo trabalhar nessa pasta.",
+            WorkdirError::CreateFailed => "Não consegui criar a pasta do Espaço.",
+        })
+    }
+}
+
+impl std::error::Error for WorkdirError {}
+
+/// Valida o Diretório de Trabalho do M9 **cedo** (na seleção e na criação — nunca só no
+/// fim): se o caminho existe, canonicaliza, exige diretório e prova escrita DE VERDADE
+/// (cria + remove um arquivo temporário; `access(2)` mente em rede/ACL). Caminho que NÃO
+/// existe não é erro — o caminho feliz o cria ([`create_workspace`]).
+///
+/// # Errors
+/// [`WorkdirError`] já com a string leiga congelada da spec §2.
+// Aguardando o WIRING do modal M9 (fatia de UI) — exercida pelos testes até lá,
+// mesmo padrão de `gallery.rs`. Remover o allow ao wirar.
+#[allow(dead_code)]
+pub fn validate_workdir(path: &Path) -> Result<PathBuf, WorkdirError> {
+    if !path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| WorkdirError::NotAccessible)?;
+    if !canonical.is_dir() {
+        return Err(WorkdirError::NotAccessible);
+    }
+    let probe = canonical.join(format!(".lina-prova-escrita-{}", std::process::id()));
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(canonical)
+        }
+        Err(_) => Err(WorkdirError::NoWritePermission),
+    }
+}
+
+/// Nome de pasta derivado do nome do Espaço: preserva o nome humano (o leigo reconhece
+/// a pasta no Finder) e só neutraliza separadores/reservados de caminho.
+fn folder_slug(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '\0' => '-',
+            other => other,
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "Meu Espaço".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Dedup do padrão M6 (« (2)», « (3)»…): o nome final não pode colidir nem com uma
+/// PASTA já existente em `parent` nem com um NOME já inscrito no registry.
+fn unique_workspace_name(parent: &Path, name: &str, registry: &WorkspaceRegistry) -> String {
+    let taken = |candidate: &str| {
+        parent.join(folder_slug(candidate)).exists()
+            || registry
+                .entries()
+                .iter()
+                .any(|e| e.name.trim() == candidate)
+    };
+    let base = name.trim();
+    let base = if base.is_empty() { "Meu Espaço" } else { base };
+    if !taken(base) {
+        return base.to_string();
+    }
+    for i in 2..100 {
+        let candidate = format!("{base} ({i})");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{base} (∞)")
+}
+
+/// **O seam ÚNICO de criação de Espaço (M9).** Cria um Espaço NOVO de verdade, na ordem
+/// que protege o usuário Free: (a) gating ANTES de qualquer esforço — `Blocked` não cria
+/// pasta nenhuma; (b) nome/pasta únicos (padrão M6); (c) pasta + store + a sequência
+/// canônica de eventos — `WorkspaceCreated{name, focus_preset}` + time do preset (via
+/// [`gallery::apply_preset`], mesmo contrato W4-5) + `WorkspaceIdAssigned` (identidade
+/// durável, mesmo contrato de `Workspace::create` — sem ele o id degradaria para o path)
+/// e `WorkspaceDefaultCwdSet` quando o Diretório de Trabalho veio; (d) inscrição no
+/// registry global SEM carimbo de foco — o `WorkspaceFocusSet`/foco é do switch CALLER.
+///
+/// Os `NodeId` do time são cunhados aqui (`Uuid::now_v7`, o mesmo formato do
+/// `Supervisor`): não há shell vivo num Espaço de FUNDO — quem spawna os PTYs é o
+/// restore na primeira abertura, a partir destes ids projetados (`plan_restore`).
+///
+/// # Errors
+/// String acionável — gating (`LimitReached`), cwd não-UTF8, ou a string leiga congelada
+/// de falha de pasta ([`WorkdirError::CreateFailed`]).
+// Aguardando o WIRING do switch/M9 (fatia ii) — exercida pelos testes até lá,
+// mesmo padrão de `gallery.rs`. Remover o allow ao wirar.
+#[allow(dead_code)]
+pub fn create_workspace(
+    parent: &Path,
+    name: &str,
+    preset: &gallery::FocusPreset,
+    default_cwd: Option<&Path>,
+    registry: &mut WorkspaceRegistry,
+    _now_ms: u64,
+    tier: LicenseTier,
+) -> Result<PathBuf, String> {
+    // (a) Gating PRIMEIRO — o limite aparece antes do esforço; Blocked = zero side effects.
+    can_create_workspace(tier, registry.active_count()).map_err(|e| e.to_string())?;
+    // Recusa de input ANTES de tocar o disco (mesmo contrato de `Workspace::create`).
+    let default_cwd = default_cwd
+        .map(|p| {
+            p.to_str().map(str::to_string).ok_or_else(|| {
+                format!(
+                    "Diretório de Trabalho com caminho não-UTF8: {}",
+                    p.display()
+                )
+            })
+        })
+        .transpose()?;
+
+    // (b) Nome/pasta únicos.
+    let final_name = unique_workspace_name(parent, name, registry);
+    let ws_root = parent.join(folder_slug(&final_name));
+
+    // (c) Pasta + store + eventos (a fonte da verdade nasce aqui).
+    std::fs::create_dir_all(&ws_root).map_err(|_| WorkdirError::CreateFailed.to_string())?;
+    let mut store = EventStore::open(Workspace::events_dir(&ws_root)).map_err(|e| e.to_string())?;
+    let roles = RoleRegistry::with_defaults().map_err(|e| e.to_string())?;
+    let placed: Vec<gallery::PlacedAgent> = gallery::preset_team(*preset, &roles)
+        .into_iter()
+        .map(|a| gallery::PlacedAgent {
+            node: Uuid::now_v7(),
+            name: a.name,
+            role: a.role,
+        })
+        .collect();
+    gallery::apply_preset(*preset, &final_name, &placed, &mut store).map_err(|e| e.to_string())?;
+    store
+        .append(&DomainEvent::WorkspaceIdAssigned {
+            workspace_id: Uuid::now_v7().to_string(),
+        })
+        .map_err(|e| e.to_string())?;
+    if let Some(cwd) = default_cwd {
+        store
+            .append(&DomainEvent::WorkspaceDefaultCwdSet { cwd })
+            .map_err(|e| e.to_string())?;
+    }
+
+    // (d) Registro no ponteiro global — sem foco (o carimbo é do caller).
+    upsert_registry_entry(&mut store, &ws_root, registry)?;
+    registry.save().map_err(|e| e.to_string())?;
+    Ok(ws_root)
 }
 
 /// A RAIZ do Espaço a partir do `events_dir` listado pelo T6 (`persistence_ui` aceita
@@ -322,6 +518,214 @@ mod tests {
             Some("Cliente X".to_string()),
             "o nome do log vence o nome do diretório"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Criação feliz (M9):** eventos na ordem canônica, registry ganhou a entrada SEM
+    /// foco (o carimbo é do switch caller), e o replay de um store reaberto re-deriva
+    /// nome, preset e Diretório de Trabalho — o log é a fonte da verdade.
+    #[test]
+    fn create_workspace_happy_path_events_registry_and_replay() {
+        let base = temp_base("create");
+        let parent = base.join("espacos");
+        let cwd_dir = base.join("projetos");
+        std::fs::create_dir_all(&cwd_dir).expect("cwd dir");
+        let mut reg = registry_at(&base);
+
+        let ws_root = create_workspace(
+            &parent,
+            "Cliente X",
+            &gallery::FocusPreset::DevApp,
+            Some(&cwd_dir),
+            &mut reg,
+            1_000,
+            LicenseTier::Pro,
+        )
+        .expect("criação feliz");
+        assert_eq!(ws_root, parent.join("Cliente X"), "pasta = slug do nome");
+
+        // Ordem canônica: WorkspaceCreated → 4×(NodeAdded+NodeRoleAssigned) →
+        // WorkspaceIdAssigned → WorkspaceDefaultCwdSet.
+        let store = EventStore::open(Workspace::events_dir(&ws_root)).expect("reabrir store");
+        let kinds: Vec<String> = store
+            .events()
+            .expect("events")
+            .into_iter()
+            .map(|r| r.kind)
+            .collect();
+        assert_eq!(kinds.first().map(String::as_str), Some("WorkspaceCreated"));
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "NodeAdded").count(),
+            4,
+            "time do preset App nasce (4 agentes); veio {kinds:?}"
+        );
+        assert_eq!(kinds.iter().filter(|k| *k == "NodeRoleAssigned").count(), 4);
+        assert_eq!(
+            kinds.last().map(String::as_str),
+            Some("WorkspaceDefaultCwdSet"),
+            "o cwd fecha a sequência"
+        );
+        assert!(
+            kinds.iter().any(|k| k == "WorkspaceIdAssigned"),
+            "identidade durável apendada"
+        );
+
+        // Replay re-deriva tudo (inv#4: evento é verdade).
+        let proj = store.project().expect("replay");
+        assert_eq!(proj.workspace_name.as_deref(), Some("Cliente X"));
+        assert_eq!(proj.focus_preset.as_deref(), Some("dev_app"));
+        assert_eq!(
+            proj.default_cwd.as_deref(),
+            cwd_dir.to_str(),
+            "Diretório de Trabalho re-derivado do log"
+        );
+        assert_eq!(proj.nodes.len(), 4, "4 nós projetados");
+
+        // Registry: entrada existe, mas NÃO focada (foco é do caller).
+        assert_eq!(reg.active_count(), 1, "entrada inscrita no ponteiro");
+        assert!(
+            reg.focused().is_none(),
+            "criar NÃO carimba foco — isso é do switch"
+        );
+        let reg2 = registry_at(&base);
+        assert_eq!(
+            reg2.entries().iter().map(|e| e.path.clone()).next(),
+            Some(ws_root.clone()),
+            "inscrição persistiu no disco"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Gating ANTES do esforço:** Free com 1 Espaço ativo → `Blocked` e NENHUMA pasta
+    /// criada (zero side effects — o limite aparece antes, nunca nega no fim).
+    #[test]
+    fn create_workspace_blocked_on_free_creates_nothing() {
+        let base = temp_base("blocked");
+        let parent = base.join("espacos");
+        let mut reg = registry_at(&base);
+        reg.upsert(WorkspaceEntry {
+            id: "primeiro".into(),
+            name: "Meu Espaço".into(),
+            path: base.join("primeiro"),
+            last_focus: 0,
+            archived: false,
+        });
+
+        let err = create_workspace(
+            &parent,
+            "Segundo",
+            &gallery::FocusPreset::Blank,
+            None,
+            &mut reg,
+            1_000,
+            LicenseTier::Free,
+        )
+        .expect_err("free=1 com 1 ativo bloqueia");
+        assert!(
+            err.contains("limite"),
+            "erro acionável de limite; veio: {err}"
+        );
+        assert!(
+            !parent.exists(),
+            "Blocked não cria pasta nenhuma (nem o parent)"
+        );
+        assert_eq!(reg.active_count(), 1, "registry intocado");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Colisão de nome/pasta → sufixo « (2)» (padrão M6):** o segundo "Cliente X" nasce
+    /// como "Cliente X (2)" — em pasta própria E com o nome sufixado no log.
+    #[test]
+    fn create_workspace_name_collision_gets_m6_suffix() {
+        let base = temp_base("colisao");
+        let parent = base.join("espacos");
+        let mut reg = registry_at(&base);
+
+        let first = create_workspace(
+            &parent,
+            "Cliente X",
+            &gallery::FocusPreset::Blank,
+            None,
+            &mut reg,
+            1_000,
+            LicenseTier::Pro,
+        )
+        .expect("primeiro");
+        let second = create_workspace(
+            &parent,
+            "Cliente X",
+            &gallery::FocusPreset::Blank,
+            None,
+            &mut reg,
+            2_000,
+            LicenseTier::Pro,
+        )
+        .expect("segundo");
+
+        assert_eq!(first, parent.join("Cliente X"));
+        assert_eq!(second, parent.join("Cliente X (2)"), "pasta sufixada");
+        let proj = EventStore::open(Workspace::events_dir(&second))
+            .expect("store do segundo")
+            .project()
+            .expect("replay");
+        assert_eq!(
+            proj.workspace_name.as_deref(),
+            Some("Cliente X (2)"),
+            "o NOME no log também leva o sufixo (pasta e nome coerentes)"
+        );
+        assert_eq!(reg.active_count(), 2, "duas entradas distintas");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **`validate_workdir` nos 4 casos da spec §2:** existe-e-escreve → Ok canonicalizado;
+    /// não-existe → Ok (o caminho feliz cria); é-arquivo → «não está acessível»; sem
+    /// permissão de escrita → «não consigo trabalhar» (teste REAL, via chmod 000).
+    #[test]
+    fn validate_workdir_four_cases() {
+        let base = temp_base("workdir");
+
+        // (1) Existe, é diretório, escreve → Ok canonicalizado.
+        let ok_dir = base.join("escrevivel");
+        std::fs::create_dir_all(&ok_dir).expect("mkdir");
+        let canonical = validate_workdir(&ok_dir).expect("dir gravável é válido");
+        assert_eq!(canonical, ok_dir.canonicalize().expect("canonicalize"));
+
+        // (2) Não existe → Ok (não é erro: a criação fará a pasta).
+        let missing = base.join("ainda-nao-existe");
+        assert_eq!(
+            validate_workdir(&missing).expect("inexistente não é erro"),
+            missing
+        );
+
+        // (3) É arquivo → NotAccessible (string leiga congelada).
+        let file = base.join("um-arquivo.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let err = validate_workdir(&file).expect_err("arquivo não é pasta");
+        assert_eq!(err, WorkdirError::NotAccessible);
+        assert_eq!(
+            err.to_string(),
+            "Essa pasta não está acessível — escolha outra ou crie uma nova."
+        );
+
+        // (4) Sem permissão de escrita → NoWritePermission (prova REAL de escrita).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sealed = base.join("selada");
+            std::fs::create_dir_all(&sealed).expect("mkdir");
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+            let err = validate_workdir(&sealed).expect_err("sem escrita");
+            assert_eq!(err, WorkdirError::NoWritePermission);
+            assert_eq!(err.to_string(), "Não consigo trabalhar nessa pasta.");
+            // Devolve a permissão para o cleanup não falhar.
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod de volta");
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
