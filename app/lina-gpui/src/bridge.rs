@@ -3650,6 +3650,11 @@ pub enum RestoreBadge {
     Resumed,
     /// Motor sem resume — OU retomada não-aplicável (sem sessão anterior observável).
     FreshStart,
+    /// 2026-06-11: o MOTOR não spawnou nesta abertura (ambiente — ex.: PATH sem o binário).
+    /// O Agente re-ergue como terminal comum SEM perder a linhagem do CLI no log; o próximo
+    /// boot re-tenta o motor. Antes disto o nó era DESCARTADO em silêncio (Dead sem sucessor
+    /// = sumia do Espaço para sempre).
+    EngineMissing,
 }
 
 #[allow(dead_code)] // ver nota em `RestoreBadge` (consumido pela costura de boot externa).
@@ -3660,6 +3665,7 @@ impl RestoreBadge {
         match self {
             RestoreBadge::Resumed => "Sessão retomada",
             RestoreBadge::FreshStart => "Novo começo — o Agente não lembra da conversa anterior",
+            RestoreBadge::EngineMissing => "A IA deste Agente não religou — reabra o Espaço",
         }
     }
 
@@ -3670,6 +3676,10 @@ impl RestoreBadge {
             RestoreBadge::Resumed => "O Agente continua de onde vocês pararam.",
             RestoreBadge::FreshStart => {
                 "A conversa de antes continua guardada aqui na tela — é só rolar para cima."
+            }
+            RestoreBadge::EngineMissing => {
+                "O programa de IA não foi encontrado nesta abertura. Nada se perdeu: \
+                 feche e reabra o Espaço para religar."
             }
         }
     }
@@ -3697,6 +3707,10 @@ pub struct RestoredTerminal {
     pub badge: RestoreBadge,
     /// Janela viva re-hidratada do store (ordem cronológica). Vazia se não havia histórico.
     pub scrollback_tail: Vec<String>,
+    /// 2026-06-11: gerações `Dead` MAIS ANTIGAS do MESMO nome — aposentadas junto com o nó
+    /// re-erguido (`NodeRemoved`). Sem isto, fechar o card depois ressuscitaria a próxima
+    /// geração da fila no boot seguinte (cadeia de zumbis do resgate de órfãos).
+    pub shadows: Vec<NodeId>,
 }
 
 /// **F1-4-3 — o PLANO de restore do quit limpo, derivável SÓ de estado durável.** Dado o estado
@@ -3715,6 +3729,55 @@ pub fn plan_restore(
     scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
 ) -> Vec<RestoredTerminal> {
     let mut out = Vec::new();
+    let is_dead_terminal = |info: &lina_core::ProjectedNode| {
+        info.kind.eq_ignore_ascii_case("terminal")
+            && info.status.as_deref() == Some(lina_core::NodeStatus::Dead.as_str())
+    };
+    // 2026-06-11 (tela do fundador, 2ª reabertura) — RESGATE DE ÓRFÃOS por identidade-nome:
+    // um `Dead` NOMEADO sem sucessor vivo de mesmo nome é uma VÍTIMA — a admissão dele falhou
+    // num boot anterior (ex.: motor invisível no PATH degradado) e ninguém o re-ergueu nem o
+    // aposentou. Pular TODO `Dead` apagava esses nós do Espaço PARA SEMPRE (23 terminais do
+    // fundador). A identidade que atravessa gerações é o NOME (único no roster vivo por
+    // construção): geração fechada DE VERDADE tem sucessor vivo de mesmo nome (e o supersede
+    // a remove via `NodeRemoved`) — essa segue no passado; o órfão MAIS NOVO de cada nome
+    // volta ao plano. `Dead` sem nome (gerações pré-ADR-0022, o nome nunca foi ao log) segue
+    // fora — não há identidade para resgatar.
+    let live_names: std::collections::BTreeSet<String> = proj
+        .nodes
+        .values()
+        .filter(|i| i.kind.eq_ignore_ascii_case("terminal"))
+        .filter(|i| i.status.as_deref() != Some(lina_core::NodeStatus::Dead.as_str()))
+        .filter_map(|i| i.name.clone())
+        .collect();
+    let mut orphan_by_name: std::collections::BTreeMap<String, NodeId> =
+        std::collections::BTreeMap::new();
+    for (node, info) in &proj.nodes {
+        if !is_dead_terminal(info) {
+            continue;
+        }
+        let Some(name) = info.name.clone() else {
+            continue;
+        };
+        if live_names.contains(&name) {
+            continue;
+        }
+        let slot = orphan_by_name.entry(name).or_insert(*node);
+        // NodeId é UUID v7 (cresce no tempo) → a geração MAIS NOVA do nome vence.
+        if *node > *slot {
+            *slot = *node;
+        }
+    }
+    let rescued: std::collections::BTreeSet<NodeId> = orphan_by_name.into_values().collect();
+    // Mapa nome → TODAS as gerações Dead (para as sombras do plano — ver `RestoredTerminal`).
+    let mut dead_named: std::collections::BTreeMap<String, Vec<NodeId>> =
+        std::collections::BTreeMap::new();
+    for (node, info) in &proj.nodes {
+        if is_dead_terminal(info) {
+            if let Some(name) = info.name.clone() {
+                dead_named.entry(name).or_default().push(*node);
+            }
+        }
+    }
     for (node, info) in &proj.nodes {
         // Só TERMINAIS re-erguem aqui (notas/pastas têm outro ciclo de vida). Case-insensitive:
         // a admissão de produção grava "Terminal" (ADR 0022 §2), mas o filtro tolera variação.
@@ -3725,8 +3788,9 @@ pub fn plan_restore(
         // anteriores) fica no passado — a foto do boot é tirada ANTES do fechamento desta
         // geração, então quem estava vivo no último quit ainda NÃO está `Dead` aqui. Sem este
         // filtro, cada reabertura re-erguia TODAS as gerações empilhadas na mesma posição
-        // (bug da tela de 2026-06-11: 23 cards em x=30,y=96, shell puro por baixo).
-        if info.status.as_deref() == Some(lina_core::NodeStatus::Dead.as_str()) {
+        // (bug da tela de 2026-06-11: 23 cards em x=30,y=96, shell puro por baixo). A EXCEÇÃO
+        // é o órfão resgatado acima — vítima, não geração fechada.
+        if is_dead_terminal(info) && !rescued.contains(node) {
             continue;
         }
         let panel = node.to_string();
@@ -3787,6 +3851,12 @@ pub fn plan_restore(
             None => Vec::new(),
         };
 
+        let shadows: Vec<NodeId> = info
+            .name
+            .as_deref()
+            .and_then(|n| dead_named.get(n))
+            .map(|gens| gens.iter().copied().filter(|s| s != node).collect())
+            .unwrap_or_default();
         out.push(RestoredTerminal {
             node: *node,
             name: info.name.clone().unwrap_or_default(),
@@ -3798,6 +3868,7 @@ pub fn plan_restore(
             command,
             badge,
             scrollback_tail,
+            shadows,
         });
     }
     out
@@ -3819,7 +3890,16 @@ impl NodeManager {
 
     pub fn restore_terminals(&self, plans: &[RestoredTerminal]) -> usize {
         let mut up = 0;
+        // 2026-06-11 — re-layout anti-colisão: o log herdou posições da era pré-fix (49 cards
+        // em 8 coordenadas; até 10 no MESMO ponto — "um terminal em cima do outro" na tela do
+        // fundador). O PRIMEIRO ocupante de cada coordenada a mantém; os demais caem para
+        // `next_free_slot` (position=None na admissão) e a posição NOVA persiste no
+        // `NodeAdded` — a correção é durável, não cosmética.
+        let mut taken_slots: std::collections::BTreeSet<(i64, i64)> =
+            std::collections::BTreeSet::new();
         for plan in plans {
+            let slot = (plan.x.round() as i64, plan.y.round() as i64);
+            let position = taken_slots.insert(slot).then_some((plan.x, plan.y));
             // Comando do restore → motor (mesmo caminho do M6): `[program, args…]` do perfil,
             // já com o verbo de resume quando o badge observou sessão anterior. Vazio = shell
             // puro (fábrica do workspace).
@@ -3832,7 +3912,8 @@ impl NodeManager {
                     profile_id: plan.profile_id.clone(),
                     label: plan.profile_id.clone().unwrap_or_else(|| plan.name.clone()),
                 });
-            let admission = NodeAdmission {
+            let had_engine = engine.is_some();
+            let build_admission = |engine: Option<AgentEngine>| NodeAdmission {
                 name: (!plan.name.is_empty()).then(|| plan.name.clone()),
                 role: plan.role.clone().unwrap_or_else(|| "terminal".into()),
                 engine,
@@ -3845,14 +3926,40 @@ impl NodeManager {
                     },
                     None => CwdPolicy::Managed,
                 },
-                position: Some((plan.x, plan.y)),
+                position, // colisão de coordenada → None → `next_free_slot` (re-layout durável)
                 requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
                 autonomy: Autonomy::Assisted,
             };
             // Reescrita do kit em LOTE (1× após o loop): com N restores, o rewrite por-admissão
             // era O(N²) de I/O — o vilão do boot lento medido em 2026-06-11 (~80 nós).
-            let node = match self.admit_node_inner(admission, false) {
+            let mut badge = plan.badge;
+            let node = match self.admit_node_inner(build_admission(engine), false) {
                 Ok(n) => n,
+                // 2026-06-11 (tela do fundador): o spawn do MOTOR falha quando o ambiente
+                // degrada (PATH sem o binário — hidratação do shell de login estourou o
+                // timeout). Falha TRANSITÓRIA não pode virar dano permanente: re-ergue como
+                // terminal comum, preservando nome/papel/cwd/posição; a linhagem do CLI é
+                // re-apendada abaixo e o próximo boot re-tenta o motor.
+                Err(e) if had_engine => {
+                    eprintln!(
+                        "lina-gpui: restore de '{}' com o motor falhou ({e}); re-erguendo \
+                         como terminal comum (o motor volta no próximo boot)",
+                        plan.name
+                    );
+                    match self.admit_node_inner(build_admission(None), false) {
+                        Ok(n) => {
+                            badge = RestoreBadge::EngineMissing;
+                            n
+                        }
+                        Err(e2) => {
+                            eprintln!(
+                                "lina-gpui: restore de '{}' falhou ({e2}); seguindo sem ele",
+                                plan.name
+                            );
+                            continue;
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!(
                         "lina-gpui: restore de '{}' falhou ({e}); seguindo sem ele",
@@ -3861,6 +3968,22 @@ impl NodeManager {
                     continue;
                 }
             };
+            // Linhagem do CLI do nó DEGRADADO: o log continua declarando o profile (intenção
+            // do nó), senão o próximo `plan_restore` o veria como shell PARA SEMPRE.
+            if badge == RestoreBadge::EngineMissing {
+                if let Some(pid) = &plan.profile_id {
+                    if let Err(e) = lock(&self.store).append(&DomainEvent::CliProfileSet {
+                        node,
+                        profile: pid.clone(),
+                    }) {
+                        eprintln!(
+                            "lina-gpui: CRÍTICO — linhagem de CLI de '{}' não persistiu ({e}); \
+                             o próximo boot pode re-erguê-lo sem motor",
+                            plan.name
+                        );
+                    }
+                }
+            }
             // SUPERSEDE: o nó da geração anterior é APOSENTADO no log — o re-erguido é um nó
             // NOVO (Dead é terminal, ADR 0020) e sem o `NodeRemoved` o antigo re-erguia DE NOVO
             // a cada boot (canvas dobrando, cards empilhados). Auditável: o remove fica no log.
@@ -3871,6 +3994,18 @@ impl NodeManager {
                      aposentado no log: {e} (pode reaparecer duplicado no próximo boot)",
                     plan.name, plan.node
                 );
+            }
+            // Sombras: gerações Dead mais antigas do MESMO nome se aposentam JUNTO — senão
+            // fechar o card depois ressuscita a próxima da fila no boot seguinte.
+            for shadow in &plan.shadows {
+                if let Err(e) =
+                    lock(&self.store).append(&DomainEvent::NodeRemoved { node: *shadow })
+                {
+                    eprintln!(
+                        "lina-gpui: sombra {shadow} de '{}' não aposentada no log ({e})",
+                        plan.name
+                    );
+                }
             }
             // Re-hidrata o grid: a janela viva entra ANTES do output novo do shell — o leigo
             // reabre e a conversa está lá. CRLF por linha (o VT trata como output normal).
@@ -3887,13 +4022,13 @@ impl NodeManager {
             // Badge honesto na projeção (render lê daqui; chave = nó NOVO re-erguido).
             {
                 let mut m = lock(&self.model);
-                m.restore_badges.insert(node, plan.badge);
+                m.restore_badges.insert(node, badge);
                 m.touch();
             }
             eprintln!(
                 "lina-gpui: [RESTORE] '{}' re-erguido ({}; {} linhas re-hidratadas)",
                 plan.name,
-                plan.badge.label(),
+                badge.label(),
                 plan.scrollback_tail.len()
             );
             up += 1;
@@ -10317,6 +10452,7 @@ mod tests {
                 command: Vec::new(), // shell puro (fábrica do workspace)
                 badge: RestoreBadge::FreshStart,
                 scrollback_tail: vec!["plano da rodada 3 fechado".into(), "até amanhã ✓".into()],
+                shadows: Vec::new(),
             },
             RestoredTerminal {
                 node: NodeId::from_u128(2),
@@ -10329,6 +10465,7 @@ mod tests {
                 command: Vec::new(),
                 badge: RestoreBadge::FreshStart,
                 scrollback_tail: Vec::new(), // sem histórico — nada a re-hidratar
+                shadows: Vec::new(),
             },
         ];
         let up = nm.restore_terminals(&plans);
@@ -10442,13 +10579,15 @@ mod tests {
         let base = std::env::temp_dir().join(format!("lina-restore-dead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let mut store = EventStore::open(base.join("events")).expect("store");
-        let vivo = NodeId::from_u128(1);
-        let morto = NodeId::from_u128(2);
+        // Geração FECHADA de verdade: o Dead tem SUCESSOR VIVO de mesmo nome (o supersede
+        // normal ainda removeria o antigo; aqui modelamos o pior caso — ele sobrou no log).
+        let morto = NodeId::from_u128(1);
+        let vivo = NodeId::from_u128(2);
         seed_terminal(
-            &mut store, vivo, 10.0, 20.0, "Vivo", "terminal", "Shell", None,
+            &mut store, morto, 30.0, 40.0, "Maestro", "maestro", "Shell", None,
         );
         seed_terminal(
-            &mut store, morto, 30.0, 40.0, "Fantasma", "terminal", "Shell", None,
+            &mut store, vivo, 10.0, 20.0, "Maestro", "maestro", "Shell", None,
         );
         store
             .append(&DomainEvent::NodeStatusChanged {
@@ -10463,10 +10602,231 @@ mod tests {
         assert_eq!(
             plans.len(),
             1,
-            "só o vivo re-ergue; o Dead de geração anterior fica no passado"
+            "só o vivo re-ergue; o Dead COM sucessor vivo fica no passado (sem empilhar)"
         );
         assert_eq!(plans[0].node, vivo);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Bug da tela 2026-06-11 (2ª reabertura, metade "sumiço"):** `Dead` NOMEADO sem sucessor
+    /// vivo de mesmo nome = ÓRFÃO (a admissão dele falhou num boot anterior; ninguém o re-ergueu
+    /// nem o aposentou). Pular todo `Dead` o apagava do Espaço PARA SEMPRE — 23 terminais do
+    /// fundador. O plano resgata a geração MAIS NOVA de cada nome órfão; `Dead` sem nome
+    /// (pré-ADR-0022) segue fora; `Dead` com sucessor vivo segue fora (anti-empilhamento).
+    #[test]
+    fn plan_restore_rescues_named_dead_orphans() {
+        let base = std::env::temp_dir().join(format!("lina-restore-orfao-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut store = EventStore::open(base.join("events")).expect("store");
+        let mark_dead = |store: &mut EventStore, node: NodeId| {
+            store
+                .append(&DomainEvent::NodeStatusChanged {
+                    node,
+                    status: lina_core::NodeStatus::Dead.as_str().to_string(),
+                    from: "Idle".to_string(),
+                    reason: "app_reopened".to_string(),
+                })
+                .expect("morte póstuma");
+        };
+        // "Terminal J": DUAS gerações órfãs (5 e 9) — só a mais nova (9) volta.
+        let j_velho = NodeId::from_u128(5);
+        let j_novo = NodeId::from_u128(9);
+        seed_terminal(
+            &mut store,
+            j_velho,
+            30.0,
+            96.0,
+            "Terminal J",
+            "terminal",
+            "claude-code",
+            Some("claude-code"),
+        );
+        seed_terminal(
+            &mut store,
+            j_novo,
+            30.0,
+            96.0,
+            "Terminal J",
+            "terminal",
+            "claude-code",
+            Some("claude-code"),
+        );
+        mark_dead(&mut store, j_velho);
+        mark_dead(&mut store, j_novo);
+        // "Terminal A": Dead antigo + sucessor VIVO → só o vivo (sem empilhar).
+        let a_morto = NodeId::from_u128(3);
+        let a_vivo = NodeId::from_u128(4);
+        seed_terminal(
+            &mut store,
+            a_morto,
+            740.0,
+            96.0,
+            "Terminal A",
+            "terminal",
+            "Shell",
+            None,
+        );
+        seed_terminal(
+            &mut store,
+            a_vivo,
+            740.0,
+            96.0,
+            "Terminal A",
+            "terminal",
+            "Shell",
+            None,
+        );
+        mark_dead(&mut store, a_morto);
+        // Sem nome (geração pré-ADR-0022: NodeRenamed nunca foi ao log) → sem identidade, fora.
+        let sem_nome = NodeId::from_u128(6);
+        store
+            .append(&DomainEvent::NodeAdded {
+                node: sem_nome,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .expect("NodeAdded");
+        store
+            .append(&DomainEvent::TerminalSpawned {
+                node: sem_nome,
+                cli: "Shell".into(),
+                cwd: None,
+            })
+            .expect("TerminalSpawned");
+        mark_dead(&mut store, sem_nome);
+
+        let proj = store.project().expect("project");
+        let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
+        let nodes: std::collections::BTreeSet<NodeId> = plans.iter().map(|p| p.node).collect();
+        assert_eq!(
+            nodes,
+            [a_vivo, j_novo].into_iter().collect(),
+            "vivo entra; órfão MAIS NOVO volta; órfão velho, Dead-com-sucessor e sem-nome ficam"
+        );
+        // Sombras: a geração VELHA do J se aposenta junto com o resgate do novo — fechar o
+        // card depois não ressuscita a próxima da fila (cadeia de zumbis morta na raiz).
+        let plano_j = plans.iter().find(|p| p.node == j_novo).expect("plano do J");
+        assert_eq!(plano_j.shadows, vec![j_velho]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Bug da tela 2026-06-11 (2ª reabertura):** com o PATH degradado (hidratação do shell de
+    /// login estourou o timeout), o exec do MOTOR falha e o restore DESCARTAVA o nó em silêncio —
+    /// o terminal sumia do Espaço para sempre (Dead sem sucessor). Agora: re-ergue como shell
+    /// preservando nome/papel/posição, re-apenda a LINHAGEM do CLI no log (o próximo boot
+    /// re-tenta o motor) e o badge conta ao leigo o que houve.
+    #[test]
+    fn restore_with_missing_engine_degrades_to_shell_preserving_lineage() {
+        let (nm, store, model) = test_manager("restore-engine-missing", None);
+        let antigo = NodeId::from_u128(88);
+        seed_terminal(
+            &mut lock(&store),
+            antigo,
+            30.0,
+            96.0,
+            "Terminal J",
+            "terminal",
+            "claude-code",
+            Some("claude-code"),
+        );
+
+        // Perfil cujo binário NÃO existe nesta máquina — o exec falha exatamente como sob o
+        // PATH mínimo do launchd (`claude` por nome puro, invisível sem hidratação).
+        let mut reg = ProfileRegistry::new();
+        reg.insert(
+            CliProfile::from_toml_str(
+                r#"
+                    id = "claude-code"
+                    program = "lina-motor-inexistente-9f3x"
+                    delivery = "pty_inject"
+                    prompt_ready_regex = "> "
+                    [end_signal]
+                    kind = "idle"
+                "#,
+                "<engine-missing>",
+            )
+            .expect("profile parseia"),
+        );
+
+        let proj = lock(&store).project().expect("project");
+        let plans = plan_restore(&proj, &reg, None);
+        assert_eq!(plans.len(), 1, "o nó com motor entra no plano");
+        assert_eq!(
+            plans[0].command.first().map(String::as_str),
+            Some("lina-motor-inexistente-9f3x"),
+            "o plano tenta o MOTOR primeiro"
+        );
+
+        assert_eq!(
+            nm.restore_terminals(&plans),
+            1,
+            "o nó re-ergue mesmo com o motor indisponível (nunca descartado)"
+        );
+
+        // Projeção nova: o nome sobreviveu E a linhagem do CLI sobreviveu (CliProfileSet
+        // re-apendado) — o próximo plan_restore volta a tentar o claude.
+        let proj2 = lock(&store).project().expect("re-project");
+        let (novo, info) = proj2
+            .nodes
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some("Terminal J"))
+            .expect("geração nova existe com o mesmo nome");
+        assert_eq!(
+            info.cli.as_deref(),
+            Some("claude-code"),
+            "linhagem do CLI preservada no log do nó degradado"
+        );
+        // Badge honesto: o leigo vê que a IA não religou (e que nada se perdeu).
+        assert_eq!(
+            lock(&model).restore_badges.get(novo).copied(),
+            Some(RestoreBadge::EngineMissing)
+        );
+    }
+
+    /// **Bug da tela 2026-06-11 ("um terminal em cima do outro"):** o log herdou da era pré-fix
+    /// coordenadas EMPILHADAS (até 10 cards no mesmo ponto) e o restore as reproduzia fielmente
+    /// para sempre. Agora o primeiro ocupante mantém a coordenada; os demais re-alocam via
+    /// `next_free_slot` e a posição nova PERSISTE (`NodeAdded`) — correção durável.
+    #[test]
+    fn restore_relayouts_colliding_positions() {
+        let (nm, store, model) = test_manager("restore-colisao", None);
+        for (id, name) in [(11_u128, "Card 1"), (12, "Card 2"), (13, "Card 3")] {
+            seed_terminal(
+                &mut lock(&store),
+                NodeId::from_u128(id),
+                30.0,
+                96.0, // TODOS na mesma coordenada (herança da era pré-fix)
+                name,
+                "terminal",
+                "Shell",
+                None,
+            );
+        }
+        let proj = lock(&store).project().expect("project");
+        let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
+        assert_eq!(plans.len(), 3);
+        assert_eq!(nm.restore_terminals(&plans), 3);
+
+        let m = lock(&model);
+        let mut posicoes: Vec<(i64, i64)> = m
+            .nodes
+            .values()
+            .filter(|v| v.name.starts_with("Card "))
+            .map(|v| (f64::from(v.x).round() as i64, f64::from(v.y).round() as i64))
+            .collect();
+        posicoes.sort_unstable();
+        posicoes.dedup();
+        assert_eq!(
+            posicoes.len(),
+            3,
+            "três cards, três coordenadas distintas — nada empilhado: {posicoes:?}"
+        );
+        assert!(
+            posicoes.contains(&(30, 96)),
+            "o primeiro ocupante mantém a coordenada original"
+        );
     }
 
     /// **Bug "terminais empilhados" (metade 2 — supersede):** o restore re-admite como nó NOVO;

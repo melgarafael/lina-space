@@ -3290,6 +3290,60 @@ fn path_looks_hydrated(path: &str) -> bool {
     })
 }
 
+/// Candidatos CONHECIDOS de diretórios onde CLIs de IA/npm vivem — a contraparte exata das
+/// famílias que `path_looks_hydrated` reconhece. **Puro** (só monta caminhos a partir do home).
+/// nvm fica de fora de propósito (dirs versionados, sem `current/bin` estável).
+fn known_cli_dir_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    vec![
+        home.join(".local/bin"),
+        std::path::PathBuf::from("/opt/homebrew/bin"),
+        std::path::PathBuf::from("/usr/local/bin"),
+        home.join(".cargo/bin"),
+        home.join(".bun/bin"),
+        home.join(".volta/bin"),
+        home.join(".deno/bin"),
+    ]
+}
+
+/// Filtra os candidatos que EXISTEM no disco. É o que torna o fallback determinístico:
+/// zero shell, zero rc do usuário, zero espera — só `is_dir`.
+fn existing_dirs(candidates: &[std::path::PathBuf]) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// **Fallback determinístico da hidratação (bug de tela 2026-06-11).** O `zsh -lic` é
+/// best-effort com timeout de 2s; sob carga (quit pesado + reabertura imediata) ele estoura
+/// e o app ficava com o PATH mínimo do launchd — NENHUM motor (`claude`/`codex`/`gemini`,
+/// declarados por NOME no CLI Profile) spawnava, e o restore descartava os nós em silêncio.
+/// Aqui, se o PATH efetivo ainda não está rico, unimos os dirs conhecidos que EXISTEM no
+/// disco — instantâneo e suficiente para o exec achar o binário; o rc do usuário deixa de
+/// ser ponto único de falha do boot.
+#[cfg(unix)]
+fn hydrate_path_fallback_known_dirs() {
+    let effective = std::env::var("PATH").unwrap_or_default();
+    if path_looks_hydrated(&effective) {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let known = existing_dirs(&known_cli_dir_candidates(std::path::Path::new(&home)));
+    if known.is_empty() {
+        return;
+    }
+    let augmented = augmented_verify_path(&effective, &known);
+    // edition 2021: `set_var` é seguro (e rodamos antes de qualquer thread/janela subir).
+    std::env::set_var("PATH", augmented.as_str());
+    eprintln!(
+        "lina-gpui: PATH completado com {} dir(s) conhecidos de CLI (shell de login indisponível)",
+        known.len()
+    );
+}
+
 /// Extrai o PATH carimbado pela sentinela `marker` no stdout do shell de login (ignora ruído de rc).
 /// **Puro** (testável sem subprocesso).
 #[must_use]
@@ -3374,6 +3428,9 @@ fn hydrate_path_from_login_shell() {
             );
         }
     }
+    // Defesa em profundidade: timeout/falha do shell de login (ou rc que devolve PATH pobre)
+    // NÃO pode deixar o boot sem os motores — o restore descartava nós por isso (2026-06-11).
+    hydrate_path_fallback_known_dirs();
 }
 
 /// No-op fora de unix (Windows não tem o problema do PATH de `launchd`; o de-risk do ConPTY é à parte).
@@ -4206,6 +4263,55 @@ mod path_tests {
             "/Users/x/.nvm/versions/node/v22.0.0/bin:/usr/bin"
         ));
         assert!(path_looks_hydrated("/Users/x/.local/bin:/usr/bin"));
+    }
+
+    /// `known_cli_dir_candidates`: a contraparte de `path_looks_hydrated` — as MESMAS famílias de
+    /// diretórios que o teste de riqueza reconhece, montadas a partir do home dado. Puro.
+    #[test]
+    fn known_cli_dir_candidates_covers_hydration_families() {
+        let home = std::path::Path::new("/Users/x");
+        let got = known_cli_dir_candidates(home);
+        for want in [
+            "/Users/x/.local/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/Users/x/.cargo/bin",
+            "/Users/x/.bun/bin",
+            "/Users/x/.volta/bin",
+            "/Users/x/.deno/bin",
+        ] {
+            assert!(
+                got.iter().any(|p| p == std::path::Path::new(want)),
+                "candidato ausente: {want}"
+            );
+        }
+    }
+
+    /// `existing_dirs`: só devolve candidatos que EXISTEM no disco — é o que torna o fallback
+    /// determinístico sem depender do rc do usuário (bug 2026-06-11: timeout do `zsh -lic` sob
+    /// carga deixava o app com o PATH mínimo do launchd e NENHUM motor spawnava no restore).
+    #[test]
+    fn existing_dirs_filters_by_disk() {
+        let base = std::env::temp_dir().join(format!("lina-pathfb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join(".local/bin");
+        std::fs::create_dir_all(&real).expect("cria dir real");
+        let ghost = base.join(".volta/bin");
+        let got = existing_dirs(&[real.clone(), ghost]);
+        assert_eq!(got, vec![real.to_string_lossy().into_owned()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Fim-a-fim puro: PATH mínimo do launchd + fallback de dirs conhecidos existentes →
+    /// o PATH resultante PASSA no `path_looks_hydrated` (o motor volta a ser achável).
+    #[cfg(unix)]
+    #[test]
+    fn fallback_known_dirs_hydrates_minimal_path() {
+        let minimal = "/usr/bin:/bin:/usr/sbin:/sbin";
+        let extras = vec!["/Users/x/.local/bin".to_string()];
+        let got = augmented_verify_path(minimal, &extras);
+        assert!(path_looks_hydrated(&got), "PATH segue mínimo: {got}");
+        assert!(got.split(':').any(|p| p == "/usr/bin"), "base preservado");
     }
 
     /// `parse_marked_path`: extrai o PATH carimbado pela sentinela, ignorando ruído de rc antes/depois,
