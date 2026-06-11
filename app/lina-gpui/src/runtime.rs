@@ -67,7 +67,6 @@ pub struct WsRuntime {
     pub desk: Desk,
     /// W4-3: freio por Espaço (pausa num Espaço não pausa outro — spec M8 §escopo).
     pub brake: wiring::Brake,
-    #[allow(dead_code)] // lido por `point_to_active` (main) quando a sidebar T4 montar.
     pub autonomy: Autonomy,
     /// F1-0-2: o perfil de injeção REAL do boot (fallback dos alvos sem `profile_id`).
     pub injection_profile: CliProfile,
@@ -89,7 +88,6 @@ pub struct WsRuntime {
 /// Compartilhado entre a view (troca/leitura do ativo) e o epílogo do `main` (parada limpa).
 pub struct RuntimeMap {
     pub map: BTreeMap<PathBuf, WsRuntime>,
-    #[allow(dead_code)] // lido pelo switch da view (sidebar T4 — mesma rodada).
     pub active: PathBuf,
 }
 
@@ -110,7 +108,6 @@ pub fn runtimes_with_boot(rt: WsRuntime) -> Runtimes {
 /// apenda `WorkspaceFocusSet` no log do ALVO (F1-4-4 crit 1) + carimba o foco no ponteiro
 /// global (`focus_target_workspace` — o PRÓXIMO boot abre o alvo). `Err` NÃO troca nada —
 /// o Espaço atual segue na tela (inv#6; a sidebar mostra a linha-⚠ do alvo).
-#[allow(dead_code)] // chamado por `WorkspaceView::switch_to_workspace` (sidebar T4 — mesma rodada).
 pub fn activate_workspace(
     rts: &Runtimes,
     target_root: PathBuf,

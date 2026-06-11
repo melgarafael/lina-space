@@ -59,7 +59,7 @@ mod prof;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -509,12 +509,15 @@ struct WorkspaceView {
     dash: Arc<dashboard::DashWiring>,
     /// F1-4-4 fatia (ii): TODOS os runtimes do processo (fundos VIVOS) + qual está ativo.
     /// A view cacheia os handles do ativo (campos acima); o switch os re-aponta.
-    /// `dead_code` até a SIDEBAR (T4) montar e chamar `switch_to_workspace` — mesma rodada.
-    #[allow(dead_code)]
     runtimes: runtime::Runtimes,
     /// Infra por-processo (PTY/fábrica/dims) para montar runtime sob demanda na troca.
-    #[allow(dead_code)] // ver nota em `runtimes` (consumido pela costura da sidebar T4).
     shared: runtime::SharedInfra,
+    /// F1-4-4 · M8: o rail de Espaços (estado headless + render — T4) com os callbacks fiados.
+    sidebar: sidebar::Sidebar,
+    /// F1-4-4 · M8: cache do mini-status por Espaço (projeção 1× por abertura do rail — T2).
+    mini_cache: dashboard::MiniStatusCache,
+    /// F1-4-4 · M9: modal Criar Espaço (estado headless — T5). `Some` = aberto.
+    create_space_modal: Option<gallery::CreateSpaceModal>,
     /// F1-1-5 (sonda `[DASH]`): último `ts` de hook reportado por nó — loga a latência
     /// evento→card 1× por evento (na MUDANÇA), sem spammar o stderr a 60fps.
     dash_lat_reported: BTreeMap<String, u64>,
@@ -694,6 +697,37 @@ impl WorkspaceView {
             settings_dir,
             runtimes,
             shared,
+            // F1-4-4 · M8: o rail nasce com os 7 callbacks da integração fiados — cliques do
+            // componente despacham para os métodos da view (o componente não se auto-muta).
+            sidebar: sidebar::Sidebar::new(
+                std::rc::Rc::new(|v: &mut Self, root: &Path, _w, cx| {
+                    v.switch_to_workspace(root.to_path_buf(), cx);
+                    v.refresh_sidebar_rows();
+                }),
+                std::rc::Rc::new(|v: &mut Self, _w, cx| v.open_create_space_modal(cx)),
+                std::rc::Rc::new(|v: &mut Self, root: &Path, novo: &str, _w, cx| {
+                    v.rename_workspace(root, novo, cx);
+                }),
+                std::rc::Rc::new(|v: &mut Self, root: &Path, _w, cx| {
+                    v.archive_workspace(root, cx);
+                }),
+                std::rc::Rc::new(|v: &mut Self, _w, cx| v.toggle_sidebar(cx)),
+                std::rc::Rc::new(|v: &mut Self, _w, _cx| {
+                    // Vista de arquivados: pendente da costura `WorkspaceUnarchived` (spec
+                    // §6-C2) — degradação VISÍVEL no log, nunca silêncio.
+                    eprintln!(
+                        "lina-gpui: [WS] vista de arquivados ainda não fiada \
+                         (aguarda WorkspaceUnarchived — spec §6-C2)"
+                    );
+                    let _ = v;
+                }),
+                std::rc::Rc::new(|v: &mut Self, _root: &Path, _w, cx| {
+                    v.sidebar.state.start_rename();
+                    cx.notify();
+                }),
+            ),
+            mini_cache: dashboard::MiniStatusCache::default(),
+            create_space_modal: None,
             prof: prof::Probe::from_env(),
         }
     }
@@ -704,7 +738,6 @@ impl WorkspaceView {
     /// foco durável (log do alvo + ponteiro global) e re-aponta a view. Os PIDs do Espaço que
     /// sai NÃO são tocados (decisão do fundador: fundos VIVOS — pumps/PTYs/threads seguem).
     /// Falha NÃO troca nada: o Espaço atual segue na tela (inv#6).
-    #[allow(dead_code)] // ver nota em `runtimes` (chamado pela sidebar T4 — mesma rodada).
     fn switch_to_workspace(&mut self, target_root: PathBuf, cx: &mut Context<Self>) {
         if lock(&self.runtimes).active == target_root {
             return;
@@ -733,7 +766,6 @@ impl WorkspaceView {
     /// POR-Espaço (câmera/z-order/seleção/fila resetam; o render re-aponta o foco ao 1º card —
     /// "nunca tela em branco"). Ativo ausente do mapa = impossível por construção
     /// (`runtimes_with_boot`/`activate_workspace` inserem antes de apontar); degrada com log.
-    #[allow(dead_code)] // ver nota em `runtimes` (chamado pela sidebar T4 — mesma rodada).
     fn point_to_active(&mut self) {
         {
             let r = lock(&self.runtimes);
@@ -767,6 +799,504 @@ impl WorkspaceView {
         self.attention_machine = attention_ui::ToastMachine::default();
         self.attention_settings_at = None;
         self.dash_lat_reported.clear();
+    }
+
+    // ──────────────── F1-4-4 · M8/M9: fiação da sidebar + criar Espaço (integração) ────────────────
+
+    /// Abre/recolhe o rail; ABRIR recarrega linhas + mini-status (1× por abertura — T2 §6-B5).
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar.state.expanded {
+            self.refresh_sidebar_rows();
+            self.sidebar.state.open();
+        } else {
+            self.sidebar.state.close();
+        }
+        cx.notify();
+    }
+
+    /// Linhas do rail: registry canônico (ordem de criação = ⌘n estável) + varredura T6 como
+    /// fallback de recuperação + mini-status honesto por Espaço (cache com staleness declarada).
+    fn refresh_sidebar_rows(&mut self) {
+        let now_ms = lina_core::now_ms();
+        let active_root = lock(&self.runtimes).active.clone();
+        let registry = lina_core::default_registry_path()
+            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok());
+        let entries: Vec<lina_core::WorkspaceEntry> = registry
+            .as_ref()
+            .map(|r| r.entries().to_vec())
+            .unwrap_or_default();
+        let scan = active_root
+            .parent()
+            .map(|base| {
+                persistence_ui::list_workspaces(base, &sidebar::events_dir_of(&active_root))
+            })
+            .unwrap_or_default();
+        // Chaves do cache = MESMA derivação do build_rows (contrato T4 §2 — byte a byte).
+        let dirs: Vec<PathBuf> = entries
+            .iter()
+            .map(|e| sidebar::events_dir_of(&e.path))
+            .chain(scan.iter().map(|s| s.events_dir.clone()))
+            .collect();
+        let sessions = lock(&self.dash.sessions).clone();
+        let today = dashboard::utc_day_prefix(now_ms);
+        self.mini_cache.refresh(&dirs, &sessions, &today, now_ms);
+        self.sidebar.state.set_rows(sidebar::build_rows(
+            &entries,
+            &scan,
+            &active_root,
+            &self.mini_cache,
+        ));
+        // Vitrine free=1 (spec §3): tier STUB `Pro` até F1-4-5 — bloqueante de release (§6-B1).
+        self.sidebar.create_blocked = registry
+            .as_ref()
+            .is_some_and(|r| r.can_create(lina_core::LicenseTier::Pro).is_err());
+    }
+
+    /// Abre o M9 — o gating roda NA ABERTURA (antes do esforço, spec §3; tier stub `Pro`).
+    fn open_create_space_modal(&mut self, cx: &mut Context<Self>) {
+        let registry = lina_core::default_registry_path()
+            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok());
+        let active = registry
+            .as_ref()
+            .map_or(0, lina_core::WorkspaceRegistry::active_count);
+        let existing: Vec<String> = registry
+            .as_ref()
+            .map(|r| r.entries().iter().map(|e| e.name.clone()).collect())
+            .unwrap_or_default();
+        let default_cwd = {
+            let s = persistence_ui::load_settings(&self.settings_dir);
+            let trimmed = s.default_cwd.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        };
+        self.create_space_modal = Some(gallery::CreateSpaceModal::new(
+            lina_core::LicenseTier::Pro,
+            active,
+            default_cwd,
+            existing,
+        ));
+        cx.notify();
+    }
+
+    /// `[ Procurar… ]` do M9 — picker nativo só-pastas (mesmo padrão do M6); a validação
+    /// na SELEÇÃO acontece dentro de `set_workdir_picked` (T5).
+    fn m9_pick_folder(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Usar esta pasta".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(p) = paths.into_iter().next() {
+                    let _ = this.update(cx, |view, cx| {
+                        if let Some(m) = view.create_space_modal.as_mut() {
+                            m.set_workdir_picked(&p);
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// `[[ Criar Espaço ]]` — cria via seam T3 e TROCA para o novo (aterrissagem povoada,
+    /// nunca tela em branco — spec §2.3). Erro/bloqueio fica INLINE (modal segue aberto).
+    fn m9_submit(&mut self, cx: &mut Context<Self>) {
+        let Some(mut m) = self.create_space_modal.take() else {
+            return;
+        };
+        let Some(parent) = lock(&self.runtimes).active.parent().map(Path::to_path_buf) else {
+            eprintln!("lina-gpui: [WS] raiz ativa sem diretório-pai — criação abortada");
+            return;
+        };
+        let Some(mut registry) = lina_core::default_registry_path()
+            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok())
+        else {
+            eprintln!("lina-gpui: [WS] ponteiro global indisponível — criação abortada");
+            self.create_space_modal = Some(m);
+            return;
+        };
+        let mut created: Option<PathBuf> = None;
+        let ok = m.submit(
+            &parent,
+            &mut registry,
+            lina_core::now_ms(),
+            lina_core::LicenseTier::Pro,
+            |root| created = Some(root),
+        );
+        if ok {
+            if let Some(root) = created {
+                // F1-4-4 crit 2: criado → o foco vai pro Espaço NOVO já povoado pelo preset.
+                self.switch_to_workspace(root, cx);
+                self.refresh_sidebar_rows();
+            }
+        } else {
+            self.create_space_modal = Some(m); // erro de diretório/vitrine — inline, sem beco
+        }
+        cx.notify();
+    }
+
+    /// Teclado do M9 (spec §4): Tab/Shift-Tab percorre na ordem da spec (anúncio via
+    /// aria-label do elemento focado); ←→/↑↓ navegam os cards de Foco; imprimível digita
+    /// no campo focado; **Enter SUBMETE sempre** (exceto com foco no `[ Procurar… ]`, que
+    /// abre o picker — é o "ativar o controle focado"); Esc fecha sem criar (estado é RAM).
+    fn m9_handle_key(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
+        match ks.key.as_str() {
+            "escape" => {
+                self.create_space_modal = None;
+            }
+            "enter" | "return" => {
+                let focus_on_browse = self
+                    .create_space_modal
+                    .as_ref()
+                    .is_some_and(|m| matches!(m.focus, gallery::M9Focus::Browse));
+                if focus_on_browse {
+                    self.m9_pick_folder(cx);
+                } else {
+                    self.m9_submit(cx);
+                }
+            }
+            "tab" => {
+                if let Some(m) = self.create_space_modal.as_mut() {
+                    if ks.modifiers.shift {
+                        m.focus_prev();
+                    } else {
+                        m.focus_next();
+                    }
+                }
+            }
+            "left" | "up" => {
+                if let Some(m) = self.create_space_modal.as_mut() {
+                    if matches!(m.focus, gallery::M9Focus::Cards) {
+                        m.select_prev_preset();
+                    }
+                }
+            }
+            "right" | "down" => {
+                if let Some(m) = self.create_space_modal.as_mut() {
+                    if matches!(m.focus, gallery::M9Focus::Cards) {
+                        m.select_next_preset();
+                    }
+                }
+            }
+            "backspace" => {
+                if let Some(m) = self.create_space_modal.as_mut() {
+                    m.backspace();
+                }
+            }
+            _ => {
+                if !ks.modifiers.platform && !ks.modifiers.control {
+                    if let (Some(m), Some(ch)) =
+                        (self.create_space_modal.as_mut(), ks.key_char.as_deref())
+                    {
+                        m.type_char(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Casca de render do M9 (T5 entregou o ESTADO headless; a casca é fiação da
+    /// integração). Form: cards de Foco → Nome (+aviso de duplicado) → Diretório de
+    /// Trabalho (+erro com a saída POR variante) → Procurar/Criar/Cancelar. `blocked`
+    /// troca o form pela vitrine §1a (free=1). Cores 100% `theme::active()` (lint F1-2-1);
+    /// o anel de foco segue `m.focus` (o teclado dirige — `m9_handle_key`).
+    fn render_create_space(
+        &self,
+        m: &gallery::CreateSpaceModal,
+        th: &theme::Theme,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use gallery::M9Focus;
+        let w = 560.0_f32;
+        let x = (f32::from(viewport.width) - w) / 2.0;
+        let ring = |on: bool| if on { th.focus.ring } else { th.surface.border };
+        let field = |label: &str, value: &str, focused: bool, note: Option<(String, u32)>| {
+            let mut f = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(th.text.secondary))
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(ring(focused)))
+                        .bg(rgb(th.terminal.bg))
+                        .text_sm()
+                        .text_color(rgb(th.text.primary))
+                        .child(if value.is_empty() {
+                            " ".to_string()
+                        } else {
+                            value.to_string()
+                        }),
+                );
+            if let Some((texto, cor)) = note {
+                f = f.child(div().text_xs().text_color(rgb(cor)).child(texto));
+            }
+            f
+        };
+        let mut panel = div()
+            .absolute()
+            .left(px(x.max(60.0)))
+            .top(px(96.0))
+            .w(px(w))
+            .p_4()
+            .gap_3()
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(th.surface.border))
+            .bg(rgb(th.surface.panel))
+            .child(
+                div()
+                    .text_lg()
+                    .text_color(rgb(th.text.bright))
+                    .child("Criar Espaço"),
+            );
+        if let Some(blocked) = &m.blocked {
+            // Vitrine §1a (free=1): o card de upsell NO LUGAR do form — limite ANTES do esforço.
+            panel = panel.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(ring(matches!(m.focus, M9Focus::Upsell))))
+                    .bg(rgb(th.surface.raised))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(th.text.primary))
+                            .child(blocked.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(th.accent.action))
+                            .child(format!("[ {} ]", gallery::COPY_M9_BLOCKED_CTA)),
+                    ),
+            );
+        } else {
+            // Cards de Foco (3 presets — os 5 do ux-flows são backlog §6-B4).
+            let mut cards = div().flex().flex_row().gap_2();
+            for (idx, preset) in gallery::FocusPreset::all().into_iter().enumerate() {
+                let selected = idx == m.preset_idx;
+                cards = cards.child(
+                    div()
+                        .id(("m9-card", idx))
+                        .flex_1()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if selected {
+                            ring(matches!(m.focus, M9Focus::Cards))
+                        } else {
+                            th.surface.border
+                        }))
+                        .bg(rgb(if selected {
+                            th.surface.raised
+                        } else {
+                            th.surface.card
+                        }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |v, _ev: &gpui::ClickEvent, _w, cx| {
+                            if let Some(m) = v.create_space_modal.as_mut() {
+                                m.select_preset(idx);
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(th.text.primary))
+                                .child(preset.label().to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(th.text.muted))
+                                .child(preset.blurb().to_string()),
+                        ),
+                );
+            }
+            panel = panel
+                .child(cards)
+                .child(field(
+                    gallery::COPY_M9_NAME_LABEL,
+                    &m.name,
+                    matches!(m.focus, M9Focus::Name),
+                    m.dup_note().map(|n| (n, th.state.warning)),
+                ))
+                .child(field(
+                    gallery::COPY_M9_WORKDIR_LABEL,
+                    &m.workdir,
+                    matches!(m.focus, M9Focus::Workdir),
+                    m.error
+                        .as_ref()
+                        .map(|e| (format!("{} · [ {} ]", e.message, e.exit), th.state.danger)),
+                ));
+            // Botões: Procurar… · Criar Espaço · Cancelar (ordem de tab da spec §4).
+            let botao = |id: &'static str, rotulo: String, focused: bool, primario: bool| {
+                div()
+                    .id(id)
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(ring(focused)))
+                    .bg(rgb(if primario {
+                        th.accent.create
+                    } else {
+                        th.surface.raised
+                    }))
+                    .text_sm()
+                    .text_color(rgb(if primario {
+                        th.text.on_accent
+                    } else {
+                        th.text.primary
+                    }))
+                    .cursor_pointer()
+                    .child(rotulo)
+            };
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        botao(
+                            "m9-browse",
+                            gallery::COPY_M9_BROWSE.to_string(),
+                            matches!(m.focus, M9Focus::Browse),
+                            false,
+                        )
+                        .on_click(
+                            cx.listener(|v, _ev: &gpui::ClickEvent, _w, cx| v.m9_pick_folder(cx)),
+                        ),
+                    )
+                    .child(
+                        botao(
+                            "m9-create",
+                            gallery::COPY_M9_CREATE.to_string(),
+                            matches!(m.focus, M9Focus::Create),
+                            true,
+                        )
+                        .on_click(cx.listener(|v, _ev: &gpui::ClickEvent, _w, cx| v.m9_submit(cx))),
+                    )
+                    .child(
+                        botao(
+                            "m9-cancel",
+                            gallery::COPY_M9_CANCEL.to_string(),
+                            matches!(m.focus, M9Focus::Cancel),
+                            false,
+                        )
+                        .on_click(cx.listener(
+                            |v, _ev: &gpui::ClickEvent, _w, cx| {
+                                v.create_space_modal = None;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            );
+        }
+        panel.into_any_element()
+    }
+
+    /// Apenda um evento no log de um Espaço: runtime MONTADO usa o handle vivo; de fundo
+    /// não-montado abre o store 1× (busy_timeout do open cobre a concorrência — F1-4-1 crit 5).
+    fn append_to_workspace(&mut self, root: &Path, ev: &lina_core::DomainEvent) -> bool {
+        let mounted = {
+            let r = lock(&self.runtimes);
+            r.map.get(root).map(|rt| Arc::clone(&rt.store))
+        };
+        let res = match mounted {
+            Some(store) => lock(&store)
+                .append(ev)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => lina_core::EventStore::open(sidebar::events_dir_of(root))
+                .and_then(|mut s| s.append(ev).map(|_| ()))
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = res {
+            eprintln!(
+                "lina-gpui: [WS] evento não persistiu no Espaço {}: {e}",
+                root.display()
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Pós-mutação de um Espaço (rename/arquivar): re-deriva a entrada do PRÓPRIO log
+    /// (a autoridade — ADR 0010) e atualiza o ponteiro global, sem mexer no foco.
+    fn sync_registry_entry(&mut self, root: &Path) {
+        if let Some(Ok(mut reg)) =
+            lina_core::default_registry_path().map(lina_core::WorkspaceRegistry::load)
+        {
+            match lina_core::WorkspaceRegistry::rederive_entry(root) {
+                Ok(entry) => {
+                    reg.upsert(entry);
+                    if let Err(e) = reg.save() {
+                        eprintln!("lina-gpui: [WS] ponteiro global não salvo ({e}); seguindo");
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lina-gpui: [WS] re-derivação de {} falhou ({e})",
+                        root.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `[ Renomear ]` confirmado: `WorkspaceRenamed` no log do alvo + ponteiro re-derivado.
+    fn rename_workspace(&mut self, root: &Path, novo: &str, cx: &mut Context<Self>) {
+        let novo = novo.trim();
+        if novo.is_empty() {
+            return;
+        }
+        if self.append_to_workspace(
+            root,
+            &lina_core::DomainEvent::WorkspaceRenamed {
+                name: novo.to_string(),
+            },
+        ) {
+            self.sync_registry_entry(root);
+            self.refresh_sidebar_rows();
+        }
+        cx.notify();
+    }
+
+    /// `[ Arquivar ]`: `WorkspaceArchived` no log do alvo + ponteiro re-derivado — some da
+    /// lista padrão, NADA se perde (replay recupera — F1-4-4 crit 3). O «Desfazer»/«Trazer
+    /// de volta» aguarda a costura `WorkspaceUnarchived` (spec §6-C2).
+    fn archive_workspace(&mut self, root: &Path, cx: &mut Context<Self>) {
+        if lock(&self.runtimes).active == root {
+            eprintln!("lina-gpui: [WS] arquivar o Espaço ATIVO não é permitido (troque antes)");
+            return;
+        }
+        if self.append_to_workspace(root, &lina_core::DomainEvent::WorkspaceArchived) {
+            self.sync_registry_entry(root);
+            self.refresh_sidebar_rows();
+        }
+        cx.notify();
     }
 
     // ───────────────────────── F1-1-7 · Fila de Atenção (gestos + heartbeat) ─────────────────────────
@@ -1976,6 +2506,75 @@ impl WorkspaceView {
             cx.stop_propagation();
             cx.notify();
             return;
+        }
+        // F1-4-4 · M9 — modal Criar Espaço aberto: o teclado o DIRIGE (precedência de modal,
+        // spec §4: tab percorre, ←→/↑↓ nos cards, Enter SUBMETE SEMPRE, Esc fecha sem criar).
+        if self.create_space_modal.is_some() {
+            self.m9_handle_key(ks, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // F1-4-4 · M8 — rail EXPANDIDO: o teclado dirige o switcher (contrato T4 §3: digita
+        // filtra · ↑↓ navega · Enter troca/confirma rename · Esc cancela/fecha SEM trocar).
+        if self.sidebar.state.expanded {
+            match ks.key.as_str() {
+                "escape" => {
+                    if self.sidebar.state.renaming.is_some() {
+                        self.sidebar.state.cancel_rename();
+                    } else {
+                        self.sidebar.state.close();
+                    }
+                }
+                "up" => self.sidebar.state.select_prev(),
+                "down" => self.sidebar.state.select_next(),
+                "backspace" => self.sidebar.state.backspace(),
+                "enter" | "return" => {
+                    if let Some((root, novo)) = self.sidebar.state.commit_rename() {
+                        self.rename_workspace(&root, &novo, cx);
+                    } else if let Some(row) = self.sidebar.state.selected_row() {
+                        let root = row.ws_root.clone();
+                        self.switch_to_workspace(root, cx);
+                        self.refresh_sidebar_rows();
+                    }
+                }
+                _ => {
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(ch) = ks.key_char.as_deref() {
+                            self.sidebar.state.type_char(ch);
+                        }
+                    }
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // F1-4-4 · ⌘O abre/recolhe o rail de Espaços (M8; foco do teclado vai à busca — §4).
+        if ks.modifiers.platform && ks.key == "o" {
+            self.toggle_sidebar(cx);
+            return;
+        }
+        // F1-4-4 · ⌘1..9 troca pelo índice ESTÁVEL do registry (funciona com o M8 FECHADO —
+        // posição de criação, contando arquivados; arquivado/ausente = no-op). Contrato T4 §4.
+        if ks.modifiers.platform {
+            if let Ok(n) = ks.key.parse::<usize>() {
+                if (1..=9).contains(&n) {
+                    let target = lina_core::default_registry_path()
+                        .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok())
+                        .and_then(|r| {
+                            r.entries()
+                                .get(n - 1)
+                                .filter(|e| !e.archived)
+                                .map(|e| e.path.clone())
+                        });
+                    if let Some(root) = target {
+                        self.switch_to_workspace(root, cx);
+                        self.refresh_sidebar_rows();
+                    }
+                    return;
+                }
+            }
         }
         // ⌘, abre Ajustes (padrão macOS — entry point do T7; fix de tela: tema alcançável).
         if ks.modifiers.platform && ks.key == "," {
@@ -3223,6 +3822,14 @@ impl Render for WorkspaceView {
             root.child(panel)
         } else {
             root
+        };
+        // F1-4-4 · M8: o RAIL de Espaços no flanco esquerdo (52px colapsado ↔ 280px expandido;
+        // o componente se dimensiona — T4). Por cima do canvas, por baixo dos modais.
+        let root = root.child(self.sidebar.render(&th, cx));
+        // F1-4-4 · M9: modal Criar Espaço (galeria de Focos + Diretório de Trabalho — T5).
+        let root = match &self.create_space_modal {
+            Some(m) => root.child(self.render_create_space(m, &th, window.viewport_size(), cx)),
+            None => root,
         };
         // F1-2-2 · M6/M6-E: o modal de Agente é o overlay central (evoluiu o overlay do M2 — BUG 4
         // resolvido por um modal de verdade). A paleta, quando aberta, continua mais ao topo.
