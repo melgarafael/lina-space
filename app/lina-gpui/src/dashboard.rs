@@ -49,8 +49,9 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
-use lina_core::{NodeId, ProjectedNode, ProjectedState};
+use lina_core::{EventStore, NodeId, ProjectedNode, ProjectedState};
 use lina_session_watch::{CostSource, Session};
 
 use crate::inspector::Activity;
@@ -423,6 +424,210 @@ pub fn workspace_cost_today(
     WorkspaceCost {
         line,
         outside_usd: outside,
+    }
+}
+
+// ═══════ M8-T2 · Mini-status por Espaço (headless — a sidebar do Switcher consome) ═══════
+
+/// Mini-status de UM Espaço na linha do Switcher (M8, spec §1): «{N} Agentes» + ● estado
+/// dominante + custo curto de hoje + ⚠ store inacessível. Derivado 100% do log daquele
+/// Espaço (inv#4) — nenhum gpui aqui.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceMiniStatus {
+    /// Terminais VIVOS (`UiState != Encerrado`) na projeção do Espaço.
+    pub agents_alive: usize,
+    /// Total de terminais (vivos + encerrados). A célula "todos-Encerrado" da spec §1
+    /// mostra «{N} Agentes» com N = total e 0 vivos — "sem Agentes ainda" mentiria
+    /// (houve time); sem este campo o render não distingue os dois casos.
+    pub agents_total: usize,
+    /// Estado dominante PIOR-PRIMEIRO (regra da spec §1): `Sem resposta > Esperando
+    /// você > Trabalhando > Ocioso > Dormindo > Encerrado`. `None` = sem terminais.
+    pub dominant: Option<UiState>,
+    /// Forma CURTA do custo de hoje (ex.: `~US$ 0,01`) — sem o sufixo; o «estimado»
+    /// viaja no tooltip. `None` = sem dado exibível (a UI mostra «—»), NUNCA «0,00».
+    pub cost_short: Option<String>,
+    /// Texto completo e honesto p/ o tooltip: com dado, o texto integral da [`CostLine`]
+    /// (inclui «(estimado)» e a parcela de fora); sem dado, o fallback honesto.
+    pub cost_tooltip: String,
+    /// Store que não existe/não abre/não projeta → a linha vira ⚠, NUNCA some
+    /// (anti-padrão 6: esconder é mentir).
+    pub unreachable: bool,
+}
+
+impl WorkspaceMiniStatus {
+    fn unreachable() -> Self {
+        Self {
+            agents_alive: 0,
+            agents_total: 0,
+            dominant: None,
+            cost_short: None,
+            cost_tooltip: "sem dados: a pasta deste Espaço não está acessível".to_owned(),
+            unreachable: true,
+        }
+    }
+}
+
+/// Posição na regra PIOR-PRIMEIRO da spec §1 (menor = pior = dominante).
+fn dominance_rank(s: UiState) -> u8 {
+    match s {
+        UiState::SemResposta => 0,
+        UiState::EsperandoVoce => 1,
+        UiState::Trabalhando => 2,
+        UiState::Ocioso => 3,
+        UiState::Dormindo => 4,
+        UiState::Encerrado => 5,
+    }
+}
+
+/// Forma curta de dinheiro (sem sufixo): `~US$ 0,01` / `US$ 0,01`.
+fn short_money(usd: f64, estimated: bool) -> String {
+    let valor = format!("{usd:.2}").replace('.', ",");
+    let marker = if estimated { "~" } else { "" };
+    format!("{marker}US$ {valor}")
+}
+
+/// O `events_dir` tem um store? (espelho de `persistence_ui::is_workspace_store`).
+/// Checado ANTES de abrir: `EventStore::open` CRIA o store quando falta — efeito
+/// colateral proibido numa leitura de mini-status (pasta sumida viraria store fantasma).
+fn has_store(events_dir: &Path) -> bool {
+    events_dir.join("lina.db").exists() || events_dir.join("log.jsonl").exists()
+}
+
+/// Abre o store e projeta, com retry BOUNDED. O `busy_timeout` de 3 s já mora dentro de
+/// `EventStore::open` (F1-4-1 crit 5); o retry cobre o residual que o timeout não honra
+/// de forma confiável (troca de `journal_mode` — lição W5). Falhou 3×? `None` honesto.
+fn project_store_read_only(events_dir: &Path) -> Option<ProjectedState> {
+    for _ in 0..3 {
+        if let Ok(st) = EventStore::open(events_dir).and_then(|s| s.project()) {
+            return Some(st);
+        }
+    }
+    None
+}
+
+/// Mini-status de UM Espaço a partir do seu `events_dir`. Tudo INJETADO (`sessions`,
+/// `ws_root`, `today_prefix`) — função pura sem relógio nem estado global (lição
+/// wall-clock do módulo). Store ausente/corrompido → `unreachable=true`, nunca linha
+/// sumida; sem custo apurável → `cost_short=None`, nunca «0,00».
+#[must_use]
+pub fn workspace_mini_status(
+    events_dir: &Path,
+    ws_root: &str,
+    sessions: &[Session],
+    today_prefix: &str,
+) -> WorkspaceMiniStatus {
+    if !has_store(events_dir) {
+        return WorkspaceMiniStatus::unreachable();
+    }
+    let Some(state) = project_store_read_only(events_dir) else {
+        return WorkspaceMiniStatus::unreachable();
+    };
+
+    let states: Vec<UiState> = state
+        .nodes
+        .values()
+        .filter(|pn| pn.kind == "Terminal")
+        .map(|pn| UiState::from_projection(pn.status.as_deref(), pn.stalled))
+        .collect();
+    let agents_total = states.len();
+    let agents_alive = states.iter().filter(|s| **s != UiState::Encerrado).count();
+    let dominant = states.iter().copied().min_by_key(|s| dominance_rank(*s));
+
+    let cost = workspace_cost_today(sessions, ws_root, &adopted_cwds(&state), today_prefix);
+    let (cost_short, cost_tooltip) = if cost.line.has_data {
+        (
+            Some(short_money(cost.line.usd, cost.line.estimated)),
+            cost.line.text,
+        )
+    } else {
+        (None, cost.line.text)
+    };
+
+    WorkspaceMiniStatus {
+        agents_alive,
+        agents_total,
+        dominant,
+        cost_short,
+        cost_tooltip,
+        unreachable: false,
+    }
+}
+
+/// Raiz do Espaço a partir do seu `events_dir` — espelho das convenções aceitas por
+/// `persistence_ui::list_workspaces` (`<ws>/.lina/events`, `<ws>/events`, ou o próprio
+/// dir já sendo o store).
+#[must_use]
+pub fn ws_root_of(events_dir: &Path) -> PathBuf {
+    if events_dir.ends_with(".lina/events") {
+        if let Some(root) = events_dir.parent().and_then(Path::parent) {
+            return root.to_path_buf();
+        }
+    } else if events_dir.ends_with("events") {
+        if let Some(root) = events_dir.parent() {
+            return root.to_path_buf();
+        }
+    }
+    events_dir.to_path_buf()
+}
+
+/// Um mini-status guardado com a SUA marca de tempo — staleness declarada, nunca
+/// implícita: quem lê decide se está velho com o relógio que tiver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MiniStatusEntry {
+    pub status: WorkspaceMiniStatus,
+    /// Instante (epoch ms) em que o caller computou — INJETADO (sem relógio interno).
+    pub computed_at_ms: u64,
+}
+
+impl MiniStatusEntry {
+    /// Idade do snapshot dado o `now_ms` do caller (saturante — relógio que anda
+    /// para trás não vira idade negativa/gigante).
+    #[must_use]
+    pub fn age_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.computed_at_ms)
+    }
+}
+
+/// Cache do mini-status por ABERTURA do M8 (spec §6-B5): `refresh` projeta cada store
+/// 1× e guarda; os frames seguintes leem via [`MiniStatusCache::get`] sem re-projetar.
+/// Mitiga o O(N×replay) por abertura; a staleness fica DECLARADA no `computed_at_ms`.
+#[derive(Debug, Default)]
+pub struct MiniStatusCache {
+    by_dir: BTreeMap<PathBuf, MiniStatusEntry>,
+}
+
+impl MiniStatusCache {
+    /// Projeta 1× cada `events_dir` e substitui o conteúdo do cache (Espaço que saiu
+    /// da lista sai do cache — não acumula fantasmas). `computed_at_ms` é injetado
+    /// pelo caller e carimbado em TODAS as entradas desta rodada.
+    pub fn refresh(
+        &mut self,
+        entries: &[PathBuf],
+        sessions: &[Session],
+        today_prefix: &str,
+        computed_at_ms: u64,
+    ) {
+        self.by_dir = entries
+            .iter()
+            .map(|dir| {
+                let root = ws_root_of(dir);
+                let status =
+                    workspace_mini_status(dir, &root.to_string_lossy(), sessions, today_prefix);
+                (
+                    dir.clone(),
+                    MiniStatusEntry {
+                        status,
+                        computed_at_ms,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Último mini-status computado para o `events_dir` (+ o instante, p/ a idade).
+    #[must_use]
+    pub fn get(&self, events_dir: &Path) -> Option<&MiniStatusEntry> {
+        self.by_dir.get(events_dir)
     }
 }
 
@@ -1437,5 +1642,251 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ═══════════════ M8-T2 · mini-status por Espaço (EventStore REAL em temp dir) ═══════════════
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "lina-dash-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&p).expect("tempdir");
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Espaço REAL em disco: store de eventos + N terminais com (status, cwd).
+    /// Devolve o `events_dir` (layout `<ws>/.lina/events`, o canônico do app).
+    fn seed_space(root: &Path, name: &str, terminals: &[(&str, Option<&str>)]) -> PathBuf {
+        let events = root.join(".lina").join("events");
+        let mut store = lina_core::EventStore::open(&events).expect("open");
+        store
+            .append(&DomainEvent::WorkspaceCreated {
+                name: name.into(),
+                focus_preset: String::new(),
+            })
+            .expect("ws");
+        for (status, cwd) in terminals {
+            let node = Uuid::now_v7();
+            store
+                .append(&DomainEvent::NodeAdded {
+                    node,
+                    kind: "Terminal".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    requested_by: None,
+                })
+                .expect("node");
+            if let Some(cwd) = cwd {
+                store
+                    .append(&DomainEvent::TerminalSpawned {
+                        node,
+                        cli: "claude-code".into(),
+                        cwd: Some((*cwd).into()),
+                    })
+                    .expect("spawn");
+            }
+            store
+                .append(&DomainEvent::NodeStatusChanged {
+                    node,
+                    status: (*status).into(),
+                    from: String::new(),
+                    reason: String::new(),
+                })
+                .expect("status");
+        }
+        events
+    }
+
+    /// Dominância PIOR-PRIMEIRO da spec §1: 2 vivos em estados mistos → o pior grita.
+    /// `Esperando você` (Blocked) domina `Trabalhando` (Busy); vivo SEMPRE domina Encerrado.
+    #[test]
+    fn mini_status_dominance_is_worst_first_with_mixed_alive_states() {
+        let tmp = TempDir::new("dom");
+        let events = seed_space(
+            tmp.path(),
+            "Misto",
+            &[("Busy", None), ("Blocked", None), ("Dead", None)],
+        );
+        let ms = workspace_mini_status(&events, tmp.path().to_str().unwrap(), &[], TODAY);
+        assert!(!ms.unreachable);
+        assert_eq!(ms.agents_total, 3);
+        assert_eq!(ms.agents_alive, 2, "Dead não conta como vivo");
+        assert_eq!(ms.dominant, Some(UiState::EsperandoVoce));
+        // O dot da linha usa o vocabulário canônico (palavra + token de cor).
+        assert_eq!(ms.dominant.unwrap().label(), "Esperando você");
+        assert_eq!(ms.dominant.unwrap().color_token(), "ambar");
+    }
+
+    /// Espaço sem nenhum terminal: 0/0, sem dominante — a UI mostra «sem Agentes ainda».
+    #[test]
+    fn mini_status_space_without_agents() {
+        let tmp = TempDir::new("vazio");
+        let events = seed_space(tmp.path(), "Vazio", &[]);
+        let ms = workspace_mini_status(&events, tmp.path().to_str().unwrap(), &[], TODAY);
+        assert!(!ms.unreachable);
+        assert_eq!(ms.agents_total, 0);
+        assert_eq!(ms.agents_alive, 0);
+        assert_eq!(ms.dominant, None);
+    }
+
+    /// Célula "todos-Encerrado" da spec §1: ≥1 nó e 0 vivos → «{N} Agentes» (N = total)
+    /// + dominante Encerrado (cinza-escuro). "sem Agentes ainda" mentiria — houve time.
+    #[test]
+    fn mini_status_all_dead_keeps_total_and_dominant_encerrado() {
+        let tmp = TempDir::new("dead");
+        let events = seed_space(tmp.path(), "Findo", &[("Dead", None), ("Dead", None)]);
+        let ms = workspace_mini_status(&events, tmp.path().to_str().unwrap(), &[], TODAY);
+        assert_eq!(
+            ms.agents_total, 2,
+            "o total preserva o N da célula todos-Encerrado"
+        );
+        assert_eq!(ms.agents_alive, 0);
+        assert_eq!(ms.dominant, Some(UiState::Encerrado));
+        assert_eq!(ms.dominant.unwrap().color_token(), "cinza-escuro");
+    }
+
+    /// Anti-padrão 6 (esconder é mentir): store ausente ou corrompido vira linha-⚠
+    /// (`unreachable=true`), NUNCA linha sumida. E a leitura NÃO cria store fantasma.
+    #[test]
+    fn mini_status_unreachable_when_store_missing_or_corrupt() {
+        let tmp = TempDir::new("err");
+
+        // (a) Pasta sem store: ⚠ e NENHUM efeito colateral (open criaria — proibido).
+        let missing = tmp.path().join("sumiu").join(".lina").join("events");
+        let ms = workspace_mini_status(&missing, tmp.path().to_str().unwrap(), &[], TODAY);
+        assert!(ms.unreachable);
+        assert_eq!(ms.agents_total, 0);
+        assert_eq!(ms.cost_short, None);
+        assert!(
+            !missing.exists(),
+            "leitura de mini-status NÃO pode criar store fantasma"
+        );
+
+        // (b) Store corrompido (db vira lixo, sem espelho JSONL): ⚠, não pânico.
+        let corrupt_dir = tmp.path().join("ruim");
+        let events = corrupt_dir.join(".lina").join("events");
+        std::fs::create_dir_all(&events).expect("mkdir");
+        std::fs::write(events.join("lina.db"), b"isto nao e um sqlite").expect("write");
+        let ms = workspace_mini_status(&events, corrupt_dir.to_str().unwrap(), &[], TODAY);
+        assert!(ms.unreachable, "store que não abre/projeta → linha-⚠");
+    }
+
+    /// Honestidade do custo: Espaço com terminal mas SEM sessão de hoje → `cost_short`
+    /// `None` (a UI mostra «—»), NUNCA «0,00»; o tooltip carrega o fallback honesto.
+    #[test]
+    fn mini_status_cost_without_session_is_none_never_zero() {
+        let tmp = TempDir::new("semcusto");
+        let events = seed_space(tmp.path(), "Seco", &[("Busy", Some("/w/projeto"))]);
+        let ms = workspace_mini_status(&events, "/w", &[], TODAY);
+        assert_eq!(ms.cost_short, None);
+        assert!(
+            !ms.cost_tooltip.contains("0,00"),
+            "zero seria mentira: {}",
+            ms.cost_tooltip
+        );
+        assert_eq!(ms.cost_tooltip, "sem estimativa de custo ainda");
+    }
+
+    /// Custo COM sessão de hoje: forma curta SEM o sufixo («~US$ 0,01»); o «estimado»
+    /// viaja no tooltip (texto integral da CostLine).
+    #[test]
+    fn mini_status_cost_short_form_without_suffix_estimated_in_tooltip() {
+        let tmp = TempDir::new("custo");
+        let events = seed_space(tmp.path(), "Caro", &[("Busy", Some("/w/projeto"))]);
+        let sessions = [session("/w/projeto", "2026-06-06T14:02:00.000Z")];
+        let ms = workspace_mini_status(&events, "/w", &sessions, TODAY);
+        assert_eq!(ms.cost_short.as_deref(), Some("~US$ 0,01"));
+        assert!(
+            !ms.cost_short.unwrap().contains("estimado"),
+            "forma curta não carrega o sufixo"
+        );
+        assert!(
+            ms.cost_tooltip.contains("(estimado)"),
+            "{}",
+            ms.cost_tooltip
+        );
+    }
+
+    /// Sessão no cwd ADOTADO por nó do Espaço (fora do ws_root) conta no mini-status —
+    /// mesmo recorte honesto do `workspace_cost_today` (parcela de fora no tooltip).
+    #[test]
+    fn mini_status_cost_includes_adopted_cwd_outside_root() {
+        let tmp = TempDir::new("fora");
+        let events = seed_space(tmp.path(), "Fora", &[("Busy", Some("/outro/lugar"))]);
+        let sessions = [session("/outro/lugar", "2026-06-06T14:02:00.000Z")];
+        let ms = workspace_mini_status(&events, "/w", &sessions, TODAY);
+        assert_eq!(ms.cost_short.as_deref(), Some("~US$ 0,01"));
+        assert!(
+            ms.cost_tooltip.contains("fora da pasta do Espaço"),
+            "{}",
+            ms.cost_tooltip
+        );
+    }
+
+    /// Cache por abertura do M8 (spec §6-B5): `refresh` projeta 1× cada entrada e
+    /// carimba o instante INJETADO; `get` devolve o último + base p/ idade; Espaço
+    /// que saiu da lista sai do cache (sem fantasmas).
+    #[test]
+    fn mini_status_cache_refresh_get_and_declared_staleness() {
+        let tmp = TempDir::new("cache");
+        let ev_a = seed_space(&tmp.path().join("a"), "A", &[("Busy", None)]);
+        let ev_b = seed_space(&tmp.path().join("b"), "B", &[]);
+
+        let mut cache = MiniStatusCache::default();
+        cache.refresh(&[ev_a.clone(), ev_b.clone()], &[], TODAY, 1_000);
+
+        let a = cache.get(&ev_a).expect("A no cache");
+        assert_eq!(a.computed_at_ms, 1_000);
+        assert_eq!(a.status.agents_alive, 1);
+        assert_eq!(
+            a.age_ms(4_500),
+            3_500,
+            "idade = now - computed_at (injetados)"
+        );
+        assert_eq!(a.age_ms(500), 0, "relógio andando p/ trás satura em zero");
+        assert_eq!(cache.get(&ev_b).expect("B no cache").status.agents_total, 0);
+
+        // Nova abertura SÓ com B: A sai do cache (lista é a verdade da rodada).
+        cache.refresh(std::slice::from_ref(&ev_b), &[], TODAY, 2_000);
+        assert!(
+            cache.get(&ev_a).is_none(),
+            "entrada fora da lista não fica fantasma"
+        );
+        assert_eq!(cache.get(&ev_b).expect("B").computed_at_ms, 2_000);
+    }
+
+    /// `ws_root_of`: espelho das convenções de `list_workspaces` — `<ws>/.lina/events`,
+    /// `<ws>/events`, ou o próprio dir já sendo o store.
+    #[test]
+    fn ws_root_of_mirrors_list_workspaces_layouts() {
+        use std::path::PathBuf;
+        assert_eq!(
+            ws_root_of(&PathBuf::from("/ws/proj/.lina/events")),
+            PathBuf::from("/ws/proj")
+        );
+        assert_eq!(
+            ws_root_of(&PathBuf::from("/ws/proj/events")),
+            PathBuf::from("/ws/proj")
+        );
+        assert_eq!(
+            ws_root_of(&PathBuf::from("/ws/store-direto")),
+            PathBuf::from("/ws/store-direto")
+        );
     }
 }
