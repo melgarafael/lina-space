@@ -24,13 +24,13 @@ use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 // W4-2 (M2): deriva o papel do agente pelo nome ("Revisor" -> reviewer).
 
 use lina_core::{
-    build_paste, deliver_a2a, lookup_action, now_ms, run_custody, A2aEnvelope, AgentPresence,
-    AlacrittyBackend, ApprovalDecision, ApprovalExecutor, ApprovalGesture, ApprovalKeys,
-    ApprovalPort, BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger, DeliveryOutcome,
-    DomainEvent, EventRecord, EventStore, GridDelta, GridSense, MailMessage, Mailbox,
-    NodeStatus as CoreStatus, PortError, PortOutcome, ProjectedState, PtyCommand, PtyManager,
-    Recipient, ResolutionVia, RolePolicy, RouteOutcome, Router, RouterConfig, Supervisor,
-    SupervisorError, VtBackend, WorkspaceTrust, PROMPT_REGION_ROWS,
+    build_paste, deliver_a2a, discover_clis, lookup_action, now_ms, run_custody, A2aEnvelope,
+    AgentPresence, AlacrittyBackend, ApprovalDecision, ApprovalExecutor, ApprovalGesture,
+    ApprovalKeys, ApprovalPort, BrokerOutcome, BrokerRequest, BusEvent, CliProfile, CostLedger,
+    DeliveryOutcome, DiscoveredCli, DomainEvent, EventRecord, EventStore, GridDelta, GridSense,
+    MailMessage, Mailbox, NodeStatus as CoreStatus, PortError, PortOutcome, ProjectedState,
+    PtyCommand, PtyManager, Recipient, ResolutionVia, RolePolicy, RouteOutcome, Router,
+    RouterConfig, Supervisor, SupervisorError, VtBackend, WorkspaceTrust, PROMPT_REGION_ROWS,
 };
 // A2A UNIVERSAL: o registry de TODOS os CLI Profiles — a entrega resolve o profile do ALVO
 // por aqui (CliProfile vem re-exportado do core; ProfileRegistry é o índice por `id`).
@@ -192,6 +192,18 @@ pub struct NodeView {
     /// o card pinta o badge "sem doutrina/observabilidade". NUNCA silencioso. Estado de UI
     /// por sessão (não persistido; nós reconstruídos por replay nascem `false`).
     pub kit_missing: bool,
+    /// FIX-1 (dogfooding 2026-06-10): `true` = este agente divide o cwd de TRABALHO (a pasta
+    /// `UserDir` escolhida pelo usuário) com outro nó vivo — o caso de uso "time inteiro no
+    /// projeto do usuário" (default F1-4-1). A identidade A2A é isolada pelo env (ADR 0026);
+    /// o badge "vários agentes nesta pasta" só torna o compartilhamento VISÍVEL ao leigo
+    /// (nunca surpresa silenciosa). Estado de UI por sessão (replay nasce `false`).
+    pub cwd_shared: bool,
+    /// FIX-3 (costura per-Agente, dogfooding 2026-06-10): a autonomia EFETIVA deste nó — o
+    /// `LINA_AUTONOMY` carimbado no env do PTY, que o guard (`lina guard --pretooluse`) honra.
+    /// O badge do card lê DAQUI (não mais o nível do Espaço): UI e enforcement nunca divergem.
+    /// `new` nasce `Assisted` (default do produto); `admit_node` sobrescreve com a escolha do
+    /// plano. Estado de UI por sessão (replay nasce no default).
+    pub autonomy: Autonomy,
 }
 
 impl NodeView {
@@ -203,6 +215,8 @@ impl NodeView {
             x,
             y,
             kit_missing: false,
+            cwd_shared: false,
+            autonomy: Autonomy::Assisted,
         }
     }
 }
@@ -2440,6 +2454,40 @@ fn copy_skill_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
 /// Instala a skill `lina-agent-bus` em `<cwd>/.claude/skills/lina-agent-bus/` (idempotente). É o
 /// que faz o terminal carregar o A2A automático no turno 0 — sem o setup manual da demo. Best-effort
 /// com erro VISÍVEL (`eprintln`): nunca trava o app (mesma postura do bootstrap/mailbox).
+/// Sentinela da nota de localização (#9) — a checagem de idempotência ancora aqui.
+const WORKDIR_NOTE_MARK: &str = "Sua pasta de trabalho (cwd) é";
+
+/// **#9 dogfooding r2 — a doutrina do nó gerenciado CITA o cwd dele.** O spawnado nasce numa
+/// pasta NOVA (`<ws_root>/n-<uuid>`) que ele não conhece; um caminho RELATIVO vindo do
+/// orquestrador quebra silenciosamente (evidência da sessão: correção manual via `lina ask`).
+/// Appenda 1 linha com o caminho ABSOLUTO aos 3 arquivos de doutrina (neutralidade multi-CLI,
+/// inv. #3) DEPOIS de o gerador (`lina-bootstrap`) escrevê-los — o gerador é de outro dono
+/// nesta rodada; a linha vive no wrapper do app (o MESMO `write_one` que o `admit_node` usa).
+/// Idempotente ([`WORKDIR_NOTE_MARK`]); best-effort com erro VISÍVEL (postura do kit).
+fn append_workdir_note(dir: &Path) {
+    let note = format!(
+        "\n> 📍 {WORKDIR_NOTE_MARK} `{}` (caminho ABSOLUTO). Ao citar arquivos para um colega \
+         de outro terminal, use SEMPRE caminhos absolutos — um caminho relativo de OUTRA pasta \
+         não vale aqui.\n",
+        dir.display()
+    );
+    for f in ["CLAUDE.md", "AGENTS.md", "GEMINI.md"] {
+        let p = dir.join(f);
+        match std::fs::read_to_string(&p) {
+            // Já anotado (re-render do roster reescreve a base e o append re-aplica; este
+            // ramo só protege contra append duplo no MESMO conteúdo).
+            Ok(cur) if cur.contains(WORKDIR_NOTE_MARK) => {}
+            Ok(cur) => {
+                if let Err(e) = std::fs::write(&p, format!("{cur}{note}")) {
+                    eprintln!("lina-gpui: nota de cwd em {} falhou: {e}", p.display());
+                }
+            }
+            // Doutrina ausente = o write do kit já falhou (erro logado lá); nada a anotar.
+            Err(_) => {}
+        }
+    }
+}
+
 fn install_agent_bus_skill(cwd: &Path) {
     let Some(src) = agent_bus_skill_src() else {
         eprintln!(
@@ -2476,17 +2524,31 @@ pub fn shell_cmd(_name: &str) -> PtyCommand {
 }
 
 /// **ADR 0026 — identidade do nó no ENV do PTY filho (autoridade do APP no spawn).** Único
-/// ponto que carimba `VIBE_ROLE` + `LINA_NODE_NAME` + `LINA_NODE_ID` no comando de um nó —
+/// ponto que carimba `VIBE_ROLE` + `LINA_NODE_NAME` + `LINA_NODE_ID` + `LINA_AUTONOMY` (FIX-3)
+/// no comando de um nó —
 /// chamado pelo funil único `admit_node`. `LINA_NODE_ID` leva a `key` durável (`n-<uuidv7>`,
 /// a identidade de filesystem do nó, cunhada ANTES do spawn; o `NodeId` canônico só nasce no
 /// `register`, DEPOIS do PTY subir). O CLI `lina` resolve `terminal_name` por
 /// `LINA_NODE_NAME` antes da ficha por-cwd — ver ADR 0026 §segurança: um agente pode mascarar
 /// o PRÓPRIO whoami exportando a var num subshell, mas o `from` A2A final é re-carimbado pelo
 /// supervisor no drain (dir-dono); nenhuma autoridade nova nasce aqui.
-fn node_identity_env(cmd: PtyCommand, name: &str, role: &str, key: &str) -> PtyCommand {
+fn node_identity_env(
+    cmd: PtyCommand,
+    name: &str,
+    role: &str,
+    key: &str,
+    autonomy: Autonomy,
+) -> PtyCommand {
     cmd.env("VIBE_ROLE", role)
         .env("LINA_NODE_NAME", name)
         .env("LINA_NODE_ID", key)
+        // FIX-3 (costura per-Agente): a autonomia ESCOLHIDA no modal vira env por-Agente — o
+        // guard (`lina guard --pretooluse`) passa a honrar o nível DESTE nó, não só o do
+        // Espaço. O `label()` (`manual`/`assistido`/`autonomo`) casa exatamente com o
+        // `lina_core::guard::parse_autonomy`. Mesma postura de segurança do ADR 0026: o env é
+        // autoridade do APP no spawn; um agente que reexporte a var só afeta o próprio gate
+        // local (a custódia de ações irreversíveis — ADR 0004 — não muda).
+        .env("LINA_AUTONOMY", autonomy.label())
 }
 
 #[cfg(windows)]
@@ -2597,6 +2659,55 @@ pub struct AgentEngine {
     pub args: Vec<String>,
     pub profile_id: Option<String>,
     pub label: String,
+}
+
+/// **#7 dogfooding r2 — fábrica do MOTOR de um spawn agente-pede.** Produção descobre o CLI
+/// default do workspace no momento do spawn ([`default_spawn_engine`]); os testes injetam uma
+/// fixa (a discovery real leria o `PATH` do runner e lançaria o CLI de verdade no PTY do
+/// teste). Mesmo padrão injetável do [`CmdFactory`].
+pub type SpawnEngineFactory = Arc<dyn Fn() -> Option<AgentEngine> + Send + Sync>;
+
+/// **#7 dogfooding r2 — o motor DEFAULT de um spawn agente-pede**, derivado da descoberta de
+/// CLIs (W4-1). `lina spawn` cria um COLEGA (agente), mas o nó nascia da fábrica do workspace
+/// (shell puro) e `TerminalSpawned.cli` recebia o NOME do nó — poluindo as projeções por-CLI
+/// (detecção/perfis/custo; evidência: seq 20326 `cli:"@Especialista em Licenças"` vs ⌘N
+/// `cli:"Claude Code"`). Paridade com o modal ⌘N: `claude` primeiro (a MESMA pré-seleção de
+/// `agent_modal::engines_from`), senão o 1º descoberto. Máquina sem CLI → `None` (fábrica do
+/// workspace — comportamento histórico, degradação honesta). PURA (testável sem `PATH`).
+/// `profile_id` fica `None`: o `ProfileRegistry` vive no pump, não no funil — sem ele não sai
+/// `CliProfileSet` (igual a hoje; costura registrada na entrega).
+fn default_spawn_engine(found: &[DiscoveredCli]) -> Option<AgentEngine> {
+    let pick = found
+        .iter()
+        .find(|d| d.id == "claude")
+        .or_else(|| found.first())?;
+    Some(AgentEngine {
+        program: pick.path.clone(),
+        args: Vec::new(),
+        profile_id: None,
+        label: spawn_cli_label(&pick.id),
+    })
+}
+
+/// Rótulo leigo do CLI descoberto — ESPELHO de `agent_modal::engine_label` (o modal importa
+/// DESTE módulo; importar de lá criaria ciclo). O teste de paridade
+/// `spawn_cli_label_matches_modal_engine_label` trava as duas cópias juntas (drift = vermelho).
+fn spawn_cli_label(id: &str) -> String {
+    match id {
+        "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "gemini" => "Gemini CLI".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "copilot" => "Copilot CLI".to_string(),
+        "agy" => "Antigravity".to_string(),
+        other => {
+            let mut s = other.to_string();
+            if let Some(f) = s.get_mut(0..1) {
+                f.make_ascii_uppercase();
+            }
+            s
+        }
+    }
 }
 
 /// **W4-2 (M2) — deriva o PAPEL canônico pelo nome do agente** ("Revisor" → `reviewer`, "@Dev" →
@@ -3075,6 +3186,10 @@ impl BootstrapWriter {
         ) {
             eprintln!("lina-gpui: bootstrap de {name} falhou: {e}");
         }
+        // #9 dogfooding r2: o spawnado nasce num dir gerenciado NOVO que ele não conhece — a
+        // doutrina cita o cwd ABSOLUTO (1 linha, nos 3 CLIs). Sem isto, um 1º prompt com
+        // caminho RELATIVO do orquestrador quebra silencioso (correção manual na sessão).
+        append_workdir_note(&dir);
         // Instala a skill `lina-agent-bus` no cwd do terminal → A2A automático no turno 0
         // (idempotente, best-effort com erro visível). Cobre o boot (via `rewrite_bootstrap`) E os
         // nós adicionados em runtime (write-before-spawn do funil de admissão). Não duplica lógica.
@@ -3294,6 +3409,18 @@ pub enum CwdPolicy {
     UserDir { path: PathBuf, consent: bool },
 }
 
+/// FIX-1 (dogfooding 2026-06-10): o path de TRABALHO que conta para a detecção de "cwd
+/// compartilhado" — apenas `UserDir` (a pasta do usuário escolhida no M6, que recebe
+/// kit/observabilidade e onde N agentes de um time se encontram). `Managed` é dir ÚNICO por
+/// key (`n-<uuid>`, nunca colide por construção) e `UserHome` é o `$HOME` do terminal puro
+/// (sempre compartilhado, sem kit: não é o bug). `None` ⇒ não participa da detecção.
+fn shared_cwd_path(policy: &CwdPolicy) -> Option<&Path> {
+    match policy {
+        CwdPolicy::UserDir { path, .. } => Some(path.as_path()),
+        CwdPolicy::Managed | CwdPolicy::UserHome { .. } => None,
+    }
+}
+
 /// **Rodada 360 (ADR 0022 §1) — o PLANO de admissão**: a intenção "quero um terminal"
 /// normalizada. Os entry points são tradutores finos de intenção → este plano; quem o
 /// executa é SEMPRE o [`NodeManager::admit_node`]. Toda porta futura (API, CLI,
@@ -3313,6 +3440,12 @@ pub struct NodeAdmission {
     /// ORIGEM HUMANA (⌘T/seed). `Some(spawner)` na admissão de spawn agente-pede → carimba
     /// `NodeAdded.requested_by` (auditoria intent-vs-action + base do anti-fork-bomb).
     pub requested_by: Option<NodeId>,
+    /// FIX-3 (costura per-Agente): a autonomia ESCOLHIDA para este nó (do modal M6 →
+    /// `CreatePlan.autonomy`). `admit_node` a carimba em `LINA_AUTONOMY` (env do PTY, lido pelo
+    /// guard) e na projeção (`NodeView.autonomy`, fonte do badge). Os construtores ⌘T/seed/spawn
+    /// usam `Assisted` (default do produto); só ⌘N (`create_agent_with_autonomy`) propaga a
+    /// escolha do usuário.
+    pub autonomy: Autonomy,
 }
 
 impl NodeAdmission {
@@ -3330,6 +3463,7 @@ impl NodeAdmission {
             },
             position: None,
             requested_by: None,
+            autonomy: Autonomy::Assisted,
         }
     }
 
@@ -3343,6 +3477,7 @@ impl NodeAdmission {
             cwd: CwdPolicy::Managed,
             position: Some((x, y)),
             requested_by: None,
+            autonomy: Autonomy::Assisted,
         }
     }
 
@@ -3355,14 +3490,19 @@ impl NodeAdmission {
         name: impl Into<String>,
         role: impl Into<String>,
         requested_by: NodeId,
+        // #7 dogfooding r2: o MOTOR do colega spawnado (CLI default do workspace, resolvido
+        // pelo `execute_spawn` via `SpawnEngineFactory`). `None` = máquina sem CLI → fábrica
+        // do workspace (comportamento histórico; `TerminalSpawned.cli` degrada para o nome).
+        engine: Option<AgentEngine>,
     ) -> Self {
         Self {
             name: Some(name.into()),
             role: role.into(),
-            engine: None,
+            engine,
             cwd: CwdPolicy::Managed,
             position: None,
             requested_by: Some(requested_by),
+            autonomy: Autonomy::Assisted,
         }
     }
 }
@@ -3444,6 +3584,9 @@ pub struct NodeManager {
     /// com a `MailboxPump` (consumidor) via [`NodeManager::reinject_queue`] — substitui a mailbox
     /// de filesystem, que era drop-zone gravável por qualquer agente do mesmo usuário de SO.
     reinject_queue: ReinjectQueue,
+    /// #7 dogfooding r2: o MOTOR de spawns agente-pede. Default de produção = discovery
+    /// ([`default_spawn_engine`]); os testes injetam fixa via [`Self::set_spawn_engine_factory`].
+    spawn_engine: SpawnEngineFactory,
 }
 
 impl NodeManager {
@@ -3480,7 +3623,20 @@ impl NodeManager {
             bootstrap,
             lina_dir,
             reinject_queue: new_reinject_queue(),
+            // #7: produção resolve o motor do spawn por DISCOVERY no momento do spawn (sem
+            // mudança de assinatura — o main não precisa de fiação para o default correto).
+            spawn_engine: Arc::new(|| default_spawn_engine(&discover_clis())),
         }
+    }
+
+    /// **#7 — injeta a fábrica do motor de spawn** (testes: determinismo — a discovery real
+    /// leria o `PATH` do runner e lançaria o CLI de verdade; fiação futura: o boot pode fixar
+    /// o motor resolvido com o `ProfileRegistry` para o spawn ganhar `CliProfileSet`).
+    // Chamadores hoje: só os harnesses de teste (o default de produção já é o correto, sem
+    // fiação no main) — `allow` consciente até a costura do registry, não dead code esquecido.
+    #[allow(dead_code)]
+    pub fn set_spawn_engine_factory(&mut self, f: SpawnEngineFactory) {
+        self.spawn_engine = f;
     }
 
     /// FIX-A3: a fila EM-PROCESSO de re-injeção de doutrina, compartilhada (clone de `Arc`) com a
@@ -3799,6 +3955,9 @@ impl NodeManager {
     /// `role_override`; `engine`/`cwd` viram plano. `kit_consent` = o usuário autorizou no
     /// modal a Lina criar os arquivos de orquestração na pasta DELE (ADR 0022 §4) — sem
     /// efeito quando `cwd = None` (pasta gerenciada sempre recebe o kit completo).
+    // FIX-3 moveu o modal p/ `create_agent_with_autonomy`; este wrapper segue como porta dos
+    // call-sites de teste/seed (`allow` consciente — não dead code esquecido).
+    #[allow(dead_code)]
     pub fn create_agent_with(
         &self,
         name: &str,
@@ -3806,6 +3965,32 @@ impl NodeManager {
         cwd: Option<&std::path::Path>,
         role_override: Option<&str>,
         kit_consent: bool,
+    ) -> Result<NodeId, String> {
+        // Autonomia DEFAULT do produto (`Assisted`); a porta ⌘N com a escolha EXPLÍCITA do
+        // usuário é [`Self::create_agent_with_autonomy`] (usada pelo modal M6). Este wrapper
+        // mantém os call-sites existentes (seed/testes) intocados — tradutor fino (ADR 0022 §1).
+        self.create_agent_with_autonomy(
+            name,
+            engine,
+            cwd,
+            role_override,
+            kit_consent,
+            Autonomy::Assisted,
+        )
+    }
+
+    /// **Porta ⌘N com a AUTONOMIA escolhida no modal (FIX-3 costura per-Agente).** Igual a
+    /// [`Self::create_agent_with`], mas propaga `autonomy` ao plano → o funil `admit_node`
+    /// carimba `LINA_AUTONOMY` no env do PTY (o guard `lina guard --pretooluse` honra o nível
+    /// DESTE nó) e a projeção reflete o nível no badge do card (`NodeView.autonomy`).
+    pub fn create_agent_with_autonomy(
+        &self,
+        name: &str,
+        engine: Option<&AgentEngine>,
+        cwd: Option<&std::path::Path>,
+        role_override: Option<&str>,
+        kit_consent: bool,
+        autonomy: Autonomy,
     ) -> Result<NodeId, String> {
         let name = name.trim();
         let role = match role_override.map(str::trim).filter(|r| !r.is_empty()) {
@@ -3825,7 +4010,24 @@ impl NodeManager {
             },
             position: None,
             requested_by: None, // criação pelo modal humano (⌘N) — não é spawn agente-pede
+            autonomy,
         })
+    }
+
+    /// FIX-1: os nós VIVOS cujo cwd de TRABALHO coincide com o do `plan` (mesmo projeto do
+    /// usuário). Só `UserDir` conta ([`shared_cwd_path`]); vazio quando o `plan` não é
+    /// `UserDir` ou ninguém mais está na pasta. Lido ANTES de o novo nó entrar em `self.cwds`
+    /// (passo 7 do funil) → enxerga só os JÁ vivos.
+    fn live_nodes_sharing_cwd(&self, plan_cwd: &CwdPolicy) -> Vec<NodeId> {
+        let Some(candidate) = shared_cwd_path(plan_cwd) else {
+            return Vec::new();
+        };
+        lock(&self.cwds)
+            .iter()
+            .filter_map(|(node, policy)| {
+                (shared_cwd_path(policy) == Some(candidate)).then_some(*node)
+            })
+            .collect()
     }
 
     /// **O FUNIL ÚNICO de admissão (ADR 0022 §1) — o único lugar do app que transforma a
@@ -3867,7 +4069,12 @@ impl NodeManager {
         // 2) Validação de nome (regra ÚNICA do funil — antes espalhada por entry point).
         let name = match &plan.name {
             Some(n) => {
-                let n = n.trim();
+                // #6 dogfooding r2: o `@` é ENDEREÇAMENTO, não nome — o `lina spawn` chega
+                // com o alvo "@Nome" (msg.to) e o nó nascia com o sigil EMBUTIDO (seq 20326:
+                // "@Especialista em Licenças"; superfícies exibiam "@@Nome" ao endereçar).
+                // Normaliza no FUNIL (vale para TODAS as portas) ANTES de validar; "@"/"@@"
+                // puros viram vazio e caem na recusa de nome inválido.
+                let n = n.trim().trim_start_matches('@').trim();
                 if n.is_empty()
                     || n.chars().any(char::is_control)
                     || n.contains("{{")
@@ -3906,6 +4113,7 @@ impl NodeManager {
             &name,
             &role,
             &key,
+            plan.autonomy,
         );
 
         // 4) Política de cwd (§4) + kit write-before-spawn (o shell já encontra o CLAUDE.md).
@@ -3995,6 +4203,16 @@ impl NodeManager {
             }
         };
 
+        // FIX-1 (dogfooding 2026-06-10): o cwd de TRABALHO já pertence a outro nó VIVO? O caso
+        // de uso central — um time inteiro no projeto do usuário (default F1-4-1) — põe N
+        // agentes no MESMO `UserDir`. A identidade A2A é isolada pelo env (ADR 0026); aqui a
+        // DEFESA ESTRUTURAL DETECTA o compartilhamento e o SINALIZA ao leigo (badge no card),
+        // nunca surpresa silenciosa. (O isolamento por-nó da OBSERVABILIDADE — token HTTP no
+        // `.claude/settings.json` lido por cwd — é story dedicada: toca o contrato F1-1-3 + a
+        // neutralidade multi-CLI; ver `.entrega-fix1.md`.)
+        let cwd_sharers = self.live_nodes_sharing_cwd(&plan.cwd);
+        let cwd_shared = !cwd_sharers.is_empty();
+
         // 5) Slot calculado ANTES de o nó existir: imune ao placeholder (0,0) que o pump cria.
         //    Posição FIXA só na porta seed/demo (roteiro determinístico).
         let (x, y) = match plan.position {
@@ -4053,7 +4271,16 @@ impl NodeManager {
             let mut m = lock(&self.model);
             let mut view = NodeView::new(name.clone(), NodeKind::Terminal, x, y);
             view.kit_missing = kit_missing;
+            view.cwd_shared = cwd_shared;
+            view.autonomy = plan.autonomy;
             m.nodes.insert(node, view);
+            // FIX-1: os nós que JÁ estavam nesta pasta agora têm companhia → badge honesto
+            // neles também (o compartilhamento é mútuo; nenhum card esconde que divide a pasta).
+            for sharer in &cwd_sharers {
+                if let Some(v) = m.nodes.get_mut(sharer) {
+                    v.cwd_shared = true;
+                }
+            }
             if !m.order.contains(&node) {
                 m.order.push(node);
             }
@@ -4100,7 +4327,16 @@ impl NodeManager {
         if let Some(existing) = self.admitted_node_for_spawn(spawn_id) {
             return Ok(existing);
         }
-        let child = self.admit_node(NodeAdmission::spawned_agent(name, role, requested_by))?;
+        // #7 dogfooding r2: o colega spawnado nasce com o MOTOR default do workspace (paridade
+        // ⌘N — `TerminalSpawned.cli` registra o CLI, nunca o nome do nó). Resolução injetável
+        // (produção: discovery; testes: fixa).
+        let engine = (self.spawn_engine)();
+        let child = self.admit_node(NodeAdmission::spawned_agent(
+            name,
+            role,
+            requested_by,
+            engine,
+        ))?;
         if let Err(e) = lock(&self.store).append(&DomainEvent::SpawnAdmitted {
             id: spawn_id.to_string(),
             node: child,
@@ -6064,7 +6300,7 @@ mod tests {
             keys.insert(node, k.to_string());
         }
 
-        let nm = NodeManager::new(
+        let mut nm = NodeManager::new(
             Arc::clone(&pty),
             Arc::clone(&sup),
             Arc::clone(&store),
@@ -6079,6 +6315,9 @@ mod tests {
             bootstrap,
             dir.join(".lina"),
         );
+        // #7: motor de spawn FIXO (None) — a discovery real leria o PATH do runner e um
+        // spawn de teste LANÇARIA o CLI de verdade. `None` = fábrica `cat` (como sempre).
+        nm.set_spawn_engine_factory(Arc::new(|| None));
         (nm, store, model)
     }
 
@@ -6092,7 +6331,7 @@ mod tests {
         let cmd_factory: CmdFactory = Arc::new(|_n: &str| PtyCommand::new("cat"));
         let model: Model = Arc::new(Mutex::new(SharedModel::default()));
         let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
-        Arc::new(NodeManager::new(
+        let mut nm = NodeManager::new(
             pty,
             sup,
             store,
@@ -6106,7 +6345,10 @@ mod tests {
             cmd_factory,
             None,
             std::env::temp_dir().join("lina-test-nodes"),
-        ))
+        );
+        // #7: motor de spawn FIXO (None) — sem discovery real no runner (ver `test_manager`).
+        nm.set_spawn_engine_factory(Arc::new(|| None));
+        Arc::new(nm)
     }
 
     /// **Harness do funil de cwd ÚNICO (ADR 0022 §4 / fix do slot reciclável):** um
@@ -8732,26 +8974,424 @@ mod tests {
     /// (a key durável `n-<uuidv7>`) via [`node_identity_env`] — junto do `VIBE_ROLE`
     /// histórico. É o que impede a colisão de identidade quando N terminais compartilham o
     /// MESMO cwd (a ficha `.lina/bootstrap.json` é último-escritor-vence; o env, não).
-    /// NÃO-VACUOSO: remover a injeção de qualquer uma das 3 vars falha o assert dela.
+    /// NÃO-VACUOSO: remover a injeção de qualquer uma das 4 vars falha o assert dela.
     #[test]
     fn admitted_pty_env_carries_node_identity() {
+        // Autonomia NÃO-default (`Manual`) prova que a escolha do plano FLUI ao env (FIX-3) —
+        // distinta do `Assisted` default; `label()` casa com `lina_core::guard::parse_autonomy`.
         let cmd = node_identity_env(
             PtyCommand::new("cat"),
             "Bug Finder",
             "BUG_FIXER",
             "n-0197-deadbeef",
+            Autonomy::Manual,
         );
         let dbg = format!("{cmd:?}");
         for (var, val) in [
             ("VIBE_ROLE", "BUG_FIXER"),
             ("LINA_NODE_NAME", "Bug Finder"),
             ("LINA_NODE_ID", "n-0197-deadbeef"),
+            ("LINA_AUTONOMY", "manual"),
         ] {
             assert!(
                 dbg.contains(var) && dbg.contains(val),
                 "env de identidade ausente no comando do PTY: {var}={val} em {dbg}"
             );
         }
+    }
+
+    /// **FIX-1 (dogfooding 2026-06-10) — admissões no MESMO cwd de TRABALHO são DETECTADAS e
+    /// sinalizadas (badge "vários agentes nesta pasta"):** o caso de uso central do produto
+    /// (um time inteiro no projeto do usuário; default F1-4-1) põe N agentes no MESMO `UserDir`.
+    /// A identidade A2A já é isolada pelo env (ADR 0026: `admitted_pty_env_carries_node_identity`
+    /// + `identity_env_cli.rs`); ESTE teste prova a DEFESA ESTRUTURAL — o funil detecta que o
+    ///   cwd já pertence a outro nó vivo e marca `cwd_shared` em TODOS os que dividem a pasta (o
+    ///   card avisa; nunca surpresa silenciosa). Controle: nó em pasta DISTINTA não é marcado.
+    ///   NÃO-VACUOSO: sem a detecção, `cwd_shared` fica `false` e o assert do 2º (+ o re-marque
+    ///   do 1º) falha.
+    #[test]
+    fn admissoes_no_mesmo_user_dir_detectam_e_marcam_cwd_compartilhado() {
+        let ws = std::env::temp_dir().join(format!("lina-cwdshared-ws-{}", std::process::id()));
+        let shared =
+            std::env::temp_dir().join(format!("lina-cwdshared-proj-{}", std::process::id()));
+        let other =
+            std::env::temp_dir().join(format!("lina-cwdshared-other-{}", std::process::id()));
+        for d in [&ws, &shared, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, _store, model) = test_manager("cwdshared", Some(bw));
+
+        // 1º agente na pasta compartilhada (consentido) — SOZINHO: ainda não compartilha.
+        let a = nm
+            .create_agent_with("Arquiteto", None, Some(&shared), None, true)
+            .expect("admite o 1º na pasta");
+        assert!(
+            !lock(&model).nodes.get(&a).expect("nó a").cwd_shared,
+            "1º sozinho na pasta: ainda NÃO compartilha"
+        );
+
+        // 2º agente na MESMA pasta → colisão DETECTADA: AMBOS marcados.
+        let b = nm
+            .create_agent_with("Backend", None, Some(&shared), None, true)
+            .expect("admite o 2º na MESMA pasta");
+        {
+            let m = lock(&model);
+            assert!(
+                m.nodes.get(&b).expect("nó b").cwd_shared,
+                "2º no mesmo cwd: marcado compartilhado"
+            );
+            assert!(
+                m.nodes.get(&a).expect("nó a").cwd_shared,
+                "o 1º é RE-marcado ao ganhar companhia na pasta (badge honesto)"
+            );
+        }
+
+        // Controle: 3º agente em pasta DISTINTA → NÃO marcado.
+        let c = nm
+            .create_agent_with("QA", None, Some(&other), None, true)
+            .expect("admite o 3º em pasta distinta");
+        assert!(
+            !lock(&model).nodes.get(&c).expect("nó c").cwd_shared,
+            "pasta própria distinta: não compartilha"
+        );
+
+        for d in [&ws, &shared, &other] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// **FIX-1 — duas admissões no MESMO cwd nascem com IDENTIDADE DISTINTA (a base da
+    /// isolação A2A via env, ADR 0026):** a `key` durável (`n-<uuid>` → `LINA_NODE_ID`) difere
+    /// por nó MESMO compartilhando a pasta — é o que o `node_identity_env` carimba
+    /// (`admitted_pty_env_carries_node_identity`) e o que faz o outbox por-nó do `lina ask` não
+    /// colidir (`identity_env_cli::ask_outbox_lands_in_env_named_subdir`, lina-bootstrap). O
+    /// assert do MESMO cwd prova que a isolação vem da IDENTIDADE, não de separar a pasta (raiz
+    /// comum preservada — o caso de uso "time no projeto do usuário"). NÃO-VACUOSO: keys
+    /// recicláveis (o bug do slot `t{seq}`, já corrigido) fariam as keys coincidirem.
+    #[test]
+    fn duas_admissoes_no_mesmo_cwd_tem_identidades_distintas() {
+        let ws = std::env::temp_dir().join(format!("lina-ident2-ws-{}", std::process::id()));
+        let shared = std::env::temp_dir().join(format!("lina-ident2-proj-{}", std::process::id()));
+        for d in [&ws, &shared] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, _store, _model) = test_manager("ident-mesmo-cwd", Some(bw));
+
+        let a = nm
+            .create_agent_with("Arquiteto", None, Some(&shared), None, true)
+            .expect("1º no cwd compartilhado");
+        let b = nm
+            .create_agent_with("Backend", None, Some(&shared), None, true)
+            .expect("2º no MESMO cwd");
+
+        // `LINA_NODE_ID` = a key durável; distinta por construção (`n-<uuid v7>`, nunca reciclada).
+        {
+            let keys = lock(&nm.keys);
+            let ka = keys.get(&a).expect("key a");
+            let kb = keys.get(&b).expect("key b");
+            assert_ne!(
+                ka, kb,
+                "LINA_NODE_ID (key) distinto por nó, mesmo no MESMO cwd"
+            );
+            assert!(
+                ka.starts_with("n-") && kb.starts_with("n-"),
+                "as keys são `n-<uuid>` (virgens, não-recicláveis): {ka} / {kb}"
+            );
+        }
+        // E os dois apontam para o MESMO cwd de trabalho: a isolação é por IDENTIDADE, não por pasta.
+        {
+            let cwds = lock(&nm.cwds);
+            assert_eq!(
+                shared_cwd_path(cwds.get(&a).expect("cwd a")),
+                shared_cwd_path(cwds.get(&b).expect("cwd b")),
+                "raiz comum: ambos no MESMO cwd (isolação por identidade, não por subpasta)"
+            );
+        }
+
+        for d in [&ws, &shared] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// **FIX-1 — o estado COLIDIDO de produção (N nós no mesmo cwd, dogfooding 2026-06-10)
+    /// reabre sem panic:** o event log já tem `TerminalSpawned.cwd` idêntico em vários nós; o
+    /// `project()` (replay = fonte da verdade, inv#4) reconstrói TODOS sem panic, com o mesmo
+    /// cwd fiel. `cwd_shared` é estado de UI por sessão (nasce `false` no replay — documentado);
+    /// o ponto é a ROBUSTEZ: reabrir o app no estado atual nunca quebra.
+    #[test]
+    fn replay_de_estado_com_nos_no_mesmo_cwd_reconstroi_sem_panic() {
+        let ws = std::env::temp_dir().join(format!("lina-replay-ws-{}", std::process::id()));
+        let shared = std::env::temp_dir().join(format!("lina-replay-proj-{}", std::process::id()));
+        for d in [&ws, &shared] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let (nm, store, _model) = test_manager("replay-colidido", Some(bw));
+
+        // Estado colidido: 2 nós no MESMO cwd (exatamente o que o log de produção tem hoje).
+        nm.create_agent_with("Arquiteto", None, Some(&shared), None, true)
+            .expect("1º");
+        nm.create_agent_with("Backend", None, Some(&shared), None, true)
+            .expect("2º");
+
+        // Replay do log → reconstrói SEM panic; os 2 nós voltam, ambos com o MESMO cwd.
+        let projected = lock(&store)
+            .project()
+            .expect("replay do estado colidido NÃO paniqueia");
+        assert_eq!(
+            projected.nodes.len(),
+            2,
+            "os 2 nós do estado colidido reconstroem pelo event log"
+        );
+        let cwds: std::collections::BTreeSet<&str> = projected
+            .nodes
+            .values()
+            .filter_map(|n| n.cwd.as_deref())
+            .collect();
+        assert_eq!(
+            cwds.len(),
+            1,
+            "ambos reconstroem com o MESMO cwd (estado colidido fiel ao TerminalSpawned.cwd)"
+        );
+
+        for d in [&ws, &shared] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// **FIX-3 (costura per-Agente) — a autonomia ESCOLHIDA no ⌘N chega ao nó (badge + guard):**
+    /// `create_agent_with_autonomy(Manual)` projeta `NodeView.autonomy == Manual` (a FONTE do
+    /// badge do card, per-Agente) e o funil carimba `LINA_AUTONOMY` no env (o guard honra —
+    /// provado em `admitted_pty_env_carries_node_identity`). Controle: o wrapper
+    /// `create_agent_with` mantém o default do produto (`Assisted`). NÃO-VACUOSO: sem a
+    /// propagação `view.autonomy = plan.autonomy`, ambos ficariam no default do `new`.
+    #[test]
+    fn create_agent_propaga_autonomia_escolhida_pro_no() {
+        let (nm, _store, model) = test_manager("autonomy-prop", None);
+
+        let manual = nm
+            .create_agent_with_autonomy("Cauteloso", None, None, None, false, Autonomy::Manual)
+            .expect("⌘N com autonomia explícita");
+        assert_eq!(
+            lock(&model).nodes.get(&manual).expect("nó manual").autonomy,
+            Autonomy::Manual,
+            "a autonomia escolhida no modal projeta no NodeView (badge per-Agente)"
+        );
+
+        // Controle: o wrapper sem autonomia explícita mantém o default do produto (Assisted).
+        let default = nm
+            .create_agent_with("Padrao", None, None, None, false)
+            .expect("⌘N default");
+        assert_eq!(
+            lock(&model)
+                .nodes
+                .get(&default)
+                .expect("nó default")
+                .autonomy,
+            Autonomy::Assisted,
+            "default do produto intocado (Assisted)"
+        );
+    }
+
+    /// **#6 dogfooding r2 — o sigil `@` é ENDEREÇAMENTO, não nome:** o `lina spawn` chega com
+    /// o alvo "@Nome" e o nó nascia com o `@` embutido (seq 20326: "@Especialista em
+    /// Licenças"; superfícies exibiam "@@"). O funil normaliza: spawn com "@X" e com "X"
+    /// produz nó SEMPRE "X" — e o casamento tolerante do roster (`node_by_name`) segue
+    /// resolvendo o endereço "@X" para ele. NÃO-VACUOSO: sem o strip no funil, o 1º assert
+    /// recebe "@Especialista em Licenças" e falha.
+    #[test]
+    fn spawn_strips_addressing_sigil_from_node_name() {
+        let (nm, _store, model) = test_manager("sigil6", None);
+        let spawner = nm
+            .admit_node(NodeAdmission::default_terminal())
+            .expect("spawner");
+
+        let with_sigil = nm
+            .execute_spawn("msg_sig1", "@Especialista em Licenças", "terminal", spawner)
+            .expect("spawn com @ no alvo");
+        let without = nm
+            .execute_spawn("msg_sig2", "Especialista em Dados", "terminal", spawner)
+            .expect("spawn sem @");
+        {
+            let m = lock(&model);
+            assert_eq!(
+                m.nodes.get(&with_sigil).expect("nó @").name,
+                "Especialista em Licenças",
+                "o @ de endereçamento NÃO entra no nome do nó"
+            );
+            assert_eq!(
+                m.nodes.get(&without).expect("nó").name,
+                "Especialista em Dados",
+                "nome sem sigil passa intacto (controle)"
+            );
+        }
+        // "Endereçar @X depois funciona": o roster casa o endereço com o nome limpo (a
+        // tolerância de `node_by_name` — sem o "@@" que o nome-com-sigil produzia).
+        let sup = Supervisor::new();
+        let id = sup.register("Especialista em Licenças", None, Box::new(std::io::sink()));
+        assert_eq!(
+            sup.node_by_name("@Especialista em Licenças"),
+            Some(id),
+            "o endereço @X resolve o nó X"
+        );
+        // E "@"/"@@" puros não viram nó sem nome: recusa visível do funil.
+        assert!(
+            nm.execute_spawn("msg_sig3", "@", "terminal", spawner)
+                .is_err(),
+            "@ puro é endereço vazio — nome inválido"
+        );
+    }
+
+    /// **#7 dogfooding r2 — `TerminalSpawned.cli` do spawn registra o CLI, não o nome do nó
+    /// (paridade com o ⌘N):** com o MESMO motor, a porta spawn e a porta ⌘N gravam o MESMO
+    /// `cli` ("Claude Code"). Antes, o spawn nascia com engine `None` e o campo caía no
+    /// fallback legado = NOME do nó (seq 20326 vs 20134) — poluindo as projeções por-CLI
+    /// (detecção/perfis/custo). NÃO-VACUOSO: voltar o engine do spawn a `None` faz o `cli`
+    /// gravar o nome de novo e o assert anti-nome falha.
+    #[test]
+    fn spawn_terminal_spawned_cli_matches_modal_path() {
+        let (mut nm, store, _model) = test_manager("cli7", None);
+        let engine = AgentEngine {
+            program: "cat".into(), // determinístico no PTY de teste; o label é o que se grava
+            args: Vec::new(),
+            profile_id: None,
+            label: "Claude Code".into(),
+        };
+        let fixed = engine.clone();
+        nm.set_spawn_engine_factory(Arc::new(move || Some(fixed.clone())));
+        let spawner = nm
+            .admit_node(NodeAdmission::default_terminal())
+            .expect("spawner");
+
+        nm.execute_spawn("msg_cli7", "Especialista em Licenças", "terminal", spawner)
+            .expect("spawn agente-pede");
+        nm.create_agent_with("Colega Modal", Some(&engine), None, None, true)
+            .expect("porta ⌘N");
+
+        let clis: Vec<String> = lock(&store)
+            .events()
+            .expect("events")
+            .iter()
+            .filter(|r| r.kind == "TerminalSpawned")
+            .filter_map(|r| Some(r.payload.get("cli")?.as_str()?.to_string()))
+            .collect();
+        assert_eq!(
+            clis.iter().filter(|c| *c == "Claude Code").count(),
+            2,
+            "spawn e ⌘N gravam o MESMO cli (paridade): {clis:?}"
+        );
+        assert!(
+            !clis
+                .iter()
+                .any(|c| c.contains("Especialista") || c.contains("Colega")),
+            "NENHUM TerminalSpawned grava nome de nó no campo cli: {clis:?}"
+        );
+    }
+
+    /// **#7 — o motor default do spawn é o que o modal pré-seleciona:** `claude` primeiro,
+    /// senão o 1º descoberto (com o `program` = binário REAL do PATH); máquina sem CLI →
+    /// `None` (degrada à fábrica do workspace). Função PURA — sem tocar o PATH do runner.
+    #[test]
+    fn default_spawn_engine_prefers_claude_then_first_then_none() {
+        let codex = DiscoveredCli {
+            id: "codex".into(),
+            version: None,
+            path: "/u/bin/codex".into(),
+        };
+        let claude = DiscoveredCli {
+            id: "claude".into(),
+            version: Some("2.1".into()),
+            path: "/u/bin/claude".into(),
+        };
+        let e = default_spawn_engine(&[codex.clone(), claude]).expect("acha claude");
+        assert_eq!(e.label, "Claude Code");
+        assert_eq!(
+            e.program, "/u/bin/claude",
+            "o program é o binário DESCOBERTO (não um chute)"
+        );
+        let e = default_spawn_engine(&[codex]).expect("sem claude → 1º descoberto");
+        assert_eq!(e.label, "Codex");
+        assert!(
+            default_spawn_engine(&[]).is_none(),
+            "máquina sem CLI → None (fábrica do workspace, comportamento histórico)"
+        );
+    }
+
+    /// **#7 — trava de espelho:** `spawn_cli_label` (funil) ≡ `agent_modal::engine_label`
+    /// (modal) para TODOS os CLIs conhecidos + o fallback Title-case. São duas cópias de
+    /// propósito (o modal importa DESTE módulo; o import inverso criaria ciclo) — divergir
+    /// é teste vermelho, não bug silencioso de rótulo.
+    #[test]
+    fn spawn_cli_label_matches_modal_engine_label() {
+        for id in lina_core::KNOWN_CLIS.iter().copied().chain(["foo-cli"]) {
+            assert_eq!(
+                spawn_cli_label(id),
+                crate::agent_modal::engine_label(id),
+                "rótulo divergente entre funil e modal p/ {id:?}"
+            );
+        }
+    }
+
+    /// **#9 dogfooding r2 — a doutrina do nó gerenciado CITA o cwd ABSOLUTO (idempotente):**
+    /// o spawnado nasce numa pasta NOVA que não conhece — um caminho relativo do orquestrador
+    /// quebrava silencioso (correção manual na sessão). O kit (`write_one`, o gerador que o
+    /// `admit_node` usa) anota a localização nos 3 arquivos de doutrina; o re-render por
+    /// mudança de roster NÃO duplica a nota. NÃO-VACUOSO: sem o append, o 1º assert falha.
+    #[test]
+    fn write_one_doctrine_cites_absolute_workdir_idempotently() {
+        let ws = std::env::temp_dir().join(format!("lina-wd9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+        let roster = vec!["Spawnado".to_string(), "Maestro".to_string()];
+        bw.write_one("n-teste9", "Spawnado", &roster);
+
+        let dir = bw.dir_for("n-teste9");
+        for f in ["CLAUDE.md", "AGENTS.md", "GEMINI.md"] {
+            let body = std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert!(
+                body.contains(WORKDIR_NOTE_MARK),
+                "{f} carrega a nota de localização"
+            );
+            assert!(
+                body.contains(&dir.display().to_string()),
+                "{f} cita o caminho ABSOLUTO da pasta do nó"
+            );
+        }
+        // Re-render (mudança de roster reescreve a doutrina) → nota presente e ÚNICA.
+        bw.write_one("n-teste9", "Spawnado", &roster);
+        let body = std::fs::read_to_string(dir.join("CLAUDE.md")).expect("re-render");
+        assert_eq!(
+            body.matches(WORKDIR_NOTE_MARK).count(),
+            1,
+            "a nota não duplica no re-render (idempotente)"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     /// **Terminal PURO não escreve NADA no HOME do usuário (invariante crítico):** mesmo com o
@@ -8785,6 +9425,7 @@ mod tests {
                 cwd: CwdPolicy::UserHome { path: home.clone() },
                 position: None,
                 requested_by: None,
+                autonomy: Autonomy::Assisted,
             })
             .expect("admite o terminal puro");
 

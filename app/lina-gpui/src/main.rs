@@ -1245,10 +1245,10 @@ impl WorkspaceView {
 
     /// Abre o M6-E em modo EDITAR (pré-preenchido com nome + papel correntes do nó).
     fn open_agent_modal_edit(&mut self, node: NodeId, cx: &mut Context<Self>) {
-        let Some(name) = lock(&self.nodes.model)
+        let Some((name, node_autonomy)) = lock(&self.nodes.model)
             .nodes
             .get(&node)
-            .map(|v| v.name.clone())
+            .map(|v| (v.name.clone(), v.autonomy))
         else {
             return; // nó sumiu entre o build da paleta e o clique — nada a editar.
         };
@@ -1258,9 +1258,9 @@ impl WorkspaceView {
             node,
             &name,
             role.as_deref(),
-            // FIX-3: o nível EFETIVO do nó hoje = o do Espaço (fonte única; por-Agente entra
-            // com a costura do funil).
-            self.ws_autonomy,
+            // FIX-3 costura: o nível REAL do nó (per-Agente, `NodeView.autonomy`) — o modal de
+            // edição mostra o MESMO que o badge do card (consistência badge↔modal).
+            node_autonomy,
             self.live_names(),
         );
         self.open_agent_modal(modal, cx);
@@ -1446,7 +1446,7 @@ impl WorkspaceView {
         let result: Result<Option<NodeId>, String> = match &plan {
             Plan::Create(p) => self
                 .nodes
-                .create_agent_with(
+                .create_agent_with_autonomy(
                     &p.name,
                     Some(&p.engine),
                     p.cwd.as_deref(),
@@ -1454,6 +1454,9 @@ impl WorkspaceView {
                     // ADR 0022 §4: consentimento explícito do modal — sem ele, pasta própria
                     // nasce SEM kit e o card mostra o badge (degradação visível).
                     p.kit_consent,
+                    // FIX-3 costura: a autonomia ESCOLHIDA no modal vira `LINA_AUTONOMY`
+                    // por-Agente (o guard honra) e a projeção (`NodeView.autonomy`) reflete o badge.
+                    p.autonomy,
                 )
                 .map(Some),
             Plan::Save(p) => self
@@ -1472,21 +1475,21 @@ impl WorkspaceView {
                         eprintln!("lina-gpui: M6 — {note}");
                     }
                 }
-                // FIX-3 · COSTURA PENDENTE (funil do bridge): a escolha de autonomia viaja
-                // TIPADA no plano, mas `create_agent_with`/`admit_node` ainda não carimbam
-                // `LINA_AUTONOMY` por-Agente. NUNCA silencioso: divergência do nível efetivo
-                // do Espaço fica registrada no stderr até a costura fechar (entrega FIX-3).
+                // FIX-3 costura: a CRIAÇÃO (⌘N) agora carimba `LINA_AUTONOMY` por-Agente
+                // (`create_agent_with_autonomy`) e o badge reflete `NodeView.autonomy` — FECHADO.
+                // A EDIÇÃO (SavePlan) ainda aguarda a porta de autonomia no `NodeManager` (análoga
+                // a `assign_role`, Pedido 3 da costura): até lá, mudar a autonomia no Editar
+                // registra mas não re-carimba o env do nó VIVO. NUNCA silencioso (eprintln honesto).
                 let pending = match &plan {
-                    Plan::Create(p) => (p.autonomy != self.ws_autonomy).then_some(p.autonomy),
+                    Plan::Create(_) => None,
                     Plan::Save(p) => p.autonomy,
                 };
                 if let Some(a) = pending {
                     eprintln!(
-                        "lina-gpui: M6 — autonomia escolhida ({}) registrada no plano; \
-                         aplicação por-Agente aguarda a costura do funil (bridge) — \
-                         efetivo hoje: {} (Espaço).",
+                        "lina-gpui: M6 — nova autonomia ({}) registrada na edição; aplicação ao \
+                         nó VIVO aguarda a porta de autonomia no NodeManager (Pedido 3 da costura \
+                         FIX-3). Recriar o agente já aplica imediatamente.",
                         agent_modal::autonomy_surface_label(a),
-                        agent_modal::autonomy_surface_label(self.ws_autonomy)
                     );
                 }
                 self.agent_modal = None;
@@ -2405,7 +2408,10 @@ impl Render for WorkspaceView {
                 title = title.child(
                     div()
                         .id(("card-autonomy", card_eid))
-                        .aria_label(agent_modal::card_autonomy_aria(self.ws_autonomy))
+                        // FIX-3 costura (Pedido 2): per-Agente — o badge lê `nv.autonomy` (o
+                        // `LINA_AUTONOMY` carimbado no env deste nó), não o nível do Espaço.
+                        // UI e enforcement (guard) nunca divergem.
+                        .aria_label(agent_modal::card_autonomy_aria(nv.autonomy))
                         .px_2()
                         .rounded_md()
                         .bg(rgb(auto_bg))
@@ -2417,7 +2423,7 @@ impl Render for WorkspaceView {
                         .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
                             view.open_agent_modal_edit(node_id, cx);
                         }))
-                        .child(text!(agent_modal::card_autonomy_badge(self.ws_autonomy))),
+                        .child(text!(agent_modal::card_autonomy_badge(nv.autonomy))),
                 );
                 title = title.child(
                     div()
@@ -2445,6 +2451,22 @@ impl Render for WorkspaceView {
                         .text_size(px(10.0 * z))
                         .text_color(rgb(th.state.warning))
                         .child(text!("⚠ sem doutrina/observabilidade")),
+                );
+            }
+            // FIX-1 (dogfooding 2026-06-10): VÁRIOS agentes dividem ESTA pasta de trabalho (um
+            // time no mesmo projeto do usuário — default F1-4-1). A identidade A2A é isolada pelo
+            // env (ADR 0026); o badge só torna o compartilhamento VISÍVEL ao leigo — informacional,
+            // não alarme (`text.muted`, não `warning`). Chip de 1 linha na barra do título (nunca
+            // no corpo: clipa as rows do PTY — família de bugs A/B desta base).
+            if nv.cwd_shared {
+                title = title.child(
+                    div()
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .text_size(px(10.0 * z))
+                        .text_color(rgb(th.text.muted))
+                        .child(text!("vários agentes nesta pasta")),
                 );
             }
             // O ✕ só aparece quando há >1 card: o ÚLTIMO nó nunca pode ser fechado (o canvas
@@ -3816,6 +3838,7 @@ fn main() {
                 cwd: CwdPolicy::UserHome { path: home.clone() },
                 position: Some((x, y)),
                 requested_by: None,
+                autonomy: Autonomy::Assisted, // carga de profiling — autonomia default
             };
             if let Err(e) = nodes.admit_node(admission) {
                 eprintln!(
