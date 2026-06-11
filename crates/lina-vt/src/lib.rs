@@ -223,6 +223,17 @@ pub trait VtBackend: Send {
     fn scrollback_len(&self) -> usize {
         0
     }
+
+    /// F1-6-3 (MEDIA-3): nº de vezes que o ring de colheita SATUROU dentro de um sub-chunk —
+    /// **possível perda de scrollback** (evicção-antes-da-colheita) sob sequências adversariais
+    /// muitas-linhas-por-poucos-bytes (`CSI Ps S`/`REP` no primary screen). `0` = nenhuma perda
+    /// possível detectada; output real (LF/wrap) nunca satura (provado por teste). Monotônico
+    /// na vida do backend (não é drenado — o consumidor compara com a leitura anterior).
+    /// Default `0` (método ADITIVO: backends sem captura e a porta libghostty ficam intactos —
+    /// o contrato existente da trait não muda).
+    fn scrollback_loss_count(&self) -> u64 {
+        0
+    }
 }
 
 // ───────────────────────── AlacrittyBackend (impl da Onda 0) ─────────────────────────
@@ -291,7 +302,34 @@ pub const SCROLLBACK_HARVEST_STEP: usize = 512;
 /// um firehose de `SU` no *primary screen* poderia exceder o slack — caso **adversarial e irreal**
 /// (TUIs que usam scroll-region vivem no *alt-screen*, onde `scrolling_history=0` e nada é
 /// capturado). O cabo é à prova de perda para output via `LF` (o caso real de scrollback).
+/// F1-6-3 (MEDIA-3): quando esse bound é atingido, a perda **não é mais silenciosa** — o
+/// `advance_capturing` detecta a saturação (`after == ceiling`), incrementa o contador por
+/// painel ([`VtBackend::scrollback_loss_count`]) e emite warning rate-limitado no stderr.
 pub const SCROLLBACK_HARVEST_SLACK: usize = 2 * SCROLLBACK_HARVEST_STEP;
+
+/// F1-6-3 — rate-limit do warning `[SB-LOSS]`: loga na 1ª ocorrência e depois só em potências
+/// de 2 (2ª, 4ª, 8ª…). Sob `SU` torrencial o contador cresce a cada sub-chunk — logar todas as
+/// ocorrências viraria firehose de stderr e o warning morreria por ruído (o anti-padrão que o
+/// MEDIA-3 corrige). `count` é a ocorrência corrente (1-based; o chamador incrementa antes).
+#[must_use]
+fn should_log_saturation(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
+/// F1-6-3 — monta o warning `[SB-LOSS]` da `count`-ésima saturação, ou `None` quando o
+/// rate-limit o suprime. Função PURA: formato e gating testáveis sem capturar stderr; o
+/// chamador único (`advance_capturing`) só faz `eprintln!` e CONTA a emissão
+/// ([`AlacrittyBackend::loss_warnings_logged`]) — a fiação fica vigiada por teste.
+#[must_use]
+fn saturation_warning(count: u64, ceiling: usize, cap: usize, slack: usize) -> Option<String> {
+    should_log_saturation(count).then(|| {
+        format!(
+            "lina-vt: [SB-LOSS] ring de colheita saturou (history=={ceiling}); possível \
+             evicção-antes-da-colheita sob CSI S/REP — ocorrência nº {count} neste painel \
+             (cap={cap}, slack={slack})"
+        )
+    })
+}
 
 /// Backend VT sobre `alacritty_terminal` 0.26 (parser `vte` 0.15 + grid + damage).
 pub struct AlacrittyBackend {
@@ -314,6 +352,15 @@ pub struct AlacrittyBackend {
     /// W5-2 FIAÇÃO: linhas colhidas (saídas do viewport) ainda não drenadas por
     /// [`Self::take_scrollback`]. Ordem cronológica (mais antiga primeiro).
     captured: Vec<String>,
+    /// F1-6-3 (MEDIA-3): nº de sub-chunks em que o ring de colheita SATUROU
+    /// (`after == ceiling`) — possível **evicção-antes-da-colheita** sob `CSI Ps S`/`REP`
+    /// (muitas linhas por poucos bytes). A perda deixa de ser silenciosa: contador por
+    /// painel (este backend É o painel), exposto via [`VtBackend::scrollback_loss_count`].
+    harvest_saturations: u64,
+    /// F1-6-3: quantos warnings `[SB-LOSS]` este painel já EMITIU no stderr (pós rate-limit).
+    /// Existe para o teste do critério (a) vigiar a EMISSÃO, não só o contador — remover o
+    /// `eprintln!` da fiação derruba o teste (anti-vacuidade, regras-comuns §6).
+    loss_warnings_logged: u64,
 }
 
 impl AlacrittyBackend {
@@ -365,6 +412,8 @@ impl AlacrittyBackend {
             capture,
             slack,
             captured: Vec::new(),
+            harvest_saturations: 0,
+            loss_warnings_logged: 0,
         }
     }
 
@@ -373,6 +422,13 @@ impl AlacrittyBackend {
     #[must_use]
     pub fn scrollback_cap(&self) -> usize {
         self.scrollback_cap
+    }
+
+    /// F1-6-3: warnings `[SB-LOSS]` efetivamente EMITIDOS no stderr por este painel (pós
+    /// rate-limit) — o lado "warning emitido" do critério (a), assertável sem capturar stderr.
+    #[must_use]
+    pub fn loss_warnings_logged(&self) -> u64 {
+        self.loss_warnings_logged
     }
 
     /// Acesso somente-leitura ao grid parseado — útil para consumidores internos
@@ -409,6 +465,22 @@ impl AlacrittyBackend {
             let before = self.grid().history_size();
             self.parser.advance(&mut self.term, step);
             let after = self.grid().history_size();
+            // F1-6-3 (MEDIA-3): o ring SATUROU dentro DESTE sub-chunk → o invariante
+            // "`s` = nº exato de linhas que rolaram" pode ter quebrado (linhas evictadas/
+            // não-colhidas). Output real via LF/wrap NUNCA chega aqui (1 byte move ≤1 linha;
+            // STEP << slack — provado por teste); só sequências adversariais muitas-linhas-
+            // por-poucos-bytes (`CSI Ps S`, `REP`) saturam. Doutrina "nunca engula erro":
+            // a perda vira contador por painel + warning rate-limitado no stderr. Zero-perda
+            // sob SU adversarial NÃO é prometido — fronteira documentada (F1-6-5).
+            if after == ceiling {
+                self.harvest_saturations = self.harvest_saturations.saturating_add(1);
+                if let Some(warning) =
+                    saturation_warning(self.harvest_saturations, ceiling, cap, self.slack)
+                {
+                    self.loss_warnings_logged = self.loss_warnings_logged.saturating_add(1);
+                    eprintln!("{warning}");
+                }
+            }
             if after > before {
                 // Colhe as `s` linhas mais NOVAS (as que acabaram de entrar no histórico), em
                 // ordem cronológica: a mais antiga das novas está em Line(-s); a mais nova em Line(-1).
@@ -674,6 +746,10 @@ impl VtBackend for AlacrittyBackend {
 
     fn scrollback_len(&self) -> usize {
         self.grid().history_size()
+    }
+
+    fn scrollback_loss_count(&self) -> u64 {
+        self.harvest_saturations
     }
 }
 
@@ -1174,6 +1250,145 @@ mod tests {
         );
         // E o ring continua respeitando o cap (comportamento legado intacto).
         assert_eq!(b.grid().history_size(), 8);
+    }
+
+    // ───────────────── F1-6-3 (MEDIA-3): perda sob CSI Ps S / REP é SINALIZADA ─────────────────
+
+    /// F1-6-3 critério (a) — `CSI Ps S` (SU) torrencial: cada `\x1b[30S` (5 bytes) rola 30
+    /// linhas → um sub-chunk de 512 bytes empurra ~3000 linhas >> slack (1024). O ring satura
+    /// (`after == ceiling`) e a possível evicção-antes-da-colheita é SINALIZADA: o contador
+    /// por painel incrementa (e o warning `[SB-LOSS]` sai rate-limitado no stderr).
+    #[test]
+    fn su_torrential_saturates_and_signals_loss() {
+        let cap = 8usize;
+        let mut b = AlacrittyBackend::with_scrollback_capture(20, 30, cap);
+        // Semeia conteúdo real no viewport (as linhas roladas têm texto, como num CLI vivo).
+        for i in 0..30u32 {
+            b.advance(format!("seed{i}\r\n").as_bytes());
+        }
+        assert_eq!(b.scrollback_loss_count(), 0, "sem SU ainda, sem sinal");
+
+        // 400 × "\x1b[30S" = 2000 bytes (4 sub-chunks) ≈ 12.000 linhas roladas.
+        let blast = "\x1b[30S".repeat(400);
+        b.advance(blast.as_bytes());
+
+        assert!(
+            b.scrollback_loss_count() > 0,
+            "saturação sob SU torrencial TEM de ser sinalizada (perda silenciosa = MEDIA-3)"
+        );
+        // Critério (a), metade EMISSÃO: o warning saiu de verdade (≥1) e EXATAMENTE nas
+        // ocorrências que o rate-limit manda (potências de 2 ≤ contador) — deletar o
+        // `eprintln!`/fiação derruba este assert (anti-vacuidade, regras-comuns §6).
+        let expected_logs = (1..=b.scrollback_loss_count())
+            .filter(|c| c.is_power_of_two())
+            .count() as u64;
+        assert!(b.loss_warnings_logged() >= 1, "warning nunca foi emitido");
+        assert_eq!(
+            b.loss_warnings_logged(),
+            expected_logs,
+            "emissões devem seguir o rate-limit (potências de 2)"
+        );
+        // O mecanismo segue vivo pós-saturação: colheita continua e o ring volta ao cap.
+        b.advance(b"depois\r\n");
+        assert_eq!(b.scrollback_len(), cap, "ring trimado ao cap pós-saturação");
+    }
+
+    /// F1-6-3 critério (a) — `REP` (`CSI Ps b`): um único `\x1b[60000b` (9 bytes) repete o
+    /// caractere precedente 60.000×, que em cols=10 quebra em ~6.000 linhas de wrap DENTRO de
+    /// um único sub-chunk — o outro vetor muitas-linhas-por-poucos-bytes do MEDIA-3.
+    #[test]
+    fn rep_wrap_torrential_saturates_and_signals_loss() {
+        let cap = 8usize;
+        let mut b = AlacrittyBackend::with_scrollback_capture(10, 4, cap);
+        b.advance(b"x"); // o caractere que o REP repete
+        assert_eq!(b.scrollback_loss_count(), 0);
+
+        b.advance(b"\x1b[60000b");
+
+        assert!(
+            b.scrollback_loss_count() > 0,
+            "saturação sob REP+wrap TEM de ser sinalizada"
+        );
+        assert!(
+            b.loss_warnings_logged() >= 1,
+            "warning não emitido sob REP (critério a: warning + contador)"
+        );
+    }
+
+    /// F1-6-3 critério (b) — NÃO-VACUOSO/zero falso-positivo: output NORMAL (LF e wrap),
+    /// inclusive TORRENCIAL num único advance (o firehose do W5-2), NUNCA satura o ring nem
+    /// incrementa o contador. Falso-positivo aqui mataria o warning por ruído — e este teste
+    /// FALHA se a detecção for afrouxada para `after > cap` (vacuidade vigiada).
+    #[test]
+    fn normal_lf_and_wrap_torrential_never_signal_loss() {
+        let cap = 8usize;
+        let mut b = AlacrittyBackend::with_scrollback_capture(20, 4, cap);
+
+        // Firehose de LF: 5.000 linhas num único advance (mesma carga do teste de zero-perda).
+        let mut blast = String::with_capacity(5_000 * 8);
+        for i in 0..5_000u32 {
+            blast.push_str(&format!("L{i}\r\n"));
+        }
+        b.advance(blast.as_bytes());
+        assert_eq!(
+            b.scrollback_loss_count(),
+            0,
+            "LF torrencial é o caminho feliz: zero falso-positivo"
+        );
+
+        // Wrap torrencial: linha contínua de 40.000 chars (sem LF) quebra em ~2.000 linhas,
+        // mas 1 byte = 1 célula → ≤ STEP linhas por sub-chunk << slack: nunca satura.
+        b.advance("y".repeat(40_000).as_bytes());
+        b.advance(b"\r\n");
+        assert_eq!(
+            b.scrollback_loss_count(),
+            0,
+            "wrap normal é o caminho feliz: zero falso-positivo"
+        );
+    }
+
+    /// F1-6-3 — o caminho LEGADO (sem captura) nunca conta perda de colheita: não há colheita
+    /// a perder (a detecção vive só no `advance_capturing`). Também prova o default aditivo
+    /// da trait (`scrollback_loss_count` = 0 sem override de comportamento novo).
+    #[test]
+    fn legacy_no_capture_never_counts_loss() {
+        let mut b = AlacrittyBackend::with_scrollback_cap(20, 30, 8);
+        b.advance("\x1b[30S".repeat(400).as_bytes());
+        assert_eq!(
+            b.scrollback_loss_count(),
+            0,
+            "sem captura não há colheita — e portanto não há perda de colheita a sinalizar"
+        );
+    }
+
+    /// F1-6-3 — rate-limit do warning: loga na 1ª e depois só em potências de 2 (anti-firehose
+    /// de stderr; sob SU torrencial o contador sobe a cada sub-chunk).
+    #[test]
+    fn saturation_warning_is_rate_limited_to_powers_of_two() {
+        let logged: Vec<u64> = (1..=64).filter(|&c| should_log_saturation(c)).collect();
+        assert_eq!(logged, vec![1, 2, 4, 8, 16, 32, 64]);
+        assert!(!should_log_saturation(3));
+        assert!(!should_log_saturation(63));
+    }
+
+    /// F1-6-3 — o TEXTO do warning é estruturado e grep-ável: tag `[SB-LOSS]`, ocorrência,
+    /// cap e slack (o Maestro/forense lê o stderr); suprimido fora das potências de 2.
+    #[test]
+    fn saturation_warning_message_is_structured_and_gated() {
+        let w = saturation_warning(1, 1032, 8, 1024).expect("1ª ocorrência loga");
+        for key in [
+            "lina-vt: [SB-LOSS]",
+            "history==1032",
+            "ocorrência nº 1",
+            "cap=8",
+            "slack=1024",
+        ] {
+            assert!(w.contains(key), "faltou `{key}` em: {w}");
+        }
+        assert!(
+            saturation_warning(3, 1032, 8, 1024).is_none(),
+            "fora das potências de 2 o rate-limit suprime"
+        );
     }
 
     // ───────────────────────────── Seleção de texto ─────────────────────────────
