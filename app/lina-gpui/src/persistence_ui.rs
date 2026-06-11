@@ -539,13 +539,32 @@ impl PersistenceModel {
 
 // ═══════════════════════════════ entrada (main.rs) ═══════════════════════════════
 
-/// AUTO-ABRE o painel no boot? Env-gated (`LINA_PERSIST_PANEL=1|true`) — hoje é só um
-/// **override de dev**: em produção a janela abre SOB DEMANDA pela engrenagem da barra, `⌘,`
-/// ou paleta (fix de tela F1-2-1 — antes o tema era inalcançável sem a env, violando inv#6).
+/// AUTO-ABRE o painel no boot? **Override de dev** — em produção a janela abre SOB DEMANDA pela
+/// engrenagem da barra, `⌘,` ou paleta (fix de tela F1-2-1 — antes o tema era inalcançável sem a
+/// env, violando inv#6). O gate honra o flag canônico de dev `LINA_DEV` (F1-2-5: superfície limpa
+/// por padrão; ferramentas de dev voltam com `LINA_DEV=1`) **e** o legado `LINA_PERSIST_PANEL`
+/// (back-compat para roteiros de validação que já o usam). Fechado por padrão.
 #[must_use]
 pub fn should_show() -> bool {
-    matches!(
+    should_show_from(
+        std::env::var("LINA_DEV").ok().as_deref(),
         std::env::var("LINA_PERSIST_PANEL").ok().as_deref(),
+    )
+}
+
+/// Decisão PURA do gate (testável sem mexer no env do processo): abre se o flag canônico de dev OU
+/// o legado específico forem verdadeiros.
+#[must_use]
+fn should_show_from(lina_dev: Option<&str>, persist_panel: Option<&str>) -> bool {
+    is_dev_flag_on(lina_dev) || is_dev_flag_on(persist_panel)
+}
+
+/// Um flag de env de dev está "ligado"? Aceita `1|true|force` (mesma convenção de `LINA_DASH`/
+/// `LINA_ONBOARDING`), tolerante a espaços. `None`/vazio/qualquer outro = desligado.
+#[must_use]
+fn is_dev_flag_on(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
         Some("1") | Some("true") | Some("force")
     )
 }
@@ -1102,6 +1121,42 @@ impl Render for PersistenceView {
 mod tests {
     use super::*;
     use crate::bridge::SharedModel;
+
+    /// F1-2-5 (gate da flag de dev) — NÃO-VACUOSO: o painel de diagnóstico fica FECHADO por
+    /// padrão (superfície limpa, inv#6) e só auto-abre com o flag canônico `LINA_DEV` ou o legado
+    /// `LINA_PERSIST_PANEL`. Se alguém remover o gate (fazer o `should_show_from` retornar `true`
+    /// incondicionalmente), a 1ª asserção FALHA. Puro: não toca o env do processo.
+    #[test]
+    fn dev_panel_closed_by_default_opens_only_with_flag() {
+        // Sem nenhuma flag → fechado (o que o fundador vê no percurso T0→T8: sem resíduo de dev).
+        assert!(!should_show_from(None, None), "fechado sem flag");
+        assert!(
+            !should_show_from(Some("0"), Some("0")),
+            "fechado com flag falsa"
+        );
+        assert!(
+            !should_show_from(Some("nope"), None),
+            "valor desconhecido = desligado"
+        );
+
+        // Flag CANÔNICO de dev (F1-2-5: ferramentas de dev voltam com LINA_DEV=1).
+        assert!(should_show_from(Some("1"), None), "LINA_DEV=1 abre");
+        assert!(should_show_from(Some("true"), None), "LINA_DEV=true abre");
+        assert!(
+            should_show_from(Some(" force "), None),
+            "tolera espaços ao redor"
+        );
+
+        // Flag LEGADO específico segue valendo (back-compat dos roteiros de validação).
+        assert!(
+            should_show_from(None, Some("1")),
+            "LINA_PERSIST_PANEL=1 abre"
+        );
+        assert!(
+            should_show_from(None, Some("force")),
+            "LINA_PERSIST_PANEL=force abre"
+        );
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {
