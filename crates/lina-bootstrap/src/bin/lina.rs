@@ -155,6 +155,9 @@ fn run_whoami(hook: bool) -> ExitCode {
         println!("{}", bs.whoami_hook_json_with_roles(&input, &roles));
     } else {
         println!("{}", bs.whoami_with_roles(&input, &roles));
+        // FIX-4: o ramo HUMANO ganha a linha de estado global; o JSON do hook NÃO (não corromper o
+        // contrato de contexto do SessionStart). O agente que roda `lina whoami` enxerga o freio/teto.
+        println!("{}", space_state_line(space_state()));
     }
     ExitCode::SUCCESS
 }
@@ -269,39 +272,46 @@ fn run_ask(args: &[String]) -> ExitCode {
 /// (poll bounded no espelho `log.jsonl`) o desfecho REAL e o reportamos.
 fn enqueue_and_report(from: &str, msg: MailMessage) -> ExitCode {
     let mailbox = Mailbox::new(mailbox_root());
-    match enqueue_per_node(&mailbox, from, &msg) {
-        Ok(()) => match poll_route_outcome(&msg.id) {
-            RouteConfirm::Delivered { to_node } => {
-                let dst = if to_node.is_empty() {
-                    msg.to.clone()
-                } else {
-                    to_node
-                };
-                println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
-                ExitCode::SUCCESS
-            }
-            RouteConfirm::Blocked { reason } => {
-                eprintln!(
-                    "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
-                    msg.to,
-                    explain_block(&reason),
-                    block_hint(&reason)
-                );
-                ExitCode::from(1)
-            }
-            RouteConfirm::Pending => {
-                println!(
-                    "ok: enviada a {} (id {}); ainda SEM confirmacao de entrega apos a espera (o \
-                     Espaco pode estar ocupado). Confirme com `lina list` se o destino esta vivo e \
-                     tente de novo — NAO conclua que o colega e um stub.",
-                    msg.to, msg.id
-                );
-                ExitCode::SUCCESS
-            }
-        },
-        Err(e) => {
-            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+    if let Err(e) = enqueue_per_node(&mailbox, from, &msg) {
+        eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+        return ExitCode::from(1);
+    }
+    // FIX-4: o freio de orquestração e o teto de custo são estados GLOBAIS que SÓ o humano vê no
+    // canvas. Sob pausa, a msg JÁ ENFILEIROU acima (durável — nada se perde) mas NÃO será roteada
+    // até o humano retomar; o poll só devolveria `Pending` → o velho "tente de novo" fazia o agente
+    // pedalar 20 min contra a fila congelada. Contamos a verdade INTEIRA (o agente NARRA e PARA);
+    // a fila é a MESMA — só a narração muda.
+    if let Some(notice) = dispatch_pause_notice(space_state()) {
+        println!("{notice}");
+        return ExitCode::SUCCESS;
+    }
+    match poll_route_outcome(&msg.id) {
+        RouteConfirm::Delivered { to_node } => {
+            let dst = if to_node.is_empty() {
+                msg.to.clone()
+            } else {
+                to_node
+            };
+            println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
+            ExitCode::SUCCESS
+        }
+        RouteConfirm::Blocked { reason } => {
+            eprintln!(
+                "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
+                msg.to,
+                explain_block(&reason),
+                block_hint(&reason)
+            );
             ExitCode::from(1)
+        }
+        RouteConfirm::Pending => {
+            println!(
+                "ok: enviada a {} (id {}); ainda SEM confirmacao de entrega apos a espera (o \
+                 Espaco pode estar ocupado). Confirme com `lina list` se o destino esta vivo e \
+                 tente de novo — NAO conclua que o colega e um stub.",
+                msg.to, msg.id
+            );
+            ExitCode::SUCCESS
         }
     }
 }
@@ -528,6 +538,10 @@ fn run_check(args: &[String]) -> ExitCode {
         }
         None => println!("ultima atividade A2A: nenhuma registrada no log"),
     }
+    // FIX-4: a mesma dor — o agente checava um colega "Idle" sem saber que o ESPAÇO estava pausado e
+    // re-tentava sem fim. A linha de estado global (leitura pura do log) torna visível o freio/teto
+    // que só apareciam no canvas.
+    println!("{}", space_state_line(space_state()));
     ExitCode::SUCCESS
 }
 
@@ -602,6 +616,94 @@ fn poll_route_outcome(msg_id: &str) -> RouteConfirm {
             _ => std::thread::sleep(Duration::from_millis(150)),
         }
     }
+}
+
+/// **FIX-4 — estado GLOBAL do Espaço projetado do event log** (livro-razão; invariante #4). São
+/// estados que SÓ o humano vê (rodapé do canvas) e que, invisíveis ao agente, o faziam pedalar
+/// contra uma fila congelada ("estados globais do Espaço são invisíveis aos agentes" — mesma
+/// família do teto de custo). Cada flag segue o ÚLTIMO evento de transição do log — o mesmo replay
+/// de `Router::restore_orchestration_state` e do `CostLedger` (W3-7c §2.2). `Default` = nada
+/// pausado: a AUSÊNCIA de freio no log É "ativo" (nunca inventamos uma pausa que o humano não pôs).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SpaceState {
+    /// Freio de orquestração (W4-3): `true` = PAUSADO — delegações novas ENFILEIRAM (duráveis), não
+    /// são roteadas, até o humano clicar ▶ Retomar cooperação no canvas.
+    orchestration_paused: bool,
+    /// Teto de custo do dia (W3-7c): `true` = ATINGIDO — workspace pausado até a confirmação humana
+    /// (`lina resume` → o supervisor apenda `CostCeilingResumed`).
+    cost_ceiling_hit: bool,
+}
+
+/// **PURO** (testável, sem I/O): projeta o [`SpaceState`] varrendo o `log.jsonl`. Cada flag segue o
+/// ÚLTIMO evento de transição (último vence — idêntico ao replay do core). Só o `kind` decide (o
+/// freio nem tem payload; o teto tem campos que aqui são irrelevantes). Tolera linhas parciais/
+/// inválidas (arquivo sob append, mesma postura de [`scan_log_outcome`]).
+fn scan_space_state(content: &str) -> SpaceState {
+    let mut state = SpaceState::default();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("kind").and_then(serde_json::Value::as_str) {
+            Some("OrchestrationPaused") => state.orchestration_paused = true,
+            Some("OrchestrationResumed") => state.orchestration_paused = false,
+            Some("CostCeilingHit") => state.cost_ceiling_hit = true,
+            Some("CostCeilingResumed") => state.cost_ceiling_hit = false,
+            _ => {}
+        }
+    }
+    state
+}
+
+/// Lê o espelho `log.jsonl` (NÃO o SQLite — evita conexão concorrente/lock na troca de WAL, como
+/// [`poll_route_outcome`]) e projeta o [`SpaceState`]. Log ausente/ilegível → `Default` (nada
+/// pausado): sem evento de freio, o Espaço está ativo.
+fn space_state() -> SpaceState {
+    std::fs::read_to_string(event_log_path())
+        .ok()
+        .map(|c| scan_space_state(&c))
+        .unwrap_or_default()
+}
+
+/// Copy congelada (fundador, FIX-4) do freio de orquestração — narração leiga que o agente LÊ e
+/// repassa ao humano (anti-eco). Os símbolos ⏸/▶ casam os botões do rodapé do canvas (o humano
+/// clica em ▶ Retomar cooperação); são semânticos, não decoração.
+const ORCHESTRATION_PAUSED_NOTICE: &str = "⏸ o Espaço está PAUSADO — sua mensagem ficou guardada na fila (nada se perde). Diga ao usuário: clique em ▶ Retomar cooperação para o time voltar a se falar.";
+
+/// Copy do teto de custo (FIX-4, mesma família do freio): o teto do dia foi atingido; a retomada
+/// exige confirmação HUMANA na janela do Lina (espelha o que [`run_resume`] já registra).
+const COST_CEILING_NOTICE: &str = "⏸ o teto de custo do dia foi atingido — sua mensagem ficou guardada na fila (nada se perde). Diga ao usuário que é preciso confirmar a retomada do teto na janela do Lina para o time voltar a trabalhar.";
+
+/// **PURO** — narração que RETÉM a delegação quando um estado global está pausado, ou `None` quando
+/// o Espaço está ativo (segue o fluxo normal de confirmação). É o coração do FIX-4: trocar o "ok,
+/// tente de novo" (meia-verdade que faz o agente pedalar) pela verdade INTEIRA, para o agente NARRAR
+/// e PARAR. Freio e teto são gates independentes; com os dois ativos, conta os dois.
+fn dispatch_pause_notice(state: SpaceState) -> Option<String> {
+    match (state.orchestration_paused, state.cost_ceiling_hit) {
+        (false, false) => None,
+        (true, false) => Some(ORCHESTRATION_PAUSED_NOTICE.to_string()),
+        (false, true) => Some(COST_CEILING_NOTICE.to_string()),
+        (true, true) => Some(format!(
+            "{ORCHESTRATION_PAUSED_NOTICE}\n{COST_CEILING_NOTICE}"
+        )),
+    }
+}
+
+/// **PURO** — a linha de ESTADO GLOBAL que `lina check`/`lina whoami` exibem nos DOIS casos (ativo
+/// e pausado): torna visível, em vocabulário leigo, o que antes só aparecia no canvas. O agente que
+/// sempre lê "cooperação automática: ativa" reconhece de imediato quando vira "PAUSADA".
+fn space_state_line(state: SpaceState) -> String {
+    let cooperacao = if state.orchestration_paused {
+        "⏸ PAUSADA (delegações ficam guardadas na fila; peça ao usuário ▶ Retomar cooperação)"
+    } else {
+        "ativa"
+    };
+    let teto = if state.cost_ceiling_hit {
+        "⏸ ATINGIDO (delegações guardadas; precisa de confirmação humana na janela do Lina)"
+    } else {
+        "ok"
+    };
+    format!("Estado do Espaço · cooperação automática: {cooperacao} · teto de custo: {teto}")
 }
 
 /// Tradução acionável do motivo de bloqueio (o leitor é um agente de IA — texto claro, sem jargão de log).
@@ -1872,6 +1974,126 @@ mod vault_tests {
         assert_eq!(
             scan_spawn_outcome("{lixo\n", "msg_A"),
             SpawnConfirm::Pending
+        );
+    }
+}
+
+#[cfg(test)]
+mod space_state_tests {
+    use super::*;
+
+    /// Linha de log mínima (só `kind` decide a projeção — o payload do freio é vazio).
+    fn rec(kind: &str) -> String {
+        format!(r#"{{"seq":1,"ts":1,"kind":"{kind}","version":1,"payload":{{"event":"{kind}"}}}}"#)
+    }
+
+    /// **`scan_space_state` (puro):** cada flag segue o ÚLTIMO evento de transição (último vence —
+    /// idêntico ao replay de `restore_orchestration_state`/`CostLedger`). Controles provam a não-
+    /// vacuosidade: vazio → default; Paused→Resumed volta a ativo; freio e teto são independentes.
+    #[test]
+    fn scan_space_state_tracks_last_transition_per_flag() {
+        // Vazio → nada pausado (ausência de freio = ativo).
+        assert_eq!(scan_space_state(""), SpaceState::default());
+
+        // Freio: último vence.
+        let paused = scan_space_state(&rec("OrchestrationPaused"));
+        assert!(paused.orchestration_paused && !paused.cost_ceiling_hit);
+        let resumed = scan_space_state(&format!(
+            "{}\n{}",
+            rec("OrchestrationPaused"),
+            rec("OrchestrationResumed")
+        ));
+        assert!(
+            !resumed.orchestration_paused,
+            "Resumed depois de Paused volta a ativo (último vence)"
+        );
+
+        // Teto: independente do freio, mesmo padrão de transição.
+        let hit = scan_space_state(&rec("CostCeilingHit"));
+        assert!(hit.cost_ceiling_hit && !hit.orchestration_paused);
+        let both = scan_space_state(&format!(
+            "{}\n{}",
+            rec("OrchestrationPaused"),
+            rec("CostCeilingHit")
+        ));
+        assert!(
+            both.orchestration_paused && both.cost_ceiling_hit,
+            "freio e teto são gates independentes"
+        );
+        let cost_resumed = scan_space_state(&format!(
+            "{}\n{}",
+            rec("CostCeilingHit"),
+            rec("CostCeilingResumed")
+        ));
+        assert!(!cost_resumed.cost_ceiling_hit);
+
+        // Linha-lixo é tolerada (arquivo sob append).
+        assert_eq!(scan_space_state("{lixo parcial\n"), SpaceState::default());
+    }
+
+    /// **`dispatch_pause_notice` (puro):** ativo → `None` (segue o fluxo normal); freio → a verdade
+    /// do freio SEM "tente de novo"; teto → a verdade do teto; ambos → as duas. É o coração do FIX-4.
+    #[test]
+    fn dispatch_pause_notice_speaks_the_whole_truth() {
+        assert_eq!(
+            dispatch_pause_notice(SpaceState::default()),
+            None,
+            "Espaço ativo não retém — fluxo normal de confirmação"
+        );
+
+        let brake = dispatch_pause_notice(SpaceState {
+            orchestration_paused: true,
+            cost_ceiling_hit: false,
+        })
+        .expect("freio narra a verdade");
+        assert!(
+            brake.contains("PAUSADO") && brake.contains("▶ Retomar cooperação"),
+            "{brake}"
+        );
+        assert!(
+            !brake.contains("tente de novo"),
+            "a verdade do freio NÃO manda o agente re-tentar (era a meia-verdade que fazia pedalar): {brake}"
+        );
+
+        let cost = dispatch_pause_notice(SpaceState {
+            orchestration_paused: false,
+            cost_ceiling_hit: true,
+        })
+        .expect("teto narra a verdade");
+        assert!(cost.contains("teto de custo"), "{cost}");
+
+        let both = dispatch_pause_notice(SpaceState {
+            orchestration_paused: true,
+            cost_ceiling_hit: true,
+        })
+        .expect("os dois narram");
+        assert!(
+            both.contains("Retomar cooperação") && both.contains("teto de custo"),
+            "ambos os gates são contados quando os dois estão ativos: {both}"
+        );
+    }
+
+    /// **`space_state_line` (puro):** aparece nos DOIS casos com o vocabulário certo. Controle:
+    /// o ativo diz "ativa" e NÃO diz "PAUSADA" (não-vacuoso).
+    #[test]
+    fn space_state_line_renders_both_cases() {
+        let ativo = space_state_line(SpaceState::default());
+        assert!(
+            ativo.contains("cooperação automática: ativa") && ativo.contains("teto de custo: ok"),
+            "{ativo}"
+        );
+        assert!(
+            !ativo.contains("PAUSADA"),
+            "controle: ativo não diz PAUSADA: {ativo}"
+        );
+
+        let pausado = space_state_line(SpaceState {
+            orchestration_paused: true,
+            cost_ceiling_hit: true,
+        });
+        assert!(
+            pausado.contains("PAUSADA") && pausado.contains("ATINGIDO"),
+            "{pausado}"
         );
     }
 }
