@@ -1,0 +1,494 @@
+<!doctype html>
+<!--
+T1 Instrumento de Estúdio — o Lina é um instrumento que o leigo aprende a tocar, não um painel que ele administra.
+Mecanismo: cor = UM significado fixo acoplado ao elemento acionável · viewer vivo SÓ no conjunto de foco (periferia congelada honesta) · flat honesto, função é a forma.
+Nunca: gradiente decorativo, sombra teatral, cor sem significado, animar input do usuário.
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lina — T1 · Instrumento de Estúdio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* ====== T1 — Instrumento de Estúdio · tokens ======
+     Carvão quente: planos por degraus de tom + borda 1px. Zero sombra.
+     Paleta semântica fixa (UM significado por cor, em todo o app):
+       âmbar  #e8a93f = trabalhando        (7.44:1 sobre cartão)
+       verde  #9ec98a = pronto             (8.17:1 sobre cartão)
+       verm.  #ff8a70 = precisa de você    (6.67:1 sobre cartão · texto escuro sobre ele 7.51:1)
+       azul   #7db8e8 = mensagem do time / chegando (7.23:1 sobre cartão)
+     Texto #ede6d9 sobre rail #211c17 = 13.61:1 · sobre cartão #2a241d = 12.36:1
+     Grid: #e9e2d5 sobre #15110d = 14.58:1 · linhas de apoio #a89c88 = 6.96:1
+     Periferia congelada: #9a8e7c sobre #15110d = 5.85:1 (esmaecido, ainda AA). */
+  :root{
+    --bg-canvas:#1b1713;
+    --bg-rail:#211c17;
+    --bg-card:#2a241d;
+    --bg-elev:#342d24;
+    --border:#3e362b;
+    --border-grid:#332c22;
+    --text:#ede6d9;
+    --text-2:#b6ab99;
+    --grid-bg:#15110d;
+    --grid-text:#e9e2d5;
+    --grid-dim:#a89c88;
+    --grid-frozen:#9a8e7c;
+    --amber:#e8a93f;
+    --green:#9ec98a;
+    --red:#ff8a70;
+    --blue:#7db8e8;
+    --ink-on-accent:#1f1a12;
+    --ui:'IBM Plex Sans',system-ui,sans-serif;
+    --display:'Fraunces','Iowan Old Style',Georgia,serif;
+    --mono:'JetBrains Mono','Cascadia Mono',Menlo,Consolas,monospace;
+    --r:4px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; min-width:1180px;
+    background:var(--bg-canvas); color:var(--text);
+    font-family:var(--ui); font-size:14px; line-height:1.45;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:rgba(232,169,63,.30)}
+  a{color:inherit}
+  button{font-family:var(--ui); cursor:pointer}
+  :is(a,button):focus-visible{outline:2px solid var(--amber); outline-offset:2px}
+
+  .frame{display:flex; height:100vh; min-height:640px; min-width:1180px}
+
+  /* ============ RAIL ============ */
+  .rail{
+    flex:0 0 270px; display:flex; flex-direction:column;
+    background:var(--bg-rail); border-right:1px solid var(--border);
+    padding:14px 12px 10px;
+  }
+  .rail-top{display:flex; align-items:center; justify-content:space-between; padding:0 4px 2px}
+  .wordmark{font-size:15px; font-weight:600; letter-spacing:.04em}
+  .collapse{
+    width:26px; height:26px; display:grid; place-items:center;
+    background:none; border:1px solid transparent; border-radius:var(--r);
+    color:var(--text-2); font-size:11px; padding:0;
+  }
+  .collapse:hover{border-color:var(--border); color:var(--text)}
+
+  .space-now{padding:14px 6px 16px; border-bottom:1px solid var(--border)}
+  .space-now h1{
+    margin:0; font-family:var(--display); font-weight:600;
+    font-size:19px; line-height:1.25; letter-spacing:.005em;
+  }
+  .space-now .sub{margin-top:5px; font-size:12px; color:var(--text-2)}
+
+  .search{
+    margin:12px 0 4px; width:100%; text-align:left;
+    display:flex; align-items:center; gap:10px;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--r);
+    padding:8px 10px; color:var(--text); min-height:44px;
+  }
+  .search:hover{background:var(--bg-elev)}
+  .search .lbl{flex:1}
+  .search .lbl b{display:block; font-size:13px; font-weight:600}
+  .search .lbl small{display:block; font-size:11.5px; font-weight:400; color:var(--text-2); margin-top:1px}
+  .search kbd{
+    font-family:var(--ui); font-size:11px; color:var(--text-2);
+    background:var(--bg-elev); border:1px solid var(--border); border-radius:3px;
+    padding:2px 6px;
+  }
+
+  .rail-section{margin-top:14px}
+  .rail-section>h2{
+    margin:0 0 6px; padding:0 6px;
+    font-size:10.5px; font-weight:600; letter-spacing:.09em; text-transform:uppercase;
+    color:var(--text-2);
+  }
+  .space-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px}
+  .space-item{
+    position:relative; width:100%; text-align:left;
+    background:none; border:1px solid transparent; border-radius:var(--r);
+    padding:7px 8px 7px 10px; color:var(--text); min-height:34px;
+  }
+  .space-item:hover{background:var(--bg-card)}
+  .space-item .nm{display:block; font-size:13px; font-weight:500; line-height:1.3}
+  .space-item .mt{display:flex; align-items:center; gap:5px; margin-top:2px; font-size:11.5px; color:var(--text-2)}
+  .space-item .mt .dot-work{color:var(--amber); font-size:9px; line-height:1}
+  .space-item--current{background:var(--bg-card); border-color:var(--border)}
+  .space-item--current::before{
+    content:""; position:absolute; left:-1px; top:6px; bottom:6px;
+    width:2px; background:var(--text); border-radius:1px;
+  }
+  .tag-atual{
+    float:right; font-size:10px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--text-2); border:1px solid var(--border); border-radius:3px; padding:1px 5px; margin-top:1px;
+  }
+  .row-unload{display:flex; align-items:flex-start; gap:8px}
+  .row-unload .grow{flex:1; min-width:0}
+  .btn-unload{
+    flex:none; margin-top:3px; min-height:24px;
+    font-size:11.5px; font-weight:500; color:var(--text);
+    background:var(--bg-elev); border:1px solid var(--border); border-radius:3px; padding:3px 9px;
+  }
+  .btn-unload:hover{background:var(--border)}
+
+  .btn-new-space{
+    margin-top:8px; width:100%; min-height:32px; text-align:left;
+    font-size:12.5px; font-weight:500; color:var(--text-2);
+    background:none; border:1px dashed var(--border); border-radius:var(--r); padding:6px 10px;
+  }
+  .btn-new-space:hover{color:var(--text); border-color:var(--text-2)}
+
+  .rail-foot{margin-top:auto; padding:10px 4px 50px; display:flex; flex-direction:column; gap:8px}
+  .saved{font-size:12px; color:var(--green)}
+  .appearance{
+    width:100%; min-height:28px; text-align:left;
+    font-size:11.5px; color:var(--text-2);
+    background:none; border:1px solid var(--border); border-radius:var(--r); padding:5px 9px;
+  }
+  .appearance:hover{color:var(--text)}
+
+  /* ============ CANVAS ============ */
+  .canvas{flex:1; position:relative; overflow:hidden}
+  .scroller{position:absolute; inset:0; overflow:auto}
+  .scroller::-webkit-scrollbar{width:10px; height:10px}
+  .scroller::-webkit-scrollbar-thumb{background:var(--border); border-radius:5px}
+  .scroller::-webkit-scrollbar-track{background:transparent}
+  .stage{
+    position:relative; width:1170px; height:840px; min-width:100%; min-height:100%;
+    background-image:radial-gradient(rgba(237,230,217,.05) 1px, transparent 1.4px);
+    background-size:26px 26px;
+  }
+
+  /* Pill de atenção — padrão PULL. O MESMO vermelho do chip e do botão do cartão 3:
+     a cor do indicador É a cor do acionável (acoplamento OP-1). */
+  .attn{
+    position:absolute; top:14px; left:50%; transform:translateX(-50%); z-index:6;
+    display:inline-flex; align-items:center; min-height:32px;
+    background:var(--red); color:var(--ink-on-accent);
+    font-size:13px; font-weight:600; letter-spacing:.005em;
+    border:1px solid var(--red); border-radius:var(--r); padding:6px 14px;
+    text-decoration:none; white-space:nowrap;
+  }
+  .attn:hover{background:#ffa18c; border-color:#ffa18c}
+
+  .zoom{
+    position:absolute; right:16px; bottom:14px; z-index:6;
+    display:flex; align-items:stretch; gap:5px;
+  }
+  .zoom button{
+    min-width:28px; min-height:28px; padding:3px 9px;
+    background:var(--bg-card); color:var(--text);
+    border:1px solid var(--border); border-radius:var(--r);
+    font-size:12px; font-weight:500;
+  }
+  .zoom button:hover{background:var(--bg-elev)}
+  .zoom .pct{font-variant-numeric:tabular-nums}
+
+  /* ============ CARTÃO-TERMINAL ============ */
+  .card{
+    position:absolute;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:var(--r);
+    display:flex; flex-direction:column;
+  }
+  .card-head{display:flex; align-items:flex-start; justify-content:space-between; gap:10px; padding:11px 14px 9px}
+  .card-head .who{min-width:0}
+  .card-head h2{margin:0; font-size:14px; font-weight:600; line-height:1.3; letter-spacing:.005em}
+  .card-head .meta{display:block; margin-top:2px; font-size:11.5px; color:var(--text-2)}
+  .card-head .state{flex:none; display:flex; align-items:center; gap:6px}
+
+  .chip{
+    display:inline-flex; align-items:center; gap:6px;
+    font-size:12px; font-weight:500; line-height:1;
+    border-radius:3px; padding:5px 9px; white-space:nowrap;
+  }
+  .chip .glyph{font-size:11px; line-height:1}
+  .chip--working{color:var(--amber); background:rgba(232,169,63,.10); border:1px solid rgba(232,169,63,.38)}
+  .chip--needs  {color:var(--red);   background:rgba(255,138,112,.10); border:1px solid rgba(255,138,112,.38)}
+  .chip--done   {color:var(--green); background:rgba(158,201,138,.10); border:1px solid rgba(158,201,138,.38)}
+  .chip--arriving{color:var(--blue); background:rgba(125,184,232,.10); border:1px solid rgba(125,184,232,.38)}
+
+  /* fila de atenção no cabeçalho do cartão 3 — mesmo vermelho acionável */
+  .badge-attn{
+    display:inline-flex; align-items:center; gap:4px;
+    background:var(--red); color:var(--ink-on-accent);
+    font-size:11px; font-weight:600; line-height:1;
+    border-radius:3px; padding:5px 7px;
+  }
+
+  .grid-wrap{position:relative; padding:0 12px}
+  pre.tgrid{
+    margin:0; padding:12px 14px;
+    background:var(--grid-bg); border:1px solid var(--border-grid); border-radius:var(--r);
+    font-family:var(--mono); font-size:12.5px; line-height:1.62; color:var(--grid-text);
+    white-space:pre; overflow:hidden;
+  }
+  .g-work{color:var(--amber)}        /* linha de trabalho em curso */
+  .g-dim{color:var(--grid-dim)}      /* linha de apoio ⎿ */
+  .g-ask{color:var(--red)}           /* a linha que espera VOCÊ */
+  .g-ok{color:var(--green)}          /* item verificado */
+
+  .narr{margin:0; padding:10px 14px 12px; font-size:13px; line-height:1.5; color:var(--text)}
+
+  /* — Cartão 1: FOCO. Anel âmbar (trabalhando) + aba "ao vivo": viewer vivo só aqui. — */
+  .card--focus{border-color:var(--amber); outline:1px solid rgba(232,169,63,.45); outline-offset:3px}
+  .card--focus pre.tgrid{font-size:13px}
+  .card--focus pre.tgrid::after{content:"█"; color:var(--grid-text)} /* cursor vivo do foco — decoração CSS, fora do texto canônico */
+  .tab-live{
+    position:absolute; top:-11px; left:14px;
+    display:inline-flex; align-items:center; gap:5px;
+    background:var(--amber); color:var(--ink-on-accent);
+    font-size:11px; font-weight:600; letter-spacing:.02em; line-height:1;
+    border-radius:3px; padding:4px 8px;
+  }
+
+  /* — Cartão 2: periferia CONGELADA, honesta. O grid esmaece; a narração segue viva. — */
+  .frozen pre.tgrid{color:var(--grid-frozen)}
+  .seal{
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    max-width:88%; text-align:center;
+    background:var(--bg-rail); border:1px solid var(--border); border-radius:var(--r);
+    padding:7px 12px; font-size:12px; font-weight:500; line-height:1.45; color:var(--text);
+  }
+
+  /* — Cartão 3: ações no chrome. O "sim" veste o MESMO vermelho do pedido. — */
+  .actions{display:flex; gap:8px; padding:10px 14px 0}
+  .btn-yes{
+    min-height:28px; padding:6px 12px;
+    background:var(--red); color:var(--ink-on-accent);
+    font-size:12.5px; font-weight:600;
+    border:1px solid var(--red); border-radius:var(--r);
+  }
+  .btn-yes:hover{background:#ffa18c; border-color:#ffa18c}
+  .btn-later{
+    min-height:28px; padding:6px 12px;
+    background:var(--bg-elev); color:var(--text);
+    font-size:12.5px; font-weight:500;
+    border:1px solid var(--border); border-radius:var(--r);
+  }
+  .btn-later:hover{background:var(--border)}
+
+  /* — Cartão 4: momento de conclusão — a única aparição da Fraunces no canvas. — */
+  .narr--moment{font-family:var(--display); font-weight:500; font-size:15px; letter-spacing:.005em}
+
+  /* posições no palco — grade solta, cara de canvas */
+  #construtor{left:32px;  top:96px;  width:404px}
+  #redator   {left:466px; top:138px; width:328px}
+  #caixa     {left:824px; top:88px;  width:330px}
+  #revisor   {left:150px; top:516px; width:330px}
+  #automacoes{left:730px; top:552px; width:304px}
+
+  /* navegação do protótipo (não é UI do app) */
+  .proto-nav{
+    position:fixed; left:14px; bottom:12px; z-index:50;
+    background:var(--bg-card); border:1px solid var(--border); border-radius:999px;
+    padding:5px 12px; font-size:11.5px; color:var(--text-2); text-decoration:none;
+  }
+  .proto-nav:hover{color:var(--text)}
+
+  /* vida ambiente mínima — só com permissão do sistema */
+  @media (prefers-reduced-motion: no-preference){
+    .pulse{animation:pulse 2.4s ease-in-out infinite}
+    .card--focus pre.tgrid::after{animation:blink 1.15s steps(1,end) infinite}
+    @keyframes pulse{0%,100%{opacity:1} 50%{opacity:.38}}
+    @keyframes blink{0%,49%{opacity:1} 50%,100%{opacity:0}}
+  }
+</style>
+</head>
+<body>
+<div class="frame">
+
+  <!-- ============ RAIL ============ -->
+  <aside class="rail">
+    <div class="rail-top">
+      <span class="wordmark">Lina</span>
+      <button class="collapse" type="button" aria-label="Recolher o painel">◀</button>
+    </div>
+
+    <div class="space-now">
+      <h1>Loja Virtual — Lançamento</h1>
+      <p class="sub">5 terminais · 2 trabalhando agora</p>
+    </div>
+
+    <button class="search" type="button">
+      <span class="lbl"><b>Buscar</b><small>terminais, Espaços e ações</small></span>
+      <kbd>⌘K</kbd>
+    </button>
+
+    <nav class="rail-section" aria-label="Espaços">
+      <h2>Espaços</h2>
+      <ul class="space-list">
+        <li>
+          <button class="space-item space-item--current" type="button" aria-current="true">
+            <span class="tag-atual">atual</span>
+            <span class="nm">Loja Virtual — Lançamento</span>
+          </button>
+        </li>
+        <li>
+          <button class="space-item row-unload" type="button">
+            <span class="grow">
+              <span class="nm">Marketing de Conteúdo</span>
+              <span class="mt"><span class="dot-work" aria-hidden="true">●</span>2 trabalhando ao fundo</span>
+            </span>
+            <span class="btn-unload">Descarregar</span>
+          </button>
+        </li>
+        <li>
+          <button class="space-item" type="button">
+            <span class="nm">Pesquisa de Fornecedores</span>
+            <span class="mt">descansando</span>
+          </button>
+        </li>
+      </ul>
+      <button class="btn-new-space" type="button">+ Criar Espaço</button>
+    </nav>
+
+    <div class="rail-foot">
+      <p class="saved" style="margin:0">✓ Tudo salvo · agora há pouco</p>
+      <button class="appearance" type="button">Aparência: Escuro (carvão) · segue o sistema</button>
+    </div>
+  </aside>
+
+  <!-- ============ CANVAS ============ -->
+  <main class="canvas">
+    <div class="scroller">
+      <div class="stage">
+
+        <!-- Cartão 1 — FOCO: o único viewer vivo da tela -->
+        <article class="card card--focus" id="construtor">
+          <span class="tab-live"><span class="pulse" aria-hidden="true">●</span>ao vivo</span>
+          <header class="card-head">
+            <div class="who">
+              <h2>Construtor de Páginas</h2>
+              <span class="meta">há 2 min nisso</span>
+            </div>
+            <div class="state">
+              <span class="chip chip--working"><span class="glyph pulse" aria-hidden="true">●</span>Trabalhando</span>
+            </div>
+          </header>
+          <div class="grid-wrap">
+<pre class="tgrid"><span class="g-work">✻ Trabalhando na sua loja…</span>
+
+● Li a planilha  precos-planos.xlsx
+<span class="g-dim">  ⎿ 3 planos encontrados</span>
+
+● Editei  loja/secao-precos.html
+<span class="g-dim">  ⎿ 42 linhas ajustadas</span>
+
+Deixando os 3 planos lado a lado, com o
+"Profissional" em destaque…</pre>
+          </div>
+          <p class="narr">Montando a seção de preços com os 3 planos.</p>
+        </article>
+
+        <!-- Cartão 2 — periferia congelada (honesta): a tela pausa, o trabalho não -->
+        <article class="card" id="redator">
+          <header class="card-head">
+            <div class="who">
+              <h2>Redator de Vendas</h2>
+              <span class="meta">há 5 min nisso</span>
+            </div>
+            <div class="state">
+              <span class="chip chip--working"><span class="glyph" aria-hidden="true">●</span>Trabalhando</span>
+            </div>
+          </header>
+          <div class="grid-wrap frozen">
+<pre class="tgrid">Título: "Sua loja no ar em 7 dias"
+
+Testando 3 versões do subtítulo:
+A — foco no prazo de entrega
+B — foco na economia mensal
+C — foco em "sem precisar de técnico"</pre>
+            <span class="seal">⏸ Pausado na tela — o trabalho continua</span>
+          </div>
+          <p class="narr">Construindo a página de vendas…</p>
+        </article>
+
+        <!-- Cartão 3 — pede VOCÊ: chip, pill e botão no MESMO vermelho (OP-1) -->
+        <article class="card" id="caixa">
+          <header class="card-head">
+            <div class="who">
+              <h2>Caixa e Pagamentos</h2>
+              <span class="meta">esperando há 1 min</span>
+            </div>
+            <div class="state">
+              <span class="badge-attn" title="1 pedido esperando você"><span aria-hidden="true">◆</span>1</span>
+              <span class="chip chip--needs"><span class="glyph" aria-hidden="true">◆</span>Precisa de você</span>
+            </div>
+          </header>
+          <div class="grid-wrap">
+<pre class="tgrid">Configurei Pix e cartão no ambiente
+de testes. Falta uma decisão sua:
+
+Ativo o cupom LANCA10 — 10% de
+desconto na primeira compra?
+
+<span class="g-ask">Permitir? (s/n) █</span></pre>
+          </div>
+          <div class="actions">
+            <button class="btn-yes" type="button">Sim, pode ativar</button>
+            <button class="btn-later" type="button">Agora não</button>
+          </div>
+          <p class="narr">Esperando sua resposta para continuar.</p>
+        </article>
+
+        <!-- Cartão 4 — pronto: o momento ganha a Fraunces, e só ele -->
+        <article class="card" id="revisor">
+          <header class="card-head">
+            <div class="who">
+              <h2>Revisor de Qualidade</h2>
+              <span class="meta">terminou há 3 min</span>
+            </div>
+            <div class="state">
+              <span class="chip chip--done"><span class="glyph" aria-hidden="true">✓</span>Pronto</span>
+            </div>
+          </header>
+          <div class="grid-wrap">
+<pre class="tgrid"><span class="g-ok">✓ Revisei as 5 páginas da loja</span>
+<span class="g-ok">✓ Botões e links funcionando</span>
+<span class="g-ok">✓ Nada quebrado no celular</span>
+<span class="g-ok">✓ Carregamento rápido</span>
+
+Relatório completo guardado no Espaço.</pre>
+          </div>
+          <p class="narr narr--moment">Pronto — terminei a revisão</p>
+        </article>
+
+        <!-- Cartão 5 — recém-chegado: azul = mensagem do time / chegando -->
+        <article class="card" id="automacoes">
+          <header class="card-head">
+            <div class="who">
+              <h2>Automações</h2>
+              <span class="meta">chegou agora</span>
+            </div>
+            <div class="state">
+              <span class="chip chip--arriving"><span class="glyph" aria-hidden="true">○</span>Chegando</span>
+            </div>
+          </header>
+          <div class="grid-wrap">
+<pre class="tgrid">Olá! Sou o novo terminal de Automações.
+Me apresentando ao time…  █</pre>
+          </div>
+          <p class="narr">Acabou de chegar — conhecendo o trabalho do time.</p>
+        </article>
+
+      </div>
+    </div>
+
+    <!-- Pill de atenção (PULL) — leva ao cartão 3 -->
+    <a class="attn" href="#caixa">◆ 1 pedido precisa de você — ir até lá</a>
+
+    <!-- Zoom -->
+    <div class="zoom" role="group" aria-label="Controles de zoom">
+      <button type="button">Ver tudo</button>
+      <button type="button" aria-label="Afastar">−</button>
+      <button type="button" class="pct">100%</button>
+      <button type="button" aria-label="Aproximar">+</button>
+    </div>
+  </main>
+</div>
+
+<a class="proto-nav" href="index.html">Protótipo T1 — ← escolher outro território</a>
+</body>
+</html>

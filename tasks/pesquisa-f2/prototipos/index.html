@@ -1,0 +1,378 @@
+<!--
+INDEX picker "Direct" — a folha de escolha dos 4 territórios: deliberadamente neutra, porque o instrumento de decisão não pode enviesar a decisão.
+Mecanismo: folha de especificação — papel neutro, tinta escura, rótulos em JetBrains Mono, leitura em Source Sans 3 (sans humanista discreta, de propósito: nenhuma das quatro peles); a pele de cada território só existe DENTRO da amostra do seu card.
+Nunca: ranking visual entre os 4 (mesmo tamanho, mesma hierarquia), pele de território vazando para o chrome da folha, decidir pelo fundador.
+-->
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lina — Escolha o território estético</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@500&family=Bricolage+Grotesque:wght@500&family=Fraunces:opsz,wght@9..144,500&family=Geist:wght@500&family=IBM+Plex+Mono:wght@400&family=IBM+Plex+Sans:wght@500&family=JetBrains+Mono:wght@400;500&family=Source+Sans+3:wght@400;600&family=Space+Grotesk:wght@500&display=swap" rel="stylesheet">
+<style>
+  /* ===== Tokens da folha (neutros de propósito) ===== */
+  :root{
+    --papel:#f2f1ec;          /* fundo da folha            */
+    --cartao:#fbfaf7;         /* fundo dos cards           */
+    --tinta:#232119;          /* tinta principal   14.2:1 papel · 15.4:1 cartão */
+    --tinta-2:#5b564c;        /* tinta secundária   6.4:1 papel ·  6.9:1 cartão */
+    --tinta-meta:#6c665a;     /* rótulos mono       5.0:1 papel ·  5.4:1 cartão */
+    --tinta-aviso:#4f4a41;    /* avisos             7.7:1 papel */
+    --regua:#d8d5cc;          /* hairlines e bordas */
+    --sans:"Source Sans 3","Segoe UI",system-ui,sans-serif;
+    --mono:"JetBrains Mono","SF Mono","Cascadia Mono",ui-monospace,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{font-size:16px}
+  body{
+    background:var(--papel);
+    color:var(--tinta);
+    font-family:var(--sans);
+    font-weight:400;
+    line-height:1.5;
+    min-width:1180px;
+  }
+  .folha{
+    max-width:1240px;
+    margin:0 auto;
+    padding:44px 48px 56px;
+  }
+
+  /* ===== Cabeçalho — ritmo de folha de especificação ===== */
+  .kicker{
+    display:flex;justify-content:space-between;align-items:baseline;
+    border-top:2px solid var(--tinta);
+    padding-top:10px;
+    font-family:var(--mono);
+    font-size:.6875rem;          /* 11px */
+    font-weight:500;
+    letter-spacing:.14em;
+    color:var(--tinta-meta);
+  }
+  h1{
+    font-size:2.375rem;          /* 38px */
+    font-weight:600;
+    letter-spacing:-.015em;
+    line-height:1.15;
+    margin-top:26px;
+  }
+  .subtitulo{
+    font-size:1.0625rem;         /* 17px */
+    color:var(--tinta-2);
+    margin-top:8px;
+    max-width:62ch;
+  }
+  .legenda{
+    font-family:var(--mono);
+    font-size:.6875rem;
+    letter-spacing:.04em;
+    color:var(--tinta-meta);
+    margin:30px 0 14px;
+    padding-bottom:10px;
+    border-bottom:1px solid var(--regua);
+  }
+
+  /* ===== Grade dos 4 cards — mesmo tamanho, mesma hierarquia ===== */
+  .territorios{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:24px;
+  }
+  a.card{
+    display:flex;flex-direction:column;
+    background:var(--cartao);
+    border:1px solid var(--regua);
+    border-radius:6px;
+    padding:22px 24px 24px;
+    text-decoration:none;
+    color:var(--tinta);
+  }
+  a.card:hover{border-color:var(--tinta)}
+  a.card:hover .abrir{text-decoration:underline;text-underline-offset:3px}
+  a.card:focus-visible{outline:2px solid var(--tinta);outline-offset:3px}
+  .card-topo{
+    display:flex;justify-content:space-between;align-items:center;
+    margin-bottom:14px;
+  }
+  .tag{
+    font-family:var(--mono);
+    font-size:.6875rem;
+    font-weight:500;
+    letter-spacing:.1em;
+    background:var(--tinta);
+    color:var(--papel);            /* 14.2:1 */
+    padding:4px 8px;
+    border-radius:3px;
+    min-height:24px;
+    display:inline-flex;align-items:center;
+  }
+  .abrir{
+    font-family:var(--mono);
+    font-size:.6875rem;
+    letter-spacing:.06em;
+    color:var(--tinta-meta);
+  }
+  h2{
+    font-size:1.3125rem;           /* 21px */
+    font-weight:600;
+    letter-spacing:-.01em;
+  }
+  .statement{
+    font-size:.9375rem;            /* 15px */
+    color:var(--tinta-2);
+    margin-top:6px;
+    min-height:3em;                /* iguala a altura nos 4 — sem hierarquia escondida */
+  }
+  .atributos{
+    font-family:var(--mono);
+    font-size:.71875rem;           /* 11.5px */
+    letter-spacing:.03em;
+    color:var(--tinta-meta);
+    margin-top:12px;
+  }
+
+  /* ===== Amostra de pele — único lugar onde o território aparece ===== */
+  .amostra{
+    margin-top:16px;
+    border:1px solid var(--regua);
+    border-radius:4px;
+    overflow:hidden;
+  }
+  .amostra-chrome{
+    height:56px;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:0 16px;
+  }
+  .fontes{display:flex;align-items:baseline;gap:10px;font-size:1rem}
+  .fontes .sep{font-family:var(--mono);font-size:.75rem}
+  .papel-fontes{
+    font-family:var(--mono);
+    font-size:.625rem;             /* 10px */
+    letter-spacing:.08em;
+  }
+  .amostra-term{
+    height:44px;
+    display:flex;align-items:center;gap:14px;
+    padding:0 16px;
+    font-family:var(--mono);
+    font-size:.71875rem;           /* 11.5px */
+    font-weight:500;
+    white-space:nowrap;
+  }
+
+  /* T1 — Instrumento de Estúdio (carvão quente · 4 cores semânticas) */
+  .t1 .amostra-chrome{background:#241e17}
+  .t1 .fontes{color:#efe9df}                          /* 13.7:1 */
+  .t1 .fontes .sep,.t1 .papel-fontes{color:#d6ccbf}   /* 10.4:1 */
+  .t1 .f-ui{font-family:"IBM Plex Sans",system-ui,sans-serif;font-weight:500}
+  .t1 .f-disp{font-family:"Fraunces",Georgia,serif;font-weight:500}
+  .t1 .amostra-term{background:#1d1812}
+  .t1 .st-trab{color:#d99a3d}                         /* 7.3:1 */
+  .t1 .st-voce{color:#e0654f}                         /* 5.2:1 */
+  .t1 .st-pronto{color:#7ab97a}                       /* 7.6:1 */
+  .t1 .st-cheg{color:#6fb3e0}                         /* 7.7:1 */
+
+  /* T2 — Oficina de Precisão (monocromo · acento só no "precisa de você") */
+  .t2 .amostra-chrome{background:#1f1f22}
+  .t2 .fontes{color:#e9e9e6}                          /* 13.5:1 */
+  .t2 .fontes .sep,.t2 .papel-fontes{color:#c9c9c6}   /* 9.9:1 */
+  .t2 .f-ui{font-family:"Geist",system-ui,sans-serif;font-weight:500}
+  .t2 .amostra-term{background:#19191c}
+  .t2 .st-trab,.t2 .st-pronto,.t2 .st-cheg{color:#c4c4c0}  /* 10.0:1 */
+  .t2 .st-voce{color:#ff7a55}                         /* 6.8:1 — o ÚNICO acento */
+
+  /* T3 — Ateliê Caloroso (papel quente · ilhas escuras) */
+  .t3 .amostra-chrome{background:#f6efe6}
+  .t3 .fontes{color:#2d241c}                          /* 13.3:1 */
+  .t3 .fontes .sep,.t3 .papel-fontes{color:#5a4c3e}   /* 7.3:1 */
+  .t3 .f-ui{font-family:"Atkinson Hyperlegible Next",system-ui,sans-serif;font-weight:500}
+  .t3 .f-disp{font-family:"Bricolage Grotesque",system-ui,sans-serif;font-weight:500}
+  .t3 .amostra-term{background:#2a211a}
+  .t3 .st-trab{color:#d9a05b}                         /* 6.9:1 */
+  .t3 .st-voce{color:#e4765e}                         /* 5.3:1 */
+  .t3 .st-pronto{color:#8fbc7f}                       /* 7.3:1 */
+  .t3 .st-cheg{color:#7fa9c9}                         /* 6.3:1 */
+
+  /* T4 — Sala de Controle (escuro profundo · cores de dado) */
+  .t4 .amostra-chrome{background:#0d1118}
+  .t4 .fontes{color:#dde6ed}                          /* 15.0:1 */
+  .t4 .fontes .sep,.t4 .papel-fontes{color:#b8c6d1}   /* 10.8:1 */
+  .t4 .f-ui{font-family:"IBM Plex Sans",system-ui,sans-serif;font-weight:500}
+  .t4 .f-disp{font-family:"Space Grotesk",system-ui,sans-serif;font-weight:500}
+  .t4 .f-mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-weight:400;font-size:.875rem}
+  .t4 .amostra-term{background:#090e15}
+  .t4 .st-trab{color:#e0aa4e}                         /* 9.2:1 */
+  .t4 .st-voce{color:#ff6f61}                         /* 7.1:1 */
+  .t4 .st-pronto{color:#57d98c}                       /* 10.8:1 */
+  .t4 .st-cheg{color:#4fc9d6}                         /* 9.8:1 */
+
+  /* ===== Avisos ===== */
+  .avisos{
+    margin-top:40px;
+    border-top:1px solid var(--regua);
+    padding-top:18px;
+  }
+  .avisos-titulo{
+    font-family:var(--mono);
+    font-size:.6875rem;
+    font-weight:500;
+    letter-spacing:.14em;
+    color:var(--tinta-meta);
+    margin-bottom:12px;
+  }
+  .avisos ul{list-style:none}
+  .avisos li{
+    font-size:.9375rem;
+    color:var(--tinta-aviso);
+    padding-left:22px;
+    position:relative;
+    margin-bottom:7px;
+  }
+  .avisos li::before{
+    content:"—";
+    position:absolute;left:0;
+    font-family:var(--mono);
+    color:var(--tinta-meta);
+  }
+  .transparencia{
+    margin-top:14px;
+    font-size:.8125rem;            /* 13px */
+    color:var(--tinta-2);
+    border-left:2px solid var(--regua);
+    padding-left:12px;
+    max-width:70ch;
+  }
+
+  /* ===== Rodapé da folha ===== */
+  .rodape{
+    margin-top:36px;
+    border-top:2px solid var(--tinta);
+    padding-top:10px;
+    display:flex;justify-content:space-between;
+    font-family:var(--mono);
+    font-size:.6875rem;
+    letter-spacing:.1em;
+    color:var(--tinta-meta);
+  }
+
+  /* Movimento: só o hover dos cards, e só para quem aceita movimento */
+  @media (prefers-reduced-motion: no-preference){
+    a.card{transition:border-color 120ms ease-out}
+  }
+</style>
+</head>
+<body>
+<div class="folha">
+
+  <header>
+    <div class="kicker">
+      <span>LINA · PROTÓTIPOS DE TERRITÓRIO</span>
+      <span>4 OPÇÕES · 1 ESCOLHA</span>
+    </div>
+    <h1>Onde o Lina vai morar?</h1>
+    <p class="subtitulo">Quatro territórios, a mesma tela em cada um — só a pele muda. Clique para entrar.</p>
+  </header>
+
+  <p class="legenda">EM CADA CARD: A TIPOGRAFIA DO TERRITÓRIO E O VOCABULÁRIO DE ESTADOS — O TERMINAL É SEMPRE ESCURO, EM JETBRAINS MONO, NOS QUATRO.</p>
+
+  <nav class="territorios" aria-label="Territórios estéticos">
+
+    <a class="card t1" href="t1-instrumento.html">
+      <div class="card-topo"><span class="tag">T1</span><span class="abrir">abrir →</span></div>
+      <h2>Instrumento de Estúdio</h2>
+      <p class="statement">Um instrumento que você aprende a tocar: o trabalho do time à vista, cores que significam sempre a mesma coisa.</p>
+      <p class="atributos">vivo · honesto · preciso · legível · artesanal</p>
+      <div class="amostra">
+        <div class="amostra-chrome">
+          <span class="fontes"><span class="f-ui">IBM Plex Sans</span><span class="sep">·</span><span class="f-disp">Fraunces</span></span>
+          <span class="papel-fontes">UI · MOMENTOS</span>
+        </div>
+        <div class="amostra-term">
+          <span class="st-trab">● Trabalhando</span>
+          <span class="st-voce">◆ Precisa de você</span>
+          <span class="st-pronto">✓ Pronto</span>
+          <span class="st-cheg">○ Chegando</span>
+        </div>
+      </div>
+    </a>
+
+    <a class="card t2" href="t2-oficina.html">
+      <div class="card-topo"><span class="tag">T2</span><span class="abrir">abrir →</span></div>
+      <h2>Oficina de Precisão</h2>
+      <p class="statement">A ferramenta que desaparece: quase tudo em cinza, uma única cor reservada para o que precisa de você.</p>
+      <p class="atributos">contido · sério · silencioso · focado · afiado</p>
+      <div class="amostra">
+        <div class="amostra-chrome">
+          <span class="fontes"><span class="f-ui">Geist</span></span>
+          <span class="papel-fontes">UI · SEM DISPLAY</span>
+        </div>
+        <div class="amostra-term">
+          <span class="st-trab">● Trabalhando</span>
+          <span class="st-voce">◆ Precisa de você</span>
+          <span class="st-pronto">✓ Pronto</span>
+          <span class="st-cheg">○ Chegando</span>
+        </div>
+      </div>
+    </a>
+
+    <a class="card t3" href="t3-atelie.html">
+      <div class="card-topo"><span class="tag">T3</span><span class="abrir">abrir →</span></div>
+      <h2>Ateliê Caloroso</h2>
+      <p class="statement">Uma sala de trabalho clara e quente: os terminais são ilhas escuras ancoradas no papel.</p>
+      <p class="atributos">caloroso · leve · acolhedor · humano · otimista</p>
+      <div class="amostra">
+        <div class="amostra-chrome">
+          <span class="fontes"><span class="f-ui">Atkinson Hyperlegible Next</span><span class="sep">·</span><span class="f-disp">Bricolage Grotesque</span></span>
+          <span class="papel-fontes">UI · DISPLAY</span>
+        </div>
+        <div class="amostra-term">
+          <span class="st-trab">● Trabalhando</span>
+          <span class="st-voce">◆ Precisa de você</span>
+          <span class="st-pronto">✓ Pronto</span>
+          <span class="st-cheg">○ Chegando</span>
+        </div>
+      </div>
+    </a>
+
+    <a class="card t4" href="t4-sala-controle.html">
+      <div class="card-topo"><span class="tag">T4</span><span class="abrir">abrir →</span></div>
+      <h2>Sala de Controle</h2>
+      <p class="statement">O cockpit completo: escuro profundo, números à vista, densidade máxima para quem quer ver tudo.</p>
+      <p class="atributos">denso · técnico · vigilante · potente · completo</p>
+      <div class="amostra">
+        <div class="amostra-chrome">
+          <span class="fontes"><span class="f-ui">IBM Plex Sans</span><span class="sep">·</span><span class="f-disp">Space Grotesk</span><span class="sep">·</span><span class="f-mono">IBM Plex Mono</span></span>
+          <span class="papel-fontes">UI · HEADINGS · TELEMETRIA</span>
+        </div>
+        <div class="amostra-term">
+          <span class="st-trab">● Trabalhando</span>
+          <span class="st-voce">◆ Precisa de você</span>
+          <span class="st-pronto">✓ Pronto</span>
+          <span class="st-cheg">○ Chegando</span>
+        </div>
+      </div>
+    </a>
+
+  </nav>
+
+  <section class="avisos">
+    <p class="avisos-titulo">ANTES DE ESCOLHER</p>
+    <ul>
+      <li>Estes protótipos NÃO decidem performance real nem animação — são telas paradas; velocidade e movimento se provam no app.</li>
+      <li>As fontes aqui vêm da internet (Google Fonts) só para o protótipo; no app de verdade elas são embarcadas (licença OFL).</li>
+      <li>Fusões são legítimas — ex.: T1 com a temperatura do T3. A escolha é o CENTRO DE GRAVIDADE, não uma prisão.</li>
+    </ul>
+    <p class="transparencia">A pesquisa D1 defende o T1 — mas a tela não decide por você; os 4 estão completos e honestos.</p>
+  </section>
+
+  <footer class="rodape">
+    <span>ESTA FOLHA É NEUTRA DE PROPÓSITO</span>
+    <span>QUEM ESCOLHE É VOCÊ</span>
+  </footer>
+
+</div>
+</body>
+</html>

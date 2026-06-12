@@ -1,0 +1,539 @@
+<!--
+T3 Ateliê Caloroso — a sala importa: um ateliê acolhedor onde os ajudantes trabalham à vista.
+Mecanismo: papel quente light-first · terminais como ilhas dark ancoradas (precedente code-block-dark) · celebração contida · cor de identidade do Espaço.
+Nunca: branco puro, festa permanente, esconder o terminal de verdade.
+-->
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lina — T3 · Ateliê Caloroso</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;500;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   TOKENS — papel quente (nunca branco puro) + tinta escura quente.
+   Ratios WCAG computados (luminância relativa, fórmula WCAG 2.x):
+     tinta #33291F  / papel  #F4EDE0 → 12.21 : 1
+     tinta #33291F  / cartão #FBF6EC → 13.19 : 1
+     tinta #33291F  / rail   #EFE6D5 → 11.47 : 1
+     2ª tinta #6E5F4B / cartão #FBF6EC → 5.73 : 1   (mín. 4.51 no hover-row)
+     terracota #9E3A1D / rail #EFE6D5 → 5.51 : 1
+     grid #EFE6D6 / ilha #2B241C → 12.36 : 1  · dim #B3A68D → 6.38 : 1
+     âmbar grid #E3A84E → 7.27 : 1 · verde grid #A8C87F → 8.19 : 1
+     chip Trabalhando #7A4D00/#F5E2B8 → 5.69 · Precisa #962718/#F7DCD2 → 6.20
+     chip Pronto #4A6320/#E6ECCB → 5.56 · Chegando #4D6175/#E4E9E3 → 5.20
+     pill/botão atenção #FFF3E8/#9B2C1B → 6.95 · selo #4A6320/#FBF6EC → 6.30
+   ============================================================ */
+:root{
+  --papel:#F4EDE0;          /* canvas — papel quente */
+  --rail:#EFE6D5;           /* rail um tom mais profundo */
+  --cartao:#FBF6EC;         /* chrome dos cartões — creme */
+  --tinta:#33291F;          /* tinta escura quente */
+  --tinta-2:#6E5F4B;        /* metas e sub-rótulos */
+  --borda:#E2D5BE;
+  --borda-forte:#CBB99C;
+  --argila:#9E3A1D;         /* cor de identidade do Espaço (terracota) */
+  --argila-fundo:#F7EFE0;
+  --ilha:#2B241C;           /* terminal — ilha dark quente */
+  --ilha-texto:#EFE6D6;
+  --ilha-dim:#B3A68D;
+  --ilha-ambar:#E3A84E;
+  --ilha-verde:#A8C87F;
+  --trab-texto:#7A4D00;  --trab-fundo:#F5E2B8;
+  --precisa-texto:#962718; --precisa-fundo:#F7DCD2; --precisa-cheio:#9B2C1B; --precisa-claro:#FFF3E8;
+  --pronto-texto:#4A6320;  --pronto-fundo:#E6ECCB;
+  --chega-texto:#4D6175;   --chega-fundo:#E4E9E3;
+  --ui:'Atkinson Hyperlegible Next', system-ui, sans-serif;
+  --display:'Bricolage Grotesque', system-ui, sans-serif;
+  --mono:'JetBrains Mono', ui-monospace, 'Cascadia Mono', monospace;
+  /* sombra de ANCORAGEM (função: assentar a ilha/cartão no papel — não teatral) */
+  --ancora-cartao: 0 1px 2px rgba(62,45,25,.06), 0 12px 26px -14px rgba(62,45,25,.22);
+  --ancora-ilha: 0 2px 6px -2px rgba(43,36,28,.35), 0 8px 18px -10px rgba(43,36,28,.30);
+}
+*{ margin:0; padding:0; box-sizing:border-box; }
+html,body{ height:100%; }
+body{
+  font-family:var(--ui);
+  font-size:15px;
+  color:var(--tinta);
+  background:var(--papel);
+  display:flex;
+  min-width:1180px;
+  min-height:100vh;
+  border-top:3px solid var(--argila); /* detalhe de chrome na cor do Espaço */
+}
+
+/* ================= RAIL ================= */
+.rail{
+  width:272px; flex:none;
+  background:var(--rail);
+  border-right:1px solid var(--borda-forte);
+  display:flex; flex-direction:column;
+  padding:18px 16px 52px;
+  gap:20px;
+}
+.rail-topo{ display:flex; align-items:center; justify-content:space-between; }
+.wordmark{
+  font-family:var(--display); font-weight:700; font-size:21px;
+  letter-spacing:.01em; color:var(--tinta);
+  display:flex; align-items:baseline; gap:6px;
+}
+.wordmark::after{
+  content:""; width:7px; height:7px; border-radius:50%;
+  background:var(--argila); align-self:center; margin-top:4px;
+}
+.recolher{
+  width:28px; height:28px; border:1px solid var(--borda-forte);
+  border-radius:9px; background:var(--cartao); color:var(--tinta-2);
+  font-size:12px; cursor:pointer; line-height:1;
+}
+
+/* indicador do Espaço atual */
+.espaco-atual{
+  background:var(--argila-fundo);
+  border:1px solid var(--borda);
+  border-left:4px solid var(--argila);
+  border-radius:12px;
+  padding:13px 14px 12px;
+}
+.espaco-atual .nome{
+  font-family:var(--display); font-weight:700; font-size:18px;
+  line-height:1.25; color:var(--argila);
+}
+.espaco-atual .sub{ font-size:13px; color:var(--tinta-2); margin-top:4px; }
+
+/* botão Buscar (D4 — sempre visível) */
+.buscar{
+  display:flex; align-items:center; gap:10px; text-align:left;
+  width:100%; min-height:48px;
+  background:var(--cartao); border:1px solid var(--borda);
+  border-radius:12px; padding:10px 12px;
+  font-family:var(--ui); cursor:pointer;
+  box-shadow:0 1px 2px rgba(62,45,25,.05);
+}
+.buscar .lupa{ font-size:14px; color:var(--tinta-2); }
+.buscar .rotulos{ flex:1; }
+.buscar .rotulo{ font-weight:700; font-size:14px; color:var(--tinta); }
+.buscar .sub-rotulo{ font-size:12px; color:var(--tinta-2); margin-top:1px; }
+.buscar kbd{
+  font-family:var(--mono); font-size:11.5px; color:var(--tinta-2);
+  background:var(--rail); border:1px solid var(--borda-forte);
+  border-bottom-width:2px; border-radius:6px; padding:3px 7px;
+}
+
+/* seção Espaços */
+.espacos h2{
+  font-size:11.5px; font-weight:700; letter-spacing:.09em;
+  text-transform:uppercase; color:var(--tinta-2); margin:0 2px 8px;
+}
+.espacos ul{ list-style:none; display:flex; flex-direction:column; gap:4px; }
+.espaco{
+  display:flex; align-items:center; gap:8px;
+  min-height:44px; border-radius:10px; padding:7px 10px;
+}
+.espaco .texto{ flex:1; min-width:0; }
+.espaco .titulo{ font-size:14px; font-weight:500; color:var(--tinta); line-height:1.3; }
+.espaco .meta{ font-size:12px; color:var(--tinta-2); margin-top:1px; }
+.espaco--atual{
+  background:var(--argila-fundo);
+  border:1px solid var(--borda);
+}
+.espaco--atual .titulo{ color:var(--argila); font-weight:700; }
+.espaco--atual .marcador{
+  font-size:11px; font-weight:700; color:var(--argila);
+  border:1px solid var(--argila); border-radius:999px;
+  padding:2px 8px; white-space:nowrap;
+}
+.espaco--hover{ background:#E7DBC4; } /* ação de linha exposta, como se em hover */
+.descarregar{
+  font-family:var(--ui); font-size:12.5px; font-weight:700;
+  color:var(--argila); background:var(--cartao);
+  border:1px solid var(--argila); border-radius:8px;
+  min-height:26px; padding:3px 10px; cursor:pointer; white-space:nowrap;
+}
+.criar-espaco{
+  width:100%; min-height:38px;
+  font-family:var(--ui); font-size:14px; font-weight:500; color:var(--tinta);
+  background:none; border:1.5px dashed var(--borda-forte);
+  border-radius:10px; cursor:pointer; padding:8px 12px;
+}
+
+/* rodapé do rail */
+.rail-rodape{
+  margin-top:auto; display:flex; flex-direction:column; gap:7px;
+  font-size:12.5px; color:var(--tinta-2);
+  border-top:1px solid var(--borda); padding-top:12px;
+}
+.salvo{ color:var(--pronto-texto); font-weight:500; }
+
+/* ================= CANVAS ================= */
+.canvas{
+  flex:1; position:relative; overflow:auto;
+  background-color:var(--papel);
+  background-image:radial-gradient(circle, #D9CBB2 1.1px, transparent 1.1px);
+  background-size:26px 26px;
+}
+
+/* pill de atenção (padrão PULL) */
+.pill-atencao{
+  position:absolute; top:20px; left:50%; transform:translateX(-50%);
+  z-index:6;
+  display:inline-flex; align-items:center; gap:9px;
+  background:var(--precisa-cheio); color:var(--precisa-claro);
+  text-decoration:none;
+  font-size:14px; font-weight:700;
+  min-height:36px; padding:8px 20px; border-radius:999px;
+  box-shadow:var(--ancora-cartao);
+}
+.pill-atencao .ir{ font-weight:500; text-decoration:underline; text-underline-offset:3px; }
+
+/* tabuleiro dos cartões */
+.tabuleiro{
+  position:relative;
+  padding:92px 24px 96px 44px;
+  max-width:1280px;
+}
+.fileira{ display:flex; align-items:flex-start; gap:28px; }
+.fileira--baixo{ margin-top:46px; padding-left:64px; gap:48px; }
+
+/* ============ cartão-terminal ============ */
+.cartao{
+  position:relative; flex:none;
+  background:var(--cartao);
+  border:1px solid var(--borda);
+  border-radius:12px;
+  box-shadow:var(--ancora-cartao);
+}
+.cartao-cabeca{
+  display:flex; align-items:flex-start; justify-content:space-between;
+  gap:10px; padding:15px 18px 11px;
+}
+.cartao-cabeca h2{
+  font-size:16px; font-weight:700; color:var(--tinta); line-height:1.25;
+  display:flex; align-items:center; gap:8px;
+}
+.cartao-cabeca .meta{ font-size:13px; color:var(--tinta-2); margin-top:3px; }
+
+/* chips de estado — sempre texto+ícone+cor */
+.chip{
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:12.5px; font-weight:700; line-height:1;
+  min-height:24px; padding:4px 11px; border-radius:999px;
+  white-space:nowrap; flex:none;
+}
+.chip .ico{ font-size:11px; }
+.chip--trabalhando{ background:var(--trab-fundo); color:var(--trab-texto); }
+.chip--precisa{ background:var(--precisa-fundo); color:var(--precisa-texto); }
+.chip--pronto{ background:var(--pronto-fundo); color:var(--pronto-texto); }
+.chip--chegando{ background:var(--chega-fundo); color:var(--chega-texto); }
+
+/* a ILHA — terminal sempre dark, ancorado no papel */
+.ilha{
+  margin:0 16px;
+  background:var(--ilha);
+  border-radius:9px;
+  box-shadow:var(--ancora-ilha);
+  padding:14px 16px;
+  overflow:hidden;
+}
+.ilha pre{
+  font-family:var(--mono);
+  font-size:12px; line-height:1.65;
+  color:var(--ilha-texto);
+  white-space:pre-wrap; word-break:break-word;
+}
+.g-ambar{ color:var(--ilha-ambar); }
+.g-verde{ color:var(--ilha-verde); }
+.g-dim{ color:var(--ilha-dim); }
+.caret{ color:var(--ilha-ambar); }
+
+/* faixa de narração leiga — no chrome, fora do grid */
+.narracao{
+  padding:12px 18px 16px;
+  font-size:14.5px; line-height:1.45; color:var(--tinta);
+}
+
+/* fila de atenção no cabeçalho do cartão 3 */
+.fila-atencao{
+  display:inline-flex; align-items:center; gap:4px; white-space:nowrap; flex:none;
+  font-size:11.5px; font-weight:700;
+  background:var(--precisa-cheio); color:var(--precisa-claro);
+  border-radius:999px; padding:3px 8px; line-height:1;
+}
+.cartao--atencao{
+  border:1.5px solid var(--precisa-cheio);
+}
+
+/* botões de aprovação (cartão 3) */
+.aprovacao{
+  display:flex; gap:10px; padding:0 18px 16px;
+}
+.botao{
+  font-family:var(--ui); font-size:13.5px; font-weight:700;
+  min-height:34px; padding:7px 16px; border-radius:10px; cursor:pointer;
+}
+.botao--sim{
+  background:var(--precisa-cheio); color:var(--precisa-claro);
+  border:1px solid #84230F;
+}
+.botao--depois{
+  background:none; color:var(--tinta);
+  border:1.5px solid var(--borda-forte);
+}
+
+/* celebração contida — SÓ no cartão 4 */
+.selo{
+  position:absolute; right:14px; bottom:50px; z-index:2;
+  transform:rotate(-4deg);
+  font-family:var(--display); font-weight:700; font-size:13px;
+  letter-spacing:.03em;
+  color:var(--pronto-texto); background:var(--cartao);
+  border:2px solid var(--pronto-texto); border-radius:8px;
+  padding:5px 11px;
+  box-shadow:0 1px 0 rgba(62,45,25,.10);
+}
+
+/* larguras e deslocamentos da grade solta */
+.cartao--construtor{ width:368px; }
+.cartao--redator{ width:344px; margin-top:30px; }
+.cartao--caixa{ width:330px; margin-top:8px; }
+.cartao--revisor{ width:352px; }
+.cartao--automacoes{ width:300px; margin-top:26px; }
+.cartao--automacoes .cartao-cabeca h2{ font-size:15px; }
+
+/* controles de zoom */
+.zoom{
+  position:fixed; right:22px; bottom:20px; z-index:6;
+  display:flex; align-items:center; gap:2px;
+  background:var(--cartao); border:1px solid var(--borda);
+  border-radius:11px; padding:4px;
+  box-shadow:0 1px 2px rgba(62,45,25,.07);
+}
+.zoom button{
+  font-family:var(--ui); font-size:13px; font-weight:500;
+  color:var(--tinta); background:none; border:0; border-radius:8px;
+  min-width:28px; min-height:28px; padding:4px 9px; cursor:pointer;
+}
+.zoom button:hover{ background:var(--rail); }
+.zoom .sep{ width:1px; height:18px; background:var(--borda); }
+
+/* pill de navegação do protótipo (não é UI do app) */
+.pill-prototipo{
+  position:fixed; left:16px; bottom:14px; z-index:7;
+  font-size:12px; color:var(--tinta-2);
+  background:var(--cartao); border:1px solid var(--borda);
+  border-radius:999px; padding:5px 12px;
+  text-decoration:none;
+  box-shadow:0 1px 2px rgba(62,45,25,.06);
+}
+.pill-prototipo:hover{ color:var(--tinta); }
+
+.visualmente-oculto{
+  position:absolute; width:1px; height:1px; overflow:hidden;
+  clip:rect(0 0 0 0); white-space:nowrap;
+}
+
+/* vida ambiente mínima — SÓ com movimento permitido */
+@media (prefers-reduced-motion: no-preference){
+  .caret{ animation:piscar 1.1s steps(1,end) infinite; }
+  @keyframes piscar{ 0%,55%{opacity:1} 56%,100%{opacity:0} }
+  .chip--trabalhando .ico{ animation:pulso 2.4s ease-in-out infinite; }
+  @keyframes pulso{ 0%,100%{opacity:1} 50%{opacity:.45} }
+}
+</style>
+</head>
+<body>
+
+<!-- ================= RAIL ================= -->
+<nav class="rail" aria-label="Painel do Espaço">
+  <div class="rail-topo">
+    <h1 class="wordmark">Lina</h1>
+    <button class="recolher" aria-label="Recolher painel">◀</button>
+  </div>
+
+  <div class="espaco-atual">
+    <p class="nome">Loja Virtual — Lançamento</p>
+    <p class="sub">5 terminais · 2 trabalhando agora</p>
+  </div>
+
+  <button class="buscar">
+    <span class="lupa" aria-hidden="true">⌕</span>
+    <span class="rotulos">
+      <span class="rotulo">Buscar</span><br>
+      <span class="sub-rotulo">terminais, Espaços e ações</span>
+    </span>
+    <kbd>⌘K</kbd>
+  </button>
+
+  <section class="espacos">
+    <h2>Espaços</h2>
+    <ul>
+      <li class="espaco espaco--atual" aria-current="true">
+        <span class="texto">
+          <span class="titulo">Loja Virtual — Lançamento</span>
+        </span>
+        <span class="marcador">atual</span>
+      </li>
+      <li class="espaco espaco--hover">
+        <span class="texto">
+          <span class="titulo">Marketing de Conteúdo</span>
+          <span class="meta" style="display:block">2 trabalhando ao fundo</span>
+        </span>
+        <button class="descarregar">Descarregar</button>
+      </li>
+      <li class="espaco">
+        <span class="texto">
+          <span class="titulo">Pesquisa de Fornecedores</span>
+          <span class="meta" style="display:block">descansando</span>
+        </span>
+      </li>
+    </ul>
+  </section>
+
+  <button class="criar-espaco">+ Criar Espaço</button>
+
+  <div class="rail-rodape">
+    <span class="salvo">✓ Tudo salvo · agora há pouco</span>
+    <span>Aparência: Claro (papel) · segue o sistema</span>
+  </div>
+</nav>
+
+<!-- ================= CANVAS ================= -->
+<main class="canvas">
+  <a class="pill-atencao" href="#cartao-caixa">◆ 1 pedido precisa de você — <span class="ir">ir até lá</span></a>
+
+  <div class="tabuleiro">
+
+    <div class="fileira">
+
+      <!-- Cartão 1 — Construtor de Páginas -->
+      <article class="cartao cartao--construtor">
+        <header class="cartao-cabeca">
+          <div>
+            <h2>Construtor de Páginas</h2>
+            <p class="meta">há 2 min nisso</p>
+          </div>
+          <span class="chip chip--trabalhando"><span class="ico" aria-hidden="true">●</span>Trabalhando</span>
+        </header>
+        <div class="ilha">
+<pre><span class="g-ambar">✻ Trabalhando na sua loja…</span>
+
+● Li a planilha  precos-planos.xlsx
+<span class="g-dim">  ⎿ 3 planos encontrados</span>
+
+● Editei  loja/secao-precos.html
+<span class="g-dim">  ⎿ 42 linhas ajustadas</span>
+
+Deixando os 3 planos lado a lado, com o
+"Profissional" em destaque…</pre>
+        </div>
+        <p class="narracao">Montando a seção de preços com os 3 planos.</p>
+      </article>
+
+      <!-- Cartão 2 — Redator de Vendas -->
+      <article class="cartao cartao--redator">
+        <header class="cartao-cabeca">
+          <div>
+            <h2>Redator de Vendas</h2>
+            <p class="meta">há 5 min nisso</p>
+          </div>
+          <span class="chip chip--trabalhando"><span class="ico" aria-hidden="true">●</span>Trabalhando</span>
+        </header>
+        <div class="ilha">
+<pre>Título: "Sua loja no ar em 7 dias"
+
+Testando 3 versões do subtítulo:
+A — foco no prazo de entrega
+B — foco na economia mensal
+C — foco em "sem precisar de técnico"</pre>
+        </div>
+        <p class="narracao">Construindo a página de vendas…</p>
+      </article>
+
+      <!-- Cartão 3 — Caixa e Pagamentos (destino da pill de atenção) -->
+      <article class="cartao cartao--caixa cartao--atencao" id="cartao-caixa">
+        <header class="cartao-cabeca">
+          <div>
+            <h2>Caixa e Pagamentos
+              <span class="fila-atencao" title="1 pedido esperando você">◆ 1<span class="visualmente-oculto"> pedido esperando você</span></span>
+            </h2>
+            <p class="meta">esperando há 1 min</p>
+          </div>
+          <span class="chip chip--precisa"><span class="ico" aria-hidden="true">◆</span>Precisa de você</span>
+        </header>
+        <div class="ilha">
+<pre>Configurei Pix e cartão no ambiente
+de testes. Falta uma decisão sua:
+
+Ativo o cupom LANCA10 — 10% de
+desconto na primeira compra?
+
+Permitir? (s/n) <span class="caret">█</span></pre>
+        </div>
+        <p class="narracao">Esperando sua resposta para continuar.</p>
+        <div class="aprovacao">
+          <button class="botao botao--sim">Sim, pode ativar</button>
+          <button class="botao botao--depois">Agora não</button>
+        </div>
+      </article>
+
+    </div>
+
+    <div class="fileira fileira--baixo">
+
+      <!-- Cartão 4 — Revisor de Qualidade (celebração contida) -->
+      <article class="cartao cartao--revisor">
+        <header class="cartao-cabeca">
+          <div>
+            <h2>Revisor de Qualidade</h2>
+            <p class="meta">terminou há 3 min</p>
+          </div>
+          <span class="chip chip--pronto"><span class="ico" aria-hidden="true">✓</span>Pronto</span>
+        </header>
+        <div class="ilha">
+<pre><span class="g-verde">✓ Revisei as 5 páginas da loja
+✓ Botões e links funcionando
+✓ Nada quebrado no celular
+✓ Carregamento rápido</span>
+
+Relatório completo guardado no Espaço.</pre>
+        </div>
+        <p class="narracao">Pronto — terminei a revisão</p>
+        <span class="selo" aria-hidden="true">Bem feito ✓</span>
+      </article>
+
+      <!-- Cartão 5 — Automações (recém-chegado) -->
+      <article class="cartao cartao--automacoes">
+        <header class="cartao-cabeca">
+          <div>
+            <h2>Automações</h2>
+            <p class="meta">chegou agora</p>
+          </div>
+          <span class="chip chip--chegando"><span class="ico" aria-hidden="true">○</span>Chegando</span>
+        </header>
+        <div class="ilha">
+<pre>Olá! Sou o novo terminal de Automações.
+Me apresentando ao time…  <span class="caret">█</span></pre>
+        </div>
+        <p class="narracao">Acabou de chegar — conhecendo o trabalho do time.</p>
+      </article>
+
+    </div>
+  </div>
+
+  <div class="zoom" role="group" aria-label="Controles de zoom">
+    <button>Ver tudo</button>
+    <span class="sep" aria-hidden="true"></span>
+    <button aria-label="Diminuir zoom">−</button>
+    <button>100%</button>
+    <button aria-label="Aumentar zoom">+</button>
+  </div>
+</main>
+
+<a class="pill-prototipo" href="index.html">Protótipo T3 — ← escolher outro território</a>
+
+</body>
+</html>

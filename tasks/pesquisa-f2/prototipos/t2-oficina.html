@@ -1,0 +1,411 @@
+<!--
+T2 Oficina de Precisão — a ferramenta que desaparece: chrome que recua, o trabalho é o protagonista.
+Mecanismo: monocromo + 1 único acento, reservado ao que precisa de você · densidade média-alta · zero ornamento.
+Nunca: display font, celebração, segunda cor, glow.
+-->
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lina — T2 · Oficina de Precisão</title>
+<!-- Tipografia: Geist como DECISÃO declarada (rota OFL) — não inércia dev-tool; sem display: a tipografia não performa. Mono selada: JetBrains Mono. Fallbacks são fallback honesto, não escolha. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!--
+Acento ÚNICO: #F08A3C (laranja calibrado de instrumento de medição — sinal, não decoração).
+Aparece EXCLUSIVAMENTE no estado "Precisa de você": chip do cartão 3, pill de atenção, botão de aprovação, fila.
+Ratios AA computados (WCAG): ink/chrome 13.72 · meta/cartão 5.95 · narração/cartão 11.53 · grid 12.56 ·
+grid-dim 7.15 · chips 9.91/8.12/5.61 · acento/cartão 6.50 · acento/chip-tinta 6.16 · tinta/botão-acento 7.45.
+-->
+<style>
+  :root{
+    /* monocromo neutro — terminais um degrau MAIS escuros que o chrome */
+    --bg-canvas:#18181A;
+    --bg-chrome:#1E1E21;
+    --bg-card:#202024;
+    --bg-chip:#2B2B30;
+    --bg-grid:#131316;
+    --bg-raise:#26262B;
+    --line:#2E2E34;
+    --line-soft:#28282D;
+    --ink:#E9E9EC;        /* 13.72:1 sobre chrome · 13.40:1 sobre cartão */
+    --ink-2:#ABABB4;      /* 7.30:1 sobre chrome */
+    --ink-3:#9B9CA5;      /* 6.09:1 chrome · 5.95:1 cartão */
+    --ink-narr:#D9D9DD;   /* 11.53:1 sobre cartão */
+    --ink-grid:#D4D4D9;   /* 12.56:1 sobre grid */
+    --ink-grid-dim:#9DA1A8; /* 7.15:1 sobre grid */
+    --chip-work:#D8D8DC;  /* 9.91:1 sobre chip */
+    --chip-done:#C4C4CB;  /* 8.12:1 sobre chip */
+    --chip-new:#A2A3AC;   /* 5.61:1 sobre chip */
+    /* o acento — um só, e ele só significa "precisa de você" */
+    --accent:#F08A3C;         /* 6.50:1 sobre cartão · 7.42:1 sobre grid */
+    --accent-ink:#1A1108;     /* 7.45:1 sobre o acento */
+    --accent-chip-bg:#33210F; /* acento 6.16:1 por cima */
+    --accent-line:#4D331A;
+    --radius:3px;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    min-width:1180px;
+    background:var(--bg-canvas);
+    color:var(--ink);
+    font-family:"Geist",system-ui,sans-serif;
+    font-size:13px;
+    line-height:1.45;
+    display:flex;
+    overflow:hidden;
+  }
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;text-align:left}
+  .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+  /* ── RAIL ─────────────────────────────────────────────── */
+  .rail{
+    width:252px;flex:none;height:100vh;
+    background:var(--bg-chrome);
+    border-right:1px solid var(--line);
+    display:flex;flex-direction:column;
+    padding:12px 12px 50px; /* clearance: a pill fixa de navegação do protótipo vive no canto inferior-esquerdo */
+  }
+  .rail-top{display:flex;align-items:center;justify-content:space-between;padding:2px 2px 12px}
+  .wordmark{font-weight:600;font-size:14px;letter-spacing:.02em}
+  .collapse{
+    width:24px;height:24px;display:grid;place-items:center;
+    color:var(--ink-2);border:1px solid var(--line);border-radius:var(--radius);
+    font-size:10px;
+  }
+  .space-now{
+    border:1px solid var(--line);border-radius:var(--radius);
+    background:var(--bg-raise);
+    padding:9px 10px;margin-bottom:10px;
+  }
+  .space-now-name{font-weight:600;font-size:13px}
+  .space-now-meta{color:var(--ink-2);font-size:11.5px;margin-top:2px}
+  .search{
+    width:100%;border:1px solid var(--line);border-radius:var(--radius);
+    background:var(--bg-card);padding:7px 10px 8px;margin-bottom:14px;
+    display:block;min-height:44px;
+  }
+  .search-top{display:flex;align-items:center;justify-content:space-between}
+  .search-label{font-weight:500;color:var(--ink)}
+  .search kbd{
+    font-family:"Geist",system-ui,sans-serif;font-size:11px;color:var(--ink-2);
+    background:var(--bg-raise);border:1px solid var(--line);border-radius:2px;
+    padding:1px 5px;
+  }
+  .search-sub{display:block;color:var(--ink-3);font-size:11px;margin-top:2px}
+  .rail-label{
+    font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--ink-3);padding:0 2px 6px;
+  }
+  .spaces{list-style:none}
+  .spaces li{margin-bottom:2px}
+  .space-item{
+    width:100%;display:block;padding:6px 8px;border-radius:var(--radius);
+    border-left:2px solid transparent;min-height:24px;
+  }
+  .space-item.current{
+    background:var(--bg-raise);border-left:2px solid var(--ink);
+  }
+  .space-line{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+  .space-name{font-size:12.5px;font-weight:500;color:var(--ink)}
+  .space-tag{font-size:11px;color:var(--ink-3);flex:none}
+  .space-meta{display:block;font-size:11px;color:var(--ink-3);margin-top:1px}
+  .space-row{display:flex;align-items:center;gap:6px}
+  .space-row .space-item{flex:1}
+  .row-action{
+    flex:none;min-height:24px;padding:2px 8px;
+    border:1px solid var(--line);border-radius:var(--radius);
+    color:#C9C9D0;font-size:11.5px;background:var(--bg-card);
+  }
+  .new-space{
+    width:100%;margin-top:8px;padding:6px 8px;min-height:28px;
+    border:1px dashed var(--line);border-radius:var(--radius);
+    color:var(--ink-2);font-size:12.5px;
+  }
+  .rail-foot{margin-top:auto;padding:10px 2px 0;border-top:1px solid var(--line-soft)}
+  .saved{font-size:11.5px;color:var(--ink-2)}
+  .saved .ok{font-weight:600}
+  .appearance{font-size:11px;color:var(--ink-3);margin-top:4px}
+
+  /* ── CANVAS ───────────────────────────────────────────── */
+  .canvas{
+    flex:1;position:relative;height:100vh;overflow:auto;
+    background-color:var(--bg-canvas);
+    background-image:radial-gradient(circle,#222227 1px,transparent 1px);
+    background-size:22px 22px;
+  }
+  .canvas-inner{position:relative;min-width:1010px;padding:64px 26px 76px}
+
+  .attention{
+    position:absolute;top:16px;left:50%;transform:translateX(-50%);
+    background:var(--accent);color:var(--accent-ink);
+    font-weight:600;font-size:12.5px;
+    border-radius:var(--radius);min-height:30px;padding:6px 14px;
+    white-space:nowrap;z-index:3;
+  }
+
+  .row{display:flex;align-items:flex-start;gap:18px}
+  .row-2{margin-top:44px;justify-content:space-between;padding:0 96px 0 30px}
+
+  /* ── CARTÃO-TERMINAL ─────────────────────────────────── */
+  .card{
+    background:var(--bg-card);
+    border:1px solid var(--line);border-radius:var(--radius);
+    flex:none;overflow:hidden;
+  }
+  .c1{width:338px}
+  .c2{width:296px;transform:translateY(20px)}
+  .c3{width:304px;transform:translateY(8px);border-color:var(--accent-line)}
+  .c4{width:324px}
+  .c5{width:308px;transform:translateY(26px)}
+  .card-head{padding:8px 11px 7px;border-bottom:1px solid var(--line-soft)}
+  .card-title-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .card-name{font-size:13px;font-weight:600;display:flex;align-items:center;gap:7px}
+  .c1 .card-name{font-size:13.5px}
+  .fila{
+    flex:none;min-width:17px;height:17px;padding:0 4px;
+    display:inline-grid;place-items:center;
+    background:var(--accent);color:var(--accent-ink);
+    font-size:10.5px;font-weight:600;border-radius:2px;
+  }
+  .meta{font-size:11px;color:var(--ink-3);margin-top:3px}
+
+  .chip{
+    flex:none;display:inline-flex;align-items:center;gap:5px;
+    background:var(--bg-chip);border:1px solid var(--line);
+    border-radius:2px;padding:2px 7px;min-height:20px;
+    font-size:11px;
+  }
+  .chip .glif{font-size:9px;line-height:1}
+  .chip-work{color:var(--chip-work);font-weight:600}
+  .chip-done{color:var(--chip-done);font-weight:500}
+  .chip-new{color:var(--chip-new);font-weight:400}
+  .chip-you{
+    color:var(--accent);font-weight:600;
+    background:var(--accent-chip-bg);border-color:var(--accent-line);
+  }
+
+  pre.grid{
+    background:var(--bg-grid);
+    border-top:1px solid var(--line-soft);border-bottom:1px solid var(--line-soft);
+    margin:0 -1px;
+    padding:10px 13px 11px;
+    font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace;
+    font-size:11.5px;line-height:1.62;
+    color:var(--ink-grid);
+    white-space:pre;overflow:hidden;
+  }
+  pre.grid .dim{color:var(--ink-grid-dim)}
+  .caret{color:var(--ink-grid)}
+  .c3 .caret{color:var(--accent)}
+
+  .narr{padding:8px 11px 9px;font-size:12.5px;color:var(--ink-narr)}
+  .actions{display:flex;gap:8px;padding:0 11px 10px}
+  .btn-accent{
+    background:var(--accent);color:var(--accent-ink);
+    font-weight:600;font-size:12px;
+    border-radius:var(--radius);min-height:28px;padding:4px 12px;
+  }
+  .btn-ghost{
+    border:1px solid var(--line);border-radius:var(--radius);
+    color:#C9C9D0;font-size:12px;min-height:28px;padding:4px 12px;
+  }
+
+  /* ── ZOOM ─────────────────────────────────────────────── */
+  .zoom{
+    position:fixed;right:18px;bottom:16px;z-index:4;
+    display:flex;align-items:stretch;
+    background:var(--bg-card);border:1px solid var(--line);
+    border-radius:var(--radius);overflow:hidden;
+  }
+  .zoom button{
+    min-width:28px;min-height:28px;padding:3px 9px;
+    display:grid;place-items:center;
+    color:#C9C9D0;font-size:12px;
+  }
+  .zoom button + button{border-left:1px solid var(--line-soft)}
+  .zoom .pct{font-size:11.5px}
+
+  /* ── NAVEGAÇÃO DO PROTÓTIPO (não é UI do app) ─────────── */
+  .proto{
+    position:fixed;left:14px;bottom:14px;z-index:4;
+    font-size:11px;color:#9FA0A8;text-decoration:none;
+    background:var(--bg-chrome);border:1px solid var(--line);
+    border-radius:99px;padding:5px 11px;min-height:24px;
+    display:inline-flex;align-items:center;
+  }
+  .proto:hover{color:var(--ink)}
+
+  /* vida ambiente: SÓ o caret, e só para quem aceita movimento */
+  @media (prefers-reduced-motion: no-preference){
+    .caret{animation:blink 1.1s steps(1,end) infinite}
+    @keyframes blink{50%{opacity:0}}
+  }
+</style>
+</head>
+<body>
+<h1 class="sr-only">Lina — protótipo T2, território Oficina de Precisão</h1>
+
+<nav class="rail" aria-label="Painel do Espaço">
+  <div class="rail-top">
+    <span class="wordmark">Lina</span>
+    <button class="collapse" aria-label="Recolher painel">◀</button>
+  </div>
+
+  <div class="space-now">
+    <div class="space-now-name">Loja Virtual — Lançamento</div>
+    <div class="space-now-meta">5 terminais · 2 trabalhando agora</div>
+  </div>
+
+  <button class="search">
+    <span class="search-top"><span class="search-label">Buscar</span><kbd>⌘K</kbd></span>
+    <span class="search-sub">terminais, Espaços e ações</span>
+  </button>
+
+  <div class="rail-label">Espaços</div>
+  <ul class="spaces">
+    <li>
+      <button class="space-item current" aria-current="true">
+        <span class="space-line"><span class="space-name">Loja Virtual — Lançamento</span><span class="space-tag">aberto</span></span>
+      </button>
+    </li>
+    <li class="space-row">
+      <button class="space-item">
+        <span class="space-name">Marketing de Conteúdo</span>
+        <span class="space-meta">2 trabalhando ao fundo</span>
+      </button>
+      <button class="row-action">Descarregar</button>
+    </li>
+    <li>
+      <button class="space-item">
+        <span class="space-name">Pesquisa de Fornecedores</span>
+        <span class="space-meta">descansando</span>
+      </button>
+    </li>
+  </ul>
+  <button class="new-space">+ Criar Espaço</button>
+
+  <div class="rail-foot">
+    <div class="saved"><span class="ok">✓</span> Tudo salvo · agora há pouco</div>
+    <div class="appearance">Aparência: Escuro · segue o sistema</div>
+  </div>
+</nav>
+
+<main class="canvas" aria-label="Canvas do Espaço">
+  <button class="attention">◆ 1 pedido precisa de você — ir até lá</button>
+
+  <div class="canvas-inner">
+    <div class="row row-1">
+
+      <article class="card c1">
+        <header class="card-head">
+          <div class="card-title-row">
+            <h2 class="card-name">Construtor de Páginas</h2>
+            <span class="chip chip-work"><span class="glif">●</span>Trabalhando</span>
+          </div>
+          <p class="meta">há 2 min nisso · 14 ações</p>
+        </header>
+        <pre class="grid">✻ Trabalhando na sua loja…
+
+● Li a planilha  precos-planos.xlsx
+<span class="dim">  ⎿ 3 planos encontrados</span>
+
+● Editei  loja/secao-precos.html
+<span class="dim">  ⎿ 42 linhas ajustadas</span>
+
+Deixando os 3 planos lado a lado, com o
+"Profissional" em destaque…</pre>
+        <footer class="narr">Montando a seção de preços com os 3 planos.</footer>
+      </article>
+
+      <article class="card c2">
+        <header class="card-head">
+          <div class="card-title-row">
+            <h2 class="card-name">Redator de Vendas</h2>
+            <span class="chip chip-work"><span class="glif">●</span>Trabalhando</span>
+          </div>
+          <p class="meta">há 5 min nisso · 23 ações</p>
+        </header>
+        <pre class="grid">Título: "Sua loja no ar em 7 dias"
+
+Testando 3 versões do subtítulo:
+A — foco no prazo de entrega
+B — foco na economia mensal
+C — foco em "sem precisar de técnico"</pre>
+        <footer class="narr">Construindo a página de vendas…</footer>
+      </article>
+
+      <article class="card c3">
+        <header class="card-head">
+          <div class="card-title-row">
+            <h2 class="card-name">Caixa e Pagamentos<span class="fila" role="img" aria-label="1 pedido na fila de atenção">1</span></h2>
+            <span class="chip chip-you"><span class="glif">◆</span>Precisa de você</span>
+          </div>
+          <p class="meta">esperando há 1 min</p>
+        </header>
+        <pre class="grid">Configurei Pix e cartão no ambiente
+de testes. Falta uma decisão sua:
+
+Ativo o cupom LANCA10 — 10% de
+desconto na primeira compra?
+
+Permitir? (s/n) <span class="caret">█</span></pre>
+        <footer class="narr">Esperando sua resposta para continuar.</footer>
+        <div class="actions">
+          <button class="btn-accent">Sim, pode ativar</button>
+          <button class="btn-ghost">Agora não</button>
+        </div>
+      </article>
+
+    </div>
+
+    <div class="row row-2">
+
+      <article class="card c4">
+        <header class="card-head">
+          <div class="card-title-row">
+            <h2 class="card-name">Revisor de Qualidade</h2>
+            <span class="chip chip-done"><span class="glif">✓</span>Pronto</span>
+          </div>
+          <p class="meta">terminou há 3 min · 9 verificações</p>
+        </header>
+        <pre class="grid">✓ Revisei as 5 páginas da loja
+✓ Botões e links funcionando
+✓ Nada quebrado no celular
+✓ Carregamento rápido
+
+<span class="dim">Relatório completo guardado no Espaço.</span></pre>
+        <footer class="narr">Pronto — terminei a revisão</footer>
+      </article>
+
+      <article class="card c5">
+        <header class="card-head">
+          <div class="card-title-row">
+            <h2 class="card-name">Automações</h2>
+            <span class="chip chip-new"><span class="glif">○</span>Chegando</span>
+          </div>
+          <p class="meta">chegou agora</p>
+        </header>
+        <pre class="grid">Olá! Sou o novo terminal de Automações.
+Me apresentando ao time…  <span class="caret">█</span></pre>
+        <footer class="narr">Acabou de chegar — conhecendo o trabalho do time.</footer>
+      </article>
+
+    </div>
+  </div>
+
+  <div class="zoom" role="group" aria-label="Controles de zoom">
+    <button>Ver tudo</button>
+    <button aria-label="Diminuir zoom">−</button>
+    <button class="pct" aria-label="Nível de zoom, redefinir">100%</button>
+    <button aria-label="Aumentar zoom">+</button>
+  </div>
+</main>
+
+<a class="proto" href="index.html">Protótipo T2 — ← escolher outro território</a>
+
+</body>
+</html>

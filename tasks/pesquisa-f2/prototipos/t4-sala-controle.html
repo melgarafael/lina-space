@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<!--
+T4 Sala de Controle — o cockpit: telemetria total à vista, nada escondido.
+Mecanismo: dark profundo · densidade alta · números e fluxo de dados visíveis · glow de instrumentação contido ao que significa.
+Nunca: esconder números, glassmorphism, roxo decorativo, suavizar o sistema para parecer simples.
+-->
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lina — T4 · Sala de Controle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;600&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   T4 — SALA DE CONTROLE · tokens
+   Tipografia: IBM Plex Sans (voz da UI) · IBM Plex Mono (telemetria)
+   · JetBrains Mono (grids — selada) · Space Grotesk como acento de
+   headings é DECISÃO CONSCIENTE (entrega-d1 §II/T4): assumida apesar
+   do risco de clichê de branding de IA — aqui ela rotula instrumentos,
+   não faz marketing. Os fallbacks abaixo são honestos, não escolha.
+   AA computado (WCAG 2.x): chrome 14.58 · narração 13.96 · grid 13.44
+   · meta 7.12 · telemetria 6.99 · chips 7.72–8.96 · botões 8.74/10.53
+   · pill 9.14 — todos ≥ 4.5.
+   ============================================================ */
+:root{
+  --bg:#0a0e15;          /* fundo profundo, azul frio */
+  --rail:#0d121b;
+  --panel:#101723;       /* chrome do cartão */
+  --panel-2:#0c121c;     /* faixas de telemetria */
+  --well:#121a26;        /* botões/recortes do rail */
+  --grid-bg:#070a10;     /* terminal: sempre dark, o mais fundo */
+  --line:#1c2634;
+  --line-2:#27344a;
+  --ink:#d9e4f1;
+  --ink-head:#e3ecf7;
+  --ink-2:#94a7bd;
+  --ink-3:#8ba0b8;
+  --ink-bar:#a9bcd2;
+  --grid-ink:#c9d6e6;
+  --cyan:#4fd9ea;   --cyan-deep:#1b6d7a;
+  --green:#5fdd92;  --green-deep:#1f7a48;
+  --amber:#f2b65a;  --amber-deep:#8a6420;
+  --red:#ff8d8d;    --red-deep:#e23d3d;
+  --chip-cyan-bg:#0b2a31; --chip-green-bg:#0b2b1c;
+  --chip-amber-bg:#2c2008; --chip-red-bg:#311118;
+  --f-ui:'IBM Plex Sans',system-ui,sans-serif;
+  --f-mono:'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace;
+  --f-grid:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
+  --f-disp:'Space Grotesk','IBM Plex Sans',system-ui,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  min-width:1180px;
+  display:flex;
+  background:var(--bg);
+  color:var(--ink);
+  font:400 13px/1.45 var(--f-ui);
+  overflow:hidden;
+}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+
+/* ============ RAIL ============ */
+.rail{
+  width:270px;flex:none;display:flex;flex-direction:column;
+  background:var(--rail);border-right:1px solid var(--line);
+  padding:12px 12px 10px;gap:12px;overflow-y:auto;
+}
+.rail-top{display:flex;align-items:center;justify-content:space-between}
+.wordmark{font:600 17px/1 var(--f-disp);color:var(--ink-head);letter-spacing:.02em}
+.recolher{
+  min-width:26px;min-height:26px;border:1px solid var(--line);border-radius:4px;
+  color:var(--ink-3);font:500 11px/1 var(--f-mono);background:var(--well);
+}
+.recolher:hover{border-color:var(--line-2);color:var(--ink)}
+
+.espaco-atual{
+  border:1px solid var(--line-2);border-left:2px solid var(--cyan);
+  border-radius:4px;background:var(--well);padding:9px 10px 8px;
+}
+.espaco-atual .rotulo{
+  display:block;font:600 9px/1 var(--f-mono);letter-spacing:.14em;
+  color:var(--ink-3);text-transform:uppercase;margin-bottom:5px;
+}
+.espaco-atual strong{display:block;font:600 13.5px/1.3 var(--f-disp);color:var(--ink-head)}
+.espaco-atual .sub{display:block;font:400 10.5px/1.4 var(--f-mono);color:var(--ink-2);margin-top:4px}
+
+.buscar{
+  display:block;width:100%;text-align:left;border:1px solid var(--line);
+  border-radius:4px;background:var(--well);padding:8px 10px;min-height:44px;
+}
+.buscar:hover{border-color:var(--line-2)}
+.buscar-linha{display:flex;align-items:center;justify-content:space-between}
+.buscar-linha b{font:500 12.5px/1 var(--f-ui);color:var(--ink)}
+.buscar kbd{
+  font:500 10px/1 var(--f-mono);color:var(--ink-3);
+  border:1px solid var(--line-2);border-radius:3px;padding:3px 5px;background:var(--rail);
+}
+.buscar-sub{display:block;font:400 10.5px/1.3 var(--f-ui);color:var(--ink-3);margin-top:4px}
+
+.espacos h2{
+  font:600 9px/1 var(--f-mono);letter-spacing:.14em;text-transform:uppercase;
+  color:var(--ink-3);padding:2px 2px 7px;
+}
+.espacos ul{list-style:none;display:flex;flex-direction:column;gap:2px}
+.espaco-row{border-radius:4px;padding:7px 8px;min-height:32px}
+.espaco-row.atual{background:var(--well);border:1px solid var(--line);border-left:2px solid var(--cyan)}
+.espaco-row .nome{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.espaco-row .nome span{font:500 12px/1.3 var(--f-ui);color:var(--ink)}
+.tag-atual{
+  flex:none;font:600 9px/1 var(--f-mono);letter-spacing:.1em;text-transform:uppercase;
+  color:var(--cyan);border:1px solid var(--cyan-deep);border-radius:3px;padding:3px 5px;
+}
+.espaco-row .meta-linha{
+  display:flex;align-items:center;justify-content:space-between;gap:6px;
+  font:400 10.5px/1.4 var(--f-mono);color:var(--ink-3);margin-top:3px;
+}
+.descarregar{
+  flex:none;font:500 10.5px/1 var(--f-mono);color:#a9c4e0;
+  border:1px solid var(--line-2);border-radius:3px;background:#16202e;
+  padding:5px 8px;min-height:24px;
+}
+.descarregar:hover{border-color:#3b4d68;color:var(--ink)}
+
+.criar{
+  width:100%;min-height:32px;border:1px dashed var(--line-2);border-radius:4px;
+  font:500 12px/1 var(--f-ui);color:#a9c4e0;text-align:left;padding:8px 10px;
+}
+.criar:hover{border-style:solid;color:var(--ink)}
+
+.rail-foot{
+  margin-top:auto;border-top:1px solid var(--line);padding-top:9px;
+  display:flex;flex-direction:column;gap:5px;
+}
+.salvo{font:400 10.5px/1.4 var(--f-mono);color:var(--green)}
+.aparencia{font:400 10.5px/1.4 var(--f-mono);color:var(--ink-3)}
+
+/* ============ CANVAS ============ */
+.canvas{
+  flex:1;overflow:auto;position:relative;
+  background-color:var(--bg);
+  background-image:
+    linear-gradient(to right, rgba(39,52,74,.22) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(39,52,74,.22) 1px, transparent 1px),
+    radial-gradient(rgba(70,92,124,.30) 1px, transparent 1.4px);
+  background-size:140px 140px,140px 140px,28px 28px;
+}
+
+/* barra de telemetria global — nada escondido */
+.statusbar{
+  position:sticky;top:0;left:0;z-index:6;min-width:1000px;
+  display:flex;align-items:center;gap:12px;
+  background:#0b1018;border-bottom:1px solid var(--line);
+  padding:8px 14px;min-height:38px;
+}
+.aovivo{display:inline-flex;align-items:center;gap:6px;flex:none}
+.aovivo .ponto{
+  width:7px;height:7px;border-radius:50%;background:var(--cyan);
+  box-shadow:0 0 7px rgba(79,217,234,.65);
+}
+.aovivo b{font:600 9.5px/1 var(--f-mono);letter-spacing:.14em;color:var(--cyan)}
+.statusbar .numeros{font:500 11.5px/1 var(--f-mono);color:var(--ink-bar);white-space:nowrap}
+.statusbar .direita{margin-left:auto;display:inline-flex;align-items:center;gap:8px;flex:none}
+.statusbar .legenda{font:400 10px/1 var(--f-mono);color:var(--ink-3)}
+
+/* sparklines — CSS puro, cor é dado */
+.spark{display:inline-flex;align-items:flex-end;gap:2px;height:14px;flex:none}
+.spark i{width:3px;height:var(--h);border-radius:1px 1px 0 0;background:var(--cyan);opacity:.9}
+.spark-red i{background:var(--red)}
+.spark-green i{background:var(--green)}
+.spark-amber i{background:var(--amber)}
+
+/* prancheta espacial */
+.board{position:relative;min-width:1000px;min-height:780px}
+
+/* pill de atenção (padrão PULL) — mesma cor do estado "precisa de você" */
+.pill-atencao{
+  position:absolute;left:500px;top:16px;transform:translateX(-50%);z-index:5;
+  display:inline-flex;align-items:center;white-space:nowrap;
+  font:500 12px/1 var(--f-ui);color:var(--red);text-decoration:none;
+  background:#2b1016;border:1px solid var(--red-deep);border-radius:999px;
+  padding:8px 16px;min-height:30px;
+  box-shadow:0 0 12px rgba(226,61,61,.22);
+}
+.pill-atencao:hover{color:#ffb9b9;border-color:#ff6b6b}
+
+/* ============ CARTÃO-TERMINAL ============ */
+.card{
+  position:absolute;display:flex;flex-direction:column;
+  background:var(--panel);border:1px solid var(--line);border-radius:4px;
+  overflow:hidden;
+}
+.card::before{content:"";display:block;height:2px;flex:none}
+.card-trabalhando::before{background:var(--cyan)}
+.card-atencao::before{background:var(--red-deep)}
+.card-pronto::before{background:var(--green)}
+.card-chegando::before{background:var(--amber)}
+.card-atencao{border-color:#5c2129}
+.card-atencao:target{outline:2px solid var(--red-deep);outline-offset:3px}
+
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:8px 11px 6px}
+.card-head h2{font:600 13px/1.25 var(--f-disp);color:var(--ink-head);letter-spacing:.01em;white-space:nowrap}
+.chip{
+  flex:none;display:inline-flex;align-items:center;gap:4px;
+  font:500 10.5px/1 var(--f-mono);border:1px solid;border-radius:3px;padding:4px 6px;
+}
+.chip .icone{font-size:9px}
+.chip-cyan{color:var(--cyan);background:var(--chip-cyan-bg);border-color:var(--cyan-deep)}
+.chip-cyan .icone{text-shadow:0 0 6px rgba(79,217,234,.6)}
+.chip-green{color:var(--green);background:var(--chip-green-bg);border-color:var(--green-deep)}
+.chip-amber{color:var(--amber);background:var(--chip-amber-bg);border-color:var(--amber-deep)}
+.chip-red{color:var(--red);background:var(--chip-red-bg);border-color:var(--red-deep)}
+.chip-red .icone{text-shadow:0 0 6px rgba(255,107,107,.55)}
+
+.card-sub{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 11px 7px}
+.card-sub .meta{font:400 10.5px/1 var(--f-mono);color:var(--ink-2)}
+.fila{
+  flex:none;font:500 10px/1 var(--f-mono);color:var(--red);
+  background:var(--chip-red-bg);border:1px solid var(--red-deep);border-radius:3px;padding:3px 6px;
+}
+
+.telemetria{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  background:var(--panel-2);border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+  padding:5px 11px;font:400 10.5px/1 var(--f-mono);color:var(--ink-3);white-space:nowrap;
+}
+
+.gridterm{
+  font:400 11px/1.6 var(--f-grid);color:var(--grid-ink);
+  background:var(--grid-bg);padding:10px 12px;white-space:pre;overflow:hidden;
+}
+
+.narracao{
+  font:400 12px/1.45 var(--f-ui);color:var(--ink);
+  border-top:1px solid var(--line);padding:8px 11px;
+}
+
+.acoes{display:flex;gap:8px;padding:0 11px 10px;border-top:0}
+.btn{font:500 12px/1 var(--f-ui);border-radius:4px;padding:7px 12px;min-height:28px;border:1px solid}
+.btn-sim{color:var(--red);background:#321319;border-color:var(--red-deep)}
+.btn-sim:hover{color:#ffb9b9;border-color:#ff6b6b}
+.btn-nao{color:#c6d4e4;background:#182331;border-color:var(--line-2)}
+.btn-nao:hover{border-color:#3b4d68}
+
+/* posições — grade solta, leves deslocamentos (cara de canvas) */
+#construtor{left:16px;top:64px;width:348px}
+#redator{left:382px;top:100px;width:298px}
+#caixa{left:694px;top:56px;width:290px}
+#revisor{left:120px;top:424px;width:330px}
+#automacoes{left:660px;top:452px;width:300px}
+
+/* ============ CONTROLES DE ZOOM ============ */
+.zoom{
+  position:fixed;right:16px;bottom:16px;z-index:8;
+  display:flex;align-items:stretch;gap:1px;
+  background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden;
+}
+.zoom button{
+  min-width:30px;min-height:28px;padding:5px 10px;background:var(--well);
+  font:500 11.5px/1 var(--f-mono);color:#c6d4e4;
+}
+.zoom button:hover{color:var(--ink-head);background:#182331}
+
+/* ============ NAVEGAÇÃO DO PROTÓTIPO (não é UI do app) ============ */
+.proto-nav{
+  position:fixed;left:16px;bottom:16px;z-index:8;
+  font:400 10.5px/1 var(--f-mono);color:var(--ink-3);text-decoration:none;
+  background:#10161f;border:1px solid var(--line);border-radius:999px;padding:7px 11px;
+}
+.proto-nav:hover{color:var(--ink);border-color:var(--line-2)}
+
+/* ============ vida ambiente — SÓ sem reduce-motion ============ */
+@media (prefers-reduced-motion: no-preference){
+  .aovivo .ponto{animation:pulso 1.8s ease-in-out infinite}
+  .chip-cyan .icone{animation:pulso 2.4s ease-in-out infinite}
+  .pill-atencao{animation:alerta 2.8s ease-in-out infinite}
+  @keyframes pulso{0%,100%{opacity:1}50%{opacity:.4}}
+  @keyframes alerta{
+    0%,100%{box-shadow:0 0 10px rgba(226,61,61,.18)}
+    50%{box-shadow:0 0 18px rgba(226,61,61,.4)}
+  }
+}
+</style>
+</head>
+<body>
+
+<!-- ======================= RAIL ======================= -->
+<aside class="rail">
+  <div class="rail-top">
+    <h1 class="wordmark">Lina</h1>
+    <button class="recolher" aria-label="Recolher painel lateral">◀</button>
+  </div>
+
+  <div class="espaco-atual">
+    <span class="rotulo">Espaço atual</span>
+    <strong>Loja Virtual — Lançamento</strong>
+    <span class="sub">5 terminais · 2 trabalhando agora</span>
+  </div>
+
+  <button class="buscar">
+    <span class="buscar-linha"><b>Buscar</b><kbd>⌘K</kbd></span>
+    <span class="buscar-sub">terminais, Espaços e ações</span>
+  </button>
+
+  <nav class="espacos" aria-label="Espaços">
+    <h2>Espaços</h2>
+    <ul>
+      <li class="espaco-row atual">
+        <span class="nome"><span>Loja Virtual — Lançamento</span><span class="tag-atual">atual</span></span>
+      </li>
+      <li class="espaco-row">
+        <span class="nome"><span>Marketing de Conteúdo</span></span>
+        <span class="meta-linha"><span>2 trabalhando ao fundo</span><button class="descarregar">Descarregar</button></span>
+      </li>
+      <li class="espaco-row">
+        <span class="nome"><span>Pesquisa de Fornecedores</span></span>
+        <span class="meta-linha"><span>descansando</span></span>
+      </li>
+    </ul>
+  </nav>
+
+  <button class="criar">+ Criar Espaço</button>
+
+  <footer class="rail-foot">
+    <span class="salvo">✓ Tudo salvo · agora há pouco</span>
+    <span class="aparencia">Aparência: Escuro profundo · segue o sistema</span>
+  </footer>
+</aside>
+
+<!-- ======================= CANVAS ======================= -->
+<main class="canvas">
+
+  <!-- telemetria global: o cockpit não esconde número -->
+  <div class="statusbar">
+    <span class="aovivo"><span class="ponto" aria-hidden="true"></span><b>AO VIVO</b></span>
+    <span class="numeros">5 terminais · 2 trabalhando · 1 esperando você · 38 eventos/min</span>
+    <span class="direita">
+      <span class="spark" aria-hidden="true"><i style="--h:20%"></i><i style="--h:30%"></i><i style="--h:25%"></i><i style="--h:45%"></i><i style="--h:40%"></i><i style="--h:60%"></i><i style="--h:50%"></i><i style="--h:70%"></i><i style="--h:55%"></i><i style="--h:75%"></i><i style="--h:65%"></i><i style="--h:85%"></i><i style="--h:70%"></i><i style="--h:90%"></i><i style="--h:80%"></i><i style="--h:95%"></i><i style="--h:75%"></i><i style="--h:88%"></i><i style="--h:92%"></i><i style="--h:100%"></i></span>
+      <span class="legenda">eventos · últimos 10 min</span>
+    </span>
+  </div>
+
+  <section class="board" aria-label="Terminais deste Espaço">
+
+    <a class="pill-atencao" href="#caixa">◆ 1 pedido precisa de você — ir até lá</a>
+
+    <!-- Cartão 1 — Construtor de Páginas -->
+    <article class="card card-trabalhando" id="construtor">
+      <header class="card-head">
+        <h2>Construtor de Páginas</h2>
+        <span class="chip chip-cyan"><span class="icone" aria-hidden="true">●</span>Trabalhando</span>
+      </header>
+      <div class="card-sub"><span class="meta">há 2 min nisso</span></div>
+      <div class="telemetria"><span>2 min ativo · 14 ações · fila 0</span><span class="spark" aria-hidden="true"><i style="--h:40%"></i><i style="--h:65%"></i><i style="--h:50%"></i><i style="--h:80%"></i><i style="--h:60%"></i><i style="--h:90%"></i><i style="--h:70%"></i><i style="--h:95%"></i><i style="--h:75%"></i><i style="--h:85%"></i><i style="--h:90%"></i><i style="--h:100%"></i></span></div>
+      <pre class="gridterm">✻ Trabalhando na sua loja…
+
+● Li a planilha  precos-planos.xlsx
+  ⎿ 3 planos encontrados
+
+● Editei  loja/secao-precos.html
+  ⎿ 42 linhas ajustadas
+
+Deixando os 3 planos lado a lado, com o
+"Profissional" em destaque…</pre>
+      <p class="narracao">Montando a seção de preços com os 3 planos.</p>
+    </article>
+
+    <!-- Cartão 2 — Redator de Vendas -->
+    <article class="card card-trabalhando" id="redator">
+      <header class="card-head">
+        <h2>Redator de Vendas</h2>
+        <span class="chip chip-cyan"><span class="icone" aria-hidden="true">●</span>Trabalhando</span>
+      </header>
+      <div class="card-sub"><span class="meta">há 5 min nisso</span></div>
+      <div class="telemetria"><span>5 min ativo · 9 ações · fila 0</span><span class="spark" aria-hidden="true"><i style="--h:55%"></i><i style="--h:40%"></i><i style="--h:70%"></i><i style="--h:50%"></i><i style="--h:75%"></i><i style="--h:60%"></i><i style="--h:80%"></i><i style="--h:55%"></i><i style="--h:70%"></i><i style="--h:85%"></i><i style="--h:65%"></i><i style="--h:75%"></i></span></div>
+      <pre class="gridterm">Título: "Sua loja no ar em 7 dias"
+
+Testando 3 versões do subtítulo:
+A — foco no prazo de entrega
+B — foco na economia mensal
+C — foco em "sem precisar de técnico"</pre>
+      <p class="narracao">Construindo a página de vendas…</p>
+    </article>
+
+    <!-- Cartão 3 — Caixa e Pagamentos · destino da pill de atenção -->
+    <article class="card card-atencao" id="caixa">
+      <header class="card-head">
+        <h2>Caixa e Pagamentos</h2>
+        <span class="chip chip-red"><span class="icone" aria-hidden="true">◆</span>Precisa de você</span>
+      </header>
+      <div class="card-sub"><span class="meta">esperando há 1 min</span><span class="fila">◆ 1 na fila</span></div>
+      <div class="telemetria"><span>1 min em espera · 6 ações · fila 1</span><span class="spark spark-red" aria-hidden="true"><i style="--h:80%"></i><i style="--h:70%"></i><i style="--h:55%"></i><i style="--h:40%"></i><i style="--h:30%"></i><i style="--h:20%"></i><i style="--h:12%"></i><i style="--h:8%"></i><i style="--h:8%"></i><i style="--h:8%"></i><i style="--h:8%"></i><i style="--h:8%"></i></span></div>
+      <pre class="gridterm">Configurei Pix e cartão no ambiente
+de testes. Falta uma decisão sua:
+
+Ativo o cupom LANCA10 — 10% de
+desconto na primeira compra?
+
+Permitir? (s/n) █</pre>
+      <p class="narracao">Esperando sua resposta para continuar.</p>
+      <div class="acoes">
+        <button class="btn btn-sim">Sim, pode ativar</button>
+        <button class="btn btn-nao">Agora não</button>
+      </div>
+    </article>
+
+    <!-- Cartão 4 — Revisor de Qualidade -->
+    <article class="card card-pronto" id="revisor">
+      <header class="card-head">
+        <h2>Revisor de Qualidade</h2>
+        <span class="chip chip-green"><span class="icone" aria-hidden="true">✓</span>Pronto</span>
+      </header>
+      <div class="card-sub"><span class="meta">terminou há 3 min</span></div>
+      <div class="telemetria"><span>descansando · 23 ações · fila 0</span><span class="spark spark-green" aria-hidden="true"><i style="--h:60%"></i><i style="--h:75%"></i><i style="--h:90%"></i><i style="--h:100%"></i><i style="--h:85%"></i><i style="--h:70%"></i><i style="--h:40%"></i><i style="--h:20%"></i><i style="--h:10%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i></span></div>
+      <pre class="gridterm">✓ Revisei as 5 páginas da loja
+✓ Botões e links funcionando
+✓ Nada quebrado no celular
+✓ Carregamento rápido
+
+Relatório completo guardado no Espaço.</pre>
+      <p class="narracao">Pronto — terminei a revisão</p>
+    </article>
+
+    <!-- Cartão 5 — Automações · recém-chegado -->
+    <article class="card card-chegando" id="automacoes">
+      <header class="card-head">
+        <h2>Automações</h2>
+        <span class="chip chip-amber"><span class="icone" aria-hidden="true">○</span>Chegando</span>
+      </header>
+      <div class="card-sub"><span class="meta">chegou agora</span></div>
+      <div class="telemetria"><span>0 min ativo · 1 ação · fila 0</span><span class="spark spark-amber" aria-hidden="true"><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:6%"></i><i style="--h:10%"></i><i style="--h:25%"></i><i style="--h:45%"></i></span></div>
+      <pre class="gridterm">Olá! Sou o novo terminal de Automações.
+Me apresentando ao time…  █</pre>
+      <p class="narracao">Acabou de chegar — conhecendo o trabalho do time.</p>
+    </article>
+
+  </section>
+
+  <div class="zoom" role="group" aria-label="Controles de zoom">
+    <button>Ver tudo</button>
+    <button aria-label="Diminuir zoom">−</button>
+    <button aria-label="Nível de zoom atual">100%</button>
+    <button aria-label="Aumentar zoom">+</button>
+  </div>
+
+</main>
+
+<a class="proto-nav" href="index.html">Protótipo T4 — ← escolher outro território</a>
+
+</body>
+</html>
