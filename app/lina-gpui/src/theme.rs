@@ -24,6 +24,10 @@
 //! anti-número-mágico do shell é a F2-1-5). Voz da fusão **T1 + temperatura T3** selada na
 //! F2-0-D (épico 38 §VIII): IBM Plex Sans (UI) + Fraunces (momentos) + JetBrains Mono (grid —
 //! fecha a dívida do ADR 0019 §7: fonte de código/terminal **via token**, nunca literal).
+//! A **F2-1-4** fecha a onda: modo **"sistema"** ([`ModeSetting`], resolvido pela aparência viva
+//! da janela na costura — decisão F2-0-D nº2: o chrome segue o sistema) e **ajustes parciais por
+//! token** ([`Theme::refine`]/[`TOKEN_PATHS`] — padrão *refinement* do Zed, modelado por
+//! descrição, jamais com o código GPL ao lado).
 //!
 //! **Doutrina de movimento (D1-A8, observada no Raycast):** NUNCA animar ação iniciada por input
 //! frequente (abrir/focar/teclar = [`MotionTokens::instant`] = 0ms — repetida centenas de vezes
@@ -50,6 +54,7 @@
 //! Âncora `UiHost` (invariante #7): tema é assunto EXCLUSIVO do shell — nenhum token atravessa para
 //! `lina-core` (este módulo não importa nada do core nem do gpui; consumidores chamam `gpui::rgb`).
 
+use std::collections::BTreeMap;
 use std::sync::{LazyLock, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -83,6 +88,71 @@ impl Mode {
         match self {
             Self::Dark => "escuro",
             Self::Light => "claro",
+        }
+    }
+}
+
+/// A PREFERÊNCIA de modo persistida (F2-1-4) — inclui `"sistema"`, o default selado na F2-0-D
+/// (decisão nº2: o chrome SEGUE O SISTEMA; supersede o "Dark OLED" do T0). [`Mode`] continua
+/// sendo o tipo RESOLVIDO que as views leem; a resolução acontece em [`ModeSetting::resolve`]
+/// com a aparência viva da janela (`WindowAppearance` do gpui — fiação na costura, modelo
+/// `ThemeSelection::Dynamic` do Zed por descrição).
+// dead_code: o consumidor de produção é a costura (boot + observer de aparência + linha de
+// Ajustes). Remover o allow ao fiar.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModeSetting {
+    /// Segue a aparência do sistema — herda a única escolha de tema que o leigo já fez (D1-A6g).
+    #[default]
+    Sistema,
+    /// Escuro sempre (escolha explícita).
+    Escuro,
+    /// Claro sempre (escolha explícita).
+    Claro,
+}
+
+#[allow(dead_code)]
+impl ModeSetting {
+    /// Lê a preferência persistida. `"escuro"`/`"claro"` seguem explícitos; desconhecido/vazio →
+    /// `Sistema` (o default decidido — atenção: a MIGRAÇÃO de `settings.json` legados com
+    /// `"escuro"`-default-nunca-escolhido é decisão da costura, ver pedido r2).
+    #[must_use]
+    pub fn from_setting(s: &str) -> Self {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("claro") {
+            Self::Claro
+        } else if s.eq_ignore_ascii_case("escuro") {
+            Self::Escuro
+        } else {
+            Self::Sistema
+        }
+    }
+
+    /// A string persistida (`settings.json`/`tema.json`).
+    #[must_use]
+    pub fn as_setting(self) -> &'static str {
+        match self {
+            Self::Sistema => "sistema",
+            Self::Escuro => "escuro",
+            Self::Claro => "claro",
+        }
+    }
+
+    /// Resolve a preferência para o modo CONCRETO do frame, dado "o sistema está escuro?". A
+    /// costura lê `WindowAppearance` (Dark/VibrantDark ⇒ `true`) e re-resolve no observer — a
+    /// troca de aparência do SO re-pinta o shell sem restart, como a troca manual.
+    #[must_use]
+    pub fn resolve(self, system_is_dark: bool) -> Mode {
+        match self {
+            Self::Escuro => Mode::Dark,
+            Self::Claro => Mode::Light,
+            Self::Sistema => {
+                if system_is_dark {
+                    Mode::Dark
+                } else {
+                    Mode::Light
+                }
+            }
         }
     }
 }
@@ -137,16 +207,17 @@ pub const ACCENTS: [(&str, ColorScale); 8] = [
     ("teal", ColorScale::new(0x73daca, 0x0c6e5d)),
 ];
 
-/// A escala do acento `name` (case-insensitive); desconhecido → [`DEFAULT_ACCENT`] (best-effort,
-/// nunca falha — mesma postura do `load_settings`).
-fn accent_scale(name: &str) -> ColorScale {
+/// O acento curado para `name` (case-insensitive), com o NOME canônico junto — desconhecido →
+/// [`DEFAULT_ACCENT`] (best-effort, nunca falha — mesma postura do `load_settings`). O nome
+/// canônico vai para [`Theme::accent_name`]: o tema sabe re-construir a si mesmo (F2-1-4).
+fn accent_entry(name: &str) -> (&'static str, ColorScale) {
     let name = name.trim();
     ACCENTS
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
         .or_else(|| ACCENTS.iter().find(|(n, _)| *n == DEFAULT_ACCENT))
-        .map(|(_, s)| *s)
-        .unwrap_or(ColorScale::new(0x7aa2f7, 0x2f4fc7))
+        .map(|(n, s)| (*n, *s))
+        .unwrap_or((DEFAULT_ACCENT, ColorScale::new(0x7aa2f7, 0x2f4fc7)))
 }
 
 // ═══════════════════════════ escalas base (fonte única dos valores) ═══════════════════════════
@@ -463,6 +534,9 @@ impl MotionTokens {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub mode: Mode,
+    /// O nome CANÔNICO do acento resolvido (sempre um dos [`ACCENTS`]) — permite re-construir o
+    /// tema sem estado externo ([`set_overrides`]) e exibir a escolha atual na superfície.
+    pub accent_name: &'static str,
     pub surface: SurfaceTokens,
     pub text: TextTokens,
     pub accent: AccentTokens,
@@ -480,9 +554,11 @@ impl Theme {
     /// Acento desconhecido → [`DEFAULT_ACCENT`] (best-effort, nunca falha).
     #[must_use]
     pub fn build(mode: Mode, accent: &str) -> Self {
-        let accent_primary = accent_scale(accent).pick(mode);
+        let (accent_name, accent_colors) = accent_entry(accent);
+        let accent_primary = accent_colors.pick(mode);
         Self {
             mode,
+            accent_name,
             surface: SurfaceTokens {
                 canvas: scale::CANVAS.pick(mode),
                 panel: scale::PANEL.pick(mode),
@@ -533,6 +609,107 @@ impl Theme {
             motion: MotionTokens::CANONICAL,
         }
     }
+
+    /// **F2-1-4 — ajustes parciais por token** (padrão *refinement*, "Avançado" do T7§A):
+    /// caminho pt-br ([`TOKEN_PATHS`]) → cor `"#rrggbb"`. Chave desconhecida ou valor inválido é
+    /// IGNORADO ("aplica o que entende"). O gate WCAG protege os DEFAULTS curados; ajuste manual
+    /// é liberdade (e responsabilidade) do usuário — aviso de contraste na superfície é F2-2+.
+    pub fn refine(&mut self, ajustes: &BTreeMap<String, String>) {
+        for (path, value) in ajustes {
+            let Some(rgb) = parse_hex_rgb(value) else {
+                continue;
+            };
+            if let Some(slot) = self.token_slot(path) {
+                *slot = rgb;
+            }
+        }
+    }
+
+    /// O slot mutável do token de COR no caminho pt-br `path`. `None` = desconhecido. A tabela
+    /// canônica é [`TOKEN_PATHS`] — teste garante o 1:1 (escrever + ler de volta nos 30).
+    fn token_slot(&mut self, path: &str) -> Option<&mut u32> {
+        Some(match path {
+            "superficie.canvas" => &mut self.surface.canvas,
+            "superficie.painel" => &mut self.surface.panel,
+            "superficie.cartao" => &mut self.surface.card,
+            "superficie.chrome" => &mut self.surface.chrome,
+            "superficie.elevado" => &mut self.surface.raised,
+            "superficie.elevado_alt" => &mut self.surface.raised_alt,
+            "superficie.linha_selecionada" => &mut self.surface.selected_row,
+            "superficie.perigo_suave" => &mut self.surface.danger_muted,
+            "superficie.sucesso_suave" => &mut self.surface.success_muted,
+            "superficie.borda" => &mut self.surface.border,
+            "superficie.borda_suave" => &mut self.surface.border_muted,
+            "texto.primario" => &mut self.text.primary,
+            "texto.secundario" => &mut self.text.secondary,
+            "texto.apagado" => &mut self.text.muted,
+            "texto.brilhante" => &mut self.text.bright,
+            "texto.sobre_acento" => &mut self.text.on_accent,
+            "texto.sobre_enfase" => &mut self.text.on_emphasis,
+            "acento.primario" => &mut self.accent.primary,
+            "acento.secundario" => &mut self.accent.secondary,
+            "acento.acao" => &mut self.accent.action,
+            "acento.criacao" => &mut self.accent.create,
+            "acento.confirmacao" => &mut self.accent.confirm,
+            "estado.sucesso" => &mut self.state.success,
+            "estado.alerta" => &mut self.state.warning,
+            "estado.perigo" => &mut self.state.danger,
+            "foco.anel" => &mut self.focus.ring,
+            "terminal.fundo" => &mut self.terminal.bg,
+            "terminal.cursor" => &mut self.terminal.cursor,
+            "terminal.texto_cursor" => &mut self.terminal.cursor_text,
+            "terminal.selecao" => &mut self.terminal.selection,
+            _ => return None,
+        })
+    }
+}
+
+/// Os caminhos pt-br dos tokens de cor ajustáveis (F2-1-4) — a tabela canônica que `tema.json`
+/// (seção `ajustes`) e a futura superfície de Ajustes (F2-2+) enxergam. Zero jargão: nomes em
+/// pt-br legível, espelhando a semântica dos grupos.
+// dead_code: consumido pelos testes hoje e pela superfície de Ajustes/F2-2 amanhã.
+#[allow(dead_code)]
+pub const TOKEN_PATHS: [&str; 30] = [
+    "superficie.canvas",
+    "superficie.painel",
+    "superficie.cartao",
+    "superficie.chrome",
+    "superficie.elevado",
+    "superficie.elevado_alt",
+    "superficie.linha_selecionada",
+    "superficie.perigo_suave",
+    "superficie.sucesso_suave",
+    "superficie.borda",
+    "superficie.borda_suave",
+    "texto.primario",
+    "texto.secundario",
+    "texto.apagado",
+    "texto.brilhante",
+    "texto.sobre_acento",
+    "texto.sobre_enfase",
+    "acento.primario",
+    "acento.secundario",
+    "acento.acao",
+    "acento.criacao",
+    "acento.confirmacao",
+    "estado.sucesso",
+    "estado.alerta",
+    "estado.perigo",
+    "foco.anel",
+    "terminal.fundo",
+    "terminal.cursor",
+    "terminal.texto_cursor",
+    "terminal.selecao",
+];
+
+/// `"#rrggbb"` (case-insensitive, com `#`) → u32. Qualquer outro formato → `None` (ignorado —
+/// "aplica o que entende"; o formato canônico é o que o export escreve).
+fn parse_hex_rgb(s: &str) -> Option<u32> {
+    let hex = s.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
 }
 
 // ═══════════════════════════ tema ATIVO (troca ao vivo, sem restart) ═══════════════════════════
@@ -542,6 +719,12 @@ impl Theme {
 /// janelas re-pintam no frame seguinte (os `render` leem [`active`] a cada frame).
 static ACTIVE: LazyLock<RwLock<Theme>> =
     LazyLock::new(|| RwLock::new(Theme::build(Mode::Dark, DEFAULT_ACCENT)));
+
+/// Os ajustes parciais VIVOS (F2-1-4): re-aplicados sobre todo tema construído por [`apply`] —
+/// trocar modo/acento não apaga o refinamento do usuário (mesma razão do reduce-motion). Nunca
+/// segurar este lock junto com o de `ACTIVE` (ordem: ler/clonar AQUI, soltar, depois escrever lá).
+static AJUSTES: LazyLock<RwLock<BTreeMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
 /// Cópia do tema ativo (leitura barata; nunca segura lock através de render).
 #[must_use]
@@ -553,13 +736,35 @@ pub fn active() -> Theme {
 /// Aplica `(mode, acento)` como tema vivo — efeito no próximo frame de TODAS as janelas (sem
 /// restart, sem flash: é só a próxima passada de render lendo novos u32).
 ///
-/// O flag reduce-motion SOBREVIVE à troca (F2-1-3): trocar modo/acento jamais religa animação
-/// para quem a reduziu — seria regressão de a11y silenciosa.
+/// Sobrevivem à troca (nunca se perdem ao mudar modo/acento): o flag reduce-motion (F2-1-3 —
+/// religar animação reduzida seria regressão de a11y) e os ajustes parciais (F2-1-4 — o
+/// refinamento do usuário é re-aplicado sobre o tema novo).
 pub fn apply(mode: Mode, accent: &str) {
+    // Ordem de locks: clonar AJUSTES e soltar ANTES de escrever ACTIVE (ver doc do static).
+    let ajustes = AJUSTES
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     let mut active = ACTIVE.write().unwrap_or_else(PoisonError::into_inner);
     let reduce_motion = active.motion.reduce_motion;
     *active = Theme::build(mode, accent);
     active.motion.reduce_motion = reduce_motion;
+    active.refine(&ajustes);
+}
+
+/// Define os ajustes parciais vivos (F2-1-4) — substitui o mapa INTEIRO (import é atômico:
+/// remover um ajuste do arquivo remove o refinamento) e re-aplica sobre o tema ativo via
+/// [`apply`] (re-construção limpa: base curada → refinamento). Chaves desconhecidas e valores
+/// inválidos são ignorados ([`Theme::refine`]).
+// dead_code: o consumidor de produção é a costura (import de tema/Ajustes). Remover ao fiar.
+#[allow(dead_code)]
+pub fn set_overrides(ajustes: BTreeMap<String, String>) {
+    *AJUSTES.write().unwrap_or_else(PoisonError::into_inner) = ajustes;
+    let (mode, accent) = {
+        let th = active();
+        (th.mode, th.accent_name)
+    };
+    apply(mode, accent);
 }
 
 /// Liga/desliga o reduce-motion do tema vivo (F2-1-3) — o ÚNICO ponto de mutação do flag.
@@ -617,14 +822,22 @@ pub struct ThemePrefs {
     pub tipografia: Option<TypographyPrefs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub movimento: Option<MotionPrefs>,
+    /// Ajustes parciais por token (F2-1-4, "Avançado"): `"superficie.canvas": "#0a0e27"`.
+    /// Caminhos em [`TOKEN_PATHS`]; desconhecidos/inválidos são ignorados no import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ajustes: Option<BTreeMap<String, String>>,
 }
 
 /// Serializa as preferências correntes como JSON legível (export local). As seções F2-1 saem
-/// preenchidas: a tipografia canônica (documenta a voz no arquivo) e o estado VIVO do
-/// reduce-motion (preferência real do processo).
+/// preenchidas: a tipografia canônica (documenta a voz no arquivo), o estado VIVO do
+/// reduce-motion e os ajustes parciais vivos (omitidos se não houver nenhum).
 #[must_use]
 pub fn export_json(mode: Mode, accent: &str) -> String {
     let voice = TypographyTokens::CANONICAL;
+    let ajustes = AJUSTES
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     let prefs = ThemePrefs {
         modo: mode.as_setting().to_string(),
         acento: accent.trim().to_lowercase(),
@@ -636,6 +849,11 @@ pub fn export_json(mode: Mode, accent: &str) -> String {
         movimento: Some(MotionPrefs {
             reduzir: active().motion.reduce_motion,
         }),
+        ajustes: if ajustes.is_empty() {
+            None
+        } else {
+            Some(ajustes)
+        },
     };
     // ThemePrefs é Serialize de structs planas — `to_string_pretty` não tem caminho de erro real;
     // o fallback mantém a função infalível (best-effort, mesma postura do save_settings).
@@ -1137,6 +1355,142 @@ mod tests {
         set_reduce_motion(false);
         apply(Mode::Dark, DEFAULT_ACCENT);
         assert!(!active().motion.reduce_motion);
+    }
+
+    /// **F2-1-4 — modo "sistema":** parse das 3 strings (desconhecido/vazio → Sistema, o default
+    /// selado na F2-0-D), roundtrip `as_setting`/`from_setting` e a matriz de resolução completa
+    /// (Sistema segue a aparência; Escuro/Claro são explícitos e ignoram o sistema).
+    #[test]
+    fn mode_setting_parses_resolves_and_defaults_to_sistema() {
+        assert_eq!(ModeSetting::from_setting("sistema"), ModeSetting::Sistema);
+        assert_eq!(ModeSetting::from_setting(" SISTEMA "), ModeSetting::Sistema);
+        assert_eq!(ModeSetting::from_setting("escuro"), ModeSetting::Escuro);
+        assert_eq!(ModeSetting::from_setting("claro"), ModeSetting::Claro);
+        assert_eq!(ModeSetting::from_setting(""), ModeSetting::Sistema);
+        assert_eq!(ModeSetting::from_setting("???"), ModeSetting::Sistema);
+        assert_eq!(ModeSetting::default(), ModeSetting::Sistema);
+        for setting in [
+            ModeSetting::Sistema,
+            ModeSetting::Escuro,
+            ModeSetting::Claro,
+        ] {
+            assert_eq!(ModeSetting::from_setting(setting.as_setting()), setting);
+        }
+        // Matriz de resolução: (preferência, sistema_escuro?) → modo concreto.
+        assert_eq!(ModeSetting::Sistema.resolve(true), Mode::Dark);
+        assert_eq!(ModeSetting::Sistema.resolve(false), Mode::Light);
+        assert_eq!(ModeSetting::Escuro.resolve(false), Mode::Dark);
+        assert_eq!(ModeSetting::Claro.resolve(true), Mode::Light);
+    }
+
+    /// **F2-1-4 — tabela 1:1:** cada caminho de [`TOKEN_PATHS`] escreve E lê de volta no slot
+    /// certo (30/30, sem duplicata) — a tabela pt-br nunca pode divergir dos structs.
+    #[test]
+    fn token_paths_write_and_read_back_one_to_one() {
+        let mut names: Vec<&str> = TOKEN_PATHS.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), TOKEN_PATHS.len(), "caminho de token duplicado");
+
+        let mut th = Theme::build(Mode::Dark, DEFAULT_ACCENT);
+        let mut ajustes = BTreeMap::new();
+        for (i, path) in TOKEN_PATHS.iter().enumerate() {
+            // valor único por caminho — provará que cada chave atinge o SEU slot.
+            ajustes.insert((*path).to_string(), format!("#{:06x}", 0x100000 + i));
+        }
+        th.refine(&ajustes);
+        for (i, path) in TOKEN_PATHS.iter().enumerate() {
+            let got = *th
+                .token_slot(path)
+                .unwrap_or_else(|| panic!("caminho '{path}' sem slot"));
+            assert_eq!(
+                got,
+                0x100000 + i as u32,
+                "caminho '{path}' escreveu no slot errado"
+            );
+        }
+    }
+
+    /// **F2-1-4 — "aplica o que entende":** caminho desconhecido, hex sem `#`, hex curto e lixo
+    /// são IGNORADOS; um ajuste válido no mesmo mapa É aplicado (case-insensitive).
+    #[test]
+    fn refine_ignores_unknown_paths_and_invalid_values() {
+        let base = Theme::build(Mode::Dark, DEFAULT_ACCENT);
+        let mut th = base;
+        let ajustes = BTreeMap::from([
+            ("nao.existe".to_string(), "#112233".to_string()),
+            ("superficie.canvas".to_string(), "112233".to_string()), // sem '#'
+            ("texto.primario".to_string(), "#12z".to_string()),      // inválido
+            ("estado.perigo".to_string(), "#A1B2C3".to_string()),    // válido, maiúsculo
+        ]);
+        th.refine(&ajustes);
+        assert_eq!(
+            th.surface.canvas, base.surface.canvas,
+            "hex sem # deveria ser ignorado"
+        );
+        assert_eq!(
+            th.text.primary, base.text.primary,
+            "hex inválido deveria ser ignorado"
+        );
+        assert_eq!(th.state.danger, 0xa1b2c3, "ajuste válido não aplicado");
+    }
+
+    /// **F2-1-4 — ajustes vivos:** `set_overrides` aplica sobre o tema ativo, SOBREVIVE a
+    /// `apply` (trocar modo/acento não apaga o refinamento), aparece no export e some com o
+    /// mapa vazio (import atômico). Guard serializa contra os outros testes do global.
+    #[test]
+    fn overrides_survive_apply_and_roundtrip_via_export() {
+        let _guard = THEME_TEST_GUARD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        set_overrides(BTreeMap::from([(
+            "superficie.canvas".to_string(),
+            "#101010".to_string(),
+        )]));
+        assert_eq!(active().surface.canvas, 0x101010, "override não aplicou");
+
+        apply(Mode::Light, "teal");
+        assert_eq!(
+            active().surface.canvas,
+            0x101010,
+            "apply() apagou o ajuste do usuário — refinamento deve sobreviver à troca"
+        );
+        assert_eq!(
+            active().accent_name,
+            "teal",
+            "tema não sabe seu acento canônico"
+        );
+
+        let json = export_json(Mode::Light, "teal");
+        assert!(
+            json.contains("\"ajustes\""),
+            "export sem a seção ajustes: {json}"
+        );
+        assert!(
+            json.contains("\"superficie.canvas\""),
+            "export sem o caminho: {json}"
+        );
+        let prefs = parse_prefs(&json).expect("roundtrip");
+        assert_eq!(
+            prefs.ajustes.expect("ajustes presentes")["superficie.canvas"],
+            "#101010"
+        );
+
+        // mapa vazio = remove o refinamento (import atômico) e volta ao curado.
+        set_overrides(BTreeMap::new());
+        assert_eq!(
+            active().surface.canvas,
+            Theme::build(Mode::Light, "teal").surface.canvas,
+            "mapa vazio deveria restaurar o token curado"
+        );
+        let json = export_json(Mode::Light, "teal");
+        assert!(
+            !json.contains("\"ajustes\""),
+            "ajustes vazios não devem poluir o export"
+        );
+
+        // restaura o default p/ não vazar estado entre testes.
+        apply(Mode::Dark, DEFAULT_ACCENT);
     }
 
     /// Stepping consistente: toda escala TEMÁTICA tem dois degraus REAIS (dark ≠ light) — uma

@@ -4783,9 +4783,13 @@ fn main() {
     // F1-2-1: aplica o tema PERSISTIDO (T7 `settings.json`, ao lado do event log) ANTES de abrir
     // qualquer janela — a escolha dark/light + acento sobrevive ao restart, 100% local (inv #2).
     // (Tema é GLOBAL do processo — aplicado aqui, fora do runtime por-Espaço.)
+    // F2-1-4: `"sistema"` resolve com chute dark AQUI (não há janela ainda — appearance real
+    // é inacessível); o 1º callback do observer (registrado na abertura da janela, abaixo)
+    // re-resolve com o appearance REAL — janela claro-no-SO re-pinta no 1º frame, sem restart.
     {
         let s = persistence_ui::load_settings(&ws_root.join(".lina").join("events"));
-        theme::apply(s.theme_mode(), &s.accent);
+        let setting = theme::ModeSetting::from_setting(&s.theme);
+        theme::apply(setting.resolve(true), &s.accent);
     }
 
     // M8 fatia (i) · infra POR-PROCESSO (`SharedInfra`): o `PtyManager` (processos do SO), a
@@ -5053,6 +5057,28 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                // F2-1-4 (decisão F2-0-D nº2 — chrome SEGUE O SISTEMA): com a janela viva, o
+                // appearance real existe. Re-resolve JÁ (corrige o chute dark do boot p/ quem
+                // usa SO claro) e observa mudanças ao vivo — só re-aplica quando o setting
+                // persistido é "sistema" (escuro/claro fixos ignoram o SO por escolha).
+                let theme_settings_dir = panel_dir.clone();
+                let resolve_system_theme = move |window: &mut Window| {
+                    let s = persistence_ui::load_settings(&theme_settings_dir);
+                    let setting = theme::ModeSetting::from_setting(&s.theme);
+                    if setting == theme::ModeSetting::Sistema {
+                        let is_dark = matches!(
+                            window.appearance(),
+                            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                        );
+                        theme::apply(setting.resolve(is_dark), &s.accent);
+                    }
+                };
+                resolve_system_theme(window);
+                window
+                    .observe_window_appearance(move |window, _cx| {
+                        resolve_system_theme(window);
+                    })
+                    .detach();
                 cx.new(|cx| {
                     WorkspaceView::new(
                         nodes,
