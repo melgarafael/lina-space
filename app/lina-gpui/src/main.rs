@@ -727,8 +727,10 @@ impl WorkspaceView {
                     );
                     let _ = v;
                 }),
-                std::rc::Rc::new(|v: &mut Self, _root: &Path, _w, cx| {
-                    v.sidebar.state.start_rename();
+                std::rc::Rc::new(|v: &mut Self, root: &Path, _w, cx| {
+                    // r5 BUG 2: a ação age na linha CLICADA (as ações agora são visíveis
+                    // em toda linha — renomear pelo roving renomearia a errada).
+                    v.sidebar.state.start_rename_for(root);
                     cx.notify();
                 }),
             ),
@@ -815,8 +817,13 @@ impl WorkspaceView {
         if !self.sidebar.state.expanded {
             self.refresh_sidebar_rows();
             self.sidebar.state.open();
+            // r5: anunciado na live-region (consistência a11y) — e o anúncio ensina os
+            // gestos, já que abrir NÃO move o foco (BUG 4(e)).
+            self.a11y_live
+                .announce("Lista de Espaços aberta — ⌘O recolhe; ⌘F busca.");
         } else {
             self.sidebar.state.close();
+            self.a11y_live.announce("Lista de Espaços recolhida.");
         }
         cx.notify();
     }
@@ -2901,7 +2908,9 @@ impl WorkspaceView {
         // foca o `[ Desfazer ]` e `Enter` o ativa SÓ com o rail aberto (de onde o gesto
         // partiu) — fora dele, Tab/Enter seguem ao terminal focado (não rouba digitação).
         if let Some(t) = &self.archive_toast {
-            if self.sidebar.state.expanded || ks.modifiers.platform {
+            // r5 BUG 4: Tab/Enter do toast SÓ quando o rail é dono do teclado (`kbd`) —
+            // rail meramente aberto não rouba mais Tab/Enter do terminal. ⌘Z segue global.
+            if self.sidebar.state.kbd || ks.modifiers.platform {
                 match sidebar::archive_toast_key(
                     ks.key.as_str(),
                     ks.modifiers.platform,
@@ -2925,45 +2934,70 @@ impl WorkspaceView {
                 }
             }
         }
-        // F1-4-4 · M8 — rail EXPANDIDO: o teclado dirige o switcher (contrato T4 §3: digita
-        // filtra · ↑↓ navega · Enter troca/confirma rename · Esc cancela/fecha SEM trocar).
-        if self.sidebar.state.expanded {
-            match ks.key.as_str() {
-                "escape" => {
-                    if self.sidebar.state.renaming.is_some() {
-                        self.sidebar.state.cancel_rename();
-                    } else {
-                        self.sidebar.state.close();
+        // r5 BUG 4 · M8 — o rail NUNCA rouba o teclado: o roteador puro decide o destino
+        // pela dupla (expanded, kbd). Rail aberto SEM foco deixa tudo FLUIR ao terminal
+        // (inclusive Esc); `⌘F` foca a busca; `⌘O` alterna de qualquer estado (BUG 1).
+        match sidebar::rail_key_route(
+            self.sidebar.state.expanded,
+            self.sidebar.state.kbd,
+            ks.key.as_str(),
+            ks.modifiers.platform,
+        ) {
+            sidebar::RailKey::ToggleRail => {
+                self.toggle_sidebar(cx);
+                cx.stop_propagation();
+                return;
+            }
+            sidebar::RailKey::FocusSearch => {
+                self.sidebar.state.focus_search();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            sidebar::RailKey::ToRail => {
+                match ks.key.as_str() {
+                    "escape" => {
+                        // Esc fecha o rail SÓ porque o foco está nele (BUG 4(c)).
+                        if self.sidebar.state.renaming.is_some() {
+                            self.sidebar.state.cancel_rename();
+                        } else {
+                            self.sidebar.state.close();
+                            self.a11y_live.announce("Lista de Espaços recolhida.");
+                        }
                     }
-                }
-                "up" => self.sidebar.state.select_prev(),
-                "down" => self.sidebar.state.select_next(),
-                "backspace" => self.sidebar.state.backspace(),
-                "enter" | "return" => {
-                    if let Some((root, novo)) = self.sidebar.state.commit_rename() {
-                        self.rename_workspace(&root, &novo, cx);
-                    } else if let Some(row) = self.sidebar.state.selected_row() {
-                        let root = row.ws_root.clone();
-                        self.switch_to_workspace(root, cx);
-                        self.refresh_sidebar_rows();
+                    "up" => self.sidebar.state.select_prev(),
+                    "down" => self.sidebar.state.select_next(),
+                    // r5 BUG 2 (teclado): ⌘⌫ arquiva a linha selecionada — mesmo destino
+                    // do botão [ Arquivar ] (toast com Desfazer da rodada r4).
+                    "backspace" if ks.modifiers.platform => {
+                        if let Some(row) = self.sidebar.state.selected_row() {
+                            let root = row.ws_root.clone();
+                            self.archive_workspace(&root, cx);
+                        }
                     }
-                }
-                _ => {
-                    if !ks.modifiers.platform && !ks.modifiers.control {
-                        if let Some(ch) = ks.key_char.as_deref() {
-                            self.sidebar.state.type_char(ch);
+                    "backspace" => self.sidebar.state.backspace(),
+                    "enter" | "return" => {
+                        if let Some((root, novo)) = self.sidebar.state.commit_rename() {
+                            self.rename_workspace(&root, &novo, cx);
+                        } else if let Some(row) = self.sidebar.state.selected_row() {
+                            let root = row.ws_root.clone();
+                            self.switch_to_workspace(root, cx);
+                            self.refresh_sidebar_rows();
+                        }
+                    }
+                    _ => {
+                        if !ks.modifiers.platform && !ks.modifiers.control {
+                            if let Some(ch) = ks.key_char.as_deref() {
+                                self.sidebar.state.type_char(ch);
+                            }
                         }
                     }
                 }
+                cx.stop_propagation();
+                cx.notify();
+                return;
             }
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        // F1-4-4 · ⌘O abre/recolhe o rail de Espaços (M8; foco do teclado vai à busca — §4).
-        if ks.modifiers.platform && ks.key == "o" {
-            self.toggle_sidebar(cx);
-            return;
+            sidebar::RailKey::PassThrough => {}
         }
         // F1-4-4 · ⌘1..9 troca pelo índice ESTÁVEL do registry (funciona com o M8 FECHADO —
         // posição de criação, contando arquivados; arquivado/ausente = no-op). Contrato T4 §4.

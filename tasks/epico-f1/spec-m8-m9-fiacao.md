@@ -108,7 +108,13 @@ Regra herdada: o limite aparece **antes** do esforço nas 4 vitrines; nenhum cam
 ## §4 · Checklist de a11y por tela (AccessKit — `a11y.rs`/`a11y_live.rs`; padrão W4-6/VoiceOver)
 
 ### M8 (dropdown/switcher)
-- [ ] Abrir (`Cmd+O`/clique) põe o **foco no campo de busca** (ux-flows:670).
+- [x] ~~Abrir (`Cmd+O`/clique) põe o **foco no campo de busca** (ux-flows:670).~~ **EMENDADO na r5
+  (aprovado pelo Arquiteto, 2026-06-12):** este critério ERA a causa-raiz do bug 4 da tela do
+  fundador — o rail aberto com a busca focada SEQUESTRAVA toda digitação dos terminais. Novo
+  contrato (`.entrega-sidebar-ux.md`): abrir o rail **não move o foco**; a busca só captura
+  quando explicitamente focada (⌘F com o rail aberto, ou clique); `Esc` fecha o rail SÓ com o
+  foco nele; `⌘O` ALTERNA (abre/recolhe) + chevron de mouse. O ux-flows:670 fica supersedido
+  neste ponto — uso real do fundador vence o wireframe.
 - [ ] `↑↓` navega as linhas (roving), `Enter` troca, `Esc` fecha **sem trocar**; `Cmd+1…9` funciona com o M8 fechado (índice estável, §1).
 - [ ] Cada linha é UM elemento focável; aria-label = **concatenação dos fragmentos congelados do §5** (separadores tipográficos apenas): «{nome} · {N} Agentes — {Estado} · gasto estimado de hoje neste Espaço: {custo} · {N} Pedidos esperando você» — sem 🔔/custo, o fragmento é OMITIDO (não lido como "zero").
 - [ ] Ordem de leitura = ordem visual; o estado NUNCA é só cor — a palavra viaja no tooltip/aria (regra do fluxo c, "consistência absoluta").

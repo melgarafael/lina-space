@@ -88,6 +88,45 @@ pub fn copy_archive_undone(name: &str) -> String {
     format!("Arquivamento de “{name}” desfeito — o Espaço voltou à lista.")
 }
 
+// ═══════════════ r5 BUG 4 — roteador de teclado do rail (puro, testável) ═══════════════
+
+/// Para onde uma tecla vai com o rail aberto. O princípio (tela do fundador, r5):
+/// **digitação NUNCA é roubada** — o rail só consome teclado quando é o dono (`kbd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailKey {
+    /// `⌘O` — alterna o rail (abre/recolhe), de qualquer lugar.
+    ToggleRail,
+    /// `⌘F` com o rail aberto e sem foco — a busca assume o teclado.
+    FocusSearch,
+    /// O rail é o dono (`kbd`) — a tecla dirige busca/roving/rename/Esc-fecha.
+    ToRail,
+    /// Tudo o mais FLUI ao terminal focado (inclusive Esc com `kbd=false` — o rail
+    /// aberto nunca rouba o Esc de um terminal).
+    PassThrough,
+}
+
+/// Decide o destino de `(key, ⌘?)` dado `(expanded, kbd)`. Não-vacuoso por construção:
+/// remover o conceito de `kbd` faz a matriz do BUG 4 falhar.
+#[must_use]
+pub fn rail_key_route(expanded: bool, kbd: bool, key: &str, platform: bool) -> RailKey {
+    if platform && key == "o" {
+        return RailKey::ToggleRail;
+    }
+    if !expanded {
+        return RailKey::PassThrough;
+    }
+    if kbd {
+        return RailKey::ToRail;
+    }
+    if platform && key == "f" {
+        return RailKey::FocusSearch;
+    }
+    RailKey::PassThrough
+}
+
+/// Subtexto leigo do `[ Arquivar ]` (r5 BUG 2) — honesto sobre o que acontece.
+pub const COPY_M8_ARCHIVE_HINT: &str = "some da lista; nada é apagado do disco";
+
 /// Estado headless do toast «Espaço arquivado · [ Desfazer ] (Ns)» — quem grava o evento
 /// no timeout e remonta as linhas é a fiação do shell (main.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +314,10 @@ pub fn matches_query(name: &str, query: &str) -> bool {
 pub struct SidebarState {
     /// Rail expandido (~280px) ou colapsado em ícones (~52px).
     pub expanded: bool,
+    /// r5 BUG 4: o rail é o DONO do teclado? Abrir o rail NÃO move o foco (o terminal
+    /// segue digitável); só clique na busca / `⌘F` / rename ligam isto — e `Esc` com o
+    /// foco aqui fecha o rail, mas NUNCA rouba o Esc do terminal quando está desligado.
+    pub kbd: bool,
     /// Texto corrente da busca (filtro substring, [`matches_query`]).
     pub query: String,
     /// Seleção do roving — índice na lista FILTRADA (padrão `PaletteState`).
@@ -298,17 +341,27 @@ impl SidebarState {
         }
     }
 
-    /// Abre expandido (o shell põe o foco de teclado na busca — checklist §4).
+    /// Abre expandido. **r5 BUG 4(e) — divergência REGISTRADA da spec §4:** a spec
+    /// mandava focar a busca ao abrir (ux-flows:670); a tela do fundador provou que isso
+    /// sequestra a digitação do terminal. Abrir agora NÃO move o foco (`kbd=false`);
+    /// a busca foca por clique ou `⌘F`.
     pub fn open(&mut self) {
         self.expanded = true;
+        self.kbd = false;
     }
 
-    /// Fecha SEM trocar (Esc, spec §4): zera busca/seleção/rename — reabrir nasce limpo.
+    /// Fecha SEM trocar (Esc, spec §4): zera busca/seleção/rename/foco — reabrir nasce limpo.
     pub fn close(&mut self) {
         self.expanded = false;
+        self.kbd = false;
         self.query.clear();
         self.selected = 0;
         self.renaming = None;
+    }
+
+    /// Clique na busca / `⌘F` com o rail aberto: o rail assume o teclado (BUG 4(b)).
+    pub fn focus_search(&mut self) {
+        self.kbd = true;
     }
 
     /// `⌘O`/clique no rail: expande ↔ colapsa.
@@ -377,11 +430,31 @@ impl SidebarState {
     }
 
     /// Entra no rename inline da linha selecionada, semeado com o nome atual
-    /// (`[ Renomear ]`/atalho). Sem linha sob o roving → no-op honesto.
+    /// (`[ Renomear ]`/atalho). Sem linha sob o roving → no-op honesto. Renomear é
+    /// digitação → o rail assume o teclado (BUG 4: senão as letras iriam ao terminal).
     pub fn start_rename(&mut self) {
         if let Some(row) = self.selected_row() {
             self.renaming = Some(row.name.clone());
+            self.kbd = true;
         }
+    }
+
+    /// Move o roving para a linha de `root` (clique numa ação de linha NÃO-selecionada —
+    /// r5 BUG 2: com as ações visíveis em TODA linha, a ação age na linha CLICADA).
+    pub fn select_root(&mut self, root: &Path) {
+        if let Some(pos) = self
+            .filtered()
+            .iter()
+            .position(|&i| self.rows[i].ws_root == root)
+        {
+            self.selected = pos;
+        }
+    }
+
+    /// `[ Renomear ]` clicado numa linha específica: seleciona-a e abre o rename inline.
+    pub fn start_rename_for(&mut self, root: &Path) {
+        self.select_root(root);
+        self.start_rename();
     }
 
     /// Confirma o rename: devolve `(ws_root, novo)` para o shell despachar em
@@ -707,11 +780,21 @@ impl Sidebar {
         } else {
             th.text.primary
         };
+        // r5 BUG 4: caret visível SÓ quando a busca é dona do teclado — o estado de foco
+        // nunca é só cor (anel + caret).
+        let search_focused = self.state.kbd && self.state.renaming.is_none();
+        let query_view = if search_focused && !self.state.query.is_empty() {
+            format!("{query_view}▏")
+        } else {
+            query_view
+        };
         let header = div()
             .flex()
             .items_center()
             .gap_2()
             .child(
+                // r5 BUG 1: affordance de FECHAR por mouse — chevron explícito (o ▣
+                // antigo não comunicava ação; o fundador só fechava com Esc).
                 div()
                     .id("sb-collapse")
                     .px_2()
@@ -719,25 +802,37 @@ impl Sidebar {
                     .rounded_md()
                     .cursor_pointer()
                     .role(Role::Button)
-                    .aria_label("Espaços — recolher a lista")
+                    .aria_label("Recolher a lista de Espaços (⌘O)")
                     .text_color(rgb(th.text.primary))
                     .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| toggle(v, w, cx)))
-                    .child(text!("▣")),
+                    .child(text!("◀")),
             )
             .child(
                 // Campo de busca: o TEXTO é estado headless (`query`); o roteamento de
-                // teclado é do shell (padrão M3/M4 — input inline sem widget).
-                div()
-                    .id("sb-search")
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(th.surface.raised))
-                    .aria_label("buscar Espaços")
-                    .text_color(rgb(query_color))
-                    .text_size(px(12.0))
-                    .child(text!(query_view)),
+                // teclado é do shell. r5 BUG 4(b): a busca só captura teclado quando
+                // explicitamente focada — clique aqui ou ⌘F.
+                {
+                    let mut search = div()
+                        .id("sb-search")
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(th.surface.raised))
+                        .aria_label("buscar Espaços (⌘F)")
+                        .text_color(rgb(query_color))
+                        .text_size(px(12.0))
+                        .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                            v.sidebar.state.focus_search();
+                            cx.notify();
+                        }))
+                        .child(text!(query_view));
+                    if search_focused {
+                        search = search.border_2().border_color(rgb(th.focus.ring));
+                    }
+                    search
+                },
             );
 
         let filtered = self.state.filtered();
@@ -955,9 +1050,10 @@ impl Sidebar {
             );
         }
 
-        // Ações da linha sob o roving (copy §5): renomear entra no modo inline
-        // (despacho ao shell), arquivar despacha direto com a raiz.
-        if is_roving && renaming.is_none() {
+        // r5 BUG 2: ações VISÍVEIS em TODA linha (antes só na linha sob o roving — quem
+        // usa mouse nunca as via; "não tem como apagar um workspace" era isto). O aria
+        // do Arquivar carrega o subtexto honesto; o destino da ação é a linha CLICADA.
+        if renaming.is_none() {
             let begin = self.on_rename_begin.clone();
             let root_rn = row.ws_root.clone();
             let archive = self.on_archive.clone();
@@ -987,7 +1083,7 @@ impl Sidebar {
                         .rounded_md()
                         .cursor_pointer()
                         .role(Role::Button)
-                        .aria_label(COPY_M8_ARCHIVE)
+                        .aria_label(format!("{COPY_M8_ARCHIVE} — {COPY_M8_ARCHIVE_HINT}"))
                         .text_size(px(10.0))
                         .text_color(rgb(th.text.muted))
                         .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
@@ -995,6 +1091,16 @@ impl Sidebar {
                         }))
                         .child(text!(COPY_M8_ARCHIVE)),
                 );
+            // Subtexto leigo na linha sob o roving (onde o olho está ao navegar por
+            // teclado) — nas demais o aria/tooltip carrega a explicação.
+            if is_roving {
+                line = line.child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_M8_ARCHIVE_HINT)),
+                );
+            }
         }
 
         if is_roving {
@@ -1434,6 +1540,117 @@ mod tests {
         st.type_char("X");
         st.cancel_rename();
         assert_eq!(st.renaming, None, "cancel descarta sem efeito");
+    }
+
+    /// r5 BUG 4 — a MATRIZ do teclado: rail aberto sem foco deixa TUDO fluir ao
+    /// terminal (imprimível, Esc, setas); a busca só captura quando focada (⌘F/clique);
+    /// Esc fecha o rail SÓ com o foco nele; ⌘O alterna de qualquer estado. Não-vacuoso:
+    /// remover o conceito de `kbd` (voltar a rotear por `expanded`) quebra as asserções
+    /// de PassThrough.
+    #[test]
+    fn rail_never_steals_keyboard_matrix() {
+        use RailKey::{FocusSearch, PassThrough, ToRail, ToggleRail};
+        // Rail FECHADO: nada é do rail (⌘O abre; resto flui).
+        assert_eq!(rail_key_route(false, false, "o", true), ToggleRail);
+        assert_eq!(rail_key_route(false, false, "a", false), PassThrough);
+        assert_eq!(rail_key_route(false, false, "escape", false), PassThrough);
+        // Rail ABERTO sem foco (o estado do bug do fundador): digitação vai ao TERMINAL.
+        assert_eq!(rail_key_route(true, false, "a", false), PassThrough);
+        assert_eq!(rail_key_route(true, false, "down", false), PassThrough);
+        assert_eq!(
+            rail_key_route(true, false, "escape", false),
+            PassThrough,
+            "Esc com foco no terminal vai ao terminal — NUNCA fecha o rail"
+        );
+        assert_eq!(
+            rail_key_route(true, false, "o", true),
+            ToggleRail,
+            "⌘O fecha"
+        );
+        assert_eq!(
+            rail_key_route(true, false, "f", true),
+            FocusSearch,
+            "⌘F foca a busca"
+        );
+        // Rail aberto COM foco: o rail dirige (busca/roving/Esc-fecha).
+        assert_eq!(rail_key_route(true, true, "a", false), ToRail);
+        assert_eq!(rail_key_route(true, true, "escape", false), ToRail);
+        assert_eq!(rail_key_route(true, true, "down", false), ToRail);
+        assert_eq!(
+            rail_key_route(true, true, "o", true),
+            ToggleRail,
+            "⌘O fecha mesmo focado"
+        );
+    }
+
+    /// r5 BUG 4(e) + BUG 1: abrir NÃO assume o teclado (divergência registrada da spec
+    /// §4/ux-flows:670 — decisão da tela do fundador); clique na busca/⌘F assume;
+    /// renomear assume (é digitação); fechar limpa tudo.
+    #[test]
+    fn opening_rail_does_not_take_keyboard_focus() {
+        let mut st = SidebarState::default();
+        st.open();
+        assert!(
+            st.expanded && !st.kbd,
+            "aberto, mas o terminal segue dono do teclado"
+        );
+        st.focus_search();
+        assert!(st.kbd, "⌘F/clique na busca: agora o rail é o dono");
+        st.close();
+        assert!(!st.expanded && !st.kbd, "fechar devolve e limpa");
+
+        // Renomear implica digitação → assume o teclado.
+        st.open();
+        st.rows = vec![SidebarRow {
+            name: "Loja".into(),
+            ws_root: PathBuf::from("/tmp/sb-kbd"),
+            focused: false,
+            status: WorkspaceMiniStatus {
+                agents_alive: 0,
+                agents_total: 0,
+                dominant: None,
+                cost_short: None,
+                cost_tooltip: String::new(),
+                unreachable: false,
+            },
+            shortcut_index: Some(1),
+        }];
+        st.start_rename();
+        assert!(st.kbd, "rename inline captura a digitação para o buffer");
+    }
+
+    /// r5 BUG 2: a ação age na linha CLICADA — `start_rename_for(root)` move o roving
+    /// para a linha certa antes de abrir o rename (com as ações visíveis em toda linha,
+    /// renomear pelo roving renomearia a errada).
+    #[test]
+    fn row_action_targets_the_clicked_row() {
+        let status = WorkspaceMiniStatus {
+            agents_alive: 0,
+            agents_total: 0,
+            dominant: None,
+            cost_short: None,
+            cost_tooltip: String::new(),
+            unreachable: false,
+        };
+        let mut st = SidebarState::default();
+        st.open();
+        st.rows = (1..=3)
+            .map(|i| SidebarRow {
+                name: format!("Espaço {i}"),
+                ws_root: PathBuf::from(format!("/tmp/sb-act-{i}")),
+                focused: false,
+                status: status.clone(),
+                shortcut_index: Some(i),
+            })
+            .collect();
+        assert_eq!(st.selected, 0, "roving nasce na 1ª linha");
+        st.start_rename_for(Path::new("/tmp/sb-act-3"));
+        assert_eq!(st.selected, 2, "o roving foi à linha clicada");
+        assert_eq!(
+            st.renaming.as_deref(),
+            Some("Espaço 3"),
+            "renomeia a CLICADA"
+        );
     }
 
     /// Spec §M8 (a11y): o toast de arquivar tem janela REAL de Desfazer — não expira antes
