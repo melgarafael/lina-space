@@ -816,6 +816,14 @@ pub enum DomainEvent {
         #[serde(default)]
         scale_factor: Option<f64>,
     },
+    /// F2-2-4 (costura): um comando da paleta foi EXECUTADO (Enter). `key` é a chave estável
+    /// de `palette::Command::key()` do shell (ex.: `"new_agent"`, `"focus_node:<uuid>"`).
+    /// Alimenta o tier 4 do ranking (hit-count) como PROJEÇÃO por replay — o modelo da
+    /// paleta nunca fabrica contagem (inv#4). META: não entra na projeção do canvas.
+    /// ADITIVO: logs antigos replayam intactos (ranking degrada sem hit-count).
+    PaletteCommandInvoked {
+        key: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -896,6 +904,7 @@ impl DomainEvent {
             DomainEvent::WorkspaceRenamed { .. } => "WorkspaceRenamed",
             DomainEvent::WorkspaceArchived => "WorkspaceArchived",
             DomainEvent::ProfWindowMetric { .. } => "ProfWindowMetric",
+            DomainEvent::PaletteCommandInvoked { .. } => "PaletteCommandInvoked",
         }
     }
 
@@ -1250,7 +1259,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::WorkspaceUnloaded { .. }
         // F2-0-1: resumo da janela [PROF] é META (livro-razão de medição; a régua D0
         // re-deriva % e percentis varrendo o log) — sem efeito na projeção do canvas.
-        | DomainEvent::ProfWindowMetric { .. } => {}
+        | DomainEvent::ProfWindowMetric { .. }
+        // F2-2-4: uso de comando da paleta é META (livro-razão do ranking; o shell projeta
+        // hit-count varrendo o log ao abrir a paleta) — sem efeito na projeção do canvas.
+        | DomainEvent::PaletteCommandInvoked { .. } => {}
     }
 }
 

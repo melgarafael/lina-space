@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::{lock, Model};
 use crate::theme;
+use crate::ui::{Button, ButtonVariant, Input};
 
 /// Quantos frames o badge fica em "salvando…" após o contador subir (≈130ms a 60fps).
 const SAVING_FRAMES: u8 = 8;
@@ -241,6 +242,12 @@ pub struct Settings {
     /// quem re-escolher "escuro" depois fica em "escuro" para sempre.
     #[serde(default)]
     pub theme_migrated_to_system: bool,
+    /// F2-2-4 (costura): MRU da paleta DURÁVEL entre sessões (keys de `palette::Command::key()`,
+    /// frente = mais recente; teto/dedup são do modelo `palette.rs`). O shell injeta no `open`
+    /// e re-grava a cada escolha. Aditivo: settings antigos carregam vazio (ranking degrada
+    /// graciosamente sem MRU — tiers alias/fuzzy seguem).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub palette_mru: Vec<String>,
 }
 
 fn default_accent_setting() -> String {
@@ -263,6 +270,7 @@ impl Default for Settings {
             theme_overrides: BTreeMap::new(),
             // Instalação nova já nasce em "sistema" — nada a migrar (e o load não re-grava).
             theme_migrated_to_system: true,
+            palette_mru: Vec::new(),
         }
     }
 }
@@ -832,19 +840,14 @@ impl PersistenceView {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let label = label.into();
-        div()
-            .id(id)
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(bg))
-            .text_color(rgb(fg))
-            .cursor_pointer()
+        let label: String = label.into();
+        // Consolidado no Button do catálogo (F2-2-1): ganha role(Button)+aria de graça (a11y que
+        // o helper inline não tinha), mantendo o par (bg,fg) WCAG-coberto que o call-site escolhe.
+        Button::new(id, label)
+            .variant(ButtonVariant::Custom(bg, fg))
             .on_click(cx.listener(move |view, _ev: &ClickEvent, window, cx| {
                 on_click(view, window, cx);
             }))
-            .child(text!(label))
             .into_any_element()
     }
 
@@ -1257,14 +1260,8 @@ impl PersistenceView {
     fn plan_key_field(&self, cx: &mut Context<Self>) -> AnyElement {
         use crate::license_ui as lic;
         let th = theme::active();
-        let (shown, fg) = if self.model.plan_key().input.is_empty() {
-            (
-                format!("{} (clique para colar)", lic::COPY_KEY_PLACEHOLDER),
-                th.text.muted,
-            )
-        } else {
-            (self.model.plan_key().input.clone(), th.text.bright)
-        };
+        let key = self.model.plan_key().input.clone();
+        let placeholder = format!("{} (clique para colar)", lic::COPY_KEY_PLACEHOLDER);
         let mut col = div()
             .flex()
             .flex_col()
@@ -1276,23 +1273,19 @@ impl PersistenceView {
                     .child(text!(lic::COPY_KEY_LABEL)),
             )
             .child(
-                div()
-                    .id("plan-key-field")
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(th.surface.border))
-                    .bg(rgb(th.surface.card))
-                    .text_color(rgb(fg))
-                    .cursor_pointer()
+                // F2-2-1: campo simulado consolidado no Input (paste_only) — o clique cola do
+                // clipboard (o gesto leigo "copiei do e-mail → colo aqui"). Ganha aria_label; cor da
+                // borda/texto/placeholder vêm do tema por dentro (placeholder apagado, valor primário).
+                Input::new("plan-key-field", key)
+                    .placeholder(placeholder)
+                    .paste_only()
+                    .aria("Chave do Lina PRO — clique para colar")
                     .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
                         if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
                             view.model.plan_paste(&text);
                         }
                         cx.notify();
-                    }))
-                    .child(text!(shown)),
+                    })),
             )
             .child(self.button(
                 "plan-key-activate",

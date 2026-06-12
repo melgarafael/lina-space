@@ -60,6 +60,17 @@ pub const COPY_M8_SEARCH_PLACEHOLDER: &str = "( buscar… )";
 /// Busca sem resultado (copy-f1-4.md §5 — congelada).
 pub const COPY_M8_SEARCH_EMPTY: &str = "Nenhum Espaço com esse nome.";
 
+// F2-2-4 — strings da PORTA VISÍVEL da paleta de comandos. Não há fonte única de strings (R9) neste
+// crate: a convenção é `COPY_*` por módulo (ver acima). Rótulo LEIGO ("Buscar comandos") + o atalho
+// (⌘K) exibido no botão. O botão abre a MESMA paleta do ⌘K, materializando o invariante de fase
+// "nada existe só atrás de atalho" (paleta escondida = paleta morta — D4-A1).
+/// Rótulo visível do botão de busca de comandos (≠ a busca de Espaços, que é ⌘F).
+pub const COPY_PALETTE_BUTTON: &str = "Buscar comandos";
+/// Atalho exibido junto ao rótulo.
+pub const COPY_PALETTE_SHORTCUT: &str = "⌘K";
+/// Aria (a palavra viaja para o leitor de tela mesmo quando o rail está colapsado em ícone).
+pub const COPY_PALETTE_ARIA: &str = "Buscar comandos — atalho Command-K";
+
 /// Botão de criar a partir da busca vazia (copy-f1-4.md §5: `[ + Criar “{texto}” ]`).
 #[must_use]
 pub fn create_from_search_label(texto: &str) -> String {
@@ -686,6 +697,10 @@ pub struct Sidebar {
     /// Core A2A; aqui só o render. **`None` = seam ainda não plugado ⇒ a ação NÃO
     /// aparece** (botão que não faz nada é tela que mente). Setado via [`Self::set_on_unload`].
     pub on_unload: Option<RowCallback>,
+    /// F2-2-4 — clique na PORTA VISÍVEL da paleta de comandos (abre o que o ⌘K abre). Mesmo racional
+    /// `Option` do `on_unload`: **`None` ⇒ o botão NÃO aparece** (sem fiação, não há porta). Setado
+    /// via [`Self::set_on_open_palette`].
+    pub on_open_palette: Option<PlainCallback>,
 }
 
 /// Cor do ● a partir do token SEMÂNTICO do estado (mesmo mapa do dashboard no shell —
@@ -724,6 +739,7 @@ impl Sidebar {
             on_archived,
             on_rename_begin,
             on_unload: None,
+            on_open_palette: None,
         }
     }
 
@@ -732,6 +748,77 @@ impl Sidebar {
     /// do mecanismo e o botão só existe quando há executor de verdade.
     pub fn set_on_unload(&mut self, cb: RowCallback) {
         self.on_unload = Some(cb);
+    }
+
+    /// F2-2-4 — pluga a PORTA VISÍVEL da paleta. A partir daqui o botão "Buscar comandos · ⌘K"
+    /// aparece no rail (colapsado e expandido) e abre a paleta ao clique. Mesmo padrão do
+    /// `set_on_unload`: a UI só mostra a porta quando há quem a abra.
+    pub fn set_on_open_palette(&mut self, cb: PlainCallback) {
+        self.on_open_palette = Some(cb);
+    }
+
+    /// O botão da porta da paleta, ou nada se o seam não está plugado. `compact` = forma de ÍCONE
+    /// (rail colapsado, 52px — só a lupa, com a palavra no aria); senão a PÍLULA rotulada
+    /// ("🔍 Buscar comandos · ⌘K"). Os dois disparam o mesmo `on_open_palette`.
+    fn palette_button(
+        &self,
+        th: &Theme,
+        cx: &mut Context<WorkspaceView>,
+        compact: bool,
+    ) -> Option<AnyElement> {
+        let open = self.on_open_palette.clone()?;
+        let base = div()
+            .id("sb-palette-open")
+            .rounded_md()
+            .cursor_pointer()
+            .role(Role::Button)
+            .aria_label(COPY_PALETTE_ARIA)
+            .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| open(v, w, cx)));
+        let btn = if compact {
+            base.flex()
+                .flex_col()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .py_1()
+                .text_color(rgb(th.text.secondary))
+                .child(
+                    div()
+                        .text_size(px(f32::from(th.typography.size.subtitle)))
+                        .child(text!("🔍")),
+                )
+                .child(
+                    // A palavra viaja mesmo no rail estreito — porta ROTULADA, não só ícone.
+                    div()
+                        .text_size(px(f32::from(th.typography.size.caption)))
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_PALETTE_BUTTON
+                            .split(' ')
+                            .next()
+                            .unwrap_or("Buscar"))),
+                )
+        } else {
+            base.flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgb(th.surface.raised))
+                .text_color(rgb(th.text.primary))
+                .text_size(px(f32::from(th.typography.size.body)))
+                .child(text!(format!("🔍  {COPY_PALETTE_BUTTON}")))
+                .child(
+                    // Atalho à direita, esmaecido (Notion/Zed: a porta ENSINA o atalho).
+                    div()
+                        .flex_1()
+                        .flex()
+                        .justify_end()
+                        .text_size(px(f32::from(th.typography.size.small)))
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_PALETTE_SHORTCUT)),
+                )
+        };
+        Some(btn.into_any_element())
     }
 
     /// Render do rail — colapsado (ícones) ou expandido (busca + linhas + rodapé).
@@ -771,6 +858,10 @@ impl Sidebar {
                     .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| toggle(v, w, cx)))
                     .child(text!("▣")),
             );
+        // F2-2-4: a porta da paleta vive no TOPO do rail — sempre visível, mesmo colapsado.
+        if let Some(btn) = self.palette_button(th, cx, true) {
+            rail = rail.child(btn);
+        }
         for (idx, row) in self.state.rows.iter().enumerate() {
             let switch = self.on_switch.clone();
             let root = row.ws_root.clone();
@@ -992,6 +1083,9 @@ impl Sidebar {
             .text_size(px(12.0))
             .line_height(px(18.0))
             .child(header)
+            // F2-2-4: porta ROTULADA da paleta de comandos (≠ busca de Espaços acima). Logo no topo,
+            // modelo Notion search-first: o leigo clica e descobre o que o Lina faz.
+            .children(self.palette_button(th, cx, false))
             .child(list)
             .child(footer)
             .into_any_element()

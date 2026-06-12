@@ -59,6 +59,9 @@ mod prof;
 // F1-4-6: copy congelada + estado headless da ativação do Lina PRO (campo de colar,
 // erros leigos por variante, painel do plano) — compartilhado pelo M9 (1b) e T7§P.
 mod license_ui;
+// F2-2-1 · catálogo de componentes núcleo (botão/painel/input/modal) da fusão T1+T3. Registro de
+// módulo apenas — a costura de boot/wiring do main.rs segue do Maestro (despacho r4).
+mod ui;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -757,7 +760,46 @@ impl WorkspaceView {
                 }
                 cx.notify();
             }));
+        // F2-2-4 · plug da PORTA VISÍVEL da paleta: o botão rotulado do rail abre a MESMA paleta do
+        // ⌘K. Sem este plug o botão nem aparece (Option None) — porta sem dono não se desenha.
+        view.sidebar
+            .set_on_open_palette(std::rc::Rc::new(|v: &mut Self, _w, cx| {
+                v.open_command_palette(cx);
+            }));
         view
+    }
+
+    /// F2-2-4 — abre a paleta de comandos (ponto ÚNICO: ⌘K e o botão do rail caem aqui). Rebuild dos
+    /// comandos com o roster do momento + injeção do contexto de ranking (MRU já vive no estado da
+    /// paleta entre aberturas; o hit-count é projeção do event log — costura `events.rs`).
+    fn open_command_palette(&mut self, cx: &mut Context<Self>) {
+        let cmds = self.palette_commands();
+        // F2-2-4 (costura): MRU durável (settings.json) + hit-count como PROJEÇÃO do event
+        // log (fold de `PaletteCommandInvoked` no abrir — ⌘K não é hot path; o modelo nunca
+        // fabrica contagem, inv#4). Store ilegível ⇒ HashMap vazio (ranking degrada).
+        let settings = persistence_ui::load_settings(&self.settings_dir);
+        self.palette.set_mru(settings.palette_mru);
+        let mut hits: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let active_root = lock(&self.runtimes).active.clone();
+        let mounted = {
+            let r = lock(&self.runtimes);
+            r.map.get(&active_root).map(|rt| Arc::clone(&rt.store))
+        };
+        if let Some(store) = mounted {
+            if let Ok(events) = lock(&store).events() {
+                for rec in events {
+                    // EventRecord é (kind + payload JSON) — filtra por kind e lê a key crua.
+                    if rec.kind == "PaletteCommandInvoked" {
+                        if let Some(key) = rec.payload.get("key").and_then(|v| v.as_str()) {
+                            *hits.entry(key.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.palette.set_hits(hits);
+        self.palette.open(cmds);
+        cx.notify();
     }
 
     // ──────────────────── F1-4-4 · troca VIVA de Espaço (fatia ii do M8) ────────────────────
@@ -2908,6 +2950,19 @@ impl WorkspaceView {
                 ks.key_char.as_deref()
             };
             if let Some(action) = self.palette.handle_key(ks.key.as_str(), ch) {
+                // F2-2-4 (costura): o Enter acabou de registrar a escolha no MRU do modelo
+                // (frente = a key executada). Persiste o fato no log (hit-count por replay)
+                // e o MRU nos settings ANTES de rodar a ação (ações podem trocar de Espaço).
+                if let Some(chosen) = self.palette.mru().first().cloned() {
+                    let active_root = lock(&self.runtimes).active.clone();
+                    self.append_to_workspace(
+                        &active_root,
+                        &lina_core::DomainEvent::PaletteCommandInvoked { key: chosen },
+                    );
+                    let mut settings = persistence_ui::load_settings(&self.settings_dir);
+                    settings.palette_mru = self.palette.mru().to_vec();
+                    persistence_ui::save_settings(&self.settings_dir, &settings);
+                }
                 self.run_palette_action(action, window, cx);
             }
             // Modal: consome a tecla de filtro p/ o IME não vazar a query ao PTY (ver naming acima).
@@ -3049,11 +3104,10 @@ impl WorkspaceView {
             self.open_agent_modal_create(cx);
             return;
         }
-        // ⌘K abre a paleta (rebuild dos comandos com o roster do momento).
+        // ⌘K abre a paleta (rebuild dos comandos com o roster do momento) — mesmo ponto que o botão
+        // visível do rail (F2-2-4: a porta tem duas entradas, uma fiação só).
         if ks.modifiers.platform && ks.key == "k" {
-            let cmds = self.palette_commands();
-            self.palette.open(cmds);
-            cx.notify();
+            self.open_command_palette(cx);
             return;
         }
         // F1-1-7: ⌘J abre/fecha a Fila de Atenção (proposta do ux-flows; sem colisão).

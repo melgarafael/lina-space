@@ -422,6 +422,7 @@ pub fn play_attention_sound() {
 use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, Role, Window};
 
 use crate::theme::Theme;
+use crate::ui::{Button, ButtonSize, ButtonVariant};
 use crate::WorkspaceView;
 
 /// Largura do toast (canto inferior direito — não cobre nós nem o input em foco).
@@ -440,20 +441,11 @@ fn btn<F>(
 where
     F: Fn(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>) + 'static,
 {
-    let label = label.into();
-    div()
-        .id(id)
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(rgb(bg))
-        .text_color(rgb(fg))
-        .text_size(px(11.0))
-        .cursor_pointer()
-        .role(Role::Button)
-        .aria_label(label.clone())
+    let label: String = label.into();
+    Button::new(id, label)
+        .variant(ButtonVariant::Custom(bg, fg))
+        .size(ButtonSize::Sm)
         .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| on_click(v, w, cx)))
-        .child(text!(label))
         .into_any_element()
 }
 

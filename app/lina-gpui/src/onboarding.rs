@@ -32,6 +32,7 @@ use lina_cli_profiles::{InstallRecipe, Installers};
 
 use crate::dev_tools::DevToolsModel;
 use crate::obsidian::SecondBrainModel;
+use crate::ui::{Button, ButtonSize};
 
 use gpui::{
     div, prelude::*, px, rgb, size, text, AnyElement, App, Bounds, ClickEvent, Context,
@@ -772,20 +773,13 @@ impl OnboardingView {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let label = label.into();
-        div()
-            .id(id)
-            .px_5()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(th().accent.confirm))
-            .text_color(rgb(th().text.on_accent))
-            .font_weight(FontWeight::BOLD)
-            .cursor_pointer()
+        let label: String = label.into();
+        Button::new(id, label)
+            .confirm()
+            .size(ButtonSize::Lg)
             .on_click(cx.listener(move |view, _ev: &ClickEvent, window, cx| {
                 on_click(view, window, cx);
             }))
-            .child(text!(label))
             .into_any_element()
     }
 
@@ -797,19 +791,12 @@ impl OnboardingView {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
-        let label = label.into();
-        div()
-            .id(id)
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(th().surface.raised))
-            .text_color(rgb(th().text.primary))
-            .cursor_pointer()
+        let label: String = label.into();
+        Button::new(id, label)
+            .secondary()
             .on_click(cx.listener(move |view, _ev: &ClickEvent, window, cx| {
                 on_click(view, window, cx);
             }))
-            .child(text!(label))
             .into_any_element()
     }
 
@@ -1033,19 +1020,12 @@ impl OnboardingView {
 
     /// Botão "Instalar para mim" de um CLI.
     fn install_button(&self, id: &'static str, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .id(id)
-            .px_4()
-            .py_2()
-            .rounded_md()
-            .bg(rgb(th().accent.action))
-            .text_color(rgb(th().text.on_accent))
-            .cursor_pointer()
+        Button::new(id, "Instalar para mim")
+            .action()
             .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
                 view.model.start_install(id);
                 cx.notify(); // desenha o feedback NA HORA; o pulso assume a animação do progresso
             }))
-            .child(text!("Instalar para mim"))
             .into_any_element()
     }
 

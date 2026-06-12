@@ -31,6 +31,7 @@ use lina_cli_profiles::{InstallRecipe, Installers, CURRENT_OS};
 use lina_core::{find_in_path, query_version, DiscoveredCli};
 
 use crate::onboarding::{install_recipe_with, run_install, InstallState, OnboardingView};
+use crate::ui::{Button, ButtonSize};
 
 // ───────────────────────────── paleta (espelha o onboarding/canvas) ─────────────────────────────
 // Mantidas locais (as do `onboarding` são module-private); os valores ESPELHAM a paleta de lá.
@@ -770,62 +771,42 @@ fn banner(bg: u32, fg: u32, msg: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// Botão "Instalar para mim" de uma ferramenta (roteia o clique pela view-pai).
+/// Botão "Instalar para mim" de uma ferramenta (roteia o clique pela view-pai). Consolidado no
+/// [`Button`] do catálogo (F2-2-1) — era cópia literal do `install_button` do onboarding.
 fn install_button(id: &'static str, cx: &mut Context<OnboardingView>) -> AnyElement {
-    div()
-        .id(id)
-        .px_4()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(th().accent.action))
-        .text_color(rgb(th().text.on_accent))
-        .cursor_pointer()
+    Button::new(id, "Instalar para mim")
+        .action()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, _w, cx| {
             onb.dev_tools.start_install(id);
             cx.notify(); // desenha o feedback na hora; o pulso assume a animação
         }))
-        .child(text!("Instalar para mim"))
         .into_any_element()
 }
 
-/// Botão primário (avançar). Espelha o `primary_button` do onboarding (que é private lá).
+/// Botão primário (avançar). Consolidado no [`Button`] do catálogo (variante `confirm`, `Lg`).
 fn primary_button(
     id: &'static str,
     label: &'static str,
     cx: &mut Context<OnboardingView>,
     on_click: impl Fn(&mut OnboardingView, &mut Window, &mut Context<OnboardingView>) + 'static,
 ) -> AnyElement {
-    div()
-        .id(id)
-        .px_5()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(th().accent.confirm))
-        .text_color(rgb(th().text.on_accent))
-        .font_weight(FontWeight::BOLD)
-        .cursor_pointer()
+    Button::new(id, label)
+        .confirm()
+        .size(ButtonSize::Lg)
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, window, cx| on_click(onb, window, cx)))
-        .child(text!(label))
         .into_any_element()
 }
 
-/// Botão secundário (voltar / verificar). Espelha o `ghost_button` do onboarding.
+/// Botão secundário (voltar / verificar). Consolidado no [`Button`] do catálogo (variante `secondary`).
 fn ghost_button(
     id: &'static str,
     label: &'static str,
     cx: &mut Context<OnboardingView>,
     on_click: impl Fn(&mut OnboardingView, &mut Window, &mut Context<OnboardingView>) + 'static,
 ) -> AnyElement {
-    div()
-        .id(id)
-        .px_4()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(th().surface.raised))
-        .text_color(rgb(th().text.primary))
-        .cursor_pointer()
+    Button::new(id, label)
+        .secondary()
         .on_click(cx.listener(move |onb, _ev: &ClickEvent, window, cx| on_click(onb, window, cx)))
-        .child(text!(label))
         .into_any_element()
 }
 

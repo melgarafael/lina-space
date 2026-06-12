@@ -5,6 +5,23 @@
 //!
 //! UX: **Cmd-K abre** (com a lista de comandos do momento) · **digitar filtra** (subsequência) · **↑↓
 //! navega** · **Enter executa** a seleção · **Esc fecha**.
+//!
+//! **F2-2-4 — porta visível + ranking previsível.** A paleta deixou de ser só ⌘K: o `sidebar.rs`
+//! ganhou um botão ROTULADO ("Buscar comandos · ⌘K") que abre esta mesma paleta — materializando o
+//! invariante de fase **"nada existe só atrás de atalho"** (paleta escondida = paleta morta, caso
+//! GitHub auditado em D4-A1). E o filtro virou um **ranking determinístico em tiers** (D4-A2, modelo
+//! Zed), nesta ordem fixa — para quem digita NUNCA se surpreender:
+//!
+//! 1. **alias estrito por prefixo** — sinônimos técnicos como keywords invisíveis ("webhook" acha "Gatilho"); um prefixo do rótulo ou de um alias sobe ao topo;
+//! 2. **MRU curto e estável** — o que você usou por último (persistido pelo shell);
+//! 3. **fuzzy smart-case** — a subsequência de sempre (case-sensitive só se você digitar maiúscula);
+//! 4. **hit-count** — desempate por popularidade, **projeção do event log** (costura `events.rs`; injetado via [`PaletteState::set_hits`] — o modelo NUNCA fabrica contagem).
+//!
+//! Tudo PURO e testável sem gpui (ver `tests`). **Filtro por contexto** (padrão Zed
+//! `CommandPaletteFilter`): ações inaplicáveis ao estado atual saem da lista (não acinzentadas) —
+//! o shell marca [`Command::when`] e o ranking as descarta.
+
+use std::collections::HashMap;
 
 use gpui::{div, prelude::*, px, rgb, text, AnyElement};
 use lina_host::NodeId;
@@ -37,31 +54,64 @@ pub enum PaletteAction {
 #[must_use]
 pub fn base_commands() -> Vec<Command> {
     vec![
-        Command::new("✦ Novo agente", PaletteAction::NewAgent),
+        Command::new("✦ Novo agente", PaletteAction::NewAgent)
+            .with_aliases(&["terminal", "criar", "novo", "time", "colega", "ia"]),
         Command::new(
             "🎨 Aparência: tema e cores (claro/escuro) — Ajustes",
             PaletteAction::OpenSettings,
-        ),
+        )
+        .with_aliases(&[
+            "configuração",
+            "preferências",
+            "settings",
+            "acento",
+            "fonte",
+        ]),
         Command::new(
             "⏸ Pausar / retomar orquestração (freio)",
             PaletteAction::ToggleBrake,
-        ),
-        Command::new("📝 Nova nota", PaletteAction::NewNote),
-        Command::new("📁 Nova pasta", PaletteAction::NewFolder),
+        )
+        .with_aliases(&["parar", "pausar", "retomar", "brake", "congelar"]),
+        Command::new("📝 Nova nota", PaletteAction::NewNote).with_aliases(&[
+            "documento",
+            "texto",
+            "anotação",
+            "markdown",
+        ]),
+        Command::new("📁 Nova pasta", PaletteAction::NewFolder).with_aliases(&[
+            "diretório",
+            "folder",
+            "organizar",
+        ]),
         // F1-1-5 (entry point descobrível do P6 — fluxo c): "dashboard", "atividade",
         // "custo" são os termos que um leigo digita.
         Command::new(
             "📊 Dashboard: atividade e custos do time",
             PaletteAction::ToggleDashboard,
-        ),
+        )
+        .with_aliases(&[
+            "gasto",
+            "dinheiro",
+            "preço",
+            "consumo",
+            "painel",
+            "métricas",
+        ]),
     ]
 }
 
-/// Um comando listável: rótulo (o que o humano lê/filtra) + ação.
+/// Um comando listável: rótulo (o que o humano LÊ) + `aliases` (keywords INVISÍVEIS que o humano
+/// pode DIGITAR — sinônimos técnicos: "webhook"→"Gatilho") + ação + `enabled` (filtro por contexto).
 #[derive(Debug, Clone)]
 pub struct Command {
     pub label: String,
     pub action: PaletteAction,
+    /// Termos extras que casam a query mas NÃO aparecem no rótulo (D4-A2: o leigo digita o sinônimo
+    /// que conhece; o alias estrito por prefixo é o tier 1 do ranking).
+    pub aliases: Vec<String>,
+    /// Filtro por contexto (padrão Zed `CommandPaletteFilter`): `false` = inaplicável ao estado
+    /// atual → SAI da lista (não acinzentado). Default `true`; o shell rebaixa com [`Self::when`].
+    pub enabled: bool,
 }
 
 impl Command {
@@ -69,8 +119,120 @@ impl Command {
         Self {
             label: label.into(),
             action,
+            aliases: Vec::new(),
+            enabled: true,
         }
     }
+
+    /// Anexa keywords invisíveis (sinônimos). Builder — encadeia após `new`.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &[&str]) -> Self {
+        self.aliases = aliases.iter().map(|s| (*s).to_owned()).collect();
+        self
+    }
+
+    /// Filtro por contexto: `when(false)` tira o comando da lista enquanto a condição não vale
+    /// (ex.: "Editar Agente" só com um Agente vivo selecionado). Builder.
+    // dead_code: os comandos de HOJE são todos sempre-aplicáveis — o 1º consumidor de produção
+    // são os comandos contextuais da F2-2-5/2-6 ("Arrumar" só com ≥2 nós etc.). Remover ao fiar.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn when(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// **Identidade ESTÁVEL** do comando para MRU e hit-count — derivada da AÇÃO (não do rótulo, que
+    /// muda com i18n/emoji). Ações com nó carregam o id, para o MRU distinguir "Focar: A" de
+    /// "Focar: B". É a chave que o event log projeta em contagem de uso (costura `events.rs`).
+    #[must_use]
+    pub fn key(&self) -> String {
+        action_key(&self.action)
+    }
+}
+
+/// Chave estável por variante de [`PaletteAction`] (ver [`Command::key`]).
+#[must_use]
+fn action_key(action: &PaletteAction) -> String {
+    use PaletteAction as A;
+    match action {
+        A::NewAgent => "new_agent".to_owned(),
+        A::EditAgent(id) => format!("edit_agent:{id}"),
+        A::FocusNode(id) => format!("focus_node:{id}"),
+        A::ToggleBrake => "toggle_brake".to_owned(),
+        A::OpenSettings => "open_settings".to_owned(),
+        A::NewNote => "new_note".to_owned(),
+        A::NewFolder => "new_folder".to_owned(),
+        A::ToggleDashboard => "toggle_dashboard".to_owned(),
+    }
+}
+
+/// Quantos comandos o MRU lembra (curto e estável — D4-A2: uma lista longa deixa de ser previsível).
+const MRU_CAP: usize = 8;
+
+/// **A classe de casamento** de um comando contra a query — o tier 1 do ranking. `Prefix` (a query é
+/// prefixo do rótulo OU de um alias) vem ANTES de `Fuzzy` (subsequência espalhada). Ordem do derive
+/// = ordem de prioridade (menor = melhor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchClass {
+    Prefix,
+    Fuzzy,
+}
+
+/// **Smart-case:** se a query tem QUALQUER maiúscula, casa case-SENSITIVE (o humano foi específico);
+/// senão, case-insensitive. Norma comum a prefixo e subsequência.
+fn fold(query: &str, haystack: &str) -> (String, String) {
+    if query.chars().any(char::is_uppercase) {
+        (query.to_owned(), haystack.to_owned())
+    } else {
+        (query.to_lowercase(), haystack.to_lowercase())
+    }
+}
+
+/// A query (smart-case) é PREFIXO do haystack?
+fn is_prefix(query: &str, haystack: &str) -> bool {
+    let (q, h) = fold(query, haystack);
+    h.starts_with(&q)
+}
+
+/// A query (smart-case) é SUBSEQUÊNCIA do haystack? Mesma norma de caixa do prefixo (via [`fold`]),
+/// para o smart-case valer inteiro — prefixo e fuzzy nunca discordam sobre maiúsculas.
+fn is_subsequence(query: &str, haystack: &str) -> bool {
+    let (q, h) = fold(query, haystack);
+    if q.is_empty() {
+        return true;
+    }
+    let mut needle = q.chars().peekable();
+    for hc in h.chars() {
+        match needle.peek() {
+            Some(&qc) if qc == hc => {
+                needle.next();
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    needle.peek().is_none()
+}
+
+/// A melhor [`MatchClass`] do comando contra a query (rótulo + aliases), ou `None` se não casa.
+/// Query vazia → `Fuzzy` (casa tudo; o MRU/hit-count é que ordena a lista default).
+fn match_class(query: &str, cmd: &Command) -> Option<MatchClass> {
+    if query.is_empty() {
+        return Some(MatchClass::Fuzzy);
+    }
+    let haystacks =
+        std::iter::once(cmd.label.as_str()).chain(cmd.aliases.iter().map(String::as_str));
+    let mut best: Option<MatchClass> = None;
+    for h in haystacks {
+        if is_prefix(query, h) {
+            return Some(MatchClass::Prefix); // melhor possível — corta cedo
+        }
+        if is_subsequence(query, h) {
+            best = Some(MatchClass::Fuzzy);
+        }
+    }
+    best
 }
 
 /// **Estado da paleta** (vive no `WorkspaceView`). Fechada por padrão.
@@ -81,6 +243,13 @@ pub struct PaletteState {
     /// Índice da seleção DENTRO da lista FILTRADA.
     selected: usize,
     commands: Vec<Command>,
+    /// MRU — chaves dos comandos usados, MAIS RECENTE PRIMEIRO (tier 2 do ranking). SOBREVIVE a
+    /// abrir/fechar (não é limpo em `close`/`open`); o shell o carrega 1× no boot ([`Self::set_mru`])
+    /// e o persiste após cada escolha ([`Self::mru`]).
+    mru: Vec<String>,
+    /// Hit-count por chave — **projeção do event log** (costura `events.rs`), injetada a cada
+    /// abertura ([`Self::set_hits`]). Desempate final (tier 4). Vazio = sem dados ⇒ não desempata.
+    hits: HashMap<String, u32>,
 }
 
 impl PaletteState {
@@ -105,13 +274,35 @@ impl PaletteState {
         self.commands.clear();
     }
 
-    /// Comandos que casam a query (fuzzy, ordem original). Query vazia → todos.
+    /// Carrega o MRU persistido (shell, 1× no boot). Trunca ao [`MRU_CAP`].
+    pub fn set_mru(&mut self, mru: Vec<String>) {
+        self.mru = mru;
+        self.mru.truncate(MRU_CAP);
+    }
+
+    /// O MRU atual (mais recente primeiro) — o shell persiste isto após cada escolha.
+    #[must_use]
+    pub fn mru(&self) -> &[String] {
+        &self.mru
+    }
+
+    /// Injeta o hit-count (projeção do event log) usado como desempate. Chamado a cada abertura.
+    pub fn set_hits(&mut self, hits: HashMap<String, u32>) {
+        self.hits = hits;
+    }
+
+    /// Comandos APLICÁVEIS que casam a query, **ranqueados** (alias-prefixo > MRU > fuzzy >
+    /// hit-count). Query vazia → todos os aplicáveis, ordenados por MRU/hit-count. Ver [`rank`].
     #[must_use]
     pub fn filtered(&self) -> Vec<&Command> {
-        self.commands
-            .iter()
-            .filter(|c| fuzzy_match(&self.query, &c.label))
-            .collect()
+        rank(&self.commands, &self.query, &self.mru, &self.hits)
+    }
+
+    /// Registra uma escolha no MRU: a chave vai para a FRENTE (dedup), truncando ao [`MRU_CAP`].
+    fn record_use(&mut self, key: &str) {
+        self.mru.retain(|k| k != key);
+        self.mru.insert(0, key.to_owned());
+        self.mru.truncate(MRU_CAP);
     }
 
     /// **Trata UMA tecla** com a paleta aberta. `Some(action)` no Enter (e fecha); `None` caso
@@ -123,9 +314,16 @@ impl PaletteState {
                 None
             }
             "enter" | "return" => {
-                let action = self.filtered().get(self.selected).map(|c| c.action.clone());
+                // Extrai (ação + chave) da seleção ANTES de mutar — a escolha sobe no MRU (tier 2).
+                let chosen = self
+                    .filtered()
+                    .get(self.selected)
+                    .map(|c| (c.action.clone(), c.key()));
+                if let Some((_, key)) = &chosen {
+                    self.record_use(key);
+                }
                 self.close();
-                action
+                chosen.map(|(action, _)| action)
             }
             "up" => {
                 self.move_sel(-1);
@@ -241,25 +439,42 @@ impl PaletteState {
     }
 }
 
-/// **Fuzzy-match SIMPLES:** a `query` (case-insensitive) é SUBSEQUÊNCIA do `label`. Query vazia casa
-/// tudo. Ex.: "na" casa "Novo **a**gente" (n…a) e "**N**ova not**a**".
+/// **O ranking determinístico (F2-2-4 / D4-A2).** Função PURA — a fonte da previsibilidade. Recebe os
+/// comandos, a query e o contexto (MRU + hit-count) e devolve os APLICÁVEIS que casam, ordenados em
+/// tiers FIXOS (estável: empates caem na ordem original). Tiers, do mais forte ao mais fraco:
+///   1. **classe de casamento** — `Prefix` (alias/rótulo começa com a query) antes de `Fuzzy`;
+///   2. **MRU** — usado mais recentemente primeiro (chave em [`PaletteState::mru`]);
+///   3. **hit-count** — mais popular primeiro (projeção do event log);
+///   4. **ordem original** — desempate final, para o resultado nunca "dançar" entre teclas.
+///
+/// O **filtro por contexto** (Zed `CommandPaletteFilter`) é o primeiro passo: `!c.enabled` sai fora.
 #[must_use]
-pub fn fuzzy_match(query: &str, label: &str) -> bool {
-    let q = query.to_lowercase();
-    if q.is_empty() {
-        return true;
-    }
-    let mut needle = q.chars().peekable();
-    for lc in label.to_lowercase().chars() {
-        match needle.peek() {
-            Some(&qc) if qc == lc => {
-                needle.next();
-            }
-            Some(_) => {}
-            None => break,
-        }
-    }
-    needle.peek().is_none()
+pub fn rank<'a>(
+    commands: &'a [Command],
+    query: &str,
+    mru: &[String],
+    hits: &HashMap<String, u32>,
+) -> Vec<&'a Command> {
+    // Rank do MRU: índice na lista (0 = mais recente); ausente = pior (fim).
+    let mru_rank = |key: &str| mru.iter().position(|k| k == key).unwrap_or(usize::MAX);
+    let hit = |key: &str| hits.get(key).copied().unwrap_or(0);
+
+    let mut scored: Vec<(usize, &Command, MatchClass)> = commands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.enabled) // filtro por contexto: inaplicável NÃO entra na lista
+        .filter_map(|(i, c)| match_class(query, c).map(|class| (i, c, class)))
+        .collect();
+
+    scored.sort_by(|a, b| {
+        let (ka, kb) = (a.1.key(), b.1.key());
+        a.2.cmp(&b.2) // 1. Prefix < Fuzzy
+            .then_with(|| mru_rank(&ka).cmp(&mru_rank(&kb))) // 2. MRU (menor índice = melhor)
+            .then_with(|| hit(&kb).cmp(&hit(&ka))) // 3. hit-count (maior primeiro)
+            .then_with(|| a.0.cmp(&b.0)) // 4. ordem original (estabilidade)
+    });
+
+    scored.into_iter().map(|(_, c, _)| c).collect()
 }
 
 #[cfg(test)]
@@ -295,17 +510,28 @@ mod tests {
         ]
     }
 
-    /// Subsequência case-insensitive; query vazia casa tudo.
+    /// O matcher do ranking: subsequência smart-case + prefixo. Query vazia casa tudo; minúscula é
+    /// case-insensitive; um char a mais não casa; maiúscula explícita torna case-sensitive.
     #[test]
-    fn fuzzy_match_is_case_insensitive_subsequence() {
-        assert!(fuzzy_match("", "qualquer"));
-        assert!(fuzzy_match("na", "Novo agente"), "n…a subsequência");
-        assert!(fuzzy_match("NOTA", "Nova nota"));
-        assert!(fuzzy_match("paus", "Pausar orquestração"));
-        assert!(!fuzzy_match("xyz", "Novo agente"));
+    fn subsequence_and_prefix_engine() {
+        assert!(is_subsequence("", "qualquer"));
+        assert!(is_subsequence("na", "Novo agente"), "n…a subsequência");
         assert!(
-            !fuzzy_match("agentee", "Novo agente"),
+            is_subsequence("nota", "Nova nota"),
+            "minúscula ignora caixa"
+        );
+        assert!(!is_subsequence("xyz", "Novo agente"));
+        assert!(
+            !is_subsequence("agentee", "Novo agente"),
             "char a mais não casa"
+        );
+        // Smart-case: maiúscula explícita NÃO casa rótulo minúsculo.
+        assert!(!is_subsequence("NOTA", "nova nota"));
+        // Prefixo (smart-case).
+        assert!(is_prefix("nov", "Novo agente"));
+        assert!(
+            !is_prefix("agente", "Novo agente"),
+            "não começa com a query"
         );
     }
 
@@ -369,5 +595,173 @@ mod tests {
             p.handle_key("enter", None),
             Some(PaletteAction::FocusNode(id))
         );
+    }
+
+    // ───────────────────────── F2-2-4 · ranking previsível ─────────────────────────
+
+    /// Atalho de teste: rótulos ranqueados, na ordem.
+    fn ranked(cmds: &[Command], q: &str, mru: &[&str], hits: &[(&str, u32)]) -> Vec<String> {
+        let mru: Vec<String> = mru.iter().map(|s| (*s).to_owned()).collect();
+        let hits: HashMap<String, u32> = hits.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect();
+        rank(cmds, q, &mru, &hits)
+            .into_iter()
+            .map(|c| c.label.clone())
+            .collect()
+    }
+
+    /// **Alias = keyword INVISÍVEL:** o leigo digita o sinônimo técnico ("webhook") e acha o comando
+    /// cujo RÓTULO não tem a palavra ("Gatilho"). É o caso-âncora da D4-A2.
+    #[test]
+    fn alias_finds_command_by_invisible_keyword() {
+        let cmds = vec![
+            Command::new("⚡ Gatilho de automação", PaletteAction::NewFolder)
+                .with_aliases(&["webhook", "trigger"]),
+            Command::new("📝 Nova nota", PaletteAction::NewNote),
+        ];
+        let out = ranked(&cmds, "webhook", &[], &[]);
+        assert_eq!(
+            out,
+            vec!["⚡ Gatilho de automação"],
+            "alias acha o que o rótulo esconde"
+        );
+    }
+
+    /// **Tier 1 — prefixo > fuzzy:** quem COMEÇA com a query sobe acima de quem só a contém espalhada.
+    #[test]
+    fn prefix_outranks_scattered_fuzzy() {
+        let cmds = vec![
+            Command::new("Nova nota", PaletteAction::NewNote), // fuzzy: n-o-t-a espalhado
+            Command::new("Notas do dia", PaletteAction::NewFolder), // prefixo "nota"
+        ];
+        let out = ranked(&cmds, "nota", &[], &[]);
+        assert_eq!(
+            out,
+            vec!["Notas do dia", "Nova nota"],
+            "prefixo vence subsequência"
+        );
+    }
+
+    /// **Tier 2 — MRO:** com a MESMA classe de casamento, o usado por último sobe.
+    #[test]
+    fn mru_lifts_recently_used() {
+        let cmds = vec![
+            Command::new("Pausar", PaletteAction::ToggleBrake), // key: toggle_brake
+            Command::new("Painel", PaletteAction::ToggleDashboard), // key: toggle_dashboard
+        ];
+        // Ambos casam "pa" por prefixo; MRU coloca o Painel na frente.
+        let out = ranked(&cmds, "pa", &["toggle_dashboard"], &[]);
+        assert_eq!(
+            out,
+            vec!["Painel", "Pausar"],
+            "MRU recente sobe dentro do mesmo tier"
+        );
+    }
+
+    /// **Tier 1 ainda vence o tier 2:** um PREFIXO não-MRU fica acima de um FUZZY que está no MRU
+    /// (a ordem dos tiers é fixa — alias-prefixo antes de MRU).
+    #[test]
+    fn prefix_beats_mru_fuzzy() {
+        let cmds = vec![
+            Command::new("Abrir nota", PaletteAction::NewNote), // fuzzy "no": n…o espalhado
+            Command::new("Nota azul", PaletteAction::NewFolder), // prefixo "no" (No-ta)
+        ];
+        // "no": "Nota azul" é PREFIXO (tier 1); "Abrir nota" é só fuzzy. Mesmo com o fuzzy no MRU,
+        // o prefixo manda — a ordem dos tiers é fixa.
+        let out = ranked(&cmds, "no", &["new_note"], &[]);
+        assert_eq!(
+            out,
+            vec!["Nota azul", "Abrir nota"],
+            "tier de classe > tier de MRU"
+        );
+    }
+
+    /// **Tier 4 — hit-count desempata:** mesma classe, sem MRU → o mais popular primeiro.
+    #[test]
+    fn hit_count_breaks_remaining_ties() {
+        let cmds = vec![
+            Command::new("Pausar", PaletteAction::ToggleBrake),
+            Command::new("Painel", PaletteAction::ToggleDashboard),
+        ];
+        let out = ranked(
+            &cmds,
+            "pa",
+            &[],
+            &[("toggle_dashboard", 9), ("toggle_brake", 2)],
+        );
+        assert_eq!(
+            out,
+            vec!["Painel", "Pausar"],
+            "mais usado historicamente desempata"
+        );
+    }
+
+    /// **Filtro por contexto (Zed `CommandPaletteFilter`):** `when(false)` TIRA o comando da lista —
+    /// não acinzentado, FORA. Um botão que não faz nada é tela que mente.
+    #[test]
+    fn context_filter_drops_inapplicable() {
+        let cmds = vec![
+            Command::new("Editar Agente", PaletteAction::EditAgent(Uuid::now_v7())).when(false),
+            Command::new("Novo agente", PaletteAction::NewAgent),
+        ];
+        let out = ranked(&cmds, "", &[], &[]);
+        assert_eq!(out, vec!["Novo agente"], "inaplicável não aparece");
+    }
+
+    /// **Smart-case:** query toda minúscula casa qualquer caixa; uma maiúscula torna o match
+    /// case-sensitive (o humano foi específico).
+    #[test]
+    fn smart_case_matching() {
+        let cmds = vec![Command::new("novo agente", PaletteAction::NewAgent)];
+        assert_eq!(ranked(&cmds, "novo", &[], &[]).len(), 1, "minúscula casa");
+        assert!(
+            ranked(&cmds, "Novo", &[], &[]).is_empty(),
+            "maiúscula explícita NÃO casa rótulo minúsculo"
+        );
+    }
+
+    /// **MRU grava no Enter e SOBREVIVE a reabrir:** escolher um comando o joga ao topo na próxima
+    /// abertura (previsibilidade entre sessões; o shell persiste via `mru()`).
+    #[test]
+    fn enter_records_mru_and_persists_across_reopen() {
+        let mut p = PaletteState::default();
+        p.open(vec![
+            Command::new("Pausar", PaletteAction::ToggleBrake),
+            Command::new("Painel", PaletteAction::ToggleDashboard),
+        ]);
+        // Seleciona o 2º (Painel) e executa.
+        p.handle_key("down", None);
+        assert_eq!(
+            p.handle_key("enter", None),
+            Some(PaletteAction::ToggleDashboard)
+        );
+        assert_eq!(
+            p.mru().first().map(String::as_str),
+            Some("toggle_dashboard")
+        );
+        // Reabre: Painel agora lidera a lista (query vazia ordena por MRU).
+        p.open(vec![
+            Command::new("Pausar", PaletteAction::ToggleBrake),
+            Command::new("Painel", PaletteAction::ToggleDashboard),
+        ]);
+        let labels: Vec<_> = p.filtered().iter().map(|c| c.label.clone()).collect();
+        assert_eq!(
+            labels,
+            vec!["Painel", "Pausar"],
+            "o último usado abre no topo"
+        );
+    }
+
+    /// MRU dedup + teto: re-escolher não duplica; o teto [`MRU_CAP`] segura a lista curta.
+    #[test]
+    fn mru_dedups_and_caps() {
+        let mut p = PaletteState::default();
+        p.set_mru(vec!["toggle_brake".into(), "new_note".into()]);
+        p.record_use("new_note"); // já existia → vai pra frente, sem duplicar
+        assert_eq!(p.mru(), &["new_note".to_owned(), "toggle_brake".to_owned()]);
+        // Enche além do teto.
+        for i in 0..MRU_CAP + 3 {
+            p.record_use(&format!("k{i}"));
+        }
+        assert_eq!(p.mru().len(), MRU_CAP, "MRU fica curto (teto)");
     }
 }

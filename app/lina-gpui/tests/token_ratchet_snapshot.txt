@@ -2,12 +2,12 @@
 # Gerado por tests/token_ratchet.rs; regenerar APENAS após queda real:
 #   LINA_RATCHET_UPDATE=1 cargo test -p lina-gpui --test token_ratchet
 # arquivo px_literal font_weight text_size_px
-agent_modal.rs 5 10 3
-attention_ui.rs 19 0 11
-dev_tools.rs 4 3 2
+agent_modal.rs 5 9 3
+attention_ui.rs 18 0 10
+dev_tools.rs 4 2 2
 main.rs 30 3 18
 obsidian.rs 2 4 2
-onboarding.rs 13 5 5
+onboarding.rs 13 4 5
 palette.rs 2 0 0
 persistence_ui.rs 27 6 13
 sidebar.rs 14 0 13

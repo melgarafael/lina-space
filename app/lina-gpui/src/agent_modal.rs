@@ -21,12 +21,14 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, text, transparent_black, AnyElement, ClickEvent, Context, FontWeight,
-    Pixels, ScrollHandle, Size,
+    Pixels, Role, ScrollHandle, Size,
 };
 use lina_bootstrap::Autonomy;
 use lina_cli_profiles::ProfileRegistry;
 use lina_core::DiscoveredCli;
 use lina_host::NodeId;
+
+use crate::ui::{Button, Frame, Modal, Panel, Space};
 
 use crate::bridge::AgentEngine;
 use crate::role_suggester::{humanize, role_registry, RoleSuggester, RoleSuggestion};
@@ -1504,17 +1506,16 @@ pub fn render(
                     .child(text!(title)),
             )
             .child(
-                div()
-                    .id("m6-close")
-                    .flex_none()
-                    .px_2()
-                    .rounded_md()
-                    .text_color(rgb(th.text.muted))
-                    .cursor_pointer()
+                // F2-2-1: consolidado no Button (ghost/icon) — ganha role(Button)+aria("Fechar"),
+                // que o ✕ inline não tinha (era invisível a leitor de tela).
+                Button::new("m6-close", "✕")
+                    .icon()
+                    .ghost()
+                    .aria("Fechar")
+                    .no_shrink()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
                         v.modal_cancel(cx);
-                    }))
-                    .child(text!("✕")),
+                    })),
             ),
     );
 
@@ -2136,31 +2137,21 @@ pub fn render(
         for (i, a) in AUTONOMY_OPTIONS.into_iter().enumerate() {
             let active = a == modal.autonomy();
             let mark = if active { "◉" } else { "○" };
+            // F2-2-1: o idioma do card selecionável (borda 2px sempre, anel focus.ring quando ativo,
+            // fundo raised_alt↔panel — geometria uniforme, sem reflow) consolidado no Panel.card().
+            // Ganha role(RadioButton) — a escolha de autonomia é 1-de-N e antes não anunciava o papel.
             options = options.child(
-                div()
+                Panel::card()
                     .id(("m6-autonomy", i))
-                    .aria_label(format!(
+                    .selected(active)
+                    .pad(Space::Md, Space::Xs)
+                    .gap(Space::Zero)
+                    .role(Role::RadioButton)
+                    .aria(format!(
                         "autonomia {} — {}",
                         autonomy_surface_label(a),
                         autonomy_desc(a)
                     ))
-                    .flex()
-                    .flex_col()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(if active {
-                        th.surface.raised_alt
-                    } else {
-                        th.surface.panel
-                    }))
-                    .border_2()
-                    .border_color(if active {
-                        rgb(th.focus.ring).into()
-                    } else {
-                        transparent_black()
-                    })
-                    .cursor_pointer()
                     .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
                         v.modal_set_autonomy(a, cx);
                     }))
@@ -2292,78 +2283,44 @@ pub fn render(
             .justify_end()
             .gap_2()
             .child(
-                // bugB3: o par de botões do rodapé é inegociável (flex_none nos dois).
-                div()
-                    .id("m6-cancel")
-                    .flex_none()
-                    .px_4()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(th.surface.raised))
-                    .text_color(rgb(th.text.bright))
-                    .cursor_pointer()
+                // bugB3: o par de botões do rodapé é inegociável (flex_none nos dois → no_shrink).
+                // F2-2-1: consolidado no Button (secondary/confirm) — ganha role+aria.
+                Button::new("m6-cancel", COPY_CANCEL)
+                    .secondary()
+                    .no_shrink()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
                         v.modal_cancel(cx);
-                    }))
-                    .child(text!(COPY_CANCEL)),
+                    })),
             )
             .child(
-                div()
-                    .id("m6-create")
-                    .flex_none()
-                    .px_4()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(th.accent.confirm))
-                    .text_color(rgb(th.text.on_accent))
-                    .font_weight(FontWeight::BOLD)
-                    .cursor_pointer()
+                Button::new("m6-create", if is_edit { COPY_SAVE } else { COPY_CREATE })
+                    .confirm()
+                    .no_shrink()
                     .on_click(cx.listener(|v, _ev: &ClickEvent, window, cx| {
                         v.modal_commit(window, cx);
-                    }))
-                    .child(text!(if is_edit { COPY_SAVE } else { COPY_CREATE })),
+                    })),
             ),
     );
 
-    // backdrop + caixa central (irmão do overlay de nomeação do M2 que este modal substitui).
-    // Fix bugB2: a caixa vem do `modal_frame` (clamp à janela nos 2 eixos — era `w(640)` fixo
-    // sem teto). O corpo é raiz de scroll em BLOCO (lição W6): se algum estado raro exceder o
-    // orçamento (`MODAL_BASE_RESERVED`), o conteúdo ROLA dentro da caixa — nunca pinta por
-    // cima do canvas nem passa da borda da janela.
-    div()
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .bottom_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .w(px(frame.w))
-                .max_h(px(frame.max_h))
-                .flex()
-                .flex_col()
-                .px_6()
-                .py_5()
-                .gap_2()
-                .rounded_lg()
-                .bg(rgb(th.surface.card))
-                .border_2()
-                .border_color(rgb(th.accent.create))
-                .child(
-                    div()
-                        .id("m6-body")
-                        // min_h(0): filho de flex-col tem min-height:auto — sem isto o corpo
-                        // nunca encolhe e o scroll-fallback não engata.
-                        .min_h(px(0.0))
-                        .overflow_y_scroll()
-                        .w_full()
-                        .child(col),
-                ),
-        )
-        .into_any_element()
+    // backdrop + caixa central, consolidados no Modal do catálogo (F2-2-1). Fix bugB2 preservado:
+    // a caixa vem do `modal_frame` (clamp à janela nos 2 eixos), e o corpo é raiz de scroll em
+    // BLOCO (o Modal faz `min_h(0)+overflow_y_scroll`). GANHA `role(Dialog)`+aria (o maior buraco
+    // de a11y do modal — antes não anunciava como diálogo). Véu/occlude OFF: comportamento visual
+    // idêntico ao atual (o véu discreto da fusão é gate-de-tela, não entra às cegas).
+    Modal::new(
+        "m6-modal",
+        Frame {
+            w: frame.w,
+            max_h: frame.max_h,
+        },
+    )
+    .aria(if is_edit {
+        "Editar agente"
+    } else {
+        "Criar agente"
+    })
+    .body(col)
+    .into_any_element()
 }
 
 /// Uma caixa de CAMPO do editor leve (idioma do `#m6-name`): clique foca, caret ▌ no focado,
