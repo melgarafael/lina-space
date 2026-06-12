@@ -4789,7 +4789,9 @@ fn main() {
     {
         let s = persistence_ui::load_settings(&ws_root.join(".lina").join("events"));
         let setting = theme::ModeSetting::from_setting(&s.theme);
-        theme::apply(setting.resolve(true), &s.accent);
+        theme::set_overrides(s.theme_overrides.clone()); // ajustes por token persistidos (F2-1-4)
+        theme::set_reduce_motion(s.reduce_motion); // a11y persistido (F2-1-3)
+        theme::apply_setting(setting, &s.accent); // carimbo interno default=dark (chute honesto)
     }
 
     // M8 fatia (i) · infra POR-PROCESSO (`SharedInfra`): o `PtyManager` (processos do SO), a
@@ -5058,25 +5060,23 @@ fn main() {
             },
             |window, cx| {
                 // F2-1-4 (decisão F2-0-D nº2 — chrome SEGUE O SISTEMA): com a janela viva, o
-                // appearance real existe. Re-resolve JÁ (corrige o chute dark do boot p/ quem
-                // usa SO claro) e observa mudanças ao vivo — só re-aplica quando o setting
-                // persistido é "sistema" (escuro/claro fixos ignoram o SO por escolha).
-                let theme_settings_dir = panel_dir.clone();
-                let resolve_system_theme = move |window: &mut Window| {
-                    let s = persistence_ui::load_settings(&theme_settings_dir);
-                    let setting = theme::ModeSetting::from_setting(&s.theme);
-                    if setting == theme::ModeSetting::Sistema {
-                        let is_dark = matches!(
-                            window.appearance(),
-                            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
-                        );
-                        theme::apply(setting.resolve(is_dark), &s.accent);
-                    }
+                // appearance real existe. SEM captura (v2 anti-staleness): o observer só
+                // carimba o estado do SO; quem decide re-aplicar é o estado VIVO da
+                // preferência (`set_system_appearance` re-aplica só quando a preferência
+                // corrente é Sistema — escuro/claro explícitos apenas guardam o carimbo,
+                // para a troca futura nos Ajustes resolver certo). 1º fire corrige o chute
+                // dark do boot para quem usa SO claro.
+                let stamp_system_appearance = |window: &mut Window| {
+                    let is_dark = matches!(
+                        window.appearance(),
+                        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                    );
+                    theme::set_system_appearance(is_dark);
                 };
-                resolve_system_theme(window);
+                stamp_system_appearance(window);
                 window
                     .observe_window_appearance(move |window, _cx| {
-                        resolve_system_theme(window);
+                        stamp_system_appearance(window);
                     })
                     .detach();
                 cx.new(|cx| {

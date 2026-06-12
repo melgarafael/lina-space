@@ -1,54 +1,69 @@
-# Pedido de costura — r2 F2-1-4 (Terminal C → Maestro)
+# Pedido de costura — r2 F2-1-4 v2 (Terminal C → Maestro) — ATUALIZA o pedido anterior
 
-> Lado token da F2-1-4 entregue em `theme.rs` (suíte completa 415/0 + clippy -D warnings + fmt só
-> no meu arquivo; só theme.rs na árvore). O que existe pronto para fiar + decisões que são suas.
+> Sua costura `47d52d8` (boot + observer no main.rs) aterrissou ENQUANTO eu fechava o lado
+> persistence_ui — obrigado, ela já funciona. Este v2 substitui o pedido anterior: sobraram
+> **3 trocas de linha no main.rs** que eliminam uma janela de estado VELHO, + 2 linhas de boot
+> para os ajustes/reduce-motion persistidos. Meu lado (theme.rs + persistence_ui.rs) está
+> completo: suíte 417/0 + catraca 2/2 + clippy -D warnings + fmt só nos meus 2 arquivos.
 
-## O que o theme.rs agora oferece (API pronta, testada)
+## Por que trocar (bug real de staleness no observer atual)
 
-1. **`ModeSetting`** (`Sistema` default | `Escuro` | `Claro`): `from_setting`/`as_setting`
-   (strings `"sistema"`/`"escuro"`/`"claro"`) + **`resolve(system_is_dark) -> Mode`**
-   (matriz testada). `Mode`/`apply()` intactos — zero quebra nos consumidores atuais.
-2. **Ajustes parciais por token**: `set_overrides(BTreeMap<String,String>)` (mapa inteiro,
-   atômico) · `Theme::refine()` · `TOKEN_PATHS` (30 caminhos pt-br, teste 1:1 escreve-e-lê) ·
-   seção `ajustes` no `tema.json` (`"superficie.canvas": "#0a0e27"`); desconhecido/inválido
-   ignorado; ajustes SOBREVIVEM a `apply()` (teste) e saem no export quando existem.
-3. **`Theme.accent_name`**: o nome canônico do acento vivo (p/ exibir nos Ajustes e re-construir).
-4. `parse_prefs(json) -> ThemePrefs` completo (modo/acento/tipografia/movimento/ajustes).
+O observer de `main.rs:5073-5078` captura `setting` e `s.accent` NO BOOT (closure `move`).
+Se o usuário trocar modo/acento nos Ajustes depois, o observer continua com os valores velhos:
+na próxima mudança de aparência do SO ele re-aplica a PREFERÊNCIA DO BOOT por cima da escolha
+nova (ex.: usuário escolheu "claro" explícito → SO muda → tela volta a seguir o sistema).
+Além disso, o `apply_setting` novo resolve contra um carimbo interno (`SYSTEM_IS_DARK`) que o
+observer atual não atualiza — os dois mundos precisam convergir no MESMO ponto de entrada.
 
-## Diffs de fiação (arquivos seus)
+## Diff mínimo (main.rs, 2 pontos)
 
 ```text
-main.rs (boot, ~linha do theme::apply atual)
-  let setting = theme::ModeSetting::from_setting(&s.theme);
-  let is_dark = matches!(cx.window_appearance(),
-      WindowAppearance::Dark | WindowAppearance::VibrantDark);
-  theme::apply(setting.resolve(is_dark), &s.accent);
+BOOT (main.rs:~4792)
+  ANTES  theme::apply(setting.resolve(true), &s.accent);
+  DEPOIS theme::set_overrides(s.theme_overrides.clone());   // ajustes persistidos (F2-1-4)
+         theme::set_reduce_motion(s.reduce_motion);          // a11y persistido (F2-1-3)
+         theme::apply_setting(setting, &s.accent);           // carimbo interno default=dark
+                                                             // (mesmo chute honesto de hoje)
 
-main.rs (observer — o "segue o sistema" AO VIVO; gpui: Window::observe_window_appearance)
-  // no setup da janela: se setting == Sistema, re-resolver e theme::apply no callback.
-
-persistence_ui.rs (Ajustes): 3º estado no toggle de modo → persistir "sistema".
-persistence_ui.rs (import_theme): trocar parse_json por parse_prefs e aplicar:
-  modo (ModeSetting) · acento · movimento.reduzir → theme::set_reduce_motion ·
-  ajustes → theme::set_overrides (mapa ausente ⇒ BTreeMap::new(), limpa — import é atômico).
+OBSERVER (main.rs:~5073-5078)
+  ANTES  .observe_window_appearance(move |window, _cx| {
+             ... theme::apply(setting.resolve(is_dark), &s.accent);   // setting/accent VELHOS
+         })
+  DEPOIS .observe_window_appearance(|window, _cx| {
+             let is_dark = matches!(
+                 window.appearance(),
+                 WindowAppearance::Dark | WindowAppearance::VibrantDark
+             );
+             theme::set_system_appearance(is_dark);   // sem captura: o estado vivo decide
+         })
+  (set_system_appearance só re-aplica quando a preferência VIVA é Sistema — testado; com
+   Escuro/Claro explícitos apenas guarda o carimbo. O 1º fire do observer corrige o chute
+   dark do boot, como hoje. Remover o #[allow(dead_code)] de set_system_appearance ao fiar.)
 ```
 
-`#[allow(dead_code)]` removíveis ao fiar: `ModeSetting`, `set_overrides`, `set_reduce_motion`,
-`MotionTokens::effective`, `TOKEN_PATHS`.
+## O que JÁ entreguei no meu lado (não precisa de ação sua além de validar)
 
-## Decisões que são SUAS (2)
+- `persistence_ui.rs`: ciclo de modo 3 estados (sistema→escuro→claro) com rótulo leigo
+  ("segue o computador"); pastilhas de acento pintam no modo RESOLVIDO; `apply_theme` via
+  `apply_setting` (preferência viva sempre fresca); import de `tema.json` COMPLETO (modo
+  incl. sistema, acento, reduzir→`set_reduce_motion`, ajustes→`set_overrides`, atômico);
+  export grava a preferência ("sistema" sai "sistema"); **migração única** `escuro`→`sistema`
+  com marcador `theme_migrated_to_system` ("claro" explícito intocado; "escuro" re-escolhido
+  pós-migração respeitado p/ sempre); `theme_overrides` persistem no `settings.json` (decisão
+  nº1 do pedido anterior, confirmada por você no chat da fronteira).
+- `theme.rs`: `apply_setting`/`set_system_appearance` (estado vivo da preferência + carimbo do
+  SO; teste "segue o sistema ao vivo / explícito ignora"); API legada de parse do `Mode`
+  REMOVIDA (um único caminho: `ModeSetting`; `Settings::theme_mode()` saiu junto — o último
+  consumidor era o boot antigo).
 
-1. **Persistência dos ajustes entre sessões:** sugiro gravar `ajustes` no `settings.json`
-   (fonte única; `tema.json` segue sendo veículo de export/import) — alternativa é reler
-   `tema.json` no boot, mas aí o arquivo vira estado vivo sem o usuário saber.
-2. **Migração do legado:** `settings.json` com `"escuro"` é indistinguível entre
-   default-nunca-escolhido e escolha explícita. Opções: (a) migração única `escuro→sistema`
-   (honra a decisão F2-0-D nº2 como default; quem queria escuro fixo re-escolhe em 1 clique);
-   (b) legado intacto, `sistema` só para instalações novas. A decisão do fundador diz "chrome
-   SEGUE O SISTEMA" como default do produto — (a) é a leitura forte; (b) a conservadora.
+## Testes que provam o critério (novos nesta fatia)
 
-## Régua (gate F2-1 — estado)
+`system_mode_follows_appearance_only_when_sistema` · `legacy_escuro_migrates_to_sistema_once` ·
+`import_applies_reduzir_and_ajustes_and_persists` · `prefs_export_import_roundtrip` (preferência
+"sistema" preservada no export) + atualizações dos existentes para o ciclo de 3 estados.
 
-WCAG estendido verde nos 2 modos × 8 acentos (gate intacto; ajustes de usuário são liberdade
-"Avançado" — o gate protege os DEFAULTS curados, doc do `refine` explica). Pendentes da onda:
-F2-1-1b (fonte do grid, atômica) e F2-1-5 (catraca, r2 — base de tokens pronta).
+## Nota de árvore
+
+A catraca da F2-1-5 (worker da r2) flakeou 1× durante meu run (snapshot sendo gravado em
+paralelo); re-run limpo 2/2. Não é regressão minha nem dela — é o custo conhecido de validar
+em árvore compartilhada; a validação de fora (sua) decide.

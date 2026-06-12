@@ -13,7 +13,7 @@
 //!   restart (as views leem o tema a cada `render`).
 //! - **Local-first** (invariante #2): a escolha persiste via `Settings` (T7, `settings.json` — o
 //!   mesmo canal de Ajustes existente); export/import de tema é JSON **100% local** ([`export_json`]/
-//!   [`parse_json`]) — zero rede neste módulo (nenhum import de rede; só `std` + `serde`).
+//!   [`parse_prefs`]) — zero rede neste módulo (nenhum import de rede; só `std` + `serde`).
 //! - **Gate WCAG ampliado (CI)**: os testes deste módulo FALHAM se qualquer token de texto baixar de
 //!   4.5:1 (AA normal) / 3:1 (muted/large) em QUALQUER modo × acento, se o focus ring baixar de 3:1
 //!   ([WCAG 1.4.11]), ou se um `rgb(0x…)` literal reaparecer no shell fora deste módulo (lint).
@@ -55,6 +55,7 @@
 //! `lina-core` (este módulo não importa nada do core nem do gpui; consumidores chamam `gpui::rgb`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -62,8 +63,9 @@ use serde::{Deserialize, Serialize};
 
 // ═══════════════════════════ modo + escala (stepping consistente) ═══════════════════════════
 
-/// Modo visual do shell. Persistido em `Settings.theme` como `"escuro"`/`"claro"` (strings já
-/// existentes do T7 — compatível com `settings.json` antigos).
+/// Modo visual RESOLVIDO do shell — o que as views leem. Desde a F2-1-4, NÃO é o que se
+/// persiste: a preferência persistida é [`ModeSetting`] (`"sistema"`/`"escuro"`/`"claro"`),
+/// resolvida para `Mode` por [`ModeSetting::resolve`] (um único caminho de parse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
@@ -71,35 +73,11 @@ pub enum Mode {
     Light,
 }
 
-impl Mode {
-    /// Lê o modo da string persistida do T7. Desconhecido → `Dark` (default seguro, nunca falha).
-    #[must_use]
-    pub fn from_setting(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("claro") {
-            Self::Light
-        } else {
-            Self::Dark
-        }
-    }
-
-    /// A string persistida no T7 (`settings.json`).
-    #[must_use]
-    pub fn as_setting(self) -> &'static str {
-        match self {
-            Self::Dark => "escuro",
-            Self::Light => "claro",
-        }
-    }
-}
-
 /// A PREFERÊNCIA de modo persistida (F2-1-4) — inclui `"sistema"`, o default selado na F2-0-D
 /// (decisão nº2: o chrome SEGUE O SISTEMA; supersede o "Dark OLED" do T0). [`Mode`] continua
 /// sendo o tipo RESOLVIDO que as views leem; a resolução acontece em [`ModeSetting::resolve`]
 /// com a aparência viva da janela (`WindowAppearance` do gpui — fiação na costura, modelo
 /// `ThemeSelection::Dynamic` do Zed por descrição).
-// dead_code: o consumidor de produção é a costura (boot + observer de aparência + linha de
-// Ajustes). Remover o allow ao fiar.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModeSetting {
     /// Segue a aparência do sistema — herda a única escolha de tema que o leigo já fez (D1-A6g).
@@ -111,11 +89,10 @@ pub enum ModeSetting {
     Claro,
 }
 
-#[allow(dead_code)]
 impl ModeSetting {
     /// Lê a preferência persistida. `"escuro"`/`"claro"` seguem explícitos; desconhecido/vazio →
-    /// `Sistema` (o default decidido — atenção: a MIGRAÇÃO de `settings.json` legados com
-    /// `"escuro"`-default-nunca-escolhido é decisão da costura, ver pedido r2).
+    /// `Sistema` (o default decidido — a migração única do legado `"escuro"` vive em
+    /// `persistence_ui::load_settings`).
     #[must_use]
     pub fn from_setting(s: &str) -> Self {
         let s = s.trim();
@@ -755,9 +732,7 @@ pub fn apply(mode: Mode, accent: &str) {
 /// Define os ajustes parciais vivos (F2-1-4) — substitui o mapa INTEIRO (import é atômico:
 /// remover um ajuste do arquivo remove o refinamento) e re-aplica sobre o tema ativo via
 /// [`apply`] (re-construção limpa: base curada → refinamento). Chaves desconhecidas e valores
-/// inválidos são ignorados ([`Theme::refine`]).
-// dead_code: o consumidor de produção é a costura (import de tema/Ajustes). Remover ao fiar.
-#[allow(dead_code)]
+/// inválidos são ignorados ([`Theme::refine`]). Consumidores: import de tema + boot.
 pub fn set_overrides(ajustes: BTreeMap<String, String>) {
     *AJUSTES.write().unwrap_or_else(PoisonError::into_inner) = ajustes;
     let (mode, accent) = {
@@ -768,16 +743,50 @@ pub fn set_overrides(ajustes: BTreeMap<String, String>) {
 }
 
 /// Liga/desliga o reduce-motion do tema vivo (F2-1-3) — o ÚNICO ponto de mutação do flag.
-/// A FONTE da verdade é o sistema/Ajustes; a fiação (observer) é costura posterior.
-// dead_code: a fiação (observer de aparência/Ajustes) é a costura que consome isto — pedido ao
-// Maestro junto com o diff do grid. Remover o allow ao fiar.
-#[allow(dead_code)]
+/// A FONTE da verdade é o ajuste persistido (`Settings.reduce_motion`, fiado no toggle e no boot).
 pub fn set_reduce_motion(on: bool) {
     ACTIVE
         .write()
         .unwrap_or_else(PoisonError::into_inner)
         .motion
         .reduce_motion = on;
+}
+
+// ═══════════════════ modo "sistema" — resolução viva (F2-1-4) ═══════════════════
+
+/// "O sistema está escuro?" — carimbado pelo boot e pelo observer de aparência (costura do
+/// `main.rs`). Default `true` (o app nasceu dark-first; o boot carimba o valor real antes do
+/// 1º frame temático).
+static SYSTEM_IS_DARK: AtomicBool = AtomicBool::new(true);
+
+/// A PREFERÊNCIA de modo viva — guardada para [`set_system_appearance`] re-resolver sozinha
+/// quando a aparência do SO muda (só re-aplica se a preferência é `Sistema`).
+static MODE_PREF: LazyLock<RwLock<ModeSetting>> =
+    LazyLock::new(|| RwLock::new(ModeSetting::Sistema));
+
+/// Aplica uma PREFERÊNCIA de modo (F2-1-4): resolve `Sistema` contra a aparência viva do SO e
+/// delega em [`apply`]. É o caminho de produção dos Ajustes/boot/import — `apply` cru fica para
+/// quem já tem um [`Mode`] concreto.
+pub fn apply_setting(setting: ModeSetting, accent: &str) {
+    *MODE_PREF.write().unwrap_or_else(PoisonError::into_inner) = setting;
+    apply(
+        setting.resolve(SYSTEM_IS_DARK.load(Ordering::Relaxed)),
+        accent,
+    );
+}
+
+/// Carimba a aparência do SO (boot + observer `WindowAppearance` — costura) e, SE a preferência
+/// viva é `Sistema`, re-resolve e re-aplica o tema na hora ("segue o sistema" AO VIVO). Com
+/// preferência explícita (`Escuro`/`Claro`), só guarda o carimbo — nada re-pinta.
+// dead_code: o consumidor é a costura do main.rs (boot + observer). Remover o allow ao fiar.
+#[allow(dead_code)]
+pub fn set_system_appearance(is_dark: bool) {
+    SYSTEM_IS_DARK.store(is_dark, Ordering::Relaxed);
+    let setting = *MODE_PREF.read().unwrap_or_else(PoisonError::into_inner);
+    if setting == ModeSetting::Sistema {
+        let accent = active().accent_name;
+        apply(setting.resolve(is_dark), accent);
+    }
 }
 
 // ═══════════════════════════ export/import JSON (100% local — T7§A Avançado) ═══════════════════════════
@@ -811,7 +820,8 @@ pub struct MotionPrefs {
 /// seções AUSENTES de versões antigas viram `None` (import antigo nunca quebra — F2-1 item 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemePrefs {
-    /// `"escuro"` | `"claro"` (mesmas strings do T7).
+    /// `"sistema"` | `"escuro"` | `"claro"` — a PREFERÊNCIA (F2-1-4), não o modo resolvido;
+    /// `"sistema"` segue a aparência do SO. Strings antigas do T7 seguem válidas.
     #[serde(default)]
     pub modo: String,
     /// Nome do acento curado (ex.: `"azul"`).
@@ -828,18 +838,19 @@ pub struct ThemePrefs {
     pub ajustes: Option<BTreeMap<String, String>>,
 }
 
-/// Serializa as preferências correntes como JSON legível (export local). As seções F2-1 saem
-/// preenchidas: a tipografia canônica (documenta a voz no arquivo), o estado VIVO do
+/// Serializa as preferências correntes como JSON legível (export local). Grava a PREFERÊNCIA de
+/// modo (`"sistema"` exporta como `"sistema"`, não como o modo resolvido do momento). As seções
+/// F2-1 saem preenchidas: a tipografia canônica (documenta a voz no arquivo), o estado VIVO do
 /// reduce-motion e os ajustes parciais vivos (omitidos se não houver nenhum).
 #[must_use]
-pub fn export_json(mode: Mode, accent: &str) -> String {
+pub fn export_json(setting: ModeSetting, accent: &str) -> String {
     let voice = TypographyTokens::CANONICAL;
     let ajustes = AJUSTES
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let prefs = ThemePrefs {
-        modo: mode.as_setting().to_string(),
+        modo: setting.as_setting().to_string(),
         acento: accent.trim().to_lowercase(),
         tipografia: Some(TypographyPrefs {
             interface: voice.family.ui.to_string(),
@@ -860,23 +871,24 @@ pub fn export_json(mode: Mode, accent: &str) -> String {
     serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Lê um arquivo de tema COMPLETO (todas as seções, incl. F2-1). JSON inválido → `Err` com
-/// mensagem LEIGA; campos desconhecidos ignorados; seções ausentes → `None`. A F2-1-4 (overrides
-/// parciais por token) consome DAQUI.
+/// Lê um arquivo de tema COMPLETO (todas as seções, incl. F2-1) — o ÚNICO caminho de parse.
+/// JSON inválido → `Err` com mensagem LEIGA; campos desconhecidos ignorados; seções ausentes →
+/// `None`. O import (`persistence_ui::import_theme`) aplica daqui: modo/acento/reduzir/ajustes.
 pub fn parse_prefs(json: &str) -> Result<ThemePrefs, String> {
     serde_json::from_str(json).map_err(|_| "Este arquivo não parece um tema do Lina.".to_string())
 }
 
-/// Lê um arquivo de tema no contrato dos consumidores atuais (modo + acento). Acento desconhecido
-/// cai no default ao construir ([`Theme::build`]).
-pub fn parse_json(json: &str) -> Result<(Mode, String), String> {
-    let prefs = parse_prefs(json)?;
-    let accent = if prefs.acento.trim().is_empty() {
-        DEFAULT_ACCENT.to_string()
-    } else {
-        prefs.acento.trim().to_lowercase()
-    };
-    Ok((Mode::from_setting(&prefs.modo), accent))
+impl ThemePrefs {
+    /// O acento do arquivo, normalizado: vazio → [`DEFAULT_ACCENT`]; desconhecido cai no default
+    /// ao construir ([`Theme::build`]) — best-effort, nunca falha.
+    #[must_use]
+    pub fn acento_normalizado(&self) -> String {
+        if self.acento.trim().is_empty() {
+            DEFAULT_ACCENT.to_string()
+        } else {
+            self.acento.trim().to_lowercase()
+        }
+    }
 }
 
 // ═══════════════════════════ testes (o GATE do CI mora aqui) ═══════════════════════════
@@ -1096,18 +1108,6 @@ mod tests {
         );
     }
 
-    /// Modo parseia das strings persistidas do T7 (incl. desconhecido → Dark, nunca falha).
-    #[test]
-    fn mode_parses_from_settings_strings() {
-        assert_eq!(Mode::from_setting("escuro"), Mode::Dark);
-        assert_eq!(Mode::from_setting("claro"), Mode::Light);
-        assert_eq!(Mode::from_setting(" CLARO "), Mode::Light);
-        assert_eq!(Mode::from_setting("???"), Mode::Dark);
-        assert_eq!(Mode::from_setting(""), Mode::Dark);
-        assert_eq!(Mode::from_setting(Mode::Light.as_setting()), Mode::Light);
-        assert_eq!(Mode::from_setting(Mode::Dark.as_setting()), Mode::Dark);
-    }
-
     /// Acento desconhecido cai no DEFAULT (best-effort) — um `settings.json` editado à mão com
     /// acento inválido não quebra o boot nem perde o tema.
     #[test]
@@ -1141,36 +1141,65 @@ mod tests {
         assert_eq!(active().mode, Mode::Dark);
     }
 
-    /// **Critério 3 (export/import)**: export gera JSON legível; import o aplica (roundtrip).
+    /// **Critério 3 (export/import)**: export gera JSON legível e grava a PREFERÊNCIA
+    /// (incl. `"sistema"`); o parse a devolve no roundtrip.
     #[test]
     fn prefs_export_import_roundtrip() {
-        let json = export_json(Mode::Light, "teal");
+        let json = export_json(ModeSetting::Claro, "teal");
         // legível: chaves em pt-br, valores nomeados (não números mágicos).
         assert!(json.contains("\"modo\": \"claro\""), "JSON legível: {json}");
         assert!(
             json.contains("\"acento\": \"teal\""),
             "JSON legível: {json}"
         );
-        let (mode, accent) = parse_json(&json).expect("roundtrip");
-        assert_eq!(mode, Mode::Light);
-        assert_eq!(accent, "teal");
+        let prefs = parse_prefs(&json).expect("roundtrip");
+        assert_eq!(ModeSetting::from_setting(&prefs.modo), ModeSetting::Claro);
+        assert_eq!(prefs.acento_normalizado(), "teal");
+        // a preferência "sistema" exporta como "sistema" — nunca o modo resolvido do momento.
+        let json = export_json(ModeSetting::Sistema, "teal");
+        assert!(
+            json.contains("\"modo\": \"sistema\""),
+            "preferência preservada: {json}"
+        );
     }
 
     /// T7§A estados de erro: campos de versão FUTURA são ignorados ("aplica o que entende");
     /// arquivo que não é um tema → mensagem leiga; acento vazio → default.
     #[test]
     fn import_tolerates_future_fields_and_rejects_garbage() {
-        let (mode, accent) =
-            parse_json(r#"{"modo":"claro","acento":"rosa","brilho_holografico":9000}"#)
-                .expect("campos desconhecidos ignorados");
-        assert_eq!(mode, Mode::Light);
-        assert_eq!(accent, "rosa");
+        let prefs = parse_prefs(r#"{"modo":"claro","acento":"rosa","brilho_holografico":9000}"#)
+            .expect("campos desconhecidos ignorados");
+        assert_eq!(ModeSetting::from_setting(&prefs.modo), ModeSetting::Claro);
+        assert_eq!(prefs.acento_normalizado(), "rosa");
 
-        let err = parse_json("isto não é json").expect_err("lixo rejeitado");
+        let err = parse_prefs("isto não é json").expect_err("lixo rejeitado");
         assert_eq!(err, "Este arquivo não parece um tema do Lina.");
 
-        let (_, accent) = parse_json(r#"{"modo":"escuro"}"#).expect("acento ausente");
-        assert_eq!(accent, DEFAULT_ACCENT);
+        let prefs = parse_prefs(r#"{"modo":"escuro"}"#).expect("acento ausente");
+        assert_eq!(prefs.acento_normalizado(), DEFAULT_ACCENT);
+    }
+
+    /// **F2-1-4 — "segue o sistema" AO VIVO:** com preferência `Sistema`, mudar a aparência do
+    /// SO re-resolve e re-aplica sozinho; com preferência explícita, o carimbo NÃO re-pinta.
+    #[test]
+    fn system_mode_follows_appearance_only_when_sistema() {
+        let _guard = THEME_TEST_GUARD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        set_system_appearance(false);
+        apply_setting(ModeSetting::Sistema, "azul");
+        assert_eq!(active().mode, Mode::Light, "sistema claro → tema claro");
+        set_system_appearance(true); // o SO escureceu → re-resolve sem ninguém pedir
+        assert_eq!(active().mode, Mode::Dark, "seguiu o sistema ao vivo");
+
+        apply_setting(ModeSetting::Claro, "azul"); // escolha explícita ignora o SO
+        set_system_appearance(false);
+        set_system_appearance(true);
+        assert_eq!(active().mode, Mode::Light, "explícito não segue o sistema");
+
+        // restaura o default p/ não vazar estado entre testes.
+        apply_setting(ModeSetting::Escuro, DEFAULT_ACCENT);
+        assert_eq!(active().mode, Mode::Dark);
     }
 
     /// **F2-1-1 — integridade da tipografia:** escala de tamanhos ESTRITAMENTE crescente
@@ -1304,7 +1333,7 @@ mod tests {
     /// tema ANTIGO (só modo/acento) importa sem quebrar; roundtrip preserva o vocabulário.
     #[test]
     fn prefs_vocabulary_is_additive_and_roundtrips() {
-        let json = export_json(Mode::Dark, "ambar");
+        let json = export_json(ModeSetting::Escuro, "ambar");
         assert!(
             json.contains("\"tipografia\""),
             "export sem seção tipografia: {json}"
@@ -1328,9 +1357,9 @@ mod tests {
         let old = parse_prefs(r#"{"modo":"claro","acento":"rosa"}"#).expect("import antigo");
         assert_eq!(old.tipografia, None);
         assert_eq!(old.movimento, None);
-        let (mode, accent) = parse_json(r#"{"modo":"claro","acento":"rosa"}"#).expect("antigo");
-        assert_eq!(mode, Mode::Light);
-        assert_eq!(accent, "rosa");
+        assert_eq!(old.ajustes, None);
+        assert_eq!(ModeSetting::from_setting(&old.modo), ModeSetting::Claro);
+        assert_eq!(old.acento_normalizado(), "rosa");
     }
 
     /// **F2-1-3 — flag vivo:** `set_reduce_motion` muda o tema ATIVO e o flag SOBREVIVE a
@@ -1461,7 +1490,7 @@ mod tests {
             "tema não sabe seu acento canônico"
         );
 
-        let json = export_json(Mode::Light, "teal");
+        let json = export_json(ModeSetting::Claro, "teal");
         assert!(
             json.contains("\"ajustes\""),
             "export sem a seção ajustes: {json}"
@@ -1483,7 +1512,7 @@ mod tests {
             Theme::build(Mode::Light, "teal").surface.canvas,
             "mapa vazio deveria restaurar o token curado"
         );
-        let json = export_json(Mode::Light, "teal");
+        let json = export_json(ModeSetting::Claro, "teal");
         assert!(
             !json.contains("\"ajustes\""),
             "ajustes vazios não devem poluir o export"

@@ -20,6 +20,7 @@
 //! render do canvas, dono de outro terminal). Invariantes #6 (estado salvo e VISÍVEL; nunca silenciosa;
 //! navegação sem becos) e #2 (local-first).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -209,7 +210,8 @@ pub fn list_workspaces(base: &Path, current: &Path) -> Vec<WorkspaceEntry> {
 /// Preferências do usuário, persistidas em `settings.json` (persiste após reabrir).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
-    /// Tema visual (`"escuro"` | `"claro"`).
+    /// Tema visual (`"sistema"` | `"escuro"` | `"claro"`) — `"sistema"` segue a aparência do SO
+    /// (F2-1-4; decisão F2-0-D nº2: o chrome segue o sistema é o DEFAULT do produto).
     pub theme: String,
     /// Acento curado do design system (F1-2-1; nome em `theme::ACCENTS`). `serde(default)`:
     /// `settings.json` antigos (sem o campo) seguem carregando sem resetar as demais escolhas.
@@ -229,6 +231,16 @@ pub struct Settings {
     /// Espaço voltar vivo); settings.json antigos seguem carregando sem reset.
     #[serde(default = "default_restore_on_open")]
     pub restore_on_open: bool,
+    /// F2-1-4: ajustes parciais por token (tema "Avançado") — persistem entre sessões AQUI
+    /// (fonte única; `tema.json` é só veículo de export/import). Vazio = sem refinamento.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub theme_overrides: BTreeMap<String, String>,
+    /// F2-1-4: marcador da migração única `escuro`→`sistema` (o default antigo "escuro" quase
+    /// nunca foi escolha; a decisão F2-0-D nº2 fez "sistema" o default do produto). `false` em
+    /// settings antigos (`serde(default)`) dispara a migração UMA vez em [`load_settings`];
+    /// quem re-escolher "escuro" depois fica em "escuro" para sempre.
+    #[serde(default)]
+    pub theme_migrated_to_system: bool,
 }
 
 fn default_accent_setting() -> String {
@@ -242,21 +254,26 @@ fn default_restore_on_open() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: "escuro".into(),
+            theme: "sistema".into(),
             accent: default_accent_setting(),
             reduce_motion: false,
             default_cwd: String::new(),
             attention_sound_muted: false,
             restore_on_open: true,
+            theme_overrides: BTreeMap::new(),
+            // Instalação nova já nasce em "sistema" — nada a migrar (e o load não re-grava).
+            theme_migrated_to_system: true,
         }
     }
 }
 
 impl Settings {
-    /// O par `(modo, acento)` destes ajustes, pronto p/ `theme::apply` (fonte única da conversão).
+    /// A PREFERÊNCIA de modo destes ajustes (F2-1-4) — `"sistema"` incluso; é o que
+    /// `theme::apply_setting` resolve contra a aparência viva do SO (único caminho de parse;
+    /// o `theme_mode()` legado saiu junto com o último consumidor, na costura r2a).
     #[must_use]
-    pub fn theme_mode(&self) -> theme::Mode {
-        theme::Mode::from_setting(&self.theme)
+    pub fn mode_setting(&self) -> theme::ModeSetting {
+        theme::ModeSetting::from_setting(&self.theme)
     }
 }
 
@@ -265,12 +282,25 @@ fn settings_path(dir: &Path) -> PathBuf {
 }
 
 /// Lê os ajustes (best-effort: ausência/erro → default — nunca falha).
+///
+/// **Migração única F2-1-4 (decisão F2-0-D nº2):** num `settings.json` pré-F2 (sem o marcador),
+/// `"escuro"` era o default de fábrica que quase ninguém escolheu — vira `"sistema"`; `"claro"`
+/// foi escolha explícita (o default era escuro) e FICA. O marcador gravado impede re-migrar quem
+/// re-escolher "escuro" depois.
 #[must_use]
 pub fn load_settings(dir: &Path) -> Settings {
-    std::fs::read_to_string(settings_path(dir))
+    let mut s: Settings = std::fs::read_to_string(settings_path(dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !s.theme_migrated_to_system {
+        if s.theme.trim().eq_ignore_ascii_case("escuro") {
+            s.theme = "sistema".into();
+        }
+        s.theme_migrated_to_system = true;
+        save_settings(dir, &s);
+    }
+    s
 }
 
 /// Grava os ajustes (best-effort; erro logado, não derruba).
@@ -577,14 +607,15 @@ impl PersistenceModel {
         self.refresh_workspaces();
     }
 
-    /// T7: alterna o tema (escuro↔claro), persiste e **aplica ao vivo** (F1-2-1: todas as janelas
-    /// re-pintam no próximo frame, sem restart).
+    /// T7 + F2-1-4: cicla o modo (sistema → escuro → claro → sistema), persiste e **aplica ao
+    /// vivo** (todas as janelas re-pintam no próximo frame, sem restart).
     pub fn toggle_theme(&mut self) {
-        self.settings.theme = if self.settings.theme == "escuro" {
-            "claro".into()
-        } else {
-            "escuro".into()
-        };
+        self.settings.theme = match self.settings.mode_setting() {
+            theme::ModeSetting::Sistema => "escuro",
+            theme::ModeSetting::Escuro => "claro",
+            theme::ModeSetting::Claro => "sistema",
+        }
+        .into();
         self.persist_settings();
         self.apply_theme();
     }
@@ -596,9 +627,10 @@ impl PersistenceModel {
         self.apply_theme();
     }
 
-    /// Aplica o tema dos ajustes correntes como tema VIVO do processo (fonte única: `theme::apply`).
+    /// Aplica o tema dos ajustes correntes como tema VIVO do processo — pela PREFERÊNCIA
+    /// (F2-1-4): `theme::apply_setting` resolve `"sistema"` contra a aparência viva do SO.
     fn apply_theme(&self) {
-        theme::apply(self.settings.theme_mode(), &self.settings.accent);
+        theme::apply_setting(self.settings.mode_setting(), &self.settings.accent);
     }
 
     /// Onde o export/import de tema mora (`tema.json`, ao lado do `settings.json` — local-first).
@@ -606,9 +638,10 @@ impl PersistenceModel {
         self.settings_dir.join("tema.json")
     }
 
-    /// F1-2-1 (T7§A Avançado): exporta o tema corrente como JSON legível, 100% local.
+    /// F1-2-1 (T7§A Avançado): exporta o tema corrente como JSON legível, 100% local — grava a
+    /// PREFERÊNCIA (`"sistema"` sai como `"sistema"`) + ajustes vivos.
     pub fn export_theme(&mut self) {
-        let json = theme::export_json(self.settings.theme_mode(), &self.settings.accent);
+        let json = theme::export_json(self.settings.mode_setting(), &self.settings.accent);
         let path = self.theme_file();
         self.theme_io = Some(match std::fs::write(&path, json) {
             Ok(()) => format!("Tema exportado em {}", path.display()),
@@ -617,17 +650,28 @@ impl PersistenceModel {
         });
     }
 
-    /// F1-2-1 (T7§A Avançado): importa `tema.json`, aplica ao vivo e persiste. Arquivo
-    /// inválido → mensagem leiga (copy do T7§A); campos de versão futura são ignorados.
+    /// F1-2-1 + F2-1-4 (T7§A Avançado): importa `tema.json` COMPLETO — preferência de modo
+    /// (incl. `"sistema"`), acento, reduzir-animações e ajustes por token — aplica ao vivo e
+    /// persiste. Arquivo inválido → mensagem leiga; campos de versão futura são ignorados;
+    /// seções ausentes não mexem no que o usuário já tinha (aplica o que entende), EXCETO
+    /// `ajustes`: presente-ou-ausente é o estado inteiro do refinamento (import atômico).
     pub fn import_theme(&mut self) {
         let path = self.theme_file();
         let parsed = std::fs::read_to_string(&path)
             .map_err(|_| format!("Não achei um tema para importar em {}", path.display()))
-            .and_then(|json| theme::parse_json(&json));
+            .and_then(|json| theme::parse_prefs(&json));
         self.theme_io = Some(match parsed {
-            Ok((mode, accent)) => {
-                self.settings.theme = mode.as_setting().to_string();
-                self.settings.accent = accent;
+            Ok(prefs) => {
+                self.settings.theme = theme::ModeSetting::from_setting(&prefs.modo)
+                    .as_setting()
+                    .to_string();
+                self.settings.accent = prefs.acento_normalizado();
+                if let Some(mov) = prefs.movimento {
+                    self.settings.reduce_motion = mov.reduzir;
+                    theme::set_reduce_motion(mov.reduzir);
+                }
+                self.settings.theme_overrides = prefs.ajustes.unwrap_or_default();
+                theme::set_overrides(self.settings.theme_overrides.clone());
                 self.persist_settings();
                 self.apply_theme();
                 "Tema importado e aplicado ✓".to_string()
@@ -642,9 +686,11 @@ impl PersistenceModel {
         self.theme_io.as_deref()
     }
 
-    /// T7: alterna "reduzir animações" e persiste.
+    /// T7 + F2-1-3: alterna "reduzir animações", persiste E aplica no tema vivo (o ajuste agora
+    /// está FIADO: `MotionTokens::effective` zera as durações de todo consumidor de movimento).
     pub fn toggle_reduce_motion(&mut self) {
         self.settings.reduce_motion = !self.settings.reduce_motion;
+        theme::set_reduce_motion(self.settings.reduce_motion);
         self.persist_settings();
     }
 
@@ -957,14 +1003,14 @@ impl PersistenceView {
         self.section("sec-workspaces", "Espaços (T6)", list.into_any_element())
     }
 
-    /// F1-2-1 · T7§A — Aparência: modo (escuro/claro, troca AO VIVO) + 8 acentos curados +
-    /// exportar/importar tema (JSON local). A escolha persiste em `settings.json` (local-first).
+    /// F1-2-1 · T7§A + F2-1-4 — Aparência: modo (sistema/escuro/claro, troca AO VIVO) + 8
+    /// acentos curados + exportar/importar tema (JSON local). Persiste em `settings.json`.
     fn appearance_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let th = theme::active();
         let s = self.model.settings();
-        // Pastilhas dos 8 acentos curados: cada uma pinta com o próprio valor NO MODO ATUAL; a
-        // ativa ganha o anel de foco (token `focus.ring` — visível nos 2 temas, gate ≥3:1).
-        let mode = s.theme_mode();
+        // Pastilhas dos 8 acentos curados: pintam no modo RESOLVIDO vivo (com "sistema", é o
+        // modo que o SO ditou); a ativa ganha o anel de foco (`focus.ring`, gate ≥3:1).
+        let mode = th.mode;
         let current = s.accent.clone();
         let mut swatches = div().flex().flex_row().items_center().gap_2();
         for (i, (name, scale)) in theme::ACCENTS.iter().enumerate() {
@@ -1013,7 +1059,15 @@ impl PersistenceView {
                     )
                     .child(self.button(
                         "toggle-theme",
-                        format!("{} (trocar)", s.theme),
+                        // Rótulo LEIGO pela preferência (zero jargão): "sistema" vira uma frase.
+                        format!(
+                            "{} (trocar)",
+                            match s.mode_setting() {
+                                theme::ModeSetting::Sistema => "segue o computador",
+                                theme::ModeSetting::Escuro => "escuro",
+                                theme::ModeSetting::Claro => "claro",
+                            }
+                        ),
                         (th.surface.raised, th.text.bright),
                         cx,
                         |v, _w, cx| {
@@ -1754,17 +1808,124 @@ mod tests {
         {
             let mut model =
                 PersistenceModel::new(shared, store, events.clone(), tmp.path().to_path_buf());
-            assert_eq!(model.settings().theme, "escuro");
-            model.toggle_theme(); // escuro → claro
-            model.toggle_reduce_motion(); // false → true
+            assert_eq!(
+                model.settings().theme,
+                "sistema",
+                "default do produto: segue o sistema (F2-0-D nº2)"
+            );
+            model.toggle_theme(); // sistema → escuro
+            model.toggle_reduce_motion(); // false → true (persistido E fiado no tema vivo)
+            assert!(
+                theme::active().motion.reduce_motion,
+                "toggle fiou o flag vivo (F2-1-3)"
+            );
             model.set_default_cwd("/tmp/projetos");
         }
         // "reabrir": relê do disco.
         let reloaded = load_settings(&events);
-        assert_eq!(reloaded.theme, "claro");
+        assert_eq!(reloaded.theme, "escuro");
         assert!(reloaded.reduce_motion);
         assert_eq!(reloaded.default_cwd, "/tmp/projetos");
-        theme::apply(theme::Mode::Dark, theme::DEFAULT_ACCENT); // não vaza estado global
+        // não vaza estado global.
+        theme::set_reduce_motion(false);
+        theme::apply(theme::Mode::Dark, theme::DEFAULT_ACCENT);
+    }
+
+    /// **F2-1-4 — migração única `escuro`→`sistema`:** settings pré-F2 com o default de fábrica
+    /// "escuro" (sem o marcador) migram UMA vez para "sistema" (decisão F2-0-D nº2) e o marcador
+    /// é gravado; quem re-escolher "escuro" DEPOIS fica em "escuro". "claro" (escolha explícita
+    /// de quem fugiu do default) nunca é tocado.
+    #[test]
+    fn legacy_escuro_migrates_to_sistema_once() {
+        let tmp = TempDir::new("migra");
+        let dir = tmp.path().join("events");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"theme":"escuro","reduce_motion":false,"default_cwd":""}"#,
+        )
+        .expect("settings pré-F2");
+
+        let s = load_settings(&dir);
+        assert_eq!(s.theme, "sistema", "default de fábrica migrou");
+        assert!(s.theme_migrated_to_system, "marcador gravado");
+        // o arquivo no disco já carrega a migração (re-load não depende da 1ª leitura).
+        assert_eq!(load_settings(&dir).theme, "sistema");
+
+        // escolha explícita PÓS-migração é respeitada para sempre.
+        let mut explicit = s;
+        explicit.theme = "escuro".into();
+        save_settings(&dir, &explicit);
+        assert_eq!(
+            load_settings(&dir).theme,
+            "escuro",
+            "escuro explícito não re-migra"
+        );
+
+        // "claro" pré-F2 era escolha explícita → intocado pela migração.
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"theme":"claro","reduce_motion":false,"default_cwd":""}"#,
+        )
+        .expect("settings claro pré-F2");
+        let s = load_settings(&dir);
+        assert_eq!(s.theme, "claro", "claro explícito preservado");
+        assert!(s.theme_migrated_to_system);
+    }
+
+    /// **F2-1-4 — import completo:** `tema.json` com modo + acento + reduzir + ajustes aplica
+    /// TUDO ao vivo e persiste (incl. `theme_overrides` no settings.json — fonte única entre
+    /// sessões). Guard serializa (toca o tema global).
+    #[test]
+    fn import_applies_reduzir_and_ajustes_and_persists() {
+        let _guard = crate::theme::THEME_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new("import-f214");
+        let events = seed_workspace(tmp.path(), "App", "T1");
+        let store = Arc::new(Mutex::new(EventStore::open(&events).expect("open")));
+        let shared = shared_with(0, false);
+        let mut model =
+            PersistenceModel::new(shared, store, events.clone(), tmp.path().to_path_buf());
+
+        std::fs::write(
+            events.join("tema.json"),
+            r##"{
+              "modo": "claro",
+              "acento": "rosa",
+              "movimento": { "reduzir": true },
+              "ajustes": { "superficie.canvas": "#101010" }
+            }"##,
+        )
+        .expect("tema.json completo");
+        model.import_theme();
+        assert_eq!(
+            model.theme_io_message(),
+            Some("Tema importado e aplicado ✓")
+        );
+        assert_eq!(model.settings().theme, "claro");
+        assert_eq!(model.settings().accent, "rosa");
+        assert!(model.settings().reduce_motion, "reduzir importado");
+        assert!(
+            theme::active().motion.reduce_motion,
+            "reduzir aplicado ao vivo"
+        );
+        assert_eq!(
+            theme::active().surface.canvas,
+            0x101010,
+            "ajuste por token aplicado ao vivo"
+        );
+        // persistiu entre sessões (settings.json é a fonte única dos ajustes).
+        let reloaded = load_settings(&events);
+        assert_eq!(
+            reloaded.theme_overrides.get("superficie.canvas"),
+            Some(&"#101010".to_string())
+        );
+
+        // não vaza estado global.
+        theme::set_overrides(BTreeMap::new());
+        theme::set_reduce_motion(false);
+        theme::apply_setting(theme::ModeSetting::Escuro, theme::DEFAULT_ACCENT);
     }
 
     /// F1-1-7: o mute do lembrete sonoro da Fila de Atenção PERSISTE (settings.json),
@@ -1836,7 +1997,7 @@ mod tests {
             reloaded.accent, "violeta",
             "o override sobrevive à reabertura"
         );
-        theme::apply(reloaded.theme_mode(), &reloaded.accent);
+        theme::apply(reloaded.mode_setting().resolve(true), &reloaded.accent);
         assert_eq!(
             theme::active().accent.primary,
             theme::Theme::build(theme::Mode::Dark, "violeta")
@@ -1879,6 +2040,7 @@ mod tests {
         let mut model =
             PersistenceModel::new(shared, store, events.clone(), tmp.path().to_path_buf());
 
+        model.toggle_theme(); // sistema → escuro
         model.toggle_theme(); // escuro → claro
         model.set_accent("teal");
         model.export_theme();
@@ -1893,7 +2055,7 @@ mod tests {
         );
 
         // outro estado → importar restaura o exportado (aplica vivo + persiste).
-        model.toggle_theme(); // claro → escuro
+        model.toggle_theme(); // claro → sistema
         model.set_accent("rosa");
         model.import_theme();
         assert_eq!(model.settings().theme, "claro");
