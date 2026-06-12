@@ -66,3 +66,38 @@ do `relatorio-saida-f1.md`).
 ---
 *Roteiro v2 escrito pelo QA (despacho `r4-validacao-saida`), 2026-06-11. Itens 2-4 dependem
 das entregas da rodada r4 chegarem ao repack — o Maestro confirma antes da sua sessão.*
+
+---
+
+## ADENDO r5 — os 4 bugs que você reportou (consertados; valide nesta ordem)
+
+> Antes: feche o Lina antigo e abra o `dist/Lina.app` NOVO (repack **11/06 23:58** — tem TUDO
+> das rodadas r4+r5).
+
+### A. Velocidade (era o bug 3 — "impossível de usar")
+1. Abra 3+ Espaços e deixe-os de fundo. Abra o Monitor de Atividade (Aplicações › Utilitários).
+2. **VEJA:** o processo "Lina" em repouso perto de **0% de CPU** (antes: dezenas de % contínuos).
+3. Crie um Espaço novo. **VEJA:** sem o engasgo de ~10 segundos de antes.
+4. Abra/feche o rail e troque de Espaço várias vezes. **VEJA:** sem travadinhas a cada clique.
+
+### B. Rail — abrir/fechar (bug 1)
+1. Pressione **⌘O** repetidas vezes. **VEJA:** o rail abre E recolhe (alterna).
+2. Com o rail aberto, clique na **setinha ◀** no topo dele. **VEJA:** recolhe pelo mouse.
+
+### C. Rail — tirar um Espaço da lista (bug 2)
+1. Abra o rail e passe o mouse sobre a linha de um Espaço que NÃO é o atual.
+2. **VEJA:** as ações **Renomear** e **Arquivar** visíveis na linha (com o subtexto
+   "some da lista; nada é apagado do disco").
+3. Arquive um. **VEJA:** o toast com **[ Desfazer ]** por 8s (clique, Tab+Enter ou ⌘Z desfazem).
+
+### D. Rail — o teclado é seu (bug 4)
+1. Abra o rail (⌘O) e, SEM clicar nele, digite no terminal focado.
+   **VEJA:** o texto vai para o TERMINAL (antes ia para a busca do rail).
+2. Clique na busca do rail (ou ⌘F com o rail aberto) e digite. **VEJA:** agora sim filtra.
+3. Com o foco num terminal, pressione **Esc**. **VEJA:** o rail NÃO fecha (o Esc é do terminal);
+   com o foco no rail, **Esc** fecha.
+
+### E. Descarregar (novo — modelo "Maestri")
+1. Com um Espaço de fundo cujos agentes estão OCIOSOS, abra o rail → ação **Descarregar** na linha.
+2. **VEJA:** a narração diz quantos desligaram (e, se alguém estava trabalhando, que ficou ligado).
+3. Volte o foco para esse Espaço (⌘número ou clique). **VEJA:** os terminais religam sozinhos.
