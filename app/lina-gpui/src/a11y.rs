@@ -117,6 +117,15 @@ impl LiveRegion {
     pub fn current(&self) -> Option<&str> {
         self.current.as_deref()
     }
+
+    /// F1 (M9/toast — spec §4): anúncio **avulso** na MESMA live-region dos nós — erro de
+    /// validação ao focar um campo do modal, toast de arquivamento. Não cita nó nenhum
+    /// (`current_nodes` limpo), então um nó sumir do canvas não o apaga; o próximo
+    /// `observe()` com transição →Idle o substitui, como qualquer anúncio.
+    pub fn announce(&mut self, msg: impl Into<String>) {
+        self.current = Some(msg.into());
+        self.current_nodes.clear();
+    }
 }
 
 // ═══════════════════════════ contraste WCAG (gate de CI ≥4.5:1) ═══════════════════════════
@@ -309,6 +318,25 @@ mod tests {
         let a = Uuid::now_v7();
         let mut lr = LiveRegion::default();
         assert_eq!(lr.observe(&[(a, "A".into(), NodeStatus::Idle)]), None);
+    }
+
+    /// F1 (M9): anúncio AVULSO entra na live-region e SOBREVIVE ao roster de nós (não cita nó
+    /// nenhum — um nó sumir/observar de novo não o apaga). Removendo `announce()`, este falha.
+    #[test]
+    fn standalone_announce_reaches_live_region_and_survives_node_churn() {
+        let a = Uuid::now_v7();
+        let mut lr = LiveRegion::default();
+        lr.observe(&[(a, "A".into(), NodeStatus::Busy)]);
+        lr.announce("O diretório informado não existe.");
+        assert_eq!(lr.current(), Some("O diretório informado não existe."));
+        // frames seguintes sem transição não o apagam; nem o nó A sumir (anúncio não cita nós).
+        lr.observe(&[(a, "A".into(), NodeStatus::Busy)]);
+        lr.observe(&[]);
+        assert_eq!(
+            lr.current(),
+            Some("O diretório informado não existe."),
+            "anúncio avulso não é apagado pelo churn de nós"
+        );
     }
 
     /// Sanidade da MAQUINARIA WCAG (extremos branco/preto e identidade). O gate de PALETA vivo é

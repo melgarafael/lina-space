@@ -518,6 +518,9 @@ struct WorkspaceView {
     mini_cache: dashboard::MiniStatusCache,
     /// F1-4-4 · M9: modal Criar Espaço (estado headless — T5). `Some` = aberto.
     create_space_modal: Option<gallery::CreateSpaceModal>,
+    /// Spec M8 (a11y): arquivamento PENDENTE com `[ Desfazer ]` — o `WorkspaceArchived` só
+    /// é gravado quando a janela do toast fecha (commit adiado; desfazer = cancelar).
+    archive_toast: Option<sidebar::ArchiveToast>,
     /// F1-1-5 (sonda `[DASH]`): último `ts` de hook reportado por nó — loga a latência
     /// evento→card 1× por evento (na MUDANÇA), sem spammar o stderr a 60fps.
     dash_lat_reported: BTreeMap<String, u64>,
@@ -728,6 +731,7 @@ impl WorkspaceView {
             ),
             mini_cache: dashboard::MiniStatusCache::default(),
             create_space_modal: None,
+            archive_toast: None,
             prof: prof::Probe::from_env(),
         }
     }
@@ -821,10 +825,20 @@ impl WorkspaceView {
         let active_root = lock(&self.runtimes).active.clone();
         let registry = lina_core::default_registry_path()
             .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok());
-        let entries: Vec<lina_core::WorkspaceEntry> = registry
+        let mut entries: Vec<lina_core::WorkspaceEntry> = registry
             .as_ref()
             .map(|r| r.entries().to_vec())
             .unwrap_or_default();
+        // Arquivamento PENDENTE (janela do Desfazer): a linha já sai da lista padrão como se
+        // arquivada — marcado na CÓPIA local (o registry só muda no commit), preservando a
+        // posição do `⌘{n}` (arquivado segura a posição — contrato T4 §4).
+        if let Some(t) = &self.archive_toast {
+            for e in &mut entries {
+                if e.path == t.root {
+                    e.archived = true;
+                }
+            }
+        }
         let scan = active_root
             .parent()
             .map(|base| {
@@ -874,7 +888,22 @@ impl WorkspaceView {
             default_cwd,
             existing,
         ));
+        // a11y (spec §4): nascer bloqueado (vitrine free=1) já é anunciado — o foco nasce no upsell.
+        self.m9_announce();
         cx.notify();
+    }
+
+    /// Spec §4 (M9 a11y): lê o `announcement()` do modal para o FOCO corrente (erro do
+    /// Diretório ao focar o campo; vitrine inteira no upsell) e o manda à live-region —
+    /// é a fiação que o T5 deixou pendente (.entrega-m8-t5 §contrato item 2).
+    fn m9_announce(&mut self) {
+        if let Some(msg) = self
+            .create_space_modal
+            .as_ref()
+            .and_then(gallery::CreateSpaceModal::announcement)
+        {
+            self.a11y_live.announce(msg);
+        }
     }
 
     /// `[ Procurar… ]` do M9 — picker nativo só-pastas (mesmo padrão do M6); a validação
@@ -892,6 +921,11 @@ impl WorkspaceView {
                     let _ = this.update(cx, |view, cx| {
                         if let Some(m) = view.create_space_modal.as_mut() {
                             m.set_workdir_picked(&p);
+                            // a11y: a validação NA SELEÇÃO falhou → anuncia já (o foco ainda
+                            // está no [ Procurar… ], então `announcement()` não cobriria).
+                            if let Some(e) = m.error.as_ref() {
+                                view.a11y_live.announce(e.message.clone());
+                            }
                             cx.notify();
                         }
                     });
@@ -934,6 +968,7 @@ impl WorkspaceView {
             }
         } else {
             self.create_space_modal = Some(m); // erro de diretório/vitrine — inline, sem beco
+            self.m9_announce(); // a11y: o submit falho focou o campo do erro → anuncia.
         }
         cx.notify();
     }
@@ -966,6 +1001,9 @@ impl WorkspaceView {
                         m.focus_next();
                     }
                 }
+                // a11y (spec §4): após mover o foco, o announcement do alvo novo vai à
+                // live-region — é assim que o erro do Diretório é FALADO ao focar o campo.
+                self.m9_announce();
             }
             "left" | "up" => {
                 if let Some(m) = self.create_space_modal.as_mut() {
@@ -1314,18 +1352,62 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// `[ Arquivar ]`: `WorkspaceArchived` no log do alvo + ponteiro re-derivado — some da
-    /// lista padrão, NADA se perde (replay recupera — F1-4-4 crit 3). O «Desfazer»/«Trazer
-    /// de volta» aguarda a costura `WorkspaceUnarchived` (spec §6-C2).
+    /// `[ Arquivar ]` com Desfazer (spec §M8): a linha some JÁ, mas o `WorkspaceArchived`
+    /// só é gravado quando a janela do toast fecha (commit adiado — `commit_pending_archive`).
+    /// Desfazer dentro da janela = cancelar a gravação; nenhum evento novo no core (o
+    /// `WorkspaceUnarchived` da spec §6-C2 segue pendente para a vista de arquivados).
+    /// Anunciado na live-region (o arquivamento é AUDÍVEL, não só visual).
     fn archive_workspace(&mut self, root: &Path, cx: &mut Context<Self>) {
         if lock(&self.runtimes).active == root {
             eprintln!("lina-gpui: [WS] arquivar o Espaço ATIVO não é permitido (troque antes)");
             return;
         }
-        if self.append_to_workspace(root, &lina_core::DomainEvent::WorkspaceArchived) {
-            self.sync_registry_entry(root);
-            self.refresh_sidebar_rows();
+        // Um arquivamento pendente por vez: iniciar o 2º COMMITA o 1º (não o perde).
+        self.commit_pending_archive(cx);
+        let name = lina_core::default_registry_path()
+            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok())
+            .and_then(|r| {
+                r.entries()
+                    .iter()
+                    .find(|e| e.path == root)
+                    .map(|e| e.name.clone())
+            })
+            .unwrap_or_else(|| root.display().to_string());
+        let toast = sidebar::ArchiveToast::new(root.to_path_buf(), name, lina_core::now_ms());
+        self.a11y_live
+            .announce(sidebar::copy_archive_announce(&toast.name));
+        self.archive_toast = Some(toast);
+        self.refresh_sidebar_rows();
+        cx.notify();
+    }
+
+    /// Fecha a janela do Desfazer: grava o `WorkspaceArchived` no log do alvo + ponteiro
+    /// re-derivado — some da lista padrão, NADA se perde (replay recupera — F1-4-4 crit 3).
+    /// Se o usuário TROCOU para o Espaço pendente durante a janela (⌘n), arquivar o ativo
+    /// é proibido → vira Desfazer (anunciado).
+    fn commit_pending_archive(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.archive_toast.take() else {
+            return;
+        };
+        if lock(&self.runtimes).active == t.root {
+            self.a11y_live
+                .announce(sidebar::copy_archive_undone(&t.name));
+        } else if self.append_to_workspace(&t.root, &lina_core::DomainEvent::WorkspaceArchived) {
+            self.sync_registry_entry(&t.root);
         }
+        self.refresh_sidebar_rows();
+        cx.notify();
+    }
+
+    /// `[ Desfazer ]` (clique, Tab+Enter ou ⌘Z): cancela o arquivamento pendente — a linha
+    /// volta à lista; nada foi gravado, nada a reverter. Anunciado na live-region.
+    fn undo_pending_archive(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.archive_toast.take() else {
+            return;
+        };
+        self.a11y_live
+            .announce(sidebar::copy_archive_undone(&t.name));
+        self.refresh_sidebar_rows();
         cx.notify();
     }
 
@@ -1336,6 +1418,11 @@ impl WorkspaceView {
     /// devolve se há ANIMAÇÃO viva (countdown/pulso → o loop sobe p/ ~30fps).
     fn attention_heartbeat(&mut self, cx: &mut Context<Self>) -> bool {
         let now = lina_core::now_ms();
+        // Spec §M8: janela do Desfazer fechou → grava o arquivamento pendente (carona no
+        // heartbeat, que roda sempre — ≥4Hz; o countdown do toast também anima por ele).
+        if self.archive_toast.as_ref().is_some_and(|t| t.expired(now)) {
+            self.commit_pending_archive(cx);
+        }
         let items = self.attention.sync(now);
         let changed = items != self.attention_items;
         if changed {
@@ -1381,7 +1468,7 @@ impl WorkspaceView {
             eprintln!("lina-gpui: [ATT] fila · {diag}");
             self.attention_diag_last = diag;
         }
-        let animating = toast_alive || pulsing;
+        let animating = toast_alive || pulsing || self.archive_toast.is_some();
         if changed || animating {
             cx.notify();
         }
@@ -2544,6 +2631,34 @@ impl WorkspaceView {
             cx.stop_propagation();
             cx.notify();
             return;
+        }
+        // Spec §M8 (a11y) — toast de arquivar vivo: `⌘Z` desfaz de QUALQUER lugar; `Tab`
+        // foca o `[ Desfazer ]` e `Enter` o ativa SÓ com o rail aberto (de onde o gesto
+        // partiu) — fora dele, Tab/Enter seguem ao terminal focado (não rouba digitação).
+        if let Some(t) = &self.archive_toast {
+            if self.sidebar.state.expanded || ks.modifiers.platform {
+                match sidebar::archive_toast_key(
+                    ks.key.as_str(),
+                    ks.modifiers.platform,
+                    t.undo_focused,
+                ) {
+                    sidebar::ArchiveToastKey::Undo => {
+                        self.undo_pending_archive(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    sidebar::ArchiveToastKey::FocusUndo => {
+                        if let Some(t) = self.archive_toast.as_mut() {
+                            t.undo_focused = true;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    sidebar::ArchiveToastKey::None => {}
+                }
+            }
         }
         // F1-4-4 · M8 — rail EXPANDIDO: o teclado dirige o switcher (contrato T4 §3: digita
         // filtra · ↑↓ navega · Enter troca/confirma rename · Esc cancela/fecha SEM trocar).
@@ -3799,11 +3914,57 @@ impl Render for WorkspaceView {
 
         let root = root.child(topbar).child(footer);
 
+        // Spec §M8: TOAST de arquivamento (canto inferior esquerdo, perto do rail de onde o
+        // gesto partiu) — «Espaço “N” arquivado · [ Desfazer ] (Ns)». O countdown anima pelo
+        // heartbeat; o anúncio audível já foi à live-region no `archive_workspace`.
+        let mut root = root;
+        if let Some(t) = &self.archive_toast {
+            let secs = t.remaining_secs(lina_core::now_ms());
+            let undo_ring = if t.undo_focused {
+                th.focus.ring
+            } else {
+                th.surface.border
+            };
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom_8()
+                    .left_8()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_3()
+                    .rounded_md()
+                    .bg(rgb(th.surface.raised))
+                    .border_1()
+                    .border_color(rgb(th.surface.border))
+                    .text_color(rgb(th.text.primary))
+                    .child(text!(format!("Espaço “{}” arquivado", t.name)))
+                    .child(
+                        div()
+                            .id("archive-undo")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .border_2()
+                            .border_color(rgb(undo_ring))
+                            .bg(rgb(th.surface.raised_alt))
+                            .text_color(rgb(th.text.bright))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                                v.undo_pending_archive(cx);
+                            }))
+                            .child(text!(format!("{} ({secs}s)", sidebar::COPY_ARCHIVE_UNDO))),
+                    ),
+            );
+        }
+
         // F1-1-7: TOAST da Fila de Atenção (canto inferior direito) — single com
         // countdown (pause-on-hover) ou colapsado «+N» (countdown desativado). A
         // visibilidade vem da MÁQUINA testada (expirado/«Depois» não renascem; o item
         // segue no badge/fila — nada se perde).
-        let mut root = root;
         if let Some(tv) = self
             .attention_machine
             .visible(&self.attention_items, att_now)

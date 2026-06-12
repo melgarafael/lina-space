@@ -241,6 +241,24 @@ pub fn engine_label(id: &str) -> String {
     }
 }
 
+/// Copy LEIGA do aviso de aposentadoria do Gemini CLI (F1-1-9 critério 2 → render no gate de
+/// saída F1). A VERDADE vive no profile (`profiles/gemini.toml`: TRANSITIONAL / fim 2026-06-18;
+/// sucessor em `profiles/antigravity.toml`) — aqui só a tradução aprovada para a tela. Zero
+/// jargão (sem "EoL"/"deprecated"); informa, NUNCA bloqueia a escolha.
+pub const COPY_GEMINI_TRANSITION: &str = "O Google está aposentando o Gemini CLI: ele deixa de \
+ser atualizado em 18/jun/2026. O sucessor é o Antigravity — quando puder, prefira ele. Dá para \
+criar este agente mesmo assim; o aviso é só para você não ser pego de surpresa.";
+
+/// Aviso de transição/aposentadoria de um motor, por id da descoberta — mesmo padrão de
+/// conhecimento-por-id do [`engine_label`]. `None` = nada a avisar.
+#[must_use]
+pub fn engine_transition_notice(id: &str) -> Option<&'static str> {
+    match id {
+        "gemini" => Some(COPY_GEMINI_TRANSITION),
+        _ => None,
+    }
+}
+
 /// Monta a lista de motores do quick-start a partir da DESCOBERTA (W4-1) + os profiles TOML do
 /// disco. **Recomendado primeiro** (claude), demais na ordem da descoberta. Puro e testável.
 #[must_use]
@@ -997,6 +1015,13 @@ impl AgentModal {
     pub fn selected_engine_idx(&self) -> usize {
         self.selected_engine
     }
+    /// Aviso de aposentadoria do motor SELECIONADO (F1-1-9 critério 2): `Some` ⇒ o render
+    /// mostra o banner leigo abaixo dos chips. É o ESTADO que a casca fia — testável headless.
+    #[must_use]
+    pub fn eol_notice(&self) -> Option<&'static str> {
+        self.selected_engine()
+            .and_then(|e| engine_transition_notice(&e.id))
+    }
     #[must_use]
     pub fn autonomy(&self) -> Autonomy {
         self.autonomy
@@ -1586,6 +1611,20 @@ pub fn render(
                     .child(text!(COPY_INSTALL_OTHER)),
             );
             col = col.child(chips);
+            // F1-1-9 (render no gate de saída F1): motor selecionado em aposentadoria →
+            // banner leigo de transição. Informa, NUNCA bloqueia (a criação segue livre).
+            if let Some(notice) = modal.eol_notice() {
+                col = col.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(th.state.warning))
+                        .text_color(rgb(th.state.warning))
+                        .child(text!(format!("⚠ {notice}"))),
+                );
+            }
         }
     }
 
@@ -2681,6 +2720,38 @@ mod tests {
             args: vec!["--flag".into()],
             profile_id: Some("claude-code".into()),
         }]
+    }
+
+    /// F1-1-9 critério 2 (gate de saída F1): selecionar o **Gemini** no quick-start liga o
+    /// aviso leigo de aposentadoria (data 18/jun/2026, sucessor Antigravity, sem jargão);
+    /// selecionar o Claude o DESLIGA (não-vacuoso: remova `eol_notice` e este falha).
+    #[test]
+    fn gemini_selection_shows_transition_notice_claude_does_not() {
+        let mut m = modal();
+        let mut engines = engines_one();
+        engines.push(Engine {
+            id: "gemini".into(),
+            label: engine_label("gemini"),
+            version: None,
+            program: "gemini".into(),
+            args: vec![],
+            profile_id: Some("gemini".into()),
+        });
+        m.set_engines(engines);
+        assert!(
+            m.eol_notice().is_none(),
+            "Claude selecionado (default) → sem aviso"
+        );
+        m.select_engine(1);
+        let notice = m.eol_notice().expect("Gemini selecionado → aviso presente");
+        assert!(notice.contains("18/jun/2026"), "data dura do profile");
+        assert!(notice.contains("Antigravity"), "aponta o sucessor");
+        assert!(
+            !notice.to_lowercase().contains("eol"),
+            "zero jargão na tela"
+        );
+        m.select_engine(0);
+        assert!(m.eol_notice().is_none(), "voltar ao Claude apaga o aviso");
     }
 
     /// Rodada 360 (ADR 0022 §4): o consentimento do kit é OPT-IN explícito — nasce

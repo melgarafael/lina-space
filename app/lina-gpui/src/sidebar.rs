@@ -66,6 +66,91 @@ pub fn create_from_search_label(texto: &str) -> String {
     format!("+ Criar “{texto}”")
 }
 
+// ═══════════════ toast de arquivamento com Desfazer (spec-m8-m9 §M8, a11y) ═══════════════
+
+/// Janela do Desfazer (ms). O `WorkspaceArchived` só é GRAVADO no log quando o toast expira
+/// (commit adiado): desfazer dentro da janela cancela a gravação — sem precisar de um evento
+/// `WorkspaceUnarchived` que o core ainda não tem (spec §6-C2). 8s cobre leitura + Tab+Enter.
+pub const ARCHIVE_TOAST_TIMEOUT_MS: u64 = 8_000;
+
+/// Rótulo do botão do toast (leigo, padrão de Desfazer).
+pub const COPY_ARCHIVE_UNDO: &str = "Desfazer";
+
+/// Anúncio do toast na live-region (a11y — spec §M8: o arquivamento é AUDÍVEL, não só cor).
+#[must_use]
+pub fn copy_archive_announce(name: &str) -> String {
+    format!("Espaço “{name}” arquivado — nada se perde. Desfazer disponível por alguns segundos.")
+}
+
+/// Anúncio do Desfazer efetivado (live-region).
+#[must_use]
+pub fn copy_archive_undone(name: &str) -> String {
+    format!("Arquivamento de “{name}” desfeito — o Espaço voltou à lista.")
+}
+
+/// Estado headless do toast «Espaço arquivado · [ Desfazer ] (Ns)» — quem grava o evento
+/// no timeout e remonta as linhas é a fiação do shell (main.rs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveToast {
+    /// Raiz do Espaço com arquivamento PENDENTE (a linha some da lista, mas o log só
+    /// recebe `WorkspaceArchived` quando a janela fecha).
+    pub root: PathBuf,
+    /// Nome exibido/anunciado.
+    pub name: String,
+    /// Instante (epoch ms) em que o commit acontece.
+    pub deadline_ms: u64,
+    /// `[ Desfazer ]` focado pelo teclado (Tab) — Enter o ativa.
+    pub undo_focused: bool,
+}
+
+impl ArchiveToast {
+    #[must_use]
+    pub fn new(root: PathBuf, name: String, now_ms: u64) -> Self {
+        Self {
+            root,
+            name,
+            deadline_ms: now_ms.saturating_add(ARCHIVE_TOAST_TIMEOUT_MS),
+            undo_focused: false,
+        }
+    }
+
+    /// Janela fechou → a fiação grava o `WorkspaceArchived` e derruba o toast.
+    #[must_use]
+    pub fn expired(&self, now_ms: u64) -> bool {
+        now_ms >= self.deadline_ms
+    }
+
+    /// Segundos restantes (teto), para o countdown do render.
+    #[must_use]
+    pub fn remaining_secs(&self, now_ms: u64) -> u64 {
+        self.deadline_ms.saturating_sub(now_ms).div_ceil(1000)
+    }
+}
+
+/// Efeito de uma tecla sobre o toast vivo (puro — a fiação do shell aplica).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveToastKey {
+    /// `Tab` → move o foco do teclado para o `[ Desfazer ]`.
+    FocusUndo,
+    /// `⌘Z` (de qualquer lugar) ou `Enter` com o botão focado → desfaz.
+    Undo,
+    /// A tecla não é do toast — segue o fluxo normal.
+    None,
+}
+
+/// Decide o efeito de `(key, ⌘?, foco)` sobre o toast — é o caminho de TECLADO exigido pela
+/// spec (§M8: `[ Desfazer ]` alcançável por teclado antes do timeout): `Tab` foca, `Enter`
+/// ativa; `⌘Z` desfaz direto (gesto universal), sem depender do foco.
+#[must_use]
+pub fn archive_toast_key(key: &str, platform: bool, undo_focused: bool) -> ArchiveToastKey {
+    match key {
+        "z" if platform => ArchiveToastKey::Undo,
+        "tab" if !platform => ArchiveToastKey::FocusUndo,
+        "enter" | "return" if !platform && undo_focused => ArchiveToastKey::Undo,
+        _ => ArchiveToastKey::None,
+    }
+}
+
 // ════════════════════════════ camada 1 · estado (gpui-free) ════════════════════════════
 
 /// Uma linha do Switcher: a gramática da spec §1 já RESOLVIDA em dados
@@ -1349,5 +1434,47 @@ mod tests {
         st.type_char("X");
         st.cancel_rename();
         assert_eq!(st.renaming, None, "cancel descarta sem efeito");
+    }
+
+    /// Spec §M8 (a11y): o toast de arquivar tem janela REAL de Desfazer — não expira antes
+    /// do timeout, expira depois, e o countdown desce de N até 0 (teto, nunca "0s" com
+    /// tempo sobrando). Tudo com relógio INJETADO (determinístico).
+    #[test]
+    fn archive_toast_window_and_countdown() {
+        let t0 = 1_000_000_u64;
+        let t = ArchiveToast::new(PathBuf::from("/tmp/sb-arch"), "Loja".into(), t0);
+        assert!(!t.expired(t0), "nasce dentro da janela");
+        assert!(!t.expired(t0 + ARCHIVE_TOAST_TIMEOUT_MS - 1));
+        assert!(t.expired(t0 + ARCHIVE_TOAST_TIMEOUT_MS), "fecha no prazo");
+        assert_eq!(t.remaining_secs(t0), ARCHIVE_TOAST_TIMEOUT_MS / 1000);
+        assert_eq!(
+            t.remaining_secs(t0 + 7_100),
+            1,
+            "teto: 900ms restantes → 1s"
+        );
+        assert_eq!(t.remaining_secs(t0 + ARCHIVE_TOAST_TIMEOUT_MS), 0);
+        // O anúncio da live-region carrega o NOME (o leigo sabe O QUE foi arquivado).
+        assert!(copy_archive_announce("Loja").contains("“Loja”"));
+        assert!(copy_archive_undone("Loja").contains("“Loja”"));
+    }
+
+    /// Spec §M8: `[ Desfazer ]` é alcançável por TECLADO antes do timeout — `Tab` foca,
+    /// `Enter` ativa; `⌘Z` desfaz de qualquer lugar; `Enter` SEM foco no botão não desfaz
+    /// (não rouba o Enter de quem está digitando). Não-vacuoso: remova `archive_toast_key`
+    /// e este teste falha.
+    #[test]
+    fn archive_toast_undo_reachable_by_keyboard() {
+        use ArchiveToastKey::{FocusUndo, None as KNone, Undo};
+        // caminho Tab → Enter (foco primeiro, ativação depois).
+        assert_eq!(archive_toast_key("tab", false, false), FocusUndo);
+        assert_eq!(archive_toast_key("enter", false, true), Undo);
+        assert_eq!(archive_toast_key("return", false, true), Undo);
+        // ⌘Z desfaz direto, com ou sem foco no botão.
+        assert_eq!(archive_toast_key("z", true, false), Undo);
+        assert_eq!(archive_toast_key("z", true, true), Undo);
+        // Enter sem foco no botão NÃO desfaz; demais teclas seguem o fluxo normal.
+        assert_eq!(archive_toast_key("enter", false, false), KNone);
+        assert_eq!(archive_toast_key("z", false, false), KNone);
+        assert_eq!(archive_toast_key("escape", false, false), KNone);
     }
 }
