@@ -17,7 +17,7 @@
 //!   e nunca são dropados enquanto o runtime existir — ciclo de vida explícito (inv do CLAUDE.md).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -137,6 +137,13 @@ pub fn activate_workspace(
         {
             eprintln!("lina-gpui: [WS] troca sem WorkspaceFocusSet no log do alvo ({e}); seguindo");
         }
+        // r5 park-seam: Espaço descarregado volta ao foco → religa os estacionados
+        // ("religam ao focar", promessa do Descarregar). Idempotente (parked_pending);
+        // runtime recém-bootado religa pelo restore de boot e cai aqui como no-op.
+        let relit = relight_unloaded(rt);
+        if relit > 0 {
+            eprintln!("lina-gpui: [PARK] {relit} terminal(is) religado(s) no foco");
+        }
     }
     // Carimbo durável no ponteiro global — best-effort (inv#6): falha loga e a troca segue.
     let now_ms = std::time::SystemTime::now()
@@ -155,6 +162,102 @@ pub fn activate_workspace(
     }
     r.active = target_root;
     Ok(())
+}
+
+// ───────────────── r5 park-seam · Descarregar Espaço de fundo + religar no foco ─────────────────
+
+/// Resultado do Descarregar — o rail narra a partir daqui ("X desligados; Y seguem trabalhando").
+#[allow(dead_code)] // consumido pelo botão do rail (costura do C) — padrão `RestoreBadge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnloadOutcome {
+    /// Terminais ociosos desligados (PTY morto; card/nó preservados).
+    pub parked: usize,
+    /// Vivos preservados (Busy/Blocked/em atividade — "sem interferir", restrição do fundador).
+    pub kept: usize,
+}
+
+/// **Callback público do botão «Descarregar Espaço» (rail/sidebar — o C fia).** Desliga os
+/// PTYs OCIOSOS de um Espaço de FUNDO sem remover nada (religam no próximo foco, via
+/// [`activate_workspace`]). Recusa o Espaço ATIVO (descarregar o que está na tela não faz
+/// sentido e mataria a sessão em uso). Espaço não-montado → `Ok(0/0)` (já não consome nada).
+///
+/// # Errors
+/// Alvo é o Espaço em foco.
+#[allow(dead_code)] // consumido pelo botão do rail (costura do C) — padrão `plan_restore`.
+pub fn unload_workspace(rts: &Runtimes, target_root: &Path) -> Result<UnloadOutcome, String> {
+    let r = lock(rts);
+    if r.active == target_root {
+        return Err("este Espaço está em foco — troque para outro antes de descarregá-lo".into());
+    }
+    let Some(rt) = r.map.get(target_root) else {
+        return Ok(UnloadOutcome { parked: 0, kept: 0 });
+    };
+    let plan = lina_core::suspend::unload_plan(&rt.sup.list());
+    let parked = rt.nodes.park_terminals(&plan.park);
+    Ok(UnloadOutcome {
+        parked,
+        kept: plan.keep.len(),
+    })
+}
+
+/// **PURO — ids estacionados que AINDA pendem religação:** união dos `parked` de todos os
+/// `WorkspaceUnloaded` do log, filtrada a quem segue `Dead` NA PROJEÇÃO. O supersede do
+/// restore (`NodeRemoved`) os tira da projeção → religar é idempotente por construção.
+fn parked_pending(
+    recs: &[lina_core::EventRecord],
+    proj: &lina_core::ProjectedState,
+) -> std::collections::BTreeSet<NodeId> {
+    let mut out = std::collections::BTreeSet::new();
+    for r in recs {
+        if r.kind != "WorkspaceUnloaded" {
+            continue;
+        }
+        let Some(parked) = r
+            .payload
+            .get("parked")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for v in parked {
+            let Some(id) = v.as_str().and_then(|s| s.parse::<NodeId>().ok()) else {
+                continue;
+            };
+            let dead = proj
+                .nodes
+                .get(&id)
+                .is_some_and(|n| n.status.as_deref() == Some("Dead"));
+            if dead {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
+/// Religa os terminais estacionados de um runtime JÁ MONTADO (o caso "Espaço de fundo
+/// descarregado voltou ao foco") — reusa o fluxo F1-4-3 inteiro: `plan_restore` (resgate de
+/// órfão-nomeado) filtrado aos estacionados + `restore_terminals` (re-ergue, badge honesto,
+/// supersede com `NodeRemoved`). Devolve quantos religou. (Runtime NOVO não passa aqui: o
+/// restore de boot dentro de `boot_ws_runtime` já resgata os estacionados do log.)
+fn relight_unloaded(rt: &WsRuntime) -> usize {
+    let (recs, proj) = {
+        let s = lock(&rt.store);
+        match (s.events(), s.project()) {
+            (Ok(r), Ok(p)) => (r, p),
+            _ => return 0, // log ilegível → não religa às cegas (próximo foco re-tenta)
+        }
+    };
+    let pending = parked_pending(&recs, &proj);
+    if pending.is_empty() {
+        return 0;
+    }
+    let plans: Vec<bridge::RestoredTerminal> =
+        bridge::plan_restore(&proj, &rt.profile_registry, rt.nodes.scrollback().as_ref())
+            .into_iter()
+            .filter(|p| pending.contains(&p.node))
+            .collect();
+    rt.nodes.restore_terminals(&plans)
 }
 
 /// Epílogo do processo: para o dreno de TODOS os runtimes (o `main` chama após `app.run`).
@@ -729,6 +832,60 @@ fn subscribe_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **r5 park-seam — `parked_pending` (puro sobre log+projeção):** só ids de
+    /// `WorkspaceUnloaded` que AINDA estão `Dead` na projeção pendem religação; depois do
+    /// supersede (`NodeRemoved` do restore) saem sozinhos — religar 2× é impossível por
+    /// construção (idempotência do foco).
+    #[test]
+    fn parked_pending_tracks_unloaded_until_superseded() {
+        let dir = std::env::temp_dir().join(format!("lina-relight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = EventStore::open(dir.join(".lina/events")).expect("store");
+        let node: NodeId = uuid::Uuid::now_v7();
+        store
+            .append(&lina_core::DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 1.0,
+                y: 2.0,
+                requested_by: None,
+            })
+            .expect("NodeAdded");
+        store
+            .append(&lina_core::DomainEvent::NodeRenamed {
+                node,
+                name: "Pesquisador".into(),
+            })
+            .expect("NodeRenamed");
+        store
+            .append(&lina_core::DomainEvent::NodeStatusChanged {
+                node,
+                status: "Dead".into(),
+                from: "Idle".into(),
+                reason: "unloaded_bg".into(),
+            })
+            .expect("morte registrada");
+        store
+            .append(&lina_core::DomainEvent::WorkspaceUnloaded {
+                parked: vec![node.to_string()],
+                kept: vec![],
+            })
+            .expect("gesto registrado");
+
+        let recs = store.events().expect("events");
+        let proj = store.project().expect("project");
+        let pending = parked_pending(&recs, &proj);
+        assert!(pending.contains(&node), "estacionado pende religação");
+
+        // Supersede (o restore aposenta o antigo) → sai do pendente (idempotência).
+        store
+            .append(&lina_core::DomainEvent::NodeRemoved { node })
+            .expect("NodeRemoved");
+        let pending2 = parked_pending(&store.events().expect("e"), &store.project().expect("p"));
+        assert!(pending2.is_empty(), "aposentado não religa de novo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// **r5 perf-ws (regressão do multi-workspace):** N Espaços compartilham UMA varredura —
     /// fonte duplicada não duplica o walk, todo inscrito recebe o MESMO snapshot, e um

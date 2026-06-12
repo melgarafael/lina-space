@@ -655,7 +655,7 @@ impl WorkspaceView {
                 .await;
         })
         .detach();
-        Self {
+        let mut view = Self {
             nodes,
             input,
             a2a,
@@ -738,7 +738,24 @@ impl WorkspaceView {
             create_space_modal: None,
             archive_toast: None,
             prof: prof::Probe::from_env(),
-        }
+        };
+        // r5 · plug do Descarregar (contrato combinado C↔Core A2A): botão do rail →
+        // executor `runtime::unload_workspace` (Busy preservado por re-checagem no seam);
+        // narração leiga dos números REAIS + refresh. Com o callback plugado, a dupla
+        // guarda do rail (`row_can_unload`) passa a exibir a ação nos Espaços de fundo.
+        view.sidebar
+            .set_on_unload(std::rc::Rc::new(|v: &mut Self, root: &Path, _w, cx| {
+                match runtime::unload_workspace(&v.runtimes, root) {
+                    Ok(o) => {
+                        v.a11y_live
+                            .announce(sidebar::copy_unload_narration(o.parked, o.kept));
+                        v.refresh_sidebar_rows();
+                    }
+                    Err(e) => v.a11y_live.announce(e),
+                }
+                cx.notify();
+            }));
+        view
     }
 
     // ──────────────────── F1-4-4 · troca VIVA de Espaço (fatia ii do M8) ────────────────────

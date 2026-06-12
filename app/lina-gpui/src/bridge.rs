@@ -5078,6 +5078,71 @@ impl NodeManager {
             eprintln!("lina-gpui: thread de kill não pôde subir: {e}");
         }
     }
+
+    /// **r5 park-seam — Descarregar Espaço: desliga PTYs OCIOSOS sem remover nós.** O card
+    /// fica no canvas e o nó fica na projeção (NUNCA `NodeRemoved`); só o processo morre.
+    /// Religação = resgate de órfão-nomeado do `plan_restore` no próximo foco (F1-4-3).
+    /// A restrição do fundador ("sem interferir nos processos rodando") é re-checada AQUI,
+    /// no instante da execução (defesa em profundidade contra lista velha do chamador):
+    /// só quem está `Idle` AGORA estaciona. Devolve quantos desligou.
+    //
+    // Consumido por `runtime::unload_workspace` (callback do botão do rail — costura do C);
+    // `dead_code` até a fiação entrar, como `plan_restore` na F1-4-3.
+    #[allow(dead_code)]
+    pub fn park_terminals(&self, candidates: &[NodeId]) -> usize {
+        let roster = self.sup.list();
+        let plan = lina_core::suspend::unload_plan(&roster);
+        let safe: std::collections::BTreeSet<NodeId> = plan.park.iter().copied().collect();
+        let mut parked: Vec<String> = Vec::new();
+        for &node in candidates {
+            if !safe.contains(&node) {
+                continue; // Busy/Blocked/em-atividade preservados (ou já fora do roster)
+            }
+            let Some(key) = lock(&self.keys).get(&node).cloned() else {
+                continue; // artefato (Note/Folder) ou já estacionado — sem PTY a desligar
+            };
+            // Fato-antes-do-efeito: a morte entra no LOG antes do kill — é o que faz a
+            // projeção ver `Dead{unloaded_bg}` e o resgate do plan_restore religar depois.
+            // Falha de append → NÃO desliga (nenhum efeito sem registro).
+            let from = roster
+                .iter()
+                .find(|i| i.id == node)
+                .map_or("", |i| i.status.as_str());
+            if let Err(e) = lock(&self.store).append(&DomainEvent::NodeStatusChanged {
+                node,
+                status: lina_core::NodeStatus::Dead.as_str().to_string(),
+                from: from.to_string(),
+                reason: "unloaded_bg".to_string(),
+            }) {
+                eprintln!("lina-gpui: park de {node} ABORTADO (morte não registrável): {e}");
+                continue;
+            }
+            lock(&self.keys).remove(&node);
+            lock(&self.grids).remove(&node);
+            self.retire_pty(node, key); // desregistra do roster + SIGTERM→SIGKILL em fundo
+            parked.push(node.to_string());
+        }
+        if parked.is_empty() {
+            return 0;
+        }
+        // Livro-razão do GESTO (estacionados + preservados) — religação/auditoria leem daqui.
+        if let Err(e) = lock(&self.store).append(&DomainEvent::WorkspaceUnloaded {
+            parked: parked.clone(),
+            kept: plan.keep.iter().map(ToString::to_string).collect(),
+        }) {
+            eprintln!(
+                "lina-gpui: WorkspaceUnloaded não logado ({e}); as mortes individuais estão no log"
+            );
+        }
+        // Roster mudou → os CLAUDE.md dos colegas não listam os estacionados.
+        self.rewrite_bootstrap();
+        eprintln!(
+            "lina-gpui: [PARK] {} terminal(is) ocioso(s) desligado(s); {} em atividade preservado(s)",
+            parked.len(),
+            plan.keep.len()
+        );
+        parked.len()
+    }
 }
 
 // ─────────────── R2b · fiação VIVA da detecção (metade-app — grids do APP) ───────────────
@@ -6936,6 +7001,16 @@ mod tests {
         tag: &str,
         bootstrap: Option<BootstrapWriter>,
     ) -> (NodeManager, Arc<Mutex<EventStore>>, Model) {
+        let (nm, store, model, _sup) = test_manager_full(tag, bootstrap);
+        (nm, store, model)
+    }
+
+    /// Como [`test_manager`], expondo também o `Supervisor` — testes que precisam forjar
+    /// status de roster (ex.: Idle/Busy para o gate do Descarregar) usam esta variante.
+    fn test_manager_full(
+        tag: &str,
+        bootstrap: Option<BootstrapWriter>,
+    ) -> (NodeManager, Arc<Mutex<EventStore>>, Model, Arc<Supervisor>) {
         let dir = std::env::temp_dir().join(format!("lina-nm-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("open store")));
@@ -6989,7 +7064,7 @@ mod tests {
         // #7: motor de spawn FIXO (None) — a discovery real leria o PATH do runner e um
         // spawn de teste LANÇARIA o CLI de verdade. `None` = fábrica `cat` (como sempre).
         nm.set_spawn_engine_factory(Arc::new(|| None));
-        (nm, store, model)
+        (nm, store, model, sup)
     }
 
     /// SEAM-1: `Arc<NodeManager>` de teste compartilhando o `store` dado — para os testes do
@@ -7062,6 +7137,111 @@ mod tests {
             ws_root.join(".lina"),
         );
         (nm, store)
+    }
+
+    /// **r5 park-seam (Descarregar, gate 1): `park_terminals` só atinge o OCIOSO.** A restrição
+    /// literal do fundador ("sem interferir nos processos rodando") é re-checada NO SEAM, no
+    /// instante da execução (defesa em profundidade — o chamador pode passar lista velha):
+    /// Busy é preservado mesmo que esteja em `candidates`. O gesto é event-sourced
+    /// (fato-antes-do-efeito): `NodeStatusChanged{Dead, unloaded_bg}` + `WorkspaceUnloaded`
+    /// no log, SEM `NodeRemoved` — o card fica no canvas; só o processo morre.
+    #[test]
+    fn park_terminals_parks_only_idle_preserves_busy_and_logs_gesture() {
+        let (nm, store, model, sup) = test_manager_full("park", None);
+        let ids: Vec<NodeId> = lock(&model).order.clone();
+        let (a, b) = (ids[0], ids[1]);
+        sup.set_status(a, lina_core::NodeStatus::Idle)
+            .expect("A Idle");
+        sup.set_status(b, lina_core::NodeStatus::Busy)
+            .expect("B Busy");
+
+        let parked = nm.park_terminals(&[a, b]);
+        assert_eq!(parked, 1, "só o ocioso (A) estaciona; B Busy é preservado");
+
+        // Fato no log: morte registrada de A + o livro-razão do gesto; NUNCA NodeRemoved.
+        let recs = lock(&store).events().expect("events");
+        let dead_a = recs.iter().any(|r| {
+            r.kind == "NodeStatusChanged"
+                && r.payload["node"].as_str() == Some(&a.to_string())
+                && r.payload["status"].as_str() == Some("Dead")
+                && r.payload["reason"].as_str() == Some("unloaded_bg")
+        });
+        assert!(dead_a, "morte de A registrada com reason=unloaded_bg");
+        let gesture = recs
+            .iter()
+            .find(|r| r.kind == "WorkspaceUnloaded")
+            .expect("WorkspaceUnloaded no log");
+        assert_eq!(
+            gesture.payload["parked"][0].as_str(),
+            Some(a.to_string().as_str())
+        );
+        assert!(
+            gesture.payload["kept"]
+                .as_array()
+                .is_some_and(|k| k.iter().any(|v| v.as_str() == Some(&b.to_string()))),
+            "B preservado consta em kept"
+        );
+        assert!(
+            !recs.iter().any(|r| r.kind == "NodeRemoved"),
+            "park NÃO remove nó (o card fica; só o PTY morre)"
+        );
+
+        // Estado vivo: A fora do roster (PTY desligado) e sem grid; card de A SEGUE no canvas;
+        // B intocado. Re-park de A é no-op (idempotente).
+        assert!(sup.get(a).is_none(), "A desregistrado do roster vivo");
+        assert_eq!(
+            sup.get(b).map(|i| i.status),
+            Some(lina_core::NodeStatus::Busy),
+            "B intocado"
+        );
+        assert!(
+            lock(&model).nodes.contains_key(&a),
+            "card de A fica no canvas"
+        );
+        assert!(!lock(&nm.grids).contains_key(&a), "grid de A liberado");
+        assert_eq!(
+            nm.park_terminals(&[a]),
+            0,
+            "re-park do já-estacionado é no-op"
+        );
+    }
+
+    /// **r5 park-seam (gate 2): religar restaura.** Após o park, o nó estacionado é um
+    /// "órfão nomeado morto sem sucessor vivo" — exatamente o que o resgate do
+    /// `plan_restore` (F1-4-3) re-ergue: mesmo nome, nó NOVO, antigo aposentado com
+    /// `NodeRemoved`. É o ciclo completo do Descarregar sem mecanismo novo de restore.
+    #[test]
+    fn relight_after_park_restores_terminal_with_same_name() {
+        let (nm, store, _model, sup) = test_manager_full("relight", None);
+        // Nó ADMITIDO de verdade (NodeAdded+NodeRenamed no log) — os seeds do harness entram
+        // direto no model e não existem na projeção; o religar é dirigido pela PROJEÇÃO.
+        let a = nm.add_node().expect("admitir terminal");
+        let name = sup.get(a).expect("no roster").name;
+        sup.set_status(a, lina_core::NodeStatus::Idle)
+            .expect("Idle");
+        assert_eq!(nm.park_terminals(&[a]), 1, "estacionado");
+
+        let proj = lock(&store).project().expect("projeção");
+        let reg = ProfileRegistry::new();
+        let plans: Vec<RestoredTerminal> = plan_restore(&proj, &reg, None)
+            .into_iter()
+            .filter(|p| p.node == a)
+            .collect();
+        assert_eq!(plans.len(), 1, "o estacionado entra no plano de religação");
+        assert_eq!(plans[0].name, name, "identidade-nome atravessa o park");
+
+        assert_eq!(nm.restore_terminals(&plans), 1, "religou");
+        let new_id = sup
+            .node_by_name(&name)
+            .expect("nome de volta ao roster VIVO");
+        assert_ne!(new_id, a, "re-erguido é nó NOVO (Dead é terminal)");
+        let recs = lock(&store).events().expect("events");
+        assert!(
+            recs.iter()
+                .any(|r| r.kind == "NodeRemoved"
+                    && r.payload["node"].as_str() == Some(&a.to_string())),
+            "o antigo foi aposentado no log (sem zumbi no próximo boot)"
+        );
     }
 
     /// **GATE de ADD (headless, determinístico):** `add_node` sobe a contagem 2→3, dá um grid
