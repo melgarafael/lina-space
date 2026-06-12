@@ -8,3 +8,9 @@ Itens herdados com dono/lente já combinados:
 5. **Strings dos toasts/badges** — @Redator (registro anti-alarme do vocabulário F2-2).
 Revisões combinadas: D = contrato a11y empírico (alerta dele: migração preserva value+live/glifo+texto; toast_stack mantém teto-3 e id único) · @Arquiteto = revisão CEGA de completude (nenhum dot/chip de estado legado sem live()) · Terminal A = autor de specs · Maestro = validação de fora.
 Vereditos de base: F2-2-2 a11y PASS prova-dupla (D) · conformidade 0028 PASS 90 (Arquiteto-revisor).
+
+## Régua de completude da migração (baseline do @Arquiteto, capturada ANTES da migração — escopo OFICIAL da story)
+1. **attention_ui.rs** — O MAIOR E MAIS CRÍTICO: render_toast (l.508, Role::Status CRU na l.531 — o toast de permissão/custódia mudo sem foco; o som 1x/30s não DIZ o que pede) + render_badge/sino (l.454, contagem e escalação sem auto-anúncio).
+2. **Card do nó** — P0 já nomeado: status_dot/card_border + node_label→aria_label, derivados de BadgeKind/aggregate_badge.
+3. **Chips do título** (autonomy/kit_missing/cwd_shared ~3667/3712/3728) — verificar se comunicam MUDANÇA de estado.
+CRITÉRIO: migrado = compõe LiveRegion com cortesia certa (needs_you/escalação→Assertive); ZERO Role::Status cru; ZERO só-aria_label para estado que muda sem foco.
