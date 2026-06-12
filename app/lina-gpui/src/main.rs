@@ -3233,6 +3233,37 @@ impl Render for WorkspaceView {
         for line in self.prof.begin_frame(frame_now) {
             eprintln!("lina-gpui: {line}");
         }
+        // F2-0-1 (costura a): carimba o scale factor na sonda — loga só na MUDANÇA (e avisa
+        // em LoDPI <1.5x); custo por frame = 1 comparação de f64 quando nada mudou.
+        if let Some(line) = self
+            .prof
+            .observe_scale_factor(f64::from(window.scale_factor()))
+        {
+            eprintln!("lina-gpui: {line}");
+        }
+        // F2-0-1 (costura b): janelas fechadas viram fato no log do Espaço ativo (inv#4 — a
+        // régua D0 re-deriva o gate por replay). Vec vazio em ~119/120 frames = custo nulo;
+        // sonda desligada nunca acumula. Falha de append já é logada pelo próprio helper.
+        let summaries = self.prof.take_window_summaries();
+        if !summaries.is_empty() {
+            let active_root = lock(&self.runtimes).active.clone();
+            for s in summaries {
+                self.append_to_workspace(
+                    &active_root,
+                    &lina_core::DomainEvent::ProfWindowMetric {
+                        frames: s.frames,
+                        budget_ms: s.budget_ms,
+                        active_ms: s.active_ms,
+                        excess_ms: s.excess_ms,
+                        frames_over_budget: s.frames_over_budget,
+                        frame_p50_ms: s.frame_p50_ms,
+                        frame_p95_ms: s.frame_p95_ms,
+                        frame_p99_ms: s.frame_p99_ms,
+                        scale_factor: s.scale_factor,
+                    },
+                );
+            }
+        }
         if let Some(prev) = self.last_frame_at {
             let dt_ms = frame_now.saturating_duration_since(prev).as_secs_f64() * 1000.0;
             if dt_ms <= IDLE_GAP_MS {

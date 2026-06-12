@@ -1,4 +1,5 @@
-//! `theme` — **F1-2-1: design system com tokens nomeados (dark/light + personalização local-first)**.
+//! `theme` — **F1-2-1 + F2-1: design system com tokens nomeados — cor (dark/light), tipografia,
+//! espaçamento, cantos e movimento (personalização local-first)**.
 //!
 //! A **fonte única de cor do shell** (modelo do Zed/GPUI Component — [[13.3]] achado 5: "nunca cores
 //! hard-coded"). Tudo que pinta a UI lê DAQUI:
@@ -17,6 +18,31 @@
 //!   4.5:1 (AA normal) / 3:1 (muted/large) em QUALQUER modo × acento, se o focus ring baixar de 3:1
 //!   ([WCAG 1.4.11]), ou se um `rgb(0x…)` literal reaparecer no shell fora deste módulo (lint).
 //!
+//! **F2-1 — vocabulário completo (mesmas garantias da cor):** o módulo também é a fonte única de
+//! TIPOGRAFIA, ESPAÇAMENTO, CANTOS e MOVIMENTO ([`TypographyTokens`]/[`SpacingTokens`]/
+//! [`RadiusTokens`]/[`MotionTokens`]), com testes-gate de integridade neste módulo (a catraca
+//! anti-número-mágico do shell é a F2-1-5). Voz da fusão **T1 + temperatura T3** selada na
+//! F2-0-D (épico 38 §VIII): IBM Plex Sans (UI) + Fraunces (momentos) + JetBrains Mono (grid —
+//! fecha a dívida do ADR 0019 §7: fonte de código/terminal **via token**, nunca literal).
+//!
+//! **Doutrina de movimento (D1-A8, observada no Raycast):** NUNCA animar ação iniciada por input
+//! frequente (abrir/focar/teclar = [`MotionTokens::instant`] = 0ms — repetida centenas de vezes
+//! ao dia, animação = lentidão); o restante ≤300ms e SEMPRE subordinado a reduce-motion
+//! ([`MotionTokens::effective`] zera tudo com o flag ligado — ADR 0019 §7).
+//!
+//! **Fontes — instâncias estáticas obrigatórias (D1-A7, verificada via API em 2026-06-12):** o pin
+//! do gpui/cosmic-text não aplica eixos variáveis (zed#4850 · cosmic-text#406) — toda família
+//! entra como estáticos OFL completos. Pesos escolhidos (fonte: pesquisa D1, fetch real dos repos):
+//! - **IBM Plex Sans** (OFL, repo `IBM/plex`, estáticos completos): Regular 400 · Medium 500 ·
+//!   SemiBold 600 · Bold 700.
+//! - **Fraunces** (OFL, repo `undercasetype/Fraunces`, `fonts/static/` pré-gerados): SemiBold 600
+//!   em opsz alto (72pt) — só momentos display, nunca corpo de UI.
+//! - **JetBrains Mono** (OFL, repo `JetBrains/JetBrainsMono`, estáticos completos): Regular 400 ·
+//!   Bold 700 (o bold ANSI do grid).
+//!
+//! O empacotamento físico no .app (embedding via `add_fonts`) é story posterior; até lá o consumo
+//! resolve pelo sistema (fallback do font-kit se ausente — o token já nomeia a família certa).
+//!
 //! **Terminal é superfície escura nos 2 temas** (decisão de curadoria): o conteúdo do grid vem do CLI
 //! via ANSI e assume fundo escuro; tematizar o conteúdo além de BG/cursor padrão está fora do escopo
 //! (F1-2-1 "NÃO entra"). No modo claro, o terminal fica como um viewport escuro dentro do chrome claro.
@@ -25,6 +51,7 @@
 //! `lina-core` (este módulo não importa nada do core nem do gpui; consumidores chamam `gpui::rgb`).
 
 use std::sync::{LazyLock, PoisonError, RwLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -256,7 +283,182 @@ pub struct TerminalTokens {
     pub selection: u32,
 }
 
-/// O tema resolvido — tokens prontos para `gpui::rgb()`. `Copy` barato (~30 u32): as views leem uma
+// ═══════════════════ vocabulário F2-1 (tipografia · espaçamento · cantos · movimento) ═══════════════════
+
+/// Famílias tipográficas — a voz da fusão T1+T3 (F2-0-D, épico 38 §VIII). `&'static str` de
+/// propósito: famílias são CURADORIA (como os 8 acentos), não campo livre — trocar uma exige
+/// decisão registrada NESTE módulo, nunca um literal no shell (ADR 0019 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FontFamilyTokens {
+    /// UI/chrome (IBM Plex Sans — humanista-técnica com calor, pt-br impecável; D1 §II-T1).
+    pub ui: &'static str,
+    /// Momentos display (Fraunces — onboarding, conclusões; NUNCA corpo de UI).
+    pub display: &'static str,
+    /// Grid do terminal e código (JetBrains Mono — selada pelo ADR 0019 §7).
+    pub mono: &'static str,
+}
+
+/// Escala de tamanhos (px inteiros) — nascida da MEDIÇÃO do shell no kickoff F2-1 (corpo
+/// dominante 12px, micro-UI 10-11, títulos 15/20/28, momentos 40), não de razão teórica.
+/// Consumo: `.text_size(px(f32::from(t.size.body)))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypeScaleTokens {
+    /// Legendas e medidas mínimas (kbd, medidores).
+    pub caption: u16,
+    /// Texto de apoio.
+    pub small: u16,
+    /// Corpo padrão do shell.
+    pub body: u16,
+    /// Grid do terminal — CONTRATO com as métricas de célula (`bridge.rs` `CELL_W`/`CELL_H`
+    /// medem ESTA família NESTE px; mudar aqui exige re-derivar as métricas na costura).
+    pub grid: u16,
+    /// Subtítulos e cabeçalhos de card.
+    pub subtitle: u16,
+    /// Títulos de janela/overlay.
+    pub title: u16,
+    /// Cabeçalhos de tela (onboarding).
+    pub heading: u16,
+    /// Momentos display (Fraunces).
+    pub display: u16,
+}
+
+/// Pesos nomeados — instâncias ESTÁTICAS completas obrigatórias (D1-A7: o pin não aplica eixos
+/// variáveis). Consumo: `FontWeight(f32::from(t.weight.semibold))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FontWeightTokens {
+    pub regular: u16,
+    pub medium: u16,
+    pub semibold: u16,
+    pub bold: u16,
+}
+
+/// Tipografia completa do shell (F2-1-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypographyTokens {
+    pub family: FontFamilyTokens,
+    pub size: TypeScaleTokens,
+    pub weight: FontWeightTokens,
+}
+
+impl TypographyTokens {
+    /// A voz canônica da fusão T1+T3 (F2-0-D). Toda construção de tema parte DAQUI.
+    pub const CANONICAL: Self = Self {
+        family: FontFamilyTokens {
+            ui: "IBM Plex Sans",
+            display: "Fraunces",
+            mono: "JetBrains Mono",
+        },
+        size: TypeScaleTokens {
+            caption: 10,
+            small: 11,
+            body: 12,
+            grid: 13,
+            subtitle: 15,
+            title: 20,
+            heading: 28,
+            display: 40,
+        },
+        weight: FontWeightTokens {
+            regular: 400,
+            medium: 500,
+            semibold: 600,
+            bold: 700,
+        },
+    };
+}
+
+/// Espaçamento (F2-1-2) — a escala selada no épico: 4/8/12/16/24/32. Mapa para os utilitários
+/// gpui (1 unidade = 4px): `xs`=`p_1` · `sm`=`p_2` · `md`=`p_3` · `lg`=`p_4` · `xl`=`p_6` ·
+/// `xxl`=`p_8`. Consumo direto: `.p(px(f32::from(t.spacing.md)))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpacingTokens {
+    pub xs: u16,
+    pub sm: u16,
+    pub md: u16,
+    pub lg: u16,
+    pub xl: u16,
+    pub xxl: u16,
+}
+
+impl SpacingTokens {
+    pub const CANONICAL: Self = Self {
+        xs: 4,
+        sm: 8,
+        md: 12,
+        lg: 16,
+        xl: 24,
+        xxl: 32,
+    };
+}
+
+/// Cantos (F2-1-2). `md`=6 preserva o degrau dominante MEDIDO no shell (103 usos de
+/// `.rounded_md()`); o "flat honesto" da fusão entra na APLICAÇÃO (F2-2), não inflando a escala.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RadiusTokens {
+    /// Cantos retos (flat honesto — T1).
+    pub none: u16,
+    pub sm: u16,
+    pub md: u16,
+    pub lg: u16,
+    /// Pílulas/badges (valor sentinela "tudo redondo").
+    pub full: u16,
+}
+
+impl RadiusTokens {
+    pub const CANONICAL: Self = Self {
+        none: 0,
+        sm: 4,
+        md: 6,
+        lg: 12,
+        full: 9999,
+    };
+}
+
+/// Movimento (F2-1-3) — durações nomeadas + reduce-motion. **DOUTRINA (D1-A8): nunca animar
+/// ação iniciada por input frequente** — abrir/focar terminal, teclar, chrome = [`Self::instant`]
+/// (0ms); animação só onde SIGNIFICA (estado mudou, trabalho fluindo, espaço). Use SEMPRE
+/// [`Self::effective`] (subordinação a reduce-motion é do ADR 0019 §7, não opcional).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionTokens {
+    /// Ações de input frequente: SEM animação, por doutrina (0ms).
+    pub instant: Duration,
+    /// Micro-transições de estado (hover de chip, fade de badge).
+    pub fast: Duration,
+    /// Transição padrão de estado (cor de chip, banner).
+    pub base: Duration,
+    /// Movimento espacial (pan/zoom programático, spawn) — teto <300ms (D1-A8).
+    pub slow: Duration,
+    /// `true` = toda duração efetiva vira 0ms. A FONTE é o sistema/Ajustes (fiação é costura);
+    /// o único ponto de mutação é [`set_reduce_motion`].
+    pub reduce_motion: bool,
+}
+
+impl MotionTokens {
+    pub const CANONICAL: Self = Self {
+        instant: Duration::ZERO,
+        fast: Duration::from_millis(120),
+        base: Duration::from_millis(180),
+        slow: Duration::from_millis(280),
+        reduce_motion: false,
+    };
+
+    /// A duração EFETIVA de uma animação: zera TUDO sob reduce-motion. Consumidores usam este
+    /// acessor, nunca o campo cru — é ele que garante a subordinação (ADR 0019 §7).
+    // dead_code: o 1º consumidor de produção chega com a costura/F2-2 (este crate é binário —
+    // sem consumidor externo possível). Remover o allow ao fiar o primeiro uso.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn effective(self, d: Duration) -> Duration {
+        if self.reduce_motion {
+            Duration::ZERO
+        } else {
+            d
+        }
+    }
+}
+
+/// O tema resolvido — tokens prontos para `gpui::rgb()`. `Copy` barato (~30 u32 + o vocabulário
+/// F2-1, tudo inteiros/`Duration`/`&'static str`): as views leem uma
 /// cópia por render ([`active`]) e nunca seguram lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
@@ -267,6 +469,10 @@ pub struct Theme {
     pub state: StateTokens,
     pub focus: FocusTokens,
     pub terminal: TerminalTokens,
+    pub typography: TypographyTokens,
+    pub spacing: SpacingTokens,
+    pub radius: RadiusTokens,
+    pub motion: MotionTokens,
 }
 
 impl Theme {
@@ -320,6 +526,11 @@ impl Theme {
                 cursor_text: scale::TERMINAL_CURSOR_TEXT.pick(mode),
                 selection: scale::TERMINAL_SELECTION.pick(mode),
             },
+            // Vocabulário F2-1: invariante a modo/acento — a voz é UMA (fusão T1+T3).
+            typography: TypographyTokens::CANONICAL,
+            spacing: SpacingTokens::CANONICAL,
+            radius: RadiusTokens::CANONICAL,
+            motion: MotionTokens::CANONICAL,
         }
     }
 }
@@ -341,14 +552,58 @@ pub fn active() -> Theme {
 
 /// Aplica `(mode, acento)` como tema vivo — efeito no próximo frame de TODAS as janelas (sem
 /// restart, sem flash: é só a próxima passada de render lendo novos u32).
+///
+/// O flag reduce-motion SOBREVIVE à troca (F2-1-3): trocar modo/acento jamais religa animação
+/// para quem a reduziu — seria regressão de a11y silenciosa.
 pub fn apply(mode: Mode, accent: &str) {
-    *ACTIVE.write().unwrap_or_else(PoisonError::into_inner) = Theme::build(mode, accent);
+    let mut active = ACTIVE.write().unwrap_or_else(PoisonError::into_inner);
+    let reduce_motion = active.motion.reduce_motion;
+    *active = Theme::build(mode, accent);
+    active.motion.reduce_motion = reduce_motion;
+}
+
+/// Liga/desliga o reduce-motion do tema vivo (F2-1-3) — o ÚNICO ponto de mutação do flag.
+/// A FONTE da verdade é o sistema/Ajustes; a fiação (observer) é costura posterior.
+// dead_code: a fiação (observer de aparência/Ajustes) é a costura que consome isto — pedido ao
+// Maestro junto com o diff do grid. Remover o allow ao fiar.
+#[allow(dead_code)]
+pub fn set_reduce_motion(on: bool) {
+    ACTIVE
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .motion
+        .reduce_motion = on;
 }
 
 // ═══════════════════════════ export/import JSON (100% local — T7§A Avançado) ═══════════════════════════
 
+/// Seção de tipografia do arquivo de tema (F2-1, aditiva). Documenta a voz em pt-br legível;
+/// famílias são CURADAS — a APLICAÇÃO de override parcial por token é a F2-1-4 (que consome
+/// [`parse_prefs`]), não esta story.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TypographyPrefs {
+    /// Família da UI (`"IBM Plex Sans"`).
+    #[serde(default)]
+    pub interface: String,
+    /// Família dos momentos display (`"Fraunces"`).
+    #[serde(default)]
+    pub momentos: String,
+    /// Família do grid do terminal (`"JetBrains Mono"` — ADR 0019 §7).
+    #[serde(default)]
+    pub terminal: String,
+}
+
+/// Seção de movimento do arquivo de tema (F2-1, aditiva).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MotionPrefs {
+    /// `true` = toda duração efetiva vira 0ms ([`MotionTokens::effective`]).
+    #[serde(default)]
+    pub reduzir: bool,
+}
+
 /// O tema como arquivo: JSON **legível** em pt-br, local-first (nenhuma rede). Campos desconhecidos
-/// de versões futuras são IGNORADOS no import ("aplica o que entende" — T7§A estados de erro).
+/// de versões futuras são IGNORADOS no import ("aplica o que entende" — T7§A estados de erro);
+/// seções AUSENTES de versões antigas viram `None` (import antigo nunca quebra — F2-1 item 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemePrefs {
     /// `"escuro"` | `"claro"` (mesmas strings do T7).
@@ -357,25 +612,47 @@ pub struct ThemePrefs {
     /// Nome do acento curado (ex.: `"azul"`).
     #[serde(default)]
     pub acento: String,
+    /// Vocabulário F2-1 (aditivo — ausente em temas pré-F2-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tipografia: Option<TypographyPrefs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movimento: Option<MotionPrefs>,
 }
 
-/// Serializa as preferências correntes como JSON legível (export local).
+/// Serializa as preferências correntes como JSON legível (export local). As seções F2-1 saem
+/// preenchidas: a tipografia canônica (documenta a voz no arquivo) e o estado VIVO do
+/// reduce-motion (preferência real do processo).
 #[must_use]
 pub fn export_json(mode: Mode, accent: &str) -> String {
+    let voice = TypographyTokens::CANONICAL;
     let prefs = ThemePrefs {
         modo: mode.as_setting().to_string(),
         acento: accent.trim().to_lowercase(),
+        tipografia: Some(TypographyPrefs {
+            interface: voice.family.ui.to_string(),
+            momentos: voice.family.display.to_string(),
+            terminal: voice.family.mono.to_string(),
+        }),
+        movimento: Some(MotionPrefs {
+            reduzir: active().motion.reduce_motion,
+        }),
     };
     // ThemePrefs é Serialize de structs planas — `to_string_pretty` não tem caminho de erro real;
     // o fallback mantém a função infalível (best-effort, mesma postura do save_settings).
     serde_json::to_string_pretty(&prefs).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Lê um arquivo de tema. JSON inválido → `Err` com mensagem LEIGA (copy do T7§A); campos
-/// desconhecidos são ignorados; acento desconhecido cai no default ao construir ([`Theme::build`]).
+/// Lê um arquivo de tema COMPLETO (todas as seções, incl. F2-1). JSON inválido → `Err` com
+/// mensagem LEIGA; campos desconhecidos ignorados; seções ausentes → `None`. A F2-1-4 (overrides
+/// parciais por token) consome DAQUI.
+pub fn parse_prefs(json: &str) -> Result<ThemePrefs, String> {
+    serde_json::from_str(json).map_err(|_| "Este arquivo não parece um tema do Lina.".to_string())
+}
+
+/// Lê um arquivo de tema no contrato dos consumidores atuais (modo + acento). Acento desconhecido
+/// cai no default ao construir ([`Theme::build`]).
 pub fn parse_json(json: &str) -> Result<(Mode, String), String> {
-    let prefs: ThemePrefs = serde_json::from_str(json)
-        .map_err(|_| "Este arquivo não parece um tema do Lina.".to_string())?;
+    let prefs = parse_prefs(json)?;
     let accent = if prefs.acento.trim().is_empty() {
         DEFAULT_ACCENT.to_string()
     } else {
@@ -676,6 +953,190 @@ mod tests {
 
         let (_, accent) = parse_json(r#"{"modo":"escuro"}"#).expect("acento ausente");
         assert_eq!(accent, DEFAULT_ACCENT);
+    }
+
+    /// **F2-1-1 — integridade da tipografia:** escala de tamanhos ESTRITAMENTE crescente
+    /// (`grid`=13 é contrato com as métricas de célula do `bridge.rs`), pesos crescentes,
+    /// famílias não-vazias e distintas.
+    #[test]
+    fn typography_vocabulary_integrity() {
+        let t = TypographyTokens::CANONICAL;
+        let sizes = [
+            t.size.caption,
+            t.size.small,
+            t.size.body,
+            t.size.grid,
+            t.size.subtitle,
+            t.size.title,
+            t.size.heading,
+            t.size.display,
+        ];
+        assert!(
+            sizes.windows(2).all(|w| w[0] < w[1]),
+            "escala de tamanhos não é estritamente crescente: {sizes:?}"
+        );
+        assert_eq!(
+            t.size.grid, 13,
+            "grid≠13px quebra o contrato de célula (bridge.rs CELL_W/CELL_H — re-derivar na costura)"
+        );
+        let weights = [
+            t.weight.regular,
+            t.weight.medium,
+            t.weight.semibold,
+            t.weight.bold,
+        ];
+        assert!(
+            weights.windows(2).all(|w| w[0] < w[1]),
+            "pesos fora de ordem: {weights:?}"
+        );
+        assert_eq!(t.weight.regular, 400, "regular ≠ 400 (convenção OpenType)");
+        for fam in [t.family.ui, t.family.display, t.family.mono] {
+            assert!(!fam.trim().is_empty(), "família vazia no vocabulário");
+        }
+        assert_ne!(
+            t.family.ui, t.family.display,
+            "UI e display iguais — a voz perde o contraste"
+        );
+        assert_ne!(t.family.ui, t.family.mono, "UI e mono iguais");
+    }
+
+    /// **ADR 0019 §7 — dívida FECHADA:** JetBrains Mono selada para grid/código VIA TOKEN. Este
+    /// teste é o guardião: trocar a família do grid exige decisão NESTE módulo (e re-derivar as
+    /// métricas de célula), nunca um literal no shell.
+    #[test]
+    fn mono_family_is_jetbrains_mono_per_adr_0019() {
+        assert_eq!(TypographyTokens::CANONICAL.family.mono, "JetBrains Mono");
+        assert_eq!(
+            Theme::build(Mode::Dark, DEFAULT_ACCENT)
+                .typography
+                .family
+                .mono,
+            "JetBrains Mono"
+        );
+        assert_eq!(
+            Theme::build(Mode::Light, DEFAULT_ACCENT)
+                .typography
+                .family
+                .ui,
+            "IBM Plex Sans"
+        );
+    }
+
+    /// **F2-1-2:** espaçamento é EXATAMENTE a escala do épico (4/8/12/16/24/32); cantos
+    /// crescentes com `none`=0 (flat honesto disponível) e `md`=6 (degrau dominante medido).
+    #[test]
+    fn spacing_and_radius_scales_match_epic() {
+        let s = SpacingTokens::CANONICAL;
+        assert_eq!(
+            [s.xs, s.sm, s.md, s.lg, s.xl, s.xxl],
+            [4, 8, 12, 16, 24, 32],
+            "a escala de espaçamento é a do épico F2-1-2 — mudá-la é decisão de épico, não de story"
+        );
+        let r = RadiusTokens::CANONICAL;
+        assert_eq!(r.none, 0, "flat honesto exige o degrau zero");
+        assert_eq!(r.md, 6, "md≠6 muda o degrau dominante do shell sem decisão");
+        assert!(
+            r.none < r.sm && r.sm < r.md && r.md < r.lg && r.lg < r.full,
+            "cantos fora de ordem"
+        );
+    }
+
+    /// **F2-1-3 — doutrina de movimento (D1-A8):** input frequente = 0ms; durações nomeadas
+    /// crescentes com teto <300ms; `effective` zera TUDO sob reduce-motion.
+    #[test]
+    fn motion_durations_respect_doctrine_and_reduce_motion() {
+        let m = MotionTokens::CANONICAL;
+        assert_eq!(
+            m.instant,
+            Duration::ZERO,
+            "input frequente NUNCA anima (D1-A8)"
+        );
+        assert!(
+            m.instant < m.fast && m.fast < m.base && m.base < m.slow,
+            "durações fora de ordem"
+        );
+        assert!(
+            m.slow < Duration::from_millis(300),
+            "teto D1-A8 estourado: {:?} ≥ 300ms",
+            m.slow
+        );
+        assert!(
+            !m.reduce_motion,
+            "default = animações ligadas (o flag real vem do sistema, na fiação)"
+        );
+        assert_eq!(
+            m.effective(m.slow),
+            m.slow,
+            "sem reduce, a duração passa intacta"
+        );
+        let reduced = MotionTokens {
+            reduce_motion: true,
+            ..m
+        };
+        for d in [m.fast, m.base, m.slow] {
+            assert_eq!(
+                reduced.effective(d),
+                Duration::ZERO,
+                "reduce-motion não zerou {d:?} (ADR 0019 §7: subordinação obrigatória)"
+            );
+        }
+    }
+
+    /// **F2-1 item 4 — JSON aditivo:** export carrega as seções novas (legíveis em pt-br);
+    /// tema ANTIGO (só modo/acento) importa sem quebrar; roundtrip preserva o vocabulário.
+    #[test]
+    fn prefs_vocabulary_is_additive_and_roundtrips() {
+        let json = export_json(Mode::Dark, "ambar");
+        assert!(
+            json.contains("\"tipografia\""),
+            "export sem seção tipografia: {json}"
+        );
+        assert!(
+            json.contains("\"JetBrains Mono\""),
+            "export sem a família do grid: {json}"
+        );
+        assert!(
+            json.contains("\"movimento\""),
+            "export sem seção movimento: {json}"
+        );
+
+        let prefs = parse_prefs(&json).expect("roundtrip do export");
+        let tip = prefs.tipografia.expect("tipografia presente no roundtrip");
+        assert_eq!(tip.interface, "IBM Plex Sans");
+        assert_eq!(tip.momentos, "Fraunces");
+        assert_eq!(tip.terminal, "JetBrains Mono");
+
+        // Tema PRÉ-F2-1 (só modo/acento): importa com seções → None, contrato antigo intacto.
+        let old = parse_prefs(r#"{"modo":"claro","acento":"rosa"}"#).expect("import antigo");
+        assert_eq!(old.tipografia, None);
+        assert_eq!(old.movimento, None);
+        let (mode, accent) = parse_json(r#"{"modo":"claro","acento":"rosa"}"#).expect("antigo");
+        assert_eq!(mode, Mode::Light);
+        assert_eq!(accent, "rosa");
+    }
+
+    /// **F2-1-3 — flag vivo:** `set_reduce_motion` muda o tema ATIVO e o flag SOBREVIVE a
+    /// `apply` (trocar modo/acento jamais religa animação reduzida — a11y). Guard serializa.
+    #[test]
+    fn reduce_motion_survives_apply_and_zeroes_effective() {
+        let _guard = THEME_TEST_GUARD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        set_reduce_motion(true);
+        assert!(active().motion.reduce_motion);
+        assert_eq!(
+            active().motion.effective(Duration::from_millis(180)),
+            Duration::ZERO
+        );
+        apply(Mode::Light, "teal");
+        assert!(
+            active().motion.reduce_motion,
+            "apply() apagou o reduce-motion — regressão de a11y"
+        );
+        // restaura o default p/ não vazar estado entre testes.
+        set_reduce_motion(false);
+        apply(Mode::Dark, DEFAULT_ACCENT);
+        assert!(!active().motion.reduce_motion);
     }
 
     /// Stepping consistente: toda escala TEMÁTICA tem dois degraus REAIS (dark ≠ light) — uma

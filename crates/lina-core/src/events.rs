@@ -796,6 +796,26 @@ pub enum DomainEvent {
     /// free/PRO (a vaga libera; ver `workspace::can_create_workspace`). Desarquivar, se a
     /// Fase 1 precisar, é evento aditivo futuro — o log preserva a história inteira.
     WorkspaceArchived,
+    /// F2-0-1 (régua D0 camada d; épico 38 §VI): resumo de UMA janela da sonda `[PROF]`
+    /// (~120 frames) persistido como fato — o gate de perf da F2 (p95 ≤ orçamento E
+    /// excess-time <1%) fica re-derivável por replay. Numerador/denominador BRUTOS
+    /// (`excess_ms`/`active_ms`): re-agregar janelas é soma de somas, exata — a % nunca
+    /// é gravada (é projeção, não fato). META/medição: NÃO entra em projeções de roster.
+    /// ADITIVO: variante nova; logs antigos replayam intactos (ADR 0001 §2).
+    ProfWindowMetric {
+        frames: usize,
+        budget_ms: f64,
+        active_ms: f64,
+        excess_ms: f64,
+        frames_over_budget: usize,
+        frame_p50_ms: f64,
+        frame_p95_ms: f64,
+        frame_p99_ms: f64,
+        /// Scale factor da janela na medição (1.0 = LoDPI — gap §II.8 da onda V);
+        /// `None` = costura do render não fiada (medição sem carimbo).
+        #[serde(default)]
+        scale_factor: Option<f64>,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -875,6 +895,7 @@ impl DomainEvent {
             DomainEvent::WorkspaceDefaultCwdSet { .. } => "WorkspaceDefaultCwdSet",
             DomainEvent::WorkspaceRenamed { .. } => "WorkspaceRenamed",
             DomainEvent::WorkspaceArchived => "WorkspaceArchived",
+            DomainEvent::ProfWindowMetric { .. } => "ProfWindowMetric",
         }
     }
 
@@ -1226,7 +1247,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::NodeResumed { .. }
         // r5 perf-ws: Descarregar é META (livro-razão do gesto; o estado vivo é dos PTYs e o
         // religar usa o fluxo de restore F1-4-3) — sem efeito na projeção do canvas.
-        | DomainEvent::WorkspaceUnloaded { .. } => {}
+        | DomainEvent::WorkspaceUnloaded { .. }
+        // F2-0-1: resumo da janela [PROF] é META (livro-razão de medição; a régua D0
+        // re-deriva % e percentis varrendo o log) — sem efeito na projeção do canvas.
+        | DomainEvent::ProfWindowMetric { .. } => {}
     }
 }
 

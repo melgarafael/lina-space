@@ -26,7 +26,28 @@
 //! janela — medimos *enquanto desenha*), sem spam (1 bloco por janela). Overhead: com
 //! `LINA_PROF` ausente/`0` a sonda é UM check de bool por frame — o protocolo de overhead
 //! (critério c) compara o `[FPS]` (sempre ativo) entre `LINA_PROF=0` e `=1` na MESMA carga.
+//!
+//! **F2-0-1 — métricas de gate (estrutura SuperTuxKart/CapFrameX da régua D0(d)):** além de
+//! p50/p95, a janela emite **p99** e **`excess_time` (% do TEMPO acima do orçamento)** =
+//! soma do frametime dos frames que estouraram [`PROF_BUDGET_MS`] ÷ tempo ativo total. O
+//! orçamento é PARÂMETRO (`16.6` default = 60Hz; `LINA_PROF_BUDGET_MS=8.33` para 120Hz) —
+//! a meta de plataforma muda, a sonda não. O fechamento da janela também produz um
+//! [`ProfWindowSummary`] serializável (numerador/denominador BRUTOS — re-derivável por
+//! replay, inv#4): a fiação que o converte em evento do log é costura (`events.rs`); a
+//! sonda só acumula e entrega via [`Probe::take_window_summaries`].
+//!
+//! **LoDPI (gap §II.8 da onda V):** [`Probe::observe_scale_factor`] loga o scale factor da
+//! janela e AVISA quando rodando em 1x — nitidez de glifo só é validável a olho num monitor
+//! 1080p real; a sonda garante que a sessão de tela SAIBA em que escala mediu.
+//!
+//! **Cena de estresse canônica (reprodutível, gate F2):**
+//! ```sh
+//! LINA_PROF=1 LINA_LOAD_ACTIVE=10 cargo run -p lina-gpui --release
+//! # + pan/zoom contínuos por 60s; gate: p95 ≤ 16.6ms E excess_time < 1%
+//! # (condição "Steady" da régua: excess_time < 0.1%)
+//! ```
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,6 +63,9 @@ pub const PROF_WINDOW_MS: f64 = 2000.0;
 pub const PROF_IDLE_GAP_MS: f64 = 250.0;
 /// Quantos painéis o ranking "mais caros" reporta por janela.
 pub const PROF_TOP_K: usize = 5;
+/// Orçamento de frametime (ms) do gate F2 — 16.6 = 60Hz. Override: `LINA_PROF_BUDGET_MS`
+/// (ex.: `8.33` para a meta 120Hz). Parâmetro da SONDA, não da plataforma.
+pub const PROF_BUDGET_MS: f64 = 16.6;
 
 /// `LINA_PROF=1|true|on|yes` liga a sonda (mesmo idioma de `LINA_DEMO`/`LINA_DASH`).
 #[must_use]
@@ -134,6 +158,43 @@ pub struct FrameSample {
     pub runs: usize,
 }
 
+/// Resumo SERIALIZÁVEL de uma janela fechada — o payload do evento de métrica do [PROF]
+/// (contrato §VI do épico F2; a fiação `summary → evento` é costura em `events.rs`).
+/// Carrega numerador (`excess_ms`) e denominador (`active_ms`) BRUTOS: a régua re-deriva a
+/// % acima do orçamento por replay somando janelas — exato, sem média-de-porcentagens.
+/// Aditivo (`serde(default)`): replay de log antigo sem algum campo nunca quebra.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfWindowSummary {
+    /// Frames fechados (válidos, não-ociosos) na janela.
+    pub frames: usize,
+    /// Orçamento vigente quando a janela fechou (16.6 default; `LINA_PROF_BUDGET_MS`).
+    pub budget_ms: f64,
+    /// Denominador: soma do frametime de TODOS os frames da janela (tempo ativo, ms).
+    pub active_ms: f64,
+    /// Numerador: soma do frametime dos frames com `frame_ms > budget_ms` (ms). A estrutura
+    /// CapFrameX conta o frame inteiro que estourou, não só o excedente.
+    pub excess_ms: f64,
+    /// Quantos frames estouraram o orçamento (legibilidade; redundante com excess_ms).
+    pub frames_over_budget: usize,
+    pub frame_p50_ms: f64,
+    pub frame_p95_ms: f64,
+    pub frame_p99_ms: f64,
+    /// Último scale factor observado ([`Probe::observe_scale_factor`]); `None` = não fiado.
+    pub scale_factor: Option<f64>,
+}
+
+impl ProfWindowSummary {
+    /// % do tempo acima do orçamento (métrica do gate: <1% passa; <0.1% = "Steady").
+    #[must_use]
+    pub fn excess_time_pct(&self) -> f64 {
+        if self.active_ms <= 0.0 {
+            return 0.0;
+        }
+        self.excess_ms / self.active_ms * 100.0
+    }
+}
+
 /// Frame em aberto: medido neste `render`, fechado no próximo (precisa do intervalo + paint).
 struct Pending {
     marks: RenderMarks,
@@ -194,6 +255,10 @@ struct Collector {
     /// sessão de tela sobe para ≥drawn quando o gate F1-5-3 precisar do custo POR PAINEL
     /// completo, incluindo os BARATOS/ociosos que nunca entrariam num top-5).
     top_k: usize,
+    /// Orçamento de frametime (ms) do gate ([`PROF_BUDGET_MS`]; override `LINA_PROF_BUDGET_MS`).
+    budget_ms: f64,
+    /// Último scale factor observado — carimba o [`ProfWindowSummary`] (medição em 1x ≠ 2x).
+    scale_factor: Option<f64>,
     frames: Vec<FrameSample>,
     panels: BTreeMap<String, PanelStats>,
 }
@@ -202,6 +267,8 @@ impl Default for Collector {
     fn default() -> Self {
         Self {
             top_k: PROF_TOP_K,
+            budget_ms: PROF_BUDGET_MS,
+            scale_factor: None,
             frames: Vec::new(),
             panels: BTreeMap::new(),
         }
@@ -223,7 +290,11 @@ fn fmt_p50_p95(samples: &mut [f64]) -> String {
 }
 
 impl Collector {
-    fn push(&mut self, frame: FrameSample, panels: Vec<PanelSample>) -> Option<Vec<String>> {
+    fn push(
+        &mut self,
+        frame: FrameSample,
+        panels: Vec<PanelSample>,
+    ) -> Option<(Vec<String>, ProfWindowSummary)> {
         for p in panels {
             let st = self.panels.entry(p.name).or_default();
             st.ms.push(p.ms);
@@ -232,12 +303,37 @@ impl Collector {
         self.frames.push(frame);
         let active_ms: f64 = self.frames.iter().map(|f| f.frame_ms).sum();
         if self.frames.len() >= PROF_WINDOW || active_ms >= PROF_WINDOW_MS {
-            let lines = self.report_lines();
+            let report = (self.report_lines(), self.window_summary());
             self.frames.clear();
             self.panels.clear();
-            return Some(lines);
+            return Some(report);
         }
         None
+    }
+
+    /// O [`ProfWindowSummary`] da janela corrente (numerador/denominador brutos + percentis).
+    fn window_summary(&self) -> ProfWindowSummary {
+        let mut frame: Vec<f64> = self.frames.iter().map(|f| f.frame_ms).collect();
+        frame.sort_by(f64::total_cmp);
+        let over: Vec<f64> = frame
+            .iter()
+            .copied()
+            .filter(|&ms| ms > self.budget_ms)
+            .collect();
+        ProfWindowSummary {
+            frames: frame.len(),
+            budget_ms: self.budget_ms,
+            // `+ 0.0` normaliza o `-0.0` que `Iterator::sum` devolve para lista vazia
+            // (acumulador inicial IEEE) — senão o evento serializa `-0.0` e a linha
+            // imprime `excess_time=-0.00%`.
+            active_ms: frame.iter().sum::<f64>() + 0.0,
+            excess_ms: over.iter().sum::<f64>() + 0.0,
+            frames_over_budget: over.len(),
+            frame_p50_ms: percentile_sorted(&frame, 50.0),
+            frame_p95_ms: percentile_sorted(&frame, 95.0),
+            frame_p99_ms: percentile_sorted(&frame, 99.0),
+            scale_factor: self.scale_factor,
+        }
     }
 
     /// As linhas do bloco `[PROF]` da janela corrente (1 linha de fases + 1 de top-K painéis).
@@ -266,11 +362,18 @@ impl Collector {
         drawn.sort_by(f64::total_cmp);
         runs.sort_by(f64::total_cmp);
 
+        // Métricas do gate F2 (p99 + excess_time) saem do MESMO resumo que vira evento —
+        // o que o grep do stderr lê e o que o replay re-deriva nunca divergem.
+        let s = self.window_summary();
         let mut lines = vec![format!(
-            "[PROF] frames={n} live={} drawn={} | frame {} | cpu_render {} | poll {} | assemble {} | chrome {} | layout_paint {} | present_vsync {} | runs p50={}",
+            "[PROF] frames={n} live={} drawn={} | frame {} p99={:.1}ms | budget={:.1}ms excess_time={:.2}% over={}/{n} | cpu_render {} | poll {} | assemble {} | chrome {} | layout_paint {} | present_vsync {} | runs p50={}",
             percentile_sorted(&live, 50.0) as usize,
             percentile_sorted(&drawn, 50.0) as usize,
             fmt_p50_p95(&mut frame),
+            s.frame_p99_ms,
+            s.budget_ms,
+            s.excess_time_pct(),
+            s.frames_over_budget,
             fmt_p50_p95(&mut cpu),
             fmt_p50_p95(&mut poll),
             fmt_p50_p95(&mut assemble),
@@ -332,6 +435,9 @@ pub struct Probe {
     pending: Option<Pending>,
     cur_panels: Vec<PanelSample>,
     collector: Collector,
+    /// Resumos de janelas FECHADAS aguardando dreno ([`Self::take_window_summaries`]) — a
+    /// fiação `summary → evento do log` é costura (`events.rs`/`main.rs`), não desta sonda.
+    summaries: Vec<ProfWindowSummary>,
 }
 
 impl Probe {
@@ -343,6 +449,7 @@ impl Probe {
             pending: None,
             cur_panels: Vec::new(),
             collector: Collector::default(),
+            summaries: Vec::new(),
         }
     }
 
@@ -356,6 +463,15 @@ impl Probe {
             .and_then(|v| v.trim().parse::<usize>().ok())
         {
             probe.collector.top_k = k.max(1);
+        }
+        // `LINA_PROF_BUDGET_MS=8.33` — orçamento do gate (default 16.6 = 60Hz). Finito e >0:
+        // orçamento absurdo silenciaria o excess_time (sem dado ≠ "passou").
+        if let Some(b) = std::env::var("LINA_PROF_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|b| b.is_finite() && *b > 0.0)
+        {
+            probe.collector.budget_ms = b;
         }
         probe
     }
@@ -377,9 +493,42 @@ impl Probe {
             return Vec::new();
         };
         match close_frame(pending, now, paint_at) {
-            Some((frame, panels)) => self.collector.push(frame, panels).unwrap_or_default(),
+            Some((frame, panels)) => match self.collector.push(frame, panels) {
+                Some((lines, summary)) => {
+                    self.summaries.push(summary);
+                    lines
+                }
+                None => Vec::new(),
+            },
             None => Vec::new(), // fechou contra ociosidade — descartado (não envenena p50/p95)
         }
+    }
+
+    /// Drena os resumos de janelas fechadas desde o último dreno — a fiação (costura) os
+    /// converte em eventos aditivos do log (contrato §VI do F2; inv#4: replay re-deriva).
+    // dead_code: o chamador é a fiação em `main.rs`/`events.rs` (costura F2-0-1, pendente).
+    #[allow(dead_code)]
+    pub fn take_window_summaries(&mut self) -> Vec<ProfWindowSummary> {
+        std::mem::take(&mut self.summaries)
+    }
+
+    /// LoDPI check (F2, gap §II.8): registra o scale factor da janela e devolve a linha
+    /// `[PROF]` quando ele MUDA (1ª observação inclusa) — com AVISO em 1x, onde a nitidez
+    /// de glifo precisa ser validada a olho num monitor 1080p REAL. Chamável todo frame
+    /// (barato; só fala na mudança). Carimba também o [`ProfWindowSummary`].
+    // dead_code: o chamador é a fiação no `render` do `main.rs` (costura F2-0-1, pendente).
+    #[allow(dead_code)]
+    pub fn observe_scale_factor(&mut self, scale: f64) -> Option<String> {
+        if !self.enabled || self.collector.scale_factor == Some(scale) {
+            return None;
+        }
+        self.collector.scale_factor = Some(scale);
+        let aviso = if scale < 1.5 {
+            " AVISO: LoDPI (~1x) — valide a nitidez do texto a olho num monitor 1080p real"
+        } else {
+            ""
+        };
+        Some(format!("[PROF] scale_factor={scale:.2}{aviso}"))
     }
 
     /// Um painel DESENHADO terminou de montar neste frame.
@@ -583,7 +732,7 @@ mod tests {
                 panels,
             };
             let (f, ps) = close_frame(pending, t(base, i * 16 + 16), None).expect("contínuo");
-            if let Some(lines) = c.push(f, ps) {
+            if let Some((lines, _)) = c.push(f, ps) {
                 let top = &lines[1];
                 let pos = |n: &str| top.find(n).unwrap_or(usize::MAX);
                 assert!(pos("P6") < pos("P5"), "ordem por p95 desc: {top}");
@@ -608,7 +757,7 @@ mod tests {
                 panels: vec![],
             };
             let (f, ps) = close_frame(pending, t(base, i * 16 + 16), None).expect("contínuo");
-            if let Some(lines) = c.push(f, ps) {
+            if let Some((lines, _)) = c.push(f, ps) {
                 assert!(
                     lines[0].contains("layout_paint p50=--"),
                     "sem dado → `--`: {}",
@@ -643,7 +792,7 @@ mod tests {
                 panels,
             };
             let (f, ps) = close_frame(pending, t(base, i * 16 + 16), None).expect("contínuo");
-            if let Some(lines) = c.push(f, ps) {
+            if let Some((lines, _)) = c.push(f, ps) {
                 let top = &lines[1];
                 assert!(
                     top.starts_with("[PROF] top2 (de 4 medidos)"),
@@ -673,5 +822,135 @@ mod tests {
         let got = slot.take().expect("carimbado");
         assert!(got >= slot.epoch);
         assert!(slot.take().is_none(), "take consome");
+    }
+
+    /// Frames sintéticos de duração exata (frame = intervalo até o próximo begin; as fases
+    /// internas não importam para as métricas de orçamento).
+    fn run_frames(probe: &mut Probe, durations_ms: &[u64]) -> Vec<String> {
+        let base = Instant::now();
+        let mut at = 0u64;
+        let mut lines = Vec::new();
+        for &d in durations_ms {
+            lines.extend(probe.begin_frame(t(base, at)));
+            probe.finish_frame(marks(base, at));
+            at += d;
+        }
+        lines.extend(probe.begin_frame(t(base, at)));
+        lines
+    }
+
+    /// F2-0-1 (gate): excess_time = soma do frametime dos frames ACIMA do orçamento ÷ tempo
+    /// ativo total (estrutura CapFrameX: o frame que estourou conta INTEIRO). 118×10ms +
+    /// 2×130ms → excess = 260/1440 ≈ 18.06%, over=2, e o p99 captura os outliers que o p95
+    /// esconde (em 120 amostras o nearest-rank do p99 é o índice 118 — 2 outliers entram)
+    /// — exatamente o porquê do gate exigir as duas métricas.
+    #[test]
+    fn excess_time_counts_whole_offending_frames() {
+        let mut probe = Probe::new(true);
+        let mut durations = vec![10u64; PROF_WINDOW - 2];
+        durations.extend([130, 130]);
+        let _ = run_frames(&mut probe, &durations);
+        let s = probe.take_window_summaries().pop().expect("janela fechou");
+        assert_eq!(s.frames, PROF_WINDOW);
+        assert_eq!(s.frames_over_budget, 2);
+        assert!((s.active_ms - 1440.0).abs() < 0.5, "active={}", s.active_ms);
+        assert!((s.excess_ms - 260.0).abs() < 0.5, "excess={}", s.excess_ms);
+        assert!(
+            (s.excess_time_pct() - 260.0 / 1440.0 * 100.0).abs() < 0.1,
+            "pct={}",
+            s.excess_time_pct()
+        );
+        assert!(s.frame_p95_ms < 16.6, "p95 não vê os 2 outliers");
+        assert!(s.frame_p99_ms > 16.6, "p99 vê: {}", s.frame_p99_ms);
+    }
+
+    /// O orçamento é PARÂMETRO: com budget=8.33 (meta 120Hz), frames de 10ms — verdes a
+    /// 60Hz — passam a contar como excesso. A meta muda, a sonda não.
+    #[test]
+    fn budget_is_parametric() {
+        let mut probe = Probe::new(true);
+        probe.collector.budget_ms = 8.33;
+        let _ = run_frames(&mut probe, &[10u64; PROF_WINDOW]);
+        let s = probe.take_window_summaries().pop().expect("janela fechou");
+        assert!((s.budget_ms - 8.33).abs() < f64::EPSILON);
+        assert_eq!(s.frames_over_budget, PROF_WINDOW, "todo frame estoura 8.33");
+        assert!((s.excess_time_pct() - 100.0).abs() < 0.01);
+    }
+
+    /// A linha [PROF] carrega as métricas do gate (p99 + budget + excess_time + over) — é o
+    /// formato que o Maestro grepa no stderr na cena de estresse canônica.
+    #[test]
+    fn report_line_carries_gate_metrics() {
+        let mut probe = Probe::new(true);
+        let lines = run_frames(&mut probe, &[10u64; PROF_WINDOW]);
+        let l = lines.first().expect("janela fechou");
+        for key in ["p99=", "budget=16.6ms", "excess_time=0.00%", "over=0/120"] {
+            assert!(l.contains(key), "faltou `{key}` em: {l}");
+        }
+    }
+
+    /// inv#4 (re-derivação por replay): o resumo serializa com numerador/denominador BRUTOS;
+    /// deserializar JSON SEM campos novos não quebra (`serde(default)` — evento aditivo) e a
+    /// % re-derivada de duas janelas agregadas é exata (soma de somas, não média de %).
+    #[test]
+    fn summary_roundtrips_and_rederives_by_aggregation() {
+        let s = ProfWindowSummary {
+            frames: 120,
+            budget_ms: PROF_BUDGET_MS,
+            active_ms: 1320.0,
+            excess_ms: 130.0,
+            frames_over_budget: 1,
+            frame_p50_ms: 10.0,
+            frame_p95_ms: 10.0,
+            frame_p99_ms: 130.0,
+            scale_factor: Some(2.0),
+        };
+        let json = serde_json::to_string(&s).expect("serializa");
+        let back: ProfWindowSummary = serde_json::from_str(&json).expect("deserializa");
+        assert_eq!(back, s);
+        // Log antigo (campos faltando) → defaults, replay nunca quebra.
+        let old: ProfWindowSummary =
+            serde_json::from_str(r#"{"frames":60,"active_ms":600.0}"#).expect("aditivo");
+        assert_eq!(old.frames, 60);
+        assert_eq!(old.excess_ms, 0.0);
+        assert_eq!(old.scale_factor, None);
+        // Agregação entre janelas: (130+0)/(1320+600) — exato a partir dos brutos.
+        let agg = (s.excess_ms + old.excess_ms) / (s.active_ms + old.active_ms) * 100.0;
+        assert!((agg - 130.0 / 1920.0 * 100.0).abs() < 1e-9);
+    }
+
+    /// LoDPI (gap §II.8): 1ª observação loga; repetição NÃO loga (chamável todo frame);
+    /// mudança loga de novo; escala 1x carrega o AVISO, 2x não; o resumo da janela carimba
+    /// a escala em que se mediu. Sonda desligada: silêncio total.
+    #[test]
+    fn scale_factor_logs_on_change_and_warns_on_lodpi() {
+        let mut probe = Probe::new(true);
+        let first = probe.observe_scale_factor(1.0).expect("1ª observação loga");
+        assert!(first.starts_with("[PROF] scale_factor=1.00"), "{first}");
+        assert!(first.contains("AVISO"), "1x avisa: {first}");
+        assert!(probe.observe_scale_factor(1.0).is_none(), "repetição cala");
+        let hi = probe.observe_scale_factor(2.0).expect("mudança loga");
+        assert!(!hi.contains("AVISO"), "2x não avisa: {hi}");
+
+        let _ = run_frames(&mut probe, &[10u64; PROF_WINDOW]);
+        let s = probe.take_window_summaries().pop().expect("janela fechou");
+        assert_eq!(s.scale_factor, Some(2.0), "resumo carimba a escala");
+
+        let mut off = Probe::new(false);
+        assert!(off.observe_scale_factor(1.0).is_none(), "desligada cala");
+    }
+
+    /// O dreno de resumos CONSOME (segundo take = vazio) e a sonda DESLIGADA nunca acumula
+    /// resumo — extensão do gating F1-5-1 às métricas novas.
+    #[test]
+    fn summaries_drain_consumes_and_respects_gate() {
+        let mut probe = Probe::new(true);
+        let _ = run_frames(&mut probe, &[10u64; PROF_WINDOW]);
+        assert_eq!(probe.take_window_summaries().len(), 1);
+        assert!(probe.take_window_summaries().is_empty(), "dreno consome");
+
+        let mut off = Probe::new(false);
+        let _ = run_frames(&mut off, &[10u64; PROF_WINDOW]);
+        assert!(off.take_window_summaries().is_empty(), "desligada: nada");
     }
 }
