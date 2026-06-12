@@ -1,12 +1,26 @@
 # ADR 0028 — Live-region: o caminho do auto-anúncio (custom Element × patch no gpui pinado × upstream)
 
-- **Status:** **Proposto (DRAFT) — decisão PROVISÓRIA.** O spike que tira esta decisão do papel
-  está com o Especialista em Telas NESTA rodada (despacho `tasks/despachos/r1-telas.md`; entrega
-  `tasks/epico-f1/.entrega-spike-a11y.md` + roteiro `tasks/epico-f1/spike-a11y-roteiro.md`).
-  A validação final é NA TELA (VoiceOver anunciando 1 frase **sem foco**), executada pelo
-  Maestro/fundador — gpui não roda headless. O selo vem com essa evidência.
-- **Onda/Story:** F1-2 · F1-2-7 (ação #1 P0 da pesquisa 13.15)
-- **Data:** 2026-06-10
+- **Status:** **Aceito (2026-06-12, F2-0-4).** O que sela é a **decisão de CAMINHO** (a — custom
+  `Element`), com duas evidências independentes:
+  1. **Pressuposto re-verificado contra o vendor REAL do pin** (2×): a verificação V-D2
+     (`tasks/pesquisa-f2/entrega-v-verificacao.md` §II.5) rodou `grep -c "pub(crate) aria_"` no
+     checkout cargo do SHA `09165c1` (`crates/gpui/src/elements/div.rs`) = **15 exatos, zero
+     live**; re-checado no selo (2026-06-12, mesmo checkout): 15 campos `aria_*` e **nenhuma
+     ocorrência** de `set_live`/`Live::` em `crates/gpui/src/`. (Nota de precisão da V-D2: o gpui
+     não está vendorizado no repo — é dep git do cargo; a verificação é no checkout do cache,
+     mesmo SHA.)
+  2. **Viabilidade do caminho (a) provada pelo spike** (`tasks/epico-f1/.entrega-spike-a11y.md`):
+     o Element custom foi implementado **sem patch no pin** — o gatilho que mudaria a
+     recomendação para (b) não disparou.
+
+  **O que o selo NÃO cobre:** a alegação de conformidade ("anuncia sem foco") segue regida pela
+  seção *Honestidade de comunicação* — a validação NA TELA (VoiceOver, executor Maestro/fundador;
+  roteiro `tasks/epico-f1/spike-a11y-roteiro.md`) continua sendo o gate para qualquer copy/doc
+  afirmar auto-anúncio, e o gatilho "Spike reprovado na tela" do *Critério de reversão* permanece
+  armado. Selar o caminho ≠ declarar o resultado.
+- **Onda/Story:** F1-2 · F1-2-7 (ação #1 P0 da pesquisa 13.15) · selo: **F2-0-4** (ADR-gate da
+  F2-2-2)
+- **Data:** 2026-06-10 (draft) · 2026-06-12 (aceito)
 - **Fontes:** pesquisa **13.15** (inteira) · comentário **"GAP CONHECIDO (red-team)"** na função
   `live_region_element` em `app/lina-gpui/src/a11y.rs` (citado pelo símbolo — estável; hoje ≈
   l.194) · `.entrega-w46.md` · doc `33 - Decisao de Framework de UI` (governança do pin do gpui
@@ -51,6 +65,17 @@ polimento), e a decisão de caminho mexe na âncora **UiHost/porta gpui↔Slint*
    evidência arquivo:linha do vendorado (formato exigido no despacho do spike) — a recomendação
    **vira (b)**, com duas condições de contorno: o patch é o MÍNIMO (expor `set_live`, nada
    além) e nasce com plano de descomissionamento atrelado ao rastreio (c).
+
+## Consequência nova da F2 (acrescida no selo, 2026-06-12)
+
+**Todo componente do catálogo F2-2 que COMUNICA ESTADO — toast, badge, indicador de progresso —
+nasce compondo com o custom Element de live-region. Retrofit é proibido.** A razão é o achado 2
+deste ADR aplicado em escala: um componente de estado construído sobre `div` puro nasce mudo para
+leitores de tela (`live()` é `Off` na árvore inteira do pin), e "adicionar a11y depois" em N
+componentes shipped é exatamente o retrabalho que a decisão de caminho existe para evitar. A
+F2-2-2 (toast/badge/progresso) é a primeira consumidora e tem este ADR como gate; os demais itens
+do catálogo herdam a regra. Critério auditável: nenhum componente novo do catálogo que exiba
+mudança de estado sem foco usa `div`+`Role::Status` cru — compõe com o Element.
 
 ## Critério de reversão (explícito, por gatilho)
 
