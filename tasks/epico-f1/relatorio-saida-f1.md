@@ -30,8 +30,10 @@ ainda exige tela/run real (rastreado no §4).
 | **F1-6** | Gate de saída do épico (CI 3-SO · portabilidade · anti-slop) | CI 3-SO triado (`core-windows` promovido a gate bloqueante); amostra anti-slop = §3 deste relatório | `ci-3so-triagem.md` · `.entrega-f1-6-1-2.md` · `.entrega-f1-6-3.md` · `.entrega-f1-6-4.md` | run real linkado + red-team final + esta amostra |
 
 **Repack do app testável pelo fundador:** `/Users/rafaelmelgaco/einstein workspace/lina-space/dist/Lina.app`
-+ `dist/Lina-0.1.0.dmg` (2026-06-11 11:24) — o fundador testa o `.app`, não o dev build
-(item 9 do `conselho-f13-consolidado.md`, ✅ fechado).
+(repack real: 2026-06-11 **20:49**, com os fixes `ef6acd6`+`f1d4810`; o `.dmg` é de 20:04 — novo
+repack completo sai ao fim da rodada r4) — o fundador testa o `.app`, não o dev build
+(item 9 do `conselho-f13-consolidado.md`, ✅ fechado). *(Timestamp corrigido pela auditoria QA
+r4 — `.entrega-validacao-saida.md` item 10.)*
 
 ---
 
@@ -107,7 +109,8 @@ item 7:
 - **Ativação cega re-validada pós-encurtamento: 66/66 (100%)** — 3 juízes cegos × 22 frases
   (workflow `wf_e5334b6f`).
 
-**O que FALTA (output criativo num 2º CLI) e por quê — transcripts reais em `/tmp/lina-3cli/`:**
+**O que FALTA (output criativo num 2º CLI) e por quê — transcripts reais em `/tmp/lina-3cli/`
+(cópia durável: `tasks/epico-f1/{codex,gemini}-transcript.txt`, resgatada na auditoria QA r4):**
 - **Codex** (`/tmp/lina-3cli/codex-transcript.txt`): a sessão chegou a carregar (gpt-5.5,
   reasoning xhigh) e recebeu o prompt de cold-review, mas **bateu o limite de uso da conta
   OpenAI ANTES de gerar o output criativo** (`ERROR: You've hit your usage limit … try again at
