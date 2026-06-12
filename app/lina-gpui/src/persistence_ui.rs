@@ -323,6 +323,16 @@ pub struct PersistenceModel {
     // ── tema (F1-2-1) ──
     /// Resultado do último export/import de tema (mensagem leiga na tela; `None` = sem atividade).
     theme_io: Option<String>,
+    // ── Plano (T7§P — F1-4-6) ──
+    /// Estado da licença CACHEADO (recarregado em abrir/ativar/remover — pontos de
+    /// gating; nunca por timer, critério 7 de F1-4-5).
+    license: lina_license::LicenseState,
+    /// O campo «cole aqui a chave…» do painel (mesmo estado headless do M9).
+    plan_key: crate::license_ui::KeyEntry,
+    /// PRO: `[ Trocar chave… ]` expandiu o campo de troca?
+    plan_swap_open: bool,
+    /// `[ Remover chave ]` aguardando a confirmação honesta?
+    plan_remove_confirm: bool,
 }
 
 impl PersistenceModel {
@@ -352,9 +362,88 @@ impl PersistenceModel {
             recovery_dismissed: false,
             workspaces: Vec::new(),
             theme_io: None,
+            license: lina_license::LicenseState::load_default(),
+            plan_key: crate::license_ui::KeyEntry::default(),
+            plan_swap_open: false,
+            plan_remove_confirm: false,
         };
         model.refresh_workspaces();
         model
+    }
+
+    // ───────────────────── Plano (T7§P — F1-4-6; tudo offline) ─────────────────────
+
+    /// O que o painel mostra AGORA (projeção pura — critério 3: consistente com o
+    /// `lina-license`). `used` = Espaços ativos do registry global.
+    #[must_use]
+    pub fn plan_view(&self) -> crate::license_ui::PlanPanel {
+        let used = lina_core::default_registry_path()
+            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok())
+            .map_or(0, |r| r.active_count()) as u32;
+        crate::license_ui::plan_panel(
+            &self.license.effective(crate::license_ui::now_epoch_s()),
+            used,
+        )
+    }
+
+    #[must_use]
+    pub fn plan_key(&self) -> &crate::license_ui::KeyEntry {
+        &self.plan_key
+    }
+    #[must_use]
+    pub fn plan_swap_open(&self) -> bool {
+        self.plan_swap_open
+    }
+    #[must_use]
+    pub fn plan_remove_confirm(&self) -> bool {
+        self.plan_remove_confirm
+    }
+    pub fn plan_toggle_swap(&mut self) {
+        self.plan_swap_open = !self.plan_swap_open;
+        self.plan_remove_confirm = false;
+    }
+    pub fn plan_ask_remove(&mut self) {
+        self.plan_remove_confirm = true;
+    }
+    pub fn plan_cancel_remove(&mut self) {
+        self.plan_remove_confirm = false;
+    }
+
+    /// Clicar no campo cola DO CLIPBOARD (a janela T7 não roteia teclado — o gesto do
+    /// leigo é exatamente "colar"). Substitui o conteúdo (previsível), normalizando
+    /// espaços/quebras em silêncio (§2).
+    pub fn plan_paste(&mut self, clipboard_text: &str) {
+        self.plan_key.input.clear();
+        self.plan_key.feedback = None;
+        self.plan_key.type_str(clipboard_text);
+    }
+
+    /// `[[ Ativar ]]` do painel: chave oficial + caminho padrão; sucesso recarrega o
+    /// estado (o painel vira PRO sem restart). Devolve o anúncio p/ leitor de tela.
+    pub fn plan_activate(&mut self) -> Option<String> {
+        let path = lina_license::default_license_path().unwrap_or_default();
+        let ok = self.plan_key.activate(
+            &path,
+            &lina_license::Verifier::official(),
+            crate::license_ui::now_epoch_s(),
+        );
+        if ok {
+            self.license = lina_license::LicenseState::load_default();
+            self.plan_swap_open = false;
+        }
+        self.plan_key.announcement()
+    }
+
+    /// `[[ Remover ]]` confirmado: apaga o license.json (volta a Free; Espaços abertos
+    /// seguem — o limite vale para CRIAR novos) e recarrega o estado.
+    pub fn plan_remove(&mut self) {
+        let path = lina_license::default_license_path().unwrap_or_default();
+        if let Err(e) = lina_license::deactivate(&path) {
+            eprintln!("lina-gpui: T7§P — não removi a chave ({e})");
+        }
+        self.license = lina_license::LicenseState::load_default();
+        self.plan_remove_confirm = false;
+        self.plan_key = crate::license_ui::KeyEntry::default();
     }
 
     /// Chamado a cada frame: atualiza o indicador de salvamento e o estado de recuperação a partir
@@ -1107,6 +1196,310 @@ impl PersistenceView {
             );
         self.section("sec-settings", "Ajustes (T7)", body.into_any_element())
     }
+
+    /// Campo «cole aqui a chave…» do T7§P: esta janela não roteia teclado (pré-existente),
+    /// então o CLIQUE no campo cola do clipboard — o gesto real do leigo ("copiei do
+    /// e-mail → colo aqui"). `[[ Ativar ]]` valida 100% offline e atualiza o painel.
+    fn plan_key_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::license_ui as lic;
+        let th = theme::active();
+        let (shown, fg) = if self.model.plan_key().input.is_empty() {
+            (
+                format!("{} (clique para colar)", lic::COPY_KEY_PLACEHOLDER),
+                th.text.muted,
+            )
+        } else {
+            (self.model.plan_key().input.clone(), th.text.bright)
+        };
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(th.text.secondary))
+                    .child(text!(lic::COPY_KEY_LABEL)),
+            )
+            .child(
+                div()
+                    .id("plan-key-field")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(th.surface.border))
+                    .bg(rgb(th.surface.card))
+                    .text_color(rgb(fg))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                            view.model.plan_paste(&text);
+                        }
+                        cx.notify();
+                    }))
+                    .child(text!(shown)),
+            )
+            .child(self.button(
+                "plan-key-activate",
+                format!("[[ {} ]]", lic::COPY_KEY_ACTIVATE),
+                (
+                    theme::active().accent.action,
+                    theme::active().text.on_accent,
+                ),
+                cx,
+                |view, _w, cx| {
+                    let _ = view.model.plan_activate();
+                    cx.notify();
+                },
+            ));
+        match self.model.plan_key().feedback {
+            Some(lic::KeyFeedback::Error {
+                ref message,
+                renewable,
+            }) => {
+                col = col.child(
+                    div()
+                        .text_color(rgb(th.state.warning))
+                        .child(text!(message.clone())),
+                );
+                if renewable {
+                    col = col
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(th.text.muted))
+                                .child(text!(lic::COPY_RENEW_NOTE)),
+                        )
+                        .child(self.button(
+                            "plan-renew-link",
+                            "[ Renovar no site ↗ ]",
+                            (theme::active().surface.raised, theme::active().text.bright),
+                            cx,
+                            |_view, _w, cx| cx.open_url(lic::STORE_URL),
+                        ));
+                }
+            }
+            Some(lic::KeyFeedback::Success {
+                ref changed,
+                ref valid_until,
+            }) => {
+                col = col.child(
+                    div()
+                        .text_color(rgb(th.state.success))
+                        .child(text!(lic::COPY_SUCCESS_TITLE)),
+                );
+                col = col.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(th.text.secondary))
+                        .child(text!(lic::COPY_SUCCESS_CHANGED)),
+                );
+                for (i, item) in changed.iter().enumerate() {
+                    col = col.child(
+                        div()
+                            .id(("plan-changed", i))
+                            .text_size(px(12.0))
+                            .text_color(rgb(th.text.primary))
+                            .child(text!(item.clone())),
+                    );
+                }
+                if let Some(v) = valid_until {
+                    col = col.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(th.text.muted))
+                            .child(text!(v.clone())),
+                    );
+                }
+            }
+            None => {}
+        }
+        col.into_any_element()
+    }
+
+    /// T7§P — Ajustes › Plano (F1-4-6): a face não-técnica da licença 100% offline.
+    /// Free = duas colunas honestas + campo; PRO = validade/uso + trocar/remover;
+    /// degradado = re-colagem graciosa. Copy congelada em `license_ui` (copy-f1-4 §3).
+    fn plan_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::license_ui as lic;
+        let th = theme::active();
+        let mut body = div().flex().flex_col().gap_3();
+        match self.model.plan_view() {
+            lic::PlanPanel::Pro { valid_until, usage } => {
+                body = body.child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(th.state.success))
+                        .child(text!(lic::COPY_PLAN_PRO_TITLE)),
+                );
+                if let Some(v) = valid_until {
+                    body = body.child(div().text_color(rgb(th.text.muted)).child(text!(v)));
+                }
+                body = body.child(div().text_color(rgb(th.text.primary)).child(text!(usage)));
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(self.button(
+                            "plan-swap",
+                            format!("[ {} ]", lic::COPY_PLAN_SWAP),
+                            (th.surface.raised, th.text.bright),
+                            cx,
+                            |view, _w, cx| {
+                                view.model.plan_toggle_swap();
+                                cx.notify();
+                            },
+                        ))
+                        .child(self.button(
+                            "plan-remove",
+                            format!("[ {} ]", lic::COPY_PLAN_REMOVE),
+                            (th.surface.raised, th.text.bright),
+                            cx,
+                            |view, _w, cx| {
+                                view.model.plan_ask_remove();
+                                cx.notify();
+                            },
+                        )),
+                );
+                if self.model.plan_swap_open() {
+                    body = body
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(th.text.secondary))
+                                .child(text!(lic::COPY_PLAN_SWAP_NOTE)),
+                        )
+                        .child(self.plan_key_field(cx));
+                }
+                if self.model.plan_remove_confirm() {
+                    body = body.child(
+                        div()
+                            .p_3()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(th.state.warning))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(rgb(th.text.primary))
+                                    .child(text!(lic::COPY_PLAN_REMOVE_CONFIRM)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(self.button(
+                                        "plan-remove-cancel",
+                                        format!("[ {} ]", lic::COPY_PLAN_REMOVE_CANCEL),
+                                        (th.surface.raised, th.text.bright),
+                                        cx,
+                                        |view, _w, cx| {
+                                            view.model.plan_cancel_remove();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(self.button(
+                                        "plan-remove-do",
+                                        format!("[[ {} ]]", lic::COPY_PLAN_REMOVE_DO),
+                                        (th.state.warning, th.text.on_emphasis),
+                                        cx,
+                                        |view, _w, cx| {
+                                            view.model.plan_remove();
+                                            cx.notify();
+                                        },
+                                    )),
+                            ),
+                    );
+                }
+            }
+            lic::PlanPanel::Repaste => {
+                body = body
+                    .child(
+                        div()
+                            .text_color(rgb(th.text.primary))
+                            .child(text!(lic::COPY_PLAN_REPASTE)),
+                    )
+                    .child(self.plan_key_field(cx));
+            }
+            lic::PlanPanel::Free { expired_note } => {
+                body = body.child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(th.text.bright))
+                        .child(text!(lic::COPY_PLAN_FREE_TITLE)),
+                );
+                if let Some(note) = expired_note {
+                    body = body.child(div().text_color(rgb(th.state.warning)).child(text!(note)));
+                }
+                // Duas colunas honestas (E1 do ux-flows; strings §3 congeladas).
+                let mut have = div().flex().flex_col().gap_1().flex_1().child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(th.text.secondary))
+                        .child(text!(lic::COPY_PLAN_HAVE_COL)),
+                );
+                for (i, item) in lic::COPY_PLAN_HAVE_ITEMS.iter().enumerate() {
+                    have = have.child(
+                        div()
+                            .id(("plan-have", i))
+                            .text_size(px(12.0))
+                            .text_color(rgb(th.text.primary))
+                            .child(text!((*item).to_string())),
+                    );
+                }
+                let unlock = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(th.text.secondary))
+                            .child(text!(lic::COPY_PLAN_UNLOCK_COL)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(th.text.primary))
+                            .child(text!(lic::COPY_SUCCESS_SPACES)),
+                    );
+                body = body.child(div().flex().flex_row().gap_4().child(have).child(unlock));
+                body = body.child(
+                    div()
+                        .text_color(rgb(th.text.primary))
+                        .child(text!(lic::COPY_PLAN_ASK_KEY)),
+                );
+                body = body.child(self.plan_key_field(cx));
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(th.text.muted))
+                                .child(text!(lic::COPY_PLAN_BUY_PREFIX)),
+                        )
+                        .child(self.button(
+                            "plan-buy",
+                            format!("[ {} ]", lic::COPY_PLAN_BUY_LINK),
+                            (th.surface.raised, th.text.bright),
+                            cx,
+                            |_view, _w, cx| cx.open_url(lic::STORE_URL),
+                        )),
+                );
+            }
+        }
+        self.section("sec-plan", "Plano", body.into_any_element())
+    }
 }
 
 impl Render for PersistenceView {
@@ -1150,6 +1543,7 @@ impl Render for PersistenceView {
                     )
                     .child(self.recovery_banner(cx))
                     .child(self.workspaces_list(cx))
+                    .child(self.plan_section(cx))
                     .child(self.appearance_panel(cx))
                     .child(self.settings_panel(cx)),
             )

@@ -56,6 +56,9 @@ mod sidebar;
 // F1-5-1: sonda [PROF] — decompõe o frametime que a [FPS] mede agregado (poll/assemble por
 // painel/chrome + layout_paint/present via sentinela de paint). Lógica gpui-free, testável.
 mod prof;
+// F1-4-6: copy congelada + estado headless da ativação do Lina PRO (campo de colar,
+// erros leigos por variante, painel do plano) — compartilhado pelo M9 (1b) e T7§P.
+mod license_ui;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -860,13 +863,31 @@ impl WorkspaceView {
             &active_root,
             &self.mini_cache,
         ));
-        // Vitrine free=1 (spec §3): tier STUB `Pro` até F1-4-5 — bloqueante de release (§6-B1).
-        self.sidebar.create_blocked = registry
+        // F1-4-6: o selo «PRO» do `+ Novo Espaço…` segue o gate REAL da licença
+        // (vitrine §1a ANTES do esforço — o stub `Pro` morreu nesta fatia).
+        let active = registry
             .as_ref()
-            .is_some_and(|r| r.can_create(lina_core::LicenseTier::Pro).is_err());
+            .map_or(0, lina_core::WorkspaceRegistry::active_count);
+        self.sidebar.create_blocked = self.license_gate_blocked_copy(active).is_some();
     }
 
-    /// Abre o M9 — o gating roda NA ABERTURA (antes do esforço, spec §3; tier stub `Pro`).
+    /// F1-4-6: o GATE REAL de criação — veredito do `lina-license` (assinatura ed25519
+    /// local; free=1/PRO=N data-driven) traduzido na linha-fato da vitrine 1b. `None` =
+    /// pode criar. Carrega o estado do disco a cada PONTO de gating (critério 7 de
+    /// F1-4-5: o relógio é avaliado aqui, nunca num timer).
+    fn license_gate_blocked_copy(&self, active_count: usize) -> Option<String> {
+        let state = lina_license::LicenseState::load_default();
+        match state.can_create_workspace(active_count as u32, license_ui::now_epoch_s()) {
+            lina_license::WorkspaceGate::Allowed => None,
+            lina_license::WorkspaceGate::Blocked { limit, reason, .. } => {
+                let expiry = state.effective(license_ui::now_epoch_s()).expiry;
+                Some(license_ui::blocked_copy(reason, limit, expiry))
+            }
+        }
+    }
+
+    /// Abre o M9 — o gating roda NA ABERTURA (antes do esforço, spec §3) com o gate
+    /// REAL da licença (F1-4-6); bloqueado ⇒ vitrine 1b com o campo de colar a chave.
     fn open_create_space_modal(&mut self, cx: &mut Context<Self>) {
         let registry = lina_core::default_registry_path()
             .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok());
@@ -882,14 +903,44 @@ impl WorkspaceView {
             let trimmed = s.default_cwd.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
         };
+        let blocked = self.license_gate_blocked_copy(active);
         self.create_space_modal = Some(gallery::CreateSpaceModal::new(
-            lina_core::LicenseTier::Pro,
-            active,
+            blocked,
             default_cwd,
             existing,
         ));
-        // a11y (spec §4): nascer bloqueado (vitrine free=1) já é anunciado — o foco nasce no upsell.
+        // a11y (spec §4): nascer bloqueado (vitrine 1b) já é anunciado — o foco nasce no upsell.
         self.m9_announce();
+        cx.notify();
+    }
+
+    /// `[[ Ativar ]]` da vitrine 1b (M9): valida a chave colada 100% offline e, em
+    /// sucesso, DESTRAVA o modal sem restart (colar → confirmar → criar, ≤3 interações).
+    /// Erro fica inline no campo + live-region (critério 5). Side effect único: gravar
+    /// `~/.lina/license.json` via `lina_license::activate`.
+    fn m9_activate_key(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.create_space_modal.as_mut() else {
+            return;
+        };
+        let path = lina_license::default_license_path().unwrap_or_default();
+        let activated = m.key.activate(
+            &path,
+            &lina_license::Verifier::official(),
+            license_ui::now_epoch_s(),
+        );
+        if let Some(msg) = m.key.announcement() {
+            self.a11y_live.announce(msg);
+        }
+        if activated {
+            if let Some(m) = self.create_space_modal.as_mut() {
+                m.unblock_after_activation();
+            }
+            // O selo «PRO» do rail e a vitrine seguem o estado novo imediatamente.
+            self.refresh_sidebar_rows();
+        } else if let Some(m) = self.create_space_modal.as_mut() {
+            // E1: foco volta ao campo (saída da tabela de erros); E2/E3/E4 mantêm o texto.
+            m.focus = gallery::M9Focus::KeyField;
+        }
         cx.notify();
     }
 
@@ -952,14 +1003,22 @@ impl WorkspaceView {
             self.create_space_modal = Some(m);
             return;
         };
+        // F1-4-6: re-check de corrida do submit com o gate REAL (outro processo pode
+        // ter criado um Espaço entre abrir e submeter) — Allowed→Pro, Blocked→Free.
+        // Nota honesta: PRO com teto finito N>1 projeta em `Pro` (ilimitado no core);
+        // o teto data-driven é garantido pelo gate de ABERTURA, que é o do produto.
+        let tier = if self
+            .license_gate_blocked_copy(registry.active_count())
+            .is_none()
+        {
+            lina_core::LicenseTier::Pro
+        } else {
+            lina_core::LicenseTier::Free
+        };
         let mut created: Option<PathBuf> = None;
-        let ok = m.submit(
-            &parent,
-            &mut registry,
-            lina_core::now_ms(),
-            lina_core::LicenseTier::Pro,
-            |root| created = Some(root),
-        );
+        let ok = m.submit(&parent, &mut registry, lina_core::now_ms(), tier, |root| {
+            created = Some(root)
+        });
         if ok {
             if let Some(root) = created {
                 // F1-4-4 crit 2: criado → o foco vai pro Espaço NOVO já povoado pelo preset.
@@ -983,14 +1042,40 @@ impl WorkspaceView {
                 self.create_space_modal = None;
             }
             "enter" | "return" => {
-                let focus_on_browse = self
+                // F1-4-6: na vitrine bloqueada (1b), Enter ATIVA o controle focado
+                // (expandir campo / Ativar / abrir o site / fechar) — não há form a
+                // submeter. Fora dela, vale a spec §4: Enter SUBMETE sempre.
+                let upsell = self
                     .create_space_modal
                     .as_ref()
-                    .is_some_and(|m| matches!(m.focus, gallery::M9Focus::Browse));
-                if focus_on_browse {
-                    self.m9_pick_folder(cx);
-                } else {
-                    self.m9_submit(cx);
+                    .map_or(gallery::UpsellAction::None, |m| m.upsell_enter());
+                match upsell {
+                    gallery::UpsellAction::OpenKeyField => {
+                        if let Some(m) = self.create_space_modal.as_mut() {
+                            m.open_key_field();
+                        }
+                        self.m9_announce();
+                    }
+                    gallery::UpsellAction::Activate => self.m9_activate_key(cx),
+                    gallery::UpsellAction::OpenStore => {
+                        // Único toque externo do fluxo: navegador padrão, por gesto
+                        // explícito (inv#2) — o app em si nunca faz requisição.
+                        cx.open_url(license_ui::STORE_URL);
+                    }
+                    gallery::UpsellAction::Close => {
+                        self.create_space_modal = None;
+                    }
+                    gallery::UpsellAction::None => {
+                        let focus_on_browse = self
+                            .create_space_modal
+                            .as_ref()
+                            .is_some_and(|m| matches!(m.focus, gallery::M9Focus::Browse));
+                        if focus_on_browse {
+                            self.m9_pick_folder(cx);
+                        } else {
+                            self.m9_submit(cx);
+                        }
+                    }
                 }
             }
             "tab" => {
@@ -1110,31 +1195,211 @@ impl WorkspaceView {
                     .child("Criar Espaço"),
             );
         if let Some(blocked) = &m.blocked {
-            // Vitrine §1a (free=1): o card de upsell NO LUGAR do form — limite ANTES do esforço.
-            panel = panel.child(
-                div()
-                    .p_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(ring(matches!(m.focus, M9Focus::Upsell))))
-                    .bg(rgb(th.surface.raised))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
+            // F1-4-6 — vitrine 1b NO LUGAR do form (limite ANTES do esforço): título +
+            // explicação honesta (copy §1b congelada), a linha-fato do motivo, «Já tenho
+            // uma chave» expandindo o campo ALI MESMO, e a saída de compra no navegador.
+            let mut card = div()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(ring(matches!(m.focus, M9Focus::Upsell))))
+                .bg(rgb(th.surface.raised))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(th.text.bright))
+                        .child(license_ui::COPY_BLOCK_TITLE),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(th.text.primary))
+                        .child(license_ui::COPY_BLOCK_BODY),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(th.text.muted))
+                        .child(blocked.clone()),
+                );
+            if m.key_field_open {
+                // Campo de colar (rótulo a11y «Sua Chave do Lina PRO») + [[ Ativar ]].
+                let shown = if m.key.input.is_empty() {
+                    license_ui::COPY_KEY_PLACEHOLDER.to_string()
+                } else {
+                    format!("{}▌", m.key.input)
+                };
+                let shown_fg = if m.key.input.is_empty() {
+                    th.text.muted
+                } else {
+                    th.text.bright
+                };
+                card = card
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(th.text.primary))
-                            .child(blocked.clone()),
+                            .text_xs()
+                            .text_color(rgb(th.text.secondary))
+                            .child(license_ui::COPY_KEY_LABEL),
                     )
                     .child(
                         div()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_2()
+                            .border_color(rgb(ring(matches!(m.focus, M9Focus::KeyField))))
+                            .bg(rgb(th.surface.card))
                             .text_sm()
-                            .text_color(rgb(th.accent.action))
-                            .child(format!("[ {} ]", gallery::COPY_M9_BLOCKED_CTA)),
-                    ),
-            );
+                            .text_color(rgb(shown_fg))
+                            .child(shown),
+                    )
+                    .child(
+                        div()
+                            .id("m9-key-activate")
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_2()
+                            .border_color(rgb(ring(matches!(m.focus, M9Focus::Activate))))
+                            .bg(rgb(th.accent.action))
+                            .text_color(rgb(th.text.on_accent))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|v, _ev: &gpui::ClickEvent, _w, cx| {
+                                v.m9_activate_key(cx);
+                            }))
+                            .child(format!("[[ {} ]]", license_ui::COPY_KEY_ACTIVATE)),
+                    );
+                // Erro acionável inline (E1–E4) — campo mantém o texto para corrigir.
+                if let Some(license_ui::KeyFeedback::Error { message, renewable }) = &m.key.feedback
+                {
+                    card = card.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(th.state.warning))
+                            .child(message.clone()),
+                    );
+                    if *renewable {
+                        card = card.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(th.text.muted))
+                                .child(license_ui::COPY_RENEW_NOTE),
+                        );
+                    }
+                }
+            } else {
+                card = card.child(
+                    div()
+                        .id("m9-key-toggle")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_2()
+                        .border_color(rgb(ring(matches!(m.focus, M9Focus::KeyToggle))))
+                        .bg(rgb(th.surface.raised_alt))
+                        .text_color(rgb(th.text.bright))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|v, _ev: &gpui::ClickEvent, _w, cx| {
+                            if let Some(m) = v.create_space_modal.as_mut() {
+                                m.open_key_field();
+                            }
+                            v.m9_announce();
+                            cx.notify();
+                        }))
+                        .child(format!("[[ {} ]]", license_ui::COPY_BLOCK_HAVE_KEY)),
+                );
+            }
+            card = card
+                .child(
+                    div()
+                        .id("m9-key-buy")
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_2()
+                        .border_color(rgb(ring(matches!(m.focus, M9Focus::Buy))))
+                        .bg(rgb(th.surface.raised))
+                        .text_color(rgb(th.accent.action))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|_v, _ev: &gpui::ClickEvent, _w, cx| {
+                            cx.open_url(license_ui::STORE_URL);
+                        }))
+                        .child(format!("[ {} ]", license_ui::COPY_BLOCK_BUY)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(th.text.muted))
+                        .child(license_ui::COPY_BLOCK_NOTE),
+                )
+                // «Agora não» (§1b): a saída neutra — fecha sem criar, nada insiste.
+                .child(
+                    div()
+                        .id("m9-key-not-now")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .border_2()
+                        .border_color(rgb(ring(matches!(m.focus, M9Focus::Cancel))))
+                        .text_color(rgb(th.text.muted))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|v, _ev: &gpui::ClickEvent, _w, cx| {
+                            v.create_space_modal = None;
+                            cx.notify();
+                        }))
+                        .child(format!("[ {} ]", license_ui::COPY_BLOCK_NOT_NOW)),
+                );
+            panel = panel.child(card);
         } else {
+            // F1-4-6: chave acabou de ativar NESTE modal → banner discreto «o que mudou»
+            // sobre o form já destravado (sem restart; sem tela extra no caminho ≤3).
+            if let Some(license_ui::KeyFeedback::Success {
+                changed,
+                valid_until,
+            }) = &m.key.feedback
+            {
+                let mut ok = div()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(th.state.success))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(th.state.success))
+                            .child(license_ui::COPY_SUCCESS_TITLE),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(th.text.secondary))
+                            .child(license_ui::COPY_SUCCESS_CHANGED),
+                    );
+                for item in changed {
+                    ok = ok.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(th.text.primary))
+                            .child(item.clone()),
+                    );
+                }
+                if let Some(v) = valid_until {
+                    ok = ok.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(th.text.muted))
+                            .child(v.clone()),
+                    );
+                }
+                panel = panel.child(ok);
+            }
             // Cards de Foco (3 presets — os 5 do ux-flows são backlog §6-B4).
             let mut cards = div().flex().flex_row().gap_2();
             for (idx, preset) in gallery::FocusPreset::all().into_iter().enumerate() {

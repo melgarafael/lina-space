@@ -30,6 +30,9 @@ lina-session-watch = { path = "../../crates/lina-session-watch" }
 # F1-1-3 (wiring): listener loopback dos hooks de observabilidade — bind 1x no boot;
 # token por spawn (atribuição NUNCA pelo payload); a timeline do dashboard drena daqui.
 lina-hooks = { path = "../../crates/lina-hooks" }
+# F1-4-6 (UX de ativação): gate REAL free=1/PRO=N + ativação por chave colada (ed25519
+# local, zero rede) — mata o stub `LicenseTier::Pro` que era bloqueante de release (§6-B1).
+lina-license = { path = "../../crates/lina-license" }
 # W3-6c Round 5: desserializar `MailMessage` no drain AUTENTICADO por-nó da fila de broker (o app lê
 # só os subdirs por-nó, carimbando a origem; rejeita flat) — precisa nomear `serde_json` direto.
 serde_json = "1"
@@ -49,6 +52,10 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea9
 [dev-dependencies]
 # Só nos testes: cunhar `NodeId` (UUID v7) para exercitar `bus_to_host`.
 uuid = { version = "1", features = ["v7"] }
+# F1-4-6: ASSINAR chaves de teste (Verifier::with_key) — só verify existe em produção;
+# mesma versão/features do dev-deps do lina-license (os tipos precisam unificar).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # === gpui_platform POR-SO ===========================================================
 # macOS: runtime_shaders compila shaders Metal em runtime (dispensa o Metal Toolchain offline).

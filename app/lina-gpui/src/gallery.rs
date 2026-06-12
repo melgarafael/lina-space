@@ -247,8 +247,8 @@ impl From<WorkdirError> for WorkdirErrorView {
 
 /// Alvos de foco do M9 na ORDEM de tab da spec §4: cards → Nome → Diretório →
 /// Procurar → Criar → Cancelar (ordem de leitura = ordem visual). No estado
-/// bloqueado (free=1) o ciclo é Upsell → Cancelar (o card de upsell é focável e
-/// lê a string congelada inteira).
+/// bloqueado (free=1) o ciclo é a vitrine 1b (F1-4-6): Upsell → «Já tenho uma
+/// chave» (ou campo+Ativar, se aberto) → «Quero o Lina PRO ↗» → Cancelar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum M9Focus {
     Cards,
@@ -257,8 +257,27 @@ pub enum M9Focus {
     Browse,
     Create,
     Cancel,
-    /// Card de upsell free=1 (vitrine 4) — só existe com `blocked`.
+    /// Card de upsell free=1 (vitrine 1b) — só existe com `blocked`.
     Upsell,
+    /// `[[ Já tenho uma chave ]]` — Enter/clique expande o campo ALI MESMO (copy §1b).
+    KeyToggle,
+    /// O campo «cole aqui a chave…» (F1-4-6; rótulo a11y «Sua Chave do Lina PRO»).
+    KeyField,
+    /// `[[ Ativar ]]` — verificação local instantânea (zero rede).
+    Activate,
+    /// `[ Quero o Lina PRO ↗ ]` — abre o site no navegador (único toque externo, por clique).
+    Buy,
+}
+
+/// O que o `Enter` ativa na vitrine bloqueada (intenção devolvida ao shell — quem
+/// executa side effects [ativar/abrir navegador/fechar] é a fiação do main).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsellAction {
+    OpenKeyField,
+    Activate,
+    OpenStore,
+    Close,
+    None,
 }
 
 /// **O modal M9 — estado puro (nenhum gpui; nenhum side effect até o Criar).**
@@ -284,10 +303,15 @@ pub struct CreateSpaceModal {
     pub workdir_touched: bool,
     /// Erro corrente do Diretório (validação CEDO: na seleção E na criação).
     pub error: Option<WorkdirErrorView>,
-    /// Vitrine free=1 (copy §1a) — `Some` ⇒ criação indisponível, upsell no lugar.
+    /// Linha-fato do bloqueio (F1-4-6: por `BlockReason`, via `license_ui::blocked_copy`)
+    /// — `Some` ⇒ criação indisponível, a vitrine 1b no lugar do form.
     pub blocked: Option<String>,
     /// Alvo de foco corrente (ordem de tab da spec §4).
     pub focus: M9Focus,
+    /// F1-4-6: o campo «cole aqui a chave…» da vitrine 1b (estado compartilhado com T7).
+    pub key: crate::license_ui::KeyEntry,
+    /// `[[ Já tenho uma chave ]]` já expandiu o campo? (copy §1b: ali mesmo, sem trocar de tela).
+    pub key_field_open: bool,
     /// `Settings.default_cwd` (T7) — base do pré-preenchimento quando definido.
     default_cwd: Option<String>,
     /// Nomes de Espaço já tomados (registry) — aviso leve de duplicado (padrão M6).
@@ -295,19 +319,16 @@ pub struct CreateSpaceModal {
 }
 
 impl CreateSpaceModal {
-    /// Abre o modal. O gating roda AQUI (antes de qualquer esforço — spec §3): com
-    /// `tier`/`active_count` no limite, o modal nasce na vitrine de upsell (§1a).
-    /// `default_cwd` = `Settings.default_cwd` (T7) se definido; `existing` = nomes
-    /// já inscritos no registry (aviso de duplicado).
+    /// Abre o modal. O gating roda ANTES (no shell, com o gate REAL do `lina-license` —
+    /// F1-4-6 matou o stub de tier): `blocked = Some(copy)` ⇒ o modal nasce na vitrine
+    /// 1b (upsell + colar chave). `default_cwd` = `Settings.default_cwd` (T7) se
+    /// definido; `existing` = nomes já inscritos no registry (aviso de duplicado).
     #[must_use]
     pub fn new(
-        tier: LicenseTier,
-        active_count: usize,
+        blocked: Option<String>,
         default_cwd: Option<String>,
         existing: Vec<String>,
     ) -> Self {
-        let blocked = can_create_workspace(tier, active_count)
-            .map_or(Some(COPY_M9_BLOCKED_FREE.into()), |()| None);
         let focus = if blocked.is_some() {
             M9Focus::Upsell
         } else {
@@ -322,6 +343,8 @@ impl CreateSpaceModal {
             error: None,
             blocked,
             focus,
+            key: crate::license_ui::KeyEntry::default(),
+            key_field_open: false,
             default_cwd,
             existing,
         };
@@ -389,6 +412,9 @@ impl CreateSpaceModal {
                 self.workdir_touched = true;
                 self.error = None;
             }
+            // F1-4-6 (vitrine 1b): digitar/colar no campo da chave — normalização
+            // silenciosa de espaços/quebras dentro do KeyEntry (copy §2).
+            M9Focus::KeyField => self.key.type_str(s),
             _ => {}
         }
     }
@@ -412,15 +438,31 @@ impl CreateSpaceModal {
                 self.workdir_touched = true;
                 self.error = None;
             }
+            M9Focus::KeyField => self.key.backspace(),
             _ => {}
         }
     }
 
     /// A ordem de tab da spec §4 (cards → Nome → Diretório → Procurar → Criar →
-    /// Cancelar, circular). Bloqueado: Upsell → Cancelar.
+    /// Cancelar, circular). Bloqueado (vitrine 1b): Upsell → chave → compra → Cancelar.
     fn tab_ring(&self) -> &'static [M9Focus] {
         if self.blocked.is_some() {
-            &[M9Focus::Upsell, M9Focus::Cancel]
+            if self.key_field_open {
+                &[
+                    M9Focus::Upsell,
+                    M9Focus::KeyField,
+                    M9Focus::Activate,
+                    M9Focus::Buy,
+                    M9Focus::Cancel,
+                ]
+            } else {
+                &[
+                    M9Focus::Upsell,
+                    M9Focus::KeyToggle,
+                    M9Focus::Buy,
+                    M9Focus::Cancel,
+                ]
+            }
         } else {
             &[
                 M9Focus::Cards,
@@ -448,17 +490,64 @@ impl CreateSpaceModal {
     }
 
     /// O que a live-region (AccessKit) anuncia para o foco CORRENTE (spec §4 M9):
-    /// erro do Diretório ao focar o campo; vitrine inteira ao focar o card de upsell.
+    /// erro do Diretório ao focar o campo; vitrine 1b inteira ao focar o upsell;
+    /// campo/botões da ativação com rótulo a11y (F1-4-6 critério 5).
     #[must_use]
     pub fn announcement(&self) -> Option<String> {
+        use crate::license_ui as lic;
         match self.focus {
             M9Focus::Workdir => self.error.as_ref().map(|e| e.message.clone()),
             M9Focus::Upsell => self
                 .blocked
                 .as_ref()
-                .map(|b| format!("{b} — {COPY_M9_BLOCKED_CTA}")),
+                .map(|b| format!("{b}. {} — {}", lic::COPY_BLOCK_TITLE, lic::COPY_BLOCK_BODY)),
+            M9Focus::KeyToggle => Some(lic::COPY_BLOCK_HAVE_KEY.to_string()),
+            // Erro/sucesso da última tentativa vence o rótulo (o usuário ouve o que houve).
+            M9Focus::KeyField => Some(
+                self.key
+                    .announcement()
+                    .unwrap_or_else(|| lic::COPY_KEY_LABEL.to_string()),
+            ),
+            M9Focus::Activate => Some(lic::COPY_KEY_ACTIVATE.to_string()),
+            M9Focus::Buy => Some(format!(
+                "{} — {}",
+                lic::COPY_BLOCK_BUY,
+                lic::COPY_BLOCK_NOTE
+            )),
             _ => None,
         }
+    }
+
+    /// `[[ Já tenho uma chave ]]`: expande o campo de colar ALI MESMO (copy §1b) e
+    /// move o foco para ele.
+    pub fn open_key_field(&mut self) {
+        self.key_field_open = true;
+        self.focus = M9Focus::KeyField;
+    }
+
+    /// O que o `Enter` significa na vitrine bloqueada (intenção; o shell executa).
+    /// Fora do bloqueio devolve [`UpsellAction::None`] (Enter segue submetendo).
+    #[must_use]
+    pub fn upsell_enter(&self) -> UpsellAction {
+        if self.blocked.is_none() {
+            return UpsellAction::None;
+        }
+        match self.focus {
+            M9Focus::KeyToggle | M9Focus::Upsell => UpsellAction::OpenKeyField,
+            M9Focus::KeyField | M9Focus::Activate => UpsellAction::Activate,
+            M9Focus::Buy => UpsellAction::OpenStore,
+            M9Focus::Cancel => UpsellAction::Close,
+            _ => UpsellAction::None,
+        }
+    }
+
+    /// Chave ativada (F1-4-6): o bloqueio cai SEM restart — a vitrine dá lugar ao form
+    /// (foco no 1º card), com o feedback de sucesso preservado para o banner «o que
+    /// mudou». Colar → confirmar → criar em ≤3 interações (critério 1).
+    pub fn unblock_after_activation(&mut self) {
+        self.blocked = None;
+        self.key_field_open = false;
+        self.focus = M9Focus::Cards;
     }
 
     /// Pasta devolvida pelo seletor NATIVO (`[ Procurar… ]` — o shell chama
@@ -762,8 +851,12 @@ mod tests {
         dir
     }
 
+    /// Abre o modal com o gate JÁ resolvido (como o shell faz desde F1-4-6: o veredito
+    /// vem do `lina-license`; aqui os testes o injetam pelo seam de `blocked`).
     fn open_modal(tier: LicenseTier, active: usize) -> CreateSpaceModal {
-        CreateSpaceModal::new(tier, active, None, Vec::new())
+        let blocked =
+            can_create_workspace(tier, active).map_or(Some(COPY_M9_BLOCKED_FREE.into()), |()| None);
+        CreateSpaceModal::new(blocked, None, Vec::new())
     }
 
     /// Spec §2.2: o Diretório acompanha o nome (template `~/EspaçosDeTrabalho/{nome}`)
@@ -803,12 +896,7 @@ mod tests {
     /// `Settings.default_cwd` (T7) definido vence o template como base do pré-preenchimento.
     #[test]
     fn m9_default_cwd_do_settings_e_a_base_quando_definido() {
-        let m = CreateSpaceModal::new(
-            LicenseTier::Pro,
-            0,
-            Some("/tmp/projetos".into()),
-            Vec::new(),
-        );
+        let m = CreateSpaceModal::new(None, Some("/tmp/projetos".into()), Vec::new());
         assert_eq!(m.workdir, "/tmp/projetos");
     }
 
@@ -816,12 +904,7 @@ mod tests {
     /// não bloqueia; o texto é o `copy_dup_note` do M6 (reuso literal).
     #[test]
     fn m9_nome_duplicado_avisa_com_o_sufixo_m6() {
-        let mut m = CreateSpaceModal::new(
-            LicenseTier::Pro,
-            0,
-            None,
-            vec!["App".into(), "App (2)".into()],
-        );
+        let mut m = CreateSpaceModal::new(None, None, vec!["App".into(), "App (2)".into()]);
         let note = m.dup_note().expect("aviso leve presente");
         assert_eq!(note, crate::agent_modal::copy_dup_note("App (3)"));
         // Nome livre → sem aviso.
@@ -838,12 +921,22 @@ mod tests {
         let mut m = open_modal(LicenseTier::Free, 1);
         assert_eq!(m.blocked.as_deref(), Some(COPY_M9_BLOCKED_FREE));
         assert_eq!(m.focus, M9Focus::Upsell);
-        assert_eq!(
-            m.announcement().as_deref(),
-            Some("Você já usa o Espaço do plano Free (1 de 1) — Conhecer o PRO")
+        let ann = m.announcement().expect("vitrine anunciada");
+        assert!(
+            ann.starts_with("Você já usa o Espaço do plano Free (1 de 1)")
+                && ann.contains("Seu segundo Espaço vem com o Lina PRO"),
+            "anuncia fato + vitrine 1b: {ann}"
         );
-        m.focus_next();
-        assert_eq!(m.focus, M9Focus::Cancel, "Esc/Cancelar — nunca beco");
+        // Anel da vitrine 1b (F1-4-6): chave → compra → Cancelar (nunca beco).
+        for expected in [
+            M9Focus::KeyToggle,
+            M9Focus::Buy,
+            M9Focus::Cancel,
+            M9Focus::Upsell, // circular
+        ] {
+            m.focus_next();
+            assert_eq!(m.focus, expected);
+        }
 
         let parent = temp_dir("blocked");
         let mut registry =
@@ -858,9 +951,75 @@ mod tests {
             0,
             "zero side effects no disco"
         );
-        // Com tier Pro (stub desta fatia), nenhuma vitrine aparece.
+        // Gate liberado (PRO real via lina-license no shell) → nenhuma vitrine.
         assert!(open_modal(LicenseTier::Pro, 1).blocked.is_none());
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// F1-4-6 (vitrine 1b, caminho de TECLADO): «Já tenho uma chave» expande o campo
+    /// ali mesmo; digitar/colar vai pro campo (normalizado); o anel cresce para
+    /// campo→Ativar; `upsell_enter()` devolve a intenção certa por foco; e o
+    /// `unblock_after_activation` derruba a vitrine SEM restart (foco no 1º card,
+    /// feedback preservado p/ o banner «o que mudou»). Não-vacuoso: sem o estado novo
+    /// do KeyEntry/anel, cada asserção falha.
+    #[test]
+    fn m9_vitrine_1b_expande_campo_e_destrava_apos_ativar() {
+        let mut m = open_modal(LicenseTier::Free, 1);
+        assert_eq!(
+            m.upsell_enter(),
+            UpsellAction::OpenKeyField,
+            "Enter no upsell"
+        );
+        m.focus_next(); // KeyToggle
+        assert_eq!(m.upsell_enter(), UpsellAction::OpenKeyField);
+        m.open_key_field();
+        assert!(m.key_field_open && m.focus == M9Focus::KeyField);
+        assert_eq!(
+            m.announcement().as_deref(),
+            Some(crate::license_ui::COPY_KEY_LABEL),
+            "campo anuncia o rótulo a11y congelado"
+        );
+        // Colar com lixo de formatação: normalização silenciosa (copy §2).
+        m.type_char("LINA1. ab\n");
+        m.type_char("c");
+        assert_eq!(m.key.input, "LINA1.abc");
+        m.backspace();
+        assert_eq!(m.key.input, "LINA1.ab");
+        assert_eq!(
+            m.upsell_enter(),
+            UpsellAction::Activate,
+            "Enter no campo ativa"
+        );
+        m.focus_next();
+        assert_eq!(m.focus, M9Focus::Activate);
+        assert_eq!(m.upsell_enter(), UpsellAction::Activate);
+        m.focus_next();
+        assert_eq!(m.focus, M9Focus::Buy);
+        assert_eq!(m.upsell_enter(), UpsellAction::OpenStore);
+        m.focus_next();
+        assert_eq!(m.focus, M9Focus::Cancel);
+        assert_eq!(m.upsell_enter(), UpsellAction::Close, "nunca beco");
+
+        // Ativação bem-sucedida (o shell valida via lina-license) → vitrine cai.
+        m.key.feedback = Some(crate::license_ui::KeyFeedback::Success {
+            changed: vec![crate::license_ui::COPY_SUCCESS_SPACES.into()],
+            valid_until: None,
+        });
+        m.unblock_after_activation();
+        assert!(m.blocked.is_none(), "destravado SEM restart");
+        assert_eq!(m.focus, M9Focus::Cards, "pronto pra criar (3ª interação)");
+        assert_eq!(
+            m.upsell_enter(),
+            UpsellAction::None,
+            "fora da vitrine, Enter volta a submeter (spec §4)"
+        );
+        assert!(
+            matches!(
+                m.key.feedback,
+                Some(crate::license_ui::KeyFeedback::Success { .. })
+            ),
+            "feedback preservado p/ o banner «o que mudou»"
+        );
     }
 
     /// Spec §2 (tabela de erros): cada situação do Diretório mapeia para a SUA string
