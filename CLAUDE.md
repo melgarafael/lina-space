@@ -30,7 +30,7 @@ Estas abstrações existem na Fase 0 **para o futuro caber**. Mantenha-as vivas:
 - **trait `VtBackend`** (`lina-vt`) — abstrai o motor VT; permite migrar `alacritty_terminal` → `libghostty-vt` depois.
 - **trait `PortalEngine` + `ExternalTextureLayer`** (futuro) — o browser navegável-pela-IA (Fase 1+) encaixa sem refazer o render. Não simplifique a cena a ponto de excluí-lo.
 - **CLI Profiles TOML** (`lina-cli-profiles`) — toda especificidade de CLI vive em config. Novos CLIs entram sem recompilar.
-- **Event Store** (`lina-core`) — event-sourcing com upcasting versionado; toda a Fase 1 (observabilidade, retenção por estado, inteligência da Lina) é evento/projeção sobre o log — e o backlog F2 (Curador-feed, webhooks ampliados, discovery; ver ADR 0010) também o reusará.
+- **Event Store** (`lina-core`) — event-sourcing com upcasting versionado; toda a Fase 1 (observabilidade, retenção por estado, inteligência da Lina) é evento/projeção sobre o log — e o backlog F3 (Curador-feed, webhooks ampliados, discovery; re-faseado de F2→F3 em 2026-06-12 — **a F2 é UI/UX**; ver addendum do ADR 0010) também o reusará.
 - **Workspace Bus / Supervisor** (`lina-core`) — broker in-process; toda orquestração futura pendura aqui.
 - **Envelope A2A versionado** — campos `id/root_cause_id/from/to/intent/hops/await`; não invente formatos por feature.
 

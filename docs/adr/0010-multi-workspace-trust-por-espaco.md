@@ -99,3 +99,20 @@ storage na entrega da story e na mensagem do commit):
    0", `workspace.rs`) — não há evento de foco no log hoje; perder o registry perde no máximo
    "qual abre primeiro", nunca um fato de Espaço. Se o foco um dia precisar ser fato auditável,
    é evento aditivo novo (story própria), não promoção do registry a autoridade.
+
+## Addendum (2026-06-12) — re-faseamento do backlog nominal: F2 → F3 (fundador)
+
+Decisão do fundador (2026-06-12, fechamento da F1): **a Fase 2 é UI/UX** — identidade
+visual única, design system próprio (em gpui), navegabilidade, organização/dimensionamento
+no canvas, menus e comandos. Coordenação/orquestração e inteligência do sistema passam a
+ser **Fase 3**. Consequências sobre este ADR:
+
+- O "BACKLOG EXPLÍCITO DA FASE 2" do §Decisão(escopo) passa a ler-se **backlog da FASE 3**
+  — itens 1 (webhooks), 2 (discovery), 3 (Curador+feed), 4 (presets), 7 (agendador).
+- **Exceção candidata:** item 5 (Ghost wires + Linha do Tempo) é superfície visual de
+  canvas — candidato a F2; a decisão final é do épico F2 (pós-pesquisa).
+- Item 6 (Vault Obsidian via env vars + bootstrap) foi entregue na prática durante a F1
+  (o bootstrap de todo terminal já injeta o vault); reconciliar no fechamento da F3.
+- Specs nominais renomeadas no vault: `35 - Proposta F3 - Mentalidade por Papel` e
+  `36 - Spec F3 - Coordenacao de Codigo Multi-Agente` (eram "F2"; conteúdo inalterado).
+- O item de fronteira "F1-6/Fase 2" do §Limite (auth por-nó L1-3) acompanha: **F3**.
