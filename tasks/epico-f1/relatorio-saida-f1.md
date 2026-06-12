@@ -134,10 +134,13 @@ outputs de 1 CLI" para "≥2 CLIs" e fechando o item 4 do gate F1-6 por completo
 
 Tudo o que é auditável passou. A declaração formal espera este lote — cada item com fonte e dono.
 
-- [ ] **Red-team FINAL de saída: 0 ALTA.** Os red-teams por onda já estão 0 ALTA
-      (`redteam-gate-f1-1.md` · `redteam-spawn-f1-3-6.md`); falta a passada adversarial final
-      sobre o épico inteiro no HEAD de saída, re-derivada no código. **Dono:** Bug Finder / Revisor
-      (coordenação do Maestro).
+- [x] **Red-team FINAL de saída: 0 ALTA — FECHADO 2026-06-11 (rodada r4).** Passada adversarial
+      sobre o épico inteiro (HEAD `f1d4810`, 7 eixos) + ADENDO de licença/keygen (`cb3180e`,
+      cripto 0 ALTA nos 5 eixos): **`redteam-saida-f1.md`**. As 3 dívidas do seam (M2/M3/M4)
+      re-derivadas VERDES. Restam 3 MEDIA→backlog com dono (MM1 doc-FS · MM2 history sem chamador
+      · MM3 local-first) + **ML1** (gate free=1 ainda no stub Pro — fiação em curso na fatia
+      F1-4-6 desta rodada; era o "tier stub = bloqueante de release" do §6-B1, agora com a
+      cripto pronta para fiar).
 - [ ] **Run CI 3-SO verde LINKADO.** A triagem está pronta e `core-windows` foi promovido a gate
       bloqueante (`ci-3so-triagem.md` §2). Falta o **run real no GitHub** (o push é do Maestro):
       5 jobs verdes com `core-windows` EXECUTANDO (`running N tests`/`test result: ok`, não só
