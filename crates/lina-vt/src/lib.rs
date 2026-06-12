@@ -6,6 +6,7 @@
 //! o que alimenta o render (W2) e a detecção de idle do A2A (W0-9/W0-10).
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -234,6 +235,33 @@ pub trait VtBackend: Send {
     fn scrollback_loss_count(&self) -> u64 {
         0
     }
+
+    // ── Synchronized output / DEC private mode 2026 (F2-0-6) ──
+
+    /// F2-0-6: **deadline do synchronized update** (DEC 2026) atualmente RETIDO, se houver.
+    ///
+    /// `Some(instant)` ⇒ um app TUI abriu um batch atômico (`CSI ? 2026 h`) que ainda não fechou
+    /// (`CSI ? 2026 l`): os writes intermediários estão **segurados** (o grid não muda até o batch
+    /// fechar — zero frame rasgado). O `instant` é o **teto anti-congelamento**: passado ele, o
+    /// reader DEVE liberar o batch via [`VtBackend::flush_sync`] mesmo sem o `l` (app que esquece
+    /// de fechar não congela o terminal). `None` ⇒ nenhum sync pendente.
+    ///
+    /// O reader usa isto para AGENDAR o flush do teto (dormir até o `instant`) em vez de busy-poll.
+    /// Default `None`: backends sem synchronized output (e a porta libghostty até implementá-lo)
+    /// nunca seguram frame, então nunca há deadline. Aditivo — o contrato existente não muda.
+    fn sync_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    /// F2-0-6: **força o fim** de um synchronized update pendente, apresentando ATÔMICO o batch
+    /// retido (o teto: app que esqueceu o `CSI ? 2026 l` não deixa o grid congelado no frame
+    /// anterior). Devolve `true` se HAVIA um sync pendente que foi liberado — então o grid pode ter
+    /// mudado e o chamador deve coletar [`VtBackend::damaged_rows`] e emitir o delta de tela. `false`
+    /// ⇒ não havia nada retido (no-op idempotente). Default `false`: backends sem synchronized
+    /// output não retêm nada, então nunca há o que liberar. Aditivo.
+    fn flush_sync(&mut self) -> bool {
+        false
+    }
 }
 
 // ───────────────────────── AlacrittyBackend (impl da Onda 0) ─────────────────────────
@@ -461,46 +489,70 @@ impl AlacrittyBackend {
     /// `s = history_size_depois − history_size_antes` é o nº EXATO de linhas que rolaram, e as `s`
     /// mais novas (Line `-s..=-1`) são exatamente elas — nenhuma se perde entre rolar e colher.
     fn advance_capturing(&mut self, bytes: &[u8]) {
-        let cap = self.scrollback_cap;
-        let ceiling = cap.saturating_add(self.slack); // == Config::scrolling_history do ring
         for step in bytes.chunks(SCROLLBACK_HARVEST_STEP.max(1)) {
             let before = self.grid().history_size();
             self.parser.advance(&mut self.term, step);
-            let after = self.grid().history_size();
-            // F1-6-3 (MEDIA-3): o ring SATUROU dentro DESTE sub-chunk → o invariante
-            // "`s` = nº exato de linhas que rolaram" pode ter quebrado (linhas evictadas/
-            // não-colhidas). Output real via LF/wrap NUNCA chega aqui (1 byte move ≤1 linha;
-            // STEP << slack — provado por teste); só sequências adversariais muitas-linhas-
-            // por-poucos-bytes (`CSI Ps S`, `REP`) saturam. Doutrina "nunca engula erro":
-            // a perda vira contador por painel + warning rate-limitado no stderr. Zero-perda
-            // sob SU adversarial NÃO é prometido — fronteira documentada (F1-6-5).
-            if after == ceiling {
-                self.harvest_saturations = self.harvest_saturations.saturating_add(1);
-                if let Some(warning) =
-                    saturation_warning(self.harvest_saturations, ceiling, cap, self.slack)
-                {
-                    self.loss_warnings_logged = self.loss_warnings_logged.saturating_add(1);
-                    eprintln!("{warning}");
-                }
-            }
-            if after > before {
-                // Colhe as `s` linhas mais NOVAS (as que acabaram de entrar no histórico), em
-                // ordem cronológica: a mais antiga das novas está em Line(-s); a mais nova em Line(-1).
-                let s = after - before;
-                for k in (1..=s).rev() {
-                    let text = self.line_text_at(-(k as i32));
-                    self.captured.push(text.trim_end().to_string());
-                }
-            }
-            // Trima o ring de volta ao cap (remove os mais antigos — JÁ colhidos) e restaura o
-            // headroom de captura para o próximo sub-chunk. O 2º `update_history` devolve o
-            // `max_scroll_limit` ao teto sem reintroduzir linhas (só encolhe quando atual > alvo).
-            if after > cap {
-                let g = self.term.grid_mut();
-                g.update_history(cap);
-                g.update_history(ceiling);
+            self.harvest_and_trim(before);
+        }
+    }
+
+    /// W5-2 FIAÇÃO — colhe as linhas que entraram no histórico desde `before` (cabo
+    /// `append-on-scroll`), contabiliza eventual saturação do ring (F1-6-3) e trima o ring de volta
+    /// ao `cap`. É o pós-passo de uma aplicação de bytes que PODE ter rolado o viewport.
+    ///
+    /// Compartilhado por dois chamadores: [`Self::advance_capturing`] (um por sub-chunk de output
+    /// normal) e [`<Self as VtBackend>::flush_sync`] (o teto de synchronized output aplica um batch
+    /// retido de uma vez — também pode rolar linhas que precisam ser colhidas, senão o flush do teto
+    /// seria perda SILENCIOSA de scrollback).
+    fn harvest_and_trim(&mut self, before: usize) {
+        let cap = self.scrollback_cap;
+        let ceiling = cap.saturating_add(self.slack); // == Config::scrolling_history do ring
+        let after = self.grid().history_size();
+        // F1-6-3 (MEDIA-3): o ring SATUROU → o invariante "`s` = nº exato de linhas que rolaram"
+        // pode ter quebrado (linhas evictadas/não-colhidas). Output real via LF/wrap NUNCA chega
+        // aqui (1 byte move ≤1 linha; STEP << slack — provado por teste); só sequências
+        // adversariais muitas-linhas-por-poucos-bytes (`CSI Ps S`, `REP`) saturam. Doutrina "nunca
+        // engula erro": a perda vira contador por painel + warning rate-limitado no stderr.
+        // Zero-perda sob SU adversarial NÃO é prometido — fronteira documentada (F1-6-5).
+        if after == ceiling {
+            self.harvest_saturations = self.harvest_saturations.saturating_add(1);
+            if let Some(warning) =
+                saturation_warning(self.harvest_saturations, ceiling, cap, self.slack)
+            {
+                self.loss_warnings_logged = self.loss_warnings_logged.saturating_add(1);
+                eprintln!("{warning}");
             }
         }
+        if after > before {
+            // Colhe as `s` linhas mais NOVAS (as que acabaram de entrar no histórico), em
+            // ordem cronológica: a mais antiga das novas está em Line(-s); a mais nova em Line(-1).
+            let s = after - before;
+            for k in (1..=s).rev() {
+                let text = self.line_text_at(-(k as i32));
+                self.captured.push(text.trim_end().to_string());
+            }
+        }
+        // Trima o ring de volta ao cap (remove os mais antigos — JÁ colhidos) e restaura o
+        // headroom de captura para o próximo sub-chunk. O 2º `update_history` devolve o
+        // `max_scroll_limit` ao teto sem reintroduzir linhas (só encolhe quando atual > alvo).
+        if after > cap {
+            let g = self.term.grid_mut();
+            g.update_history(cap);
+            g.update_history(ceiling);
+        }
+    }
+
+    /// Dobra no acumulador da trait ([`Self::damage`]) o dano que o `Term` registrou desde o último
+    /// `reset_damage`. `Term::damage()` exige `&mut self` enquanto a trait expõe `damaged_rows(&self)`,
+    /// então acumulamos aqui. Chamado por todo caminho que aplica bytes ao grid: [`<Self as
+    /// VtBackend>::advance`] e o flush do teto de synchronized output ([`<Self as
+    /// VtBackend>::flush_sync`]) — o batch liberado também precisa reportar suas linhas sujas.
+    fn accumulate_damage(&mut self) {
+        let rows: Vec<usize> = match self.term.damage() {
+            TermDamage::Full => (0..self.size.rows).collect(),
+            TermDamage::Partial(iter) => iter.map(|line| line.line).collect(),
+        };
+        self.damage.extend(rows);
     }
 
     /// Marca todas as linhas do viewport como danificadas (usado em resize).
@@ -530,15 +582,9 @@ impl VtBackend for AlacrittyBackend {
             self.parser.advance(&mut self.term, bytes);
         }
 
-        // Acumula as linhas danificadas por este `advance`. `Term::damage()`
-        // devolve o dano acumulado desde o último `Term::reset_damage`; só
-        // chamamos `reset_damage` no nosso próprio `reset_damage`, então o
-        // acumulador reflete tudo que mudou desde então.
-        let rows: Vec<usize> = match self.term.damage() {
-            TermDamage::Full => (0..self.size.rows).collect(),
-            TermDamage::Partial(iter) => iter.map(|line| line.line).collect(),
-        };
-        self.damage.extend(rows);
+        // Acumula as linhas danificadas por este `advance` (desde o último `reset_damage`, que só
+        // ocorre no nosso próprio `reset_damage` — o acumulador reflete tudo que mudou desde então).
+        self.accumulate_damage();
     }
 
     fn damaged_rows(&self) -> Vec<usize> {
@@ -752,6 +798,37 @@ impl VtBackend for AlacrittyBackend {
 
     fn scrollback_loss_count(&self) -> u64 {
         self.harvest_saturations
+    }
+
+    fn sync_deadline(&self) -> Option<Instant> {
+        // O parser `vte` grava o deadline do batch retido em `StdSyncHandler` ao ver `CSI ? 2026 h`;
+        // expomos esse instante para o reader AGENDAR o flush do teto (~150 ms) sem busy-poll.
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    fn flush_sync(&mut self) -> bool {
+        // Nada retido → no-op idempotente.
+        if self.parser.sync_timeout().sync_timeout().is_none() {
+            return false;
+        }
+        // Com captura ON, medir o histórico ANTES de liberar: o flush aplica o buffer retido de uma
+        // vez e pode rolar linhas para o scrollback — colhê-las (via `harvest_and_trim`) evita que o
+        // caminho do teto vire perda SILENCIOSA do cabo `append-on-scroll` (mesma contabilidade do
+        // `advance_capturing`). Sem captura, esse pré-passo não existe (custo zero).
+        let before = if self.capture {
+            self.grid().history_size()
+        } else {
+            0
+        };
+        // Apresenta o batch atômico AGORA: o `vte` processa o buffer retido e zera o estado de sync
+        // (o `Term` é o `Handler`, como em todo `advance`).
+        self.parser.stop_sync(&mut self.term);
+        if self.capture {
+            self.harvest_and_trim(before);
+        }
+        // O batch liberado mudou o grid: dobra o dano para o reader emitir o delta de tela.
+        self.accumulate_damage();
+        true
     }
 }
 

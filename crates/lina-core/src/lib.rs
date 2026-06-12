@@ -462,6 +462,17 @@ impl PtyHost {
                 .spawn(move || run_reader(reader, shared, config, delta_tx, node, seq))
                 .map_err(|e| PtyHostError::Io(node, e.to_string()))?
         };
+        // F2-0-6: vigia-irmã do teto do synchronized output (detached — encerra sozinha por
+        // `stop`/estado ≤100ms após o terminal sair; o reader segue 100% intocado).
+        {
+            let shared = Arc::clone(&shared);
+            let delta_tx = self.delta_tx.clone();
+            let seq = Arc::clone(&self.seq);
+            thread::Builder::new()
+                .name(format!("lina-sync-watchdog-{node}"))
+                .spawn(move || run_sync_watchdog(shared, delta_tx, node, seq))
+                .map_err(|e| PtyHostError::Io(node, e.to_string()))?;
+        }
 
         self.terminals.insert(
             node,
@@ -667,6 +678,88 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// minúsculas. `"@Dev Backend"` → `"dev backend"`.
 fn normalize_name(s: &str) -> String {
     s.trim().trim_start_matches('@').trim().to_ascii_lowercase()
+}
+
+/// F2-0-6 (costura do teto do synchronized output — spec §4 do RESULTADO): se há um batch
+/// retido cujo deadline venceu, libera-o (apresentação atômica) e emite o `GridDelta`.
+/// Devolve o PRÓXIMO deadline a observar (`Some` = sync ainda pendente; `None` = nenhum).
+/// `bytes: 0` é intencional: o batch já foi contado no `inflight` quando entrou via
+/// `advance` — o teto não lê bytes novos do PTY.
+fn service_sync_ceiling(
+    shared: &TermShared,
+    delta_tx: &Sender<GridDelta>,
+    node: NodeId,
+    seq: &AtomicU64,
+) -> Option<Instant> {
+    let (next_deadline, flushed, rows, scrolled) = {
+        let mut vt = lock(&shared.vt);
+        match vt.sync_deadline() {
+            None => return None,
+            Some(dl) if Instant::now() < dl => return Some(dl),
+            Some(_) => {
+                let flushed = vt.flush_sync();
+                let rows = vt.damaged_rows();
+                vt.reset_damage();
+                let scrolled = vt.take_scrollback();
+                (vt.sync_deadline(), flushed, rows, scrolled)
+            }
+        }
+    };
+    // Persiste o scrollback colhido FORA do lock do vt (mesmo padrão do `flush` — não aninha
+    // vt↔store; em erro de disco a linha fica no cache da cauda e o próximo push re-tenta).
+    if let Some(sink) = &shared.scrollback {
+        if !scrolled.is_empty() {
+            let mut store = lock(&sink.store);
+            for line in scrolled {
+                if let Err(e) = store.push_line(&sink.panel, line) {
+                    tracing::warn!(panel = %sink.panel, error = %e,
+                        "scrollback push (teto sync) falhou; linha fica no cache, re-tenta");
+                }
+            }
+        }
+    }
+    if flushed {
+        let s = seq.fetch_add(1, Ordering::Relaxed);
+        let _ = delta_tx.send(GridDelta {
+            node,
+            rows,
+            bytes: 0,
+            seq: s,
+        });
+    }
+    next_deadline
+}
+
+/// F2-0-6: vigia do teto do synchronized output — DECISÃO DE COSTURA (desvio documentado da
+/// spec §4b): em vez de des-bloquear o `read` do PTY (exigiria plumbar o fd cru por 3 crates),
+/// uma thread-irmã por terminal serve o teto. O leitor fica INTOCADO (zero risco ao hot path).
+/// Cadência: dorme até o deadline exato quando há sync pendente; cochilo grosso (100ms) quando
+/// não há. Custo: 1 lock + 1 match por wake. Consequência honesta: um sync aberto pode ser
+/// detectado até ~100ms tarde → teto efetivo ≤ ~250ms no pior caso — aceitável: o teto é
+/// anti-travamento (CLI que esqueceu o ESU), não precisão de apresentação.
+fn run_sync_watchdog(
+    shared: Arc<TermShared>,
+    delta_tx: Sender<GridDelta>,
+    node: NodeId,
+    seq: Arc<AtomicU64>,
+) {
+    const IDLE_NAP: Duration = Duration::from_millis(100);
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if !matches!(*lock(&shared.state), TerminalState::Running) {
+            break;
+        }
+        let nap = match service_sync_ceiling(&shared, &delta_tx, node, &seq) {
+            Some(dl) => dl
+                .saturating_duration_since(Instant::now())
+                .min(IDLE_NAP)
+                .max(Duration::from_millis(1)),
+            None => IDLE_NAP,
+        };
+        thread::sleep(nap);
+    }
 }
 
 /// Wrapper da thread de leitura: roda o loop dentro de `catch_unwind` e marca o
