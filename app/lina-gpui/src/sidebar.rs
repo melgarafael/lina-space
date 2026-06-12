@@ -127,6 +127,40 @@ pub fn rail_key_route(expanded: bool, kbd: bool, key: &str, platform: bool) -> R
 /// Subtexto leigo do `[ Arquivar ]` (r5 BUG 2) — honesto sobre o que acontece.
 pub const COPY_M8_ARCHIVE_HINT: &str = "some da lista; nada é apagado do disco";
 
+// ═══════════════ r5 (unload-ui) — Descarregar Espaço de fundo ═══════════════
+
+/// Rótulo da ação de linha (curto; a explicação viaja no hint/aria).
+pub const COPY_M8_UNLOAD: &str = "Descarregar";
+/// Explicação leiga (aria/tooltip) — honesta: só os OCIOSOS desligam, e religam.
+pub const COPY_M8_UNLOAD_HINT: &str =
+    "desliga os terminais ociosos deste Espaço — religam quando você voltar";
+
+/// A ação Descarregar aparece nesta linha? Regra (despacho r5): só Espaço de FUNDO
+/// (`row.focused` = ativo desta janela ⇒ nunca) e só com o seam do executor PLUGADO
+/// (sem mecanismo, sem botão — tela nunca mente).
+#[must_use]
+pub fn row_can_unload(row_is_active: bool, seam_wired: bool) -> bool {
+    seam_wired && !row_is_active
+}
+
+/// Narração pós-Descarregar (live-region + visual), dos números REAIS do
+/// `UnloadPlan` do core: `parked` desligados, `kept` preservados porque trabalhavam.
+#[must_use]
+pub fn copy_unload_narration(parked: usize, kept: usize) -> String {
+    let off = match parked {
+        0 => "nenhum terminal precisou desligar".to_string(),
+        1 => "1 terminal ocioso desligado — religa quando você voltar".to_string(),
+        n => format!("{n} terminais ociosos desligados — religam quando você voltar"),
+    };
+    match kept {
+        0 => format!("Espaço descarregado: {off}."),
+        1 => format!("Espaço descarregado: 1 agente segue trabalhando e ficou ligado; {off}."),
+        n => {
+            format!("Espaço descarregado: {n} agentes seguem trabalhando e ficaram ligados; {off}.")
+        }
+    }
+}
+
 /// Estado headless do toast «Espaço arquivado · [ Desfazer ] (Ns)» — quem grava o evento
 /// no timeout e remonta as linhas é a fiação do shell (main.rs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +681,11 @@ pub struct Sidebar {
     /// `[ Renomear ]` por mouse — o shell normalmente chama `state.start_rename()`
     /// (ADITIVO: clique precisa de UM despacho, e o componente não se auto-muta).
     pub on_rename_begin: RowCallback,
+    /// r5 (unload-ui): `[ Descarregar ]` numa linha de Espaço de FUNDO — o MECANISMO
+    /// (estacionar PTYs ociosos via `lina_core::suspend::unload_plan`) é do seam do
+    /// Core A2A; aqui só o render. **`None` = seam ainda não plugado ⇒ a ação NÃO
+    /// aparece** (botão que não faz nada é tela que mente). Setado via [`Self::set_on_unload`].
+    pub on_unload: Option<RowCallback>,
 }
 
 /// Cor do ● a partir do token SEMÂNTICO do estado (mesmo mapa do dashboard no shell —
@@ -684,7 +723,15 @@ impl Sidebar {
             on_toggle,
             on_archived,
             on_rename_begin,
+            on_unload: None,
         }
+    }
+
+    /// Pluga o seam do Descarregar (Core A2A) — a partir daqui a ação aparece nas
+    /// linhas de Espaço de fundo. Separado do `new` de propósito: a UI nasceu antes
+    /// do mecanismo e o botão só existe quando há executor de verdade.
+    pub fn set_on_unload(&mut self, cb: RowCallback) {
+        self.on_unload = Some(cb);
     }
 
     /// Render do rail — colapsado (ícones) ou expandido (busca + linhas + rodapé).
@@ -1091,6 +1138,28 @@ impl Sidebar {
                         }))
                         .child(text!(COPY_M8_ARCHIVE)),
                 );
+            // r5 (unload-ui): Descarregar — SÓ Espaço de FUNDO e SÓ com o seam do
+            // executor plugado (`row_can_unload`); o mecanismo é do Core A2A.
+            if row_can_unload(row.focused, self.on_unload.is_some()) {
+                if let Some(unload) = self.on_unload.clone() {
+                    let root_un = row.ws_root.clone();
+                    line = line.child(
+                        div()
+                            .id(("sb-unload", row_idx))
+                            .px_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .role(Role::Button)
+                            .aria_label(format!("{COPY_M8_UNLOAD} — {COPY_M8_UNLOAD_HINT}"))
+                            .text_size(px(10.0))
+                            .text_color(rgb(th.text.muted))
+                            .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
+                                unload(v, &root_un, w, cx)
+                            }))
+                            .child(text!(COPY_M8_UNLOAD)),
+                    );
+                }
+            }
             // Subtexto leigo na linha sob o roving (onde o olho está ao navegar por
             // teclado) — nas demais o aria/tooltip carrega a explicação.
             if is_roving {
@@ -1650,6 +1719,48 @@ mod tests {
             st.renaming.as_deref(),
             Some("Espaço 3"),
             "renomeia a CLICADA"
+        );
+    }
+
+    /// r5 (unload-ui): a ação Descarregar SÓ existe em Espaço de FUNDO e SÓ com o seam
+    /// do executor plugado — Espaço ativo nunca a mostra; seam ausente = botão ausente
+    /// (tela nunca mente). Não-vacuoso: remover qualquer um dos dois guardas falha aqui.
+    #[test]
+    fn unload_action_only_on_background_rows_with_seam_wired() {
+        assert!(row_can_unload(false, true), "fundo + seam = aparece");
+        assert!(!row_can_unload(true, true), "Espaço ATIVO nunca mostra");
+        assert!(!row_can_unload(false, false), "sem executor, sem botão");
+        assert!(!row_can_unload(true, false));
+    }
+
+    /// r5 (unload-ui): a narração vem dos números REAIS do plano — quem segue
+    /// trabalhando fica LIGADO e é dito; ociosos desligam "e religam quando você
+    /// voltar"; plural/singular honestos.
+    #[test]
+    fn unload_narration_tells_kept_and_parked_counts() {
+        let s = copy_unload_narration(3, 2);
+        assert!(
+            s.contains("2 agentes seguem trabalhando e ficaram ligados"),
+            "{s}"
+        );
+        assert!(s.contains("3 terminais ociosos desligados"), "{s}");
+        assert!(s.contains("religam quando você voltar"), "{s}");
+
+        let s1 = copy_unload_narration(1, 1);
+        assert!(
+            s1.contains("1 agente segue trabalhando e ficou ligado"),
+            "{s1}"
+        );
+        assert!(s1.contains("1 terminal ocioso desligado"), "{s1}");
+
+        let s0 = copy_unload_narration(0, 3);
+        assert!(s0.contains("3 agentes seguem trabalhando"), "{s0}");
+        assert!(s0.contains("nenhum terminal precisou desligar"), "{s0}");
+
+        let all_idle = copy_unload_narration(4, 0);
+        assert!(
+            !all_idle.contains("seguem trabalhando"),
+            "sem kept, não inventa agente trabalhando: {all_idle}"
         );
     }
 
