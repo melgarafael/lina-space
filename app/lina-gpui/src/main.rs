@@ -34,6 +34,10 @@ mod runtime;
 mod gallery;
 // W4-6: acessibilidade (AccessibleBuffer sem ANSI, live-region "resposta pronta", WCAG, reduce-motion).
 mod a11y;
+// F2-2-2 (ADR 0028): o live-region (custom Element) foi PROMOVIDO de spike a produção — saiu do
+// `#[path] pub mod live` do a11y.rs para `mod a11y_live;` no crate root. Consumidores (toast/badge
+// do E, a11y.rs::live_region_element) usam `crate::a11y_live::*`. Registro é do dono do main.rs.
+mod a11y_live;
 // W4-2 · P4: inspetor do nó selecionado (nome/papel/activity/perfil/status) — gpui-free, testável.
 mod inspector;
 // W4-2 · M3/M4: criadores de NOTA e PASTA (apenda Note/FolderCreated + persiste em .lina/) — gpui-free, testável.
@@ -2157,9 +2161,11 @@ impl WorkspaceView {
             .flex_col()
             .gap_2()
             .p_3()
+            // Fusão: painel de chrome em IBM Plex Sans, escala de token (cascateia aos filhos).
+            .font_family(th.typography.family.ui)
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(f32::from(th.typography.size.body)))
                     .text_color(rgb(th.text.primary))
                     .child("Atividade e custos do time"),
             )
@@ -2168,13 +2174,13 @@ impl WorkspaceView {
                 // (inclui a parcela ADOTADA fora da pasta do Espaço, rotulada).
                 div()
                     .id("dash-total")
-                    .text_size(px(15.))
+                    .text_size(px(f32::from(th.typography.size.subtitle)))
                     .text_color(rgb(th.text.primary))
                     .child(format!("Hoje: {}", total.line.text)),
             )
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(px(f32::from(th.typography.size.caption)))
                     .text_color(rgb(th.text.muted))
                     .child(format!(
                         "motor: {} · {}",
@@ -2214,7 +2220,7 @@ impl WorkspaceView {
             let mut name_line = div().flex().flex_row().items_center().gap_2().child(
                 div()
                     .flex_1()
-                    .text_size(px(12.))
+                    .text_size(px(f32::from(th.typography.size.body)))
                     .text_color(rgb(th.text.primary))
                     .child(format!("{}  ● {}", row.name, row.state.label())),
             );
@@ -2225,7 +2231,7 @@ impl WorkspaceView {
                         .px_2()
                         .rounded_md()
                         .bg(rgb(th.surface.raised))
-                        .text_size(px(11.))
+                        .text_size(px(f32::from(th.typography.size.small)))
                         .text_color(rgb(th.accent.primary))
                         .cursor_pointer()
                         .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
@@ -2245,13 +2251,13 @@ impl WorkspaceView {
                     .child(name_line)
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(f32::from(th.typography.size.small)))
                             .text_color(rgb(cost_color))
                             .child(cost_text),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(f32::from(th.typography.size.small)))
                             .text_color(rgb(color))
                             .child(row.activity),
                     ),
@@ -3594,17 +3600,34 @@ impl Render for WorkspaceView {
             panels_drawn += 1; // W5-1: passou da guarda de suspenso → este painel é DESENHADO.
             let (sx, sy) = cam.world_to_screen((nv.x, nv.y));
             let z = cam.zoom;
-            // Foco = token `focus.ring` (≥3:1 nos 2 temas — gate F1-2-1; F1-2-6 reusa no teclado).
-            let card_border = if node_id == focused {
+            // OP-1 (fusão T1+T3, §VIII): "precisa de você" é o sinal MAIS forte — um gate de
+            // custódia pendente para este nó VENCE o status e veste o vermelho do acionável (a cor do
+            // INDICADOR é a cor do PEDIDO). Computado aqui (antes do dot/borda) para a cor semântica.
+            let needs_human = lock(&self.desk)
+                .queue
+                .iter()
+                .any(|p| p.requester() == nv.name);
+            // Borda SEMÂNTICA: precisa-de-você → `danger` (o card inteiro pede você, mesmo na
+            // periferia — fusão "o que precisa de você salta"); senão foco → `focus.ring`; senão
+            // neutra. (Tokens ≥3:1 nos 2 temas — gate F1-2-1; F1-2-6 reusa no teclado.)
+            let card_border = if needs_human {
+                rgb(th.state.danger)
+            } else if node_id == focused {
                 rgb(th.focus.ring)
             } else {
                 rgb(th.surface.border)
             };
-            let status_dot = match nv.status {
-                NodeStatus::Idle => rgb(th.state.success),
-                NodeStatus::Busy | NodeStatus::Running => rgb(th.state.warning),
-                NodeStatus::Crashed | NodeStatus::Dead => rgb(th.state.danger),
-                _ => rgb(th.accent.primary),
+            // Indicador pela cor SEMÂNTICA FIXA da fusão (OP-1): vermelho=precisa-de-você ·
+            // âmbar=trabalhando · verde=pronto · vermelho=encerrado. Universal no app inteiro.
+            let status_dot = if needs_human {
+                rgb(th.state.danger)
+            } else {
+                match nv.status {
+                    NodeStatus::Idle => rgb(th.state.success),
+                    NodeStatus::Busy | NodeStatus::Running => rgb(th.state.warning),
+                    NodeStatus::Crashed | NodeStatus::Dead => rgb(th.state.danger),
+                    _ => rgb(th.accent.primary),
+                }
             };
 
             let mut title = div()
@@ -3616,7 +3639,9 @@ impl Render for WorkspaceView {
                 .px_3()
                 .py_2()
                 .bg(rgb(th.surface.panel))
-                .text_size(px(13.0 * z))
+                // Fusão: chrome em IBM Plex Sans (cascateia aos chips-filho) na escala de token.
+                .font_family(th.typography.family.ui)
+                .text_size(px(f32::from(th.typography.size.body) * z))
                 .text_color(rgb(th.accent.primary))
                 .child(div().size(px(9.0 * z)).rounded_full().bg(status_dot))
                 .child(text!(nv.name.clone()))
@@ -3651,7 +3676,7 @@ impl Render for WorkspaceView {
                         .bg(rgb(auto_bg))
                         .border_1()
                         .border_color(rgb(th.surface.border))
-                        .text_size(px(10.0 * z))
+                        .text_size(px(f32::from(th.typography.size.caption) * z))
                         .text_color(rgb(auto_fg))
                         .cursor_pointer()
                         .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
@@ -3665,7 +3690,7 @@ impl Render for WorkspaceView {
                         .px_2()
                         .rounded_md()
                         .bg(rgb(th.surface.raised))
-                        .text_size(px(11.0 * z))
+                        .text_size(px(f32::from(th.typography.size.small) * z))
                         .text_color(rgb(th.accent.primary))
                         .cursor_pointer()
                         .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, cx| {
@@ -3682,7 +3707,7 @@ impl Render for WorkspaceView {
                         .px_2()
                         .rounded_md()
                         .bg(rgb(th.surface.raised))
-                        .text_size(px(10.0 * z))
+                        .text_size(px(f32::from(th.typography.size.caption) * z))
                         .text_color(rgb(th.state.warning))
                         .child(text!("⚠ sem doutrina/observabilidade")),
                 );
@@ -3698,7 +3723,7 @@ impl Render for WorkspaceView {
                         .px_2()
                         .rounded_md()
                         .bg(rgb(th.surface.raised))
-                        .text_size(px(10.0 * z))
+                        .text_size(px(f32::from(th.typography.size.caption) * z))
                         .text_color(rgb(th.text.muted))
                         .child(text!("vários agentes nesta pasta")),
                 );
@@ -3746,11 +3771,7 @@ impl Render for WorkspaceView {
                 ));
             }
 
-            // W4-6 a11y: "precisa de você" anunciável — há um gate de custódia pendente p/ este nó?
-            let needs_human = lock(&self.desk)
-                .queue
-                .iter()
-                .any(|p| p.requester() == nv.name);
+            // W4-6 a11y: "precisa de você" anunciável reusa o `needs_human` JÁ computado (OP-1, acima).
             // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
             let mut body = div()
                 .id(("grid", card_eid))
@@ -3799,17 +3820,23 @@ impl Render for WorkspaceView {
                         .justify_center()
                         .gap_2()
                         .size_full()
-                        .child(div().text_size(px(40.0 * z)).child(text!(icon)))
+                        // Card-artefato (nota/pasta) em IBM Plex Sans, escala de token (cascateia).
+                        .font_family(th.typography.family.ui)
+                        .child(
+                            div()
+                                .text_size(px(f32::from(th.typography.size.display) * z))
+                                .child(text!(icon)),
+                        )
                         .child(
                             div()
                                 .text_color(rgb(th.text.primary))
-                                .text_size(px(15.0 * z))
+                                .text_size(px(f32::from(th.typography.size.subtitle) * z))
                                 .child(text!(nv.name.clone())),
                         )
                         .child(
                             div()
                                 .text_color(rgb(th.text.muted))
-                                .text_size(px(11.0 * z))
+                                .text_size(px(f32::from(th.typography.size.small) * z))
                                 .child(text!(what)),
                         ),
                 );
@@ -4543,17 +4570,27 @@ fn empty_canvas_hint() -> impl IntoElement {
         .items_center()
         .justify_center()
         .gap_3()
-        .child(div().text_size(px(44.0)).child(text!("✨")))
         .child(
             div()
-                .text_size(px(20.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(th.text.primary))
+                .font_family(th.typography.family.display)
+                .text_size(px(f32::from(th.typography.size.display)))
+                .child(text!("✨")),
+        )
+        .child(
+            // MOMENTO da fusão (directive #4): Fraunces no acolhimento — a 1ª vez que o fundador vê
+            // o Espaço pronto. Fraunces é a "decoração" autorizada: UMA aparição, no momento, não no corpo.
+            div()
+                .font_family(th.typography.family.display)
+                .text_size(px(f32::from(th.typography.size.heading)))
+                .font_weight(FontWeight(f32::from(th.typography.weight.semibold)))
+                .text_color(rgb(th.text.bright))
                 .child(text!("Seu Espaço está pronto")),
         )
         .child(
+            // Instrução = UI em IBM Plex Sans (Fraunces só no momento, nunca em rótulo recorrente).
             div()
-                .text_size(px(15.0))
+                .font_family(th.typography.family.ui)
+                .text_size(px(f32::from(th.typography.size.subtitle)))
                 .text_color(rgb(th.text.secondary))
                 .child(text!("Pressione ⌘N para criar seu primeiro agente")),
         )

@@ -28,11 +28,9 @@ use lina_host::{NodeId, NodeStatus};
 
 use crate::canvas::aggregate_badge;
 
-/// SPIKE F1-2-7 (caminho (a) do ADR 0028): live-region via custom `Element` com `set_live`.
-/// O registro do módulo vive AQUI (e não em `main.rs`, dono único de outro worker nesta
-/// rodada) via `#[path]` — promover para `mod a11y_live;` no crate root é costura futura.
-#[path = "a11y_live.rs"]
-pub mod live;
+// F2-2-2: o live-region (ADR 0028) foi PROMOVIDO de spike a produção e do `#[path] pub mod live`
+// daqui para `mod a11y_live;` no crate root (`main.rs`) — o registro agora é do dono do `main.rs`.
+// Consumidores usam `crate::a11y_live::*`; o wrapper [`live_region_element`] abaixo permanece.
 
 // ═══════════════════════════ AccessibleBuffer (W0-2: linearização sem ANSI) ═══════════════════════════
 
@@ -216,7 +214,7 @@ pub fn reduce_motion_effective(user_override: bool) -> bool {
 /// roteiro `tasks/epico-f1/spike-a11y-roteiro.md`. NÃO afirmar "conforme ARIA live-region" até a
 /// tela confirmar. O que já era fato segue: nó **legível ao FOCAR** e VISÍVEL na tela (banner).
 pub fn live_region_element(msg: &str) -> AnyElement {
-    live::live_announce(msg).into_any_element()
+    crate::a11y_live::live_announce(msg).into_any_element()
 }
 
 #[cfg(test)]

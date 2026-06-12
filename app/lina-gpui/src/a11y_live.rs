@@ -1,4 +1,5 @@
-//! `a11y_live` — **SPIKE F1-2-7, caminho (a) do ADR 0028: live-region via custom `Element`**.
+//! `a11y_live` — **live-region de PRODUÇÃO (ADR 0028), via custom `Element`** (promovido do spike
+//! F1-2-7 na F2-2-2; agora `mod a11y_live;` no crate root, consumido por toast/badge/banner).
 //!
 //! O gpui do SHA pinado (`09165c1`) NUNCA chama `set_live` ao montar a árvore AccessKit
 //! (13.15 achado 2: `Interactivity::write_a11y_info` seta 18 campos `aria_*`, nenhum `live`),
@@ -26,60 +27,117 @@
 
 use gpui::accesskit::{Live, Node as A11yNode, Role as A11yRole};
 use gpui::{
-    div, text, App, Bounds, Div, DivFrameState, Element, ElementId, GlobalElementId, Hitbox,
-    InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Styled, Window,
+    div, text, App, Bounds, Div, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, ParentElement, Pixels, Styled, Window,
 };
 
 use crate::theme;
 
+/// **Cortesia do anúncio** (F2-2-2 / ADR 0028). `Polite` não interrompe a fala corrente — o
+/// default de quase tudo (toast informativo, badge que mudou de cor). `Assertive` interrompe — RESERVADO
+/// a "precisa de você AGORA" (gate humano, erro que trava o fluxo); usar à toa treina o usuário a
+/// ignorar o leitor de tela. Mapeia para o `Live` do AccessKit e para o `Role` honesto do nó.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Politeness {
+    /// Não interrompe — enfileira atrás da fala atual (`Live::Polite`, `Role::Status`).
+    Polite,
+    /// Interrompe — só para o que exige ação imediata (`Live::Assertive`, `Role::Alert`).
+    Assertive,
+}
+
+impl Politeness {
+    #[must_use]
+    fn live(self) -> Live {
+        match self {
+            Politeness::Polite => Live::Polite,
+            Politeness::Assertive => Live::Assertive,
+        }
+    }
+
+    /// O `Role` honesto: `Status` (polite) vs `Alert` (assertive) — o adapter trata os dois como
+    /// live-region, mas o role correto preserva a semântica para outras tecnologias assistivas.
+    #[must_use]
+    fn role(self) -> A11yRole {
+        match self {
+            Politeness::Polite => A11yRole::Status,
+            Politeness::Assertive => A11yRole::Alert,
+        }
+    }
+}
+
 /// Escreve no nó AccessKit as propriedades que fazem o auto-anúncio acontecer. Função PURA
 /// e separada do [`Element`] de propósito (lição a11y do repo: testar a lógica do NÓ, não o
-/// `TreeUpdate`): `live=Polite` (cortês: não interrompe a fala corrente), `value` (o TEXTO que
-/// o adapter anuncia — `event.rs:37`) e `label` (identidade do nó ao FOCAR, comportamento que
-/// o banner já tinha via `aria_label`).
-pub fn write_live_node_props(node: &mut A11yNode, msg: &str) {
-    node.set_live(Live::Polite);
+/// `TreeUpdate`): `live` (cortesia — ver [`Politeness`]), `value` (o TEXTO que o adapter anuncia —
+/// `event.rs:37`) e `label` (identidade do nó ao FOCAR, comportamento que o banner já tinha via
+/// `aria_label`).
+pub fn write_live_node_props(node: &mut A11yNode, msg: &str, politeness: Politeness) {
+    node.set_live(politeness.live());
     node.set_value(msg);
     node.set_label(msg);
 }
 
-/// O banner "resposta pronta" como **live-region de verdade**: visual idêntico ao do W4-6
-/// (pílula `🔊 msg` verde/painel) + nó AccessKit com `live=Polite` que o `div()` builtin não
-/// consegue produzir. O `Div` interno é PURAMENTE visual (sem id/role/aria_label) — o nó a11y
-/// é do wrapper, evitando um nó `Status` duplicado na árvore.
-pub struct LiveAnnounce {
+/// **Live-region de PRODUÇÃO (F2-2-2 / ADR 0028).** A promoção do spike: antes o `Element` custom
+/// envolvia SÓ a pílula do banner; agora envolve QUALQUER elemento (`child: El`), de modo que toast,
+/// badge e banner **nascem compondo** o nó auto-anunciável (retrofit proibido). O `child` é
+/// PURAMENTE visual (sem id/role/aria próprio do nó vivo); a identidade a11y é DESTE wrapper, com um
+/// `id` ÚNICO por instância — banner + N toasts + badges coexistem sem colidir na árvore.
+pub struct LiveRegion<El> {
+    id: ElementId,
     msg: String,
-    div: Div,
+    politeness: Politeness,
+    child: El,
 }
 
-/// Constrói o elemento de anúncio. `msg` cru vai para o nó a11y (value+label); o emoji 🔊 é
-/// só visual (o leitor de tela não deve falar "alto-falante" antes de cada anúncio).
+/// Envolve `child` num live-region. `id` ÚNICO por instância viva (colisão de id colapsa nós na
+/// árvore a11y). `msg` é o texto cru que o adapter anuncia (`value`); `politeness` escolhe se
+/// interrompe. Use isto para tornar QUALQUER componente acessível por construção.
 #[must_use]
-pub fn live_announce(msg: &str) -> LiveAnnounce {
+pub fn live_region<El: IntoElement>(
+    id: impl Into<ElementId>,
+    msg: impl Into<String>,
+    politeness: Politeness,
+    child: El,
+) -> LiveRegion<El::Element> {
+    LiveRegion {
+        id: id.into(),
+        msg: msg.into(),
+        politeness,
+        child: child.into_element(),
+    }
+}
+
+/// **Anúncio standalone** (a API limpa do despacho: `announce(texto, cortesia)`) — a pílula `🔊 msg`
+/// do banner W4-6 como live-region de verdade. `msg` cru vai ao nó (value+label); o emoji 🔊 é só
+/// visual (o leitor não deve falar "alto-falante" antes de cada anúncio). Id estável singleton.
+#[must_use]
+pub fn announce(msg: &str, politeness: Politeness) -> LiveRegion<Div> {
     let th = theme::active();
-    let div = div()
+    let pill = div()
         .px_3()
         .py_1()
         .rounded_md()
         .bg(gpui::rgb(th.surface.panel))
         .text_color(gpui::rgb(th.state.success))
         .child(text!(format!("🔊 {msg}")));
-    LiveAnnounce {
-        msg: msg.to_string(),
-        div,
-    }
+    live_region(ElementId::Name("a11y-live".into()), msg, politeness, pill)
 }
 
-impl Element for LiveAnnounce {
-    // Delegação total de layout/pintura ao `Div` interno (padrão `WithRemSize` do zed:
-    // `crates/ui/src/utils/with_rem_size.rs`) — os estados são os do `Div`.
-    type RequestLayoutState = DivFrameState;
-    type PrepaintState = Option<Hitbox>;
+/// Back-compat (W4-6 / `a11y.rs`): anúncio cortês do banner. Açúcar para [`announce`] com [`Politeness::Polite`].
+#[must_use]
+pub fn live_announce(msg: &str) -> LiveRegion<Div> {
+    announce(msg, Politeness::Polite)
+}
+
+impl<El: Element> Element for LiveRegion<El> {
+    // Delegação total de layout/pintura ao `child` (padrão `WithRemSize` do zed:
+    // `crates/ui/src/utils/with_rem_size.rs`) — os estados são os do elemento envolvido.
+    type RequestLayoutState = El::RequestLayoutState;
+    type PrepaintState = El::PrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         // SEM id o gpui exclui o elemento da árvore a11y (`Drawable::prepaint` exige
-        // `GlobalElementId` antes de chamar `write_a11y_info`). Reusa o id estável do banner.
-        Some(ElementId::Name("a11y-live".into()))
+        // `GlobalElementId` antes de chamar `write_a11y_info`).
+        Some(self.id.clone())
     }
 
     fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
@@ -87,13 +145,13 @@ impl Element for LiveAnnounce {
     }
 
     fn a11y_role(&self) -> Option<A11yRole> {
-        // `Status` é o role honesto de um anúncio de estado (o mesmo do banner W4-6).
-        Some(A11yRole::Status)
+        // Role honesto conforme a cortesia: `Status` (polite) vs `Alert` (assertive).
+        Some(self.politeness.role())
     }
 
     fn write_a11y_info(&self, node: &mut A11yNode) {
         // O coração do spike: o que o gpui não seta, o Element custom seta.
-        write_live_node_props(node, &self.msg);
+        write_live_node_props(node, &self.msg, self.politeness);
     }
 
     fn request_layout(
@@ -103,7 +161,7 @@ impl Element for LiveAnnounce {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        self.div.request_layout(id, inspector_id, window, cx)
+        self.child.request_layout(id, inspector_id, window, cx)
     }
 
     fn prepaint(
@@ -115,7 +173,7 @@ impl Element for LiveAnnounce {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.div
+        self.child
             .prepaint(id, inspector_id, bounds, request_layout, window, cx)
     }
 
@@ -129,7 +187,7 @@ impl Element for LiveAnnounce {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.div.paint(
+        self.child.paint(
             id,
             inspector_id,
             bounds,
@@ -141,7 +199,7 @@ impl Element for LiveAnnounce {
     }
 }
 
-impl IntoElement for LiveAnnounce {
+impl<El: Element> IntoElement for LiveRegion<El> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -158,7 +216,7 @@ mod tests {
     #[test]
     fn node_is_polite_live_region() {
         let mut node = A11yNode::new(A11yRole::Status);
-        write_live_node_props(&mut node, "A: resposta pronta");
+        write_live_node_props(&mut node, "A: resposta pronta", Politeness::Polite);
         assert_eq!(
             node.live(),
             Some(Live::Polite),
@@ -166,12 +224,41 @@ mod tests {
         );
     }
 
+    /// F2-2-2: `Assertive` mapeia para `Live::Assertive` (interrompe) + `Role::Alert` — reservado a
+    /// "precisa de você". A cortesia errada treina o usuário a ignorar o leitor; o teste trava o mapa.
+    #[test]
+    fn assertive_interrupts_and_is_alert_role() {
+        let mut node = A11yNode::new(A11yRole::Alert);
+        write_live_node_props(&mut node, "Aprovação necessária", Politeness::Assertive);
+        assert_eq!(node.live(), Some(Live::Assertive), "assertive interrompe");
+        assert_eq!(Politeness::Assertive.role(), A11yRole::Alert);
+        assert_eq!(Politeness::Polite.role(), A11yRole::Status);
+    }
+
+    /// O wrapper genérico torna QUALQUER elemento acessível por construção (ADR 0028): id próprio,
+    /// role conforme a cortesia, e o nó carrega o value/label da mensagem.
+    #[test]
+    fn live_region_wraps_any_child_with_its_own_node() {
+        let el = live_region(
+            ElementId::Name("toast-1".into()),
+            "Espaço arquivado",
+            Politeness::Polite,
+            div().child(text!("conteúdo visual qualquer")),
+        );
+        assert!(el.id().is_some(), "id próprio por instância (sem colisão)");
+        assert_eq!(el.a11y_role(), Some(A11yRole::Status));
+        let mut node = A11yNode::new(A11yRole::Status);
+        el.write_a11y_info(&mut node);
+        assert_eq!(node.value(), Some("Espaço arquivado"));
+        assert_eq!(node.live(), Some(Live::Polite));
+    }
+
     /// Contrato do adapter macOS (`event.rs:35-44` + guard `value().is_some()`): o anúncio fala
     /// `node.value()` — um nó live só com `label` é ignorado em silêncio. value E label honestos.
     #[test]
     fn announcement_text_lives_in_value_and_label_is_honest() {
         let mut node = A11yNode::new(A11yRole::Status);
-        write_live_node_props(&mut node, "A: resposta pronta");
+        write_live_node_props(&mut node, "A: resposta pronta", Politeness::Polite);
         assert_eq!(
             node.value(),
             Some("A: resposta pronta"),

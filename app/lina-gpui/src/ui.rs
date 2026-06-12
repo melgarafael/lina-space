@@ -22,15 +22,24 @@ use gpui::{App, ClickEvent, Window};
 /// Context<V>)` para este tipo — por isso o mesmo componente serve qualquer view sem genéricos.
 pub type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
+mod badge;
 mod button;
 mod input;
 mod modal;
 mod panel;
+mod toast;
 
 // Re-export glob: a API do catálogo é consumida INCREMENTALMENTE (r4 + F2-2-2..6); o glob expõe a
 // superfície pública sem disparar `unused_imports` por item ainda-não-consumido (idioma de módulo-
 // biblioteca). O `#![allow(dead_code)]` acima cobre os itens definidos ainda sem consumidor.
+// F2-2-2: `badge`/`toast` ainda SEM consumidor (a migração por call-site — attention_ui/cards — é
+// fronteira do C nesta rodada). O glob de um módulo 100% não-consumido dispara `unused_imports`
+// (diferente de button/panel, já consumidos); o allow cai quando C aterrissar o 1º call-site.
+#[allow(unused_imports)]
+pub use badge::*;
 pub use button::*;
 pub use input::*;
 pub use modal::*;
 pub use panel::*;
+#[allow(unused_imports)]
+pub use toast::*;

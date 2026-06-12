@@ -10,8 +10,8 @@
 use lina_host::NodeStatus;
 
 /// F1-2-6: focus manager do canvas (widget composto + roving tabindex). O registro do módulo
-/// vive AQUI (e não em `main.rs`, do time EXTERNO nesta rodada) via `#[path]` — promover para
-/// `mod canvas_focus;` no crate root é costura futura (mesmo padrão do `a11y::live`).
+/// vive AQUI via `#[path]` — promover para `mod canvas_focus;` no crate root é costura futura
+/// (mesmo caminho que o `a11y_live` já trilhou na F2-2-2: de `#[path]` a `mod` no crate root).
 #[path = "canvas_focus.rs"]
 pub mod focus;
 
