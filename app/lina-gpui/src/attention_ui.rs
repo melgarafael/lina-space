@@ -771,7 +771,7 @@ pub fn render_panel(
             row = row.child(
                 div()
                     .id(("att-detail", i64id))
-                    .font_family("Menlo")
+                    .font_family(th.typography.family.mono)
                     .text_size(px(11.0))
                     .text_color(rgb(th.text.secondary))
                     .overflow_hidden()

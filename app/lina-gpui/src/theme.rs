@@ -44,8 +44,12 @@
 //! - **JetBrains Mono** (OFL, repo `JetBrains/JetBrainsMono`, estáticos completos): Regular 400 ·
 //!   Bold 700 (o bold ANSI do grid).
 //!
-//! O empacotamento físico no .app (embedding via `add_fonts`) é story posterior; até lá o consumo
-//! resolve pelo sistema (fallback do font-kit se ausente — o token já nomeia a família certa).
+//! **Embarcadas no binário (F2-1-1b):** os 7 estáticos OFL vivem em `assets/fonts/<família>/`
+//! (LICENSE junto, exigência OFL) e entram via [`embedded_fonts`] → `text_system().add_fonts`
+//! no boot (modelo do Zed) — zero dependência das fontes da máquina do usuário. A família
+//! display é **"Fraunces 72pt"**: é o NOME INTERNO da instância estática de opsz alto
+//! (name ID 16), e a OFL reserva "Fraunces" (renomear a tabela = versão modificada sem direito
+//! ao nome reservado). O token nomeia o que o arquivo declara — senão a fonte nunca resolve.
 //!
 //! **Terminal é superfície escura nos 2 temas** (decisão de curadoria): o conteúdo do grid vem do CLI
 //! via ANSI e assume fundo escuro; tematizar o conteúdo além de BG/cursor padrão está fora do escopo
@@ -340,7 +344,8 @@ pub struct TerminalTokens {
 pub struct FontFamilyTokens {
     /// UI/chrome (IBM Plex Sans — humanista-técnica com calor, pt-br impecável; D1 §II-T1).
     pub ui: &'static str,
-    /// Momentos display (Fraunces — onboarding, conclusões; NUNCA corpo de UI).
+    /// Momentos display (Fraunces em opsz alto — onboarding, conclusões; NUNCA corpo de UI).
+    /// O nome é o da instância estática embarcada ("Fraunces 72pt" — ver doc do módulo).
     pub display: &'static str,
     /// Grid do terminal e código (JetBrains Mono — selada pelo ADR 0019 §7).
     pub mono: &'static str,
@@ -393,7 +398,7 @@ impl TypographyTokens {
     pub const CANONICAL: Self = Self {
         family: FontFamilyTokens {
             ui: "IBM Plex Sans",
-            display: "Fraunces",
+            display: "Fraunces 72pt",
             mono: "JetBrains Mono",
         },
         size: TypeScaleTokens {
@@ -688,6 +693,62 @@ fn parse_hex_rgb(s: &str) -> Option<u32> {
     }
     u32::from_str_radix(hex, 16).ok()
 }
+
+// ═══════════════════ fontes embarcadas (F2-1-1b — a voz viaja com o binário) ═══════════════════
+
+/// Os bytes dos 7 estáticos OFL embarcados (ver doc do módulo). O boot entrega DIRETO ao
+/// `text_system().add_fonts` (costura) — `Cow::Borrowed` de `include_bytes!`: zero cópia, zero
+/// I/O, zero dependência da máquina do usuário. As licenças OFL acompanham os arquivos em
+/// `assets/fonts/<família>/` (exigência da licença).
+#[must_use]
+pub fn embedded_fonts() -> Vec<std::borrow::Cow<'static, [u8]>> {
+    EMBEDDED_FONTS
+        .iter()
+        .map(|(_, bytes)| std::borrow::Cow::Borrowed(*bytes))
+        .collect()
+}
+
+/// O TTF Regular do grid (JetBrains Mono) — exposto para o teste de célula do `bridge`
+/// validar `CELL_W`/`CELL_H` contra as métricas REAIS do arquivo embarcado.
+// dead_code fora de teste: consumidor é o teste de célula do bridge (cfg(test)).
+#[allow(dead_code)]
+#[must_use]
+pub fn grid_font_regular() -> &'static [u8] {
+    EMBEDDED_FONTS[0].1
+}
+
+/// (nome p/ diagnóstico, bytes). Ordem estável: o índice 0 É o Regular do grid
+/// ([`grid_font_regular`]).
+const EMBEDDED_FONTS: [(&str, &[u8]); 7] = [
+    (
+        "JetBrainsMono-Regular",
+        include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf"),
+    ),
+    (
+        "JetBrainsMono-Bold",
+        include_bytes!("../assets/fonts/jetbrains-mono/JetBrainsMono-Bold.ttf"),
+    ),
+    (
+        "IBMPlexSans-Regular",
+        include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+    ),
+    (
+        "IBMPlexSans-Medium",
+        include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Medium.ttf"),
+    ),
+    (
+        "IBMPlexSans-SemiBold",
+        include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
+    ),
+    (
+        "IBMPlexSans-Bold",
+        include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Bold.ttf"),
+    ),
+    (
+        "Fraunces72pt-SemiBold",
+        include_bytes!("../assets/fonts/fraunces/Fraunces72pt-SemiBold.ttf"),
+    ),
+];
 
 // ═══════════════════════════ tema ATIVO (troca ao vivo, sem restart) ═══════════════════════════
 
@@ -1350,7 +1411,7 @@ mod tests {
         let prefs = parse_prefs(&json).expect("roundtrip do export");
         let tip = prefs.tipografia.expect("tipografia presente no roundtrip");
         assert_eq!(tip.interface, "IBM Plex Sans");
-        assert_eq!(tip.momentos, "Fraunces");
+        assert_eq!(tip.momentos, "Fraunces 72pt");
         assert_eq!(tip.terminal, "JetBrains Mono");
 
         // Tema PRÉ-F2-1 (só modo/acento): importa com seções → None, contrato antigo intacto.
@@ -1520,6 +1581,128 @@ mod tests {
 
         // restaura o default p/ não vazar estado entre testes.
         apply(Mode::Dark, DEFAULT_ACCENT);
+    }
+
+    /// Lê o nome `name_id` (Windows/Unicode, en-US) da tabela `name` de um TTF — parser mínimo
+    /// do formato sfnt big-endian, suficiente para o teste de paridade abaixo.
+    fn ttf_name(data: &[u8], want_id: u16) -> Option<String> {
+        let n = u16::from_be_bytes([data[4], data[5]]) as usize;
+        let name_off = (0..n).find_map(|i| {
+            let off = 12 + i * 16;
+            if &data[off..off + 4] != b"name" {
+                return None;
+            }
+            let bytes: [u8; 4] = data[off + 8..off + 12].try_into().ok()?;
+            Some(u32::from_be_bytes(bytes) as usize)
+        })?;
+        let count = u16::from_be_bytes([data[name_off + 2], data[name_off + 3]]) as usize;
+        let str_off = u16::from_be_bytes([data[name_off + 4], data[name_off + 5]]) as usize;
+        (0..count).find_map(|j| {
+            let r = name_off + 6 + j * 12;
+            let get = |k: usize| u16::from_be_bytes([data[r + k], data[r + k + 1]]);
+            let (pid, eid, lid, nid, len, off) = (
+                get(0),
+                get(2),
+                get(4),
+                get(6),
+                get(8) as usize,
+                get(10) as usize,
+            );
+            if (pid, eid, lid) != (3, 1, 0x409) || nid != want_id {
+                return None;
+            }
+            let raw = &data[name_off + str_off + off..name_off + str_off + off + len];
+            let units: Vec<u16> = raw
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16(&units).ok()
+        })
+    }
+
+    /// A família "resolvível" de um TTF: a tipográfica (name ID 16) quando existe, senão a
+    /// legada (ID 1) — a mesma precedência do matching de fontes do sistema.
+    fn ttf_family(data: &[u8]) -> String {
+        ttf_name(data, 16)
+            .or_else(|| ttf_name(data, 1))
+            .unwrap_or_default()
+    }
+
+    /// **F2-1-1b — paridade token ↔ arquivo embarcado:** cada família do vocabulário tem TTF
+    /// embarcado que declara EXATAMENTE aquele nome (o modo de falha desta story é silencioso:
+    /// nome errado → font-kit cai em fallback sem avisar). Também valida o magic sfnt de todos.
+    #[test]
+    fn embedded_fonts_match_typography_tokens() {
+        let fonts = embedded_fonts();
+        assert_eq!(fonts.len(), 7, "7 estáticos OFL embarcados");
+        for f in &fonts {
+            assert_eq!(&f[0..4], &[0x00, 0x01, 0x00, 0x00], "TTF sfnt válido");
+            assert!(f.len() > 50_000, "TTF truncado? ({} bytes)", f.len());
+        }
+        let families: Vec<String> = fonts.iter().map(|f| ttf_family(f)).collect();
+        let t = TypographyTokens::CANONICAL;
+        for token in [t.family.ui, t.family.display, t.family.mono] {
+            assert!(
+                families.iter().any(|f| f == token),
+                "token '{token}' sem TTF embarcado que o declare (famílias: {families:?})"
+            );
+        }
+        // O grid exige Regular E Bold da família mono (bold ANSI).
+        let mono_count = families.iter().filter(|f| *f == t.family.mono).count();
+        assert!(
+            mono_count >= 2,
+            "mono precisa de Regular+Bold ({mono_count})"
+        );
+    }
+
+    /// **F2-1-1b (LINT, espelho do lint de cor): nenhuma família de fonte LITERAL fora deste
+    /// módulo** — `.font_family("…")` hardcoded reabre exatamente o furo que esta story fecha.
+    /// Exceção TEMPORÁRIA: o "Menlo" de `main.rs` (costura do Maestro nesta rodada — o diff da
+    /// costura troca pelo token E apaga a entrada abaixo; se a costura aterrissar sem apagar,
+    /// este comentário é o lembrete de que a exceção deve morrer).
+    #[test]
+    fn no_hardcoded_font_families_outside_theme_module() {
+        const SEAM_EXCEPTIONS: &[(&str, &str, usize)] = &[];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("ler src/") {
+            let path = entry.expect("entry").path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !name.ends_with(".rs") || name == "theme.rs" {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("ler fonte");
+            let mut allowed: Vec<(&str, usize)> = SEAM_EXCEPTIONS
+                .iter()
+                .filter(|(f, _, _)| *f == name)
+                .map(|(_, lit, n)| (*lit, *n))
+                .collect();
+            for (i, line) in content.lines().enumerate() {
+                let Some(pos) = line.find(".font_family(") else {
+                    continue;
+                };
+                let arg = &line[pos + ".font_family(".len()..];
+                if !arg.trim_start().starts_with('"') {
+                    continue; // expressão/token — o consumo certo
+                }
+                if let Some(a) = allowed
+                    .iter_mut()
+                    .find(|(lit, n)| *n > 0 && arg.contains(*lit))
+                {
+                    a.1 -= 1;
+                    continue;
+                }
+                violations.push(format!("{name}:{}: {}", i + 1, line.trim()));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "família de fonte hard-coded fora do tema (use t.typography.family.*):\n{}",
+            violations.join("\n")
+        );
     }
 
     /// Stepping consistente: toda escala TEMÁTICA tem dois degraus REAIS (dark ≠ light) — uma

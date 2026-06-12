@@ -82,13 +82,15 @@ use lina_host::{InputSink, NodeId, NodeKind, NodeStatus, WriteOp};
 use lina_bootstrap::Autonomy;
 
 use bridge::{
-    card_visible, cell_in_selection, encode_pointer, hit_test, lock, normalize_sel,
+    card_visible, cell_h, cell_in_selection, cell_w, encode_pointer, hit_test, lock, normalize_sel,
     quote_dropped_paths, screen_to_cell, shell_cmd, A2aTrigger, AgentEngine, AttentionHub, Camera,
-    CwdPolicy, Desk, Grid, NodeAdmission, NodeManager, PtrAction, CARD_H, CARD_W, CELL_H, CELL_W,
+    CwdPolicy, Desk, Grid, NodeAdmission, NodeManager, PtrAction, CARD_H, CARD_W,
 };
 
-/// Tamanho da fonte do grid (Menlo). A célula (`CELL_W`/`CELL_H`) e o layout vivem no `bridge`.
-const FONT_PX: f32 = 13.0;
+/// Tamanho da fonte do grid, do token (contrato grid=13 — teste no theme.rs).
+fn grid_font_px() -> f32 {
+    f32::from(theme::active().typography.size.grid)
+}
 
 /// Token `0xRRGGBB` do tema → [`VtRgb`] (cores do shell entrando no pipeline de células do grid:
 /// cursor padrão e fundo de seleção — únicos pontos onde o tema toca o conteúdo do terminal).
@@ -104,8 +106,8 @@ fn vt(token: u32) -> VtRgb {
 fn fit_dims() -> (u16, u16) {
     let pad = 8.0;
     let title = 34.0;
-    let cols = (((CARD_W - 2.0 * pad) / CELL_W).floor() as u16).max(80);
-    let rows = (((CARD_H - title - 2.0 * pad) / CELL_H).floor() as u16).max(24);
+    let cols = (((CARD_W - 2.0 * pad) / cell_w()).floor() as u16).max(80);
+    let rows = (((CARD_H - title - 2.0 * pad) / cell_h()).floor() as u16).max(24);
     (cols, rows)
 }
 
@@ -413,13 +415,13 @@ fn render_grid(
     div()
         .flex()
         .flex_col()
-        .font_family("Menlo")
-        .text_size(px(FONT_PX * scale))
-        // BUG A: line-height EXPLÍCITA = CELL_H. A natural do Menlo 13px (~18-19px) é MAIOR que
+        .font_family(theme::active().typography.family.mono)
+        .text_size(px(grid_font_px() * scale))
+        // BUG A: line-height EXPLÍCITA = CELL_H. A natural da fonte do grid (~18-19px) é MAIOR que
         // CELL_H=17, então as 26 rows (`fit_dims`) ocupavam mais que o body do card e a ÚLTIMA linha (a
         // barra de input "❯ …" da TUI) era CLIPADA pelo `overflow_hidden`. Travando em CELL_H, as 26
         // rows cabem exatamente (== o que `fit_dims` calcula) → o input APARECE.
-        .line_height(px(CELL_H * scale))
+        .line_height(px(cell_h() * scale))
         .children((0..screen.rows).map(move |r| {
             let cursor_col = (cur.visible && cur.line == r).then_some(cur.col);
             render_line(screen.row(r), cursor_col, r, sel, runs_out)
@@ -3447,7 +3449,7 @@ impl Render for WorkspaceView {
                 };
                 let dy: f32 = match ev.delta {
                     ScrollDelta::Lines(p) => p.y,
-                    ScrollDelta::Pixels(p) => p.y / px(CELL_H),
+                    ScrollDelta::Pixels(p) => p.y / px(cell_h()),
                 };
                 if dy == 0.0 {
                     return;
@@ -4752,8 +4754,9 @@ fn main() {
     // BUG A (instrumentação de boot): o PTY é spawnado com EXATAMENTE estas `rows`, e o render trava a
     // line-height em CELL_H → as `rows` cabem inteiras no card (a ÚLTIMA = barra de input da TUI). O
     // Maestro confere: pty_rows (nos logs por-card) == estas `rows`.
+    let (cw, ch, fpx) = (cell_w(), cell_h(), grid_font_px());
     eprintln!(
-        "lina-gpui: layout · card {CARD_W}x{CARD_H} · cell {CELL_W}x{CELL_H} · font {FONT_PX}px (line-height travada={CELL_H}) · PTY {cols}x{rows} → {rows} linhas cabem (a ultima = input)"
+        "lina-gpui: layout · card {CARD_W}x{CARD_H} · cell {cw}x{ch} · font {fpx}px (line-height travada={ch}) · PTY {cols}x{rows} → {rows} linhas cabem (a ultima = input)"
     );
 
     // #22 (inv#4 · fonte-única forense): o app e o bin `lina` (do/guard/ask) compartilham UM ÚNICO
@@ -5045,6 +5048,32 @@ fn main() {
     let runtimes_epilogue = Arc::clone(&runtimes);
     let shared_for_view = shared.clone();
     application().run(move |cx: &mut App| {
+        // F2-1-1b: fontes da identidade EMBARCADAS (zero dependência da máquina) + medição da
+        // célula real. ORDEM REAL (desvio documentado do pedido de costura): `fit_dims`/spawn de
+        // PTY rodaram ANTES deste closure (main(), ~4751) sobre as consts de fallback — que o
+        // teste `cell_fallbacks_match_embedded_grid_font_metrics` PROVA idênticas ao TTF
+        // embarcado; a medição aqui é confirmação em runtime (vence para o render via atomics;
+        // divergência insana é recusada pelo guard de `set_cell_metrics`).
+        if let Err(e) = cx.text_system().add_fonts(theme::embedded_fonts()) {
+            eprintln!(
+                "lina-gpui: fontes embarcadas não carregaram ({e}) — seguindo nas do sistema"
+            );
+        }
+        {
+            let t = theme::active().typography;
+            let font_id = cx.text_system().resolve_font(&gpui::font(t.family.mono));
+            let sz = px(f32::from(t.size.grid));
+            match cx.text_system().advance(font_id, sz, 'M') {
+                Ok(adv) => {
+                    let h = cx.text_system().ascent(font_id, sz)
+                        + cx.text_system().descent(font_id, sz);
+                    bridge::set_cell_metrics(f32::from(adv.width), f32::from(h));
+                }
+                Err(e) => eprintln!(
+                    "lina-gpui: não medi a célula do grid ({e}) — usando o fallback derivado do TTF"
+                ),
+            }
+        }
         // inv#6: o CANVAS é a base e abre SEMPRE (nunca tela em branco). O onboarding entra como janela
         // SOBREPOSTA na 1ª execução (W4-1) e se fecha sozinho no fim ("Abrir meu Espaço →"), revelando o
         // canvas por baixo — sem precisar passar os handles do canvas pro onboarding.

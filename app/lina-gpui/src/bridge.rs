@@ -2981,10 +2981,52 @@ pub fn hit_test(
 
 // ─────────────────────────── W2-4: seleção + mouse reporting ───────────────────────────
 
-/// Métricas da célula monoespaçada (Menlo 13px). Definem cols×rows (`fit_dims`) E a conversão
-/// tela→célula da seleção/mouse — uma só fonte da verdade.
-pub const CELL_W: f32 = 7.84;
-pub const CELL_H: f32 = 17.0;
+/// Métricas da célula monoespaçada — **JetBrains Mono 13px** (F2-1-1b; antes Menlo 7.84×17.0).
+/// Definem cols×rows (`fit_dims`), a line-height travada do grid E a conversão tela→célula da
+/// seleção/mouse — uma só fonte da verdade: TODO consumidor lê [`cell_w`]/[`cell_h`].
+///
+/// As consts são o **fallback derivado do arquivo embarcado** (teste `cell_fallbacks_match_…`
+/// re-deriva do TTF: advance 600/1000 em → 7.80 · ascent 1020 + descent 300 → 17.16 em 13px).
+/// No boot, a costura MEDE via text system ([`set_cell_metrics`]) — à prova de troca futura de
+/// fonte/tamanho; se a medição falhar, o fallback já é a fonte certa.
+pub const CELL_W: f32 = 7.80;
+pub const CELL_H: f32 = 17.16;
+
+/// Bits vivos das métricas (f32 ↔ u32; default = fallback). Atomics para leitura barata em
+/// render/hit-testing sem lock.
+static CELL_W_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(CELL_W.to_bits());
+static CELL_H_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(CELL_H.to_bits());
+
+/// Largura VIVA da célula (px não escalados) — medida no boot ou o fallback.
+#[must_use]
+pub fn cell_w() -> f32 {
+    f32::from_bits(CELL_W_BITS.load(Ordering::Relaxed))
+}
+
+/// Altura VIVA da célula (px não escalados) — medida no boot ou o fallback.
+#[must_use]
+pub fn cell_h() -> f32 {
+    f32::from_bits(CELL_H_BITS.load(Ordering::Relaxed))
+}
+
+/// Carimba as métricas MEDIDAS da célula (boot, via text system — costura). Valores fora da
+/// sanidade (não-finitos ou longe demais do fallback: fonte errada/fallback do font-kit) são
+/// RECUSADOS com log — grid desalinhado é pior que célula teórica ("a tela nunca mente").
+pub fn set_cell_metrics(w: f32, h: f32) {
+    let sane =
+        w.is_finite() && h.is_finite() && (w - CELL_W).abs() <= 1.0 && (h - CELL_H).abs() <= 2.0;
+    if !sane {
+        eprintln!(
+            "bridge: métricas de célula medidas ({w:.2}x{h:.2}) longe do esperado \
+             ({CELL_W:.2}x{CELL_H:.2}) — mantendo o fallback (fonte do grid ausente/errada?)"
+        );
+        return;
+    }
+    CELL_W_BITS.store(w.to_bits(), Ordering::Relaxed);
+    CELL_H_BITS.store(h.to_bits(), Ordering::Relaxed);
+}
 
 /// Origem X do grid DENTRO do card, em px NÃO escalados: borda(2) + padding do corpo(4).
 const GRID_OX: f32 = 6.0;
@@ -3005,9 +3047,11 @@ pub fn screen_to_cell(
     let z = cam.zoom;
     let (sx, sy) = cam.world_to_screen(card_world);
     let gx = sx + GRID_OX;
-    let gy = sy + GRID_OY_FIXED + CELL_H * z;
-    let col = (((screen_pt.0 - gx) / (CELL_W * z)).floor()).clamp(0.0, (dims.0.max(1) - 1) as f32);
-    let row = (((screen_pt.1 - gy) / (CELL_H * z)).floor()).clamp(0.0, (dims.1.max(1) - 1) as f32);
+    let gy = sy + GRID_OY_FIXED + cell_h() * z;
+    let col =
+        (((screen_pt.0 - gx) / (cell_w() * z)).floor()).clamp(0.0, (dims.0.max(1) - 1) as f32);
+    let row =
+        (((screen_pt.1 - gy) / (cell_h() * z)).floor()).clamp(0.0, (dims.1.max(1) - 1) as f32);
     (col as usize, row as usize)
 }
 
@@ -7985,10 +8029,10 @@ mod tests {
         ] {
             let z = cam.zoom;
             let (sx, sy) = cam.world_to_screen(card);
-            let (gx, gy) = (sx + GRID_OX, sy + GRID_OY_FIXED + CELL_H * z);
+            let (gx, gy) = (sx + GRID_OX, sy + GRID_OY_FIXED + cell_h() * z);
             for &(col, row) in &[(0usize, 0usize), (10, 5), (40, 12), (79, 23)] {
-                let px = gx + (col as f32 + 0.5) * CELL_W * z;
-                let py = gy + (row as f32 + 0.5) * CELL_H * z;
+                let px = gx + (col as f32 + 0.5) * cell_w() * z;
+                let py = gy + (row as f32 + 0.5) * cell_h() * z;
                 assert_eq!(
                     screen_to_cell(&cam, card, (px, py), dims),
                     (col, row),
@@ -8046,9 +8090,9 @@ mod tests {
         let dims = (80usize, 24usize);
         let z = cam.zoom;
         let (sx, sy) = cam.world_to_screen(card);
-        let (gx, gy) = (sx + GRID_OX, sy + GRID_OY_FIXED + CELL_H * z);
-        let col_px = |c: f32| gx + (c + 0.5) * CELL_W * z;
-        let row_px = |r: f32| gy + (r + 0.5) * CELL_H * z;
+        let (gx, gy) = (sx + GRID_OX, sy + GRID_OY_FIXED + cell_h() * z);
+        let col_px = |c: f32| gx + (c + 0.5) * cell_w() * z;
+        let row_px = |r: f32| gy + (r + 0.5) * cell_h() * z;
         // Âncora no MEIO de uma linha (col 10, row 2).
         let anchor = screen_to_cell(&cam, card, (col_px(10.0), row_px(2.0)), dims);
         assert_eq!(anchor, (10, 2));
@@ -11326,5 +11370,89 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&user_dir);
+    }
+
+    // ───────────────────── F2-1-1b: célula re-derivada (JetBrains Mono 13px) ─────────────────────
+
+    /// Lê um u16/i16 big-endian de `data` em `off`.
+    fn be_u16(data: &[u8], off: usize) -> u16 {
+        u16::from_be_bytes([data[off], data[off + 1]])
+    }
+    fn be_i16(data: &[u8], off: usize) -> i16 {
+        i16::from_be_bytes([data[off], data[off + 1]])
+    }
+
+    /// Offset da tabela sfnt `tag` no TTF (diretório big-endian do formato).
+    fn sfnt_table(data: &[u8], tag: &[u8; 4]) -> Option<usize> {
+        let n = be_u16(data, 4) as usize;
+        (0..n).find_map(|i| {
+            let off = 12 + i * 16;
+            if &data[off..off + 4] != tag {
+                return None;
+            }
+            let bytes: [u8; 4] = data[off + 8..off + 12].try_into().ok()?;
+            Some(u32::from_be_bytes(bytes) as usize)
+        })
+    }
+
+    /// **GATE F2-1-1b — as constantes de fallback são RE-DERIVADAS do arquivo embarcado**, não
+    /// chute: parseia head (unitsPerEm), hhea (ascender/descender) e hmtx (advance do glifo 0 —
+    /// monoespaçada: todos iguais) do JetBrains Mono Regular que VIAJA no binário, e confere
+    /// `CELL_W = 13 * advance/upm` e `CELL_H = 13 * (asc - desc)/upm`. Trocar a fonte/tamanho do
+    /// grid sem re-derivar a célula falha AQUI (a lição que criou esta story).
+    #[test]
+    fn cell_fallbacks_match_embedded_grid_font_metrics() {
+        let ttf = crate::theme::grid_font_regular();
+        assert_eq!(
+            &ttf[0..4],
+            &[0x00, 0x01, 0x00, 0x00],
+            "grid_font_regular não é um TTF sfnt"
+        );
+        let head = sfnt_table(ttf, b"head").expect("tabela head");
+        let hhea = sfnt_table(ttf, b"hhea").expect("tabela hhea");
+        let hmtx = sfnt_table(ttf, b"hmtx").expect("tabela hmtx");
+        let upm = f32::from(be_u16(ttf, head + 18));
+        let ascent = f32::from(be_i16(ttf, hhea + 4));
+        let descent = f32::from(be_i16(ttf, hhea + 6)); // negativo no formato
+        let advance = f32::from(be_u16(ttf, hmtx)); // glifo 0; mono ⇒ todos iguais
+        let font_px = 13.0_f32; // contrato grid=13 (theme.rs, teste typography_vocabulary_integrity)
+        let expect_w = font_px * advance / upm;
+        let expect_h = font_px * (ascent - descent) / upm;
+        assert!(
+            (CELL_W - expect_w).abs() < 0.005,
+            "CELL_W={CELL_W} difere do derivado do TTF embarcado ({expect_w:.4})"
+        );
+        assert!(
+            (CELL_H - expect_h).abs() < 0.005,
+            "CELL_H={CELL_H} difere do derivado do TTF embarcado ({expect_h:.4})"
+        );
+    }
+
+    /// `set_cell_metrics` aceita medição sã (vira o valor vivo) e RECUSA medição insana
+    /// (fonte errada/fallback do font-kit) mantendo o fallback — "a tela nunca mente".
+    /// Serializa via guard do tema (estado global de processo) e restaura ao sair.
+    #[test]
+    fn set_cell_metrics_accepts_sane_and_refuses_insane() {
+        let _guard = crate::theme::THEME_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // São (dentro da janela de sanidade): vira o valor vivo.
+        set_cell_metrics(CELL_W + 0.05, CELL_H - 0.1);
+        assert!((cell_w() - (CELL_W + 0.05)).abs() < f32::EPSILON);
+        assert!((cell_h() - (CELL_H - 0.1)).abs() < f32::EPSILON);
+        // Insano (Menlo? proporcional? NaN?): recusado, vivo fica como estava.
+        set_cell_metrics(6.0, CELL_H);
+        assert!(
+            (cell_w() - (CELL_W + 0.05)).abs() < f32::EPSILON,
+            "largura insana recusada"
+        );
+        set_cell_metrics(CELL_W, f32::NAN);
+        assert!(
+            (cell_h() - (CELL_H - 0.1)).abs() < f32::EPSILON,
+            "NaN recusado"
+        );
+        // restaura o fallback p/ não vazar estado entre testes.
+        set_cell_metrics(CELL_W, CELL_H);
+        assert!((cell_w() - CELL_W).abs() < f32::EPSILON);
     }
 }

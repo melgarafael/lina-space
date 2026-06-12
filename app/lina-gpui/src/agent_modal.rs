@@ -2250,7 +2250,7 @@ pub fn render(
                         } else {
                             th.surface.border
                         }))
-                        .font_family("Menlo")
+                        .font_family(th.typography.family.mono)
                         .text_color(rgb(th.text.primary))
                         .cursor_pointer()
                         .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
