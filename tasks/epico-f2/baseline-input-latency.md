@@ -61,16 +61,28 @@ tamanho/zoom padrão (anotar se mexer).
 
 ```sh
 # 1. Java (não existe na máquina — §5.1):
-brew install --cask temurin          # JDK Adoptium; qualquer JDK ≥8 serve ao Typometer
+brew install --cask temurin          # JDK Temurin; Java 8+ basta ao Typometer
 
-# 2. Typometer (GUI, grátis — Pavel Fatin):
-#    baixar o JAR da página oficial/releases e rodar:
-java -jar typometer-1.0.1.jar        # (nome/versão: conferir §4 — fatos verificados)
+# 2. Typometer — caminho RECOMENDADO nesta máquina (Apple Silicon + Retina): o fork
+#    frarees, buildado do master (captura nativa Cocoa + tolerância de cor p/ Retina;
+#    o fix de Apple Silicon de 2023 NÃO está na release binária — ver §4):
+brew install maven
+git clone https://github.com/frarees/typometer && cd typometer
+mvn clean package && java -jar target/typometer-*.jar
 
-# 3. Permissões macOS (mãos do fundador — §5.2): em Ajustes do Sistema → Privacidade e
-#    Segurança, conceder ao processo java (ou ao terminal que o lança):
-#    - Gravação de Tela (o Typometer compara pixels para detectar o glifo)
-#    - Acessibilidade (o Typometer injeta os keypress sintéticos)
+#    Fallback (upstream 2017, Intel/teste rápido):
+#    curl -LO https://github.com/pavelfatin/typometer/releases/download/v1.0.1/typometer-1.0.1-bin.zip
+#    unzip typometer-1.0.1-bin.zip && java -jar typometer-1.0.1/typometer-1.0.1.jar
+
+# 3. Permissões macOS (mãos do fundador — §5.2), em Ajustes → Privacidade e Segurança,
+#    para o RESPONSIBLE PROCESS (o app de terminal que lança o `java -jar`; se uma
+#    entrada "java"/JDK aparecer na lista, marcar também):
+#    - Gravação de Tela (leitura de pixels) — macOS Sequoia+ RE-PEDE confirmação
+#      periodicamente: reconfirmar antes de cada sessão
+#    - Acessibilidade (keypress sintético) — ATENÇÃO: a falta dela falha EM SILÊNCIO
+#      (o sistema pede a primeira, mas pode nunca pedir esta — adoptium-support#235)
+# 4. Teste de sanidade das permissões (30s): rodar 1 medição curta num TextEdit —
+#    os "....." aparecem? (Acessibilidade ok) O Typometer acha as métricas? (Gravação ok)
 ```
 
 ### 3.1 Cena de medição (2 condições × ~3 runs)
@@ -85,13 +97,16 @@ em primeiro plano, zoom/tamanho padrão. Desligar "smooth typing"/animação de 
 
 ### 3.2 Execução
 
-1. Abrir o Typometer → apontar a área de detecção para a linha do cursor do terminal focado
-   (o Lina em primeiro plano; Typometer ao lado/atrás).
-2. Configurar **≥200 keypresses por run** com delay entre teclas (default do app) — amostra
-   suficiente para p99 fazer sentido (1% = 2 amostras em 200; por isso 3 runs por condição).
+1. Abrir o Typometer → o Lina em primeiro plano com o terminal focado no prompt; o
+   Typometer detecta as métricas digitando "....." na janela focada (1 pixel por símbolo).
+2. Configurar o setup de referência de Pavel Fatin: **200 caracteres · delay 150ms · modo
+   síncrono** (espera cada char aparecer — mais preciso).
 3. Rodar **3× por condição** (descartar o 1º run de cada condição — warm-up de JIT/atlas).
-4. Exportar/anotar as amostras de cada run (formato de saída: §4) e calcular p50/p95/p99
-   **sobre as amostras agregadas dos runs válidos** (não médias de médias).
+4. **Exportar o CSV cru** (1 latência por keypress — a GUI só dá min/máx/média/SD) e
+   calcular p50/p95/p99 **sobre as amostras agregadas dos runs válidos** (não médias de
+   médias). Com 2×200 amostras válidas, o p99 apoia-se em ~4 amostras — registrar o n
+   junto do percentil; se o gate ficar na margem, subir para 500 chars/run (Dan Luu usou
+   ~10k keypresses para p99.9).
 5. Repetir a condição "sob carga" com pan/zoom parado vs. contínuo se der tempo (a cena de
    estresse do gate da camada d é com pan/zoom 60s — anotar qual variante foi medida).
 
@@ -103,10 +118,25 @@ teclado+tela: contar frames entre o dedo tocar a tecla e o glifo aparecer (±1 f
 Typometer por >10ms, a medição por software está enviesada (overhead de captura — §4) e a
 câmera vira a fonte da verdade.
 
-## 4. Typometer — fatos verificados *(pesquisa 2026-06-12; ver §VERIFICAÇÃO)*
+## 4. Typometer — fatos verificados (pesquisa web com verificação adversarial, 2026-06-12)
 
-*(seção preenchida ao fim da pesquisa verificada — release/JAR exato, formato de saída,
-issues conhecidas em macOS recente/janelas GPU, e alternativas vivas)*
+| Fato | Detalhe | Fonte (fetchada) |
+|---|---|---|
+| Identidade | Repo oficial `pavelfatin/typometer`, **abandonado** (último push 2020-09); release v1.0.1 (2017-09-22), asset `typometer-1.0.1-bin.zip` com `typometer-1.0.1.jar`; Java 8+ (app Swing/AWT) | github.com/pavelfatin/typometer/releases/tag/v1.0.1 |
+| Fork p/ macOS moderno | **`frarees/typometer`** — v1.1.0 (2020) adiciona captura nativa **Cocoa** + tolerância de cor (fix do issue #9/Retina); commit 2023-04 corrige `InaccessibleObjectException` (Java 16+) e targeta **Apple Silicon** — só no master, exige `mvn package` | github.com/frarees/typometer |
+| Princípio | Keypress sintético em nível de SO + leitura de pixel: digita "....." p/ calibrar (posição, passo, cor de fundo, caret), depois N chars medindo tecla→pixel; **1 pixel por símbolo** | github.com/pavelfatin/typometer#principle |
+| Alvo agnóstico | NÃO exige app AWT: digita na janela FOCADA e lê a tela — Dan Luu mediu terminais nativos (iTerm2/Terminal.app/st); janela Metal/wgpu não é impeditivo em si | github.com/pavelfatin/typometer#troubleshooting · danluu.com/term-latency/ |
+| Risco nº 1 (Retina) | Issue #9 (aberta pelo autor do iTerm2): dithering + antialiasing do macOS quebram comparação EXATA de cor → fork frarees (tolerância ~1% RGB); alvo precisa de fundo sólido, monospace, alto contraste, linha vazia longa, **caret barra/underline (não bloco)** | github.com/pavelfatin/typometer/issues/9 e /issues/5 |
+| TCC | Gravação de Tela (`Robot.createScreenCapture`) + Acessibilidade (`Robot.keyPress`), concedidas ao **responsible process** (o terminal que lança o java; marcar entrada "Java" se existir). **Acessibilidade falha em silêncio**; Sequoia+ re-pede Gravação periodicamente | github.com/adoptium/adoptium-support/issues/235 |
+| Saída | GUI: min/máx/média/SD + distribuição (sem percentis); **CSV cru com 1 latência por keypress** → p50/p95/p99 calculados fora | pavelfatin.com/typometer/ |
+| Setup de referência | Pavel: 200 chars · 150ms · síncrono; fechar apps com hook global de teclado; alvo maximizado. Dan Luu: ~10k keypresses, p50/p90/p99.9, idle vs carga | pavelfatin.com/typing-with-pleasure/ · danluu.com/term-latency/ |
+| Estado em macOS 14/15/26 | **Não-documentado** — nenhuma issue do repo menciona Sonoma/Sequoia/Tahoe (a mais recente é de 2022-08, pré-Sonoma); validar com 1 run curto antes da bateria (sanidade §3.0-4) | github.com/pavelfatin/typometer/issues |
+| Compositor | O WindowServer SEMPRE compõe com vsync → ~1 frame de compositor embutido em TODA medição; constante na máquina → comparações relativas seguem válidas | dossiê da pesquisa (Pavel/Dan Luu) |
+| Alternativas vivas | **Is It Snappy?** (iOS, câmera 240fps, repo com commit 2025-01 — o fallback §6); OSLTT (hardware open-source à venda, set/2024); NVIDIA LDAT (não vendido — só imprensa) | github.com/chadaustin/is-it-snappy · github.com/OSRTT/OSLTT |
+
+> Implicação direta para o Lina: o cursor do terminal é **bloco** por padrão na maioria dos
+> emuladores — se a calibração do Typometer falhar, mudar o caret para barra/underline na
+> cena de medição (ou medir num campo de texto do chrome) e ANOTAR a variação.
 
 ## 5. BLOQUEIO TÉCNICO da medição autônoma (honesto, com evidência)
 
@@ -138,8 +168,10 @@ detecção de mudança de pixel — risco listado em §4), a medição inteira �
 1. iPhone em 240fps, tripé, enquadrando tecla + área do cursor do terminal focado.
 2. **30+ keypresses por condição** (idle / sob carga), tecla solta e seca (ex.: `j`),
    ritmo ~1/s.
-3. Contar frames keydown→glifo no app de fotos (scrub frame a frame) ou no "Is It Snappy?"
-   (conferir estado em §4); registrar cada amostra em ms (frames × 4,17ms).
+3. Contar do frame em que a tecla **começa a descer** (não do fundo do curso — a descida
+   leva 4-8 frames; método Dan Luu) até o frame da primeira mudança do glifo; registrar
+   cada amostra em ms (frames × 4,17ms). O "Is It Snappy?" (iOS, vivo — commit 2025-01)
+   faz a marcação e o cálculo frame-a-frame sozinho.
 4. p50/p95 sobre as amostras (com n=30, p99 não é honesto — reportar p50/p95 + máximo
    observado e a limitação).
 5. Mesma âncora de validação: ±1 frame ≈ 4ms de resolução.

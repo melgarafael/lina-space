@@ -231,17 +231,10 @@ Nunca: gradiente decorativo, sombra teatral, cor sem significado, animar input d
 
   .narr{margin:0; padding:10px 14px 12px; font-size:13px; line-height:1.5; color:var(--text)}
 
-  /* — Cartão 1: FOCO. Anel âmbar (trabalhando) + aba "ao vivo": viewer vivo só aqui. — */
+  /* — Cartão 1: FOCO. Anel âmbar (trabalhando) + leve aumento: viewer vivo só aqui. — */
   .card--focus{border-color:var(--amber); outline:1px solid rgba(232,169,63,.45); outline-offset:3px}
   .card--focus pre.tgrid{font-size:13px}
   .card--focus pre.tgrid::after{content:"█"; color:var(--grid-text)} /* cursor vivo do foco — decoração CSS, fora do texto canônico */
-  .tab-live{
-    position:absolute; top:-11px; left:14px;
-    display:inline-flex; align-items:center; gap:5px;
-    background:var(--amber); color:var(--ink-on-accent);
-    font-size:11px; font-weight:600; letter-spacing:.02em; line-height:1;
-    border-radius:3px; padding:4px 8px;
-  }
 
   /* — Cartão 2: periferia CONGELADA, honesta. O grid esmaece; a narração segue viva. — */
   .frozen pre.tgrid{color:var(--grid-frozen)}
@@ -357,7 +350,6 @@ Nunca: gradiente decorativo, sombra teatral, cor sem significado, animar input d
 
         <!-- Cartão 1 — FOCO: o único viewer vivo da tela -->
         <article class="card card--focus" id="construtor">
-          <span class="tab-live"><span class="pulse" aria-hidden="true">●</span>ao vivo</span>
           <header class="card-head">
             <div class="who">
               <h2>Construtor de Páginas</h2>
@@ -413,7 +405,7 @@ C — foco em "sem precisar de técnico"</pre>
               <span class="meta">esperando há 1 min</span>
             </div>
             <div class="state">
-              <span class="badge-attn" title="1 pedido esperando você"><span aria-hidden="true">◆</span>1</span>
+              <span class="badge-attn" title="1 pedido esperando você"><span aria-hidden="true">◆</span> 1</span>
               <span class="chip chip--needs"><span class="glyph" aria-hidden="true">◆</span>Precisa de você</span>
             </div>
           </header>
@@ -426,11 +418,11 @@ desconto na primeira compra?
 
 <span class="g-ask">Permitir? (s/n) █</span></pre>
           </div>
+          <p class="narr">Esperando sua resposta para continuar.</p>
           <div class="actions">
             <button class="btn-yes" type="button">Sim, pode ativar</button>
             <button class="btn-later" type="button">Agora não</button>
           </div>
-          <p class="narr">Esperando sua resposta para continuar.</p>
         </article>
 
         <!-- Cartão 4 — pronto: o momento ganha a Fraunces, e só ele -->

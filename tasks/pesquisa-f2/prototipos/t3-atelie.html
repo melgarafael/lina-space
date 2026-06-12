@@ -35,6 +35,7 @@ Nunca: branco puro, festa permanente, esconder o terminal de verdade.
   --tinta-2:#6E5F4B;        /* metas e sub-rótulos */
   --borda:#E2D5BE;
   --borda-forte:#CBB99C;
+  --borda-controle:#8F7C5C; /* fronteira de controle clicável — ≥3:1 sobre cartão (3.75) e rail (3.26) */
   --argila:#9E3A1D;         /* cor de identidade do Espaço (terracota) */
   --argila-fundo:#F7EFE0;
   --ilha:#2B241C;           /* terminal — ilha dark quente */
@@ -86,7 +87,7 @@ body{
   background:var(--argila); align-self:center; margin-top:4px;
 }
 .recolher{
-  width:28px; height:28px; border:1px solid var(--borda-forte);
+  width:28px; height:28px; border:1px solid var(--borda-controle);
   border-radius:9px; background:var(--cartao); color:var(--tinta-2);
   font-size:12px; cursor:pointer; line-height:1;
 }
@@ -157,7 +158,7 @@ body{
 .criar-espaco{
   width:100%; min-height:38px;
   font-family:var(--ui); font-size:14px; font-weight:500; color:var(--tinta);
-  background:none; border:1.5px dashed var(--borda-forte);
+  background:none; border:1.5px dashed var(--borda-controle);
   border-radius:10px; cursor:pointer; padding:8px 12px;
 }
 
@@ -281,12 +282,13 @@ body{
 }
 .botao--depois{
   background:none; color:var(--tinta);
-  border:1.5px solid var(--borda-forte);
+  border:1.5px solid var(--borda-controle);
 }
 
 /* celebração contida — SÓ no cartão 4 */
 .selo{
-  position:absolute; right:14px; bottom:50px; z-index:2;
+  /* carimba o canto do cartão, ao lado da narração — nunca por cima do texto da ilha */
+  position:absolute; right:12px; bottom:10px; z-index:2;
   transform:rotate(-4deg);
   font-family:var(--display); font-weight:700; font-size:13px;
   letter-spacing:.03em;

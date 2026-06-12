@@ -21,8 +21,8 @@ Nunca: esconder números, glassmorphism, roxo decorativo, suavizar o sistema par
    do risco de clichê de branding de IA — aqui ela rotula instrumentos,
    não faz marketing. Os fallbacks abaixo são honestos, não escolha.
    AA computado (WCAG 2.x): chrome 14.58 · narração 13.96 · grid 13.44
-   · meta 7.12 · telemetria 6.99 · chips 7.72–8.96 · botões 8.74/10.53
-   · pill 9.14 — todos ≥ 4.5.
+   · meta 7.29 · telemetria 6.99 · chips 7.72–8.96 · botões 7.60/10.53
+   · pill 7.95 — todos ≥ 4.5.
    ============================================================ */
 :root{
   --bg:#0a0e15;          /* fundo profundo, azul frio */
@@ -79,10 +79,6 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
 .espaco-atual{
   border:1px solid var(--line-2);border-left:2px solid var(--cyan);
   border-radius:4px;background:var(--well);padding:9px 10px 8px;
-}
-.espaco-atual .rotulo{
-  display:block;font:600 9px/1 var(--f-mono);letter-spacing:.14em;
-  color:var(--ink-3);text-transform:uppercase;margin-bottom:5px;
 }
 .espaco-atual strong{display:block;font:600 13.5px/1.3 var(--f-disp);color:var(--ink-head)}
 .espaco-atual .sub{display:block;font:400 10.5px/1.4 var(--f-mono);color:var(--ink-2);margin-top:4px}
@@ -294,7 +290,6 @@ button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
   </div>
 
   <div class="espaco-atual">
-    <span class="rotulo">Espaço atual</span>
     <strong>Loja Virtual — Lançamento</strong>
     <span class="sub">5 terminais · 2 trabalhando agora</span>
   </div>
@@ -390,7 +385,7 @@ C — foco em "sem precisar de técnico"</pre>
         <h2>Caixa e Pagamentos</h2>
         <span class="chip chip-red"><span class="icone" aria-hidden="true">◆</span>Precisa de você</span>
       </header>
-      <div class="card-sub"><span class="meta">esperando há 1 min</span><span class="fila">◆ 1 na fila</span></div>
+      <div class="card-sub"><span class="meta">esperando há 1 min</span><span class="fila" title="1 pedido esperando você">◆ 1</span></div>
       <div class="telemetria"><span>1 min em espera · 6 ações · fila 1</span><span class="spark spark-red" aria-hidden="true"><i style="--h:80%"></i><i style="--h:70%"></i><i style="--h:55%"></i><i style="--h:40%"></i><i style="--h:30%"></i><i style="--h:20%"></i><i style="--h:12%"></i><i style="--h:8%"></i><i style="--h:8%"></i><i style="--h:8%"></i><i style="--h:8%"></i><i style="--h:8%"></i></span></div>
       <pre class="gridterm">Configurei Pix e cartão no ambiente
 de testes. Falta uma decisão sua:
