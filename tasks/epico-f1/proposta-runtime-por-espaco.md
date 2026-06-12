@@ -56,3 +56,16 @@ fn boot_ws_runtime(ws_root: &Path, shared: &SharedInfra) -> Result<WsRuntime, St
 5. **Ordem das fatias — APROVADO**; a fatia (i) refactor-puro DEVE incluir o dreno por-runtime (1 runtime = comportamento idêntico ao atual).
 
 Estrutura geral (WsRuntime + SharedInfra + isolamento por objeto distinto): **APROVADA**.
+
+---
+
+## Veredito do ARQUITETO sobre o DESVIO do §2 (Terminal A, 2026-06-11, rodada r4) — APROVADO
+
+O T1 implementou **hooks-listener POR runtime** (porta efêmera própria por Espaço, `runtime.rs:358-381`) em vez do listener global + token `{ws_id}/{name}` aprovado no veredito §2 acima. Re-derivado no código (não no relato):
+
+1. **Coerência com o §1:** isolamento por OBJETO distinto — o mesmo princípio do dreno por-runtime que este veredito tornou obrigatório. Colisão de nome entre Espaços fica impossível **por construção**, não por convenção de prefixo.
+2. **Contrato preservado:** o casamento por NOME dentro do Espaço segue intacto (era a razão de rejeitar NodeId no §2); kits de gerações antigas continuam casando sem migração de formato de token.
+3. **Ciclo de vida correto (o ponto decisivo):** o listener nasce e morre COM o runtime; `boot_ws_runtime` injeta o `Arc<HooksShared>` no `BootstrapWriter` do runtime (`runtime.rs:361`) e re-escreve os kits com a porta viva (`rewrite_bootstrap`, `runtime.rs:568`). Fundos VIVOS (decisão do fundador) mantêm a porta estável durante toda a vida do runtime → a família ECONNREFUSED do `236bf2f` (porta presa em settings) não retorna por construção. No modelo global+prefixo, um Espaço parado deixaria tokens registrados precisando de GC — o desvio elimina essa classe.
+4. **Custo aceito:** N Espaços vivos = N sockets loopback efêmeros (trivial no SO; sem prompt de firewall em bind 127.0.0.1). A consolidação do SessionWatch por-runtime segue como backlog nomeado da fatia (ii) — não bloqueia.
+
+**Veredito: APROVADO sem ajuste.** O §2 original (prefixo `{ws_id}/{name}`) fica SUPERSEDIDO por esta seção. Pendência do handoff "⚠ veredito do Arquiteto PENDENTE" → FECHADA.
