@@ -155,8 +155,12 @@ Tudo o que é auditável passou. A declaração formal espera este lote — cada
 - [ ] **Medição final F1-5.** A sonda `[PROF]` decomposta e o gerador de carga estão prontos
       (`.entrega-f1-5-1.md`); os **números oficiais saem da sessão de tela Maestro+fundador**
       ("Dados = sessão de tela", `prof-baseline.md` §rodapé). Medição oficial = macOS.
-- [ ] **2º output criativo do A/B (§3.2).** Re-rodar 1 tarefa criativa no Codex (≥ 09/jul) OU no
-      Gemini (se o fundador autenticar) e pontuar pela rubrica — fecha o piso "≥2 CLIs" do item 4.
+- [x] ~~**2º output criativo do A/B (§3.2).**~~ **MOVIDO PARA A FASE 3 por decisão do fundador
+      (2026-06-12):** o slot segue NOMEADO e honesto (§3.2 — Codex ≥09/jul OU Gemini autenticado),
+      mas deixa de bloquear a saída do F1. Racional: bloqueio 100% externo (limite de conta /
+      auth ausente), zero risco de produto — a portabilidade de ATIVAÇÃO 3-CLI já foi testada e
+      o bug real (descriptions >1024) já foi pego e corrigido (`63d4e6b`). A F2 será focada em
+      UI/UX; o item entra no backlog de abertura da F3.
 
 **Itens que NÃO bloqueiam a saída** (registrados, com dono pós-F1): backlog do
 `conselho-f13-consolidado.md` (breaker-por-item, `parents:` com enforcement, auditoria de
