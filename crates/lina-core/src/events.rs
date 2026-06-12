@@ -447,6 +447,17 @@ pub enum DomainEvent {
     WorkspaceFocusSet {
         workspace: String,
     },
+    /// r5 perf-ws — **Descarregar Espaço** (modelo Maestri do fundador): os PTYs OCIOSOS de um
+    /// Espaço de fundo foram desligados SEM remover os nós (religam no próximo foco via o fluxo
+    /// de restore F1-4-3). `parked` = ids dos nós estacionados; `kept` = vivos preservados
+    /// (Busy/Blocked — a restrição "sem interferir no que está rodando"). META — livro-razão do
+    /// gesto; o executor (app) deriva o plano de [`crate::suspend::unload_plan`] e religa
+    /// varrendo o log (mesmo padrão CostLedger).
+    WorkspaceUnloaded {
+        parked: Vec<String>,
+        #[serde(default)]
+        kept: Vec<String>,
+    },
     /// W4-3 (freio do rodapé): a auto-orquestração foi PAUSADA pelo humano. Enquanto pausada, novas
     /// delegações ficam ENFILEIRADAS (não injetadas) — é GATE, não kill (inv #6): nada se perde, o
     /// estado fica salvo e visível. META — o estado de pausa vive no Router (escritor único); aqui só
@@ -834,6 +845,7 @@ impl DomainEvent {
             DomainEvent::FolderCreated { .. } => "FolderCreated",
             DomainEvent::CliProfileSet { .. } => "CliProfileSet",
             DomainEvent::WorkspaceFocusSet { .. } => "WorkspaceFocusSet",
+            DomainEvent::WorkspaceUnloaded { .. } => "WorkspaceUnloaded",
             DomainEvent::OrchestrationPaused => "OrchestrationPaused",
             DomainEvent::OrchestrationResumed => "OrchestrationResumed",
             DomainEvent::WebhookConfigured { .. } => "WebhookConfigured",
@@ -1211,7 +1223,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // (auditoria/retro/[PROF]); o nó NÃO muda de `status` (suspensão ⟂ lifecycle: segue vivo
         // e endereçável). Mantém ProjectedNode intocado → zero costura no shell (app/inspector.rs).
         | DomainEvent::NodeSuspended { .. }
-        | DomainEvent::NodeResumed { .. } => {}
+        | DomainEvent::NodeResumed { .. }
+        // r5 perf-ws: Descarregar é META (livro-razão do gesto; o estado vivo é dos PTYs e o
+        // religar usa o fluxo de restore F1-4-3) — sem efeito na projeção do canvas.
+        | DomainEvent::WorkspaceUnloaded { .. } => {}
     }
 }
 
@@ -1250,7 +1265,22 @@ pub struct EventStore {
     jsonl_path: PathBuf,
     snapshots_dir: PathBuf,
     next_seq: u64,
+    /// r5 perf-ws: cache incremental de [`EventStore::project`] — `(último seq aplicado,
+    /// estado)`. O log é append-only (nunca reescrito in-place), então "aplicar só
+    /// `seq > último`" é sempre correto, inclusive para appends de OUTRO processo (o bin
+    /// `lina` no mesmo `.db`). `RefCell` porque `project(&self)` é a API consolidada e a
+    /// `Connection` já torna o tipo `!Sync` (o store vive sob `Mutex` nos consumidores).
+    proj_cache: std::cell::RefCell<Option<(u64, ProjectedState)>>,
+    /// Contador observável de eventos reaplicados por `project()` desde o open — a prova
+    /// DETERMINÍSTICA do incremental nos testes (timing seria flaky).
+    replayed_total: std::cell::Cell<u64>,
 }
+
+/// r5 perf-ws: cadência do snapshot AUTOMÁTICO no append (1 a cada N eventos). Sem isso,
+/// `take_snapshot` não tinha chamador em produção e toda conexão NOVA re-parseava o log
+/// inteiro (~91ms em 21k eventos, crescendo sem teto). Alto o bastante para testes
+/// pequenos nunca cruzarem; baixo o bastante para limitar o replay frio a poucos ms.
+const SNAPSHOT_EVERY: u64 = 4096;
 
 impl EventStore {
     /// Abre (ou cria) o event store em `dir`. **Não** faz recuperação — use
@@ -1287,6 +1317,8 @@ impl EventStore {
             jsonl_path,
             snapshots_dir,
             next_seq: next_seq as u64,
+            proj_cache: std::cell::RefCell::new(None),
+            replayed_total: std::cell::Cell::new(0),
         })
     }
 
@@ -1409,6 +1441,18 @@ impl EventStore {
         }
         // Espelha no JSONL com o `seq` EFETIVAMENTE gravado (não o otimista) — DB e espelho casam.
         append_jsonl(&self.jsonl_path, &rec)?;
+        // r5 perf-ws: snapshot AUTOMÁTICO a cada SNAPSHOT_EVERY appends — limita o replay
+        // de conexões FRESCAS (sidebar/bin) ao delta pós-snapshot. Best-effort: o append já
+        // é durável; falha de snapshot loga ALTO e nunca derruba o caminho de escrita.
+        if rec.seq.is_multiple_of(SNAPSHOT_EVERY) {
+            if let Err(e) = self.take_snapshot() {
+                eprintln!(
+                    "lina-core: snapshot automático no seq {} falhou ({e}); replay segue \
+                     correto, só mais lento",
+                    rec.seq
+                );
+            }
+        }
         Ok(rec.seq)
     }
 
@@ -1432,29 +1476,50 @@ impl EventStore {
     }
 
     /// Estado projetado = último snapshot + replay dos eventos após ele (com upcasting).
-    /// Determinístico.
+    /// Determinístico. **r5 perf-ws:** INCREMENTAL na mesma instância — parte do cache em
+    /// memória (ou do snapshot, na 1ª chamada) e reaplica SÓ `seq > último aplicado`; o
+    /// caso quente do tick (nada novo) vira 1 SELECT vazio em vez de re-parsear o log
+    /// inteiro (medido: 91ms em 21k eventos, a cada 120ms POR runtime). Appends de outro
+    /// processo entram pelo mesmo delta de seq (log append-only — nunca reescrito).
     pub fn project(&self) -> Result<ProjectedState, StoreError> {
-        let (mut state, from_seq) = match self.latest_snapshot()? {
+        let cached = self.proj_cache.borrow().clone();
+        let (mut state, from_seq) = match cached {
             Some((seq, st)) => (st, seq),
-            None => (ProjectedState::default(), 0),
+            None => match self.latest_snapshot()? {
+                Some((seq, st)) => (st, seq),
+                None => (ProjectedState::default(), 0),
+            },
         };
-        let mut stmt = self
-            .conn
-            .prepare("SELECT kind, version, payload FROM events WHERE seq > ?1 ORDER BY seq ASC")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, kind, version, payload FROM events WHERE seq > ?1 ORDER BY seq ASC",
+        )?;
         let rows = stmt.query_map([from_seq as i64], |r| {
             Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?;
+        let mut last_seq = from_seq;
         for row in rows {
-            let (kind, version, payload_str) = row?;
+            let (seq, kind, version, payload_str) = row?;
             let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
             let event = DomainEvent::from_record(&kind, version as u32, payload)?;
             apply(&mut state, &event);
+            last_seq = seq as u64;
+            self.replayed_total.set(self.replayed_total.get() + 1);
         }
+        *self.proj_cache.borrow_mut() = Some((last_seq, state.clone()));
         Ok(state)
+    }
+
+    /// Total de eventos REAPLICADOS por [`EventStore::project`] desde o open — o
+    /// observável determinístico do incremental (r5 perf-ws): sem evento novo, duas
+    /// chamadas seguidas somam zero aqui.
+    #[must_use]
+    pub fn replayed_events_total(&self) -> u64 {
+        self.replayed_total.get()
     }
 
     /// Materializa um snapshot do estado projetado (tabela + arquivo espelho em
@@ -1702,6 +1767,117 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// **r5 perf-ws (BUG 3) — `project()` é INCREMENTAL na mesma instância.** Medido: 91ms
+    /// por replay completo num log de 21k eventos, pago a cada 120ms POR runtime pelo tick
+    /// do MailboxPump (N Espaços ≈ 291% de um core). O cache em memória reaplica SÓ os
+    /// eventos novos (seq > último aplicado) — provado pelo contador determinístico
+    /// `replayed_events_total` (nunca por timing). Appends EXTERNOS (outro processo: o bin
+    /// `lina`) entram pelo mesmo delta de seq — a igualdade com um fold fresco é o juiz.
+    #[test]
+    fn project_is_incremental_and_matches_full_replay() {
+        let tmp = TempDir::new("proj-inc");
+        let mut store = EventStore::open(tmp.path()).expect("abrir");
+        let (_dev, _qa) = seed(&mut store);
+        let seeded = store.event_count().expect("count");
+
+        let p1 = store.project().expect("project 1");
+        let after_first = store.replayed_events_total();
+        assert_eq!(after_first, seeded, "1º project reaplica o log inteiro");
+
+        let p2 = store.project().expect("project 2");
+        assert_eq!(p1, p2);
+        assert_eq!(
+            store.replayed_events_total(),
+            after_first,
+            "sem evento novo o 2º project reaplica ZERO (era 91ms de replay por tick)"
+        );
+
+        // Append EXTERNO (2º processo — o bin `lina` escreve no MESMO log): o cache da
+        // instância quente precisa enxergar o delta pelo seq, nunca servir estado velho.
+        let mut other = EventStore::open(tmp.path()).expect("2ª conexão");
+        other
+            .append(&DomainEvent::TokenUsageReported {
+                node: "nó-externo".into(),
+                tokens: 7,
+            })
+            .expect("append externo");
+
+        let p3 = store.project().expect("project 3");
+        assert_eq!(
+            store.replayed_events_total(),
+            after_first + 1,
+            "só o delta (1 evento externo) é reaplicado"
+        );
+        let fresh = EventStore::open(tmp.path()).expect("conexão fresca");
+        assert_eq!(
+            p3,
+            fresh.project().expect("fold fresco"),
+            "cache nunca diverge do fold completo"
+        );
+    }
+
+    /// **r5 perf-ws — auto-snapshot a cada [`SNAPSHOT_EVERY`] appends.** `take_snapshot`
+    /// tinha ZERO chamadores em produção → conexões NOVAS (refresh do sidebar por Espaço,
+    /// verbos do bin) re-parseavam o log INTEIRO, e o custo crescia sem teto com o log.
+    /// Com a cadência, o replay de uma conexão fresca fica limitado ao delta pós-snapshot.
+    #[test]
+    fn append_auto_snapshots_to_bound_fresh_connection_replay() {
+        let tmp = TempDir::new("auto-snap");
+        let mut store = EventStore::open(tmp.path()).expect("abrir");
+        for i in 0..(SNAPSHOT_EVERY + 10) {
+            store
+                .append(&DomainEvent::TokenUsageReported {
+                    node: format!("nó-{}", i % 3),
+                    tokens: i,
+                })
+                .expect("append");
+        }
+        let fresh = EventStore::open(tmp.path()).expect("conexão fresca");
+        let p_fresh = fresh.project().expect("project fresco");
+        assert!(
+            fresh.replayed_events_total() < SNAPSHOT_EVERY,
+            "snapshot automático limita o replay da conexão fresca (reaplicou {}, log tem {})",
+            fresh.replayed_events_total(),
+            SNAPSHOT_EVERY + 10
+        );
+        assert_eq!(
+            p_fresh,
+            store.project().expect("project quente"),
+            "snapshot + delta = fold completo"
+        );
+    }
+
+    /// **r5 perf-ws — `WorkspaceUnloaded` é META e aditivo:** replay com o evento no log
+    /// produz a MESMA projeção (sem efeito no canvas) e o roundtrip preserva os campos —
+    /// o executor do Descarregar (costura no app) lê `parked`/`kept` do log para religar.
+    #[test]
+    fn workspace_unloaded_is_meta_and_roundtrips() {
+        let tmp = TempDir::new("ws-unload");
+        let mut store = EventStore::open(tmp.path()).expect("abrir");
+        seed(&mut store);
+        let before = store.project().expect("projeção antes");
+        store
+            .append(&DomainEvent::WorkspaceUnloaded {
+                parked: vec!["n1".into(), "n2".into()],
+                kept: vec!["n3".into()],
+            })
+            .expect("append");
+        assert_eq!(
+            before,
+            store.project().expect("projeção depois"),
+            "META: zero efeito na projeção do canvas"
+        );
+        let rec = store
+            .events()
+            .expect("events")
+            .into_iter()
+            .rev()
+            .find(|r| r.kind == "WorkspaceUnloaded")
+            .expect("evento no log");
+        assert_eq!(rec.payload["parked"][1].as_str(), Some("n2"));
+        assert_eq!(rec.payload["kept"][0].as_str(), Some("n3"));
     }
 
     /// Host de UI gravador para checar `Recovering`/`Recovered`.

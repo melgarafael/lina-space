@@ -308,3 +308,76 @@ pub fn record_transition(
     store.append(&event)?;
     Ok(true)
 }
+
+/// **r5 perf-ws — plano de DESCARREGAR um Espaço de fundo** (modelo Maestri do fundador:
+/// "desligar terminais SEM remover; religam ao focar"). Restrição LITERAL dele: *"sem
+/// interferir nos processos que estiverem rodando nesse workspace"* — por isso a política
+/// é conservadora: só o **`Idle`** (turno fechado, nada em curso) é estacionável; `Busy`
+/// (trabalhando), `Blocked` (aguardando gesto humano) e `Starting/Running/Ready` (em
+/// atividade ou prestes a receber o 1º prompt) são PRESERVADOS — o chamador narra/pede
+/// confirmação para esses. `Dead` não é nada (já desligado). Função PURA: quem mata PTY,
+/// apenda [`crate::DomainEvent::WorkspaceUnloaded`] e religa no foco é o executor do app.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnloadPlan {
+    /// Seguros de desligar agora (PTY morre; nó/posição/scrollback ficam).
+    pub park: Vec<NodeId>,
+    /// Vivos preservados (trabalhando/aguardando) — o "sem interferir" do fundador.
+    pub keep: Vec<NodeId>,
+}
+
+/// Deriva o plano do roster vivo do Espaço (a mesma fonte do `lina list`).
+#[must_use]
+pub fn unload_plan(roster: &[crate::NodeInfo]) -> UnloadPlan {
+    let mut plan = UnloadPlan::default();
+    for n in roster {
+        match n.status {
+            crate::NodeStatus::Idle => plan.park.push(n.id),
+            crate::NodeStatus::Dead => {}
+            _ => plan.keep.push(n.id),
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod unload_tests {
+    use super::*;
+    use crate::{NodeInfo, NodeStatus};
+
+    fn info(status: NodeStatus) -> NodeInfo {
+        NodeInfo {
+            id: uuid::Uuid::now_v7(),
+            name: format!("{status:?}"),
+            role: None,
+            status,
+        }
+    }
+
+    /// A restrição do fundador codificada: só Idle estaciona; Busy/Blocked/Starting/
+    /// Running/Ready preservados; Dead ignorado. Vazio → plano vazio (não-vácuo: se a
+    /// política regredir para "estaciona tudo", o keep esvazia e este teste quebra).
+    #[test]
+    fn unload_plan_parks_only_idle_and_preserves_working_nodes() {
+        let idle = info(NodeStatus::Idle);
+        let busy = info(NodeStatus::Busy);
+        let blocked = info(NodeStatus::Blocked);
+        let ready = info(NodeStatus::Ready);
+        let dead = info(NodeStatus::Dead);
+        let roster = vec![
+            idle.clone(),
+            busy.clone(),
+            blocked.clone(),
+            ready.clone(),
+            dead,
+        ];
+
+        let plan = unload_plan(&roster);
+        assert_eq!(plan.park, vec![idle.id], "só o ocioso desliga");
+        assert_eq!(
+            plan.keep,
+            vec![busy.id, blocked.id, ready.id],
+            "trabalhando/aguardando/prestes-a-receber ficam vivos (sem interferir)"
+        );
+        assert_eq!(unload_plan(&[]), UnloadPlan::default());
+    }
+}

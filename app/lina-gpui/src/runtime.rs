@@ -389,34 +389,12 @@ pub fn boot_ws_runtime(
         );
         None
     };
-    // Sessões (camada 3 — custo~): poll do SessionWatch em thread própria (gpui-free);
-    // o pattern vem do TOML do perfil (F1-1-1); HOME real do usuário (não é teste).
+    // Sessões (camada 3 — custo~): r5 perf-ws — o runtime se INSCREVE no hub ÚNICO do
+    // processo (antes: 1 thread + 1 SessionWatch ZERADO por Espaço = N cold-parses do HOME
+    // inteiro + N caminhadas/stat a cada 500ms — a regressão de perf do multi-workspace).
+    // O pattern segue vindo do TOML do perfil (F1-1-1); HOME real do usuário (não é teste).
     if let Some(pattern) = injection_profile.session_dir_pattern.clone() {
-        if let Some(home) = std::env::var_os("HOME") {
-            let out = Arc::clone(&dash.sessions);
-            let cli_id = injection_profile.id.clone();
-            thread::spawn(move || {
-                let mut watch = lina_session_watch::SessionWatch::with_home(PathBuf::from(home));
-                watch.add_source(cli_id, pattern);
-                let mut known: std::collections::BTreeSet<(String, String)> =
-                    std::collections::BTreeSet::new();
-                loop {
-                    if let Ok(o) = watch.poll_once() {
-                        if !o.sessions_updated.is_empty() {
-                            known.extend(o.sessions_updated);
-                            let snapshot: Vec<_> = known
-                                .iter()
-                                .filter_map(|(c, s)| watch.scanner().session(c, s))
-                                .collect();
-                            if let Ok(mut dst) = out.lock() {
-                                *dst = snapshot;
-                            }
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(500));
-                }
-            });
-        }
+        subscribe_sessions(&injection_profile.id, &pattern, &dash.sessions);
     }
 
     // ── W3-6c (ADR 0004) · COFRE DE SEGREDO + ENV LIMPO (fios 1 e 3) — ANTES de spawnar qualquer PTY.
@@ -624,4 +602,185 @@ pub fn boot_ws_runtime(
         _mailbox_pump,
         _broker_pump,
     })
+}
+
+// ───────────────── r5 perf-ws · hub ÚNICO de session-watch por PROCESSO ─────────────────
+//
+// ANTES (a regressão do multi-workspace): cada `boot_ws_runtime` subia SUA thread com um
+// `SessionWatch` ZERADO — N Espaços = N cold-parses do HOME inteiro (medido na máquina do
+// fundador: **10,8s** de parse por boot, 3.735 jsonl/1,3GB) + N caminhadas+stat a cada
+// 500ms (medido: ~10ms/poll real, 37ms em cache frio ⇒ 4 Espaços ≈ 30k stats/s contínuos).
+// DEPOIS: UM watcher por processo; fontes deduplicadas; cold-parse 1×; cada Espaço novo só
+// se INSCREVE e recebe o snapshot corrente na hora. As sessões são dado GLOBAL da máquina
+// (o HOME é um só) — não há nada por-Espaço numa varredura dessas.
+
+/// Hub testável (sem thread/relógio próprios): o estado da varredura única + os
+/// inscritos (`Weak` — runtime removido sai sozinho do fan-out).
+struct SessionHub {
+    watch: lina_session_watch::SessionWatch,
+    sources: std::collections::BTreeSet<(String, String)>,
+    known: std::collections::BTreeSet<(String, String)>,
+    last_snapshot: Vec<lina_session_watch::Session>,
+    subs: Vec<std::sync::Weak<Mutex<Vec<lina_session_watch::Session>>>>,
+}
+
+impl SessionHub {
+    fn new(home: PathBuf) -> Self {
+        Self {
+            watch: lina_session_watch::SessionWatch::with_home(home),
+            sources: std::collections::BTreeSet::new(),
+            known: std::collections::BTreeSet::new(),
+            last_snapshot: Vec::new(),
+            subs: Vec::new(),
+        }
+    }
+
+    /// Registra uma fonte (cli + pattern do TOML), DEDUPLICADA: N Espaços com o mesmo
+    /// perfil = 1 varredura. Fonte nova (outro CLI/pattern) entra no próximo poll.
+    fn add_source(&mut self, cli: &str, pattern: &str) {
+        if self.sources.insert((cli.to_string(), pattern.to_string())) {
+            self.watch.add_source(cli, pattern);
+        }
+    }
+
+    #[cfg(test)]
+    fn sources_len(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Inscreve o destino de UM runtime e o SEMEIA com o snapshot corrente — um Espaço
+    /// aberto depois do cold-parse não fica vazio esperando o próximo update.
+    fn subscribe(&mut self, out: &Arc<Mutex<Vec<lina_session_watch::Session>>>) {
+        if let Ok(mut dst) = out.lock() {
+            dst.clone_from(&self.last_snapshot);
+        }
+        self.subs.push(Arc::downgrade(out));
+    }
+
+    /// Um passo: varre 1× e, se algo mudou, refaz o snapshot e alimenta TODOS os
+    /// inscritos vivos (poda os mortos). Devolve quantos inscritos foram alimentados.
+    fn poll_and_fanout(&mut self) -> usize {
+        let updated = match self.watch.poll_once() {
+            Ok(o) if !o.sessions_updated.is_empty() => {
+                self.known.extend(o.sessions_updated);
+                self.last_snapshot = self
+                    .known
+                    .iter()
+                    .filter_map(|(c, s)| self.watch.scanner().session(c, s))
+                    .collect();
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                eprintln!("lina-gpui: [SESSÕES] poll do hub falhou (re-tenta): {e}");
+                false
+            }
+        };
+        if !updated {
+            self.subs.retain(|w| w.strong_count() > 0);
+            return 0;
+        }
+        let mut fed = 0;
+        self.subs.retain(|w| match w.upgrade() {
+            Some(out) => {
+                if let Ok(mut dst) = out.lock() {
+                    dst.clone_from(&self.last_snapshot);
+                    fed += 1;
+                }
+                true
+            }
+            None => false,
+        });
+        fed
+    }
+}
+
+/// Hub global do processo (nasce no 1º Espaço com `session_dir_pattern`).
+static SESSION_HUB: std::sync::OnceLock<Arc<Mutex<SessionHub>>> = std::sync::OnceLock::new();
+
+/// Inscreve o `dash.sessions` de um runtime no hub único (cria hub + thread na 1ª chamada).
+fn subscribe_sessions(
+    cli: &str,
+    pattern: &str,
+    out: &Arc<Mutex<Vec<lina_session_watch::Session>>>,
+) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return; // sem HOME não há o que varrer (mesma degradação de antes)
+    };
+    let hub = SESSION_HUB.get_or_init(|| {
+        let hub = Arc::new(Mutex::new(SessionHub::new(PathBuf::from(home))));
+        let for_thread = Arc::clone(&hub);
+        let spawned = thread::Builder::new()
+            .name("lina-session-hub".into())
+            .spawn(move || loop {
+                lock(&for_thread).poll_and_fanout();
+                thread::sleep(Duration::from_millis(500));
+            });
+        if let Err(e) = spawned {
+            eprintln!("lina-gpui: [SESSÕES] hub sem thread ({e}); dashboards sem sessões");
+        }
+        hub
+    });
+    let mut h = lock(hub);
+    h.add_source(cli, pattern);
+    h.subscribe(out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **r5 perf-ws (regressão do multi-workspace):** N Espaços compartilham UMA varredura —
+    /// fonte duplicada não duplica o walk, todo inscrito recebe o MESMO snapshot, e um
+    /// inscrito TARDIO (Espaço aberto depois do cold-parse) nasce já alimentado.
+    #[test]
+    fn session_hub_single_scan_feeds_all_subscribers_and_dedupes_sources() {
+        let home = std::env::temp_dir().join(format!("lina-hub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let proj = home.join(".claude/projects/proj-a");
+        std::fs::create_dir_all(&proj).expect("corpus");
+        std::fs::write(
+            proj.join("sess-1.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"sess-1","requestId":"r1","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+                "\n"
+            ),
+        )
+        .expect("fixture");
+
+        let mut hub = SessionHub::new(home.clone());
+        hub.add_source("claude-code", "~/.claude/projects/*/*.jsonl");
+        // N runtimes com o MESMO perfil registram a MESMA fonte → 1 varredura, não N.
+        hub.add_source("claude-code", "~/.claude/projects/*/*.jsonl");
+        assert_eq!(hub.sources_len(), 1, "fonte deduplicada");
+
+        let a: Arc<Mutex<Vec<lina_session_watch::Session>>> = Arc::default();
+        hub.subscribe(&a);
+        let fed = hub.poll_and_fanout();
+        assert_eq!(fed, 1, "1 inscrito alimentado no update");
+        assert_eq!(lock(&a).len(), 1, "snapshot com a sessão do corpus");
+
+        // Inscrito TARDIO: recebe o snapshot corrente NA INSCRIÇÃO (sem esperar update).
+        let b: Arc<Mutex<Vec<lina_session_watch::Session>>> = Arc::default();
+        hub.subscribe(&b);
+        assert_eq!(*lock(&a), *lock(&b), "tardio nasce com o snapshot corrente");
+
+        // Sem mudança no disco: poll não refaz snapshot nem realimenta ninguém.
+        assert_eq!(hub.poll_and_fanout(), 0, "estável → zero fan-out");
+
+        // Inscrito morto sai sozinho do fan-out (Weak podado).
+        drop(a);
+        std::fs::write(
+            proj.join("sess-2.jsonl"),
+            concat!(
+                r#"{"type":"assistant","sessionId":"sess-2","requestId":"r2","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                "\n"
+            ),
+        )
+        .expect("2ª sessão");
+        assert_eq!(hub.poll_and_fanout(), 1, "só o inscrito VIVO é alimentado");
+        assert_eq!(lock(&b).len(), 2, "snapshot cresceu com a sessão nova");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
