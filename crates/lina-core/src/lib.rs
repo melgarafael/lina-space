@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -326,6 +326,13 @@ struct TermShared {
     metrics: MetricsInner,
     /// W5-2 FIAÇÃO: cabo do scrollback (None = sem persistência; caminho legado intacto).
     scrollback: Option<ScrollbackSink>,
+    /// F2-0-6 (higiene pós-QA): sinal "sync abriu" — a vigia BLOQUEIA aqui sem timeout
+    /// enquanto não há sync pendente (**zero wakeup ocioso** — mesma doutrina anti-desperdício
+    /// do scrollback/41GB); o `flush` do reader notifica quando `sync_deadline()` vira `Some`.
+    /// O bool dentro do Mutex evita lost-wakeup (sinal antes do wait). Saída no shutdown:
+    /// wait com timeout de segurança (5s) re-checa `stop`/estado — thread parada nunca vaza
+    /// além disso após um kill.
+    sync_wake: (Mutex<bool>, Condvar),
 }
 
 struct Terminal {
@@ -450,6 +457,7 @@ impl PtyHost {
             state: Mutex::new(TerminalState::Running),
             metrics: MetricsInner::default(),
             scrollback: sink,
+            sync_wake: (Mutex::new(false), Condvar::new()),
         });
 
         let join = {
@@ -743,22 +751,41 @@ fn run_sync_watchdog(
     node: NodeId,
     seq: Arc<AtomicU64>,
 ) {
-    const IDLE_NAP: Duration = Duration::from_millis(100);
+    // Timeout de SEGURANÇA do wait (não é cadência): só para re-checar stop/estado de vez em
+    // quando — um kill com a vigia parada nunca vaza a thread além disso.
+    const STOP_RECHECK: Duration = Duration::from_secs(5);
     loop {
-        if shared.stop.load(Ordering::Relaxed) {
-            break;
+        // Fase 1 — OCIOSA DE VERDADE: bloqueia na condvar até o flush sinalizar "sync abriu"
+        // (zero wakeup enquanto nada acontece — invariante de QA da F2-0-6).
+        {
+            let (m, cv) = &shared.sync_wake;
+            let mut pending = lock(m);
+            loop {
+                if shared.stop.load(Ordering::Relaxed)
+                    || !matches!(*lock(&shared.state), TerminalState::Running)
+                {
+                    return;
+                }
+                if *pending {
+                    *pending = false;
+                    break;
+                }
+                pending = cv
+                    .wait_timeout(pending, STOP_RECHECK)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .0;
+            }
         }
-        if !matches!(*lock(&shared.state), TerminalState::Running) {
-            break;
+        // Fase 2 — há (ou houve) um sync pendente: serve até o deadline zerar.
+        while let Some(dl) = service_sync_ceiling(&shared, &delta_tx, node, &seq) {
+            if shared.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(
+                dl.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
         }
-        let nap = match service_sync_ceiling(&shared, &delta_tx, node, &seq) {
-            Some(dl) => dl
-                .saturating_duration_since(Instant::now())
-                .min(IDLE_NAP)
-                .max(Duration::from_millis(1)),
-            None => IDLE_NAP,
-        };
-        thread::sleep(nap);
     }
 }
 
@@ -870,7 +897,7 @@ fn flush(
     }
     let bytes = batch.len();
 
-    let (rows, scrolled) = {
+    let (rows, scrolled, sync_opened) = {
         let mut vt = lock(&shared.vt);
         vt.advance(batch.as_slice());
         let dirty = vt.damaged_rows();
@@ -878,8 +905,14 @@ fn flush(
         // W5-2 FIAÇÃO: drena as linhas que saíram do viewport (vazio se o backend não captura).
         // Sempre drena para não deixar o buffer interno crescer.
         let scrolled = vt.take_scrollback();
-        (dirty, scrolled)
+        // F2-0-6: o advance pode ter ABERTO um sync (BSU sem ESU neste batch) — acorda a vigia.
+        (dirty, scrolled, vt.sync_deadline().is_some())
     };
+    if sync_opened {
+        let (m, cv) = &shared.sync_wake;
+        *lock(m) = true;
+        cv.notify_one();
+    }
     batch.clear();
 
     // W5-2 FIAÇÃO: persiste o scrollback colhido FORA do lock do vt (não aninha vt↔store). Cada
