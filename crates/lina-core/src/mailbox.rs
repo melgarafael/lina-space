@@ -609,6 +609,13 @@ impl Mailbox {
                 FileVerdict::Skip => {}
             }
         }
+        // FIFO REAL por chegada (`ts_ms`; desempate por id, determinístico): a ordem de filename
+        // só coincide com a temporal em ids `msg_<uuid v7>` — ids determinísticos (ex.:
+        // `msg_spawn1st-*`) ordenavam DEPOIS de qualquer v7 e furavam a fila (r4 achado #12).
+        // Ordem é cooperação (fairness), nunca autorização: quem decide entrega/identidade são os
+        // guardrails do router à frente — um `ts_ms` forjado não compra nada que enfileirar mais
+        // cedo já não desse.
+        out.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.id.cmp(&b.id)));
         Ok(out)
     }
 
@@ -1115,6 +1122,49 @@ mod tests {
         );
         // Consumido: um segundo drain vem vazio.
         assert!(mb.drain().expect("drain 2").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **r4 achado #12 (dogfooding 2026-06-11) — FIFO REAL é por `ts_ms`, não por nome de arquivo.**
+    /// O id determinístico do 1º prompt de spawn (`msg_spawn1st-<uuid>`) quebra a premissa
+    /// "ordem de filename = ordem temporal" (`'s' > dígito` no sort): na sessão real, um handoff
+    /// 17 min MAIS NOVO furou a fila na frente do 1º prompt, ocupou o alvo por um turno de 24 min
+    /// e o 1º prompt morreu no teto de retenção (DLQ). O drain deve devolver em ordem de chegada.
+    #[test]
+    fn drain_to_inflight_orders_by_ts_not_by_filename() {
+        let dir = std::env::temp_dir().join(format!("lina-mbox-fifo-ts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+
+        // 1º prompt do spawn: MAIS VELHO (ts 1000), id determinístico que ordena DEPOIS no filename.
+        let mut spawn1st = MailMessage::new("@Maestro", "@Filho", "ask", "1o prompt do spawn");
+        spawn1st.id = "msg_spawn1st-019eb71d-08ba-7aa2-b1a7-7ee5960cc1d8".into();
+        spawn1st.ts_ms = 1_000;
+        // Mensagem comum: MAIS NOVA (ts 2000), id v7 que ordena ANTES no filename.
+        let mut depois = MailMessage::new("@Maestro", "@Filho", "ask", "chegou depois");
+        depois.id = "msg_019eb721-7df1-7b02-ae96-a3e88468d284".into();
+        depois.ts_ms = 2_000;
+        mb.enqueue_as("@Maestro", &spawn1st).expect("enqueue 1o");
+        mb.enqueue_as("@Maestro", &depois).expect("enqueue 2o");
+
+        let order = |msgs: &[MailMessage]| {
+            msgs.iter()
+                .map(|m| m.payload.clone())
+                .collect::<Vec<String>>()
+        };
+        let drained = mb.drain_to_inflight().expect("drain");
+        assert_eq!(
+            order(&drained),
+            vec!["1o prompt do spawn", "chegou depois"],
+            "quem chegou primeiro drena primeiro (ts_ms), mesmo com id fora do padrão v7"
+        );
+        // Pós-"restart" (órfãos re-drenados do .inflight sem ack): MESMA ordem temporal.
+        let redrained = mb.drain_to_inflight().expect("re-drain órfãos");
+        assert_eq!(
+            order(&redrained),
+            vec!["1o prompt do spawn", "chegou depois"],
+            "a recuperação de órfãos preserva a ordem de chegada"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

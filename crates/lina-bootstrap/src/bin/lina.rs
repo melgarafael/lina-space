@@ -440,6 +440,59 @@ fn run_handoff(args: &[String]) -> ExitCode {
 /// (F1-0-3/ADR 0019 §5: o veredito vem do log, nunca de view cacheada) + última
 /// atividade A2A. **Leitura PURA** de `agents.json` + `log.jsonl` — não injeta NADA no
 /// terminal do colega (espiar ≠ interromper; é o anti-"cutucar pra ver se está vivo").
+/// **PURO (r4 achado #13) — resolve um NOME para o node-id CERTO do log.** Nome reusado entre
+/// sessões gera homônimos: o `check` apontava o lifecycle MORTO da sessão antiga. Semântica:
+/// o nome ATUAL de um nó é o seu ÚLTIMO `NodeRenamed`; entre os nós cujo nome atual casa com
+/// `target` (tolerante a `@`/caixa — espelho do `normalize_name` do roster vivo), vence o
+/// **vivo** mais recentemente batizado; sem vivo, o último batizado (exibe o morto, honesto).
+/// Tolera linhas parciais/inválidas (arquivo sob append).
+fn resolve_check_node(content: &str, target: &str) -> Option<String> {
+    fn norm(s: &str) -> String {
+        s.trim().trim_start_matches('@').trim().to_ascii_lowercase()
+    }
+    let want = norm(target);
+    if want.is_empty() {
+        return None;
+    }
+    // (node → nome atual), mantido em ordem de RECÊNCIA do último batismo; último status por nó.
+    let mut names: Vec<(String, String)> = Vec::new();
+    let mut last_status: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        match v["kind"].as_str().unwrap_or_default() {
+            "NodeRenamed" => {
+                if let (Some(node), Some(name)) = (p["node"].as_str(), p["name"].as_str()) {
+                    names.retain(|(n, _)| n != node);
+                    names.push((node.to_string(), name.to_string()));
+                }
+            }
+            "NodeStatusChanged" => {
+                if let (Some(node), Some(st)) = (p["node"].as_str(), p["status"].as_str()) {
+                    last_status.insert(node.to_string(), st.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let candidates: Vec<&str> = names
+        .iter()
+        .filter(|(_, name)| norm(name) == want)
+        .map(|(node, _)| node.as_str())
+        .collect();
+    // Vivo = último status ≠ Dead (sem status registrado = recém-batizado → vivo).
+    let alive = |node: &str| last_status.get(node).map(String::as_str) != Some("Dead");
+    candidates
+        .iter()
+        .rev()
+        .find(|n| alive(n))
+        .or_else(|| candidates.last())
+        .map(|n| (*n).to_string())
+}
+
 fn run_check(args: &[String]) -> ExitCode {
     let Some(target_raw) = args.first() else {
         usage();
@@ -456,50 +509,49 @@ fn run_check(args: &[String]) -> ExitCode {
 
     // Projeção do lifecycle + última atividade, varrendo o espelho `log.jsonl` em ordem
     // (tolerante a linha parcial — arquivo sob append, mesma postura do poll de `ask`).
-    let mut node_id: Option<String> = None;
+    // r4 achado #13: a resolução nome→nó vem PRONTA de `resolve_check_node` (homônimo vivo
+    // vence o morto de sessão antiga; sigil/caixa tolerados) — antes, um match exato inline
+    // grudava no primeiro nó renomeado e mostrava o lifecycle errado em nome reusado.
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let node_id = resolve_check_node(&content, target);
     let mut state: Option<(String, String)> = None; // (status, reason)
     let mut stalled = false;
     let mut last_a2a: Option<(String, String, String, u64)> = None; // intent, from, to, ts
-    if let Ok(content) = std::fs::read_to_string(event_log_path()) {
-        for line in content.lines().filter(|l| !l.trim().is_empty()) {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let p = &v["payload"];
-            match v["kind"].as_str().unwrap_or_default() {
-                "NodeRenamed" if p["name"].as_str() == Some(target) => {
-                    node_id = p["node"].as_str().map(str::to_string);
-                }
-                "NodeStatusChanged"
-                    if node_id.is_some() && node_id.as_deref() == p["node"].as_str() =>
-                {
-                    state = Some((
-                        p["status"].as_str().unwrap_or("?").to_string(),
-                        p["reason"].as_str().unwrap_or("").to_string(),
-                    ));
-                    stalled = false; // transição limpa o WARN (regra da projeção F1-0-3)
-                }
-                "NodeStalled" if node_id.is_some() && node_id.as_deref() == p["node"].as_str() => {
-                    stalled = true;
-                }
-                "MessageRouted" => {
-                    let from = p["from"].as_str().unwrap_or_default();
-                    let to = p["to"].as_str().unwrap_or_default();
-                    let to_node = p["to_node"].as_str().unwrap_or_default();
-                    let touches = from == target
-                        || to.trim_start_matches('@') == target
-                        || (!to_node.is_empty() && node_id.as_deref() == Some(to_node));
-                    if touches {
-                        last_a2a = Some((
-                            p["intent"].as_str().unwrap_or("?").to_string(),
-                            from.to_string(),
-                            to.to_string(),
-                            v["ts"].as_u64().unwrap_or(0),
-                        ));
-                    }
-                }
-                _ => {}
+    for line in content.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        match v["kind"].as_str().unwrap_or_default() {
+            "NodeStatusChanged"
+                if node_id.is_some() && node_id.as_deref() == p["node"].as_str() =>
+            {
+                state = Some((
+                    p["status"].as_str().unwrap_or("?").to_string(),
+                    p["reason"].as_str().unwrap_or("").to_string(),
+                ));
+                stalled = false; // transição limpa o WARN (regra da projeção F1-0-3)
             }
+            "NodeStalled" if node_id.is_some() && node_id.as_deref() == p["node"].as_str() => {
+                stalled = true;
+            }
+            "MessageRouted" => {
+                let from = p["from"].as_str().unwrap_or_default();
+                let to = p["to"].as_str().unwrap_or_default();
+                let to_node = p["to_node"].as_str().unwrap_or_default();
+                let touches = from == target
+                    || to.trim_start_matches('@') == target
+                    || (!to_node.is_empty() && node_id.as_deref() == Some(to_node));
+                if touches {
+                    last_a2a = Some((
+                        p["intent"].as_str().unwrap_or("?").to_string(),
+                        from.to_string(),
+                        to.to_string(),
+                        v["ts"].as_u64().unwrap_or(0),
+                    ));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -884,6 +936,13 @@ fn enqueue_and_report_spawn(from: &str, name: &str, role: &str, msg: MailMessage
     if let Err(e) = enqueue_per_node(&mailbox, from, &msg) {
         eprintln!("lina: falha ao enfileirar o pedido de spawn na mailbox: {e}");
         return ExitCode::from(1);
+    }
+    // r4 (costura do fix #12.1): com o freio cobrindo o spawn, um pedido sob pausa enfileira
+    // DURÁVEL mas só acontece no resume — mesma verdade-inteira do ask/handoff (FIX-4), senão
+    // o agente leria o `Pending` como falha e re-tentaria contra a fila congelada.
+    if let Some(notice) = dispatch_pause_notice(space_state()) {
+        println!("{notice}");
+        return ExitCode::SUCCESS;
     }
     match poll_spawn_outcome(&msg.id) {
         SpawnConfirm::Approved => {
@@ -1975,6 +2034,85 @@ mod vault_tests {
             scan_spawn_outcome("{lixo\n", "msg_A"),
             SpawnConfirm::Pending
         );
+    }
+}
+
+#[cfg(test)]
+mod check_resolution_tests {
+    use super::*;
+
+    fn rename(node: &str, name: &str) -> String {
+        format!(
+            r#"{{"seq":1,"ts":1,"kind":"NodeRenamed","version":1,"payload":{{"event":"NodeRenamed","node":"{node}","name":"{name}"}}}}"#
+        )
+    }
+    fn status(node: &str, st: &str) -> String {
+        format!(
+            r#"{{"seq":1,"ts":1,"kind":"NodeStatusChanged","version":1,"payload":{{"event":"NodeStatusChanged","node":"{node}","status":"{st}","from":"Running","reason":"t"}}}}"#
+        )
+    }
+
+    /// **r4 achado #13 (dogfooding 2026-06-11):** nome REUSADO entre sessões resolvia para o
+    /// lifecycle MORTO da sessão antiga — `lina check "@Bug Finder"` apontava o nó velho. O
+    /// spawn batiza com sigil (`@Bug Finder`), que o match exato antigo nem casava. A resolução
+    /// deve ser tolerante a `@`/caixa e preferir o nó VIVO mais recentemente batizado.
+    #[test]
+    fn reused_name_resolves_to_live_node_not_dead_homonym() {
+        let log = [
+            rename("n-velho", "Bug Finder"),
+            status("n-velho", "Dead"),
+            rename("n-novo", "@Bug Finder"), // spawn batiza COM sigil (run_spawn normaliza p/ @Nome)
+            status("n-novo", "Idle"),
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&log, "Bug Finder").as_deref(),
+            Some("n-novo"),
+            "homônimo vivo vence o morto da sessão antiga (e o sigil não quebra o match)"
+        );
+    }
+
+    /// O nome ATUAL de um nó é o último batismo: quem foi renomeado PARA OUTRO nome deixa de
+    /// responder pelo antigo (senão um check de nome reciclado acharia o dono anterior).
+    #[test]
+    fn renamed_away_node_no_longer_answers_for_old_name() {
+        let log = [
+            rename("n1", "QA"),
+            status("n1", "Idle"),
+            rename("n1", "Revisor"), // n1 agora é outro — "QA" ficou órfão
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&log, "QA"),
+            None,
+            "nome abandonado não resolve mais para o ex-dono"
+        );
+        assert_eq!(
+            resolve_check_node(&log, "Revisor").as_deref(),
+            Some("n1"),
+            "o nome novo resolve"
+        );
+    }
+
+    /// Sem homônimo vivo, o ÚLTIMO batizado vence (exibição honesta do morto — não é erro);
+    /// nome desconhecido → `None`. Linha-lixo tolerada (arquivo sob append).
+    #[test]
+    fn all_dead_falls_back_to_last_claimant_and_unknown_is_none() {
+        let log = [
+            rename("n1", "Bug Finder"),
+            status("n1", "Dead"),
+            "{lixo parcial".to_string(),
+            rename("n2", "@bug finder"), // caixa diferente: mesmo nome normalizado
+            status("n2", "Dead"),
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&log, "Bug Finder").as_deref(),
+            Some("n2"),
+            "todos mortos → o último a reivindicar o nome (status honesto)"
+        );
+        assert_eq!(resolve_check_node(&log, "Ninguem"), None);
+        assert_eq!(resolve_check_node("", "Bug Finder"), None);
     }
 }
 

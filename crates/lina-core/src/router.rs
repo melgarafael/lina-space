@@ -755,7 +755,12 @@ impl Router {
         //    no `resume`. Checado ANTES do dedupe — marcá-la `seen` a tornaria `Duplicate` no resume
         //    (acked sem entregar = perdida). Replies (`reply_to`) e intents de plano PASSAM: o freio
         //    trava a auto-orquestração (delegações), não o fechamento de loops/await já abertos.
-        if self.paused && msg.reply_to.is_none() && is_delegation(&msg.intent) {
+        //    r4 achado #12: o freio cobre TAMBÉM `lina spawn` — deixar o spawn passar criava o
+        //    terminal mas represava o 1º prompt dele (meia-orquestração: nó vivo sem tarefa).
+        if self.paused
+            && msg.reply_to.is_none()
+            && (is_delegation(&msg.intent) || is_spawn_intent(&msg.intent))
+        {
             return RouteOutcome::Queued;
         }
 
@@ -4708,6 +4713,65 @@ mod tests {
         assert!(
             matches!(r[0].1, RouteOutcome::Queued),
             "freio restaurado do log → delegação ainda enfileira (não drena no crash)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **r4 achado #12 (dogfooding 2026-06-11) — o freio cobre TAMBÉM o `lina spawn`.** Antes,
+    /// `is_delegation` não incluía `spawn`: sob pausa o terminal NASCIA (SpawnApproved) mas o seu
+    /// 1º prompt (um `ask`) ficava represado — nó vivo, tarefa nunca chega (a meia-orquestração
+    /// vivida na r3: 6 nós Idle só com bootstrap). O freio é GATE, não kill: o spawn enfileira
+    /// DURÁVEL no `.inflight` e acontece INTEIRO (nó + 1º prompt) no resume.
+    #[test]
+    fn orchestration_pause_queues_spawn_until_resume() {
+        let (mut router, sup, dir) = router_with("freio-spawn");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("freio-spawn");
+        let (rec, mut deliver) = recorder();
+
+        router.pause(&mut ts.store).expect("pause");
+
+        // Sob o freio: o pedido de spawn ENFILEIRA (não executa) — paridade com a delegação.
+        let m = MailMessage::new("@A", "@QA", "spawn", "valide o checkout").with_ref("role:qa");
+        router
+            .mailbox()
+            .enqueue_as("@A", &m)
+            .expect("enqueue por-no");
+        let r1 = router.pump(&mut ts.store, 1000, &mut deliver);
+        assert_eq!(r1.len(), 1);
+        assert!(
+            matches!(r1[0].1, RouteOutcome::Queued),
+            "pausado: o spawn é enfileirado, não decidido; veio {:?}",
+            r1[0].1
+        );
+        assert!(
+            records_of_kind(&ts.store, "SpawnRequested").is_empty(),
+            "sob o freio o gate de spawn NEM roda (nada decidido/logado)"
+        );
+        let infl = router
+            .mailbox()
+            .inflight_dir()
+            .join(format!("{}.json", m.id));
+        assert!(infl.exists(), "o pedido permanece DURÁVEL no .inflight");
+
+        // Resume → o spawn drena e é decidido AGORA (gate intacto: origem → aprovado).
+        let r2 = router
+            .resume(&mut ts.store, 2000, &mut deliver)
+            .expect("resume");
+        assert_eq!(r2.len(), 1, "o resume drenou o spawn enfileirado");
+        assert!(
+            matches!(r2[0].1, RouteOutcome::SpawnApproved { .. }),
+            "ao retomar, o spawn passa pelo gate normalmente; veio {:?}",
+            r2[0].1
+        );
+        assert_eq!(
+            records_of_kind(&ts.store, "SpawnRequested").len(),
+            1,
+            "SpawnRequested logado exatamente 1× (no resume)"
+        );
+        assert!(
+            rec.borrow().is_empty(),
+            "spawn não injeta em PTY algum (decisão de gate, não entrega)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
