@@ -34,3 +34,6 @@ spikes/*/target/
 /GEMINI.md
 /.claude/settings.json
 /.claude/skills/lina-agent-bus/
+# F1-4-7: chave privada de assinatura e lotes de chaves NUNCA entram no repo
+*.lina-signing.private
+chaves-*.csv

@@ -60,6 +60,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$GPUI_BIN" "$APP/Contents/MacOS/$EXE_NAME"
 cp "$LINA_BIN" "$APP/Contents/MacOS/lina"
+# REGRA F1-4-7: o bundle copia por ALLOWLIST (acima). lina-keygen (ferramenta do fundador,
+# assina licencas) NUNCA entra no bundle — nao adicione cp dele aqui.
 chmod +x "$APP/Contents/MacOS/$EXE_NAME" "$APP/Contents/MacOS/lina"
 # Guarda anti-colisão (APFS case-insensitive): o GUI e o CLI têm de ser arquivos DISTINTOS.
 if [[ "$(stat -f%z "$APP/Contents/MacOS/$EXE_NAME")" == "$(stat -f%z "$APP/Contents/MacOS/lina")" ]]; then
