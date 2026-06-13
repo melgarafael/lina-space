@@ -3694,22 +3694,25 @@ impl Render for WorkspaceView {
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
             // P0 (F2-2-2 / ADR 0028 — prioridade soberana da r6): o estado MAIS crítico do produto —
-            // "precisa de você" (gate de custódia humano pendente) — ganha VOZ SEM FOCO via
-            // `Badge::needs_you()`, que compõe o live-region e anuncia ASSERTIVE ao surgir. Os
-            // dot/borda vermelhos da r5 PERMANECEM (o visual); o Badge soma o anúncio (a assimetria
-            // visual-vs-a11y que a r5 ampliou fecha aqui). Id estável por node (`card-needs`+card_eid):
-            // a troca de estado anuncia no MESMO nó. CANAL ÚNICO: o `aria_label` do corpo (abaixo)
-            // NÃO repete "precisa de você" — passa `needs_human=false` ao `node_label` para o leitor
-            // de tela não falar 2× (o Badge é o dono do anúncio; o corpo carrega nome + status bruto).
+            // "precisa de você" (gate de custódia humano pendente) — ganha VOZ SEM FOCO via `Badge`
+            // Danger (vermelho + "precisa de você"), que compõe o live-region. Os dot/borda vermelhos
+            // da r5 PERMANECEM (o visual); o Badge soma o anúncio (a assimetria visual-vs-a11y que a r5
+            // ampliou fecha aqui). Id estável por node (`card-needs`+card_eid): a troca de estado
+            // anuncia no MESMO nó. CANAL ÚNICO: o `aria_label` do corpo (abaixo) NÃO repete "precisa de
+            // você" — passa `needs_human=false` ao `node_label` (o Badge é o dono do anúncio; o corpo
+            // carrega nome + status bruto).
+            // CORTESIA = POLITE (refinamento da verificação dupla do QA, r6 — locator vs ator): o Badge
+            // per-card é LOCALIZADOR (diz QUAL card pede você — anuncia sem interromper); o ATOR é o
+            // toast AGREGADO da fila de atenção (Assertive — interrompe com a decisão + ação). Assertar
+            // nos DOIS pro mesmo evento treina a ignorar (doutrina do próprio badge.rs); Polite aqui
+            // preserva o P0 (anuncia sem foco) E respeita o snooze do toast (o badge não fica martelando
+            // depois que você adiou). O default do Badge JÁ é Polite — basta não chamar `needs_you()`.
             if needs_human {
-                title = title.child(
-                    ui::Badge::new(
-                        ("card-needs", card_eid),
-                        "precisa de você",
-                        ui::BadgeTone::Danger,
-                    )
-                    .needs_you(),
-                );
+                title = title.child(ui::Badge::new(
+                    ("card-needs", card_eid),
+                    "precisa de você",
+                    ui::BadgeTone::Danger,
+                ));
             }
             // BUG D: affordance ✎ DESCOBRÍVEL no próprio CARD (antes só no painel ⌘K → o fundador não
             // achava). Chip clicável no cabeçalho do Agente que abre a edição de 1ª classe
