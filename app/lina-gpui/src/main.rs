@@ -3704,10 +3704,26 @@ impl Render for WorkspaceView {
                 .font_family(th.typography.family.ui)
                 .text_size(px(f32::from(th.typography.size.body) * z))
                 .text_color(rgb(th.accent.primary))
-                .child(div().size(px(9.0 * z)).rounded_full().bg(status_dot))
-                .child(text!(nv.name.clone()))
                 .child(
                     div()
+                        .size(px(9.0 * z))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(status_dot),
+                )
+                // BUG S1 (top-bar do card): o nome CEDE com ellipsis (flex_1 + min_w(0) + truncate),
+                // não empurra os chips finais pra fora do overflow_hidden do card. Mesmo padrão da
+                // sidebar (fatia bf-sidebar). Os chips de meta/ação são flex_shrink_0 → nunca somem.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .child(text!(nv.name.clone())),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
                         .text_color(rgb(th.text.muted))
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
@@ -3753,6 +3769,7 @@ impl Render for WorkspaceView {
                         // `LINA_AUTONOMY` carimbado no env deste nó), não o nível do Espaço.
                         // UI e enforcement (guard) nunca divergem.
                         .aria_label(agent_modal::card_autonomy_aria(nv.autonomy))
+                        .flex_shrink_0()
                         .px_2()
                         .rounded_md()
                         .bg(rgb(auto_bg))
@@ -3769,6 +3786,7 @@ impl Render for WorkspaceView {
                 title = title.child(
                     div()
                         .id(("card-edit", card_eid))
+                        .flex_shrink_0()
                         .px_2()
                         .rounded_md()
                         .bg(rgb(th.surface.raised))
@@ -3813,9 +3831,10 @@ impl Render for WorkspaceView {
             // O ✕ só aparece quando há >1 card: o ÚLTIMO nó nunca pode ser fechado (o canvas
             // jamais fica em branco), então não mostramos um botão que recusaria a ação.
             if cards.len() > 1 {
-                title = title.child(div().flex_1()).child(
+                title = title.child(
                     div()
                         .id(("close", card_eid))
+                        .flex_shrink_0()
                         .px_2()
                         .rounded_md()
                         .bg(rgb(th.surface.danger_muted))

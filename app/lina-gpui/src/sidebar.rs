@@ -1114,39 +1114,60 @@ impl Sidebar {
             .as_ref()
             .map_or_else(|| row.name.clone(), |buf| format!("{buf}▏"));
 
-        let mut line = div()
-            .id(("sb-row", row_idx))
+        let can_unload = row_can_unload(row.focused, self.on_unload.is_some());
+
+        // ── LINHA PRIMÁRIA: ícone · NOME (cede) · meta (agentes/custo/⌘n) ──
+        // Doutrina B3 (espelhada de `agent_modal`): só o NOME cede — `flex_1 + min_w(0) +
+        // truncate` (o `…` é a affordance VISÍVEL de "há mais"; o nome inteiro viaja no
+        // tooltip de hover, descoberto pelo leigo de mouse). Ícone e meta são `flex_shrink_0`
+        // e NUNCA somem. Antes (bf-sidebar): `flex_1 + overflow_hidden` sem `min_w(0)` no nome
+        // e sem `flex_shrink_0` nas células → o nome herdava min-content gigante e EXPULSAVA as
+        // ações para fora dos 280px (Arquivar sumia; nome cortado mudo).
+        let icon = div()
+            .flex_shrink_0()
+            .text_color(rgb(if row.status.unreachable {
+                th.state.warning
+            } else {
+                th.text.secondary
+            }))
+            .child(text!(if row.status.unreachable { "⚠" } else { "▣" }));
+
+        let name_cell = if renaming.is_some() {
+            // Editando: o caret ▏ vive no FIM — trunca pelo INÍCIO p/ o cursor ficar visível.
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_start()
+                .text_color(rgb(th.text.primary))
+                .child(text!(name_view))
+                .into_any_element()
+        } else {
+            let full = row.name.clone();
+            div()
+                .id(("sb-name", row_idx))
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(rgb(th.text.primary))
+                .tooltip(move |_w, cx| cx.new(|_| NameTooltip(full.clone())).into())
+                .child(text!(name_view))
+                .into_any_element()
+        };
+
+        let mut primary = div()
             .flex()
             .items_center()
             .gap_2()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .role(Role::Button)
-            .aria_label(row_aria_label(row))
-            .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| switch(v, &root, w, cx)))
-            .child(
-                div()
-                    .text_color(rgb(if row.status.unreachable {
-                        th.state.warning
-                    } else {
-                        th.text.secondary
-                    }))
-                    .child(text!(if row.status.unreachable { "⚠" } else { "▣" })),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .text_color(rgb(th.text.primary))
-                    .child(text!(name_view)),
-            );
+            .child(icon)
+            .child(name_cell);
 
         // Célula Agentes + ● (tooltip honesto: a palavra viaja no aria da célula).
         let mut agents = div()
             .id(("sb-agents", row_idx))
             .flex()
+            .flex_shrink_0()
             .items_center()
             .gap_1()
             .text_size(px(11.0))
@@ -1162,14 +1183,15 @@ impl Sidebar {
                     .child(text!("●")),
             );
         }
-        line = line.child(agents);
+        primary = primary.child(agents);
 
         // Célula de custo: «—» sem dado (nunca «0,00»); tooltip honesto no aria.
         if !row.status.unreachable {
             let has_cost = row.status.cost_short.is_some();
-            line = line.child(
+            primary = primary.child(
                 div()
                     .id(("sb-cost", row_idx))
+                    .flex_shrink_0()
                     .text_size(px(11.0))
                     .text_color(rgb(if has_cost {
                         th.text.primary
@@ -1183,63 +1205,88 @@ impl Sidebar {
 
         // ⌘{n}: índice ESTÁVEL do registry — só existe para Espaços registrados.
         if let Some(n) = row.shortcut_index {
-            line = line.child(
+            primary = primary.child(
                 div()
+                    .flex_shrink_0()
                     .text_size(px(10.0))
                     .text_color(rgb(th.text.muted))
                     .child(text!(format!("⌘{n}"))),
             );
         }
 
-        // r5 BUG 2: ações VISÍVEIS em TODA linha (antes só na linha sob o roving — quem
-        // usa mouse nunca as via; "não tem como apagar um workspace" era isto). O aria
-        // do Arquivar carrega o subtexto honesto; o destino da ação é a linha CLICADA.
+        // ── A LINHA é uma COLUNA: primária + faixa de ações própria ──
+        // Em 280px, nome+meta+3 ações NÃO cabem numa linha só (a causa do bug). As ações
+        // ganham faixa própria SEMPRE-VISÍVEL (decisão r5 mantida; descobríveis, rotuladas,
+        // nunca cortadas). `flex_wrap` é a rede: rótulo futuro maior quebra a linha, não clipa.
+        let mut row_el = div()
+            .id(("sb-row", row_idx))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .role(Role::Button)
+            .aria_label(row_aria_label(row))
+            .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| switch(v, &root, w, cx)))
+            .child(primary);
+
+        // r5 BUG 2 + bf-sidebar: ações VISÍVEIS em TODA linha, agora na própria faixa (antes
+        // vazavam para fora e Arquivar sumia). `row_actions` é a fonte ÚNICA da presença (teste
+        // guardião abaixo); o aria do Arquivar carrega o subtexto honesto; o destino é a linha
+        // CLICADA. Cada botão é `flex_shrink_0` — nenhum encolhe ao ponto de virar ilegível.
         if renaming.is_none() {
-            let begin = self.on_rename_begin.clone();
-            let root_rn = row.ws_root.clone();
-            let archive = self.on_archive.clone();
-            let root_ar = row.ws_root.clone();
-            line = line
-                .child(
-                    div()
-                        .id(("sb-rename", row_idx))
-                        .px_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .role(Role::Button)
-                        .aria_label(COPY_M8_RENAME)
-                        .text_size(px(10.0))
-                        .text_color(rgb(th.text.muted))
-                        .on_click(
-                            cx.listener(move |v, _ev: &ClickEvent, w, cx| {
-                                begin(v, &root_rn, w, cx)
-                            }),
+            let mut actions = div().flex().flex_wrap().items_center().gap_3();
+            for action in row_actions(false, can_unload) {
+                let btn = match action {
+                    RowAction::Rename => {
+                        let begin = self.on_rename_begin.clone();
+                        let root_rn = row.ws_root.clone();
+                        Some(
+                            div()
+                                .id(("sb-rename", row_idx))
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .role(Role::Button)
+                                .aria_label(COPY_M8_RENAME)
+                                .text_size(px(10.0))
+                                .text_color(rgb(th.text.muted))
+                                .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
+                                    begin(v, &root_rn, w, cx)
+                                }))
+                                .child(text!(COPY_M8_RENAME)),
                         )
-                        .child(text!(COPY_M8_RENAME)),
-                )
-                .child(
-                    div()
-                        .id(("sb-archive", row_idx))
-                        .px_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .role(Role::Button)
-                        .aria_label(format!("{COPY_M8_ARCHIVE} — {COPY_M8_ARCHIVE_HINT}"))
-                        .text_size(px(10.0))
-                        .text_color(rgb(th.text.muted))
-                        .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
-                            archive(v, &root_ar, w, cx)
-                        }))
-                        .child(text!(COPY_M8_ARCHIVE)),
-                );
-            // r5 (unload-ui): Descarregar — SÓ Espaço de FUNDO e SÓ com o seam do
-            // executor plugado (`row_can_unload`); o mecanismo é do Core A2A.
-            if row_can_unload(row.focused, self.on_unload.is_some()) {
-                if let Some(unload) = self.on_unload.clone() {
-                    let root_un = row.ws_root.clone();
-                    line = line.child(
+                    }
+                    RowAction::Archive => {
+                        let archive = self.on_archive.clone();
+                        let root_ar = row.ws_root.clone();
+                        Some(
+                            div()
+                                .id(("sb-archive", row_idx))
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .role(Role::Button)
+                                .aria_label(format!("{COPY_M8_ARCHIVE} — {COPY_M8_ARCHIVE_HINT}"))
+                                .text_size(px(10.0))
+                                .text_color(rgb(th.text.muted))
+                                .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
+                                    archive(v, &root_ar, w, cx)
+                                }))
+                                .child(text!(COPY_M8_ARCHIVE)),
+                        )
+                    }
+                    // `row_actions` só devolve Unload quando `can_unload` (⇒ o seam está
+                    // plugado e `on_unload` é Some); o `map` honra isso sem unwrap.
+                    RowAction::Unload => self.on_unload.clone().map(|unload| {
+                        let root_un = row.ws_root.clone();
                         div()
                             .id(("sb-unload", row_idx))
+                            .flex_shrink_0()
                             .px_1()
                             .rounded_md()
                             .cursor_pointer()
@@ -1250,14 +1297,19 @@ impl Sidebar {
                             .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
                                 unload(v, &root_un, w, cx)
                             }))
-                            .child(text!(COPY_M8_UNLOAD)),
-                    );
+                            .child(text!(COPY_M8_UNLOAD))
+                    }),
+                };
+                if let Some(btn) = btn {
+                    actions = actions.child(btn);
                 }
             }
-            // Subtexto leigo na linha sob o roving (onde o olho está ao navegar por
-            // teclado) — nas demais o aria/tooltip carrega a explicação.
+            row_el = row_el.child(actions);
+
+            // Subtexto leigo na linha sob o roving (onde o olho está ao navegar por teclado)
+            // — nas demais o aria/tooltip carrega a explicação. Faixa própria: nunca compete.
             if is_roving {
-                line = line.child(
+                row_el = row_el.child(
                     div()
                         .text_size(px(9.0))
                         .text_color(rgb(th.text.muted))
@@ -1267,12 +1319,60 @@ impl Sidebar {
         }
 
         if is_roving {
-            line = line.bg(rgb(th.surface.raised));
+            row_el = row_el.bg(rgb(th.surface.raised));
         }
         if row.focused {
-            line = line.border_2().border_color(rgb(th.focus.ring));
+            row_el = row_el.border_2().border_color(rgb(th.focus.ring));
         }
-        line.into_any_element()
+        row_el.into_any_element()
+    }
+}
+
+// ─────────────── ações de linha: presença pura (testável) + tooltip de nome ───────────────
+
+/// Uma ação de linha do Espaço. A ENUM é a fonte única da presença — o render itera sobre
+/// [`row_actions`] e despacha o callback certo; o teste guardião abaixo prova o invariante do
+/// bug `bf-sidebar`: **Arquivar NUNCA some** fora do rename.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowAction {
+    Rename,
+    Archive,
+    Unload,
+}
+
+/// Quais ações a linha mostra. Renomeando → nenhuma (o campo vira editor). Caso contrário,
+/// Renomear+Arquivar SEMPRE; Descarregar só quando o seam permite (`can_unload`, regra r5).
+/// Fonte única consumida pelo render — remover `Archive` daqui some-o da UI E quebra o teste.
+#[must_use]
+pub fn row_actions(renaming: bool, can_unload: bool) -> Vec<RowAction> {
+    if renaming {
+        return Vec::new();
+    }
+    let mut actions = vec![RowAction::Rename, RowAction::Archive];
+    if can_unload {
+        actions.push(RowAction::Unload);
+    }
+    actions
+}
+
+/// Tooltip de hover do nome do Espaço: entrega o nome COMPLETO quando a linha o trunca. O
+/// `…` (de `truncate()`) já sinaliza "há mais"; este card revela o texto inteiro sem cortar —
+/// a affordance que o leigo de mouse precisa para não perder informação em silêncio.
+pub struct NameTooltip(pub String);
+
+impl Render for NameTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let th = crate::theme::active();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(th.surface.raised))
+            .border_1()
+            .border_color(rgb(th.surface.border))
+            .text_size(px(12.0))
+            .text_color(rgb(th.text.primary))
+            .child(text!(self.0.clone()))
     }
 }
 
@@ -1825,6 +1925,35 @@ mod tests {
         assert!(!row_can_unload(true, true), "Espaço ATIVO nunca mostra");
         assert!(!row_can_unload(false, false), "sem executor, sem botão");
         assert!(!row_can_unload(true, false));
+    }
+
+    /// **Guardião do bug `bf-sidebar` (a regressão que sumia com "Arquivar").** A faixa de
+    /// ações é montada a partir de [`row_actions`] — a fonte ÚNICA da presença. O invariante:
+    /// fora do rename, Renomear E Arquivar SEMPRE estão presentes (era o que "vazava" para
+    /// fora dos 280px e desaparecia); Descarregar entra só sob o seam (regra r5). Não-vacuoso:
+    /// remover `Archive` de `row_actions` some-a da UI E falha este teste.
+    #[test]
+    fn row_actions_always_keep_rename_and_archive_outside_editing() {
+        use RowAction::{Archive, Rename, Unload};
+        // Linha comum (sem seam de descarregar): Renomear + Arquivar, nesta ordem, sempre.
+        assert_eq!(row_actions(false, false), vec![Rename, Archive]);
+        // Espaço de fundo com seam plugado: ganha Descarregar ao FIM (nunca expulsa as outras).
+        assert_eq!(row_actions(false, true), vec![Rename, Archive, Unload]);
+        // Arquivar é o coração do bug — afirme-o explicitamente em ambos os casos.
+        assert!(
+            row_actions(false, false).contains(&Archive)
+                && row_actions(false, true).contains(&Archive),
+            "Arquivar NUNCA pode sumir fora do rename"
+        );
+        // Renomeando: o campo vira editor inline — nenhuma ação compete por espaço.
+        assert!(
+            row_actions(true, false).is_empty(),
+            "rename esconde as ações"
+        );
+        assert!(
+            row_actions(true, true).is_empty(),
+            "rename ignora até o seam"
+        );
     }
 
     /// r5 (unload-ui): a narração vem dos números REAIS do plano — quem segue
