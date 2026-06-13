@@ -3,7 +3,7 @@
 #   LINA_RATCHET_UPDATE=1 cargo test -p lina-gpui --test token_ratchet
 # arquivo px_literal font_weight text_size_px
 agent_modal.rs 5 9 3
-attention_ui.rs 18 0 10
+attention_ui.rs 16 0 10
 dev_tools.rs 4 2 2
 main.rs 12 2 0
 obsidian.rs 2 4 2

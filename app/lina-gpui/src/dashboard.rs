@@ -871,6 +871,22 @@ pub struct PanelRect {
     pub h: f32,
 }
 
+impl PanelRect {
+    /// Os dois retângulos têm área em comum? Bordas que só ENCOSTAM (gap 0) NÃO contam como
+    /// interseção (`<`, não `<=`) — é a regra que deixa dois painéis colados sem sobrepor.
+    /// Retângulo degenerado (w/h ≤ 0) nunca intersecta nada (não ocupa área).
+    #[must_use]
+    pub fn intersects(&self, other: &PanelRect) -> bool {
+        if self.w <= 0.0 || self.h <= 0.0 || other.w <= 0.0 || other.h <= 0.0 {
+            return false;
+        }
+        self.x < other.x + other.w
+            && other.x < self.x + self.w
+            && self.y < other.y + other.h
+            && other.y < self.y + self.h
+    }
+}
+
 /// **Geometria clampada do painel** — função PURA que o render gpui consome (bug da
 /// rodada: o painel fixava `w=340 / top=44 / bottom=28` sem olhar a janela e VAZAVA a
 /// borda direita no app do fundador). Invariantes (testadas): `x ≥ 0`, `x+w ≤ win_w`,
@@ -934,6 +950,51 @@ mod tests {
     use super::*;
     use lina_core::{apply, DomainEvent};
     use uuid::Uuid;
+
+    /// Geometria pura (base do T2): retângulos com área comum intersectam; separados ou apenas
+    /// ENCOSTADOS (gap 0) não; degenerado (w/h ≤ 0) nunca. A borda `<` (não `<=`) é o que deixa
+    /// dois painéis colados sem reportar sobreposição.
+    #[test]
+    fn panel_rect_intersection_rule() {
+        let a = PanelRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let overlap = PanelRect {
+            x: 50.0,
+            y: 50.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let touching = PanelRect {
+            x: 100.0,
+            y: 0.0,
+            w: 40.0,
+            h: 100.0,
+        }; // encosta em x=100
+        let apart = PanelRect {
+            x: 120.0,
+            y: 0.0,
+            w: 40.0,
+            h: 100.0,
+        };
+        let degenerate = PanelRect {
+            x: 10.0,
+            y: 10.0,
+            w: 0.0,
+            h: 50.0,
+        };
+        assert!(a.intersects(&overlap));
+        assert!(overlap.intersects(&a), "interseção é simétrica");
+        assert!(
+            !a.intersects(&touching),
+            "bordas que só encostam não sobrepõem"
+        );
+        assert!(!a.intersects(&apart));
+        assert!(!a.intersects(&degenerate), "área zero nunca intersecta");
+    }
 
     /// Nó-terminal sintético. `cwd: Some` emite o `TerminalSpawned` com o binding
     /// node↔cwd PERSISTIDO (ADR 0022 §3 — o caminho real da correlação); `cwd: None`

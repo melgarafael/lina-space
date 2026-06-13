@@ -21,6 +21,8 @@
 use lina_core::attention::PromptKind;
 use lina_core::{AttentionEvidence, AttentionItem, AttentionKind};
 
+use crate::dashboard;
+
 // ═══════════════════════════ toast: qual item + countdown (PURO) ═══════════════════════════
 
 /// O QUE o toast mostra (13.13 achado 7 + ux-flows E1): nada, UM pedido completo, ou o
@@ -413,6 +415,48 @@ pub fn play_attention_sound() {
     eprintln!("lina-gpui: [ATT] lembrete sonoro sem player nesta plataforma — badge cobre");
 }
 
+// ═══════════════════════════ geometria do toast vs painel "Atividade e custo" (PURA) ═══════════════════════════
+
+/// Largura preferida do toast (canto inferior direito). O render encolhe ANTES de invadir a
+/// coluna do dashboard — a não-sobreposição é inviolável; a largura é que cede.
+pub const TOAST_W: f32 = 480.0;
+/// Margem do toast às bordas da janela.
+const TOAST_MARGIN: f32 = 16.0;
+/// Folga do toast ao rodapé (acima do footer — não cobre o input em foco).
+const TOAST_BOTTOM_INSET: f32 = 56.0;
+/// Respiro entre o toast e a coluna do painel "Atividade e custo" quando ambos estão abertos.
+const TOAST_DASH_GAP: f32 = 12.0;
+
+/// **Geometria do toast que NUNCA colide com o painel "Atividade e custo" (T2).** Função PURA
+/// (viewport → rect) que o render consome. Com o dashboard aberto, o toast vive à ESQUERDA da
+/// coluna dele (separação horizontal com [`TOAST_DASH_GAP`]) — assim a não-interseção vale para
+/// QUALQUER altura real do toast (medida pelo gpui), não só a modelada aqui. O `h` retornado é o
+/// PIOR CASO (caixa cheia, do topo útil ao rodapé): se nem ela invade o dashboard, nada invade.
+/// Janela estreita → o toast encolhe até ceder a vez, nunca sobrepõe (largura cede, colisão não).
+#[must_use]
+pub fn toast_rect(win_w: f32, win_h: f32, dashboard_open: bool) -> dashboard::PanelRect {
+    let win_w = win_w.max(0.0);
+    let win_h = win_h.max(0.0);
+    // Limite direito da área do toast: à ESQUERDA da coluna do dashboard (com respiro) quando ele
+    // está aberto; senão, a borda da janela menos a margem. Essa separação horizontal é o que
+    // garante a não-interseção — independe da altura real do toast.
+    let right_limit = if dashboard_open {
+        (dashboard::dashboard_panel_rect(win_w, win_h).x - TOAST_DASH_GAP).max(0.0)
+    } else {
+        (win_w - TOAST_MARGIN).max(0.0)
+    };
+    // Largura preferida encolhida ao vão [margem, right_limit]; cede até sumir antes de invadir.
+    let avail = (right_limit - TOAST_MARGIN).max(0.0);
+    let w = TOAST_W.min(avail);
+    let x = (right_limit - w).max(0.0);
+    // Altura: PIOR CASO (caixa cheia, do topo útil ao rodapé) — o teste exige separação
+    // horizontal, válida para a altura real (menor) que o gpui medir.
+    let y = dashboard::PANEL_TOP_INSET.min(win_h);
+    let bottom = (win_h - TOAST_BOTTOM_INSET).clamp(y, win_h);
+    let h = bottom - y;
+    dashboard::PanelRect { x, y, w, h }
+}
+
 // ═══════════════════════════ render gpui (casca FINA sobre as puras) ═══════════════════════════
 //
 // Toda cor vem de `theme::active()` via parâmetro (lint anti-hardcode varre este
@@ -426,8 +470,6 @@ use crate::theme::Theme;
 use crate::ui::{Button, ButtonSize, ButtonVariant};
 use crate::WorkspaceView;
 
-/// Largura do toast (canto inferior direito — não cobre nós nem o input em foco).
-const TOAST_W: f32 = 480.0;
 /// Largura do painel compacto da fila.
 const PANEL_W: f32 = 400.0;
 
@@ -515,20 +557,26 @@ pub fn render_badge(
 
 /// O toast TO (canto inferior direito): single com countdown (pause-on-hover) ou
 /// colapsado «+N pedidos» (countdown DESATIVADO — 13.13 achado 7). Nunca empilha.
+#[allow(clippy::too_many_arguments)] // render de fiação: viewport + dashboard_open entram p/ a geometria T2.
 pub fn render_toast(
     items: &[lina_core::AttentionItem],
     visible: ToastView,
     timer: Option<&ToastTimer>,
     now_ms: u64,
+    viewport: (f32, f32),
+    dashboard_open: bool,
     th: &Theme,
     cx: &mut Context<WorkspaceView>,
 ) -> AnyElement {
+    // T2: posição/largura HORIZONTAL que não invade a coluna "Atividade e custo" (à esquerda dela,
+    // com folga, quando aberta). A ancoragem vertical segue no rodapé — a altura é a do conteúdo.
+    let rect = toast_rect(viewport.0, viewport.1, dashboard_open);
     let mut card = div()
         .id("att-toast")
         .absolute()
-        .right(px(16.0))
-        .bottom(px(56.0)) // acima do rodapé — não cobre nós nem o input em foco
-        .w(px(TOAST_W))
+        .left(px(rect.x))
+        .bottom(px(TOAST_BOTTOM_INSET)) // acima do rodapé — não cobre nós nem o input em foco
+        .w(px(rect.w))
         .flex()
         .flex_col()
         .gap_2()
@@ -648,7 +696,7 @@ pub fn render_toast(
                         .child(
                             div()
                                 .h(px(3.0))
-                                .w(px((TOAST_W - 24.0) * frac))
+                                .w(px((rect.w - 24.0).max(0.0) * frac))
                                 .rounded_md()
                                 .bg(rgb(th.accent.primary)),
                         ),
@@ -984,6 +1032,64 @@ mod tests {
         let mut it = item(id, node, AttentionKind::Permission, 100);
         it.prompt_kind = pk;
         it
+    }
+
+    // ─────────────── T2: toast × painel "Atividade e custo" NÃO se sobrepõem ───────────────
+
+    /// O cerne do T2: com o painel "Atividade e custo" ABERTO, o toast e o dashboard NÃO podem
+    /// ter área em comum em NENHUM tamanho de janela (inclusive estreito). A geometria modela o
+    /// toast no PIOR CASO (altura cheia) — se essa caixa não invade a coluna do dashboard, a real
+    /// (mais baixa) também não. Falha com o stub que ancora à direita ignorando o dashboard.
+    #[test]
+    fn toast_never_overlaps_dashboard_when_both_open() {
+        for (w, h) in [
+            (1440.0, 900.0),
+            (1280.0, 800.0),
+            (1024.0, 768.0),
+            (900.0, 600.0),
+            (760.0, 520.0),
+            (520.0, 420.0),
+        ] {
+            let dash = crate::dashboard::dashboard_panel_rect(w, h);
+            let toast = toast_rect(w, h, true);
+            assert!(
+                !toast.intersects(&dash),
+                "toast {toast:?} sobrepõe o dashboard {dash:?} em {w}x{h}"
+            );
+        }
+    }
+
+    /// Sem o dashboard, o toast volta ao canto inferior direito com a margem padrão (largura
+    /// cheia quando cabe) — a correção do T2 não rouba espaço quando não há com o que colidir.
+    #[test]
+    fn toast_anchors_right_when_dashboard_closed() {
+        let r = toast_rect(1440.0, 900.0, false);
+        assert_eq!(r.w, TOAST_W, "largura cheia quando há espaço");
+        assert!(
+            (r.x + r.w - (1440.0 - 16.0)).abs() < f32::EPSILON,
+            "borda direita do toast = janela − margem: {r:?}"
+        );
+    }
+
+    /// Viewport degenerada (até 0×0) nunca gera rect negativo nem sai da janela — a geometria é
+    /// total (clampada), como a do dashboard. Sem panic, sem largura/altura abaixo de zero.
+    #[test]
+    fn toast_rect_is_bounded_for_any_viewport() {
+        for (w, h) in [(0.0, 0.0), (10.0, 10.0), (320.0, 200.0), (2560.0, 1440.0)] {
+            for open in [false, true] {
+                let r = toast_rect(w, h, open);
+                assert!(r.w >= 0.0 && r.h >= 0.0, "sem dimensão negativa: {r:?}");
+                assert!(r.x >= 0.0 && r.y >= 0.0, "origem não-negativa: {r:?}");
+                assert!(
+                    r.x + r.w <= w + f32::EPSILON,
+                    "não vaza à direita: {r:?} em {w}x{h}"
+                );
+                assert!(
+                    r.y + r.h <= h + f32::EPSILON,
+                    "não vaza embaixo: {r:?} em {w}x{h}"
+                );
+            }
+        }
     }
 
     // ─────────────────── R2b: Question/Choice — copy + ação primária ───────────────────

@@ -4520,11 +4520,16 @@ impl Render for WorkspaceView {
             .attention_machine
             .visible(&self.attention_items, att_now)
         {
+            // Costura bf-toasts (T2): render_toast agora recebe viewport + dashboard_open para
+            // posicionar o toast à ESQUERDA da coluna do dashboard (sem sobreposição).
+            let vp = window.viewport_size();
             root = root.child(attention_ui::render_toast(
                 &self.attention_items,
                 tv,
                 self.attention_machine.timer(),
                 att_now,
+                (f32::from(vp.width), f32::from(vp.height)),
+                self.dashboard_open,
                 &th,
                 cx,
             ));
