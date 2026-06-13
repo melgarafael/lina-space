@@ -202,17 +202,14 @@ pub fn reduce_motion_effective(user_override: bool) -> bool {
 
 // ═══════════════════════════ elemento gpui da live-region ═══════════════════════════
 
-/// Elemento da live-region: `Role::Status` + label + texto VISÍVEL (contraste verde/painel ≥ AA).
-///
-/// ⚠️ **GAP CONHECIDO (red-team):** no gpui DESTE SHA, `Role::Status` **NÃO** torna o nó uma live-region —
-/// o BUILDER `div()` não expõe `set_live(Live::Polite)` (a `Interactivity::write_a11y_info` nunca seta
-/// `live`), então com os builders builtin os adaptadores (VoiceOver/NVDA/Orca) **NÃO auto-anunciam**.
-/// **Status do gap (spike F1-2-7):** o caminho (a) do ADR 0028 está implementado em [`live`] — um
-/// `Element` custom que sobrescreve `Element::write_a11y_info` (hook que EXISTE neste SHA, default
-/// vazio) e seta `live=Polite` + `value` (o texto que o adapter anuncia). A lógica do nó é provada
-/// por teste headless; o auto-anúncio NA TELA (VoiceOver falando sem foco) aguarda a validação do
-/// roteiro `tasks/epico-f1/spike-a11y-roteiro.md`. NÃO afirmar "conforme ARIA live-region" até a
-/// tela confirmar. O que já era fato segue: nó **legível ao FOCAR** e VISÍVEL na tela (banner).
+/// Elemento da live-region: delega ao custom `Element` de [`crate::a11y_live`] — caminho (a) do
+/// ADR 0028, SELADO na F2-0-4. O `Element` sobrescreve `Element::write_a11y_info` (hook que EXISTE
+/// neste SHA, default vazio) e seta `live=Polite` + `value` (o texto que o adapter anuncia) — o que
+/// os builders builtin (`div().role(Role::Status)`) NÃO faziam (`Interactivity::write_a11y_info`
+/// nunca seta `live`; era o gap original do red-team). A lógica do nó é provada por teste headless;
+/// o auto-anúncio NA TELA (VoiceOver falando sem foco) aguarda a validação do roteiro
+/// `tasks/epico-f1/spike-a11y-roteiro.md` — NÃO afirmar "conforme ARIA live-region" até a tela
+/// confirmar (gate do ADR 0028). O que já era fato segue: nó **legível ao FOCAR** e VISÍVEL (banner).
 pub fn live_region_element(msg: &str) -> AnyElement {
     crate::a11y_live::live_announce(msg).into_any_element()
 }
