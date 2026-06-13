@@ -2011,6 +2011,16 @@ impl WorkspaceView {
             A::NewNote => self.creating = Some((creators::CreatorKind::Note, String::new())),
             A::NewFolder => self.creating = Some((creators::CreatorKind::Folder, String::new())),
             A::ToggleDashboard => self.toggle_dashboard(cx),
+            // F2-2-5 (toolbar contextual): ⚑ Atender — NAVEGA até o nó que precisa de você
+            // (foca + revela), SEM aprovar nada (a autorização mantém autoridade única — segurança
+            // do ADR 0029). É a paridade do "ir até o terminal" da fila, agora na toolbar do card.
+            A::GotoAtencao(node) => {
+                self.focus(node);
+                self.reveal(node, window);
+                cx.notify();
+            }
+            // F2-2-5 (toolbar): ✕ Encerrar — encerra o CLI do nó (o mesmo que o ✕ do header faz).
+            A::CloseNode(node) => self.close_node(node, window),
         }
     }
 
@@ -2793,22 +2803,31 @@ impl WorkspaceView {
         }
     }
 
-    /// Fecha o nó focado, reposiciona o foco num nó vivo (nunca tela em branco) e o revela.
-    fn close_focused(&mut self, window: &Window) {
-        let node = self.focused;
+    /// Encerra `node` (mata o CLI), limpa o z-order e — SE era o nó focado — reposiciona o foco num
+    /// nó vivo (nunca tela em branco) e o revela. Fonte única do "fechar nó": [`close_focused`], o ✕
+    /// do header do card e a ação `CloseNode` da toolbar (F2-2-5) passam todos por aqui.
+    fn close_node(&mut self, node: NodeId, window: &Window) {
         if let Err(e) = self.nodes.remove_node(node) {
-            eprintln!("lina-gpui: fechar nó focado: {e}");
+            eprintln!("lina-gpui: fechar nó: {e}");
             return;
         }
         self.z_order.remove(&node);
-        // `first` num let SEPARADO: solta o lock do model ANTES do reveal (que re-locka o
-        // model) — em edition 2021 o guard temporário de um `if let` viveria por todo o bloco,
-        // causando re-lock na mesma thread (deadlock).
-        let first = lock(&self.nodes.model).order.first().copied();
-        if let Some(first) = first {
-            self.focus(first);
-            self.reveal(first, window);
+        // Fechar um nó PERIFÉRICO não rouba o foco; só reposiciona se quem saiu era o focado.
+        if self.focused == node {
+            // `first` num let SEPARADO: solta o lock do model ANTES do reveal (que re-locka o
+            // model) — em edition 2021 o guard temporário de um `if let` viveria por todo o bloco,
+            // causando re-lock na mesma thread (deadlock).
+            let first = lock(&self.nodes.model).order.first().copied();
+            if let Some(first) = first {
+                self.focus(first);
+                self.reveal(first, window);
+            }
         }
+    }
+
+    /// Fecha o nó focado (⌘⌫). Delega ao [`close_node`] (fonte única).
+    fn close_focused(&mut self, window: &Window) {
+        self.close_node(self.focused, window);
     }
 
     /// **F1-2-4 — ⌘R abre a EDIÇÃO de 1ª classe (M6-E) do Agente focado.** Substitui o stub de dev
@@ -3650,6 +3669,24 @@ impl Render for WorkspaceView {
                         .text_color(rgb(th.text.muted))
                         .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
                 );
+            // P0 (F2-2-2 / ADR 0028 — prioridade soberana da r6): o estado MAIS crítico do produto —
+            // "precisa de você" (gate de custódia humano pendente) — ganha VOZ SEM FOCO via
+            // `Badge::needs_you()`, que compõe o live-region e anuncia ASSERTIVE ao surgir. Os
+            // dot/borda vermelhos da r5 PERMANECEM (o visual); o Badge soma o anúncio (a assimetria
+            // visual-vs-a11y que a r5 ampliou fecha aqui). Id estável por node (`card-needs`+card_eid):
+            // a troca de estado anuncia no MESMO nó. CANAL ÚNICO: o `aria_label` do corpo (abaixo)
+            // NÃO repete "precisa de você" — passa `needs_human=false` ao `node_label` para o leitor
+            // de tela não falar 2× (o Badge é o dono do anúncio; o corpo carrega nome + status bruto).
+            if needs_human {
+                title = title.child(
+                    ui::Badge::new(
+                        ("card-needs", card_eid),
+                        "precisa de você",
+                        ui::BadgeTone::Danger,
+                    )
+                    .needs_you(),
+                );
+            }
             // BUG D: affordance ✎ DESCOBRÍVEL no próprio CARD (antes só no painel ⌘K → o fundador não
             // achava). Chip clicável no cabeçalho do Agente que abre a edição de 1ª classe
             // (`open_agent_modal_edit`). Mantém os entry points existentes (⌘K + duplo-clique no
@@ -3739,21 +3776,9 @@ impl Render for WorkspaceView {
                         .bg(rgb(th.surface.danger_muted))
                         .text_color(rgb(th.state.danger))
                         .cursor_pointer()
+                        // Fonte única do "fechar nó" (DRY com close_focused/CloseNode da toolbar).
                         .on_click(cx.listener(move |view, _ev: &ClickEvent, window, _cx| {
-                            if let Err(e) = view.nodes.remove_node(node_id) {
-                                eprintln!("lina-gpui: fechar terminal: {e}");
-                                return;
-                            }
-                            view.z_order.remove(&node_id);
-                            // Reposiciona o foco num nó vivo (nunca tela em branco) e o revela.
-                            // `first` em let separado: solta o lock do model antes do reveal.
-                            if view.focused == node_id {
-                                let first = lock(&view.nodes.model).order.first().copied();
-                                if let Some(first) = first {
-                                    view.focus(first);
-                                    view.reveal(first, window);
-                                }
-                            }
+                            view.close_node(node_id, window);
                         }))
                         .child(text!("✕")),
                 );
@@ -3771,13 +3796,14 @@ impl Render for WorkspaceView {
                 ));
             }
 
-            // W4-6 a11y: "precisa de você" anunciável reusa o `needs_human` JÁ computado (OP-1, acima).
             // O conteúdo do terminal: o SNAPSHOT do grid lido AGORA (não deltas).
             let mut body = div()
                 .id(("grid", card_eid))
                 .role(Role::Terminal)
-                // W4-6 a11y: nome + estado ANUNCIÁVEL (badge do W4-2: "aguardando"/"precisa de você"/…).
-                .aria_label(a11y::node_label(&nv.name, nv.status, needs_human))
+                // CANAL ÚNICO (r6 P0): o corpo carrega nome + STATUS bruto; o "precisa de você" é
+                // dono do Badge::needs_you() acima (live-region Assertive). Por isso `false` aqui —
+                // sem o override de needs_human o leitor de tela não fala "precisa de você" 2×.
+                .aria_label(a11y::node_label(&nv.name, nv.status, false))
                 .flex_1()
                 .overflow_hidden()
                 .p_1()

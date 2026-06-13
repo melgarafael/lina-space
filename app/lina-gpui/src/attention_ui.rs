@@ -421,6 +421,7 @@ pub fn play_attention_sound() {
 
 use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, Role, Window};
 
+use crate::a11y_live::{live_region, Politeness};
 use crate::theme::Theme;
 use crate::ui::{Button, ButtonSize, ButtonVariant};
 use crate::WorkspaceView;
@@ -494,13 +495,22 @@ pub fn render_badge(
         .opacity(alpha)
         .cursor_pointer()
         .role(Role::Button)
-        .aria_label(aria)
+        .aria_label(aria.clone())
         .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| v.attention_toggle_panel(cx)))
         .child(text!(label));
     if panel_open {
         el = el.border_2().border_color(rgb(th.focus.ring));
     }
-    el.into_any_element()
+    // F2-2-2 / ADR 0028: a contagem/escalação da fila muda SEM foco — o sino (que segue um Button
+    // clicável) nasce compondo o live-region. Cortesia: ESCALAÇÃO (pulsando) → Assertive (interrompe,
+    // mesmo com o toast adiado); contagem → Polite (o toast já deu o detalhe assertive do item; o sino
+    // só resume a fila, sem martelar). Id estável ⇒ anuncia na MUDANÇA da contagem, não a cada frame.
+    let courtesy = if badge.pulsing {
+        Politeness::Assertive
+    } else {
+        Politeness::Polite
+    };
+    live_region("att-badge-live", aria, courtesy, el).into_any_element()
 }
 
 /// O toast TO (canto inferior direito): single com countdown (pause-on-hover) ou
@@ -528,15 +538,21 @@ pub fn render_toast(
         .border_2()
         .text_size(px(12.0))
         .line_height(px(18.0))
-        .role(Role::Status)
         .on_hover(cx.listener(|v, hovered: &bool, _w, cx| {
             v.attention_hover(*hovered);
             cx.notify();
         }));
+    // F2-2-2 / ADR 0028: o toast de PERMISSÃO/CUSTÓDIA é o estado mais crítico — não pode ser mudo
+    // sem foco. O `Role::Status` cru NÃO auto-anuncia neste SHA (gap do a11y.rs); então o toast nasce
+    // compondo o live-region: `announce` (capturado por modo) é anunciado ASSERTIVE (interrompe — há
+    // uma decisão pendente). Substitui o `aria_label`-só de cada modo (canal único: o live carrega o
+    // label+value+live).
+    let mut announce = String::new();
     match visible {
         ToastView::Single(idx) => {
             let item = &items[idx];
             let copy = toast_copy(item);
+            announce = copy.clone(); // o que o live-region anuncia (assertive) ao surgir o toast
             let is_custody = item.kind == AttentionKind::Custody;
             let selo = if is_custody {
                 "custódia"
@@ -550,7 +566,6 @@ pub fn render_toast(
                 } else {
                     th.state.warning
                 }))
-                .aria_label(copy.clone())
                 .child(
                     div()
                         .flex()
@@ -641,9 +656,9 @@ pub fn render_toast(
             }
         }
         ToastView::Collapsed(n) => {
+            announce = format!("{n} pedidos aguardando a sua decisão");
             card = card
                 .border_color(rgb(th.state.warning))
-                .aria_label(format!("{n} pedidos aguardando a sua decisão"))
                 .child(
                     div()
                         .text_color(rgb(th.text.primary))
@@ -672,7 +687,13 @@ pub fn render_toast(
         }
         ToastView::None => {}
     }
-    card.into_any_element()
+    // None (nada visível) → sem anúncio; senão o toast nasce compondo o live-region (assertive:
+    // há uma decisão pendente — permissão/custódia/escalação interrompe a fala).
+    if announce.is_empty() {
+        card.into_any_element()
+    } else {
+        live_region("att-toast-live", announce, Politeness::Assertive, card).into_any_element()
+    }
 }
 
 /// O painel compacto da fila (mailbox): itens NA ORDEM DO CORE (custódia > permissão,

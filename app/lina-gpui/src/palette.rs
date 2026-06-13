@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 
 use gpui::{div, prelude::*, px, rgb, text, AnyElement};
-use lina_host::NodeId;
+use lina_host::{NodeId, NodeKind, NodeStatus};
 
 /// O que a paleta dispara. Genérico: o `WorkspaceView` executa (abre o modal M6, foca um
 /// nó, alterna o freio, ou — placeholder até `creators.rs` — cria nota/pasta).
@@ -36,6 +36,13 @@ pub enum PaletteAction {
     EditAgent(NodeId),
     /// Foca (e revela) um nó do canvas.
     FocusNode(NodeId),
+    /// F2-2-5 (aditivo): leva 1 clique até a DECISÃO na fila de atenção (foca o nó + abre a
+    /// superfície 🔔 com Aprovar/Recusar). **NAVEGA, nunca decide** — a autorização tem autoridade
+    /// única na fila (doutrina de segurança); a toolbar só encurta o caminho até o gate.
+    GotoAtencao(NodeId),
+    /// F2-2-5 (aditivo): encerra o nó (mata o processo do CLI) — reusa o caminho do ✕ do header, não
+    /// cria um novo. Vira ação de registry para ganhar paridade mouse(toolbar)/teclado(paleta).
+    CloseNode(NodeId),
     /// W4-3: alterna o freio (pausa/retoma a auto-orquestração).
     ToggleBrake,
     /// F1-2-1 (fix de tela): abre a janela de Ajustes (T7 — Aparência: tema/acento, Espaços, T8).
@@ -100,6 +107,57 @@ pub fn base_commands() -> Vec<Command> {
     ]
 }
 
+/// **Contexto de UM nó focado** — a entrada PURA de [`node_commands`]. O shell (costura `main.rs`)
+/// preenche a partir do estado vivo; o seletor decide as ações SEM tocar gpui (testável). `needs_human`
+/// é a MESMA fonte da fila de atenção (a toolbar LÊ o sinal, não o computa — spec §2.1).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeCtx {
+    pub id: NodeId,
+    pub kind: NodeKind,
+    pub status: NodeStatus,
+    /// Gate de custódia/permissão pendente para ESTE nó (`needs_human` da projeção de atenção).
+    pub needs_human: bool,
+    /// Quantos nós há no Espaço — Encerrar exige `> 1` (1 clique nunca esvazia o Espaço).
+    pub roster_len: usize,
+}
+
+impl NodeCtx {
+    /// Vivo = processo de pé: qualquer status MENOS `Dead` (`Crashed` = painel quebrou, processo vive).
+    #[must_use]
+    fn is_alive(&self) -> bool {
+        !matches!(self.status, NodeStatus::Dead)
+    }
+
+    /// "Agente/terminal" no vocabulário da spec = o nó-CLI (`NodeKind::Terminal`). Nota/Pasta/etc não.
+    #[must_use]
+    fn is_agent(&self) -> bool {
+        matches!(self.kind, NodeKind::Terminal)
+    }
+}
+
+/// **O SELETOR ÚNICO de ações-de-nó (F2-2-5).** Uma fonte, DUAS superfícies: a paleta dinâmica
+/// (teclado) e a toolbar contextual (mouse) consomem ESTE registry — paridade por construção (regra
+/// anti-Zed: nenhuma ação só atrás de atalho). Ordem fixa (spec §2.2): primária → reversíveis →
+/// destrutiva por último. Cada ação carrega seu [`Command::when`]; o seletor JÁ descarta as
+/// inaplicáveis — então "pede-aprovação" devolve 4, os demais estados 3. Rótulos placeholder
+/// (R9/@Redator reconcilia as `COPY_TB_*`); todo `Command` tem label NÃO-vazio (anti icon-only, D4-A3).
+#[must_use]
+pub fn node_commands(ctx: &NodeCtx) -> Vec<Command> {
+    use PaletteAction as A;
+    [
+        // Primária (cor=significado): só quando o nó PEDE você — e NAVEGA até a decisão, não decide.
+        Command::new("⚑ Atender", A::GotoAtencao(ctx.id)).when(ctx.needs_human),
+        // Reversíveis: Editar só em nó-agente vivo; Centralizar sempre.
+        Command::new("✎ Editar", A::EditAgent(ctx.id)).when(ctx.is_agent() && ctx.is_alive()),
+        Command::new("⤢ Centralizar", A::FocusNode(ctx.id)),
+        // Destrutiva por último (padrão de rodapé) — nunca deixa o Espaço sem nenhum nó.
+        Command::new("✕ Encerrar", A::CloseNode(ctx.id)).when(ctx.roster_len > 1),
+    ]
+    .into_iter()
+    .filter(|c| c.enabled) // o `when` vira filtro AQUI: a superfície recebe só o aplicável
+    .collect()
+}
+
 /// Um comando listável: rótulo (o que o humano LÊ) + `aliases` (keywords INVISÍVEIS que o humano
 /// pode DIGITAR — sinônimos técnicos: "webhook"→"Gatilho") + ação + `enabled` (filtro por contexto).
 #[derive(Debug, Clone)]
@@ -132,10 +190,8 @@ impl Command {
     }
 
     /// Filtro por contexto: `when(false)` tira o comando da lista enquanto a condição não vale
-    /// (ex.: "Editar Agente" só com um Agente vivo selecionado). Builder.
-    // dead_code: os comandos de HOJE são todos sempre-aplicáveis — o 1º consumidor de produção
-    // são os comandos contextuais da F2-2-5/2-6 ("Arrumar" só com ≥2 nós etc.). Remover ao fiar.
-    #[allow(dead_code)]
+    /// (ex.: "Editar Agente" só com um Agente vivo selecionado). Builder. **Consumidor real:
+    /// [`node_commands`] (F2-2-5)** — o `allow(dead_code)` prometido em r4 cai aqui.
     #[must_use]
     pub fn when(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -159,6 +215,8 @@ fn action_key(action: &PaletteAction) -> String {
         A::NewAgent => "new_agent".to_owned(),
         A::EditAgent(id) => format!("edit_agent:{id}"),
         A::FocusNode(id) => format!("focus_node:{id}"),
+        A::GotoAtencao(id) => format!("goto_atencao:{id}"),
+        A::CloseNode(id) => format!("close_node:{id}"),
         A::ToggleBrake => "toggle_brake".to_owned(),
         A::OpenSettings => "open_settings".to_owned(),
         A::NewNote => "new_note".to_owned(),
@@ -763,5 +821,103 @@ mod tests {
             p.record_use(&format!("k{i}"));
         }
         assert_eq!(p.mru().len(), MRU_CAP, "MRU fica curto (teto)");
+    }
+
+    // ───────────────────────── F2-2-5 · registry node_commands ─────────────────────────
+
+    fn ctx(kind: NodeKind, status: NodeStatus, needs_human: bool, roster_len: usize) -> NodeCtx {
+        NodeCtx {
+            id: Uuid::now_v7(),
+            kind,
+            status,
+            needs_human,
+            roster_len,
+        }
+    }
+
+    fn has(cmds: &[Command], pred: impl Fn(&PaletteAction) -> bool) -> bool {
+        cmds.iter().any(|c| pred(&c.action))
+    }
+
+    /// Spec §7.1: `needs_human` liga "Atender" (4 ações); todo Command tem label não-vazio (anti
+    /// icon-only); Centralizar está SEMPRE; a ordem é primária→reversíveis→destrutiva.
+    #[test]
+    fn node_commands_needs_human_shows_atender_first() {
+        let c = node_commands(&ctx(NodeKind::Terminal, NodeStatus::Idle, true, 3));
+        assert_eq!(c.len(), 4, "pede-aprovação → 4 ações");
+        assert!(
+            matches!(c[0].action, PaletteAction::GotoAtencao(_)),
+            "primária no topo"
+        );
+        assert!(
+            matches!(c[3].action, PaletteAction::CloseNode(_)),
+            "destrutiva por último"
+        );
+        assert!(
+            c.iter().all(|cmd| !cmd.label.trim().is_empty()),
+            "nenhum botão icon-only"
+        );
+        assert!(
+            has(&c, |a| matches!(a, PaletteAction::FocusNode(_))),
+            "Centralizar sempre"
+        );
+    }
+
+    /// Sem pedido de aprovação → 3 ações (sem a primária colorida). Editar presente em nó-agente vivo.
+    #[test]
+    fn node_commands_working_state_has_three_no_primary() {
+        let c = node_commands(&ctx(NodeKind::Terminal, NodeStatus::Busy, false, 2));
+        assert_eq!(c.len(), 3, "trabalhando/pronto/novo → 3 ações");
+        assert!(
+            !has(&c, |a| matches!(a, PaletteAction::GotoAtencao(_))),
+            "sem Atender sem needs_human"
+        );
+        assert!(
+            has(&c, |a| matches!(a, PaletteAction::EditAgent(_))),
+            "Editar em agente vivo"
+        );
+    }
+
+    /// Filtro por contexto (§2.2): nó NÃO-agente esconde Editar; nó MORTO esconde Editar.
+    #[test]
+    fn node_commands_hides_editar_when_not_agent_or_dead() {
+        let nota = node_commands(&ctx(NodeKind::Note, NodeStatus::Idle, false, 2));
+        assert!(
+            !has(&nota, |a| matches!(a, PaletteAction::EditAgent(_))),
+            "Nota não edita Agente"
+        );
+        let morto = node_commands(&ctx(NodeKind::Terminal, NodeStatus::Dead, false, 2));
+        assert!(
+            !has(&morto, |a| matches!(a, PaletteAction::EditAgent(_))),
+            "nó morto não edita"
+        );
+        // Centralizar permanece mesmo morto/Nota (sempre).
+        assert!(has(&nota, |a| matches!(a, PaletteAction::FocusNode(_))));
+    }
+
+    /// Encerrar exige roster > 1: 1 clique nunca esvazia o Espaço.
+    #[test]
+    fn node_commands_close_needs_more_than_one_node() {
+        let solo = node_commands(&ctx(NodeKind::Terminal, NodeStatus::Idle, false, 1));
+        assert!(
+            !has(&solo, |a| matches!(a, PaletteAction::CloseNode(_))),
+            "último nó não fecha por 1 clique"
+        );
+        let multi = node_commands(&ctx(NodeKind::Terminal, NodeStatus::Idle, false, 2));
+        assert!(has(&multi, |a| matches!(a, PaletteAction::CloseNode(_))));
+    }
+
+    /// As 2 ações aditivas têm key ESTÁVEL (telemetria/ranking — não o rótulo).
+    #[test]
+    fn additive_actions_have_stable_keys() {
+        let id = Uuid::now_v7();
+        assert_eq!(
+            action_key(&PaletteAction::GotoAtencao(id)),
+            format!("goto_atencao:{id}")
+        );
+        assert_eq!(
+            action_key(&PaletteAction::CloseNode(id)),
+            format!("close_node:{id}")
+        );
     }
 }

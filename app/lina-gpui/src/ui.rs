@@ -26,6 +26,7 @@ mod badge;
 mod button;
 mod input;
 mod modal;
+mod node_toolbar;
 mod panel;
 mod toast;
 
@@ -40,6 +41,9 @@ pub use badge::*;
 pub use button::*;
 pub use input::*;
 pub use modal::*;
+// F2-2-5: a toolbar é montada na costura `main.rs` (dono: C) — sem consumidor neste módulo ainda.
+#[allow(unused_imports)]
+pub use node_toolbar::*;
 pub use panel::*;
 #[allow(unused_imports)]
 pub use toast::*;
