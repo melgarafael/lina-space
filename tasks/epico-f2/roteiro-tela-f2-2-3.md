@@ -48,3 +48,7 @@ Esta story ASSUME estes ajustes deliberados da fusão (catálogo F2-2-1) — con
 - [ ] **Toast de permissão/custódia FALA sem foco:** com VoiceOver, quando um terminal pede permissão/custódia, o toast (canto inferior) anuncia ASSERTIVE (interrompe) o pedido — antes era mudo (Role::Status cru). O «+N pedidos» colapsado também anuncia.
 - [ ] **Sino da topbar:** ESCALAÇÃO anuncia assertive (mesmo com o toast adiado/«Depois»); contagem anuncia polite (não martela — o toast já deu o detalhe). Canal único (sem eco duplo).
 - Chips do título (autonomia/kit/cwd): **verificados — estado ESTÁTICO** (autonomia muda só pela edição focada; kit/cwd são fixados na criação) → não "mudam sem foco", não exigem live-region pelo critério.
+
+## Incremento r6c (toolbar contextual montada — F2-2-5)
+- [ ] **Barra de ações no card FOCADO:** ao focar um terminal, uma barra com 3–4 botões ROTULADOS (permanentes, não hover) aparece ancorada ACIMA do card. Quando o card chega perto do topo, ela vira pra DENTRO da borda superior (flip) — nunca some sob a topbar. Não escala com o zoom (é chrome).
+- [ ] **Ações por estado:** «⚑ Atender» só quando o nó pede você (leva até ele, NÃO aprova); «✎ Editar» só em agente vivo; «⤢ Centralizar» sempre; «✕ Encerrar» só com >1 terminal. Mesmas ações da paleta (⌘K) — teclado e mouse em paridade.

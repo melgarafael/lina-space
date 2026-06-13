@@ -3585,6 +3585,9 @@ impl Render for WorkspaceView {
         // de runs de grid montados no frame (proxy de quads). Desligada → None, custo zero.
         let prof_poll_end = self.prof.enabled.then(Instant::now);
         let mut prof_frame_runs = 0usize;
+        // F2-2-5: rect+contexto do card FOCADO, capturado no loop e consumido na ancoragem da
+        // toolbar contextual (overlay screen-space) após o desenho dos cards.
+        let mut focused_toolbar: Option<(ui::CardRect, palette::NodeCtx, String)> = None;
         for (idx, (id, nv)) in cards.iter().enumerate() {
             // F1-5-1: cronômetro POR PAINEL da fase assemble (inclui lock do grid + screen()).
             let prof_panel_start = self.prof.enabled.then(Instant::now);
@@ -3626,6 +3629,27 @@ impl Render for WorkspaceView {
                 .queue
                 .iter()
                 .any(|p| p.requester() == nv.name);
+            // F2-2-5 (toolbar contextual): captura o rect (espaço de tela) + o contexto do card
+            // FOCADO — a toolbar é ancorada DEPOIS do loop (overlay screen-space, só no nó em
+            // Zone::Focus; o `continue` de Suspenso acima já garante que o focado aqui está visível).
+            if node_id == focused {
+                focused_toolbar = Some((
+                    ui::CardRect {
+                        x: sx,
+                        y: sy,
+                        w: CARD_W * z,
+                        h: CARD_H * z,
+                    },
+                    palette::NodeCtx {
+                        id: node_id,
+                        kind: nv.kind,
+                        status: nv.status,
+                        needs_human,
+                        roster_len: cards.len(),
+                    },
+                    nv.name.clone(),
+                ));
+            }
             // Borda SEMÂNTICA: precisa-de-você → `danger` (o card inteiro pede você, mesmo na
             // periferia — fusão "o que precisa de você salta"); senão foco → `focus.ring`; senão
             // neutra. (Tokens ≥3:1 nos 2 temas — gate F1-2-1; F1-2-6 reusa no teclado.)
@@ -4369,11 +4393,41 @@ impl Render for WorkspaceView {
         }
 
         let root = root.child(topbar).child(footer);
+        let mut root = root;
+
+        // F2-2-5: a TOOLBAR contextual do card FOCADO — overlay screen-space (chrome, não escala com
+        // o zoom), ancorada ACIMA do card (flip sob a topbar via toolbar_anchor). Consome o registry
+        // ÚNICO node_commands(NodeCtx) através do NodeToolbar do catálogo; o clique EXECUTA a ação E
+        // apenda PaletteCommandInvoked (paridade de ranking com a paleta — Command::key é pub). F1-2-6
+        // intocado: o teclado faz o mesmo pela paleta (⌘K).
+        if let Some((card_rect, ctx, node_name)) = focused_toolbar {
+            // Chrome (não-token, como CARD_W/CARD_H): altura aprox. da barra + área reservada sob a
+            // topbar; afinadas no gate-de-tela. Passadas como f32 ao anchor PURO (não são px() literais).
+            const TOOLBAR_H: f32 = 40.0;
+            const SAFE_TOP: f32 = 56.0;
+            let gap = f32::from(th.spacing.sm);
+            if let Some((tx, ty)) = ui::toolbar_anchor(card_rect, TOOLBAR_H, gap, SAFE_TOP, true) {
+                root = root.child(div().absolute().left(px(tx)).top(px(ty)).child(
+                    ui::NodeToolbar::new(ctx, node_name).on_invoke(cx.listener(
+                        |view, action: &palette::PaletteAction, window, cx| {
+                            // Paridade com a paleta: apenda PaletteCommandInvoked (ranking íntegro)
+                            // e então executa a ação. `Command::key` deriva a key (API pub do registry).
+                            let key = palette::Command::new("", action.clone()).key();
+                            let active_root = lock(&view.runtimes).active.clone();
+                            view.append_to_workspace(
+                                &active_root,
+                                &lina_core::DomainEvent::PaletteCommandInvoked { key },
+                            );
+                            view.run_palette_action(action.clone(), window, cx);
+                        },
+                    )),
+                ));
+            }
+        }
 
         // Spec §M8: TOAST de arquivamento (canto inferior esquerdo, perto do rail de onde o
         // gesto partiu) — «Espaço “N” arquivado · [ Desfazer ] (Ns)». O countdown anima pelo
         // heartbeat; o anúncio audível já foi à live-region no `archive_workspace`.
-        let mut root = root;
         if let Some(t) = &self.archive_toast {
             let secs = t.remaining_secs(lina_core::now_ms());
             let undo_ring = if t.undo_focused {
