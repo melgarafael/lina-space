@@ -192,6 +192,13 @@ comprova.
 AccessKit↔macOS, não na nossa parte — reabrir a investigação antes de seguir; é o gate armado do
 ADR 0028. Roteiro técnico de origem: `tasks/epico-f1/spike-a11y-roteiro.md`.)*
 
+**Verificação extra desta parada (refinamento B da verificação dupla do QA, r6):** com o VoiceOver
+ligado, faça um agente entrar em **"precisa de você"** (gate de permissão pendente) e depois **role
+o canvas** afastando e trazendo de volta o card dele à tela, SEM o estado mudar. **Anote:**
+   - [ ] O VoiceOver **re-anunciou** "precisa de você" só por o card voltar à viewport (sem o estado
+     ter mudado)? **SIM / NÃO** — *se SIM, é o refinamento B: guardar "já anunciado" por node-id e só
+     re-anunciar em TROCA real de estado (fix pós-tela, não-bloqueante; headless não pega).*
+
 ---
 
 ## 🇪 Parada 5 *(OPCIONAL)* — Ensaio do kit de testes  ·  ~40–50 min  ·  *(só se tiver fôlego)*
