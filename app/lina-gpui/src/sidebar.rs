@@ -1370,7 +1370,7 @@ impl Render for NameTooltip {
             .bg(rgb(th.surface.raised))
             .border_1()
             .border_color(rgb(th.surface.border))
-            .text_size(px(12.0))
+            .text_size(px(f32::from(th.typography.size.body)))
             .text_color(rgb(th.text.primary))
             .child(text!(self.0.clone()))
     }
