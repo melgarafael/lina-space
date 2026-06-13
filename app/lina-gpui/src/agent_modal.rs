@@ -2305,8 +2305,9 @@ pub fn render(
     // backdrop + caixa central, consolidados no Modal do catálogo (F2-2-1). Fix bugB2 preservado:
     // a caixa vem do `modal_frame` (clamp à janela nos 2 eixos), e o corpo é raiz de scroll em
     // BLOCO (o Modal faz `min_h(0)+overflow_y_scroll`). GANHA `role(Dialog)`+aria (o maior buraco
-    // de a11y do modal — antes não anunciava como diálogo). Véu/occlude OFF: comportamento visual
-    // idêntico ao atual (o véu discreto da fusão é gate-de-tela, não entra às cegas).
+    // de a11y do modal — antes não anunciava como diálogo). A OCLUSÃO de mouse vem LIGADA por
+    // default do wrapper (`ui::modal`, fix M2): o clique no véu transparente não vaza mais pro
+    // terminal atrás. O véu VISUAL (`dim`) segue OFF — comportamento visual idêntico ao atual.
     Modal::new(
         "m6-modal",
         Frame {

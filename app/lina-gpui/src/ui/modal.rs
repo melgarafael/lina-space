@@ -3,10 +3,13 @@
 //!
 //! **Honestidade de arquitetura (ADR 0028 + costura central):** o componente NÃO sequestra o
 //! teclado — o shell tem UM `handle_key` central que roteia Esc por estado. O Modal EXPÕE os hooks
-//! de dismiss (✕, clique-no-véu, ações) e deixa o Esc onde está. O **véu** (`dim`) e o bloqueio de
-//! mouse (`occlude`) são **opt-in, default DESLIGADOS** — migrar um modal existente para cá ganha
-//! `role=Dialog`+aria (o maior buraco de a11y do shell) SEM mudar o comportamento visual; o véu
-//! discreto da fusão liga quando a validação na tela confirmar.
+//! de dismiss (✕, clique-no-véu, ações) e deixa o Esc onde está. O **véu visual** (`dim`) é
+//! **opt-in, default DESLIGADO** — o véu discreto da fusão liga quando a validação na tela
+//! confirmar. O **bloqueio de mouse** (`occlude`) é **default LIGADO** (M2/bugM2): um modal nunca
+//! deixa o clique vazar para o canvas/terminal atrás. Como o véu occludente é transparente quando
+//! `dim` está OFF, ligar a captura NÃO muda nada visualmente — só impede o vazamento. Migrar um
+//! modal para cá ganha `role=Dialog`+aria (o maior buraco de a11y do shell) e a oclusão de graça,
+//! SEM mudar o comportamento visual.
 //!
 //! O clamp do frame à janela é PURO ([`clamp_frame`]) e testado — espelha o `modal_frame` do M6.
 
@@ -83,7 +86,8 @@ pub struct Modal {
     placement: Placement,
     /// Véu discreto sobre o canvas (token escuro + opacidade; nunca blur/glass). Default OFF.
     dim: bool,
-    /// Bloqueia o mouse para o canvas atrás. Default OFF.
+    /// Bloqueia o mouse para o canvas atrás (véu transparente que captura o clique). Default ON
+    /// (M2): nenhum modal deixa o clique vazar para o terminal de trás. `.occlude(false)` opta-fora.
     occlude: bool,
     /// `role(Dialog)` + nome acessível — o buraco de a11y que a consolidação fecha.
     aria_label: Option<SharedString>,
@@ -104,7 +108,7 @@ impl Modal {
             frame,
             placement: Placement::Centered,
             dim: false,
-            occlude: false,
+            occlude: true,
             aria_label: None,
             border: None,
             title: None,
@@ -126,6 +130,8 @@ impl Modal {
         self.dim = on;
         self
     }
+    /// Liga/desliga a captura de mouse pelo véu. **Default ON** (ver [`Modal::new`]) — chame
+    /// `.occlude(false)` só num caso raro em que o clique DEVE atravessar para o canvas.
     #[must_use]
     pub fn occlude(mut self, on: bool) -> Self {
         self.occlude = on;
@@ -332,5 +338,27 @@ mod tests {
         // Janela baixíssima: altura nunca abaixo do piso.
         let f = clamp_frame(1400.0, 100.0, 640.0, 320.0, 16.0, 160.0);
         assert!((f.max_h - 160.0).abs() < 0.01, "piso de altura respeitado");
+    }
+
+    /// M2/bugM2 (NÃO-VACUOSO): o wrapper liga a captura de mouse por DEFAULT — o clique num modal
+    /// nunca vaza para o terminal/canvas atrás. Se alguém reverter o default em `new()`, a 1ª
+    /// asserção FALHA. O véu VISUAL (`dim`) permanece opt-in (gate-de-tela), e `.occlude(false)`
+    /// segue podendo optar-fora num caso raro (prova que o toggle está conectado, não hardcoded).
+    #[test]
+    fn occlude_on_by_default_dim_stays_opt_in() {
+        let frame = Frame {
+            w: 480.0,
+            max_h: 600.0,
+        };
+        let m = Modal::new("m", frame);
+        assert!(
+            m.occlude,
+            "occlude default-ON: clique no modal não vaza pro canvas atrás"
+        );
+        assert!(!m.dim, "véu VISUAL segue opt-in (não escurece sem pedir)");
+        assert!(
+            !Modal::new("m", frame).occlude(false).occlude,
+            ".occlude(false) opta-fora (toggle conectado)"
+        );
     }
 }

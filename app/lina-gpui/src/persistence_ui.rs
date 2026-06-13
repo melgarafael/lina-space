@@ -1557,6 +1557,12 @@ impl Render for PersistenceView {
         // canvas) no frame seguinte, sem restart.
         let th = theme::active();
 
+        // Doutrina de overflow (M1): esta janela é fixa (560×680, redimensionável), então o
+        // conteúdo raiz segue as 3 regiões — header FIXO · corpo ROLÁVEL · (sem footer). O ✕ é o
+        // botão de fechar da titlebar do SO (não há ✕ in-content). Sem isto, as seções
+        // (Espaços + Plano + Aparência + Ajustes) cresciam além da janela e o fim ficava
+        // inacessível (sem scroll). A linha que destrava o scroll no flex-col é `min_h(px(0.))`.
+        // Largura/margem da coluna ficam num ÚNICO wrapper (não duplicadas no header e no corpo).
         div()
             .id("persistence-panel")
             .track_focus(&self.focus)
@@ -1567,14 +1573,19 @@ impl Render for PersistenceView {
             .flex_col()
             .child(
                 div()
+                    // Coluna que preenche a altura; `min_h(0)` deixa o corpo rolar em vez de estourar.
+                    .flex_1()
+                    .min_h(px(0.))
                     .flex()
                     .flex_col()
                     .gap_6()
                     .w(px(500.0))
                     .mt(px(40.0))
                     .ml(px(30.0))
+                    // ── HEADER FIXO: título + selo "salvo"; nunca rola (sempre visível). ──
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -1588,11 +1599,23 @@ impl Render for PersistenceView {
                             )
                             .child(self.save_badge()),
                     )
-                    .child(self.recovery_banner(cx))
-                    .child(self.workspaces_list(cx))
-                    .child(self.plan_section(cx))
-                    .child(self.appearance_panel(cx))
-                    .child(self.settings_panel(cx)),
+                    // ── CORPO ROLÁVEL: o excedente das seções rola aqui dentro, não na janela. ──
+                    .child(
+                        div()
+                            .id("persistence-body")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .w_full()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_6()
+                            .child(self.recovery_banner(cx))
+                            .child(self.workspaces_list(cx))
+                            .child(self.plan_section(cx))
+                            .child(self.appearance_panel(cx))
+                            .child(self.settings_panel(cx)),
+                    ),
             )
     }
 }

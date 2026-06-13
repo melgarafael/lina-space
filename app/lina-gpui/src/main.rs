@@ -1619,7 +1619,25 @@ impl WorkspaceView {
                     ),
             );
         }
-        panel.into_any_element()
+        // Véu transparente que captura o clique: o modal Criar Espaço não vaza pro canvas atrás
+        // (mesma doutrina M2 do ui::modal::Modal — occlude por default).
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .occlude(),
+            )
+            .child(panel)
+            .into_any_element()
     }
 
     /// Apenda um evento no log de um Espaço: runtime MONTADO usa o handle vivo; de fundo
@@ -4225,8 +4243,9 @@ impl Render for WorkspaceView {
                 .bg(rgb(th.surface.raised))
                 .text_color(rgb(th.text.primary))
                 .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, _cx| {
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
                     view.camera.reset();
+                    cx.notify(); // sem isto, a câmera reseta mas o frame não re-renderiza (clique "não faz nada")
                 }))
                 .child(text!("🏠 Centralizar")),
         );
@@ -4410,7 +4429,7 @@ impl Render for WorkspaceView {
             const SAFE_TOP: f32 = 56.0;
             let gap = f32::from(th.spacing.sm);
             if let Some((tx, ty)) = ui::toolbar_anchor(card_rect, TOOLBAR_H, gap, SAFE_TOP, true) {
-                root = root.child(div().absolute().left(px(tx)).top(px(ty)).child(
+                root = root.child(div().absolute().left(px(tx)).top(px(ty)).occlude().child(
                     ui::NodeToolbar::new(ctx, node_name).on_invoke(cx.listener(
                         |view, action: &palette::PaletteAction, window, cx| {
                             // Paridade com a paleta: apenda PaletteCommandInvoked (ranking íntegro)
