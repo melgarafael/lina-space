@@ -871,24 +871,31 @@ fn project_selection(
 }
 
 /// Tabela xterm 256 cores (auto-contida — o `alacritty_terminal` não embarca palette).
+///
+/// As 16 base são a paleta **Tokyo Night "Night"** (folke/tokyonight.nvim, extras alacritty/kitty).
+/// Não é decorativa: casa 1:1 com os acentos curados do tema do app (`lina-gpui` `theme.rs` ACCENTS —
+/// azul `#7aa2f7`, verde `#9ece6a`, rosa `#f7768e`, âmbar `#e0af68`…), então o que o CLI colore (diff,
+/// prompts, avisos) cai na MESMA família visual do shell, em vez da paleta VGA crua de antes
+/// (`#cd0000` etc.) que destoava do fundo azul-marinho (`default_bg #0d1228`). O cubo 6×6×6 e a rampa
+/// de cinza abaixo são o padrão xterm universal — só os 16 base mudam por tema.
 fn xterm256(idx: u8) -> VtRgb {
     const ANSI: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00),
-        (0xcd, 0x00, 0x00),
-        (0x00, 0xcd, 0x00),
-        (0xcd, 0xcd, 0x00),
-        (0x00, 0x00, 0xee),
-        (0xcd, 0x00, 0xcd),
-        (0x00, 0xcd, 0xcd),
-        (0xe5, 0xe5, 0xe5),
-        (0x7f, 0x7f, 0x7f),
-        (0xff, 0x00, 0x00),
-        (0x00, 0xff, 0x00),
-        (0xff, 0xff, 0x00),
-        (0x5c, 0x5c, 0xff),
-        (0xff, 0x00, 0xff),
-        (0x00, 0xff, 0xff),
-        (0xff, 0xff, 0xff),
+        (0x15, 0x16, 0x1e), // 0  black
+        (0xf7, 0x76, 0x8e), // 1  red
+        (0x9e, 0xce, 0x6a), // 2  green
+        (0xe0, 0xaf, 0x68), // 3  yellow
+        (0x7a, 0xa2, 0xf7), // 4  blue
+        (0xbb, 0x9a, 0xf7), // 5  magenta
+        (0x7d, 0xcf, 0xff), // 6  cyan
+        (0xa9, 0xb1, 0xd6), // 7  white
+        (0x41, 0x48, 0x68), // 8  bright black
+        (0xff, 0x89, 0x9d), // 9  bright red
+        (0x9f, 0xe0, 0x44), // 10 bright green
+        (0xfa, 0xba, 0x4a), // 11 bright yellow
+        (0x8d, 0xb0, 0xff), // 12 bright blue
+        (0xc7, 0xa9, 0xff), // 13 bright magenta
+        (0xa4, 0xda, 0xff), // 14 bright cyan
+        (0xc0, 0xca, 0xf5), // 15 bright white
     ];
     if idx < 16 {
         let (r, g, b) = ANSI[idx as usize];
@@ -1116,6 +1123,161 @@ mod tests {
         // `row_text` preserva a largura da linha (posições de coluna); quem apara
         // os espaços à direita é `last_nonempty_line`. "AB" + 3 espaços + "Z".
         assert_eq!(b.row_text(0).trim_end(), "AB   Z");
+    }
+
+    /// C1 — a paleta ANSI base (índices 0-15) é a do **Tokyo Night "Night"**, casando 1:1 com os
+    /// acentos do tema do app (`theme.rs` ACCENTS: azul `#7aa2f7`, verde `#9ece6a`, rosa `#f7768e`…).
+    /// Trava os 16 valores: se regredir para a paleta VGA crua de antes (`#cd0000` etc.), falha.
+    /// Fonte verificada: folke/tokyonight.nvim (extras alacritty/kitty, idênticos).
+    #[test]
+    fn ansi_base_palette_is_tokyo_night() {
+        const TN: [(u8, u8, u8); 16] = [
+            (0x15, 0x16, 0x1e), // 0  black
+            (0xf7, 0x76, 0x8e), // 1  red
+            (0x9e, 0xce, 0x6a), // 2  green
+            (0xe0, 0xaf, 0x68), // 3  yellow
+            (0x7a, 0xa2, 0xf7), // 4  blue
+            (0xbb, 0x9a, 0xf7), // 5  magenta
+            (0x7d, 0xcf, 0xff), // 6  cyan
+            (0xa9, 0xb1, 0xd6), // 7  white
+            (0x41, 0x48, 0x68), // 8  bright black
+            (0xff, 0x89, 0x9d), // 9  bright red
+            (0x9f, 0xe0, 0x44), // 10 bright green
+            (0xfa, 0xba, 0x4a), // 11 bright yellow
+            (0x8d, 0xb0, 0xff), // 12 bright blue
+            (0xc7, 0xa9, 0xff), // 13 bright magenta
+            (0xa4, 0xda, 0xff), // 14 bright cyan
+            (0xc0, 0xca, 0xf5), // 15 bright white
+        ];
+        for (i, &(r, g, b)) in TN.iter().enumerate() {
+            assert_eq!(
+                xterm256(i as u8),
+                VtRgb { r, g, b },
+                "índice ANSI {i} deve ser Tokyo Night"
+            );
+        }
+    }
+
+    /// O cubo 6×6×6 (16-231) e a rampa de cinza (232-255) são o padrão xterm universal — o C1 só
+    /// troca os 16 base, então estes seguem intactos (guarda de regressão da fórmula).
+    #[test]
+    fn xterm256_cube_and_grayscale_unchanged() {
+        assert_eq!(
+            xterm256(16),
+            VtRgb { r: 0, g: 0, b: 0 },
+            "início do cubo = preto"
+        );
+        assert_eq!(
+            xterm256(231),
+            VtRgb {
+                r: 255,
+                g: 255,
+                b: 255
+            },
+            "fim do cubo = branco"
+        );
+        assert_eq!(
+            xterm256(232),
+            VtRgb { r: 8, g: 8, b: 8 },
+            "início da rampa de cinza"
+        );
+        assert_eq!(
+            xterm256(255),
+            VtRgb {
+                r: 238,
+                g: 238,
+                b: 238
+            },
+            "fim da rampa de cinza"
+        );
+    }
+
+    /// SGR ponta-a-ponta: `ESC[3Xm` (foreground 30-37) e `ESC[9Xm` (brilhantes) resolvem para a cor
+    /// Tokyo Night do índice — prova a cadeia SGR → `resolve_color` → `xterm256` no grid real.
+    #[test]
+    fn sgr_foreground_resolves_to_tokyo_night() {
+        let mut b = AlacrittyBackend::new(20, 3);
+        // vermelho(31) verde(32) azul(34) ciano(36) brilhante-vermelho(91)
+        b.advance(b"\x1b[31mR\x1b[32mG\x1b[34mB\x1b[36mC\x1b[91mr");
+        let s = b.screen(); // linha 0: cells[col]
+        assert_eq!(
+            s.cells[0].fg,
+            VtRgb {
+                r: 0xf7,
+                g: 0x76,
+                b: 0x8e
+            },
+            "31 = TN red"
+        );
+        assert_eq!(
+            s.cells[1].fg,
+            VtRgb {
+                r: 0x9e,
+                g: 0xce,
+                b: 0x6a
+            },
+            "32 = TN green"
+        );
+        assert_eq!(
+            s.cells[2].fg,
+            VtRgb {
+                r: 0x7a,
+                g: 0xa2,
+                b: 0xf7
+            },
+            "34 = TN blue"
+        );
+        assert_eq!(
+            s.cells[3].fg,
+            VtRgb {
+                r: 0x7d,
+                g: 0xcf,
+                b: 0xff
+            },
+            "36 = TN cyan"
+        );
+        assert_eq!(
+            s.cells[4].fg,
+            VtRgb {
+                r: 0xff,
+                g: 0x89,
+                b: 0x9d
+            },
+            "91 = TN bright red"
+        );
+    }
+
+    /// Bold é PESO, não brilho (`ESC[1;31m` mantém a cor e liga só o flag); inverse (`ESC[7m`) troca
+    /// fg↔bg na célula resolvida.
+    #[test]
+    fn sgr_bold_keeps_color_and_inverse_swaps() {
+        let mut b = AlacrittyBackend::new(10, 3);
+        b.advance(b"\x1b[1;31mX");
+        let s = b.screen();
+        assert_eq!(
+            s.cells[0].fg,
+            VtRgb {
+                r: 0xf7,
+                g: 0x76,
+                b: 0x8e
+            },
+            "bold não clareia: segue TN red"
+        );
+        assert!(s.cells[0].bold, "bold liga o flag");
+
+        // inverse: vermelho de fg + ESC[7m → a célula joga o vermelho para o BG.
+        let mut b2 = AlacrittyBackend::new(10, 3);
+        b2.advance(b"\x1b[31;7mY");
+        let s2 = b2.screen();
+        assert_eq!(
+            s2.cells[0].bg,
+            VtRgb {
+                r: 0xf7,
+                g: 0x76,
+                b: 0x8e
+            },
+            "inverse manda o vermelho para o bg"
+        );
     }
 
     /// Critério de aceite (b): habilitar bracketed-paste (`CSI ? 2004 h`) →

@@ -1,8 +1,9 @@
 //! **F2-2-1 · Input** — campo de texto da fusão T1+T3. **Importante:** as telas do shell NÃO usam
 //! um `Editor`/`TextInput` real do gpui; cada "campo" é SIMULADO — o estado vive num `String` no
 //! modelo gpui-free, o roteamento de teclas é central (o funil de `main.rs` chama
-//! `type_char`/`backspace`/`paste`), e o campo só PINTA: valor + glifo de cursor `▌` (quando focado)
-//! + placeholder (apagado quando vazio e sem foco) + borda `focus.ring` no foco.
+//! `type_char`/`backspace`/`paste`), e o campo só PINTA: valor + caret `▌` de alto contraste (cor do
+//! anel de foco, elemento separado que nunca é cortado) quando focado + placeholder (apagado quando
+//! vazio e sem foco) + borda `focus.ring` no foco.
 //!
 //! Cor reservada a significado (fusão): o campo NÃO tem fill colorido; erro usa `danger_muted` +
 //! borda `state.danger`, nunca vermelho gratuito. Doutrina de motion: digitação é input frequente →
@@ -15,7 +16,9 @@ use gpui::{
 
 use crate::theme::{self, Theme};
 
-/// Glifo de cursor (LEFT HALF BLOCK) anexado ao valor quando o campo está focado.
+/// Glifo de caret (LEFT HALF BLOCK). No single-line é pintado como elemento separado de alto
+/// contraste (cor do anel de foco) que o `flex_shrink_0` impede de ser cortado; no multiline segue
+/// inline no texto (a caixa rola na vertical, não há corte horizontal a temer).
 const CARET: &str = "\u{258c}";
 
 /// Fator de leading do campo multilinha: a tipografia (F2-1) ainda NÃO tem token de line-height, então
@@ -113,19 +116,33 @@ impl Input {
         self.value.is_empty() && !self.focused
     }
 
-    /// O texto pintado: placeholder se vazio-e-sem-foco; senão o valor + cursor `▌` quando focado
-    /// (exceto `PasteOnly`, que não tem cursor de digitação).
+    /// O caret aparece só com foco e em campo digitável (o `PasteOnly` não tem cursor de digitação).
+    #[must_use]
+    pub fn caret_visible(&self) -> bool {
+        self.focused && !matches!(self.kind, InputKind::PasteOnly)
+    }
+
+    /// O corpo do campo SEM o caret: placeholder se vazio-e-sem-foco, senão o valor. O render
+    /// single-line pinta o caret como elemento separado de alto contraste a partir deste corpo.
+    #[must_use]
+    pub fn body_text(&self) -> String {
+        if self.shows_placeholder() {
+            self.placeholder.to_string()
+        } else {
+            self.value.to_string()
+        }
+    }
+
+    /// Corpo + caret inline achatados (lógica PURA testável; é o que o multiline pinta): o corpo mais
+    /// o glifo `▌` quando [`Input::caret_visible`]. O single-line NÃO usa isto — pinta o caret colorido
+    /// à parte (ver `render`), para o caret ter cor própria e não ser cortado no overflow.
     #[must_use]
     pub fn display_text(&self) -> String {
-        if self.shows_placeholder() {
-            return self.placeholder.to_string();
-        }
-        let caret = if self.focused && !matches!(self.kind, InputKind::PasteOnly) {
-            CARET
+        if self.caret_visible() {
+            format!("{}{CARET}", self.body_text())
         } else {
-            ""
-        };
-        format!("{}{caret}", self.value)
+            self.body_text()
+        }
     }
 
     /// `(bg, borda, texto)` resolvidos — único ponto que toca tokens de cor. Erro veste o vermelho
@@ -157,18 +174,26 @@ impl RenderOnce for Input {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let t = theme::active();
         let (bg, border, text) = self.paint(&t);
-        let body = self.display_text();
-        let mono = self.mono;
+        // Caret de alto contraste: a cor do ANEL de foco (= acento do usuário, com ≥3:1 garantido pelo
+        // gate WCAG nos 2 temas). Usar o mesmo pigmento da borda de foco reforça "isto está focado".
+        let caret_color = t.focus.ring;
+        let show_caret = self.caret_visible();
+        let body = self.body_text();
+        let inline = self.display_text();
         let kind = self.kind;
+        let mono = self.mono;
         let touch_floor = f32::from(t.spacing.xl);
         let family = if mono {
             t.typography.family.mono
         } else {
             t.typography.family.ui
         };
+        let id = self.id;
+        let aria = self.aria_label;
+        let on_click = self.on_click;
 
         let mut el = div()
-            .id(self.id)
+            .id(id)
             // min_w(0) deixa o campo encolher no flex; overflow_hidden corta o texto longo.
             .min_w(px(0.))
             .min_h(px(touch_floor))
@@ -188,15 +213,34 @@ impl RenderOnce for Input {
                         * f32::from(t.typography.size.body)
                         * MULTILINE_LEADING))
                     .overflow_y_scroll(),
-                _ => d,
+                // Single-line/paste: linha (row) p/ o texto encolher e o caret ficar fixo ao lado.
+                _ => d.flex().items_center(),
             });
-        if let Some(aria) = self.aria_label {
+        if let Some(aria) = aria {
             el = el.aria_label(aria);
         }
-        if let Some(handler) = self.on_click {
+        if let Some(handler) = on_click {
             el = el.cursor_pointer().on_click(handler);
         }
-        el.child(body)
+
+        match kind {
+            // Multiline: o texto quebra linha e rola na vertical; o caret segue inline no fim.
+            InputKind::Multiline { .. } => el.child(inline),
+            // Single-line: corpo clipável (min_w 0 + overflow) + caret de alto contraste que o
+            // `flex_shrink_0` mantém SEMPRE visível, mesmo quando o valor enche o campo.
+            _ => {
+                let mut el = el.child(div().min_w(px(0.)).overflow_hidden().child(body));
+                if show_caret {
+                    el = el.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(caret_color))
+                            .child(CARET),
+                    );
+                }
+                el
+            }
+        }
     }
 }
 
@@ -248,6 +292,40 @@ mod tests {
         assert_eq!(
             Input::new("f", "").placeholder("digite").display_text(),
             "digite"
+        );
+    }
+
+    /// `caret_visible` decide o caret: só com foco E em campo digitável (o `PasteOnly` não tem).
+    #[test]
+    fn caret_visible_only_when_focused_and_typable() {
+        assert!(Input::new("f", "x").focused(true).caret_visible());
+        assert!(!Input::new("f", "x").caret_visible(), "sem foco, sem caret");
+        assert!(
+            !Input::new("f", "x")
+                .paste_only()
+                .focused(true)
+                .caret_visible(),
+            "campo só-colar não tem caret de digitação"
+        );
+    }
+
+    /// `body_text` é o corpo SEM caret (o caret single-line é pintado à parte, colorido). Vazio-focado
+    /// dá corpo vazio (o caret separado é que aparece); vazio-sem-foco dá o placeholder.
+    #[test]
+    fn body_text_never_includes_caret() {
+        assert_eq!(Input::new("f", "lina").focused(true).body_text(), "lina");
+        assert_eq!(Input::new("f", "lina").body_text(), "lina");
+        assert_eq!(
+            Input::new("f", "").placeholder("digite").body_text(),
+            "digite"
+        );
+        assert_eq!(
+            Input::new("f", "")
+                .placeholder("digite")
+                .focused(true)
+                .body_text(),
+            "",
+            "vazio-focado: corpo vazio, o caret separado é que indica o foco"
         );
     }
 

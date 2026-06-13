@@ -7007,14 +7007,14 @@ mod tests {
         let s = b.screen();
         let row0: String = s.row(0).iter().map(|c| c.c).collect();
         assert!(row0.starts_with("RED BOLD"), "linha 0 = {row0:?}");
-        // Cor: o 'R' (col 0) é vermelho (ANSI 1 = 0xcd0000).
+        // Cor: o 'R' (col 0) é vermelho (ANSI 1 = Tokyo Night red #f7768e — C1: paleta casada ao tema).
         assert_eq!(s.row(0)[0].c, 'R');
         assert_eq!(
             s.row(0)[0].fg,
             lina_core::VtRgb {
-                r: 0xcd,
-                g: 0x00,
-                b: 0x00
+                r: 0xf7,
+                g: 0x76,
+                b: 0x8e
             }
         );
         // Negrito: o 'B' de BOLD (col 4) é negrito; o ' ' (col 3) não.
