@@ -37,3 +37,14 @@ Esta story ASSUME estes ajustes deliberados da fusão (catálogo F2-2-1) — con
 
 ## Origem
 Épico vault `38` §VIII (decisão 1 — statement da fusão) + §F2-2 (F2-2-3). Protótipos `tasks/pesquisa-f2/prototipos/t1-instrumento.html` (cor semântica fixa, OP-1, flat honesto) + `t3-atelie.html` (calor, momento de celebração). Despacho `tasks/epico-f2/despachos/r5-frontend-identidade.md`.
+
+---
+## Incremento r6 (F2-2-2 integração — P0 soberano)
+- [ ] **VOZ no "precisa de você" (P0):** com um leitor de tela ligado (VoiceOver), um terminal que entra em "precisa de você" (gate de custódia pendente) deve ANUNCIAR sozinho, **sem você focar nele** (anúncio assertive, interrompe) — via o selo `Badge::needs_you()` no título. Antes só falava ao focar; agora a assimetria visual(vermelho)↔voz fechou. **Canal único:** ao focar o card, o leitor NÃO repete "precisa de você" 2× (o corpo lê "nome — status"; o selo carrega o pedido).
+- [ ] **Selo visível:** o card que precisa de você mostra o selo "■ precisa de você" (vermelho de estado, glifo+texto+cor — nunca só cor) ao lado do nome, além do dot/borda vermelhos da r5.
+- [ ] **Toolbar (quando montada):** ⚑ Atender leva você ATÉ o nó (foca+revela) sem aprovar nada; ✕ Encerrar fecha o nó (igual ao ✕ do header).
+
+## Incremento r6 (attention_ui — item oficial Nº1)
+- [ ] **Toast de permissão/custódia FALA sem foco:** com VoiceOver, quando um terminal pede permissão/custódia, o toast (canto inferior) anuncia ASSERTIVE (interrompe) o pedido — antes era mudo (Role::Status cru). O «+N pedidos» colapsado também anuncia.
+- [ ] **Sino da topbar:** ESCALAÇÃO anuncia assertive (mesmo com o toast adiado/«Depois»); contagem anuncia polite (não martela — o toast já deu o detalhe). Canal único (sem eco duplo).
+- Chips do título (autonomia/kit/cwd): **verificados — estado ESTÁTICO** (autonomia muda só pela edição focada; kit/cwd são fixados na criação) → não "mudam sem foco", não exigem live-region pelo critério.
