@@ -3119,12 +3119,13 @@ impl WorkspaceView {
             }
             return;
         }
-        // ⌘C copia a seleção; ⌘V cola no PTY focado (bracketed-paste). Ctrl+C/V seguem p/ o PTY.
+        // ⌘C/⌘V (Mac) · Ctrl+V (Windows) para colar. Ctrl+C NÃO é interceptado (SIGINT no PTY).
         if ks.modifiers.platform && ks.key == "c" {
             self.copy_selection(cx);
             return;
         }
-        if ks.modifiers.platform && ks.key == "v" {
+        // Windows: Ctrl+V cola (shortcut_modifier inclui control no Windows); Mac: ⌘V.
+        if shortcut_modifier(ks) && ks.key == "v" {
             self.paste_clipboard(cx);
             return;
         }
@@ -4410,8 +4411,23 @@ fn lina_demo_enabled() -> bool {
     )
 }
 
-/// Base PERSISTENTE por-usuário (macOS: `~/Library/Application Support`). Sem `$HOME` (raríssimo): cai
-/// no `temp` como degradação VISÍVEL — a alternativa (panic) violaria inv#6 ("app NUNCA quebrar").
+/// Base PERSISTENTE por-usuário. macOS: `~/Library/Application Support`. Windows: `%APPDATA%`.
+/// Sem variável de ambiente (raríssimo): cai no `temp` como degradação VISÍVEL — a alternativa
+/// (panic) violaria inv#6 ("app NUNCA quebrar").
+#[cfg(windows)]
+fn app_support_dir() -> PathBuf {
+    match std::env::var_os("APPDATA") {
+        Some(appdata) => PathBuf::from(appdata),
+        None => {
+            eprintln!(
+                "lina-gpui: APPDATA ausente — usando diretório temporário (o estado NÃO persistirá)"
+            );
+            std::env::temp_dir()
+        }
+    }
+}
+
+#[cfg(not(windows))]
 fn app_support_dir() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home)
