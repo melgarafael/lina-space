@@ -122,16 +122,24 @@ fn app_support_dir() -> PathBuf {
 ```
 **Arquivo:** `app/lina-gpui/src/main.rs`
 
-### MELHORIA-WIN-2 — Shell padrão é `cmd.exe`; deveria ser PowerShell
+### MELHORIA-WIN-2 — Shell padrão é `cmd.exe`; deveria ser PowerShell ✅ IMPLEMENTADO E APROVADO
 
-**Problema:** O app usa `$SHELL` com fallback `/bin/sh` — lógica Unix. No Windows resolve para `cmd.exe`. Claude Code roda melhor em PowerShell e é o que o usuário Windows espera.  
-**Fix sugerido:**
+**Problema:** O app usava `cmd.exe` hardcoded no Windows. Claude Code roda melhor em PowerShell e é o que o usuário Windows espera.  
+**Fix aplicado:** `platform_shell_cmd()` no Windows agora tenta `powershell.exe -NoLogo` primeiro; cai no `%COMSPEC%` (cmd.exe) como fallback se PowerShell não existir:
 ```rust
 #[cfg(windows)]
-fn default_shell() -> String {
-    std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
+fn platform_shell_cmd() -> PtyCommand {
+    let ps = std::process::Command::new("powershell.exe")
+        .arg("-Command").arg("exit 0").status().is_ok();
+    if ps {
+        PtyCommand::new("powershell.exe").arg("-NoLogo")
+    } else {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        PtyCommand::new(shell)
+    }
 }
 ```
+**Arquivo:** `app/lina-gpui/src/bridge.rs`
 
 ### MELHORIA-WIN-3 — Sem atalho de cópia de texto no Windows
 
@@ -172,7 +180,7 @@ dev.bat
 ## Pendências para Fase 4 (Empacotamento)
 
 - [x] Aplicar MELHORIA-WIN-1 (persistência real no Windows)
-- [ ] Aplicar MELHORIA-WIN-2 (PowerShell como shell padrão)
+- [x] Aplicar MELHORIA-WIN-2 (PowerShell como shell padrão)
 - [ ] Aplicar MELHORIA-WIN-3 (Ctrl+Shift+C para copiar)
 - [ ] Criar `packaging/windows/make-win.ps1`
 - [ ] Bundlar `conpty.dll` + `OpenConsole.exe`

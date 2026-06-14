@@ -2646,9 +2646,19 @@ fn node_identity_env(
 
 #[cfg(windows)]
 fn platform_shell_cmd() -> PtyCommand {
-    // Shell interativo limpo, sem a linha de intro (`/K` sem `echo`): o `cmd.exe` já abre
-    // aceitando comandos. Como o Terminal padrão do Windows.
-    PtyCommand::new("cmd.exe")
+    // PowerShell como shell padrão no Windows (melhor suporte ao Claude Code e expectativa
+    // do usuário Windows). Fallback para %COMSPEC% (cmd.exe) se powershell.exe não existir.
+    let ps = std::process::Command::new("powershell.exe")
+        .arg("-Command")
+        .arg("exit 0")
+        .status()
+        .is_ok();
+    if ps {
+        PtyCommand::new("powershell.exe").arg("-NoLogo")
+    } else {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        PtyCommand::new(shell)
+    }
 }
 
 #[cfg(not(windows))]
