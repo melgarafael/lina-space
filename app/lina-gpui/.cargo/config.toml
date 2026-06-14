@@ -1,0 +1,7 @@
+[http]
+check-revoke = false
+
+# Windows: stack padrão é 1MB (vs 8MB no Mac/Linux). O render tree do gpui é profundo
+# o suficiente para causar stack overflow. Aumenta para 8MB para paridade com Mac.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

@@ -72,3 +72,4 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "09165c15
 # como o spike. Não é produto — é o primeiro shell ponta-a-ponta.
 [profile.dev]
 debug = false
+debug-assertions = false
