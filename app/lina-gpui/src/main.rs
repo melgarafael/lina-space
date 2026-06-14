@@ -3119,8 +3119,14 @@ impl WorkspaceView {
             }
             return;
         }
-        // ⌘C/⌘V (Mac) · Ctrl+V (Windows) para colar. Ctrl+C NÃO é interceptado (SIGINT no PTY).
+        // ⌘C/⌘V (Mac) · Ctrl+Shift+C/Ctrl+V (Windows). Ctrl+C puro vai ao PTY (SIGINT).
         if ks.modifiers.platform && ks.key == "c" {
+            self.copy_selection(cx);
+            return;
+        }
+        // Windows: Ctrl+Shift+C copia (padrão do Windows Terminal — Ctrl+C é SIGINT).
+        #[cfg(windows)]
+        if ks.modifiers.control && ks.modifiers.shift && ks.key == "c" {
             self.copy_selection(cx);
             return;
         }

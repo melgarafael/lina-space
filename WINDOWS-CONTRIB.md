@@ -141,10 +141,18 @@ fn platform_shell_cmd() -> PtyCommand {
 ```
 **Arquivo:** `app/lina-gpui/src/bridge.rs`
 
-### MELHORIA-WIN-3 — Sem atalho de cópia de texto no Windows
+### MELHORIA-WIN-3 — Sem atalho de cópia de texto no Windows ✅ IMPLEMENTADO E APROVADO
 
-**Problema:** `Ctrl+C` vai para o PTY (SIGINT). No Mac `⌘C` copia a seleção. No Windows não há nenhum atalho de cópia funcional.  
-**Fix sugerido:** Adicionar `Ctrl+Shift+C` para cópia (padrão do Windows Terminal).
+**Problema:** `Ctrl+C` vai para o PTY (SIGINT). No Mac `⌘C` copia a seleção. No Windows não havia nenhum atalho de cópia funcional.  
+**Fix aplicado:** Adicionado `Ctrl+Shift+C` para cópia no Windows (padrão do Windows Terminal). `Ctrl+C` continua indo ao PTY (SIGINT):
+```rust
+#[cfg(windows)]
+if ks.modifiers.control && ks.modifiers.shift && ks.key == "c" {
+    self.copy_selection(cx);
+    return;
+}
+```
+**Arquivo:** `app/lina-gpui/src/main.rs`
 
 ---
 
@@ -181,7 +189,7 @@ dev.bat
 
 - [x] Aplicar MELHORIA-WIN-1 (persistência real no Windows)
 - [x] Aplicar MELHORIA-WIN-2 (PowerShell como shell padrão)
-- [ ] Aplicar MELHORIA-WIN-3 (Ctrl+Shift+C para copiar)
+- [x] Aplicar MELHORIA-WIN-3 (Ctrl+Shift+C para copiar)
 - [ ] Criar `packaging/windows/make-win.ps1`
 - [ ] Bundlar `conpty.dll` + `OpenConsole.exe`
 - [ ] Gerar `.zip` com `lina-gpui.exe` + assets
