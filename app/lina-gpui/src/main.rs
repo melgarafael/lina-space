@@ -572,6 +572,8 @@ struct WorkspaceView {
     /// F1-5-1: sonda [PROF] (decomposição do frametime). `LINA_PROF=1` liga; desligada, o
     /// custo por frame é UM check de bool (o protocolo de overhead compara o [FPS] 0×1).
     prof: prof::Probe,
+    /// MELHORIA-WIN-3: overlay de atalhos de teclado (Ctrl+Shift+?). `true` = visível.
+    shortcuts_open: bool,
 }
 
 impl WorkspaceView {
@@ -701,6 +703,7 @@ impl WorkspaceView {
             attention_settings_at: None,
             attention_diag_last: String::new(),
             settings_dir,
+            shortcuts_open: false,
             runtimes,
             shared,
             // F1-4-4 · M8: o rail nasce com os 7 callbacks da integração fiados — cliques do
@@ -3197,6 +3200,18 @@ impl WorkspaceView {
                 return;
             }
         }
+        // Ctrl+? (= Ctrl+Shift+/ no teclado BR — o layout consome o Shift e entrega key="?").
+        // Mac: ⌘? segue o mesmo padrão (platform+key="?"). Fecha com Esc ou repetição.
+        if ks.modifiers.control && ks.key == "?" {
+            self.shortcuts_open = !self.shortcuts_open;
+            cx.notify();
+            return;
+        }
+        if self.shortcuts_open && ks.key == "escape" {
+            self.shortcuts_open = false;
+            cx.notify();
+            return;
+        }
         let grid = lock(&self.nodes.grids).get(&self.focused).cloned();
         let app_cursor = grid.map(|g| lock(&g).mode().app_cursor).unwrap_or(false);
         let bytes = keystroke_to_bytes(ks, app_cursor);
@@ -4357,6 +4372,12 @@ impl Render for WorkspaceView {
         } else {
             root
         };
+        // MELHORIA-WIN-3: overlay de atalhos (Ctrl+Shift+? abre; Esc ou repetição fecha).
+        let root = if self.shortcuts_open {
+            root.child(render_shortcuts_overlay(&th))
+        } else {
+            root
+        };
         // F1-5-1 ([PROF]): SENTINELA de paint — canvas de tamanho ZERO como ÚLTIMO filho da
         // cena: seu closure de paint roda DENTRO da fase de paint do gpui (depois do layout,
         // ao fim do paint em ordem de árvore) e carimba o instante no slot atômico. É o que
@@ -4390,6 +4411,91 @@ impl Render for WorkspaceView {
         }
         root
     }
+}
+
+/// Overlay de atalhos de teclado (MELHORIA-WIN-3). Renderiza um painel centralizado com todos os
+/// atalhos disponíveis. Abre com Ctrl+Shift+?; fecha com Esc ou nova pressão do mesmo atalho.
+fn render_shortcuts_overlay(th: &theme::Theme) -> impl gpui::IntoElement {
+    let shortcuts: &[(&str, &str)] = &[
+        ("Ctrl+T", "Novo terminal de agente"),
+        ("Ctrl+Shift+C", "Copiar seleção"),
+        ("Ctrl+V", "Colar do clipboard"),
+        ("Ctrl+Shift+?", "Mostrar/ocultar atalhos"),
+        ("", ""),
+        ("Ctrl+K", "Paleta de comandos"),
+        ("Ctrl+J", "Fila de atenção"),
+        ("", ""),
+        ("Esc", "Fechar overlay / descartar toast"),
+    ];
+
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::rgba(0x00000088))
+        .child(
+            div()
+                .w(px(420.0))
+                .rounded(px(12.0))
+                .bg(rgb(th.surface.panel))
+                .border_1()
+                .border_color(rgb(th.accent.primary))
+                .p(px(24.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(rgb(th.text.muted))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .mb(px(14.0))
+                        .child("Atalhos de teclado"),
+                )
+                .children(shortcuts.iter().map(|(key, desc)| {
+                    if key.is_empty() {
+                        return div().h(px(6.0));
+                    }
+                    div()
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .mb(px(6.0))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(4.0))
+                                .children(key.split('+').map(|k| {
+                                    div()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(rgb(th.surface.raised))
+                                        .border_1()
+                                        .border_color(rgb(th.accent.primary))
+                                        .text_size(px(11.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(th.accent.primary))
+                                        .child(k.to_string())
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(th.text.primary))
+                                .child(desc.to_string()),
+                        )
+                }))
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .pt(px(12.0))
+                        .border_t_1()
+                        .border_color(rgb(th.surface.border))
+                        .text_size(px(11.0))
+                        .text_color(rgb(th.text.muted))
+                        .child("Pressione Esc ou Ctrl+Shift+? para fechar"),
+                ),
+        )
 }
 
 /// PRODUÇÃO vs DEMO. `LINA_DEMO` (1/true/on/yes) liga o modo demo do fundador: semeia Terminal A/B,

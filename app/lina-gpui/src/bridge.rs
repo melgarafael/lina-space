@@ -3372,21 +3372,28 @@ impl BootstrapWriter {
             &ours_md,
             stamped(self.bootstrapper.gemini_doctrine(&input)),
         );
-        // Settings/hooks (observabilidade + gate): posse por CHAVE ESTRUTURADA
-        // (`_lina_managed: true`, parseada e checada por VALOR — não substring do comando do
-        // hook, que o usuário poderia legitimamente ter). Um settings DO USUÁRIO sem a chave é
-        // preservado (recusa + badge). Red-team 360 (inv 1, MÉDIA): `contains("whoami --bootstrap")`
-        // sobrescreveria um settings do usuário que apenas contivesse aquela substring.
-        guarded(
-            ".claude/settings.json",
-            &|existing: &str| managed_ns || settings_is_ours(existing),
-            lina_bootstrap::stamp_managed_settings(
+        // Settings/hooks (observabilidade + gate): arquivo gerenciado → regrava; do usuário →
+        // MESCLA os hooks da Lina preservando todas as outras chaves (plugins, idioma, etc.)
+        // e marca como gerenciado. Nunca destrói configurações do usuário (ADR 0025).
+        {
+            let settings_path = dir.join(".claude/settings.json");
+            let lina_settings = lina_bootstrap::stamp_managed_settings(
                 &lina_bootstrap::hook_settings_json_with_observability(
                     &self.lina_bin,
                     wiring.as_ref(),
                 ),
-            ),
-        );
+            );
+            match write_or_merge_settings(&settings_path, &lina_settings, managed_ns) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "lina-gpui: .claude/settings.json em {} — falhou: {e}",
+                        dir.display()
+                    );
+                    refused.push(".claude/settings.json".to_string());
+                }
+            }
+        }
         // `.lina/bootstrap.json` é namespace da Lina — escrita direta (estado vivo do `lina whoami`).
         let lina_dir = dir.join(".lina");
         let json = serde_json::to_string_pretty(&input).unwrap_or_else(|_| String::from("{}"));
@@ -3459,6 +3466,73 @@ fn write_guarded(
     }
     std::fs::write(path, content)?;
     Ok(true)
+}
+
+/// Grava `lina_settings` em `path` com política de merge:
+/// - arquivo não existe → grava diretamente
+/// - arquivo é nosso (`_lina_managed: true`) ou `managed_ns` → sobrescreve
+/// - arquivo do usuário → merge: injeta hooks do Lina e adiciona `_lina_managed: true`
+fn write_or_merge_settings(
+    path: &Path,
+    lina_settings: &str,
+    managed_ns: bool,
+) -> std::io::Result<()> {
+    let lina_v: serde_json::Value =
+        serde_json::from_str(lina_settings).unwrap_or(serde_json::json!({}));
+    let merged = match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => lina_settings.to_string(),
+        Err(_) => return Ok(()), // não conseguiu ler: preserva sem doutrina (não falha)
+        Ok(existing) if managed_ns || settings_is_ours(&existing) => lina_settings.to_string(),
+        Ok(existing) => merge_user_settings(&existing, &lina_v),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, merged)
+}
+
+/// Merge não-destrutivo: preserva todos os campos do usuário, injeta hooks do Lina (sem
+/// duplicatas) e marca `_lina_managed: true` para que na próxima abertura o arquivo seja
+/// reconhecido como nosso e possa ser atualizado normalmente.
+fn merge_user_settings(existing: &str, lina_v: &serde_json::Value) -> String {
+    let mut merged: serde_json::Value =
+        serde_json::from_str(existing).unwrap_or(serde_json::json!({}));
+    if let Some(lina_hooks) = lina_v.get("hooks").and_then(|h| h.as_object()) {
+        let obj = merged.as_object_mut().unwrap();
+        if !obj.contains_key("hooks") {
+            obj.insert("hooks".to_string(), serde_json::json!({}));
+        }
+        let existing_hooks = obj
+            .get_mut("hooks")
+            .and_then(|h| h.as_object_mut())
+            .unwrap();
+        for (kind, lina_entries) in lina_hooks {
+            if let Some(lina_arr) = lina_entries.as_array() {
+                match existing_hooks
+                    .get_mut(kind)
+                    .and_then(|k| k.as_array_mut())
+                {
+                    Some(arr) => {
+                        for entry in lina_arr {
+                            if !arr.iter().any(|e| e == entry) {
+                                arr.push(entry.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        existing_hooks.insert(kind.clone(), lina_entries.clone());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(obj) = merged.as_object_mut() {
+        obj.insert(
+            lina_bootstrap::LINA_MANAGED_SETTINGS_KEY.to_string(),
+            serde_json::json!(true),
+        );
+    }
+    serde_json::to_string_pretty(&merged).unwrap_or_else(|_| existing.to_string())
 }
 
 /// **F1-2-3 p2 — decode PURO dos papéis custom** (testável headless): filtra os
