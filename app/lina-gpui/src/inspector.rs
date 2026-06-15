@@ -134,6 +134,11 @@ mod tests {
             cwd: None,
             // Costura F1-0-3 (coordenada via Maestro): campo novo da projeção; fixture sem WARN.
             stalled: false,
+            // Costura F2-3-2 (coordenada via Maestro): dims da projeção (resize); fixture sem resize.
+            cols: None,
+            rows: None,
+            w: None,
+            h: None,
         }
     }
 

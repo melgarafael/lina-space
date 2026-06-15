@@ -482,6 +482,8 @@ struct WorkspaceView {
     camera: Camera,
     /// Arrasto do FUNDO (pan): `(mouse_inicial_em_tela, pan_inicial)` em px de tela.
     drag: Option<((f32, f32), (f32, f32))>,
+    /// F2-3-1: gesto de MOVER um card (arrasto pela barra de título). `None` = sem gesto ativo.
+    card_drag: Option<canvas::drag::CardDrag>,
     /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
     z_order: BTreeMap<NodeId, u64>,
     z_next: u64,
@@ -672,6 +674,7 @@ impl WorkspaceView {
             focus,
             camera: Camera::default(),
             drag: None,
+            card_drag: None,
             z_order: BTreeMap::new(),
             z_next: 0,
             sel: None,
@@ -3266,6 +3269,66 @@ impl WorkspaceView {
             self.camera.reset(); // ⌘0: volta ao home (resgate da vista).
             return;
         }
+        // F2-3-5 ⌘1: enquadrar TODOS os terminais (zoom-to-fit) — o fundador nunca fica perdido no
+        // vazio. No-op se não há cards. Matemática pura e testada em `canvas::zoom`.
+        if ks.modifiers.platform && ks.key == "1" {
+            let vp = window.viewport_size();
+            let viewport = (f32::from(vp.width), f32::from(vp.height));
+            let cards: Vec<(f32, f32)> = self.cards_z_asc().into_iter().map(|(_, p)| p).collect();
+            if let Some(b) = canvas::zoom::bounds_of(&cards, CARD_W, CARD_H) {
+                self.camera = canvas::zoom::zoom_to_fit(
+                    b,
+                    viewport,
+                    48.0,
+                    crate::bridge::ZOOM_MIN,
+                    crate::bridge::ZOOM_MAX,
+                );
+                cx.notify();
+            }
+            return;
+        }
+        // F2-3-5 ⌘2: focar a SELEÇÃO (hoje = o card focado; multi-seleção é story futura — aí o
+        // call-site passa `bounds_of(&selecionados)`, a função não muda).
+        if ks.modifiers.platform && ks.key == "2" {
+            let vp = window.viewport_size();
+            let viewport = (f32::from(vp.width), f32::from(vp.height));
+            if let Some((_, (x, y))) = self
+                .cards_z_asc()
+                .into_iter()
+                .find(|(id, _)| *id == self.focused)
+            {
+                let b = canvas::zoom::Rect {
+                    x,
+                    y,
+                    w: CARD_W,
+                    h: CARD_H,
+                };
+                self.camera = canvas::zoom::zoom_to_selection(
+                    b,
+                    viewport,
+                    48.0,
+                    crate::bridge::ZOOM_MIN,
+                    crate::bridge::ZOOM_MAX,
+                );
+                cx.notify();
+            }
+            return;
+        }
+        // F2-3-1: Esc cancela um gesto de MOVER card em curso — reverte o NodeView à origem (o
+        // preview o moveu em memória) e CONSOME a tecla (não recolhe toast nem vai ao PTY). ZERO
+        // NodeMoved: o `finish` nem é chamado. Tem prioridade sobre o Esc-recolhe-toast abaixo.
+        if ks.key == "escape" && self.card_drag.is_some() {
+            if let Some(g) = self.card_drag.take() {
+                let (ox, oy) = g.origin();
+                let node = g.node();
+                if let Some(nv) = lock(&self.nodes.model).nodes.get_mut(&node) {
+                    nv.x = ox;
+                    nv.y = oy;
+                }
+                cx.notify();
+            }
+            return;
+        }
         // F1-1-7: Esc com TOAST visível — **ARBITRAGEM do Maestro (ux-flows vence a
         // copy da story): Esc NUNCA decide**, em TODAS as superfícies. Fail-safe:
         // recusar vira write no terminal na F1-1-8 e pode matar operação longa; tecla
@@ -3456,21 +3519,57 @@ impl Render for WorkspaceView {
             .text_color(rgb(th.text.primary))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|view, ev: &MouseDownEvent, window, _cx| {
-                    // PAN só ao arrastar o FUNDO (não sobre um card VISÍVEL → sem zona morta).
+                cx.listener(|view, ev: &MouseDownEvent, window, cx| {
                     let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
                     let v = window.viewport_size();
                     let vp = (f32::from(v.width), f32::from(v.height));
-                    if hit_test(&view.camera, pos, &view.cards_z_asc(), (CARD_W, CARD_H), vp)
-                        .is_none()
-                    {
-                        view.drag = Some((pos, view.camera.pan));
+                    let hit =
+                        hit_test(&view.camera, pos, &view.cards_z_asc(), (CARD_W, CARD_H), vp);
+                    match canvas::drag::drag_mode(hit) {
+                        // F2-3-1: card sob o cursor → MOVER, mas só pela BARRA DE TÍTULO (top ~34px
+                        // em mundo, escalado por zoom — mesma altura de `fit_dims`). O CORPO segue
+                        // para a seleção de texto do terminal (handler interno do grid): arrastar o
+                        // corpo NÃO move o card (invariante de janela — pega-se pelo título).
+                        canvas::drag::DragMode::MoveCard(node) => {
+                            let card_world = {
+                                let m = lock(&view.nodes.model);
+                                m.nodes.get(&node).map(|nv| (nv.x, nv.y))
+                            };
+                            if let Some((cx0, cy0)) = card_world {
+                                let (_, top_y) = view.camera.world_to_screen((cx0, cy0));
+                                let header_px = 34.0 * view.camera.zoom;
+                                if pos.1 >= top_y && pos.1 <= top_y + header_px {
+                                    view.focus(node); // z-bump: fica na frente ao pegar
+                                    view.card_drag =
+                                        Some(canvas::drag::CardDrag::begin(node, (cx0, cy0), pos));
+                                    cx.notify();
+                                }
+                            }
+                        }
+                        // Fundo vazio → PAN da câmera (comportamento histórico).
+                        canvas::drag::DragMode::PanCamera => {
+                            view.drag = Some((pos, view.camera.pan));
+                        }
                     }
                 }),
             )
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, cx| {
                 let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
-                if let Some((mouse0, pan0)) = view.drag {
+                let zoom = view.camera.zoom;
+                // F2-3-1: gesto de MOVER card tem prioridade — recalcula o PREVIEW (move só o
+                // NodeView em memória; NÃO emite evento). O event log só recebe no `mouse_up`.
+                if let Some(g) = view.card_drag.as_mut() {
+                    if ev.dragging() {
+                        g.update(pos, zoom);
+                        let (nx, ny) = g.preview();
+                        let node = g.node();
+                        if let Some(nv) = lock(&view.nodes.model).nodes.get_mut(&node) {
+                            nv.x = nx;
+                            nv.y = ny;
+                        }
+                        cx.notify();
+                    }
+                } else if let Some((mouse0, pan0)) = view.drag {
                     if ev.dragging() {
                         view.camera.pan = (pan0.0 + pos.0 - mouse0.0, pan0.1 + pos.1 - mouse0.1);
                         // BUG C (raiz): o gpui só auto-repinta num mousemove quando há `active_drag`
@@ -3497,6 +3596,22 @@ impl Render for WorkspaceView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, ev: &MouseUpEvent, _w, cx| {
+                    // F2-3-1: encerra o gesto de MOVER card e EMITE no FIM (posição final). `finish`
+                    // devolve None se cancelado (Esc) ou clique sem deslocamento → ZERO NodeMoved.
+                    if let Some(g) = view.card_drag.take() {
+                        if let Some(mv) = g.finish() {
+                            let active_root = lock(&view.runtimes).active.clone();
+                            view.append_to_workspace(
+                                &active_root,
+                                &lina_core::DomainEvent::NodeMoved {
+                                    node: mv.node,
+                                    x: mv.x as f64,
+                                    y: mv.y as f64,
+                                },
+                            );
+                            cx.notify();
+                        }
+                    }
                     // BUG C: o fim do gesto também muda o visual (limpa clique-simples / fixa o
                     // estado final). Sem `active_drag` nativo o gpui não repinta no mouseup → marca
                     // dirty se houve gesto ativo.

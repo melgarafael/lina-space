@@ -15,6 +15,25 @@ use lina_host::NodeStatus;
 #[path = "canvas_focus.rs"]
 pub mod focus;
 
+/// F2-3-1: lógica pura de arrastar-e-mover um card (delta sob zoom, ordem-z por fractional index,
+/// mover-vs-pan, máquina de gesto). Registrado via `#[path]` pelo MESMO caminho do `focus` —
+/// promover a `mod canvas_drag;` no crate root é costura futura. Consumido pela fiação de mouse
+/// em `main` (dono: Maestro).
+#[path = "canvas_drag.rs"]
+pub mod drag;
+
+/// F2-3-3: encaixe passivo (snap) ao arrastar — o card imanta num alinhamento limpo (bordas +
+/// respiro canônico) ao chegar perto de outro, sem pular sozinho. Registrado via `#[path]` pelo
+/// mesmo precedente do `drag`/`focus`. Consumido pela costura de mouse em `main` (dono: Maestro).
+#[path = "canvas_snap.rs"]
+pub mod snap;
+
+/// F2-3-5: zoom inteligente (enquadrar tudo / focar seleção / LOD com histerese). Registrado
+/// via `#[path]` aqui pelo MESMO caminho que `focus` — promover a `mod canvas_zoom;` no crate
+/// root é costura futura. Funções puras consumidas pela fiação de tecla em `main` (dono: Maestro).
+#[path = "canvas_zoom.rs"]
+pub mod zoom;
+
 /// Teto de nós GRANDES no foco. Red-team doc 12: atenção humana sustenta ~2-6; produto mira **1-4
 /// legíveis**. Acima disto a leitura degrada — o excedente vai para a periferia (fila). HOJE o canvas
 /// usa FOCO ÚNICO (o nó focado); reservado para o multi-foco (pin de até MAX_FOCUS) das próximas stories.

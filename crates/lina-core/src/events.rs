@@ -204,6 +204,20 @@ pub enum DomainEvent {
         x: f64,
         y: f64,
     },
+    /// F2-3-2: redimensionamento DURÁVEL do terminal vivo. Emitido UMA vez no FIM do
+    /// gesto de arrasto da borda (nunca por frame; gesto cancelado ⇒ ZERO evento —
+    /// espelha a doutrina de `NodeMoved`, ADR 0029 §1). `cols`/`rows` restauram a grade
+    /// do PTY; `w`/`h` (px) restauram o tamanho EXATO do card (o resto do `floor` de
+    /// `px_to_grid` não é recuperável só de cols×rows). Variante NOVA ⇒ replay de log
+    /// antigo (sem ela) nunca a vê; sem upcast (v1). Tipos `u16` espelham o pipeline de
+    /// resize ponta-a-ponta (`portable-pty`/`VtBackend`/`px_to_grid`) — zero casting.
+    TerminalRedimensionado {
+        node: NodeId,
+        cols: u16,
+        rows: u16,
+        w: f64,
+        h: f64,
+    },
     NodeRenamed {
         node: NodeId,
         name: String,
@@ -840,6 +854,7 @@ impl DomainEvent {
             DomainEvent::WorkspaceCreated { .. } => "WorkspaceCreated",
             DomainEvent::NodeAdded { .. } => "NodeAdded",
             DomainEvent::NodeMoved { .. } => "NodeMoved",
+            DomainEvent::TerminalRedimensionado { .. } => "TerminalRedimensionado",
             DomainEvent::NodeRenamed { .. } => "NodeRenamed",
             DomainEvent::NodeRoleAssigned { .. } => "NodeRoleAssigned",
             DomainEvent::NodeStatusChanged { .. } => "NodeStatusChanged",
@@ -985,6 +1000,18 @@ pub struct ProjectedNode {
     /// confirmar saúde). `serde(default)` → snapshots antigos desserializam com `false`.
     #[serde(default)]
     pub stalled: bool,
+    /// F2-3-2: grade do PTY do último `TerminalRedimensionado` do nó. `None` = nó nunca
+    /// redimensionado pelo usuário (cai no tamanho fixo do card). `serde(default)` →
+    /// snapshots antigos (sem o campo) desserializam com `None`, sem quebrar o replay.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// F2-3-2: tamanho EXATO do card em px (espelha `x`/`y`); restaura o frame ao reabrir.
+    #[serde(default)]
+    pub w: Option<f64>,
+    #[serde(default)]
+    pub h: Option<f64>,
 }
 
 /// Estado projetado do domínio. `BTreeMap` garante ordem estável → fingerprint estável.
@@ -1074,6 +1101,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
                     cli: None,
                     cwd: None,
                     stalled: false,
+                    cols: None,
+                    rows: None,
+                    w: None,
+                    h: None,
                 },
             );
         }
@@ -1081,6 +1112,20 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
             if let Some(n) = state.nodes.get_mut(node) {
                 n.x = *x;
                 n.y = *y;
+            }
+        }
+        DomainEvent::TerminalRedimensionado {
+            node,
+            cols,
+            rows,
+            w,
+            h,
+        } => {
+            if let Some(n) = state.nodes.get_mut(node) {
+                n.cols = Some(*cols);
+                n.rows = Some(*rows);
+                n.w = Some(*w);
+                n.h = Some(*h);
             }
         }
         DomainEvent::NodeRenamed { node, name } => {
@@ -2613,6 +2658,134 @@ mod tests {
             Some("/Users/founder/projeto"),
             "a projeção expõe o binding node↔cwd"
         );
+    }
+
+    /// F2-3-2: `TerminalRedimensionado` projeta a grade do PTY (cols×rows) + o tamanho
+    /// EXATO do card em px (w×h) que o canvas restaura ao reabrir.
+    #[test]
+    #[serial]
+    fn terminal_redimensionado_projeta_dimensoes() {
+        let node = Uuid::now_v7();
+        let tmp = TempDir::new("resize-projecao");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .expect("append NodeAdded");
+        store
+            .append(&DomainEvent::TerminalRedimensionado {
+                node,
+                cols: 120,
+                rows: 40,
+                w: 960.0,
+                h: 700.0,
+            })
+            .expect("append TerminalRedimensionado");
+        let state = store.project().expect("project");
+        let n = state.nodes.get(&node).expect("nó projetado");
+        assert_eq!(n.cols, Some(120), "cols restauradas");
+        assert_eq!(n.rows, Some(40), "rows restauradas");
+        assert_eq!(n.w, Some(960.0), "largura px exata restaurada");
+        assert_eq!(n.h, Some(700.0), "altura px exata restaurada");
+    }
+
+    /// F2-3-2: o último redimensionamento vence — `apply` muta o nó in-place (como
+    /// `NodeMoved`), então reabrir mostra o tamanho FINAL, não o primeiro.
+    #[test]
+    #[serial]
+    fn terminal_redimensionado_ultima_escrita_vence() {
+        let node = Uuid::now_v7();
+        let tmp = TempDir::new("resize-ultima");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .expect("append NodeAdded");
+        for (cols, rows, w, h) in [(80u16, 24u16, 640.0, 420.0), (132, 50, 1056.0, 875.0)] {
+            store
+                .append(&DomainEvent::TerminalRedimensionado {
+                    node,
+                    cols,
+                    rows,
+                    w,
+                    h,
+                })
+                .expect("append resize");
+        }
+        let state = store.project().expect("project");
+        let n = state.nodes.get(&node).expect("nó");
+        assert_eq!(
+            (n.cols, n.rows),
+            (Some(132), Some(50)),
+            "último resize vence"
+        );
+        assert_eq!((n.w, n.h), (Some(1056.0), Some(875.0)));
+    }
+
+    /// F2-3-2: as dimensões são ADITIVAS — (a) um snapshot antigo de `ProjectedNode`
+    /// (sem os campos novos) desserializa com `None` (replay de snapshot antigo nunca
+    /// quebra); (b) o `kind` persistido casa o nome da variante.
+    #[test]
+    fn terminal_redimensionado_dimensoes_aditivas_e_kind() {
+        // (a) Shape byte-fiel de um ProjectedNode pré-F2-3-2 (todos os campos antigos,
+        // NENHUM dos novos cols/rows/w/h).
+        let old_json = serde_json::json!({
+            "kind": "Terminal",
+            "name": null, "role": null, "status": null,
+            "x": 12.0, "y": 34.0,
+            "cli": null, "cwd": null, "stalled": false
+        });
+        let n: ProjectedNode =
+            serde_json::from_value(old_json).expect("snapshot antigo desserializa");
+        assert_eq!(
+            (n.cols, n.rows, n.w, n.h),
+            (None, None, None, None),
+            "snapshot antigo sem dims → None (aditivo)"
+        );
+
+        // (b) kind persistido casa o nome da variante.
+        let ev = DomainEvent::TerminalRedimensionado {
+            node: Uuid::now_v7(),
+            cols: 100,
+            rows: 30,
+            w: 800.0,
+            h: 525.0,
+        };
+        assert_eq!(ev.kind(), "TerminalRedimensionado");
+    }
+
+    /// F2-3-2: replay ROBUSTO — um `TerminalRedimensionado` ÓRFÃO (sem `NodeAdded` prévio;
+    /// ex.: nó removido) é no-op no `apply` (o nó não existe no estado) e o `project()`
+    /// não entra em pânico. Garante que um log com evento órfão sempre replaya.
+    #[test]
+    #[serial]
+    fn terminal_redimensionado_orfao_nao_quebra_replay() {
+        let node = Uuid::now_v7();
+        let tmp = TempDir::new("resize-orfao");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::TerminalRedimensionado {
+                node,
+                cols: 100,
+                rows: 30,
+                w: 800.0,
+                h: 525.0,
+            })
+            .expect("append resize órfão");
+        let state = store
+            .project()
+            .expect("project não entra em pânico com evento órfão");
+        assert!(!state.nodes.contains_key(&node), "evento órfão não cria nó");
     }
 
     // ─────────────────────────── F1-1-6 · PermissionAsked ───────────────────────────

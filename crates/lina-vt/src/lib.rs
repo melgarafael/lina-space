@@ -5,6 +5,9 @@
 //! por `libghostty-vt` no futuro **sem tocar no resto**. O grid parseado aqui é
 //! o que alimenta o render (W2) e a detecção de idle do A2A (W0-9/W0-10).
 
+/// Geometria pura do redimensionamento do terminal vivo (F2-3-2): px→grade + debounce.
+pub mod sizing;
+
 use std::collections::BTreeSet;
 use std::time::Instant;
 
