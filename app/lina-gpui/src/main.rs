@@ -3553,7 +3553,7 @@ impl Render for WorkspaceView {
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, _w, cx| {
+            .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, window, cx| {
                 let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
                 let zoom = view.camera.zoom;
                 // F2-3-1: gesto de MOVER card tem prioridade — recalcula o PREVIEW (move só o
@@ -3561,11 +3561,32 @@ impl Render for WorkspaceView {
                 if let Some(g) = view.card_drag.as_mut() {
                     if ev.dragging() {
                         g.update(pos, zoom);
-                        let (nx, ny) = g.preview();
+                        let raw = g.preview();
                         let node = g.node();
+                        // F2-3-3 (snap PASSIVO): imanta o preview nos alinhamentos dos cards
+                        // VISÍVEIS (8px de tela → mundo). Idempotente; nunca move sozinho.
+                        let vw = window.viewport_size();
+                        let vp = (f32::from(vw.width), f32::from(vw.height));
+                        let others: Vec<(f32, f32)> = {
+                            let m = lock(&view.nodes.model);
+                            m.nodes
+                                .iter()
+                                .filter(|(id, _)| **id != node)
+                                .map(|(_, nv)| (nv.x, nv.y))
+                                .filter(|p| card_visible(&view.camera, *p, (CARD_W, CARD_H), vp))
+                                .collect()
+                        };
+                        let (sx, sy) = canvas::snap::snap_position(
+                            raw,
+                            &others,
+                            CARD_W,
+                            CARD_H,
+                            crate::bridge::CARD_GAP,
+                            8.0 / zoom,
+                        );
                         if let Some(nv) = lock(&view.nodes.model).nodes.get_mut(&node) {
-                            nv.x = nx;
-                            nv.y = ny;
+                            nv.x = sx;
+                            nv.y = sy;
                         }
                         cx.notify();
                     }
@@ -3600,13 +3621,21 @@ impl Render for WorkspaceView {
                     // devolve None se cancelado (Esc) ou clique sem deslocamento → ZERO NodeMoved.
                     if let Some(g) = view.card_drag.take() {
                         if let Some(mv) = g.finish() {
+                            // F2-3-3: persiste a posição IMANTADA. O último `mouse_move` já snapou o
+                            // NodeView; `mv` é a posição CRUA do gesto (o snap vive no NodeView, não
+                            // no CardDrag). Lê a posição atual do NodeView → log e tela coincidem.
+                            let final_pos = lock(&view.nodes.model)
+                                .nodes
+                                .get(&mv.node)
+                                .map(|nv| (nv.x, nv.y))
+                                .unwrap_or((mv.x, mv.y));
                             let active_root = lock(&view.runtimes).active.clone();
                             view.append_to_workspace(
                                 &active_root,
                                 &lina_core::DomainEvent::NodeMoved {
                                     node: mv.node,
-                                    x: mv.x as f64,
-                                    y: mv.y as f64,
+                                    x: final_pos.0 as f64,
+                                    y: final_pos.1 as f64,
                                 },
                             );
                             cx.notify();
