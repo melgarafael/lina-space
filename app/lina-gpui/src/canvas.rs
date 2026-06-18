@@ -28,11 +28,23 @@ pub mod drag;
 #[path = "canvas_snap.rs"]
 pub mod snap;
 
+/// F2-3-6: tecla "o" cicla pela fila de aprovação — pula ao próximo nó que pede aprovação, com
+/// wrap-around. Registrado via `#[path]` pelo mesmo precedente do `drag`/`snap`/`focus`. Consumido
+/// pela tecla em `handle_key` (main, dono: Maestro). A câmera só anda com gesto — a tecla É o gesto.
+#[path = "canvas_cycle.rs"]
+pub mod cycle;
+
 /// F2-3-5: zoom inteligente (enquadrar tudo / focar seleção / LOD com histerese). Registrado
 /// via `#[path]` aqui pelo MESMO caminho que `focus` — promover a `mod canvas_zoom;` no crate
 /// root é costura futura. Funções puras consumidas pela fiação de tecla em `main` (dono: Maestro).
 #[path = "canvas_zoom.rs"]
 pub mod zoom;
+
+/// F2-3-4: "Arrumar" — grade limpa de 4 colunas (espelha `grid_slot`) e preset "lado a lado".
+/// Funções puras indexadas. Registrado via `#[path]` pelo mesmo precedente do `zoom`/`drag`/`focus`.
+/// Consumido pela costura de paleta/atalho em `main` (dono: Maestro), que emite `NodeMoved` por card.
+#[path = "canvas_layout.rs"]
+pub mod layout;
 
 /// Teto de nós GRANDES no foco. Red-team doc 12: atenção humana sustenta ~2-6; produto mira **1-4
 /// legíveis**. Acima disto a leitura degrada — o excedente vai para a periferia (fila). HOJE o canvas

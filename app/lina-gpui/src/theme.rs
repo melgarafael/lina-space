@@ -172,12 +172,15 @@ impl ColorScale {
 // ═══════════════════════════ acentos curados (8 — T7§A) ═══════════════════════════
 
 /// Acento padrão (o azul histórico do shell da Fase 0).
-pub const DEFAULT_ACCENT: &str = "azul";
+pub const DEFAULT_ACCENT: &str = "terracota";
 
-/// Os **8 acentos curados** do T7§A: cada um é uma [`ColorScale`] desenhada para atingir AA (≥4.5:1)
+/// Os **9 acentos curados** do T7§A: cada um é uma [`ColorScale`] desenhada para atingir AA (≥4.5:1)
 /// como TEXTO sobre todas as superfícies nos DOIS modos — o gate WCAG itera sobre todos. Liberdade
 /// dentro de limites (anti-slop): roda de cor livre fica fora da superfície.
-pub const ACCENTS: [(&str, ColorScale); 8] = [
+/// **Terracota** é o default (F2 fusão T1+T3): a cor de identidade do "Ateliê" — argila no light,
+/// argila clareada no dark — em vez do azul genérico reciclado da Fase 0.
+pub const ACCENTS: [(&str, ColorScale); 9] = [
+    ("terracota", ColorScale::new(0xe0926b, 0x9e3a1d)),
     ("azul", ColorScale::new(0x7aa2f7, 0x2f4fc7)),
     ("violeta", ColorScale::new(0xbb9af7, 0x6b3fd4)),
     ("verde", ColorScale::new(0x9ece6a, 0x33691e)),
@@ -208,34 +211,39 @@ fn accent_entry(name: &str) -> (&'static str, ColorScale) {
 mod scale {
     use super::ColorScale;
 
-    // superfície
-    pub const CANVAS: ColorScale = ColorScale::new(0x0a0e27, 0xf2f4fb);
-    pub const PANEL: ColorScale = ColorScale::new(0x141a36, 0xe7ebf6);
-    pub const CARD: ColorScale = ColorScale::new(0x0d1228, 0xfbfcff);
-    pub const CHROME: ColorScale = ColorScale::new(0x0c1130, 0xe2e7f4);
-    pub const RAISED: ColorScale = ColorScale::new(0x2a3152, 0xd3daee);
-    pub const RAISED_ALT: ColorScale = ColorScale::new(0x3a3f5a, 0xc4cde8);
-    pub const SELECTED_ROW: ColorScale = ColorScale::new(0x1b2347, 0xdde4f5);
-    pub const DANGER_MUTED: ColorScale = ColorScale::new(0x33202c, 0xf3dde2);
-    pub const SUCCESS_MUTED: ColorScale = ColorScale::new(0x18301f, 0xdff0e2);
-    pub const BORDER: ColorScale = ColorScale::new(0x2a3152, 0xc9d1e8);
-    pub const BORDER_MUTED: ColorScale = ColorScale::new(0x222a44, 0xd8deef);
+    // superfície — TEMPERATURA T3 ("Ateliê") sobre a base T1 ("Instrumento"): a fusão selada na
+    // F2-0-D finalmente materializada. Dark = CARVÃO QUENTE (marrom-tostado, não o azul-marinho
+    // reciclado da Fase 0); light = PAPEL QUENTE (`#F4EDE0`, valor WCAG-provado do protótipo
+    // `t3-atelie.html`, nunca branco puro). Cada par texto×superfície segue passando o gate WCAG.
+    pub const CANVAS: ColorScale = ColorScale::new(0x1a1510, 0xf4ede0);
+    pub const PANEL: ColorScale = ColorScale::new(0x221c15, 0xefe6d5);
+    pub const CARD: ColorScale = ColorScale::new(0x2b241c, 0xfbf6ec);
+    pub const CHROME: ColorScale = ColorScale::new(0x1f1913, 0xefe6d5);
+    pub const RAISED: ColorScale = ColorScale::new(0x3a3128, 0xe7dbc4);
+    pub const RAISED_ALT: ColorScale = ColorScale::new(0x4a3f31, 0xdccbac);
+    pub const SELECTED_ROW: ColorScale = ColorScale::new(0x322a20, 0xe7dbc4);
+    pub const DANGER_MUTED: ColorScale = ColorScale::new(0x3a241f, 0xf7dcd2);
+    pub const SUCCESS_MUTED: ColorScale = ColorScale::new(0x26301d, 0xe6eccb);
+    pub const BORDER: ColorScale = ColorScale::new(0x3a3128, 0xcbb99c);
+    pub const BORDER_MUTED: ColorScale = ColorScale::new(0x2c2419, 0xe2d5be);
 
-    // texto
-    pub const TEXT_PRIMARY: ColorScale = ColorScale::new(0xc8d3f5, 0x232a45);
-    pub const TEXT_SECONDARY: ColorScale = ColorScale::new(0x9aa5d4, 0x424e74);
-    pub const TEXT_MUTED: ColorScale = ColorScale::new(0x5b658f, 0x707d9f);
-    pub const TEXT_BRIGHT: ColorScale = ColorScale::new(0xeef1ff, 0x10142b);
+    // texto — tinta quente nos 2 modos (papel quente pede tinta marrom-escura, não cinza-azul).
+    pub const TEXT_PRIMARY: ColorScale = ColorScale::new(0xefe6d6, 0x33291f);
+    pub const TEXT_SECONDARY: ColorScale = ColorScale::new(0xc9bba2, 0x6e5f4b);
+    pub const TEXT_MUTED: ColorScale = ColorScale::new(0x7e7257, 0x8a7860);
+    pub const TEXT_BRIGHT: ColorScale = ColorScale::new(0xf7f1e6, 0x241c14);
     /// Texto sobre fills de ACENTO (action/create/confirm) — claros nos 2 modos (fills saturados).
     pub const TEXT_ON_ACCENT: ColorScale = ColorScale::new(0xeef1ff, 0xf7f9ff);
     /// Texto sobre chips de ESTADO (success/warning/danger): no dark os fills são claros → texto
     /// escuro; no light os fills são saturados escuros → texto claro.
     pub const TEXT_ON_EMPHASIS: ColorScale = ColorScale::new(0x11111b, 0xf7f9ff);
 
-    // acento (botões fortes; o `primary` vem da escolha do usuário em `ACCENTS`)
-    pub const ACCENT_SECONDARY: ColorScale = ColorScale::new(0xbb9af7, 0x6b3fd4);
-    pub const ACCENT_ACTION: ColorScale = ColorScale::new(0x3d59c9, 0x2f4fc7);
-    pub const ACCENT_CREATE: ColorScale = ColorScale::new(0x6c4ad1, 0x6b3fd4);
+    // acento (botões fortes; o `primary` vem da escolha do usuário em `ACCENTS`).
+    // Fusão quente F2: o roxo-IA banido pela doutrina (DES-2) sai; criar/secundário puxam para a
+    // argila da identidade; ação fica num azul-aço dessaturado que convive com o papel sem brigar.
+    pub const ACCENT_SECONDARY: ColorScale = ColorScale::new(0xe0af68, 0x8a5a00);
+    pub const ACCENT_ACTION: ColorScale = ColorScale::new(0x436499, 0x2f4fc7);
+    pub const ACCENT_CREATE: ColorScale = ColorScale::new(0xa54824, 0x9e3a1d);
     pub const ACCENT_CONFIRM: ColorScale = ColorScale::new(0x2c7a4b, 0x1e6b3a);
 
     // estado
@@ -244,10 +252,12 @@ mod scale {
     pub const STATE_DANGER: ColorScale = ColorScale::new(0xf7768e, 0xb02347);
 
     // terminal (superfície escura nos 2 modos — ver doc do módulo)
-    pub const TERMINAL_BG: ColorScale = ColorScale::fixed(0x0d1228);
-    pub const TERMINAL_CURSOR: ColorScale = ColorScale::fixed(0x7aa2f7);
-    pub const TERMINAL_CURSOR_TEXT: ColorScale = ColorScale::fixed(0x0a0e27);
-    pub const TERMINAL_SELECTION: ColorScale = ColorScale::fixed(0x334573);
+    // Terminal: ilha dark QUENTE (carvão tostado, casa com o canvas) + caret âmbar (como o caret do
+    // protótipo `t3-atelie.html`, nunca o azul frio da Fase 0).
+    pub const TERMINAL_BG: ColorScale = ColorScale::fixed(0x221c15);
+    pub const TERMINAL_CURSOR: ColorScale = ColorScale::fixed(0xe3a84e);
+    pub const TERMINAL_CURSOR_TEXT: ColorScale = ColorScale::fixed(0x1a1510);
+    pub const TERMINAL_SELECTION: ColorScale = ColorScale::fixed(0x4a3f2a);
 }
 
 // ═══════════════════════════ grupos de tokens (o contrato dos consumidores) ═══════════════════════════
