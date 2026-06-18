@@ -18,10 +18,12 @@ use lina_bootstrap::{
     project_retro, render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk,
     RetroInvocation, AUTONOMY_ENV,
 };
+use lina_core::history::{self, ExportFormat, HistoryLimits, HistoryPage, SearchPage};
+use lina_core::scrollback::ScrollbackStore;
 use lina_core::{
     check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, CheckKind,
-    DomainEvent, EventStore, Goal, GoalPhase, HandoffContract, MailMessage, Mailbox, ParamsLedger,
-    SystemParams, CLASS_GATED_HARD_EXTERNAL,
+    DomainEvent, EventStore, Goal, GoalPhase, HandoffContract, MailMessage, Mailbox, NodeId,
+    ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -43,6 +45,7 @@ fn main() -> ExitCode {
         Some("ask") => run_ask(&args[1..]),
         Some("handoff") => run_handoff(&args[1..]),
         Some("check") => run_check(&args[1..]),
+        Some("history") => run_history(&args[1..]),
         Some("broadcast") => run_broadcast(&args[1..]),
         Some("handshake") => run_handshake(),
         Some("plan") => run_plan(&args[1..]),
@@ -65,7 +68,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -584,6 +587,285 @@ fn resolve_check_node(content: &str, target: &str) -> Option<String> {
         .enumerate()
         .max_by_key(|&(idx, node)| (priority(node), idx))
         .map(|(_, node)| node.to_string())
+}
+
+// ───────────────── #15 (achado dogfooding): `lina history` — o Maestro vê a tela do colega ─────────────────
+
+/// Env do NodeId do terminal CORRENTE (o LEITOR), injetado pelo app ao admitir o nó (ADR 0026).
+const NODE_ID_ENV: &str = "LINA_NODE_ID";
+
+/// Valor de uma flag `--nome <valor>` em `args` (1ª ocorrência). `None` se ausente ou sem valor.
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// Identidade do LEITOR, do env injetado pelo app (ADR 0026 — autoridade do app, JAMAIS de flag/
+/// arquivo de agente: campo de agente não decide autorização). Sem ele não há como provar quem lê →
+/// a leitura cross é negada (fail-safe — nunca espia às cegas).
+fn reader_node_id() -> Result<NodeId, String> {
+    let raw = std::env::var(NODE_ID_ENV).map_err(|_| {
+        format!("{NODE_ID_ENV} ausente — nao sei quem e este terminal (rode dentro do Espaco).")
+    })?;
+    raw.trim()
+        .parse::<NodeId>()
+        .map_err(|_| format!("{NODE_ID_ENV} invalido: {raw:?}"))
+}
+
+/// NodeIds VIVOS do Espaço — os MEMBROS da fronteira de pertencimento (ADR 0006). Projeção do log
+/// (inv #4): um nó é membro se apareceu e seu último sinal NÃO é morte (`NodeStatusChanged(Dead)`,
+/// `TerminalExited` ou `NodeRemoved`) — MESMA semântica de morte do `resolve_check_node` (#4/#14/#23c).
+/// A ordem não importa (a fronteira é um teste de `contains`), então um `HashSet` basta.
+fn live_member_ids(content: &str) -> Vec<NodeId> {
+    use std::collections::{HashMap, HashSet};
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut last_status: HashMap<String, String> = HashMap::new();
+    let mut removed: HashSet<String> = HashSet::new();
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        let Some(node) = p["node"].as_str() else {
+            continue;
+        };
+        match v["kind"].as_str().unwrap_or_default() {
+            "NodeAdded" | "NodeRenamed" => {
+                seen.insert(node.to_string());
+            }
+            "TerminalSpawned" => {
+                seen.insert(node.to_string());
+                last_status.insert(node.to_string(), "Running".to_string());
+            }
+            "NodeStatusChanged" => {
+                seen.insert(node.to_string());
+                if let Some(st) = p["status"].as_str() {
+                    last_status.insert(node.to_string(), st.to_string());
+                }
+            }
+            "TerminalExited" => {
+                seen.insert(node.to_string());
+                last_status.insert(node.to_string(), "Dead".to_string());
+            }
+            "NodeRemoved" => {
+                removed.insert(node.to_string());
+            }
+            _ => {}
+        }
+    }
+    seen.into_iter()
+        .filter(|n| !removed.contains(n) && last_status.get(n).map(String::as_str) != Some("Dead"))
+        .filter_map(|n| n.parse::<NodeId>().ok())
+        .collect()
+}
+
+/// Resolve o ALVO (`@worker`) ao seu NodeId VIVO no log (homônimo vivo vence o morto — `resolve_check_node`,
+/// #4/#14/#23c). O painel do scrollback é chaveado pelo NodeId (igual ao app — `bridge.rs`:
+/// `panel = node.to_string()`), então o NodeId resolvido É o painel.
+fn resolve_owner_node(content: &str, target: &str) -> Result<NodeId, String> {
+    let id = resolve_check_node(content, target).ok_or_else(|| {
+        format!("nao encontrei '{target}' no Espaco — confira quem esta vivo com `lina list`.")
+    })?;
+    id.parse::<NodeId>()
+        .map_err(|_| format!("node-id invalido no log para '{target}': {id:?}"))
+}
+
+/// Render LEGÍVEL do `tail` (a "tela do colega" — o objetivo do #15): as LINHAS, com cabeçalho e
+/// rodapé de paginação. `--json` → a [`HistoryPage`] serializada (contrato F1, uso programático).
+/// Função PURA (testável). Janela expirada/vazia degrada com texto honesto, nunca erro.
+fn render_tail(page: &HistoryPage, json: bool, target: &str) -> String {
+    if json {
+        return serde_json::to_string(page)
+            .map(|s| format!("{s}\n"))
+            .unwrap_or_default();
+    }
+    if page.expired && page.lines.is_empty() {
+        return format!("@{target} — historico expirado (retencao excedida).\n");
+    }
+    if page.lines.is_empty() {
+        return format!("@{target} — sem historico ainda.\n");
+    }
+    let mut out = format!(
+        "@{target} — ultimas {} linha(s) (a partir da #{}):\n",
+        page.lines.len(),
+        page.start
+    );
+    for line in &page.lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if let Some(next) = page.next_cursor {
+        out.push_str(&format!(
+            "  … mais antigas: `lina history @{target} --offset {next}`\n"
+        ));
+    }
+    out
+}
+
+/// Render legível do `search`: os hits (índice global + linha). `--json` → a [`SearchPage`] do contrato.
+fn render_search(page: &SearchPage, json: bool, target: &str) -> String {
+    if json {
+        return serde_json::to_string(page)
+            .map(|s| format!("{s}\n"))
+            .unwrap_or_default();
+    }
+    if page.hits.is_empty() {
+        let mut out = format!("@{target} — nenhuma linha casou.\n");
+        if let Some(next) = page.next_cursor {
+            out.push_str(&format!("  … continue a varredura: `--cursor {next}`\n"));
+        }
+        return out;
+    }
+    let mut out = format!("@{target} — {} ocorrencia(s):\n", page.hits.len());
+    for hit in &page.hits {
+        out.push_str(&format!("  #{}: {}\n", hit.idx, hit.line));
+    }
+    if let Some(next) = page.next_cursor {
+        out.push_str(&format!("  … continue: `--cursor {next}`\n"));
+    }
+    out
+}
+
+/// **#15 — observabilidade do Maestro: ver a tela do colega.** LEITURA PURA do scrollback de um
+/// terminal (não injeta NADA — espiar ≠ cutucar, igual `lina check`), pela fronteira de pertencimento
+/// (ADR 0006): membros do mesmo Espaço leem; fora dela, default-deny + auditoria (`HistoryReadCross`).
+/// Identidade do leitor vem do env do app (ADR 0026), nunca de flag. Default imprime as LINHAS (a
+/// "tela"); `--json` devolve o `HistoryPage`/`SearchPage` do contrato F1. SEMPRE via `*_cross` (que
+/// audita+gate; same-owner passa sem evento) — o caminho cross nunca chama a variante pura.
+fn run_history(args: &[String]) -> ExitCode {
+    let Some(target_raw) = args.first() else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let target = target_raw.trim_start_matches('@');
+    let json = args.iter().any(|a| a == "--json");
+
+    let reader = match reader_node_id() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let owner = match resolve_owner_node(&content, target) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let members = live_member_ids(&content);
+    let panel = owner.to_string();
+
+    let store = match ScrollbackStore::open_default(mailbox_root()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: falha ao abrir o scrollback: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut events = match EventStore::open(events_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: falha ao abrir o event store (auditoria da leitura): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let limits = HistoryLimits::default();
+
+    // Modo: search > export > tail (default = "ultimo estado/saida", o que o #15 pede).
+    if let Some(pattern) = flag_value(args, "--search") {
+        let limit = flag_value(args, "--limit").and_then(|s| s.parse::<usize>().ok());
+        let cursor = flag_value(args, "--cursor").and_then(|s| s.parse::<u64>().ok());
+        match history::search_cross(
+            &mut events,
+            &members,
+            reader,
+            owner,
+            &store,
+            &panel,
+            &pattern,
+            limit,
+            cursor,
+            &limits,
+        ) {
+            Ok(page) => {
+                print!("{}", render_search(&page, json, target));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("lina: {e}");
+                ExitCode::from(1)
+            }
+        }
+    } else if let Some(fmt_raw) = flag_value(args, "--export") {
+        let fmt = match fmt_raw.as_str() {
+            "json" => ExportFormat::Json,
+            "txt" => ExportFormat::Txt,
+            other => {
+                eprintln!("lina: formato de export invalido: {other:?} (use json|txt)");
+                return ExitCode::from(2);
+            }
+        };
+        let lo = flag_value(args, "--from")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let hi = flag_value(args, "--to")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        match history::export_cross(
+            &mut events,
+            &members,
+            reader,
+            owner,
+            &store,
+            &panel,
+            fmt,
+            lo,
+            hi,
+            &limits,
+        ) {
+            Ok((payload, _next)) => {
+                print!("{payload}");
+                if !payload.ends_with('\n') {
+                    println!();
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("lina: {e}");
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        let n = flag_value(args, "--tail").and_then(|s| s.parse::<usize>().ok());
+        let offset = flag_value(args, "--offset")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        match history::tail_cross(
+            &mut events,
+            &members,
+            reader,
+            owner,
+            &store,
+            &panel,
+            n,
+            offset,
+            &limits,
+        ) {
+            Ok(page) => {
+                print!("{}", render_tail(&page, json, target));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("lina: {e}");
+                ExitCode::from(1)
+            }
+        }
+    }
 }
 
 fn run_check(args: &[String]) -> ExitCode {
@@ -3735,6 +4017,177 @@ mod space_state_tests {
         assert!(
             pausado.contains("PAUSADA") && pausado.contains("ATINGIDO"),
             "{pausado}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_verb_tests {
+    use super::*;
+    use lina_core::history;
+
+    /// Linha de log mínima (só `kind` + `payload.node`/`status` decidem a projeção de membros).
+    fn ev_status(node: NodeId, status: &str) -> String {
+        format!(
+            r#"{{"kind":"NodeStatusChanged","payload":{{"node":"{node}","status":"{status}"}}}}"#
+        )
+    }
+    fn ev_exited(node: NodeId) -> String {
+        format!(r#"{{"kind":"TerminalExited","payload":{{"node":"{node}"}}}}"#)
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "lina-history-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("mkdir tmp");
+        p
+    }
+
+    /// `live_member_ids`: vivos são membros; morto (`TerminalExited`/`NodeRemoved`/status Dead) NÃO é.
+    #[test]
+    fn live_members_excludes_dead_and_removed() {
+        let a = NodeId::from_u128(1);
+        let b = NodeId::from_u128(2);
+        let dead = NodeId::from_u128(3);
+        let removed = NodeId::from_u128(4);
+        let removed_ev = format!(r#"{{"kind":"NodeRemoved","payload":{{"node":"{removed}"}}}}"#);
+        let content = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            ev_status(a, "Idle"),
+            ev_status(b, "Busy"),
+            ev_status(dead, "Idle"), // estava vivo…
+            ev_exited(dead),         // …mas saiu → morto
+            removed_ev,
+        );
+        let members = live_member_ids(&content);
+        assert!(
+            members.contains(&a) && members.contains(&b),
+            "vivos sao membros"
+        );
+        assert!(!members.contains(&dead), "TerminalExited tira da fronteira");
+        assert!(!members.contains(&removed), "NodeRemoved tira da fronteira");
+    }
+
+    /// **Gate (f) do #15:** um MEMBRO lê a tela do colega (devolve a saída); um leitor FORA da
+    /// fronteira de pertencimento é BARRADO (default-deny, ADR 0006). Integra a derivação de membros
+    /// (bin) com o gate cross (core) e o painel chaveado por NodeId (como o app escreve).
+    #[test]
+    fn belonging_member_reads_screen_outsider_is_barred() {
+        use lina_core::scrollback::ScrollbackStore;
+
+        let owner = NodeId::from_u128(1); // o colega cuja tela queremos ver
+        let reader = NodeId::from_u128(2); // o Maestro (membro)
+        let content = format!(
+            "{}\n{}\n",
+            ev_status(owner, "Idle"),
+            ev_status(reader, "Busy")
+        );
+        let members = live_member_ids(&content);
+
+        let dir = tmp("gate");
+        let panel = owner.to_string(); // app chaveia o scrollback pelo NodeId
+        let mut store = ScrollbackStore::open_default(&dir).expect("scrollback");
+        store
+            .push_line(&panel, "worker: rodando os testes".to_string())
+            .expect("push");
+        store
+            .push_line(&panel, "worker: tudo verde".to_string())
+            .expect("push");
+        store.flush_all().expect("flush");
+        let mut events = EventStore::open(dir.join("events")).expect("event store");
+        let limits = HistoryLimits::default();
+
+        // MEMBRO (reader) lê o painel do owner → a "tela" volta.
+        let page = history::tail_cross(
+            &mut events,
+            &members,
+            reader,
+            owner,
+            &store,
+            &panel,
+            Some(10),
+            0,
+            &limits,
+        )
+        .expect("membro le a tela do colega");
+        let shown = render_tail(&page, false, "worker");
+        assert!(
+            shown.contains("worker: tudo verde"),
+            "a tela do colega aparece: {shown}"
+        );
+
+        // FORA da fronteira (leitor não-membro) → BARRADO.
+        let outsider = NodeId::from_u128(99);
+        let denied = history::tail_cross(
+            &mut events,
+            &members,
+            outsider,
+            owner,
+            &store,
+            &panel,
+            Some(10),
+            0,
+            &limits,
+        );
+        assert!(
+            denied.is_err(),
+            "leitor fora do Espaco e barrado (default-deny)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `render_tail`: linhas legíveis (default), `--json` (contrato F1), expirado e vazio honestos.
+    #[test]
+    fn render_tail_modes() {
+        let page = HistoryPage {
+            panel: "p".into(),
+            start: 40,
+            lines: vec!["ola".into(), "mundo".into()],
+            next_cursor: Some(7),
+            expired_before: 0,
+            expired: false,
+        };
+        let txt = render_tail(&page, false, "worker");
+        assert!(txt.contains("ola") && txt.contains("mundo"));
+        assert!(txt.contains("--offset 7"), "paginação sinalizada");
+        let json = render_tail(&page, true, "worker");
+        assert!(
+            json.contains("\"start\":40") && json.contains("\"lines\""),
+            "json do contrato"
+        );
+
+        let expirado = HistoryPage {
+            panel: "p".into(),
+            start: 0,
+            lines: vec![],
+            next_cursor: None,
+            expired_before: 5,
+            expired: true,
+        };
+        assert!(
+            render_tail(&expirado, false, "w").contains("expirado"),
+            "expirado é honesto"
+        );
+    }
+
+    /// `flag_value`: lê `--nome <valor>`; ausente → None.
+    #[test]
+    fn flag_value_reads_pairs() {
+        let args: Vec<String> = ["@w", "--tail", "30", "--json"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(flag_value(&args, "--tail").as_deref(), Some("30"));
+        assert_eq!(flag_value(&args, "--offset"), None);
+        assert_eq!(
+            flag_value(&args, "--json"),
+            None,
+            "flag booleana não tem valor"
         );
     }
 }

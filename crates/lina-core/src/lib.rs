@@ -168,6 +168,10 @@ pub mod scrollback;
 /// scrollback — leitura cross-terminal auditada pela fronteira de pertencimento (ADR 0006).
 pub mod history;
 
+/// F3-2-6: briefing em CAMADAS do worker (stable/context/volatile + verify-loop), gated por papel
+/// — montagem PURA de texto acima do CLI (inv #1), projeção do log (inv #4). Hermes §6.1/§6.2.
+pub mod briefing;
+
 /// F1-5-5: suspensão real de ociosos — máquina `Active → Idle → Suspended` (overlay ortogonal ao
 /// [`NodeStatus`]; só o render pausa, a drenagem nunca para).
 pub mod suspend;
