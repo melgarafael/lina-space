@@ -2109,26 +2109,27 @@ impl WorkspaceView {
     /// `projection_cache_is_stale` — NUNCA por frame; mesma do custo/effort). Goals e budget são META
     /// (fora da projeção do canvas), reconstruídos por replay do event log.
     fn refresh_goals_cache(&mut self) {
-        let count = self.nodes.store_event_count();
-        if !dashboard::projection_cache_is_stale(
-            self.goals_cache.as_ref().map(|(c, _, _)| *c),
-            count,
-        ) {
-            return;
+        let level = self.autonomy_level(); // só lê o enum de autonomia — NÃO toca o store.
+        let cached = self.goals_cache.as_ref().map(|(c, _, _)| *c);
+        // NÃO-BLOQUEANTE na thread de RENDER (fix freeze do `lina ask`): a entrega A2A faseada
+        // segura o store por até ~`ready_timeout` (~2s, por design). Via `try_with_store`, store
+        // ocupado → mantém o cache e re-tenta no próximo quadro; o render nunca trava nesse lock.
+        let fresh = self.nodes.try_with_store(|store| {
+            let count = store.event_count().ok()?;
+            if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                return None; // cache fresco → nada a atualizar.
+            }
+            let recs = store.events().ok()?;
+            let goals = lina_core::project_goals(&recs);
+            // `goal_max_iterations` vivo (SystemParams, spec 51); falha de replay → default da spec.
+            let budget = lina_core::resolve_from_store(store, level)
+                .map(|r| r.router_config.goal_max_iterations)
+                .unwrap_or(goal_card::DEFAULT_ITERATION_BUDGET);
+            Some((count, goals, budget))
+        });
+        if let Some(v) = fresh {
+            self.goals_cache = Some(v);
         }
-        let Some(c) = count else { return };
-        let level = self.autonomy_level();
-        // Bind do `Arc` antes do lock: o guard segura o store por VÁRIAS linhas (events + resolve),
-        // então o handle não pode ser um temporário (cairia ao fim do statement).
-        let handle = self.nodes.store_handle();
-        let store = lock(&handle);
-        let Ok(recs) = store.events() else { return };
-        let goals = lina_core::project_goals(&recs);
-        // `goal_max_iterations` vivo (SystemParams, spec 51); falha de replay → default da spec.
-        let budget = lina_core::resolve_from_store(&store, level)
-            .map(|r| r.router_config.goal_max_iterations)
-            .unwrap_or(goal_card::DEFAULT_ITERATION_BUDGET);
-        self.goals_cache = Some((c, goals, budget));
     }
 
     /// F3-1-7: o painel das Goals VIVAS sobre o canvas — um card por meta que merece rosto
@@ -2363,11 +2364,18 @@ impl WorkspaceView {
         // `refresh_cost_paused`) — NUNCA por frame; store ilegível conserva o snapshot.
         let (cards, adopted) = {
             let mut cache = lock(&self.dash.projected);
-            let count = self.nodes.store_event_count();
-            if dashboard::projection_cache_is_stale(cache.as_ref().map(|(c, _)| *c), count) {
-                if let (Some(c), Some(st)) = (count, self.nodes.projected()) {
-                    *cache = Some((c, st));
+            // NÃO-BLOQUEANTE no render (fix freeze do `lina ask`): store ocupado pela entrega A2A
+            // → conserva o snapshot; re-projeta no próximo quadro. (Antes: `store_event_count` +
+            // `projected` travavam o store na thread de render → congelava durante a entrega.)
+            let cached = cache.as_ref().map(|(c, _)| *c);
+            if let Some(v) = self.nodes.try_with_store(|store| {
+                let count = store.event_count().ok()?;
+                if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                    return None;
                 }
+                Some((count, store.project().ok()?))
+            }) {
+                *cache = Some(v);
             }
             match cache.as_ref() {
                 Some((_, st)) => (
@@ -2385,11 +2393,17 @@ impl WorkspaceView {
         // o que ambos os emissores (router/spawn) carimbam no evento.
         let effort_by_node = {
             let mut cache = lock(&self.dash.effort);
-            let count = self.nodes.store_event_count();
-            if dashboard::projection_cache_is_stale(cache.as_ref().map(|(c, _)| *c), count) {
-                if let (Some(c), Ok(recs)) = (count, lock(&self.nodes.store_handle()).events()) {
-                    *cache = Some((c, dashboard::effort_badges(&recs)));
+            // NÃO-BLOQUEANTE no render (fix freeze do `lina ask`): mesma disciplina do custo acima —
+            // store ocupado → mantém o cache; re-varre o effort no próximo quadro.
+            let cached = cache.as_ref().map(|(c, _)| *c);
+            if let Some(v) = self.nodes.try_with_store(|store| {
+                let count = store.event_count().ok()?;
+                if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                    return None;
                 }
+                Some((count, dashboard::effort_badges(&store.events().ok()?)))
+            }) {
+                *cache = Some(v);
             }
             cache.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
         };

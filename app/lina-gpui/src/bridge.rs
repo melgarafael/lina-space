@@ -4682,18 +4682,20 @@ impl NodeManager {
     /// Ordem: spawna o PTY → **persiste primeiro** (event log = fonte da verdade) → só então
     /// projeta no model. Se a persistência falhar, **desfaz** o PTY recém-criado (`retire_pty`)
     /// e devolve `Err` — nada de nó visível sem evento no log.
-    /// Rodada 360 (ADR 0022): estado projetado do log para consumidores de UI — o painel P6
-    /// correlaciona node↔cwd↔sessão via `ProjectedNode.cwd`. Replay completo (snapshot + tail):
-    /// o CHAMADOR cacheia por [`Self::store_event_count`] (padrão `refresh_cost_paused`) —
-    /// não chame por frame.
-    pub fn projected(&self) -> Option<ProjectedState> {
-        lock(&self.store).project().ok()
-    }
-
-    /// `event_count` do log — chave de cache barata para consumidores de [`Self::projected`]
-    /// (re-replay SÓ quando há evento novo).
-    pub fn store_event_count(&self) -> Option<u64> {
-        lock(&self.store).event_count().ok()
+    /// **Leitura do store SEM bloquear a thread de RENDER.** Roda `f` com o `EventStore` SE o lock
+    /// estiver livre; devolve `None` se está contendido (uma entrega A2A faseada segura o store por
+    /// até `ready_timeout` ~2s — por design). Os consumidores de render (cards de custo, badges de
+    /// effort, painel de Goals) chamam isto e, no `None`, conservam o cache — o render JAMAIS trava
+    /// num lock de caminho de fundo. `f` também devolve `None` quando não há nada a atualizar
+    /// (cache fresco): ambos os `None` colapsam em "mantém o cache", sem ambiguidade para o chamador.
+    pub fn try_with_store<R>(&self, f: impl FnOnce(&EventStore) -> Option<R>) -> Option<R> {
+        match self.store.try_lock() {
+            Ok(s) => f(&s),
+            // Poisoned: recupera o guard (mesma política do `lock()`) e segue.
+            Err(std::sync::TryLockError::Poisoned(p)) => f(&p.into_inner()),
+            // Contendido (entrega em curso) → sem leitura neste tick; o chamador mantém o cache.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// **Porta ⌘T / botão + (tradutor fino — ADR 0022 §1).** Terminal default com nome
@@ -8899,8 +8901,15 @@ mod tests {
 
         // sync com o store contendido: não bloqueia, não vê s2 ainda.
         let items = hub.sync(2_000);
-        assert_eq!(items.len(), 1, "store ocupado → tick pula a leitura (sem freeze)");
-        assert!(items.iter().all(|i| i.stable_id != "s2"), "s2 ainda não entrou");
+        assert_eq!(
+            items.len(),
+            1,
+            "store ocupado → tick pula a leitura (sem freeze)"
+        );
+        assert!(
+            items.iter().all(|i| i.stable_id != "s2"),
+            "s2 ainda não entrou"
+        );
 
         tx_release.send(()).expect("libera o lock");
         holder.join().expect("thread do lock encerra");
@@ -8908,6 +8917,52 @@ mod tests {
         // store livre → próximo tick aplica o delta represado.
         let items = hub.sync(3_000);
         assert_eq!(items.len(), 2, "store livre → s2 entra no tick seguinte");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INVARIANTE do fix do freeze (render): `try_with_store` NUNCA bloqueia. Store livre → roda
+    /// `f`; store contendido (entrega A2A em curso) → devolve `None` SEM nem rodar `f` (o render
+    /// conserva o cache). É o que blinda TODOS os consumidores de store da thread de UI (cards de
+    /// custo, badges de effort, painel de Goals) de uma vez, sem caçá-los um a um.
+    #[test]
+    fn try_with_store_is_nonblocking_under_contention() {
+        let base = std::env::temp_dir().join(format!("lina-twstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("store"),
+        ));
+        let nodes = test_nodes(Arc::clone(&store));
+
+        // Store livre → `f` roda e devolve o resultado.
+        assert_eq!(
+            nodes.try_with_store(|s| s.event_count().ok()),
+            Some(0),
+            "store livre → f roda"
+        );
+
+        // Store TRAVADO por outra thread → não bloqueia, devolve None, `f` NEM roda.
+        let (tx_locked, rx_locked) = std::sync::mpsc::channel();
+        let (tx_release, rx_release) = std::sync::mpsc::channel();
+        let store2 = Arc::clone(&store);
+        let holder = std::thread::spawn(move || {
+            let _g = lock(&store2);
+            tx_locked.send(()).expect("sinaliza travado");
+            rx_release.recv().expect("segura até liberar");
+        });
+        rx_locked.recv().expect("store travado");
+        let mut ran = false;
+        let got = nodes.try_with_store(|_s| {
+            ran = true;
+            Some(99u64)
+        });
+        assert_eq!(got, None, "store contendido → None, sem bloquear");
+        assert!(!ran, "`f` não roda quando o lock não foi adquirido");
+
+        tx_release.send(()).expect("libera o lock");
+        holder.join().expect("thread do lock encerra");
+
+        // Liberado → volta a rodar.
+        assert_eq!(nodes.try_with_store(|s| s.event_count().ok()), Some(0));
         let _ = std::fs::remove_dir_all(&base);
     }
 
