@@ -3724,8 +3724,7 @@ mod tests {
             by: Some(Uuid::now_v7()),
         };
         assert_eq!(ev.kind(), "EffortAssigned");
-        let back: DomainEvent =
-            serde_json::from_value(serde_json::to_value(&ev).unwrap()).unwrap();
+        let back: DomainEvent = serde_json::from_value(serde_json::to_value(&ev).unwrap()).unwrap();
         assert_eq!(back, ev, "roundtrip preserva todos os campos");
 
         // META: apply não toca a projeção.
@@ -3751,7 +3750,11 @@ mod tests {
                 ..
             } => {
                 assert_eq!(effort, Effort::Low);
-                assert_eq!(origin, EffortOrigin::Observed, "default conservador ≠ assigned");
+                assert_eq!(
+                    origin,
+                    EffortOrigin::Observed,
+                    "default conservador ≠ assigned"
+                );
                 assert_eq!(by, None);
                 assert_eq!(model, None);
                 assert_eq!(task_difficulty, None);

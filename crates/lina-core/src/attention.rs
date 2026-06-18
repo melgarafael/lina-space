@@ -1281,13 +1281,21 @@ mod tests {
         live.observe_records(&all[..split]);
         let cursor = all[..split].last().map(|r| r.seq).unwrap_or(0);
         let new_only: Vec<EventRecord> = all.iter().filter(|r| r.seq > cursor).cloned().collect();
-        assert_eq!(new_only.len(), all.len() - split, "filtro seq>cursor pega só os novos");
+        assert_eq!(
+            new_only.len(),
+            all.len() - split,
+            "filtro seq>cursor pega só os novos"
+        );
         live.observe_records(&new_only);
 
         // FULL-REPLAY: reconstrói do log inteiro.
         let full = AttentionQueue::replay(&all);
 
-        assert_eq!(live.items(now), full.items(now), "incremental ≡ full-replay");
+        assert_eq!(
+            live.items(now),
+            full.items(now),
+            "incremental ≡ full-replay"
+        );
     }
 
     /// **SEAM-1: banner de spawn cascata.** `SpawnRequested`+`SpawnGated{cascade}` → item `Spawn`

@@ -15,14 +15,15 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::events::{
-    AwaitReason, BlockReason, DomainEvent, Effort, EffortOrigin, EventRecord, EventStore, StoreError,
+    AcceptanceCriterion, AwaitReason, BlockReason, CheckKind, DomainEvent, Effort, EffortOrigin,
+    EventRecord, EventStore, StoreError, Verdict as GoalVerdict,
 };
-use crate::guard::{decide, ActionClass};
+use crate::guard::{classify, decide, ActionClass, Decision};
 use crate::mailbox::{
     parse_target, render_message_block_v2, validate_envelope_v2, EnvelopeViolation, MailMessage,
     Mailbox, TargetSpec,
 };
-use crate::plan::PlanError;
+use crate::plan::{Plan, PlanError, PlanItem};
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, NodeStatus, Recipient, RolePolicy, Supervisor};
 
 /// Janela de dedupe por `id` (design §3: dedupe em 60s).
@@ -48,6 +49,26 @@ pub const AWAIT_TIMEOUT_MS: u64 = 300_000;
 /// (`DELEGATION_BUDGET`); este corta o ciclo apertado um pouco antes. `2` = o salto pode repetir 2×
 /// num ciclo; a 3ª repetição que AINDA fecharia ciclo é `LoopDetected`.
 pub const MAX_CYCLE_REVISITS: u32 = 2;
+/// F3-1 (spec 52 §3, ponto [9]): teto DURO de voltas do OUTER loop de uma Goal por item. Esgotou
+/// sem `Pass` → `GoalEscalated{turn_budget_exhausted}` (PAUSA resumível, NUNCA mais um turno). É a
+/// defasagem-com-cap do ponto [9] e o ponto de escape do feedback negativo do ponto [8]. Faixa
+/// canônica 1..=20 (a validação/configurabilidade via `lina params` é fatia de params, §1 tabela).
+pub const GOAL_MAX_ITERATIONS: u32 = 3;
+/// F3-1 (spec 52 §3, parse-failure breaker do Hermes D3): vereditos do juiz NÃO-PARSEÁVEIS seguidos
+/// até `GoalEscalated{judge_unreliable}`. Distingue "instável por transporte" (reseta o contador,
+/// fail-open) de "incapaz do contrato" (pausa). Default conservador 3.
+pub const JUDGE_MAX_PARSE_FAILURES: u32 = 3;
+/// F3-1 (spec 52 §3/§4, doc-fonte linha 12 "novo desenvolvedor com effort maior"): a ESCADA de
+/// escalonamento de effort no `Fail`. Sobe um degrau por re-spawn; `Effort: Ord` torna "estritamente
+/// maior" uma comparação, não string solta. Default `["normal","high"]` da spec = `[Medium, High]`.
+/// `&'static` (não `Vec`) para [`RouterConfig`] seguir `Copy`; a configurabilidade dinâmica é porta
+/// aberta (vira `Cow`/param quando `lina params` cobrir a escada).
+pub const EFFORT_LADDER: &[Effort] = &[Effort::Medium, Effort::High];
+/// F3-1 (spec 52 §3, gate d): `NodeId` SENTINELA do JUIZ ESTRUTURAL — o supervisor rodando
+/// `CheckKind` determinístico (ZERO LLM). Nós reais nascem com `Uuid::now_v7()` (JAMAIS nil), então
+/// `reviewer = STRUCTURAL_JUDGE` nunca colide com um `target` real → `reviewer != target` por
+/// construção para o juiz automático (o executor nunca se auto-avalia).
+const STRUCTURAL_JUDGE: NodeId = NodeId::nil();
 
 /// Nível de autonomia do workspace (espelho leve do `lina_bootstrap::Autonomy` — o core NÃO
 /// depende do bootstrap; o app traduz). Só `Manual` muda o roteamento (recusa delegação).
@@ -108,6 +129,14 @@ pub struct RouterConfig {
     /// F1-0-7: falhas CONSECUTIVAS de entrega num nó até abrir o circuit breaker
     /// (`CircuitOpened` + `Blocked`). Anti retry-storm (13.11: "MANDATÓRIO").
     pub breaker_threshold: u32,
+    /// F3-1 (spec 52 §3): teto duro de voltas do OUTER loop de uma Goal por item (ver
+    /// [`GOAL_MAX_ITERATIONS`]).
+    pub goal_max_iterations: u32,
+    /// F3-1 (spec 52 §3): vereditos não-parseáveis seguidos até `judge_unreliable` (ver
+    /// [`JUDGE_MAX_PARSE_FAILURES`]).
+    pub judge_max_parse_failures: u32,
+    /// F3-1 (spec 52 §3/§4): escada de effort do escalonamento no `Fail` (ver [`EFFORT_LADDER`]).
+    pub effort_ladder: &'static [Effort],
 }
 
 /// Default do teto de retenção por alvo ocupado: **10 min** (CALIBRADO — ADR 0020
@@ -151,6 +180,9 @@ impl Default for RouterConfig {
             delivery_max_attempts: DELIVERY_MAX_ATTEMPTS,
             delivery_backoff_base_ms: DELIVERY_BACKOFF_BASE_MS,
             breaker_threshold: BREAKER_THRESHOLD,
+            goal_max_iterations: GOAL_MAX_ITERATIONS,
+            judge_max_parse_failures: JUDGE_MAX_PARSE_FAILURES,
+            effort_ladder: EFFORT_LADDER,
         }
     }
 }
@@ -207,6 +239,12 @@ pub enum RouteOutcome {
     /// F3-0-5: `effort.assign` recusado (payload inválido, alvo inexistente, effort fora do
     /// vocabulário) — nada logado, sem efeito.
     EffortRejected(String),
+    /// F3-1 (spec 52 §Superfície): verbo de Goal aplicado (`goal.define`/`goal.interpret`/
+    /// `goal.confirm`) — evento da Goal logado. NÃO entregue a PTY (verbo estruturado, como plan/params).
+    GoalApplied { intent: String, goal_id: String },
+    /// F3-1: verbo de Goal recusado (payload inválido, campo obrigatório ausente, intent desconhecido)
+    /// — nada logado, sem efeito. A `String` é o erro LEGÍVEL para o agente corrigir.
+    GoalRejected(String),
     /// W4-3 (freio do rodapé): a orquestração está PAUSADA → esta delegação foi ENFILEIRADA (retida
     /// no `.inflight`, durável), NÃO injetada. Drena ao [`Router::resume`]. É GATE humano, não kill
     /// (inv #6): nada se perde, o estado fica salvo e visível.
@@ -864,6 +902,14 @@ impl Router {
         //    carimbados server-side (jamais do payload — ADR 0007). NÃO entregue a PTY.
         if is_effort_intent(&msg.intent) {
             return self.handle_effort(msg, sender, store);
+        }
+
+        // ── F3-1: verbos da Goal (`goal.define`/`goal.interpret`/`goal.confirm`) — verbos
+        //    ESTRUTURADOS (molde de plan/params): emitem eventos da Goal, NUNCA entregues a PTY.
+        //    `goal.confirm.by` é carimbado com o `sender` autenticado (server-side, jamais payload —
+        //    ADR 0007). Precedem o pipeline de entrega/alvo, como os demais verbos.
+        if is_goal_intent(&msg.intent) {
+            return self.handle_goal(msg, sender, store);
         }
 
         // ── F1-0-4 (P1 — o fix do atropelamento): ENTREGA CIENTE DE ESTADO. Alvo single-node
@@ -1849,10 +1895,154 @@ impl Router {
                 msg.intent
             );
         }
+        // F3-1-4 (spec 52 §3): o `plan.check` é o GATILHO do OUTER loop. Se o item serve a uma Goal,
+        // o juiz estrutural roda os critérios de aceite e avança o laço (ReviewVerdict → GoalAchieved
+        // / GoalEscalated / escala de effort). `plan.claim` não dispara o juiz (o item nem terminou).
+        if msg.intent == "plan.check" {
+            if let Some(checked) = plan.itens.iter().find(|i| i.id == item).cloned() {
+                if let Some(goal_id) = checked.goal_id.clone() {
+                    if let Err(e) = self.review_and_advance(&goal_id, &checked, store) {
+                        eprintln!("lina-core: CRÍTICO — OUTER loop da Goal falhou em {item}: {e}");
+                    }
+                }
+            }
+        }
         RouteOutcome::PlanApplied {
             intent: msg.intent.clone(),
             item,
         }
+    }
+
+    /// **F3-1-4/5 (spec 52 §3): o OUTER loop da Goal** — disparado por um `plan.check` de um item que
+    /// serve a uma Goal. O Lina roda SÓ o OUTER loop (invariante #1: o INNER é o CLI de terceiro):
+    /// observa o item declarado pronto, roda o JUIZ ESTRUTURAL (`run_acceptance`, ZERO LLM), emite o
+    /// `ReviewVerdict` (juiz ≠ executor — gate d) e decide a próxima ação:
+    /// - **Pass** + todos os itens da Goal com último veredito `Pass` → exatamente um `GoalAchieved`.
+    /// - **Fail** + `iteration >= goal_max_iterations` → `GoalEscalated{turn_budget_exhausted}` (PAUSA
+    ///   resumível, nunca mais um turno — o backstop do ponto [9]).
+    /// - **Fail** abaixo do teto → escala de effort + re-despacho informado (doc-fonte linha 12).
+    ///
+    /// `None` de [`run_acceptance`] (HumanReview / fail-open) DEFERE — sem veredito automático.
+    fn review_and_advance(
+        &mut self,
+        goal_id: &str,
+        item: &PlanItem,
+        store: &mut EventStore,
+    ) -> Result<(), StoreError> {
+        // 1) Juiz estrutural. DEFERE (None) → o gate humano/QA decide; o turn-budget é o backstop.
+        let Some((verdict, evidence, defect_class)) =
+            run_acceptance(&item.acceptance, self.config.autonomy)
+        else {
+            return Ok(());
+        };
+        // 2) target = o owner do item (o "desenvolvedor" revisado). Sem owner vivo → nada a revisar.
+        let Some(target) = item.owner.as_deref().and_then(|o| self.sup.node_by_name(o)) else {
+            return Ok(());
+        };
+        // 3) iteração corrente = falhas anteriores + 1 (a tentativa que acabou de ser julgada).
+        let iteration = count_item_fails(store, goal_id, &item.id)? + 1;
+        // 4) emite o ReviewVerdict com o juiz ESTRUTURAL (reviewer != target — ENFORÇADO).
+        let verdict_seq = match emit_review_verdict(
+            store,
+            goal_id,
+            &item.id,
+            target,
+            STRUCTURAL_JUDGE,
+            verdict,
+            &evidence,
+            &defect_class,
+            iteration,
+        )? {
+            Some(seq) => seq,
+            None => return Ok(()), // recusado (reviewer==target) — não avança.
+        };
+        // 5) avança o laço.
+        match verdict {
+            GoalVerdict::Pass => {
+                let plan = store.project()?.plan;
+                if all_items_pass(store, &plan, goal_id)? {
+                    let iterations = max_goal_iteration(store, goal_id)?;
+                    store.append(&DomainEvent::GoalAchieved {
+                        goal_id: goal_id.to_string(),
+                        iterations,
+                        verdict_event_id: format!("seq:{verdict_seq}"),
+                    })?;
+                }
+            }
+            GoalVerdict::Fail => {
+                if iteration >= self.config.goal_max_iterations {
+                    store.append(&DomainEvent::GoalEscalated {
+                        goal_id: goal_id.to_string(),
+                        reason: "turn_budget_exhausted".to_string(),
+                    })?;
+                } else {
+                    self.escalate_on_fail(
+                        store,
+                        goal_id,
+                        item,
+                        target,
+                        iteration,
+                        &evidence,
+                        &defect_class,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **F3-1-4 (spec 52 §3/§4, gate e): escala de effort no `Fail`** abaixo do turn-budget. Sobe um
+    /// degrau de `effort_ladder` por iteração (capado no topo; `Effort: Ord` torna "estritamente
+    /// maior" uma comparação) e emite um `SpawnRequested` informado (re-despacho com evidência +
+    /// defect_class no prompt) — o "novo desenvolvedor com effort maior" do doc-fonte (linha 12). A
+    /// admissão física do re-spawn (LINA_EFFORT no PTY filho) é do app (`handle_spawn`/`admit_node`);
+    /// aqui só o LIVRO-RAZÃO do pedido, com `goal_id` que o justifica.
+    #[allow(clippy::too_many_arguments)]
+    fn escalate_on_fail(
+        &mut self,
+        store: &mut EventStore,
+        goal_id: &str,
+        item: &PlanItem,
+        target: NodeId,
+        iteration: u32,
+        evidence: &str,
+        defect_class: &str,
+    ) -> Result<(), StoreError> {
+        let ladder = self.config.effort_ladder;
+        if ladder.is_empty() {
+            return Ok(()); // sem escada configurada → nada a escalar (turn-budget ainda freia).
+        }
+        // degrau pela iteração, capado no topo da escada (1ª falha → degrau 0; sobe a cada volta).
+        let degrau = (iteration as usize).min(ladder.len()).saturating_sub(1);
+        let effort = ladder[degrau];
+        // name/role do alvo via projeção (a admissão física resolve os finais — fronteira core/shell).
+        let (name, role) = match store.project()?.nodes.get(&target) {
+            Some(n) => (
+                n.name
+                    .clone()
+                    .unwrap_or_else(|| item.owner.clone().unwrap_or_default()),
+                n.role.clone().unwrap_or_default(),
+            ),
+            None => (item.owner.clone().unwrap_or_default(), String::new()),
+        };
+        let prompt = format!(
+            "Revisão do item {} FALHOU (iteração {iteration}). Evidência: {evidence}. \
+             Defeito: {defect_class}. Corrija e re-submeta.",
+            item.id
+        );
+        store.append(&DomainEvent::SpawnRequested {
+            id: format!("goal-respawn:{goal_id}:{}:{iteration}", item.id),
+            requested_by: STRUCTURAL_JUDGE,
+            name,
+            role,
+            root_cause_id: goal_id.to_string(),
+            hops: 1,
+            prompt,
+            model: None,
+            effort: Some(effort),
+            goal_id: Some(goal_id.to_string()),
+        })?;
+        Ok(())
     }
 
     /// **F3-0-5: `lina params set/reset`** (molde de [`Router::handle_plan`]). Parseia o contrato
@@ -1870,7 +2060,9 @@ impl Router {
     ) -> RouteOutcome {
         let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
             Ok(v) => v,
-            Err(e) => return RouteOutcome::ParamsRejected(format!("payload de params inválido: {e}")),
+            Err(e) => {
+                return RouteOutcome::ParamsRejected(format!("payload de params inválido: {e}"))
+            }
         };
         let field = |k: &str| {
             payload
@@ -1965,7 +2157,9 @@ impl Router {
     ) -> RouteOutcome {
         let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
             Ok(v) => v,
-            Err(e) => return RouteOutcome::EffortRejected(format!("payload de effort inválido: {e}")),
+            Err(e) => {
+                return RouteOutcome::EffortRejected(format!("payload de effort inválido: {e}"))
+            }
         };
         let target = payload
             .get("target")
@@ -2015,6 +2209,128 @@ impl Router {
             return RouteOutcome::PersistFailed(e.to_string());
         }
         RouteOutcome::EffortApplied { node, effort }
+    }
+
+    /// **F3-1 (spec 52 §Superfície): verbos da Goal** (molde de [`Router::handle_params`]/
+    /// [`Router::handle_effort`]). `goal.define` cunha o `goal_id` (UUIDv7, SERVER-SIDE — jamais do
+    /// payload) e o `root_cause_id` (binding inforjável), emitindo `GoalDefined`. `goal.interpret`
+    /// emite `GoalInterpreted` (SUGESTÃO — não autoriza). `goal.confirm` é o GATE HUMANO da meta:
+    /// **`by` é CARIMBADO com o `sender` AUTENTICADO** (server-side), JAMAIS lido do payload (ADR 0007
+    /// / spec 52 §Segurança 2 — um `GoalConfirmed` forjado com `by` de outro nó é impossível aqui).
+    /// NUNCA entregue a PTY (verbo estruturado, como plan/params/effort).
+    fn handle_goal(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        store: &mut EventStore,
+    ) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let text = |k: &str| {
+            payload
+                .get(k)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let event = match msg.intent.as_str() {
+            "goal.define" => {
+                let statement = text("statement");
+                if statement.is_empty() {
+                    return RouteOutcome::GoalRejected("goal.define exige 'statement'".into());
+                }
+                // `root_cause_id` do binding inforjável (`derive_root_hops`), nunca `msg.root_cause_id`.
+                let (root, _hops) = self.derive_root_hops(msg, sender);
+                // `goal_id` cunhado SERVER-SIDE (UUIDv7 estável), nunca do payload do agente.
+                let goal_id = uuid::Uuid::now_v7().to_string();
+                let budget_tokens = payload
+                    .get("budget_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                // `origin` é PROVENIÊNCIA (rótulo), não credencial — o nome de quem pediu.
+                let origin = if msg.from.is_empty() {
+                    "human".to_string()
+                } else {
+                    msg.from.clone()
+                };
+                let goal_event = DomainEvent::GoalDefined {
+                    goal_id: goal_id.clone(),
+                    statement,
+                    root_cause_id: root,
+                    origin,
+                    budget_tokens,
+                };
+                (goal_event, goal_id)
+            }
+            "goal.interpret" => {
+                let goal_id = text("goal_id");
+                if goal_id.is_empty() {
+                    return RouteOutcome::GoalRejected("goal.interpret exige 'goal_id'".into());
+                }
+                let proposed_team = payload
+                    .get("team")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Critérios da interpretação nascem como HumanReview (gate); o DoD verificável por
+                // máquina é atribuído por item via `PlanItemAttributed` (CheckKind real).
+                let acceptance_criteria = payload
+                    .get("accept")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|desc| AcceptanceCriterion {
+                                desc: desc.to_string(),
+                                check_kind: CheckKind::HumanReview,
+                                check_arg: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let goal_event = DomainEvent::GoalInterpreted {
+                    goal_id: goal_id.clone(),
+                    interpretation: text("interpretation"),
+                    strategy: text("strategy"),
+                    proposed_team,
+                    acceptance_criteria,
+                };
+                (goal_event, goal_id)
+            }
+            "goal.confirm" => {
+                let goal_id = text("goal_id");
+                if goal_id.is_empty() {
+                    return RouteOutcome::GoalRejected("goal.confirm exige 'goal_id'".into());
+                }
+                // GATE HUMANO: `by` = o `sender` AUTENTICADO (server-side), JAMAIS do payload — um
+                // agente não forja a identidade de quem confirma a meta.
+                let amended_statement = payload
+                    .get("amended_statement")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from);
+                let goal_event = DomainEvent::GoalConfirmed {
+                    goal_id: goal_id.clone(),
+                    by: sender,
+                    amended_statement,
+                };
+                (goal_event, goal_id)
+            }
+            other => {
+                return RouteOutcome::GoalRejected(format!("intent de goal desconhecido: {other}"))
+            }
+        };
+        let (goal_event, goal_id) = event;
+        if let Err(e) = store.append(&goal_event) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        RouteOutcome::GoalApplied {
+            intent: msg.intent.clone(),
+            goal_id,
+        }
     }
 
     /// **F1-3-6 (ADR 0019 §6): gate INFORJÁVEL do `lina spawn`** (molde de [`Router::handle_plan`]).
@@ -2225,6 +2541,186 @@ fn is_params_intent(intent: &str) -> bool {
 /// router (mirror de [`is_params_intent`]) — emite `EffortAssigned`, NUNCA entregue a PTY.
 fn is_effort_intent(intent: &str) -> bool {
     intent == "effort.assign"
+}
+
+/// F3-1: `true` se o intent é um verbo da Goal (`goal.define`/`goal.interpret`/`goal.confirm`).
+/// Interceptado no router (molde de [`is_params_intent`]) — emite eventos da Goal, NUNCA entregue a
+/// PTY (o alvo `goal`/`@workspace` não é um nó endereçável).
+fn is_goal_intent(intent: &str) -> bool {
+    matches!(intent, "goal.define" | "goal.interpret" | "goal.confirm")
+}
+
+/// F3-1-2 (spec 52 §1/§3): o JUIZ ESTRUTURAL — roda os critérios de aceite de um item, ZERO LLM.
+/// `None` = DEFERE ao humano/QA (algum critério é `HumanReview`, ou o juiz não pôde avaliar →
+/// fail-open; o turn-budget é o backstop). `Some(Pass)` sse TODOS os critérios automáticos passam;
+/// `Some(Fail, evidence, defect_class)` no primeiro que falha (evidência OBSERVADA, não "ok").
+///
+/// **Segurança (spec 52 §Segurança 3):** um critério `Command`/`TestPass` cujo comando seja ação
+/// `GatedHard`/`GatedSoft`-gated (deploy/pay/`rm -rf`/push em main) NÃO é executado — o juiz não roda
+/// ação irreversível para "verificar" um critério. Degrada a `Fail` (exige confirmação humana); o
+/// critério verifica, não autoriza.
+fn run_acceptance(
+    criteria: &[AcceptanceCriterion],
+    autonomy: AutonomyLevel,
+) -> Option<(GoalVerdict, String, String)> {
+    // HumanReview em QUALQUER critério defere o item inteiro ao humano/QA (degrada honesto — o juiz
+    // estrutural não fabrica um Pass que exige olho humano).
+    if criteria
+        .iter()
+        .any(|c| matches!(c.check_kind, CheckKind::HumanReview))
+    {
+        return None;
+    }
+    for c in criteria {
+        let arg = c.check_arg.as_deref().unwrap_or("");
+        let passed = match c.check_kind {
+            CheckKind::Command | CheckKind::TestPass => {
+                // §Seg 3: o juiz NÃO roda ação não-rotineira para "verificar" (GatedHard → Ask em todo
+                // nível; GatedSoft → Ask em manual/assistido). Degrada a Fail — verifica, não autoriza.
+                if decide(classify(arg), autonomy) != Decision::Allow {
+                    return Some((
+                        GoalVerdict::Fail,
+                        format!(
+                            "critério '{}' exige confirmação humana (ação não-rotineira): {arg}",
+                            c.desc
+                        ),
+                        "criterio_nao_cumprido".to_string(),
+                    ));
+                }
+                // Erro de transporte do juiz (nem rodou) → fail-open: `?` propaga `None` (DEFERE; o
+                // turn-budget é o backstop).
+                run_check_command(arg)?
+            }
+            CheckKind::FileExists => std::path::Path::new(arg).exists(),
+            CheckKind::HumanReview => return None, // defensivo — já filtrado acima.
+        };
+        if !passed {
+            return Some((
+                GoalVerdict::Fail,
+                format!("critério '{}' não cumprido (check: {arg})", c.desc),
+                "criterio_nao_cumprido".to_string(),
+            ));
+        }
+    }
+    Some((GoalVerdict::Pass, String::new(), String::new()))
+}
+
+/// Roda um comando de check via shell (`sh -c`). `Some(true)` = exit 0, `Some(false)` = exit != 0,
+/// `None` = não pôde nem rodar (erro de transporte → fail-open no chamador, spec 52 §3). Sem captura
+/// de stdout — só o exit code decide (determinístico, ZERO LLM).
+fn run_check_command(cmd: &str) -> Option<bool> {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .ok()
+        .map(|status| status.success())
+}
+
+/// F3-1-4 (spec 52 §3, gate d): emite um `ReviewVerdict` SÓ depois de enforçar `reviewer != target` —
+/// o executor NUNCA se auto-avalia (anti-viés "dizer pronto"). `reviewer == target` → RECUSA (não
+/// loga; `None`). Sucesso → `Some(seq)` do evento. `reviewer`/`target` são carimbados pelo supervisor
+/// (server-side), nunca lidos do payload de um agente (regra-mãe ADR 0007 / spec 52 §Segurança).
+#[allow(clippy::too_many_arguments)]
+fn emit_review_verdict(
+    store: &mut EventStore,
+    goal_id: &str,
+    plan_item: &str,
+    target: NodeId,
+    reviewer: NodeId,
+    verdict: GoalVerdict,
+    evidence: &str,
+    defect_class: &str,
+    iteration: u32,
+) -> Result<Option<u64>, StoreError> {
+    if reviewer == target {
+        eprintln!(
+            "lina-core: ReviewVerdict RECUSADO — reviewer == target (auto-avaliacao proibida) \
+             goal={goal_id} item={plan_item}"
+        );
+        return Ok(None);
+    }
+    let seq = store.append(&DomainEvent::ReviewVerdict {
+        goal_id: goal_id.to_string(),
+        plan_item: plan_item.to_string(),
+        target,
+        reviewer,
+        verdict,
+        evidence: evidence.to_string(),
+        defect_class: defect_class.to_string(),
+        iteration,
+    })?;
+    Ok(Some(seq))
+}
+
+/// F3-1-4: conta os `ReviewVerdict::Fail` já no log para `(goal_id, plan_item)` — o nº de voltas
+/// falhas ANTERIORES (a iteração corrente = este valor + 1). Varre o log (padrão CostLedger).
+fn count_item_fails(store: &EventStore, goal_id: &str, item: &str) -> Result<u32, StoreError> {
+    let mut fails = 0u32;
+    for rec in store.events()? {
+        if rec.kind != "ReviewVerdict" {
+            continue;
+        }
+        let same = rec.payload.get("goal_id").and_then(|v| v.as_str()) == Some(goal_id)
+            && rec.payload.get("plan_item").and_then(|v| v.as_str()) == Some(item)
+            && rec.payload.get("verdict").and_then(|v| v.as_str()) == Some("Fail");
+        if same {
+            fails += 1;
+        }
+    }
+    Ok(fails)
+}
+
+/// F3-1-4 (gate b): `true` se TODO item da `goal_id` tem como ÚLTIMO veredito um `Pass` (o laço pode
+/// fechar). Goal sem itens → `false` (nada a fechar). Item sem veredito ou último `Fail` → `false`.
+fn all_items_pass(store: &EventStore, plan: &Plan, goal_id: &str) -> Result<bool, StoreError> {
+    let items: Vec<&str> = plan
+        .itens
+        .iter()
+        .filter(|i| i.goal_id.as_deref() == Some(goal_id))
+        .map(|i| i.id.as_str())
+        .collect();
+    if items.is_empty() {
+        return Ok(false);
+    }
+    let events = store.events()?;
+    for item in items {
+        let last_verdict = events
+            .iter()
+            .rev()
+            .find(|rec| {
+                rec.kind == "ReviewVerdict"
+                    && rec.payload.get("goal_id").and_then(|v| v.as_str()) == Some(goal_id)
+                    && rec.payload.get("plan_item").and_then(|v| v.as_str()) == Some(item)
+            })
+            .and_then(|rec| rec.payload.get("verdict").and_then(|v| v.as_str()));
+        if last_verdict != Some("Pass") {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// F3-1-4: o maior `iteration` entre os `ReviewVerdict` da goal — o total de voltas do OUTER loop
+/// (vai em `GoalAchieved.iterations`).
+fn max_goal_iteration(store: &EventStore, goal_id: &str) -> Result<u32, StoreError> {
+    let mut max = 0u32;
+    for rec in store.events()? {
+        if rec.kind != "ReviewVerdict"
+            || rec.payload.get("goal_id").and_then(|v| v.as_str()) != Some(goal_id)
+        {
+            continue;
+        }
+        let it = u32::try_from(
+            rec.payload
+                .get("iteration")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(u32::MAX);
+        max = max.max(it);
+    }
+    Ok(max)
 }
 
 /// F1-3-6: loga `SpawnGated{reason}` (livro-razão da decisão do gate, par do `SpawnRequested`).
@@ -5241,12 +5737,21 @@ mod tests {
             r#"{"key":"fanout_gate","scope":"workspace","value":"8"}"#,
         );
         let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        assert!(matches!(out, RouteOutcome::ParamsApplied { .. }), "veio {out:?}");
-        let ev = spawn_payloads(&ts.store, "SystemParamsChanged").pop().expect("evento");
+        assert!(
+            matches!(out, RouteOutcome::ParamsApplied { .. }),
+            "veio {out:?}"
+        );
+        let ev = spawn_payloads(&ts.store, "SystemParamsChanged")
+            .pop()
+            .expect("evento");
         assert_eq!(ev["key"].as_str(), Some("fanout_gate"));
         assert_eq!(ev["scope"].as_str(), Some("workspace"));
         assert_eq!(ev["new"].as_str(), Some("8"));
-        assert_eq!(ev["by"].as_str(), Some("human"), "origem humana → by carimbado server-side");
+        assert_eq!(
+            ev["by"].as_str(),
+            Some("human"),
+            "origem humana → by carimbado server-side"
+        );
     }
 
     /// O `set` RECUSA valor fora da faixa (≠ load, que clampa) — nada é logado.
@@ -5263,7 +5768,10 @@ mod tests {
             r#"{"key":"delegation_budget","scope":"workspace","value":"9999"}"#,
         );
         let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        assert!(matches!(out, RouteOutcome::ParamsRejected(_)), "veio {out:?}");
+        assert!(
+            matches!(out, RouteOutcome::ParamsRejected(_)),
+            "veio {out:?}"
+        );
         assert!(
             spawn_payloads(&ts.store, "SystemParamsChanged").is_empty(),
             "valor inválido não loga nada"
@@ -5285,9 +5793,19 @@ mod tests {
             r#"{"key":"fanout_gate","scope":"workspace","value":"8","by":"superuser"}"#,
         );
         router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        let ev = spawn_payloads(&ts.store, "SystemParamsChanged").pop().expect("evento");
-        assert_eq!(ev["by"].as_str(), Some("human"), "by efetivo = carimbo server-side");
-        assert_ne!(ev["by"].as_str(), Some("superuser"), "by do payload IGNORADO");
+        let ev = spawn_payloads(&ts.store, "SystemParamsChanged")
+            .pop()
+            .expect("evento");
+        assert_eq!(
+            ev["by"].as_str(),
+            Some("human"),
+            "by efetivo = carimbo server-side"
+        );
+        assert_ne!(
+            ev["by"].as_str(),
+            Some("superuser"),
+            "by do payload IGNORADO"
+        );
     }
 
     /// F3-0-7 §C: REDUZIR um laço balanceador abaixo do default sobe ao gate humano (GatedHard/Ask,
@@ -5307,14 +5825,23 @@ mod tests {
             r#"{"key":"delegation_budget","scope":"workspace","value":"4"}"#,
         );
         let out = router.route_message(&m_reduce, &mut ts.store, 1, &mut deliver);
-        assert!(matches!(out, RouteOutcome::ParamsGated { .. }), "reduzir laço → gate; veio {out:?}");
+        assert!(
+            matches!(out, RouteOutcome::ParamsGated { .. }),
+            "reduzir laço → gate; veio {out:?}"
+        );
         assert!(
             spawn_payloads(&ts.store, "SystemParamsChanged").is_empty(),
             "gated NÃO aplica (nenhum SystemParamsChanged)"
         );
-        let gated = spawn_payloads(&ts.store, "ActionGated").pop().expect("ActionGated logado");
+        let gated = spawn_payloads(&ts.store, "ActionGated")
+            .pop()
+            .expect("ActionGated logado");
         assert_eq!(gated["class"].as_str(), Some("gated-hard"));
-        assert_eq!(gated["decision"].as_str(), Some("ask"), "gated-hard = Ask em todo nível");
+        assert_eq!(
+            gated["decision"].as_str(),
+            Some("ask"),
+            "gated-hard = Ask em todo nível"
+        );
 
         // (ii) AUMENTAR delegation_budget (8 → 16) → aplica livre.
         let m_raise = MailMessage::new(
@@ -5324,7 +5851,10 @@ mod tests {
             r#"{"key":"delegation_budget","scope":"workspace","value":"16"}"#,
         );
         let out2 = router.route_message(&m_raise, &mut ts.store, 2, &mut deliver);
-        assert!(matches!(out2, RouteOutcome::ParamsApplied { .. }), "aumentar → aplica; veio {out2:?}");
+        assert!(
+            matches!(out2, RouteOutcome::ParamsApplied { .. }),
+            "aumentar → aplica; veio {out2:?}"
+        );
 
         // (iii) parâmetro NÃO-defensivo (scrollback_retention_days) → aplica livre.
         let m_nondef = MailMessage::new(
@@ -5334,7 +5864,10 @@ mod tests {
             r#"{"key":"scrollback_retention_days","scope":"workspace","value":"7"}"#,
         );
         let out3 = router.route_message(&m_nondef, &mut ts.store, 3, &mut deliver);
-        assert!(matches!(out3, RouteOutcome::ParamsApplied { .. }), "não-defensivo → aplica; veio {out3:?}");
+        assert!(
+            matches!(out3, RouteOutcome::ParamsApplied { .. }),
+            "não-defensivo → aplica; veio {out3:?}"
+        );
     }
 
     /// `effort.assign` resolve o alvo, valida o effort e emite `EffortAssigned{origin:assigned}`
@@ -5346,13 +5879,31 @@ mod tests {
         let b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("effort-assign");
         let (_rec, mut deliver) = recorder();
-        let m = MailMessage::new("@A", "@workspace", "effort.assign", r#"{"target":"@B","effort":"high"}"#);
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "effort.assign",
+            r#"{"target":"@B","effort":"high"}"#,
+        );
         let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        assert!(matches!(out, RouteOutcome::EffortApplied { .. }), "veio {out:?}");
-        let ev = spawn_payloads(&ts.store, "EffortAssigned").pop().expect("evento");
-        assert_eq!(ev["node"].as_str(), Some(b.to_string().as_str()), "node = alvo RESOLVIDO");
+        assert!(
+            matches!(out, RouteOutcome::EffortApplied { .. }),
+            "veio {out:?}"
+        );
+        let ev = spawn_payloads(&ts.store, "EffortAssigned")
+            .pop()
+            .expect("evento");
+        assert_eq!(
+            ev["node"].as_str(),
+            Some(b.to_string().as_str()),
+            "node = alvo RESOLVIDO"
+        );
         assert_eq!(ev["effort"].as_str(), Some("high"));
-        assert_eq!(ev["origin"].as_str(), Some("assigned"), "verbo = atribuição explícita");
+        assert_eq!(
+            ev["origin"].as_str(),
+            Some("assigned"),
+            "verbo = atribuição explícita"
+        );
     }
 
     /// Effort fora do vocabulário → recusa, nada logado.
@@ -5363,9 +5914,17 @@ mod tests {
         let _b = sup.register("@B", None, sink());
         let mut ts = TmpStore::new("effort-bad");
         let (_rec, mut deliver) = recorder();
-        let m = MailMessage::new("@A", "@workspace", "effort.assign", r#"{"target":"@B","effort":"altissimo"}"#);
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "effort.assign",
+            r#"{"target":"@B","effort":"altissimo"}"#,
+        );
         let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        assert!(matches!(out, RouteOutcome::EffortRejected(_)), "veio {out:?}");
+        assert!(
+            matches!(out, RouteOutcome::EffortRejected(_)),
+            "veio {out:?}"
+        );
         assert!(spawn_payloads(&ts.store, "EffortAssigned").is_empty());
     }
 
@@ -5376,9 +5935,17 @@ mod tests {
         let _a = sup.register("@A", None, sink());
         let mut ts = TmpStore::new("effort-not");
         let (_rec, mut deliver) = recorder();
-        let m = MailMessage::new("@A", "@workspace", "effort.assign", r#"{"target":"@Fantasma","effort":"low"}"#);
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "effort.assign",
+            r#"{"target":"@Fantasma","effort":"low"}"#,
+        );
         let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        assert!(matches!(out, RouteOutcome::EffortRejected(_)), "veio {out:?}");
+        assert!(
+            matches!(out, RouteOutcome::EffortRejected(_)),
+            "veio {out:?}"
+        );
         assert!(spawn_payloads(&ts.store, "EffortAssigned").is_empty());
     }
 
@@ -5399,9 +5966,19 @@ mod tests {
             r#"{"target":"@B","effort":"low","origin":"observed","by":"superuser"}"#,
         );
         router.route_message(&m, &mut ts.store, 1, &mut deliver);
-        let ev = spawn_payloads(&ts.store, "EffortAssigned").pop().expect("evento");
-        assert_eq!(ev["origin"].as_str(), Some("assigned"), "origin do payload IGNORADO");
-        assert_ne!(ev["by"].as_str(), Some("superuser"), "by do payload IGNORADO (server-side)");
+        let ev = spawn_payloads(&ts.store, "EffortAssigned")
+            .pop()
+            .expect("evento");
+        assert_eq!(
+            ev["origin"].as_str(),
+            Some("assigned"),
+            "origin do payload IGNORADO"
+        );
+        assert_ne!(
+            ev["by"].as_str(),
+            Some("superuser"),
+            "by do payload IGNORADO (server-side)"
+        );
     }
 
     /// GUARDA F3-0-7 §B2 (ADR 0007): um AGENTE em cascata NÃO pode se AUTO-ATRIBUIR effort (gastar
@@ -5423,19 +6000,46 @@ mod tests {
             &mut deliver,
         );
         // B tenta se AUTO-atribuir effort high → RECUSADO (auto-promoção).
-        let m_self =
-            MailMessage::new("@B", "@workspace", "effort.assign", r#"{"target":"@B","effort":"high"}"#);
+        let m_self = MailMessage::new(
+            "@B",
+            "@workspace",
+            "effort.assign",
+            r#"{"target":"@B","effort":"high"}"#,
+        );
         let out = router.route_message(&m_self, &mut ts.store, 2, &mut deliver);
-        assert!(matches!(out, RouteOutcome::EffortRejected(_)), "auto-atribuição recusada; veio {out:?}");
-        assert!(spawn_payloads(&ts.store, "EffortAssigned").is_empty(), "auto-atribuição não loga nada");
+        assert!(
+            matches!(out, RouteOutcome::EffortRejected(_)),
+            "auto-atribuição recusada; veio {out:?}"
+        );
+        assert!(
+            spawn_payloads(&ts.store, "EffortAssigned").is_empty(),
+            "auto-atribuição não loga nada"
+        );
         // ...mas B atribuindo a OUTRO (@C) SEGUE permitido (cascata legítima, by = o agente B).
-        let m_other =
-            MailMessage::new("@B", "@workspace", "effort.assign", r#"{"target":"@C","effort":"high"}"#);
+        let m_other = MailMessage::new(
+            "@B",
+            "@workspace",
+            "effort.assign",
+            r#"{"target":"@C","effort":"high"}"#,
+        );
         let out2 = router.route_message(&m_other, &mut ts.store, 3, &mut deliver);
-        assert!(matches!(out2, RouteOutcome::EffortApplied { .. }), "agente→OUTRO permitido; veio {out2:?}");
-        let ev = spawn_payloads(&ts.store, "EffortAssigned").pop().expect("evento p/ @C");
-        assert_eq!(ev["node"].as_str(), Some(c.to_string().as_str()), "node = @C resolvido");
-        assert_eq!(ev["by"].as_str(), Some(b.to_string().as_str()), "by = o agente que atribuiu (server-side)");
+        assert!(
+            matches!(out2, RouteOutcome::EffortApplied { .. }),
+            "agente→OUTRO permitido; veio {out2:?}"
+        );
+        let ev = spawn_payloads(&ts.store, "EffortAssigned")
+            .pop()
+            .expect("evento p/ @C");
+        assert_eq!(
+            ev["node"].as_str(),
+            Some(c.to_string().as_str()),
+            "node = @C resolvido"
+        );
+        assert_eq!(
+            ev["by"].as_str(),
+            Some(b.to_string().as_str()),
+            "by = o agente que atribuiu (server-side)"
+        );
     }
 
     /// **Critério 1 (caminho feliz, ORIGEM).** Um nó SEM binding (`hops==0`, pedido direto do
@@ -6181,6 +6785,403 @@ mod tests {
         router.seed_delivered_root(c, "R1".into(), 0, 3000); // mesmo root → idempotente
         let (root2, _h2) = router.derive_root_hops(&MailMessage::new("@C", "@x", "ask", ""), c);
         assert_eq!(root2, "R1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────── F3-1: juiz estrutural + OUTER loop ─────────────────────────
+
+    fn crit_cmd(desc: &str, cmd: &str) -> AcceptanceCriterion {
+        AcceptanceCriterion {
+            desc: desc.into(),
+            check_kind: CheckKind::Command,
+            check_arg: Some(cmd.into()),
+        }
+    }
+
+    /// F3-1-2: `Command` exit 0 → Pass; exit != 0 → Fail com evidência observada + defect_class.
+    #[test]
+    fn acceptance_command_exit0_passa_exit1_falha() {
+        let (v, _, _) =
+            run_acceptance(&[crit_cmd("ok", "true")], AutonomyLevel::Assisted).expect("decide");
+        assert_eq!(v, GoalVerdict::Pass, "exit 0 passa");
+
+        let (v, evidence, defect) =
+            run_acceptance(&[crit_cmd("x", "false")], AutonomyLevel::Assisted).expect("decide");
+        assert_eq!(v, GoalVerdict::Fail, "exit != 0 falha");
+        assert!(!evidence.is_empty(), "evidência observada do exit != 0");
+        assert_eq!(defect, "criterio_nao_cumprido");
+    }
+
+    /// F3-1-2 (spec 52 §Seg 3): o juiz NÃO roda ação irreversível para verificar — `git push origin
+    /// main` (GatedHard) degrada a Fail mesmo em autônomo (o gate nunca afrouxa hard).
+    #[test]
+    fn acceptance_gated_hard_nao_e_executado_pelo_juiz() {
+        let (v, evidence, _) = run_acceptance(
+            &[crit_cmd("deploy", "git push origin main")],
+            AutonomyLevel::Autonomous,
+        )
+        .expect("decide");
+        assert_eq!(v, GoalVerdict::Fail, "GatedHard não é executado pelo juiz");
+        assert!(
+            evidence.contains("humana") || evidence.contains("gate"),
+            "evidência diz que exige confirmação humana: {evidence}"
+        );
+    }
+
+    /// F3-1-2: `HumanReview` DEFERE (o juiz estrutural não dá veredito automático — exige gate).
+    #[test]
+    fn acceptance_human_review_defere() {
+        let crit = AcceptanceCriterion {
+            desc: "olhar a tela".into(),
+            check_kind: CheckKind::HumanReview,
+            check_arg: None,
+        };
+        assert!(
+            run_acceptance(&[crit], AutonomyLevel::Assisted).is_none(),
+            "HumanReview defere ao humano (None)"
+        );
+    }
+
+    /// F3-1-2: todos os critérios precisam passar (Pass sse TODOS exit 0; o 1º Fail interrompe).
+    #[test]
+    fn acceptance_exige_todos_os_criterios() {
+        let crits = [crit_cmd("a", "true"), crit_cmd("b", "false")];
+        let (v, _, _) = run_acceptance(&crits, AutonomyLevel::Assisted).expect("decide");
+        assert_eq!(v, GoalVerdict::Fail, "um critério falho derruba o conjunto");
+    }
+
+    /// Semeia uma Goal + itens atribuídos (com `acceptance`) no store, e dá `claim` do `@Dev` em cada.
+    /// Devolve o router/sup/store/deliver prontos para os `plan.check` do OUTER loop.
+    fn seed_goal(
+        tag: &str,
+        items: &[(&str, &str)], // (id, comando de acceptance)
+    ) -> (Router, Arc<Supervisor>, TmpStore, std::path::PathBuf) {
+        let (mut router, sup, dir) = router_with(tag);
+        let _dev = sup.register("@Dev", None, sink());
+        let mut ts = TmpStore::new(tag);
+        let (_rec, mut deliver) = recorder();
+        ts.store
+            .append(&DomainEvent::GoalDefined {
+                goal_id: "g".into(),
+                statement: "meta de teste".into(),
+                root_cause_id: "r".into(),
+                origin: "@Maestro".into(),
+                budget_tokens: 0,
+            })
+            .unwrap();
+        for (i, (id, cmd)) in items.iter().enumerate() {
+            let t = 1000u64 + i as u64;
+            router.seed_plan_item(&mut ts.store, *id, "tarefa").unwrap();
+            ts.store
+                .append(&DomainEvent::PlanItemAttributed {
+                    item: (*id).into(),
+                    goal_id: Some("g".into()),
+                    parents: vec![],
+                    acceptance: vec![crit_cmd("criterio", cmd)],
+                    budget_tokens: 0,
+                })
+                .unwrap();
+            router.route_message(
+                &MailMessage::new("@Dev", "plan", "plan.claim", "").with_ref(format!("plan:{id}")),
+                &mut ts.store,
+                t,
+                &mut deliver,
+            );
+        }
+        (router, sup, ts, dir)
+    }
+
+    fn check(router: &mut Router, ts: &mut TmpStore, item: &str, t: u64) {
+        let (_rec, mut deliver) = recorder();
+        router.route_message(
+            &MailMessage::new("@Dev", "plan", "plan.check", "").with_ref(format!("plan:{item}")),
+            &mut ts.store,
+            t,
+            &mut deliver,
+        );
+    }
+
+    fn recs_of<'a>(events: &'a [EventRecord], kind: &str) -> Vec<&'a EventRecord> {
+        events.iter().filter(|e| e.kind == kind).collect()
+    }
+    fn field<'a>(rec: &'a EventRecord, k: &str) -> Option<&'a str> {
+        rec.payload.get(k).and_then(serde_json::Value::as_str)
+    }
+
+    /// Gate (b): Goal com 2 itens exit-0 fecha com EXATAMENTE um `GoalAchieved` ao 2º Pass, e NENHUM
+    /// re-spawn/despacho depois. (Inclui gate d parte 1: todo ReviewVerdict tem reviewer != target.)
+    #[test]
+    fn gate_b_goal_fecha_so_com_todos_pass_sem_despacho_depois() {
+        let (mut router, _sup, mut ts, dir) =
+            seed_goal("gate-b", &[("T1", "true"), ("T2", "true")]);
+        check(&mut router, &mut ts, "T1", 2000); // Pass, mas T2 pendente → não fecha.
+        check(&mut router, &mut ts, "T2", 2001); // Pass, todos → GoalAchieved.
+
+        let events = ts.store.events().unwrap();
+        let achieved = recs_of(&events, "GoalAchieved");
+        assert_eq!(achieved.len(), 1, "exatamente um GoalAchieved");
+        assert_eq!(
+            achieved[0]
+                .payload
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "fechou na 1ª volta de cada item"
+        );
+        let achieved_seq = achieved[0].seq;
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.seq > achieved_seq && e.kind == "SpawnRequested"),
+            "nenhum re-spawn após GoalAchieved"
+        );
+        let verdicts = recs_of(&events, "ReviewVerdict");
+        assert_eq!(verdicts.len(), 2, "um veredito por item");
+        for v in &verdicts {
+            assert_ne!(
+                field(v, "reviewer"),
+                field(v, "target"),
+                "gate d: juiz != executor em todo veredito"
+            );
+            assert_eq!(field(v, "verdict"), Some("Pass"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (c): critério que SEMPRE falha → após `goal_max_iterations` (3) Fail, exatamente um
+    /// `GoalEscalated{turn_budget_exhausted}` e ZERO iteração a mais.
+    #[test]
+    fn gate_c_turn_budget_freia_apos_max_iterations() {
+        let (mut router, _sup, mut ts, dir) = seed_goal("gate-c", &[("T1", "false")]);
+        for t in [2000u64, 2001, 2002] {
+            check(&mut router, &mut ts, "T1", t);
+        }
+        let events = ts.store.events().unwrap();
+        let fails = events
+            .iter()
+            .filter(|e| e.kind == "ReviewVerdict" && field(e, "verdict") == Some("Fail"))
+            .count();
+        assert_eq!(fails, 3, "exatamente 3 Fail (turn-budget = 3)");
+        let escalated = recs_of(&events, "GoalEscalated");
+        assert_eq!(escalated.len(), 1, "um GoalEscalated");
+        assert_eq!(field(escalated[0], "reason"), Some("turn_budget_exhausted"));
+        let esc_seq = escalated[0].seq;
+        assert!(
+            !events.iter().any(|e| e.seq > esc_seq
+                && matches!(
+                    e.kind.as_str(),
+                    "ReviewVerdict" | "GoalAchieved" | "SpawnRequested"
+                )),
+            "zero iteração após GoalEscalated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (d), parte 2 (adversarial): um `ReviewVerdict` forjado com `reviewer == target` é RECUSADO
+    /// pelo supervisor (não loga) — o executor nunca se auto-avalia.
+    #[test]
+    fn gate_d_review_verdict_recusa_auto_avaliacao() {
+        let mut ts = TmpStore::new("gate-d");
+        let dev = NodeId::from_u128(1);
+        let qa = NodeId::from_u128(2);
+
+        let forged = emit_review_verdict(
+            &mut ts.store,
+            "g",
+            "T1",
+            dev,
+            dev,
+            GoalVerdict::Pass,
+            "",
+            "",
+            1,
+        )
+        .unwrap();
+        assert!(forged.is_none(), "reviewer == target é recusado");
+        assert_eq!(
+            recs_of(&ts.store.events().unwrap(), "ReviewVerdict").len(),
+            0,
+            "nada logado quando recusado"
+        );
+
+        let ok = emit_review_verdict(
+            &mut ts.store,
+            "g",
+            "T1",
+            dev,
+            qa,
+            GoalVerdict::Pass,
+            "",
+            "",
+            1,
+        )
+        .unwrap();
+        assert!(ok.is_some(), "reviewer != target é aceito");
+    }
+
+    /// Gate (e): a cada Fail abaixo do turn-budget, o re-spawn SOBE um degrau da `effort_ladder` — a
+    /// escala estritamente maior do doc-fonte (linha 12). (A asserção `Ord`-nativa entra quando
+    /// `Effort` derivar `Ord` — escalado ao Maestro; aqui a escala é provada pelos degraus emitidos.)
+    #[test]
+    fn gate_e_re_spawn_escala_effort_um_degrau_por_volta() {
+        let (mut router, _sup, mut ts, dir) = seed_goal("gate-e", &[("T1", "false")]);
+        // escada de 3 degraus + teto alto p/ ver 2 re-spawns crescentes antes do turn-budget.
+        router.config.effort_ladder = &[Effort::Low, Effort::Medium, Effort::High];
+        router.config.goal_max_iterations = 5;
+        check(&mut router, &mut ts, "T1", 2000); // Fail iter1 → re-spawn degrau 0 (Low).
+        check(&mut router, &mut ts, "T1", 2001); // Fail iter2 → re-spawn degrau 1 (Medium).
+
+        let events = ts.store.events().unwrap();
+        let efforts: Vec<&str> = recs_of(&events, "SpawnRequested")
+            .iter()
+            .filter_map(|e| field(e, "effort"))
+            .collect();
+        assert_eq!(efforts.len(), 2, "dois re-spawns informados");
+        assert_eq!(efforts[0], "low", "1ª volta no degrau base da escada");
+        assert_eq!(
+            efforts[1], "medium",
+            "2ª volta SOBE um degrau (low → medium)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-1 (superfície): `goal.define` cunha o `goal_id` SERVER-SIDE e emite `GoalDefined`.
+    #[test]
+    fn handle_goal_define_cunha_goal_id_server_side() {
+        let (mut router, sup, dir) = router_with("goal-def");
+        let _u = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("goal-def");
+        let (_rec, mut deliver) = recorder();
+        let msg = MailMessage::new(
+            "@User",
+            "goal",
+            "goal.define",
+            r#"{"statement":"criar landing"}"#,
+        );
+        let goal_id = match router.route_message(&msg, &mut ts.store, 1000, &mut deliver) {
+            RouteOutcome::GoalApplied { intent, goal_id } => {
+                assert_eq!(intent, "goal.define");
+                goal_id
+            }
+            other => panic!("esperava GoalApplied, veio {other:?}"),
+        };
+        assert!(!goal_id.is_empty(), "goal_id cunhado server-side (UUIDv7)");
+        let events = ts.store.events().unwrap();
+        let defs = recs_of(&events, "GoalDefined");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(field(defs[0], "statement"), Some("criar landing"));
+        assert_eq!(field(defs[0], "goal_id"), Some(goal_id.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-1 (ENFORCEMENT crítico, spec 52 §Segurança 2): `goal.confirm.by` é o `sender` AUTENTICADO,
+    /// JAMAIS o `by` que o payload tenta forjar — o gate humano da meta não é forjável por um agente.
+    #[test]
+    fn handle_goal_confirm_carimba_by_server_side_ignora_payload() {
+        let (mut router, sup, dir) = router_with("goal-conf");
+        let user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("goal-conf");
+        let (_rec, mut deliver) = recorder();
+        // O payload TENTA forjar `by` com outro id — deve ser ignorado pelo carimbo server-side.
+        let forged_by = NodeId::from_u128(999).to_string();
+        let payload = format!(r#"{{"goal_id":"g1","by":"{forged_by}"}}"#);
+        let msg = MailMessage::new("@User", "goal", "goal.confirm", &payload);
+        router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+
+        let events = ts.store.events().unwrap();
+        let confs = recs_of(&events, "GoalConfirmed");
+        assert_eq!(confs.len(), 1);
+        let user_str = user.to_string();
+        assert_eq!(
+            field(confs[0], "by"),
+            Some(user_str.as_str()),
+            "by é o sender autenticado (@User), não o payload"
+        );
+        assert_ne!(
+            field(confs[0], "by"),
+            Some(forged_by.as_str()),
+            "by forjado no payload é IGNORADO"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (a): o ciclo completo via verbos (define→interpret→confirm) + decomposição + check fecha a
+    /// Goal; reabrir o store do MESMO log e re-projetar reconstrói a Goal IDÊNTICA (replay = verdade).
+    #[test]
+    fn gate_a_replay_reconstroi_a_goal_apos_reabrir() {
+        let (mut router, sup, dir) = router_with("gate-a");
+        let _user = sup.register("@User", None, sink());
+        let _dev = sup.register("@Dev", None, sink());
+        let mut ts = TmpStore::new("gate-a");
+        let (_rec, mut deliver) = recorder();
+
+        let goal_id = match router.route_message(
+            &MailMessage::new("@User", "goal", "goal.define", r#"{"statement":"criar x"}"#),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        ) {
+            RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+            o => panic!("{o:?}"),
+        };
+        let interp =
+            format!(r#"{{"goal_id":"{goal_id}","interpretation":"simples","strategy":"1 dev"}}"#);
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp),
+            &mut ts.store,
+            1001,
+            &mut deliver,
+        );
+        router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.confirm",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1002,
+            &mut deliver,
+        );
+        router
+            .seed_plan_item(&mut ts.store, "T1", "tarefa")
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::PlanItemAttributed {
+                item: "T1".into(),
+                goal_id: Some(goal_id.clone()),
+                parents: vec![],
+                acceptance: vec![crit_cmd("ok", "true")],
+                budget_tokens: 0,
+            })
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::GoalDecomposed {
+                goal_id: goal_id.clone(),
+                plan_items: vec!["T1".into()],
+            })
+            .unwrap();
+        router.route_message(
+            &MailMessage::new("@Dev", "plan", "plan.claim", "").with_ref("plan:T1"),
+            &mut ts.store,
+            1003,
+            &mut deliver,
+        );
+        check(&mut router, &mut ts, "T1", 1004); // Pass → GoalAchieved.
+
+        let live = crate::project_goals(&ts.store.events().unwrap());
+        // Reabre o store do MESMO log em disco (simula matar/reabrir) e re-projeta.
+        let reopened = EventStore::open(&ts.dir).expect("reabrir store");
+        let replayed = crate::project_goals(&reopened.events().unwrap());
+
+        assert_eq!(
+            live, replayed,
+            "replay reconstrói a Goal idêntica após reabrir"
+        );
+        assert_eq!(live.len(), 1, "uma Goal");
+        assert_eq!(live[0].goal_id, goal_id);
+        assert_eq!(live[0].phase, crate::GoalPhase::Achieved);
+        assert_eq!(live[0].items, vec!["T1".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

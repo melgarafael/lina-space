@@ -30,8 +30,9 @@ use crate::guard::ActionClass;
 use crate::lifecycle::{HEARTBEAT_SAMPLE_MS, STALL_BREAKER_SAMPLES, STALL_WARN_SAMPLES};
 use crate::router::{
     AutonomyLevel, RouterConfig, AWAIT_TIMEOUT_MS, BREAKER_THRESHOLD, DEDUPE_WINDOW_MS,
-    DELEGATION_BUDGET, DELIVERY_BACKOFF_BASE_MS, DELIVERY_MAX_ATTEMPTS, FANOUT_GATE, MAX_CYCLE_REVISITS,
-    MAX_DEPTH, MAX_SPAWNS_PER_TURN, RETENTION_TIMEOUT_MS,
+    DELEGATION_BUDGET, DELIVERY_BACKOFF_BASE_MS, DELIVERY_MAX_ATTEMPTS, EFFORT_LADDER, FANOUT_GATE,
+    GOAL_MAX_ITERATIONS, JUDGE_MAX_PARSE_FAILURES, MAX_CYCLE_REVISITS, MAX_DEPTH,
+    MAX_SPAWNS_PER_TURN, RETENTION_TIMEOUT_MS,
 };
 use crate::scrollback::DEFAULT_RETENTION_DAYS;
 
@@ -200,7 +201,9 @@ pub fn validate_range(key: &str, value: &str) -> Result<(), String> {
     match key {
         "effort" => match value {
             "low" | "medium" | "high" => Ok(()),
-            _ => Err(format!("effort inválido {value:?}: use low, medium ou high")),
+            _ => Err(format!(
+                "effort inválido {value:?}: use low, medium ou high"
+            )),
         },
         // O vocabulário concreto de modelo é do CLI Profile (invariante #3) — aqui aceita o alias.
         "model" => Ok(()),
@@ -260,13 +263,17 @@ impl SystemParams {
             await_timeout_ms: over.await_timeout_ms.or(self.await_timeout_ms),
             retention_timeout_ms: over.retention_timeout_ms.or(self.retention_timeout_ms),
             delivery_max_attempts: over.delivery_max_attempts.or(self.delivery_max_attempts),
-            delivery_backoff_base_ms: over.delivery_backoff_base_ms.or(self.delivery_backoff_base_ms),
+            delivery_backoff_base_ms: over
+                .delivery_backoff_base_ms
+                .or(self.delivery_backoff_base_ms),
             breaker_threshold: over.breaker_threshold.or(self.breaker_threshold),
             heartbeat_sample_ms: over.heartbeat_sample_ms.or(self.heartbeat_sample_ms),
             stall_warn_samples: over.stall_warn_samples.or(self.stall_warn_samples),
             stall_breaker_samples: over.stall_breaker_samples.or(self.stall_breaker_samples),
             token_budget_day: over.token_budget_day.or(self.token_budget_day),
-            scrollback_retention_days: over.scrollback_retention_days.or(self.scrollback_retention_days),
+            scrollback_retention_days: over
+                .scrollback_retention_days
+                .or(self.scrollback_retention_days),
             model: over.model.or(self.model),
             effort: over.effort.or(self.effort),
         }
@@ -298,50 +305,97 @@ impl SystemParams {
         let mut warnings = Vec::new();
         let router_config = RouterConfig {
             dedupe_window_ms: clamp_keyed(
-                self.dedupe_window_ms, DEDUPE_WINDOW_MS, "dedupe_window_ms", &mut warnings,
+                self.dedupe_window_ms,
+                DEDUPE_WINDOW_MS,
+                "dedupe_window_ms",
+                &mut warnings,
             ),
             max_depth: clamp_keyed(self.max_depth, MAX_DEPTH, "max_depth", &mut warnings),
             delegation_budget: clamp_keyed(
-                self.delegation_budget, DELEGATION_BUDGET, "delegation_budget", &mut warnings,
+                self.delegation_budget,
+                DELEGATION_BUDGET,
+                "delegation_budget",
+                &mut warnings,
             ),
             max_spawns_per_turn: clamp_keyed(
-                self.max_spawns_per_turn, MAX_SPAWNS_PER_TURN, "max_spawns_per_turn", &mut warnings,
+                self.max_spawns_per_turn,
+                MAX_SPAWNS_PER_TURN,
+                "max_spawns_per_turn",
+                &mut warnings,
             ),
             fanout_gate: clamp_keyed(self.fanout_gate, FANOUT_GATE, "fanout_gate", &mut warnings),
             autonomy,
             await_timeout_ms: clamp_keyed(
-                self.await_timeout_ms, AWAIT_TIMEOUT_MS, "await_timeout_ms", &mut warnings,
+                self.await_timeout_ms,
+                AWAIT_TIMEOUT_MS,
+                "await_timeout_ms",
+                &mut warnings,
             ),
-            token_budget_day: clamp_keyed(self.token_budget_day, 0, "token_budget_day", &mut warnings),
+            token_budget_day: clamp_keyed(
+                self.token_budget_day,
+                0,
+                "token_budget_day",
+                &mut warnings,
+            ),
             heartbeat_sample_ms: clamp_keyed(
-                self.heartbeat_sample_ms, HEARTBEAT_SAMPLE_MS, "heartbeat_sample_ms", &mut warnings,
+                self.heartbeat_sample_ms,
+                HEARTBEAT_SAMPLE_MS,
+                "heartbeat_sample_ms",
+                &mut warnings,
             ),
             stall_warn_samples: clamp_keyed(
-                self.stall_warn_samples, STALL_WARN_SAMPLES, "stall_warn_samples", &mut warnings,
+                self.stall_warn_samples,
+                STALL_WARN_SAMPLES,
+                "stall_warn_samples",
+                &mut warnings,
             ),
             stall_breaker_samples: clamp_keyed(
-                self.stall_breaker_samples, STALL_BREAKER_SAMPLES, "stall_breaker_samples",
+                self.stall_breaker_samples,
+                STALL_BREAKER_SAMPLES,
+                "stall_breaker_samples",
                 &mut warnings,
             ),
             retention_timeout_ms: clamp_keyed(
-                self.retention_timeout_ms, RETENTION_TIMEOUT_MS, "retention_timeout_ms", &mut warnings,
+                self.retention_timeout_ms,
+                RETENTION_TIMEOUT_MS,
+                "retention_timeout_ms",
+                &mut warnings,
             ),
             delivery_max_attempts: clamp_keyed(
-                self.delivery_max_attempts, DELIVERY_MAX_ATTEMPTS, "delivery_max_attempts",
+                self.delivery_max_attempts,
+                DELIVERY_MAX_ATTEMPTS,
+                "delivery_max_attempts",
                 &mut warnings,
             ),
             delivery_backoff_base_ms: clamp_keyed(
-                self.delivery_backoff_base_ms, DELIVERY_BACKOFF_BASE_MS, "delivery_backoff_base_ms",
+                self.delivery_backoff_base_ms,
+                DELIVERY_BACKOFF_BASE_MS,
+                "delivery_backoff_base_ms",
                 &mut warnings,
             ),
             breaker_threshold: clamp_keyed(
-                self.breaker_threshold, BREAKER_THRESHOLD, "breaker_threshold", &mut warnings,
+                self.breaker_threshold,
+                BREAKER_THRESHOLD,
+                "breaker_threshold",
+                &mut warnings,
             ),
+            // F3-1 (spec 52 §3): ainda NÃO são SystemParams configuráveis (a casa de params da Goal é
+            // fatia própria); por ora caem no default canônico. Conciliação mecânica do call-site ao
+            // novo contrato do RouterConfig.
+            goal_max_iterations: GOAL_MAX_ITERATIONS,
+            judge_max_parse_failures: JUDGE_MAX_PARSE_FAILURES,
+            effort_ladder: EFFORT_LADDER,
         };
-        let max_cycle_revisits =
-            clamp_keyed(self.max_cycle_revisits, MAX_CYCLE_REVISITS, "max_cycle_revisits", &mut warnings);
+        let max_cycle_revisits = clamp_keyed(
+            self.max_cycle_revisits,
+            MAX_CYCLE_REVISITS,
+            "max_cycle_revisits",
+            &mut warnings,
+        );
         let scrollback_retention_days = clamp_keyed(
-            self.scrollback_retention_days, DEFAULT_RETENTION_DAYS, "scrollback_retention_days",
+            self.scrollback_retention_days,
+            DEFAULT_RETENTION_DAYS,
+            "scrollback_retention_days",
             &mut warnings,
         );
         ResolvedParams {
@@ -472,24 +526,57 @@ mod tests {
     /// Lê todos os 15 campos do `RouterConfig` resolvido e confere contra um esperado, campo a
     /// campo (o `RouterConfig` não deriva `PartialEq` — não posso usar `==`).
     fn assert_router_config_eq(got: &RouterConfig, want: &RouterConfig) {
-        assert_eq!(got.dedupe_window_ms, want.dedupe_window_ms, "dedupe_window_ms");
+        assert_eq!(
+            got.dedupe_window_ms, want.dedupe_window_ms,
+            "dedupe_window_ms"
+        );
         assert_eq!(got.max_depth, want.max_depth, "max_depth");
-        assert_eq!(got.delegation_budget, want.delegation_budget, "delegation_budget");
-        assert_eq!(got.max_spawns_per_turn, want.max_spawns_per_turn, "max_spawns_per_turn");
+        assert_eq!(
+            got.delegation_budget, want.delegation_budget,
+            "delegation_budget"
+        );
+        assert_eq!(
+            got.max_spawns_per_turn, want.max_spawns_per_turn,
+            "max_spawns_per_turn"
+        );
         assert_eq!(got.fanout_gate, want.fanout_gate, "fanout_gate");
         assert_eq!(got.autonomy, want.autonomy, "autonomy");
-        assert_eq!(got.await_timeout_ms, want.await_timeout_ms, "await_timeout_ms");
-        assert_eq!(got.token_budget_day, want.token_budget_day, "token_budget_day");
-        assert_eq!(got.heartbeat_sample_ms, want.heartbeat_sample_ms, "heartbeat_sample_ms");
-        assert_eq!(got.stall_warn_samples, want.stall_warn_samples, "stall_warn_samples");
-        assert_eq!(got.stall_breaker_samples, want.stall_breaker_samples, "stall_breaker_samples");
-        assert_eq!(got.retention_timeout_ms, want.retention_timeout_ms, "retention_timeout_ms");
-        assert_eq!(got.delivery_max_attempts, want.delivery_max_attempts, "delivery_max_attempts");
+        assert_eq!(
+            got.await_timeout_ms, want.await_timeout_ms,
+            "await_timeout_ms"
+        );
+        assert_eq!(
+            got.token_budget_day, want.token_budget_day,
+            "token_budget_day"
+        );
+        assert_eq!(
+            got.heartbeat_sample_ms, want.heartbeat_sample_ms,
+            "heartbeat_sample_ms"
+        );
+        assert_eq!(
+            got.stall_warn_samples, want.stall_warn_samples,
+            "stall_warn_samples"
+        );
+        assert_eq!(
+            got.stall_breaker_samples, want.stall_breaker_samples,
+            "stall_breaker_samples"
+        );
+        assert_eq!(
+            got.retention_timeout_ms, want.retention_timeout_ms,
+            "retention_timeout_ms"
+        );
+        assert_eq!(
+            got.delivery_max_attempts, want.delivery_max_attempts,
+            "delivery_max_attempts"
+        );
         assert_eq!(
             got.delivery_backoff_base_ms, want.delivery_backoff_base_ms,
             "delivery_backoff_base_ms"
         );
-        assert_eq!(got.breaker_threshold, want.breaker_threshold, "breaker_threshold");
+        assert_eq!(
+            got.breaker_threshold, want.breaker_threshold,
+            "breaker_threshold"
+        );
     }
 
     /// CRITÉRIO (compat total): sem nenhuma camada (4× `default()`), `resolve` cai **exatamente**
@@ -515,7 +602,10 @@ mod tests {
     /// `resolve` usa o de terminal; os demais campos caem no default.
     #[test]
     fn quatro_camadas_so_terminal_opina_fanout_gate_resolve_usa_terminal() {
-        let terminal = SystemParams { fanout_gate: Some(8), ..Default::default() };
+        let terminal = SystemParams {
+            fanout_gate: Some(8),
+            ..Default::default()
+        };
         let r = SystemParams::resolve(
             SystemParams::default(),
             SystemParams::default(),
@@ -523,26 +613,46 @@ mod tests {
             terminal,
             AutonomyLevel::Assisted,
         );
-        assert_eq!(r.router_config.fanout_gate, 8, "terminal opinou fanout_gate");
-        assert_eq!(r.router_config.delegation_budget, DELEGATION_BUDGET, "resto = default");
+        assert_eq!(
+            r.router_config.fanout_gate, 8,
+            "terminal opinou fanout_gate"
+        );
+        assert_eq!(
+            r.router_config.delegation_budget, DELEGATION_BUDGET,
+            "resto = default"
+        );
         assert!(r.warnings.is_empty());
     }
 
     /// `overlay`: campo `Some` de `over` vence; `None` herda da base.
     #[test]
     fn overlay_over_ganha_none_herda() {
-        let base = SystemParams { delegation_budget: Some(10), fanout_gate: Some(5), ..Default::default() };
-        let over = SystemParams { fanout_gate: Some(12), ..Default::default() };
+        let base = SystemParams {
+            delegation_budget: Some(10),
+            fanout_gate: Some(5),
+            ..Default::default()
+        };
+        let over = SystemParams {
+            fanout_gate: Some(12),
+            ..Default::default()
+        };
         let merged = base.overlay(over);
         assert_eq!(merged.fanout_gate, Some(12), "over ganha");
-        assert_eq!(merged.delegation_budget, Some(10), "None de over herda da base");
+        assert_eq!(
+            merged.delegation_budget,
+            Some(10),
+            "None de over herda da base"
+        );
     }
 
     /// Precedência ao longo da cadeia: uma camada baixa (global) opina e nenhuma acima sobrescreve
     /// → o valor de global atravessa até o `RouterConfig`.
     #[test]
     fn camada_baixa_atravessa_quando_ninguem_sobrescreve() {
-        let global = SystemParams { delegation_budget: Some(16), ..Default::default() };
+        let global = SystemParams {
+            delegation_budget: Some(16),
+            ..Default::default()
+        };
         let r = SystemParams::resolve(
             global,
             SystemParams::default(),
@@ -557,7 +667,10 @@ mod tests {
     /// WARN nomeado; zero panic.
     #[test]
     fn clamp_fora_da_faixa_gera_warn_sem_panic() {
-        let ws = SystemParams { delegation_budget: Some(9999), ..Default::default() };
+        let ws = SystemParams {
+            delegation_budget: Some(9999),
+            ..Default::default()
+        };
         let r = SystemParams::resolve(
             SystemParams::default(),
             ws,
@@ -575,7 +688,10 @@ mod tests {
     /// Clamp também pelo piso da faixa (ex.: `max_depth=0` < min 1 → 1).
     #[test]
     fn clamp_pelo_piso_da_faixa() {
-        let ws = SystemParams { max_depth: Some(0), ..Default::default() };
+        let ws = SystemParams {
+            max_depth: Some(0),
+            ..Default::default()
+        };
         let r = SystemParams::resolve(
             SystemParams::default(),
             ws,
@@ -591,7 +707,10 @@ mod tests {
     /// `effort`: `None` → Medium; uma camada superior sobrescreve.
     #[test]
     fn effort_default_medium_e_terminal_sobrescreve() {
-        let terminal = SystemParams { effort: Some(Effort::High), ..Default::default() };
+        let terminal = SystemParams {
+            effort: Some(Effort::High),
+            ..Default::default()
+        };
         let r = SystemParams::resolve(
             SystemParams::default(),
             SystemParams::default(),
@@ -620,7 +739,10 @@ mod tests {
     fn effort_serde_lowercase_e_default_medium() {
         assert_eq!(Effort::default(), Effort::Medium);
         assert_eq!(serde_json::to_string(&Effort::High).unwrap(), "\"high\"");
-        assert_eq!(serde_json::from_str::<Effort>("\"low\"").unwrap(), Effort::Low);
+        assert_eq!(
+            serde_json::from_str::<Effort>("\"low\"").unwrap(),
+            Effort::Low
+        );
     }
 
     /// ADITIVO: um `params.json` que só conhece um campo desserializa o resto como `None`
@@ -667,7 +789,10 @@ mod tests {
     /// Precedência no replay: terminal (camada alta) vence workspace (camada baixa).
     #[test]
     fn replay_precedencia_terminal_vence_workspace() {
-        let recs = vec![spc("workspace", "fanout_gate", "8"), spc("terminal", "fanout_gate", "12")];
+        let recs = vec![
+            spc("workspace", "fanout_gate", "8"),
+            spc("terminal", "fanout_gate", "12"),
+        ];
         let r = ParamsLedger::from_records(&recs).resolve(AutonomyLevel::Assisted);
         assert_eq!(r.router_config.fanout_gate, 12, "terminal > workspace");
     }
@@ -675,9 +800,15 @@ mod tests {
     /// Na MESMA (scope,key), o último evento do log vence (ordem de seq).
     #[test]
     fn replay_last_write_wins_na_mesma_camada() {
-        let recs = vec![spc("workspace", "fanout_gate", "8"), spc("workspace", "fanout_gate", "5")];
+        let recs = vec![
+            spc("workspace", "fanout_gate", "8"),
+            spc("workspace", "fanout_gate", "5"),
+        ];
         let r = ParamsLedger::from_records(&recs).resolve(AutonomyLevel::Assisted);
-        assert_eq!(r.router_config.fanout_gate, 5, "último da mesma camada/chave vence");
+        assert_eq!(
+            r.router_config.fanout_gate, 5,
+            "último da mesma camada/chave vence"
+        );
     }
 
     /// ADITIVO: um `scope` desconhecido (evento de versão futura) é ignorado — não aplica nem quebra.
@@ -685,7 +816,10 @@ mod tests {
     fn replay_escopo_desconhecido_e_ignorado() {
         let recs = vec![spc("galaxy", "fanout_gate", "9")];
         let r = ParamsLedger::from_records(&recs).resolve(AutonomyLevel::Assisted);
-        assert_eq!(r.router_config.fanout_gate, FANOUT_GATE, "scope desconhecido não aplica");
+        assert_eq!(
+            r.router_config.fanout_gate, FANOUT_GATE,
+            "scope desconhecido não aplica"
+        );
     }
 
     /// ADITIVO: uma `key` desconhecida é ignorada — replay de evento de versão futura é seguro.
@@ -702,7 +836,10 @@ mod tests {
     fn replay_clampa_valor_fora_da_faixa() {
         let recs = vec![spc("workspace", "delegation_budget", "9999")];
         let r = ParamsLedger::from_records(&recs).resolve(AutonomyLevel::Assisted);
-        assert_eq!(r.router_config.delegation_budget, 64, "replay clampa ao teto");
+        assert_eq!(
+            r.router_config.delegation_budget, 64,
+            "replay clampa ao teto"
+        );
         assert_eq!(r.warnings.len(), 1);
         assert_eq!(r.warnings[0].key, "delegation_budget");
     }
@@ -743,21 +880,45 @@ mod tests {
     #[test]
     fn validate_range_aceita_dentro_recusa_fora() {
         assert!(validate_range("delegation_budget", "8").is_ok());
-        assert!(validate_range("delegation_budget", "64").is_ok(), "teto inclusivo");
-        assert!(validate_range("delegation_budget", "1").is_ok(), "piso inclusivo");
+        assert!(
+            validate_range("delegation_budget", "64").is_ok(),
+            "teto inclusivo"
+        );
+        assert!(
+            validate_range("delegation_budget", "1").is_ok(),
+            "piso inclusivo"
+        );
         let e = validate_range("delegation_budget", "9999").unwrap_err();
-        assert!(e.contains("9999") && e.contains("64"), "erro nomeia valor e faixa: {e}");
-        assert!(validate_range("delegation_budget", "0").is_err(), "abaixo do piso");
+        assert!(
+            e.contains("9999") && e.contains("64"),
+            "erro nomeia valor e faixa: {e}"
+        );
+        assert!(
+            validate_range("delegation_budget", "0").is_err(),
+            "abaixo do piso"
+        );
     }
 
     /// `effort`/`model` têm vocabulário próprio; chave/valor inválidos são recusados.
     #[test]
     fn validate_range_effort_model_e_desconhecidos() {
         assert!(validate_range("effort", "high").is_ok());
-        assert!(validate_range("effort", "altissimo").is_err(), "effort fora do vocabulário");
-        assert!(validate_range("model", "opus").is_ok(), "model aceita alias (CLI Profile valida)");
-        assert!(validate_range("inexistente", "1").is_err(), "chave desconhecida recusada");
-        assert!(validate_range("fanout_gate", "abc").is_err(), "valor não-numérico recusado");
+        assert!(
+            validate_range("effort", "altissimo").is_err(),
+            "effort fora do vocabulário"
+        );
+        assert!(
+            validate_range("model", "opus").is_ok(),
+            "model aceita alias (CLI Profile valida)"
+        );
+        assert!(
+            validate_range("inexistente", "1").is_err(),
+            "chave desconhecida recusada"
+        );
+        assert!(
+            validate_range("fanout_gate", "abc").is_err(),
+            "valor não-numérico recusado"
+        );
     }
 
     /// F3-0-7 §C: a classificação gateia SÓ o ENFRAQUECIMENTO (reduzir abaixo do default) dos laços
@@ -765,18 +926,45 @@ mod tests {
     #[test]
     fn param_change_action_class_gates_only_weakening_of_balancing_loops() {
         // reduzir laço balanceador abaixo do default → GatedHard (os 3 da F3-0-7 + os 2 do R4).
-        assert_eq!(param_change_action_class("delegation_budget", 4), ActionClass::GatedHard);
-        assert_eq!(param_change_action_class("breaker_threshold", 2), ActionClass::GatedHard);
-        assert_eq!(param_change_action_class("stall_breaker_samples", 4), ActionClass::GatedHard);
-        assert_eq!(param_change_action_class("fanout_gate", 1), ActionClass::GatedHard);
-        assert_eq!(param_change_action_class("max_depth", 2), ActionClass::GatedHard);
+        assert_eq!(
+            param_change_action_class("delegation_budget", 4),
+            ActionClass::GatedHard
+        );
+        assert_eq!(
+            param_change_action_class("breaker_threshold", 2),
+            ActionClass::GatedHard
+        );
+        assert_eq!(
+            param_change_action_class("stall_breaker_samples", 4),
+            ActionClass::GatedHard
+        );
+        assert_eq!(
+            param_change_action_class("fanout_gate", 1),
+            ActionClass::GatedHard
+        );
+        assert_eq!(
+            param_change_action_class("max_depth", 2),
+            ActionClass::GatedHard
+        );
         // AUMENTAR/fortalecer NÃO é GatedHard (subir o teto do laço não desliga o breaker).
-        assert_eq!(param_change_action_class("delegation_budget", 16), ActionClass::Routine);
+        assert_eq!(
+            param_change_action_class("delegation_budget", 16),
+            ActionClass::Routine
+        );
         // No default EXATO não há redução.
-        assert_eq!(param_change_action_class("breaker_threshold", 5), ActionClass::Routine);
+        assert_eq!(
+            param_change_action_class("breaker_threshold", 5),
+            ActionClass::Routine
+        );
         // Parâmetro NÃO-defensivo nunca escala por esta regra (tem gates próprios — ADR 0005).
-        assert_eq!(param_change_action_class("scrollback_retention_days", 1), ActionClass::Routine);
-        assert_eq!(param_change_action_class("token_budget_day", 0), ActionClass::Routine);
+        assert_eq!(
+            param_change_action_class("scrollback_retention_days", 1),
+            ActionClass::Routine
+        );
+        assert_eq!(
+            param_change_action_class("token_budget_day", 0),
+            ActionClass::Routine
+        );
     }
 
     /// A faixa de `validate_range` é a MESMA do clamp do `resolve` (fonte única `param_range`): o
@@ -786,7 +974,10 @@ mod tests {
         // 9999 é recusado pelo set...
         assert!(validate_range("delegation_budget", "9999").is_err());
         // ...e clampado para 64 (o teto) pelo resolve — mesma borda.
-        let ws = SystemParams { delegation_budget: Some(9999), ..Default::default() };
+        let ws = SystemParams {
+            delegation_budget: Some(9999),
+            ..Default::default()
+        };
         let r = SystemParams::resolve(
             SystemParams::default(),
             ws,
