@@ -71,3 +71,22 @@ roles:
   - role: AUTOMATOR
     patterns: [automacao, webhook, gatilho, trigger, flow]
     skills: [mcp-builder]
+
+  - role: TRADUTOR
+    # F3-2-1 (doc-fonte linha 83; spec 52 §"Portas que NAO fecha"): o terminal que
+    # INTERPRETA-PRIMEIRO — a porta de entrada humana do método. Recebe o pedido do
+    # leigo, devolve "entendi X, vou fazer Y" ANTES de agir e propoe o time. E o origin
+    # natural de `GoalDefined.origin = "@Tradutor"` (events.rs:591).
+    #
+    # REGRA-MAE (inv. de seguranca): o papel Tradutor e ROTULO DE PROVENIENCIA, JAMAIS
+    # autoridade. Ter o papel nao concede permissao; a autenticacao em duas camadas segue
+    # soberana. A DEGRADACAO (sem Tradutor no roster -> o Maestro assume a origem) e pura
+    # em `entry_origin` (lib.rs) — rotulo, nunca credencial.
+    #
+    # POSICAO = ULTIMA (proposital): "interpretar-primeiro" e generico. Os aliases exatos
+    # (Tradutor/@Tradutor/translator/interprete) resolvem por S1/S2 — independem da posicao.
+    # Mas o keyword "interprete" (S3) e abrangente; por ULTIMO, os papeis ESPECIFICOS vencem
+    # seu keyword primeiro ("backend interprete" -> BACKEND, nao TRADUTOR), e so um nome SEM
+    # nenhum sinal especifico cai aqui. E o catch-all de interpretacao, acima do fallback.
+    patterns: [tradutor, translator, interprete, interpreter]
+    skills: [lina-orchestration]

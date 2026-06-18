@@ -77,6 +77,43 @@ pub struct RoleAssignment {
     pub matched_by: MatchStrategy,
 }
 
+// ──────────────────── Proveniência da entrada (degradação) ───────────────────
+
+/// Papel canônico do **Tradutor** — o intérprete da porta de entrada (doc-fonte
+/// linha 83). Constante para o CORE não hard-codar a string ao carimbar a origem.
+pub const TRADUTOR_ROLE: &str = "TRADUTOR";
+
+/// Papel canônico do **Maestro** — assume a origem quando não há Tradutor no roster.
+pub const MAESTRO_ROLE: &str = "MAESTRO";
+
+/// Rótulo de PROVENIÊNCIA da entrada do leigo, para `GoalDefined.origin`
+/// (`events.rs:591`): `"@Tradutor"` quando há um terminal Tradutor no roster; senão
+/// **DEGRADA** para `"@Maestro"`.
+///
+/// **Regra-mãe (invariante de segurança, spec 52 §"Portas que NÃO fecha"):** é
+/// RÓTULO, jamais credencial. Saber quem originou a Goal não concede autoridade — a
+/// autenticação em duas camadas (binding server-side) segue soberana. Esta função só
+/// NOMEIA a origem; não decide ordem nem autorização.
+///
+/// Função **pura** (sem I/O, sem roster próprio): o roteamento do CORE coleta os
+/// papéis presentes (de `agents.json`) e os passa aqui ao carimbar o `origin`. Não
+/// toca `router.rs` nem `events.rs` — é só a regra de classificação que o CORE integra.
+#[must_use]
+pub fn entry_origin<I, S>(roster_roles: I) -> &'static str
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if roster_roles
+        .into_iter()
+        .any(|role| role.as_ref().eq_ignore_ascii_case(TRADUTOR_ROLE))
+    {
+        "@Tradutor"
+    } else {
+        "@Maestro"
+    }
+}
+
 // ───────────────────────── Schema YAML (deserialização) ─────────────────────
 
 /// Registry completo lido do YAML.
@@ -501,10 +538,11 @@ mod tests {
                 "BUG_FIXER",
                 "CURADOR",
                 "AUTOMATOR",
+                "TRADUTOR",
             ],
             "ordem da cascata = ordem da tabela canônica (first match wins)"
         );
-        assert_eq!(reg.len(), 12);
+        assert_eq!(reg.len(), 13);
         assert!(!reg.is_empty());
     }
 
@@ -663,6 +701,71 @@ mod tests {
         assert_ne!(infer("build pipeline").role, "FRONTEND");
     }
 
+    // ── F3-2-1: o leigo que se declara intérprete → TRADUTOR (porta de entrada) ─
+    #[test]
+    fn tradutor_classifies_the_entry_interpreter() {
+        // S1 exato e S2 prefixo-`@` resolvem TRADUTOR independentemente da posição
+        // (são checados antes do keyword S3): o papel da porta de entrada do método.
+        for name in [
+            "Tradutor",
+            "@Tradutor",
+            "  TRADUTOR ",
+            "translator",
+            "Interprete",
+        ] {
+            let a = infer(name);
+            assert_eq!(a.role, "TRADUTOR", "{name:?} deve ser TRADUTOR");
+            assert_eq!(a.skills, vec!["lina-orchestration"]);
+            assert!(
+                !a.needs_confirmation,
+                "{name:?}: papel declarado é confiável"
+            );
+        }
+        // `@`-prefixo com especialidade após o papel.
+        let p = infer("@Interprete da Entrada");
+        assert_eq!(p.role, "TRADUTOR");
+        assert_eq!(p.matched_by, MatchStrategy::AtPrefix);
+    }
+
+    // ── F3-2-1: "interpretar-primeiro" é genérico → NÃO captura papéis específicos ─
+    #[test]
+    fn tradutor_never_steals_specific_roles() {
+        // O keyword "interprete" é abrangente; por TRADUTOR ser o ÚLTIMO da cascata,
+        // qualquer nome que ALÉM dele carregue um sinal específico resolve o ESPECÍFICO.
+        assert_eq!(
+            infer("backend interprete de protocolo").role,
+            "BACKEND",
+            "sinal específico (backend) vence o keyword genérico de interpretação"
+        );
+        assert_eq!(infer("@Dev Backend").role, "BACKEND");
+        assert_eq!(infer("Arquiteto").role, "ARQUITETO");
+        assert_eq!(infer("nosso designer interprete").role, "UIUX_DESIGNER");
+        // O verbo "interpretar" (infinitivo) NÃO casa o substantivo "interprete":
+        // sem sinal de papel → fallback, jamais TRADUTOR por engano.
+        let interpretar = infer("vou interpretar o pedido");
+        assert_eq!(interpretar.role, "DEVELOPER");
+        assert!(interpretar.needs_confirmation);
+    }
+
+    // ── F3-2-1: degradação — sem Tradutor no roster, a origem cai no Maestro ─────
+    #[test]
+    fn entry_origin_degrades_to_maestro_without_tradutor() {
+        // Com um Tradutor presente: a Goal nasce com origem `@Tradutor`.
+        assert_eq!(
+            entry_origin(["MAESTRO", "BACKEND", "TRADUTOR"]),
+            "@Tradutor"
+        );
+        // Tolerante a caixa (o roster pode vir em qualquer caixa do agents.json).
+        assert_eq!(entry_origin(["tradutor"]), "@Tradutor");
+        // SEM Tradutor: DEGRADA ao Maestro — rótulo de proveniência, não credencial.
+        assert_eq!(entry_origin(["MAESTRO", "BACKEND", "QA"]), "@Maestro");
+        // Roster vazio também degrada (nunca entra em pânico nem inventa autoridade).
+        assert_eq!(entry_origin(Vec::<String>::new()), "@Maestro");
+        // As constantes de papel batem com o registry canônico.
+        assert!(registry().role_names().any(|r| r == TRADUTOR_ROLE));
+        assert!(registry().role_names().any(|r| r == MAESTRO_ROLE));
+    }
+
     // ── Determinismo: mesma entrada, mesma saída ─────────────────────────────
     #[test]
     fn inference_is_deterministic() {
@@ -704,7 +807,7 @@ mod tests {
         assert_eq!(rev.role, "REVISOR");
         assert_eq!(rev.skills, vec!["code-review"]);
         assert!(rev.needs_confirmation);
-        assert_eq!(reg.len(), 13);
+        assert_eq!(reg.len(), 14);
     }
 
     // ── Erros acionáveis, sem panic ──────────────────────────────────────────
