@@ -147,6 +147,11 @@ pub enum PlanError {
     /// Item duplicado ao semear (`add_item` de um id já existente).
     #[error("item '{0}' ja existe no plano")]
     DuplicateItem(String),
+    /// F3-1 (spec 52 §2): `claim`/despacho de um item cujos `parents` ainda não estão todos
+    /// `Done` (anti-race estrutural). O roteador já mapeia `Err` → `RouteOutcome::PlanRejected`,
+    /// então este erro vira rejeição com a lista de pais pendentes, sem novo ramo no router.
+    #[error("item '{id}' depende de {pending:?} ainda nao concluidos")]
+    ParentsNotDone { id: String, pending: Vec<String> },
 }
 
 impl Plan {
@@ -193,10 +198,11 @@ impl Plan {
     }
 
     /// **`claim`**: `owner` reivindica o item → `@owner:owner` + `status:doing`.
-    /// Idempotente para o MESMO owner; rejeita se outro já é dono.
+    /// Idempotente para o MESMO owner; rejeita se outro já é dono ou se há pai não-`Done`.
     ///
     /// # Errors
-    /// [`PlanError::NoSuchItem`] se o item não existe; [`PlanError::AlreadyOwned`] se outro owner.
+    /// [`PlanError::NoSuchItem`] se o item não existe; [`PlanError::AlreadyOwned`] se outro owner;
+    /// [`PlanError::ParentsNotDone`] se algum `parent` ainda não está `Done` (spec 52 §2).
     pub fn try_claim(&mut self, id: &str, owner: &str) -> Result<(), PlanError> {
         let item = self
             .find(id)
@@ -209,6 +215,22 @@ impl Plan {
                     wanted: owner.to_string(),
                 });
             }
+        }
+        // F3-1 (spec 52 §2): guarda de ordem — recusa o claim enquanto algum `parent` não está
+        // `Done` (pai inexistente conta como pendente: fail-safe, nunca libera despacho prematuro).
+        // É o que torna `parents:` DADO que bloqueia o despacho, não prosa. Lê só estado projetado
+        // (determinístico, zero LLM); roda antes da mutação, igual à guarda de `AlreadyOwned`.
+        let pending: Vec<String> = item
+            .parents
+            .iter()
+            .filter(|p| self.find(p).is_none_or(|it| it.status != ItemState::Done))
+            .cloned()
+            .collect();
+        if !pending.is_empty() {
+            return Err(PlanError::ParentsNotDone {
+                id: id.to_string(),
+                pending,
+            });
         }
         self.apply_claimed(id, owner);
         Ok(())
@@ -330,6 +352,29 @@ impl Plan {
             out.push_str(FIELD_SEP);
             out.push_str("status:");
             out.push_str(item.status.status_word());
+            // F3-1 (spec 52 §2): atributos da Goal como sufixos OPCIONAIS, em ordem fixa (= ordem
+            // dos campos). Emitidos só quando não-default, de modo que o item legado (todos default)
+            // produz a MESMA linha de antes — round-trip byte-a-byte com o log gravado pré-spec.
+            if let Some(goal) = &item.goal_id {
+                out.push_str(FIELD_SEP);
+                out.push_str("@goal:");
+                out.push_str(goal);
+            }
+            if !item.parents.is_empty() {
+                out.push_str(FIELD_SEP);
+                out.push_str("@parents:");
+                out.push_str(&item.parents.join(","));
+            }
+            if !item.acceptance.is_empty() {
+                out.push_str(FIELD_SEP);
+                out.push_str("@accept:");
+                out.push_str(&render_acceptance(&item.acceptance));
+            }
+            if item.budget_tokens != 0 {
+                out.push_str(FIELD_SEP);
+                out.push_str("@budget:");
+                out.push_str(&item.budget_tokens.to_string());
+            }
             out.push('\n');
         }
         out
@@ -416,9 +461,40 @@ fn parse_item(line: &str) -> Result<PlanItem, PlanError> {
             PlanError::Malformed(format!("item sem espaco apos o checkbox: {line:?}"))
         })?;
 
-    // Campos por ` :: `. desc pode conter `::`, então id=primeiro, status=último, owner=penúltimo,
-    // desc = tudo no meio re-unido pelo separador.
-    let parts: Vec<&str> = rest.split(FIELD_SEP).collect();
+    // Campos por ` :: `. desc pode conter `::`, então id=primeiro; os campos de PONTA (owner,
+    // status) e os sufixos opcionais (spec 52 §2) são lidos do fim; desc = miolo re-unido.
+    let mut parts: Vec<&str> = rest.split(FIELD_SEP).collect();
+
+    // F3-1 (spec 52 §2): peça os sufixos OPCIONAIS a partir do FIM. A varredura PARA no primeiro
+    // campo que não casa um prefixo de sufixo — que é sempre o `status:` obrigatório. Assim um
+    // segmento da `desc` parecido com sufixo (ele vive ANTES de @owner/status) nunca é confundido.
+    // O piso `> 4` garante que jamais comemos o núcleo (id :: desc :: @owner :: status).
+    let mut goal_id: Option<String> = None;
+    let mut parents: Vec<String> = Vec::new();
+    let mut acceptance: Vec<AcceptanceCriterion> = Vec::new();
+    let mut budget_tokens: u64 = 0;
+    while parts.len() > 4 {
+        let last = parts[parts.len() - 1];
+        if let Some(g) = last.strip_prefix("@goal:") {
+            goal_id = Some(g.to_string());
+        } else if let Some(ps) = last.strip_prefix("@parents:") {
+            parents = if ps.is_empty() {
+                Vec::new()
+            } else {
+                ps.split(',').map(str::to_string).collect()
+            };
+        } else if let Some(ac) = last.strip_prefix("@accept:") {
+            acceptance = parse_acceptance(ac, line)?;
+        } else if let Some(b) = last.strip_prefix("@budget:") {
+            budget_tokens = b.parse::<u64>().map_err(|_| {
+                PlanError::Malformed(format!("@budget nao numerico: {last:?} ({line:?})"))
+            })?;
+        } else {
+            break; // chegou no campo obrigatório `status:` — fim dos sufixos
+        }
+        parts.pop();
+    }
+
     if parts.len() < 4 {
         return Err(PlanError::Malformed(format!(
             "item precisa de id :: desc :: @owner:.. :: status:..: {line:?}"
@@ -461,14 +537,62 @@ fn parse_item(line: &str) -> Result<PlanItem, PlanError> {
         desc,
         owner,
         status: state,
-        // F3-1: os atributos da Goal não vivem na gramática rígida desta fatia (a serialização dos
-        // sufixos `@goal:`/`@parents:`/`@accept:` é da fatia CORE-Plan); a linha legada parseia com
-        // os defaults, preservando o round-trip byte-a-byte.
-        goal_id: None,
-        parents: Vec::new(),
-        acceptance: Vec::new(),
-        budget_tokens: 0,
+        // F3-1 (spec 52 §2): preenchidos pelo peeling acima; ausentes → defaults (linha legada
+        // round-trippa byte-a-byte).
+        goal_id,
+        parents,
+        acceptance,
+        budget_tokens,
     })
+}
+
+/// Serializa os critérios de aceite como JSON compacto (convenção da casa — `serde_json`, igual a
+/// `goal.rs`), com o separador de campos do plano escapado por [`escape_sep`] para que `desc`/
+/// `check_arg` de texto livre nunca quebrem a gramática de linha. Round-trip exato com
+/// [`parse_acceptance`].
+fn render_acceptance(criteria: &[AcceptanceCriterion]) -> String {
+    // Tipos POD (String/Option/enum) → serialização infalível; o `expect` documenta o invariante,
+    // mesmo precedente de `goal.rs` (`serde_json::to_value(ev).expect(...)`).
+    let json = serde_json::to_string(criteria).expect("AcceptanceCriterion e sempre serializavel");
+    escape_sep(&json)
+}
+
+/// Inverso de [`render_acceptance`]: desescapa o separador e relê o JSON. JSON malformado vira
+/// [`PlanError::Malformed`] (parser rígido — degrada sem corromper).
+fn parse_acceptance(raw: &str, line: &str) -> Result<Vec<AcceptanceCriterion>, PlanError> {
+    serde_json::from_str(&unescape_sep(raw))
+        .map_err(|e| PlanError::Malformed(format!("@accept invalido ({e}): {line:?}")))
+}
+
+/// Escapa o separador de campos (`FIELD_SEP`) e a barra-invertida de forma REVERSÍVEL, para embutir
+/// texto livre numa linha cuja gramática usa ` :: ` como delimitador. `\` → `\\` PRIMEIRO (toda
+/// barra vira um par), depois ` :: ` → `\s` (marcador que, por isso, nunca colide com uma barra do
+/// conteúdo). [`unescape_sep`] é o inverso exato.
+fn escape_sep(s: &str) -> String {
+    s.replace('\\', "\\\\").replace(FIELD_SEP, "\\s")
+}
+
+/// Inverso de [`escape_sep`]: varre da esquerda consumindo 2 chars por escape (`\\` → `\`,
+/// `\s` → ` :: `). Entrada não gerada por nós degrada preservando o literal (sem corromper).
+fn unescape_sep(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('s') => out.push_str(FIELD_SEP),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -671,5 +795,197 @@ mod tests {
             p.add_item("T1", "y"),
             Err(PlanError::DuplicateItem(_))
         ));
+    }
+
+    // ─────────────────── F3-1 (spec 52 §2): parents · sufixos · round-trip ───────────────────
+
+    use crate::events::CheckKind;
+
+    /// Gate F3-1 (f): `parents:["T1"]` bloqueia `claim T2` até `T1` virar `Done`.
+    #[test]
+    fn parents_block_claim_until_all_done() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "schema").unwrap();
+        p.add_item("T2", "api").unwrap();
+        p.apply_item_attributed("T2", None, vec!["T1".into()], Vec::new(), 0);
+
+        // T1 ainda Todo → claim T2 recusado, sem mutar o item.
+        let err = p.try_claim("T2", "@W").unwrap_err();
+        assert!(
+            matches!(&err, PlanError::ParentsNotDone { pending, .. } if pending == &vec!["T1".to_string()]),
+            "esperava ParentsNotDone[T1], veio {err:?}"
+        );
+        assert_eq!(
+            p.find("T2").unwrap().status,
+            ItemState::Todo,
+            "rejeicao nao muta"
+        );
+        assert!(p.find("T2").unwrap().owner.is_none());
+
+        // Conclui T1 → T2 fica reivindicável.
+        p.try_claim("T1", "@A").unwrap();
+        p.try_check("T1", "@A").unwrap();
+        p.try_claim("T2", "@W").unwrap();
+        assert_eq!(p.find("T2").unwrap().status, ItemState::Doing);
+        assert_eq!(p.find("T2").unwrap().owner.as_deref(), Some("@W"));
+    }
+
+    /// `pending` lista SÓ os pais ainda não-`Done` (ordem preservada).
+    #[test]
+    fn parents_not_done_reports_only_the_pending() {
+        let mut p = Plan::new("W");
+        for id in ["T1", "T2", "T3"] {
+            p.add_item(id, "x").unwrap();
+        }
+        p.apply_item_attributed("T3", None, vec!["T1".into(), "T2".into()], Vec::new(), 0);
+        p.try_claim("T1", "@A").unwrap();
+        p.try_check("T1", "@A").unwrap(); // só T1 Done
+
+        match p.try_claim("T3", "@W").unwrap_err() {
+            PlanError::ParentsNotDone { id, pending } => {
+                assert_eq!(id, "T3");
+                assert_eq!(pending, vec!["T2".to_string()], "T1 ja Done sai da lista");
+            }
+            other => panic!("esperava ParentsNotDone, veio {other:?}"),
+        }
+    }
+
+    /// Pai inexistente conta como NÃO-`Done` (fail-safe: não libera despacho prematuro).
+    #[test]
+    fn missing_parent_counts_as_not_done() {
+        let mut p = Plan::new("W");
+        p.add_item("T2", "x").unwrap();
+        p.apply_item_attributed("T2", None, vec!["NAO_EXISTE".into()], Vec::new(), 0);
+        assert!(matches!(
+            p.try_claim("T2", "@W"),
+            Err(PlanError::ParentsNotDone { .. })
+        ));
+    }
+
+    /// A linha LEGADA (todos os campos novos no default) é byte-idêntica à do schema congelado —
+    /// nenhum sufixo `@goal`/`@parents`/`@accept`/`@budget` vaza para itens sem esses dados.
+    #[test]
+    fn legacy_item_line_has_no_suffixes() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "faz").unwrap();
+        p.try_claim("T1", "@A").unwrap();
+        let expected = "# Plano — W\n\
+            <!-- lina/plan@1 · escritor unico: supervisor · NAO editar a mao -->\n\
+            ## Decisoes\n\
+            ## Itens\n\
+            - [~] T1 :: faz :: @owner:@A :: status:doing\n";
+        assert_eq!(p.render(), expected);
+    }
+
+    /// Só os campos PRESENTES são emitidos (parents sem goal/accept/budget) — e round-trippam.
+    #[test]
+    fn only_present_fields_are_emitted() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "x").unwrap();
+        p.apply_item_attributed("T1", None, vec!["P1".into(), "P2".into()], Vec::new(), 0);
+        let text = p.render();
+        let line = text.lines().last().unwrap();
+        assert_eq!(
+            line,
+            "- [ ] T1 :: x :: @owner:? :: status:todo :: @parents:P1,P2"
+        );
+        assert_eq!(Plan::parse(&text).unwrap(), p);
+    }
+
+    /// Round-trip EXATO com os quatro campos preenchidos (modelo + texto byte-a-byte).
+    #[test]
+    fn goal_parents_accept_budget_roundtrip() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "raiz").unwrap();
+        p.add_item("T2", "trabalho").unwrap();
+        p.apply_item_attributed(
+            "T2",
+            Some("G1".into()),
+            vec!["T1".into()],
+            vec![AcceptanceCriterion {
+                desc: "compila sem warnings".into(),
+                check_kind: CheckKind::Command,
+                check_arg: Some("cargo clippy".into()),
+            }],
+            4096,
+        );
+        let text = p.render();
+        let back = Plan::parse(&text).expect("parse do proprio render");
+        assert_eq!(back, p, "modelo round-trip");
+        assert_eq!(back.render(), text, "texto round-trip byte-a-byte");
+
+        let t2 = back.find("T2").unwrap();
+        assert_eq!(t2.goal_id.as_deref(), Some("G1"));
+        assert_eq!(t2.parents, vec!["T1".to_string()]);
+        assert_eq!(t2.budget_tokens, 4096);
+        assert_eq!(t2.acceptance[0].desc, "compila sem warnings");
+        assert_eq!(t2.acceptance[0].check_kind, CheckKind::Command);
+    }
+
+    /// Texto livre do `acceptance` com o PRÓPRIO separador (` :: `) e barra-invertida round-trippa —
+    /// prova o escape reversível do `FIELD_SEP`.
+    #[test]
+    fn accept_with_field_sep_and_backslash_roundtrips() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "x").unwrap();
+        p.apply_item_attributed(
+            "T1",
+            None,
+            Vec::new(),
+            vec![AcceptanceCriterion {
+                desc: "passo A :: passo B".into(),
+                check_kind: CheckKind::TestPass,
+                check_arg: Some(r"glob\com\barra :: e separador".into()),
+            }],
+            0,
+        );
+        let text = p.render();
+        let back = Plan::parse(&text).expect("parse");
+        assert_eq!(back, p, "modelo round-trip");
+        assert_eq!(back.render(), text, "texto round-trip byte-a-byte");
+
+        let c = &back.find("T1").unwrap().acceptance[0];
+        assert_eq!(c.desc, "passo A :: passo B");
+        assert_eq!(
+            c.check_arg.as_deref(),
+            Some(r"glob\com\barra :: e separador")
+        );
+    }
+
+    /// Um segmento da `desc` que PARECE um sufixo (`@budget:99`) fica protegido no miolo: a varredura
+    /// de sufixos para no `status:`, antes de alcançá-lo.
+    #[test]
+    fn desc_resembling_suffix_is_not_parsed_as_one() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "ver :: @budget:99 no doc").unwrap();
+        p.try_claim("T1", "@A").unwrap();
+        let text = p.render();
+        let back = Plan::parse(&text).unwrap();
+        let t1 = back.find("T1").unwrap();
+        assert_eq!(t1.desc, "ver :: @budget:99 no doc");
+        assert_eq!(t1.budget_tokens, 0, "o @budget:99 da desc nao virou campo");
+        assert_eq!(back.render(), text, "round-trip byte-a-byte");
+    }
+
+    /// `@accept` com JSON malformado é REJEITADO pelo parser rígido (não corrompe silenciosamente).
+    #[test]
+    fn parse_rejects_malformed_accept() {
+        let bad = "# Plano — W\n\
+            <!-- lina/plan@1 -->\n\
+            ## Decisoes\n\
+            ## Itens\n\
+            - [ ] T1 :: x :: @owner:? :: status:todo :: @accept:{isto-nao-e-json}\n";
+        assert!(matches!(Plan::parse(bad), Err(PlanError::Malformed(_))));
+    }
+
+    /// `@budget` não-numérico é rejeitado (rigidez do parser).
+    #[test]
+    fn parse_rejects_non_numeric_budget() {
+        let bad = "# Plano — W\n\
+            <!-- lina/plan@1 -->\n\
+            ## Decisoes\n\
+            ## Itens\n\
+            - [ ] T1 :: x :: @owner:? :: status:todo :: @budget:abc\n";
+        assert!(matches!(Plan::parse(bad), Err(PlanError::Malformed(_))));
     }
 }
