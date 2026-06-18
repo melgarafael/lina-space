@@ -6,9 +6,8 @@
 //! Achieved|Escalated` (spec 52 §"Reconstrução por replay") — mesmo padrão de
 //! [`crate::CostLedger`]/[`crate::ParamsLedger`].
 //!
-//! Esta fatia (Rα-0) materializa só o CONTRATO (os tipos da projeção); a lógica real de
-//! [`project_goals`] (varrer os [`DomainEvent`](crate::DomainEvent) da Goal e dobrar o ciclo) é a
-//! fatia CORE-Goal-lógica seguinte.
+//! [`project_goals`] varre os [`DomainEvent`](crate::DomainEvent) da Goal e dobra o ciclo por replay
+//! — forma pura (sem I/O), reconstruível e determinística.
 
 use crate::events::{AcceptanceCriterion, DomainEvent, EventRecord};
 use serde::{Deserialize, Serialize};

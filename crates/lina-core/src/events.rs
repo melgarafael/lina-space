@@ -85,7 +85,7 @@ pub enum AwaitReason {
 /// #3). O core NUNCA conhece a sintaxe de um CLI específico — só `low/medium/high`. Serializa
 /// em `lowercase` para casar o vocabulário dos eventos (`EffortAssigned.effort: "high"`) e do
 /// `params.json` do expert. Default `Medium` (espelha [`SystemParams`](crate::SystemParams)).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
