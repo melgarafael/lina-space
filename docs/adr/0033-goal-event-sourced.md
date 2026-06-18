@@ -7,6 +7,8 @@
 
 > **Gate: stories que dependem desta decisão não iniciam até este ADR ser aceito.**
 
+> **Nota de implementação (F3-1 Rα-0, 2026-06-18):** `GoalConfirmed.by`, `ReviewVerdict.reviewer` e `ReviewVerdict.target` foram materializados como **`NodeId`** (não `String`, como o rascunho da spec 52 §1 escreve para `by`). Decisão do Maestro/Arquiteto sobre report de fidelidade do worker: alinha ao precedente `SpawnRequested.requested_by: NodeId` e à doutrina de identidade **não-forjável** (família ADR 0007) — o tipo carrega a garantia, não a string. `target`/`reviewer` já eram `NodeId` na própria spec §3.
+
 ## Contexto
 
 A **Goal** (objetivo de uma sessão de trabalho — "deixe o app pronto pra subir", "feche os 3 bugs da tela X") hoje não existe como entidade no `lina-core`. O que existe é o **plano** (`Plan`, itens com owner/status — ADR 0001) e os eventos de roteamento/lifecycle. O objetivo vive implícito no prompt e na cabeça do agente; nada o materializa, projeta ou audita.
