@@ -33,6 +33,12 @@ const BIN_VERBS: &[&str] = &[
     // e sugere, sem subcomando de mutação). Registrado no dispatch + usage(); a skill `lina-retro`
     // promete este verbo.
     "retro",
+    // F3-0-5: `lina params` (parâmetros de orquestração versionados — `show` projeta o log; `set`/
+    // `reset` mutam via envelope→supervisor quando o core integra). Registrado no dispatch + usage().
+    "params",
+    // F3-0-5 Parte 2: `lina effort @T <low|medium|high>` (cognição por terminal — envelope
+    // `effort.assign` → supervisor emite `EffortAssigned`). Registrado no dispatch + usage().
+    "effort",
 ];
 
 /// Sub-verbos do `lina plan` implementados (`run_plan`).

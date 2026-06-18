@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::events::{AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore, StoreError};
+use crate::events::{
+    AwaitReason, BlockReason, DomainEvent, Effort, EffortOrigin, EventRecord, EventStore, StoreError,
+};
+use crate::guard::{decide, ActionClass};
 use crate::mailbox::{
     parse_target, render_message_block_v2, validate_envelope_v2, EnvelopeViolation, MailMessage,
     Mailbox, TargetSpec,
@@ -190,6 +193,20 @@ pub enum RouteOutcome {
     /// W3-5: intent de plano recusado pela regra do plano (item inexistente, conflito de owner,
     /// não-owner, ou `ref` ausente) — sem corromper o `plan.md`.
     PlanRejected(String),
+    /// F3-0-5: `params.set`/`params.reset` aplicado — `SystemParamsChanged` logado (a config é
+    /// PROJEÇÃO do log; ver `resolve_from_store`). NÃO entregue a PTY (verbo de configuração).
+    ParamsApplied { intent: String, key: String },
+    /// F3-0-5: comando de params recusado (payload inválido, valor fora da faixa, intent ou chave
+    /// desconhecida) — nada logado, sem efeito.
+    ParamsRejected(String),
+    /// F3-0-7 §C: `params set` que ENFRAQUECE um laço balanceador (reduz abaixo do default) — NÃO
+    /// aplica; loga `ActionGated{gated-hard, ask}` e sobe à fila de atenção p/ o humano confirmar.
+    ParamsGated { key: String },
+    /// F3-0-5: `effort.assign` aplicado — `EffortAssigned{origin:assigned}` logado para o nó alvo.
+    EffortApplied { node: NodeId, effort: Effort },
+    /// F3-0-5: `effort.assign` recusado (payload inválido, alvo inexistente, effort fora do
+    /// vocabulário) — nada logado, sem efeito.
+    EffortRejected(String),
     /// W4-3 (freio do rodapé): a orquestração está PAUSADA → esta delegação foi ENFILEIRADA (retida
     /// no `.inflight`, durável), NÃO injetada. Drena ao [`Router::resume`]. É GATE humano, não kill
     /// (inv #6): nada se perde, o estado fica salvo e visível.
@@ -231,6 +248,11 @@ pub enum RouteOutcome {
         prompt: String,
         requested_by: NodeId,
         root_cause_id: String,
+        /// F3-0-3 (ADR 0031): modelo/effort PEDIDOS para o novo terminal (preferência de execução,
+        /// não autoridade). O app os carimba no PTY (ENV) + `EffortAssigned` em F3-0-4; o caminho de
+        /// spawn-via-agente (`handle_spawn`) ainda os deixa `None` (o verbo CLI que os passa é F3-0-5).
+        model: Option<String>,
+        effort: Option<Effort>,
     },
     /// F1-3-6 (ADR 0019 §6): o spawn precisa de CONFIRMAÇÃO HUMANA — `reason` ∈
     /// {`cascade`,`over_cap`,`cost`} (cascata SEMPRE gateia; cap estourado; workspace cost-paused).
@@ -827,6 +849,21 @@ impl Router {
         //    `derive_root_hops` (binding inforjável — jamais `msg.hops`/`msg.root_cause_id`).
         if is_spawn_intent(&msg.intent) {
             return self.handle_spawn(msg, sender, store, now_ms);
+        }
+
+        // ── F3-0-5: `lina params set/reset` é verbo ESTRUTURADO interceptado AQUI (molde do plano):
+        //    aplica ao log (`SystemParamsChanged`), NUNCA entregue a PTY (o `@workspace`/escopo não é
+        //    um nó). `by` é carimbado pela origem×cascata (`derive_root_hops`, binding inforjável),
+        //    JAMAIS lido do payload (ADR 0007). Precede o pipeline de entrega/alvo, como plan/spawn.
+        if is_params_intent(&msg.intent) {
+            return self.handle_params(msg, sender, store);
+        }
+
+        // ── F3-0-5: `lina effort @T <low|medium|high>` — verbo estruturado (mirror de handle_params):
+        //    resolve o alvo, valida o effort e emite `EffortAssigned{origin:assigned}`. `by`/`origin`
+        //    carimbados server-side (jamais do payload — ADR 0007). NÃO entregue a PTY.
+        if is_effort_intent(&msg.intent) {
+            return self.handle_effort(msg, sender, store);
         }
 
         // ── F1-0-4 (P1 — o fix do atropelamento): ENTREGA CIENTE DE ESTADO. Alvo single-node
@@ -1818,6 +1855,168 @@ impl Router {
         }
     }
 
+    /// **F3-0-5: `lina params set/reset`** (molde de [`Router::handle_plan`]). Parseia o contrato
+    /// `{key, scope, value, target?}` do payload (DADO do envelope), valida a faixa pelo core
+    /// ([`crate::params::validate_range`] — o bin não duplica as faixas), e emite um
+    /// `SystemParamsChanged`. **Segurança (ADR 0007):** `by` é CARIMBO server-side da origem×cascata
+    /// (`derive_root_hops`: origem humana → `"human"`; cascata de agente → `"maestro"`), JAMAIS o
+    /// `by` que um agente escreva no payload; `old` também é server-side (`""` aqui — o histórico do
+    /// log é a fonte do valor anterior, nunca o payload). O parâmetro muda magnitude, nunca autoridade.
+    fn handle_params(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        store: &mut EventStore,
+    ) -> RouteOutcome {
+        let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+            Ok(v) => v,
+            Err(e) => return RouteOutcome::ParamsRejected(format!("payload de params inválido: {e}")),
+        };
+        let field = |k: &str| {
+            payload
+                .get(k)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let (key, scope, value) = (field("key"), field("scope"), field("value"));
+        let target = payload
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if key.is_empty() || scope.is_empty() {
+            return RouteOutcome::ParamsRejected("params exige 'key' e 'scope'".into());
+        }
+
+        match msg.intent.as_str() {
+            // O `set` RECUSA fora-da-faixa (≠ load, que clampa) — feedback explícito ao expert.
+            "params.set" => {
+                if let Err(e) = crate::params::validate_range(&key, &value) {
+                    return RouteOutcome::ParamsRejected(e);
+                }
+                // F3-0-7 §C: REDUZIR um laço balanceador abaixo do default ENFRAQUECE uma defesa →
+                // GatedHard: NÃO aplica direto; loga `ActionGated{ask}` (a fila de atenção projeta um
+                // GuardAsk p/ o humano confirmar — guard.rs §1.1, gated-hard é Ask em TODO nível). O
+                // valor já passou na faixa → o parse p/ a classificação é infalível. (`reset` não
+                // reduz — volta ao default; não gateia.)
+                if let Ok(n) = value.parse::<u64>() {
+                    if crate::params::param_change_action_class(&key, n) == ActionClass::GatedHard {
+                        let decision = decide(ActionClass::GatedHard, self.config.autonomy);
+                        let gated = DomainEvent::ActionGated {
+                            cmd: format!("params set {key} {n}"),
+                            class: ActionClass::GatedHard.as_str().to_string(),
+                            decision: decision.as_str().to_string(),
+                            node: Some(msg.from.clone()),
+                        };
+                        if let Err(e) = store.append(&gated) {
+                            return RouteOutcome::PersistFailed(e.to_string());
+                        }
+                        return RouteOutcome::ParamsGated { key };
+                    }
+                }
+            }
+            "params.reset" => {}
+            other => {
+                return RouteOutcome::ParamsRejected(format!(
+                    "intent de params desconhecido: {other}"
+                ))
+            }
+        }
+
+        // `by` carimbado SERVER-SIDE pela origem×cascata (inforjável) — nunca o do payload.
+        let (_root, hops) = self.derive_root_hops(msg, sender);
+        let by = if hops == 0 { "human" } else { "maestro" };
+        // `reset` volta a chave para "não-setado nesta camada" (herda) → `new` vazio.
+        let new = if msg.intent == "params.reset" {
+            String::new()
+        } else {
+            value
+        };
+        let event = DomainEvent::SystemParamsChanged {
+            key: key.clone(),
+            scope,
+            new,
+            target,
+            old: String::new(),
+            by: Some(by.to_string()),
+        };
+        if let Err(e) = store.append(&event) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        RouteOutcome::ParamsApplied {
+            intent: msg.intent.clone(),
+            key,
+        }
+    }
+
+    /// **F3-0-5: `lina effort @T <low|medium|high>`** (mirror de [`Router::handle_params`]). Resolve
+    /// o alvo (`target`, DADO do payload) via [`Supervisor::node_by_name`], valida o `effort` contra
+    /// o vocabulário do enum [`Effort`], e emite `EffortAssigned`. **Segurança (ADR 0007):**
+    /// `origin` é SEMPRE `Assigned` (o verbo É uma atribuição explícita) e `by` é CARIMBO server-side
+    /// da origem×cascata (`derive_root_hops`: origem humana → `None`; cascata de agente →
+    /// `Some(sender)`), JAMAIS lidos do payload. `target`/`effort` são dado; um agente não forja
+    /// `origin`/`by`. (Atribuir effort a um nó vivo só registra/projeta o badge — a APLICAÇÃO no PTY
+    /// é por-spawn, F3-0-4 — então não há auto-promoção de gasto aqui.)
+    fn handle_effort(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        store: &mut EventStore,
+    ) -> RouteOutcome {
+        let payload: serde_json::Value = match serde_json::from_str(&msg.payload) {
+            Ok(v) => v,
+            Err(e) => return RouteOutcome::EffortRejected(format!("payload de effort inválido: {e}")),
+        };
+        let target = payload
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if target.is_empty() {
+            return RouteOutcome::EffortRejected("effort.assign exige 'target'".into());
+        }
+        // (1) resolve o alvo (DADO do payload) → NodeId; alvo inexistente recusa.
+        let Some(node) = self.sup.node_by_name(target) else {
+            return RouteOutcome::EffortRejected(format!("terminal desconhecido: {target}"));
+        };
+        // `by`/`origin` carimbados SERVER-SIDE (inforjável); `hops` (origem×cascata) decide ambos.
+        let (_root, hops) = self.derive_root_hops(msg, sender);
+        // (2) GUARDA anti-auto-promoção (F3-0-7 §B2, ADR 0007): um AGENTE em cascata (`hops>=1`) NÃO
+        //     pode se AUTO-ATRIBUIR effort (`node == sender`) — `assigned` exige carimbo de
+        //     Maestro/humano. Agente atribuindo a OUTRO segue permitido (`by=Some(sender)`); o humano
+        //     na origem (`hops==0`) é livre. Defesa em profundidade: barra já o REGISTRO de uma
+        //     auto-atribuição (que envelheceria mal quando a aplicação dinâmica do effort evoluir).
+        if hops >= 1 && node == sender {
+            return RouteOutcome::EffortRejected(
+                "auto-atribuição de effort exige Maestro/humano".into(),
+            );
+        }
+        // (3) valida o effort contra o vocabulário do enum (low|medium|high).
+        let effort = match payload.get("effort").and_then(serde_json::Value::as_str) {
+            Some("low") => Effort::Low,
+            Some("medium") => Effort::Medium,
+            Some("high") => Effort::High,
+            other => {
+                return RouteOutcome::EffortRejected(format!(
+                    "effort inválido {other:?}: use low, medium ou high"
+                ))
+            }
+        };
+        // `origin` é sempre `Assigned` (o verbo é uma atribuição); `by` segue a cascata (None = humano).
+        let by = (hops >= 1).then_some(sender);
+        let event = DomainEvent::EffortAssigned {
+            node: node.to_string(),
+            effort,
+            model: None,
+            origin: EffortOrigin::Assigned,
+            task_difficulty: None,
+            by,
+        };
+        if let Err(e) = store.append(&event) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        RouteOutcome::EffortApplied { node, effort }
+    }
+
     /// **F1-3-6 (ADR 0019 §6): gate INFORJÁVEL do `lina spawn`** (molde de [`Router::handle_plan`]).
     /// NÃO cunha NodeId nem abre PTY (autoridade única do Supervisor/app; fronteira core/shell
     /// inv#7): **DECIDE** (forma → autonomia → cascata → cap → custo) e devolve o `RouteOutcome` que
@@ -1869,6 +2068,14 @@ impl Router {
             hops,
             // SEAM-1: o 1º prompt entra no log para o banner de um spawn GATED ser reconstruível.
             prompt: prompt.clone(),
+            // F3-0-3: o caminho spawn-via-agente ainda não transporta model/effort (o `MailMessage`
+            // não tem esses campos; o verbo `lina spawn --model/--effort` é F3-0-5). `None` por ora;
+            // o caminho HUMANO os escolhe no modal e os aplica via admit_node/F3-0-4.
+            model: None,
+            effort: None,
+            // F3-1 (spec 52 §4): o caminho spawn-via-agente ainda não atrela a Goal (o ciclo de Goal
+            // é a fatia CLI/lógica seguinte). `None` por ora — call-site conciliado ao novo contrato.
+            goal_id: None,
         }) {
             return RouteOutcome::PersistFailed(e.to_string());
         }
@@ -1949,6 +2156,10 @@ impl Router {
             prompt,
             requested_by: sender,
             root_cause_id: root,
+            // F3-0-3: idem ao `SpawnRequested` acima — o spawn-via-agente não especifica model/effort
+            // nesta rodada (F3-0-5 fia o verbo CLI); o caminho humano os aplica fora do `handle_spawn`.
+            model: None,
+            effort: None,
         }
     }
 
@@ -2001,6 +2212,19 @@ fn is_plan_intent(intent: &str) -> bool {
 /// [`Router::handle_spawn`], NUNCA entregue a PTY (o alvo `@Nome` nem existe no roster ainda).
 fn is_spawn_intent(intent: &str) -> bool {
     intent == "spawn"
+}
+
+/// F3-0-5: `true` se o intent é um verbo de PARÂMETROS (`lina params set/reset`). Interceptado no
+/// router como verbo estruturado (molde de [`is_plan_intent`]) — aplicado ao log
+/// (`SystemParamsChanged`), NUNCA entregue a PTY.
+fn is_params_intent(intent: &str) -> bool {
+    matches!(intent, "params.set" | "params.reset")
+}
+
+/// F3-0-5: `true` se o intent é o verbo de atribuição de effort (`lina effort @T`). Interceptado no
+/// router (mirror de [`is_params_intent`]) — emite `EffortAssigned`, NUNCA entregue a PTY.
+fn is_effort_intent(intent: &str) -> bool {
+    intent == "effort.assign"
 }
 
 /// F1-3-6: loga `SpawnGated{reason}` (livro-razão da decisão do gate, par do `SpawnRequested`).
@@ -5000,6 +5224,220 @@ mod tests {
             .collect()
     }
 
+    // ─────────────── F3-0-5-core: verbo `lina params set/reset` no router ───────────────
+
+    /// `params.set` de ORIGEM emite `SystemParamsChanged` com key/scope/value do envelope e `by`
+    /// carimbado SERVER-SIDE (`human`, pois `hops==0`).
+    #[test]
+    fn params_set_emits_change_with_server_side_by() {
+        let (mut router, sup, _dir) = router_with("params-set");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("params-set");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "params.set",
+            r#"{"key":"fanout_gate","scope":"workspace","value":"8"}"#,
+        );
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert!(matches!(out, RouteOutcome::ParamsApplied { .. }), "veio {out:?}");
+        let ev = spawn_payloads(&ts.store, "SystemParamsChanged").pop().expect("evento");
+        assert_eq!(ev["key"].as_str(), Some("fanout_gate"));
+        assert_eq!(ev["scope"].as_str(), Some("workspace"));
+        assert_eq!(ev["new"].as_str(), Some("8"));
+        assert_eq!(ev["by"].as_str(), Some("human"), "origem humana → by carimbado server-side");
+    }
+
+    /// O `set` RECUSA valor fora da faixa (≠ load, que clampa) — nada é logado.
+    #[test]
+    fn params_set_out_of_range_is_rejected_without_event() {
+        let (mut router, sup, _dir) = router_with("params-oor");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("params-oor");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "params.set",
+            r#"{"key":"delegation_budget","scope":"workspace","value":"9999"}"#,
+        );
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert!(matches!(out, RouteOutcome::ParamsRejected(_)), "veio {out:?}");
+        assert!(
+            spawn_payloads(&ts.store, "SystemParamsChanged").is_empty(),
+            "valor inválido não loga nada"
+        );
+    }
+
+    /// REGRA-MÃE (ADR 0007): um `by` forjado no payload é IGNORADO — o carimbo é server-side.
+    /// NÃO-VACUOSO: quebraria se o handler lesse `payload["by"]` em vez de derivar do binding.
+    #[test]
+    fn params_set_ignores_forged_by_in_payload() {
+        let (mut router, sup, _dir) = router_with("params-forge");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("params-forge");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "params.set",
+            r#"{"key":"fanout_gate","scope":"workspace","value":"8","by":"superuser"}"#,
+        );
+        router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        let ev = spawn_payloads(&ts.store, "SystemParamsChanged").pop().expect("evento");
+        assert_eq!(ev["by"].as_str(), Some("human"), "by efetivo = carimbo server-side");
+        assert_ne!(ev["by"].as_str(), Some("superuser"), "by do payload IGNORADO");
+    }
+
+    /// F3-0-7 §C: REDUZIR um laço balanceador abaixo do default sobe ao gate humano (GatedHard/Ask,
+    /// não aplica); AUMENTAR e parâmetro NÃO-defensivo aplicam livres. NÃO-VACUOSO pelos 3 casos.
+    #[test]
+    fn weakening_a_balancing_loop_is_gated_hard() {
+        let (mut router, sup, _dir) = router_with("weaken");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("weaken");
+        let (_rec, mut deliver) = recorder();
+
+        // (i) REDUZIR delegation_budget (8 → 4, DENTRO da faixa) → GatedHard, NÃO aplica.
+        let m_reduce = MailMessage::new(
+            "@A",
+            "@workspace",
+            "params.set",
+            r#"{"key":"delegation_budget","scope":"workspace","value":"4"}"#,
+        );
+        let out = router.route_message(&m_reduce, &mut ts.store, 1, &mut deliver);
+        assert!(matches!(out, RouteOutcome::ParamsGated { .. }), "reduzir laço → gate; veio {out:?}");
+        assert!(
+            spawn_payloads(&ts.store, "SystemParamsChanged").is_empty(),
+            "gated NÃO aplica (nenhum SystemParamsChanged)"
+        );
+        let gated = spawn_payloads(&ts.store, "ActionGated").pop().expect("ActionGated logado");
+        assert_eq!(gated["class"].as_str(), Some("gated-hard"));
+        assert_eq!(gated["decision"].as_str(), Some("ask"), "gated-hard = Ask em todo nível");
+
+        // (ii) AUMENTAR delegation_budget (8 → 16) → aplica livre.
+        let m_raise = MailMessage::new(
+            "@A",
+            "@workspace",
+            "params.set",
+            r#"{"key":"delegation_budget","scope":"workspace","value":"16"}"#,
+        );
+        let out2 = router.route_message(&m_raise, &mut ts.store, 2, &mut deliver);
+        assert!(matches!(out2, RouteOutcome::ParamsApplied { .. }), "aumentar → aplica; veio {out2:?}");
+
+        // (iii) parâmetro NÃO-defensivo (scrollback_retention_days) → aplica livre.
+        let m_nondef = MailMessage::new(
+            "@A",
+            "@workspace",
+            "params.set",
+            r#"{"key":"scrollback_retention_days","scope":"workspace","value":"7"}"#,
+        );
+        let out3 = router.route_message(&m_nondef, &mut ts.store, 3, &mut deliver);
+        assert!(matches!(out3, RouteOutcome::ParamsApplied { .. }), "não-defensivo → aplica; veio {out3:?}");
+    }
+
+    /// `effort.assign` resolve o alvo, valida o effort e emite `EffortAssigned{origin:assigned}`
+    /// para o NODE resolvido (não o nome cru), com `origin` carimbado server-side.
+    #[test]
+    fn effort_assign_emits_effort_assigned_for_resolved_node() {
+        let (mut router, sup, _dir) = router_with("effort-assign");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("effort-assign");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new("@A", "@workspace", "effort.assign", r#"{"target":"@B","effort":"high"}"#);
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert!(matches!(out, RouteOutcome::EffortApplied { .. }), "veio {out:?}");
+        let ev = spawn_payloads(&ts.store, "EffortAssigned").pop().expect("evento");
+        assert_eq!(ev["node"].as_str(), Some(b.to_string().as_str()), "node = alvo RESOLVIDO");
+        assert_eq!(ev["effort"].as_str(), Some("high"));
+        assert_eq!(ev["origin"].as_str(), Some("assigned"), "verbo = atribuição explícita");
+    }
+
+    /// Effort fora do vocabulário → recusa, nada logado.
+    #[test]
+    fn effort_assign_invalid_effort_is_rejected() {
+        let (mut router, sup, _dir) = router_with("effort-bad");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("effort-bad");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new("@A", "@workspace", "effort.assign", r#"{"target":"@B","effort":"altissimo"}"#);
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert!(matches!(out, RouteOutcome::EffortRejected(_)), "veio {out:?}");
+        assert!(spawn_payloads(&ts.store, "EffortAssigned").is_empty());
+    }
+
+    /// Alvo inexistente → recusa (não inventa nó), nada logado.
+    #[test]
+    fn effort_assign_unknown_target_is_rejected() {
+        let (mut router, sup, _dir) = router_with("effort-not");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("effort-not");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new("@A", "@workspace", "effort.assign", r#"{"target":"@Fantasma","effort":"low"}"#);
+        let out = router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        assert!(matches!(out, RouteOutcome::EffortRejected(_)), "veio {out:?}");
+        assert!(spawn_payloads(&ts.store, "EffortAssigned").is_empty());
+    }
+
+    /// REGRA-MÃE (ADR 0007): `origin`/`by` forjados no payload são IGNORADOS — `origin` é sempre
+    /// `assigned` (server-side) e `by` vem do binding (origem humana → ausente). NÃO-VACUOSO:
+    /// quebraria se o handler lesse `payload["origin"]`/`payload["by"]`.
+    #[test]
+    fn effort_assign_ignores_forged_origin_and_by() {
+        let (mut router, sup, _dir) = router_with("effort-forge");
+        let _a = sup.register("@A", None, sink());
+        let _b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("effort-forge");
+        let (_rec, mut deliver) = recorder();
+        let m = MailMessage::new(
+            "@A",
+            "@workspace",
+            "effort.assign",
+            r#"{"target":"@B","effort":"low","origin":"observed","by":"superuser"}"#,
+        );
+        router.route_message(&m, &mut ts.store, 1, &mut deliver);
+        let ev = spawn_payloads(&ts.store, "EffortAssigned").pop().expect("evento");
+        assert_eq!(ev["origin"].as_str(), Some("assigned"), "origin do payload IGNORADO");
+        assert_ne!(ev["by"].as_str(), Some("superuser"), "by do payload IGNORADO (server-side)");
+    }
+
+    /// GUARDA F3-0-7 §B2 (ADR 0007): um AGENTE em cascata NÃO pode se AUTO-ATRIBUIR effort (gastar
+    /// mais) — recusado, nada logado. NÃO-VACUOSO: o MESMO agente atribuindo a OUTRO terminal é
+    /// PERMITIDO (cascata legítima, `by=Some(sender)`); a guarda é cirúrgica.
+    #[test]
+    fn effort_assign_agent_self_assignment_is_rejected() {
+        let (mut router, sup, _dir) = router_with("effort-self");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("effort-self");
+        let (_rec, mut deliver) = recorder();
+        // A→B fixa o binding de B (B vira cascata, hops>=1).
+        router.route_message(
+            &MailMessage::new("@A", "@B", "ask", "faça X"),
+            &mut ts.store,
+            1,
+            &mut deliver,
+        );
+        // B tenta se AUTO-atribuir effort high → RECUSADO (auto-promoção).
+        let m_self =
+            MailMessage::new("@B", "@workspace", "effort.assign", r#"{"target":"@B","effort":"high"}"#);
+        let out = router.route_message(&m_self, &mut ts.store, 2, &mut deliver);
+        assert!(matches!(out, RouteOutcome::EffortRejected(_)), "auto-atribuição recusada; veio {out:?}");
+        assert!(spawn_payloads(&ts.store, "EffortAssigned").is_empty(), "auto-atribuição não loga nada");
+        // ...mas B atribuindo a OUTRO (@C) SEGUE permitido (cascata legítima, by = o agente B).
+        let m_other =
+            MailMessage::new("@B", "@workspace", "effort.assign", r#"{"target":"@C","effort":"high"}"#);
+        let out2 = router.route_message(&m_other, &mut ts.store, 3, &mut deliver);
+        assert!(matches!(out2, RouteOutcome::EffortApplied { .. }), "agente→OUTRO permitido; veio {out2:?}");
+        let ev = spawn_payloads(&ts.store, "EffortAssigned").pop().expect("evento p/ @C");
+        assert_eq!(ev["node"].as_str(), Some(c.to_string().as_str()), "node = @C resolvido");
+        assert_eq!(ev["by"].as_str(), Some(b.to_string().as_str()), "by = o agente que atribuiu (server-side)");
+    }
+
     /// **Critério 1 (caminho feliz, ORIGEM).** Um nó SEM binding (`hops==0`, pedido direto do
     /// humano) → `SpawnApproved` com os args do envelope; `SpawnRequested` logado (intent-vs-action);
     /// `spawn_count` incrementado em `(root, sender)`; e NADA criado no core (sem `NodeAdded` — a
@@ -5021,6 +5459,8 @@ mod tests {
                 prompt,
                 requested_by,
                 root_cause_id,
+                model,
+                effort,
             } => {
                 assert_eq!(name, "@QA");
                 assert_eq!(role, "qa");
@@ -5030,6 +5470,10 @@ mod tests {
                     "requested_by = sender AUTENTICADO (não o `from`)"
                 );
                 assert_eq!(root_cause_id, m.id, "origem: root EFETIVO = msg.id FRESCO");
+                // F3-0-3: o spawn-via-agente não transporta model/effort nesta rodada — o payload do
+                // agente NÃO os fabrica (server-side `None`); o caminho humano os escolhe no modal.
+                assert_eq!(model, None, "model não vem do payload do agente");
+                assert_eq!(effort, None, "effort não vem do payload do agente");
             }
             other => panic!("origem deve aprovar; veio {other:?}"),
         }

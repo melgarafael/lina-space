@@ -33,10 +33,14 @@ pub use lina_vt::{AlacrittyBackend, VtBackend, VtCell, VtCursor, VtRgb, VtScreen
 /// Event Store (W0-5) + recuperação pós-crash visível (W0-6).
 mod events;
 pub use events::{
-    apply, ApprovalDecision, AwaitReason, BlockReason, DomainEvent, EventRecord, EventStore,
-    FlushState, PermissionEvidence, ProjectedNode, ProjectedState, PromptKind, ResolutionVia,
-    StoreError,
+    apply, AcceptanceCriterion, ApprovalDecision, AwaitReason, BlockReason, CheckKind, DomainEvent,
+    Effort, EffortOrigin, EventRecord, EventStore, FlushState, PermissionEvidence, ProjectedNode,
+    ProjectedState, PromptKind, ResolutionVia, StoreError, Verdict,
 };
+
+/// F2-3-7: store de SESSÃO LOCAL (câmera pan/zoom) — FORA do event log (ADR 0029 §3).
+mod session;
+pub use session::{session_dir, CameraSnapshot, SessionError, SessionStore};
 
 /// W4-1: CliDiscovery — varredura do `PATH` por CLIs de IA (substrato do check-up de onboarding).
 mod cli_discovery;
@@ -66,9 +70,22 @@ pub use router::{
     DELEGATION_BUDGET, FANOUT_GATE, MAX_DEPTH,
 };
 
+/// F3-0-1 ([12] Parâmetros): casa versionada dos ~15 números de orquestração — quatro camadas
+/// (global ⊕ workspace ⊕ preset ⊕ terminal) resolvidas num [`RouterConfig`] denso. Ver spec 51.
+mod params;
+pub use params::{
+    param_change_action_class, resolve_from_store, validate_range, ParamScope, ParamWarning,
+    ParamsLedger, ResolvedParams, SystemParams,
+};
+
 /// W3-5: plano compartilhado (`.lina/plan.md`) — projeção event-sourced, escritor único supervisor.
 mod plan;
 pub use plan::{ItemState, Plan, PlanError, PlanItem, PLAN_SCHEMA_V1};
+
+/// F3-1 ([3] Objetivos): a Goal como entidade event-sourced — projeção reconstruída por replay
+/// varrendo o log por `goal_id`. Contrato (Rα-0); lógica de projeção na fatia CORE-Goal seguinte.
+mod goal;
+pub use goal::{project_goals, Goal, GoalPhase};
 
 /// F1-4-1: multi-Espaço — um store por Espaço + registry-ponteiro + seam único de cwd.
 mod workspace;

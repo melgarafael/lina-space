@@ -51,7 +51,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use lina_core::{EventStore, NodeId, ProjectedNode, ProjectedState};
+use lina_core::{
+    Effort, EffortOrigin, EventRecord, EventStore, NodeId, ProjectedNode, ProjectedState,
+};
 use lina_session_watch::{CostSource, Session};
 
 use crate::inspector::Activity;
@@ -157,6 +159,131 @@ fn humanize_kebab(id: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// ═══════════ Badge modelo·effort por terminal (F3-0-6 · doc-fonte linha 57) ═══════════
+
+/// As três opções do nível de raciocínio, na ordem do controle nomeado (rápido→caprichoso).
+/// Espelha [`crate::agent_modal::AUTONOMY_OPTIONS`] — fonte única consumida pelo modal e os testes.
+pub const EFFORT_OPTIONS: [Effort; 3] = [Effort::Low, Effort::Medium, Effort::High];
+
+/// Rótulo de SUPERFÍCIE do nível de raciocínio (leigo, inv#6) — NUNCA o termo técnico
+/// `low`/`medium`/`high`, que é vocabulário de evento/ENV. Espelha `autonomy_surface_label`:
+/// o card e o controle nomeado do modal leem daqui (fonte única — sem duplicar a tradução).
+#[must_use]
+pub fn effort_surface_label(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "rápido",
+        Effort::Medium => "equilibrado",
+        Effort::High => "caprichoso",
+    }
+}
+
+/// Uma frase leiga do PORQUÊ de cada nível (responde "o que isso muda pra mim?" — o subtítulo
+/// do controle nomeado, idioma do `autonomy_desc`). Sem jargão, sem o termo técnico.
+#[must_use]
+pub fn effort_surface_help(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => {
+            "responde logo, pensando o mínimo — bom para tarefas simples e para gastar menos"
+        }
+        Effort::Medium => "equilibra rapidez e cuidado — o ajuste do dia a dia",
+        Effort::High => "pensa com calma antes de agir — para tarefas difíceis (gasta mais)",
+    }
+}
+
+/// O `modelo·effort` vivo de UM terminal — o nível de raciocínio em pt-br + o modelo
+/// correlacionado, quando conhecido. META do log (varre `EffortAssigned`, padrão CostLedger);
+/// NUNCA da projeção do canvas, porque o effort efetivo não é autoridade de estado (ADR 0007).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortBadge {
+    /// Nível efetivo do nó (o ÚLTIMO `EffortAssigned` vence).
+    pub effort: Effort,
+    /// Modelo correlacionado (`None` = só o nível; o badge omite o `·modelo`).
+    pub model: Option<String>,
+    /// `true` quando a origem é OBSERVADA (a Lina LEU o que o motor já usa), `false` quando
+    /// ATRIBUÍDA (escolha do Maestro/humano). Honestidade: o leitor de tela distingue
+    /// "é assim que ele trabalha" de "foi isso que pedimos".
+    pub observed: bool,
+}
+
+impl EffortBadge {
+    /// Texto da pílula na superfície: «equilibrado · claude-opus-4-8» (o `·modelo` só quando
+    /// conhecido — sem inventar um modelo que o log não correlacionou).
+    #[must_use]
+    pub fn surface_text(&self) -> String {
+        match &self.model {
+            Some(m) => format!("{} · {m}", effort_surface_label(self.effort)),
+            None => effort_surface_label(self.effort).to_owned(),
+        }
+    }
+
+    /// Frase para o leitor de tela (critério 5): nível + porquê + origem + modelo.
+    #[must_use]
+    pub fn a11y_label(&self) -> String {
+        let origem = if self.observed {
+            "é assim que ele trabalha"
+        } else {
+            "definido pela equipe"
+        };
+        let mut s = format!(
+            "Raciocínio: {} — {} ({origem})",
+            effort_surface_label(self.effort),
+            effort_surface_help(self.effort),
+        );
+        if let Some(m) = &self.model {
+            s.push_str(&format!(". Modelo: {m}"));
+        }
+        s
+    }
+}
+
+/// Varre o log (padrão `AttentionQueue::replay`/`CostLedger`) e devolve o ÚLTIMO `EffortAssigned`
+/// por nó — chave = o `node` do evento (o `NodeId.to_string()` que AMBOS os emissores carimbam:
+/// `router::handle_effort` e o spawn em `bridge`). `EffortAssigned` é META (fora da projeção do
+/// canvas), então o badge se reconstrói aqui, não na `ProjectedState`. Reusa o serde PÚBLICO de
+/// [`Effort`]/[`EffortOrigin`] — zero duplicação do vocabulário low/medium/high. Registros de
+/// outro `kind` ou com payload degradado são ignorados (degradação honesta, nunca chute).
+#[must_use]
+pub fn effort_badges(records: &[EventRecord]) -> BTreeMap<String, EffortBadge> {
+    let mut out = BTreeMap::new();
+    for rec in records {
+        if rec.kind != "EffortAssigned" {
+            continue;
+        }
+        let Some(node) = rec.payload.get("node").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(effort) = rec
+            .payload
+            .get("effort")
+            .and_then(|v| serde_json::from_value::<Effort>(v.clone()).ok())
+        else {
+            continue;
+        };
+        let model = rec
+            .payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        // Default CONSERVADOR `Observed` (regra-mãe ADR 0007): payload sem `origin` jamais
+        // replaya como atribuição com autoridade.
+        let observed = rec
+            .payload
+            .get("origin")
+            .and_then(|v| serde_json::from_value::<EffortOrigin>(v.clone()).ok())
+            .unwrap_or(EffortOrigin::Observed)
+            == EffortOrigin::Observed;
+        out.insert(
+            node.to_owned(),
+            EffortBadge {
+                effort,
+                model,
+                observed,
+            },
+        );
+    }
+    out
 }
 
 /// Linha de custo de HOJE — o `~`/`(estimado)` é CRITÉRIO (JSONL subconta até ~75%).
@@ -285,6 +412,10 @@ pub struct DashWiring {
     /// render re-replaya SÓ quando o log tem evento novo ([`projection_cache_is_stale`],
     /// padrão `refresh_cost_paused`); NUNCA por frame.
     pub projected: std::sync::Mutex<Option<(u64, ProjectedState)>>,
+    /// F3-0-6: cache do badge modelo·effort por nó (chave = `node` do `EffortAssigned`). Mesma
+    /// disciplina do `projected`: re-varre o log SÓ quando há evento novo, nunca por frame — o
+    /// effort é META (não está na `ProjectedState`), então o painel o reconstrói à parte.
+    pub effort: std::sync::Mutex<Option<(u64, BTreeMap<String, EffortBadge>)>>,
 }
 
 impl DashWiring {
@@ -296,6 +427,7 @@ impl DashWiring {
             cli_id,
             ws_root,
             projected: std::sync::Mutex::new(None),
+            effort: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1948,6 +2080,145 @@ mod tests {
         assert_eq!(
             ws_root_of(&PathBuf::from("/ws/store-direto")),
             PathBuf::from("/ws/store-direto")
+        );
+    }
+
+    // ═══════════════ F3-0-6 · badge modelo·effort (varredura do log, EventStore REAL) ═══════════════
+
+    /// Constrói os registros REAIS de um store temporário (paridade com a serialização do
+    /// `EffortAssigned`, não com um JSON à mão — o badge vê o que o disco vê).
+    fn records_of(tag: &str, events: &[DomainEvent]) -> Vec<EventRecord> {
+        let tmp = TempDir::new(tag);
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        for ev in events {
+            store.append(ev).expect("append");
+        }
+        store.events().expect("events")
+    }
+
+    fn effort_ev(
+        node: &str,
+        effort: Effort,
+        model: Option<&str>,
+        origin: EffortOrigin,
+    ) -> DomainEvent {
+        DomainEvent::EffortAssigned {
+            node: node.to_owned(),
+            effort,
+            model: model.map(str::to_owned),
+            origin,
+            task_difficulty: None,
+            by: None,
+        }
+    }
+
+    /// O badge varre o log (padrão CostLedger): o ÚLTIMO `EffortAssigned` do nó vence, o
+    /// modelo correlacionado aparece, e a superfície humaniza SEM vazar low/medium/high.
+    #[test]
+    fn effort_badge_scans_log_last_wins_and_humanizes() {
+        let node = Uuid::now_v7().to_string();
+        let records = records_of(
+            "effort-last",
+            &[
+                effort_ev(&node, Effort::Low, None, EffortOrigin::Observed),
+                effort_ev(
+                    &node,
+                    Effort::High,
+                    Some("claude-opus-4-8"),
+                    EffortOrigin::Assigned,
+                ),
+            ],
+        );
+        let badges = effort_badges(&records);
+        let b = badges.get(&node).expect("badge do nó");
+        assert_eq!(
+            b.effort,
+            Effort::High,
+            "o último EffortAssigned é o efetivo"
+        );
+        assert_eq!(b.model.as_deref(), Some("claude-opus-4-8"));
+        assert!(
+            !b.observed,
+            "origin assigned → escolha da equipe, não observação"
+        );
+        assert_eq!(b.surface_text(), "caprichoso · claude-opus-4-8");
+        for tecnico in ["low", "medium", "high"] {
+            assert!(
+                !b.surface_text().contains(tecnico),
+                "vazou termo técnico: {}",
+                b.surface_text()
+            );
+        }
+        for needle in [
+            "caprichoso",
+            "difíceis",
+            "definido pela equipe",
+            "claude-opus-4-8",
+        ] {
+            assert!(
+                b.a11y_label().contains(needle),
+                "a11y sem '{needle}': {}",
+                b.a11y_label()
+            );
+        }
+    }
+
+    /// Sem modelo correlacionado: a pílula omite o `·modelo` (nunca inventa) e a origem
+    /// observada fala "é assim que ele trabalha". Vocabulário completo, distinto, sem jargão.
+    #[test]
+    fn effort_badge_without_model_and_full_vocabulary() {
+        let node = "n-abc".to_owned();
+        let records = records_of(
+            "effort-nomodel",
+            &[effort_ev(
+                &node,
+                Effort::Medium,
+                None,
+                EffortOrigin::Observed,
+            )],
+        );
+        let b = effort_badges(&records).remove(&node).expect("badge");
+        assert_eq!(b.surface_text(), "equilibrado", "sem modelo → só o nível");
+        assert!(b.observed);
+        assert!(b.a11y_label().contains("é assim que ele trabalha"));
+
+        let labels: Vec<&str> = EFFORT_OPTIONS
+            .iter()
+            .map(|e| effort_surface_label(*e))
+            .collect();
+        assert_eq!(labels, ["rápido", "equilibrado", "caprichoso"]);
+        for e in EFFORT_OPTIONS {
+            for tecnico in ["low", "medium", "high"] {
+                assert_ne!(
+                    effort_surface_label(e),
+                    tecnico,
+                    "rótulo de superfície não é o termo técnico"
+                );
+            }
+            assert!(
+                !effort_surface_help(e).is_empty(),
+                "todo nível tem o porquê leigo"
+            );
+        }
+    }
+
+    /// Registro de outro `kind` (ou degradado) é ignorado — o badge não chuta um nível.
+    #[test]
+    fn effort_badges_ignore_unrelated_records() {
+        let node = Uuid::now_v7();
+        let records = records_of(
+            "effort-unrelated",
+            &[DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            }],
+        );
+        assert!(
+            effort_badges(&records).is_empty(),
+            "sem EffortAssigned → sem badge"
         );
     }
 }

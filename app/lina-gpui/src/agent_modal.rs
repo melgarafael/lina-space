@@ -25,7 +25,7 @@ use gpui::{
 };
 use lina_bootstrap::Autonomy;
 use lina_cli_profiles::ProfileRegistry;
-use lina_core::DiscoveredCli;
+use lina_core::{DiscoveredCli, Effort};
 use lina_host::NodeId;
 
 use crate::ui::{Button, Frame, Modal, Panel, Space};
@@ -103,6 +103,13 @@ pub const COPY_CONSENT_OFF_WARN: &str =
 //    nível uma escolha CONSCIENTE: 1 linha leiga por opção, sem mudar o default do produto.
 //    ("terminal" é jargão proibido aqui — a superfície fala "janela dele".)
 pub const COPY_AUTONOMY_LABEL: &str = "Autonomia";
+
+/// F3-0-6: rótulo curto da seção do nível de raciocínio (coluna estreita, par de "Autonomia").
+pub const COPY_EFFORT_LABEL: &str = "Raciocínio";
+/// F3-0-6: o controle NOMEADO em pt-br (o "porquê" do leigo) — nunca a chave técnica
+/// low/medium/high. Mostra também o trade-off de custo, que é o que o empreendedor sente.
+pub const COPY_EFFORT_CAPTION: &str =
+    "Quanto a IA pensa antes de agir — quanto mais caprichoso, mais caro.";
 
 /// Ordem de exibição das opções (da rédea mais curta à mais solta).
 pub const AUTONOMY_OPTIONS: [Autonomy; 3] =
@@ -871,6 +878,12 @@ pub struct CreatePlan {
     /// COSTURA (bridge, dono Dev 01): `create_agent_with`/`NodeAdmission` ainda não recebem o
     /// campo — o funil precisa carimbar `.env("LINA_AUTONOMY", label)` p/ o guard por-agente.
     pub autonomy: Autonomy,
+    /// F3-0-3 (ADR 0031): modelo/effort escolhidos para o novo terminal (contrato de dados do
+    /// modal). `None` = usar o default (o CLI escolhe o modelo; effort efetivo Medium). A SELEÇÃO
+    /// interativa (controles visíveis + badge) é F3-0-6 (Frontend, gate de tela do fundador); o
+    /// consumo no PTY (`LINA_EFFORT` + `EffortAssigned`) é F3-0-4. Aqui só existe a CASA aditiva.
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
 }
 
 /// O plano de SALVAR do modo edição (M6-E): aplica nome/papel agora; motor fica p/ F1-2-4.
@@ -924,6 +937,9 @@ pub struct AgentModal {
     original: Option<(String, Option<String>, Autonomy)>,
     /// FIX-3: nível de autonomia selecionado na seção AUTONOMIA (criar E editar).
     autonomy: Autonomy,
+    /// F3-0-6: nível de raciocínio selecionado na seção RACIOCÍNIO (só CRIAR — vai ao spawn via
+    /// `CreatePlan.effort`). `None` = casa não-tocada → o controle exibe o default [`Effort::Medium`].
+    effort: Option<Effort>,
 }
 
 impl AgentModal {
@@ -955,6 +971,8 @@ impl AgentModal {
             // FIX-3: nasce no DEFAULT do produto (decisão do fundador — assistido). O caller
             // (main.rs) sobrepõe com o nível efetivo do Espaço via `set_autonomy`.
             autonomy: Autonomy::Assisted,
+            // F3-0-6: casa não-tocada → o controle mostra o default neutro (Medium/equilibrado).
+            effort: None,
         }
     }
 
@@ -1032,6 +1050,18 @@ impl AgentModal {
     /// Espaço ao abrir (criar) — o default do produto continua sendo o do `new_create`.
     pub fn set_autonomy(&mut self, a: Autonomy) {
         self.autonomy = a;
+    }
+    /// F3-0-6: nível EFETIVO mostrado no controle nomeado. `None` (casa não-tocada) exibe o
+    /// default do produto ([`Effort::Medium`]) como selecionado — honesto: é o que o novo Agente
+    /// terá. A APLICAÇÃO no PTY é por-spawn (F3-0-4); aqui só se escolhe a preferência.
+    #[must_use]
+    pub fn effort(&self) -> Effort {
+        self.effort.unwrap_or(Effort::Medium)
+    }
+    /// F3-0-6: seleção da seção RACIOCÍNIO (clique numa opção) — carimba a casa `effort` que o
+    /// `create_plan` leva ao spawn.
+    pub fn set_effort(&mut self, e: Effort) {
+        self.effort = Some(e);
     }
     #[must_use]
     pub fn cwd_display(&self) -> String {
@@ -1409,6 +1439,11 @@ impl AgentModal {
             role: self.role.as_ref().map(|r| r.role.clone()),
             kit_consent: self.kit_consent,
             autonomy: self.autonomy,
+            // F3-0-3 deu a CASA; F3-0-6 liga a SELEÇÃO: o nível escolhido no controle nomeado vai
+            // ao spawn (vira `LINA_EFFORT` + `EffortAssigned` em F3-0-4). `model` segue do CLI (a
+            // escolha de modelo não é desta story; o badge só LÊ o modelo correlacionado).
+            model: None,
+            effort: self.effort,
         })
     }
 
@@ -2187,6 +2222,83 @@ pub fn render(
                         .w(px(ROW_LABEL_W))
                         .text_color(rgb(th.text.primary))
                         .child(text!(COPY_AUTONOMY_LABEL)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .child(options),
+                ),
+        );
+    }
+
+    // ── Raciocínio (F3-0-6) — controle NOMEADO do nível de esforço por Agente, só ao CRIAR (é o
+    //    spawn que carimba `LINA_EFFORT`+`EffortAssigned`; em edição não há caminho de aplicação,
+    //    então não pintamos um controle morto). Mesma geometria/idioma da Autonomia (radio 1-de-N).
+    if matches!(modal.mode, ModalMode::Create) {
+        let mut options = div().flex().flex_col().gap_1();
+        for (i, e) in crate::dashboard::EFFORT_OPTIONS.into_iter().enumerate() {
+            let active = e == modal.effort();
+            let mark = if active { "◉" } else { "○" };
+            options = options.child(
+                Panel::card()
+                    .id(("m6-effort", i))
+                    .selected(active)
+                    .pad(Space::Md, Space::Xs)
+                    .gap(Space::Zero)
+                    .role(Role::RadioButton)
+                    .aria(format!(
+                        "raciocínio {} — {}",
+                        crate::dashboard::effort_surface_label(e),
+                        crate::dashboard::effort_surface_help(e)
+                    ))
+                    .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, cx| {
+                        v.modal_set_effort(e, cx);
+                    }))
+                    .child(
+                        div()
+                            .font_weight(FontWeight(f32::from(th.typography.weight.bold)))
+                            .text_color(rgb(if active {
+                                th.text.bright
+                            } else {
+                                th.text.primary
+                            }))
+                            .child(text!(format!(
+                                "{mark} {}",
+                                crate::dashboard::effort_surface_label(e)
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_size(px(f32::from(th.typography.size.body)))
+                            .text_color(rgb(th.text.secondary))
+                            .child(text!(crate::dashboard::effort_surface_help(e))),
+                    ),
+            );
+        }
+        // O nome do controle (pt-br leigo) vive ABAIXO das opções — explica o conceito e o custo
+        // sem precisar da chave técnica (DES-4/inv#6).
+        options = options.child(
+            div()
+                .text_size(px(f32::from(th.typography.size.body)))
+                .text_color(rgb(th.text.muted))
+                .child(text!(COPY_EFFORT_CAPTION)),
+        );
+        col = col.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(ROW_GAP))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(ROW_LABEL_W))
+                        .text_color(rgb(th.text.primary))
+                        .child(text!(COPY_EFFORT_LABEL)),
                 )
                 .child(
                     div()
@@ -3654,6 +3766,40 @@ kind = "idle"
             Autonomy::Autonomous,
             "a escolha viaja TIPADA"
         );
+    }
+
+    /// F3-0-3 (ADR 0031): o `CreatePlan` carrega a CASA de `model`/`effort` (contrato aditivo). A
+    /// seleção interativa (controles visíveis + badge) é F3-0-6; aqui o default é `None`.
+    #[test]
+    fn create_plan_carries_model_effort_house() {
+        let mut m = modal();
+        type_str(&mut m, "Ajudante");
+        m.set_engines(engines_one());
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.model, None, "casa existe; seleção de modelo é F3-0-6");
+        assert_eq!(
+            plan.effort, None,
+            "sem escolha no controle → None = default neutro (o CLI/Medium decide)"
+        );
+    }
+
+    /// F3-0-6: a seleção no controle NOMEADO de Raciocínio chega ao `CreatePlan` (que o spawn leva
+    /// a `LINA_EFFORT`+`EffortAssigned` em F3-0-4). E o controle reflete o default Medium até a
+    /// primeira escolha — honesto: é o nível que o Agente nasce tendo.
+    #[test]
+    fn create_plan_carries_selected_effort() {
+        let mut m = modal();
+        type_str(&mut m, "Ajudante");
+        m.set_engines(engines_one());
+        assert_eq!(
+            m.effort(),
+            Effort::Medium,
+            "casa não-tocada exibe o default neutro"
+        );
+        m.set_effort(Effort::High);
+        assert_eq!(m.effort(), Effort::High, "o controle reflete a escolha");
+        let plan = m.create_plan().expect("plano");
+        assert_eq!(plan.effort, Some(Effort::High), "a escolha vai ao spawn");
     }
 
     /// FIX-3 (M6-E): autonomia segue a semântica role do Salvar — `None` = não mudou; mudar e

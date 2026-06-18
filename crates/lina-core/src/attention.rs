@@ -373,12 +373,21 @@ impl AttentionQueue {
     #[must_use]
     pub fn replay(records: &[EventRecord]) -> Self {
         let mut q = Self::new();
+        q.observe_records(records);
+        q
+    }
+
+    /// Aplica eventos do log (já em ordem de `seq`) à fila VIVA — base da projeção INCREMENTAL.
+    /// `replay` é `new()` + `observe_records(todos)`; aplicar SÓ os registros novos
+    /// (`seq > último aplicado`) à fila persistida converge ao MESMO estado, pois `observe` é um
+    /// fold sequencial determinístico. É o que tira o full-replay `O(N)` da thread de UI no
+    /// `AttentionHub::sync` (mesmo padrão do cache incremental de `EventStore::project`).
+    pub fn observe_records(&mut self, records: &[EventRecord]) {
         for rec in records {
             if let Ok(ev) = DomainEvent::from_record(&rec.kind, rec.version, rec.payload.clone()) {
-                q.observe(&ev, rec.ts);
+                self.observe(&ev, rec.ts);
             }
         }
-        q
     }
 
     #[allow(clippy::too_many_arguments)] // espelho 1:1 dos campos do evento (fold)
@@ -1239,6 +1248,48 @@ mod tests {
         assert_eq!(ids, vec!["p2"], "só a pendência não-resolvida sobrevive");
     }
 
+    /// INVARIANTE do fix P0 (anti-travamento): aplicar SÓ os eventos novos (`seq > cursor`) a uma
+    /// fila viva, em dois lotes, produz EXATAMENTE o mesmo estado que reconstruir do log inteiro
+    /// (`replay`). É a equivalência que autoriza tirar o full-replay `O(N)` da thread de UI.
+    #[test]
+    #[serial]
+    fn incremental_observe_records_equals_full_replay() {
+        let tmp = TempDir::new("incremental");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        for ev in [
+            ask("A", PermissionEvidence::Hook, "p1"),
+            ask("B", PermissionEvidence::Grid, "p2"),
+            ask("C", PermissionEvidence::Hook, "p3"),
+            DomainEvent::PermissionResolved {
+                stable_id: "p1".into(),
+                decision: ApprovalDecision::Approve,
+                via: ResolutionVia::Human,
+            },
+            ask("D", PermissionEvidence::Hook, "p4"),
+            DomainEvent::PermissionDismissed {
+                stable_id: "p3".into(),
+            },
+        ] {
+            store.append(&ev).expect("append");
+        }
+        let all = store.events().expect("events");
+        let now = all.last().map(|r| r.ts).unwrap_or(T0);
+
+        // INCREMENTAL: fila viva recebe o lote [seq<=3] e depois SÓ os novos (seq>3) — cursor.
+        let split = 3usize;
+        let mut live = AttentionQueue::new();
+        live.observe_records(&all[..split]);
+        let cursor = all[..split].last().map(|r| r.seq).unwrap_or(0);
+        let new_only: Vec<EventRecord> = all.iter().filter(|r| r.seq > cursor).cloned().collect();
+        assert_eq!(new_only.len(), all.len() - split, "filtro seq>cursor pega só os novos");
+        live.observe_records(&new_only);
+
+        // FULL-REPLAY: reconstrói do log inteiro.
+        let full = AttentionQueue::replay(&all);
+
+        assert_eq!(live.items(now), full.items(now), "incremental ≡ full-replay");
+    }
+
     /// **SEAM-1: banner de spawn cascata.** `SpawnRequested`+`SpawnGated{cascade}` → item `Spawn`
     /// pendente; ORIGEM (sem `SpawnGated`) NÃO vira banner; `decline_spawn` devolve `SpawnDeclined`
     /// e, observado, tira o banner.
@@ -1257,6 +1308,9 @@ mod tests {
                 root_cause_id: "msg_orig".into(),
                 hops: 0,
                 prompt: "x".into(),
+                model: None,
+                effort: None,
+                goal_id: None,
             },
             T0,
         );
@@ -1275,6 +1329,9 @@ mod tests {
                 root_cause_id: "R".into(),
                 hops: 1,
                 prompt: "ajude".into(),
+                model: None,
+                effort: None,
+                goal_id: None,
             },
             T0 + 1,
         );
@@ -1325,6 +1382,9 @@ mod tests {
                 root_cause_id: "R".into(),
                 hops: 1,
                 prompt: "p".into(),
+                model: None,
+                effort: None,
+                goal_id: None,
             },
             T0,
         );
@@ -1462,6 +1522,9 @@ mod tests {
                 root_cause_id: "R".into(),
                 hops: 1,
                 prompt: "p".into(),
+                model: None,
+                effort: None,
+                goal_id: None,
             },
             T0 + 3,
         );

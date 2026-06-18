@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lina_bootstrap::{
-    autonomy_from_env, canonical_role, classify_retro_args, pretooluse_result, project_retro,
-    render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk, RetroInvocation,
+    autonomy_from_env, canonical_role, classify_retro_args, parse_log_records, pretooluse_result,
+    project_retro, render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk,
+    RetroInvocation,
 };
 use lina_core::{
     check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, HandoffContract,
-    MailMessage, Mailbox, CLASS_GATED_HARD_EXTERNAL,
+    MailMessage, Mailbox, ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -51,6 +52,8 @@ fn main() -> ExitCode {
         Some("vault") => run_vault(&args[1..]),
         Some("spawn") => run_spawn(&args[1..]),
         Some("retro") => run_retro(&args[1..]),
+        Some("params") => run_params(&args[1..]),
+        Some("effort") => run_effort(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -60,7 +63,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -1086,6 +1089,498 @@ fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+// ── F3-0-5: verbos `lina params set|reset` — parse + gate de autonomia + montagem do envelope ──
+// O bin enfileira o contrato {key,scope,value,target?}; o supervisor (`handle_params`) valida a
+// faixa (`validate_range`), carimba `by` server-side (ADR 0007) e emite `SystemParamsChanged`.
+
+/// Camadas válidas de um parâmetro (espelha `ParamScope` do core, serializado em `lowercase`).
+const PARAM_SCOPES: [&str; 4] = ["global", "workspace", "preset", "terminal"];
+
+/// A mutação parseada de `lina params set|reset` (PURA). `reset` é `set` com `value` vazio: no replay
+/// o core cai em `None` → default (`set_from_event`). `target` nomeia o NodeId (scope=terminal) ou o
+/// slug (scope=preset); `None` para workspace/global.
+#[derive(Debug, PartialEq, Eq)]
+struct ParamsMutation {
+    key: String,
+    scope: String,
+    value: String,
+    target: Option<String>,
+}
+
+/// Parseia `set <key> <value> --scope <s> [--target <t>]` ou `reset <key> --scope <s> [--target <t>]`.
+/// Valida só a FORMA (escopo no enum; `target` obrigatório p/ terminal/preset). A faixa do VALOR é do
+/// core (`validate_range`, F3-0-5 (iii)) — JAMAIS duplicada aqui (COD-5). `Err` NOMEIA o que faltou.
+fn parse_params_mutation(verb: &str, args: &[String]) -> Result<ParamsMutation, String> {
+    let mut scope: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--scope" => {
+                i += 1;
+                scope = Some(
+                    args.get(i)
+                        .ok_or("--scope exige um valor (global|workspace|preset|terminal)")?
+                        .clone(),
+                );
+            }
+            "--target" => {
+                i += 1;
+                target = Some(
+                    args.get(i)
+                        .ok_or("--target exige um valor (NodeId p/ terminal, slug p/ preset)")?
+                        .clone(),
+                );
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let mut positional = positional.into_iter();
+    let key = positional.next().ok_or_else(|| {
+        format!("lina params {verb} exige a chave do parametro (ex.: fanout_gate)")
+    })?;
+    let value = if verb == "reset" {
+        String::new()
+    } else {
+        positional.next().ok_or_else(|| {
+            format!(
+                "lina params {verb} exige o valor (ex.: lina params set {key} 8 --scope workspace)"
+            )
+        })?
+    };
+
+    let scope =
+        scope.ok_or("lina params set/reset exige --scope <global|workspace|preset|terminal>")?;
+    if !PARAM_SCOPES.contains(&scope.as_str()) {
+        return Err(format!(
+            "escopo desconhecido: {scope:?} — use um de: {}",
+            PARAM_SCOPES.join("|")
+        ));
+    }
+    if matches!(scope.as_str(), "terminal" | "preset") && target.is_none() {
+        return Err(format!(
+            "scope={scope} exige --target <alvo> (NodeId p/ terminal, slug p/ preset)"
+        ));
+    }
+
+    Ok(ParamsMutation {
+        key,
+        scope,
+        value,
+        target,
+    })
+}
+
+/// Monta o envelope do contrato (b): intent `params.set`/`params.reset`, payload JSON
+/// `{key,scope,value,target?}`, alvo sentinela `"params"` (o supervisor intercepta por INTENT, como em
+/// `plan`). O bin NÃO emite o evento nem carimba `by` — só enfileira; `handle_params` (escritor único)
+/// valida, carimba `by` server-side (ADR 0007) e emite `SystemParamsChanged`.
+fn build_params_envelope(from: &str, intent: &str, m: &ParamsMutation) -> MailMessage {
+    let payload = serde_json::json!({
+        "key": m.key,
+        "scope": m.scope,
+        "value": m.value,
+        "target": m.target,
+    })
+    .to_string();
+    MailMessage::new(from, "params", intent, payload)
+}
+
+/// Gate de autonomia da mutação (espelha `run_spawn`): `manual` recusa AQUI com orientação (o agente
+/// PROPÕE ao humano, não altera sozinho); `assistido`/`autonomo` seguem — o propõe->confirma do
+/// assistido é a narração do agente, não um passo do CLI. `Some(msg)` = recusa; `None` = pode seguir.
+fn params_mutation_gate(autonomy: Autonomy) -> Option<String> {
+    matches!(autonomy, Autonomy::Manual).then(|| {
+        "no modo MANUAL voce NAO altera parametros do Espaco sozinho — proponha a mudanca ao \
+         usuario/Maestro (ou peca para subir a autonomia)."
+            .to_string()
+    })
+}
+
+/// `lina params show | set <chave> <valor> --scope <s> [--target <t>] | reset <chave> --scope <s>`
+/// (F3-0-5). `show` projeta o log (SÓ-LEITURA); `set`/`reset` enfileiram o contrato {key,scope,value,
+/// target?} — o supervisor (`handle_params`) valida a faixa, carimba `by` server-side e emite o evento.
+fn run_params(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("show") => run_params_show(),
+        Some(verb @ ("set" | "reset")) => run_params_mutation(verb, &args[1..]),
+        _ => {
+            usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina params set <chave> <valor> --scope <s> [--target <t>]` / `reset <chave> --scope <s> [...]`.
+/// Parseia o contrato, aplica o gate de autonomia (`manual` recusa AQUI — o agente PROPÕE ao humano;
+/// o router é o backstop durável) e ENFILEIRA o envelope. O bin NÃO valida a faixa nem aplica: quem
+/// valida (`validate_range`), carimba `by` server-side e emite `SystemParamsChanged` é o supervisor.
+fn run_params_mutation(verb: &str, args: &[String]) -> ExitCode {
+    let m = match parse_params_mutation(verb, args) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match load_identity() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'/autonomia): {e}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(refusal) = params_mutation_gate(input.autonomy) {
+        eprintln!("lina: {refusal}");
+        return ExitCode::from(1);
+    }
+    let intent = format!("params.{verb}");
+    let msg = build_params_envelope(&input.terminal_name, &intent, &m);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &input.terminal_name, &msg) {
+        Ok(()) => {
+            let shown = if m.value.is_empty() {
+                "(reset)"
+            } else {
+                m.value.as_str()
+            };
+            println!(
+                "ok: params {verb} {}={shown} (escopo {}) enfileirado (msg {}) — o supervisor valida e aplica",
+                m.key, m.scope, msg.id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `lina params show` — SÓ-LEITURA: lê o espelho `log.jsonl` (NUNCA o SQLite — doutrina do verbo
+/// read-only, lina.rs:1139), reconstrói as 4 camadas por replay (`ParamsLedger::from_records`,
+/// invariante #4) e lista os parâmetros com override + a camada de origem. Sem log ⇒ tudo default.
+fn run_params_show() -> ExitCode {
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let records = parse_log_records(&content);
+    let ledger = ParamsLedger::from_records(&records);
+    print!("{}", render_params_show(&ledger));
+    ExitCode::SUCCESS
+}
+
+/// Renderiza os parâmetros com override + a camada de ORIGEM. Camadas em precedência DECRESCENTE
+/// (`terminal` vence): a primeira que opina um parâmetro define o efetivo. Usa serde (genérico) para
+/// não duplicar o mapa de 18 chaves do core (COD-5) — campo `None` serializa como `null`.
+fn render_params_show(ledger: &ParamsLedger) -> String {
+    let layers: [(&str, &SystemParams); 4] = [
+        ("terminal", &ledger.terminal),
+        ("preset", &ledger.preset),
+        ("workspace", &ledger.workspace),
+        ("global", &ledger.global),
+    ];
+    let serialized: Vec<(&str, serde_json::Map<String, serde_json::Value>)> = layers
+        .iter()
+        .map(|(scope, params)| {
+            let map = serde_json::to_value(params)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            (*scope, map)
+        })
+        .collect();
+
+    // Conjunto canônico de chaves = as de uma camada serializada (todas presentes via serde).
+    let keys: Vec<&String> = serialized
+        .first()
+        .map(|(_, m)| m.keys().collect())
+        .unwrap_or_default();
+
+    let mut lines: Vec<String> = Vec::new();
+    for key in keys {
+        let origin = serialized
+            .iter()
+            .find_map(|(scope, map)| map.get(key).filter(|v| !v.is_null()).map(|v| (*scope, v)));
+        if let Some((scope, value)) = origin {
+            lines.push(format!(
+                "  {key} = {}  ·  {scope}",
+                render_param_value(value)
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        "Parametros de orquestracao: tudo no default (nenhum override no Espaco).\n".to_string()
+    } else {
+        let mut out = String::from("Parametros de orquestracao (efetivo · origem):\n");
+        out.push_str(&lines.join("\n"));
+        out.push('\n');
+        out
+    }
+}
+
+/// Valor do parâmetro sem as aspas JSON de string (`8`, `high`, …).
+fn render_param_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+// ── F3-0-5 Parte 2: verbo `lina effort @T low|medium|high` (contrato aprovado pelo Maestro) ──
+// O bin enfileira {target, effort} com intent `effort.assign`; o supervisor (`handle_effort`) resolve
+// o alvo, valida o nível, carimba `by`/`origin` server-side, RECUSA auto-atribuição e emite `EffortAssigned`.
+
+/// Níveis de raciocínio do contrato NEUTRO (o mapeamento concreto é do CLI Profile — invariante #3).
+const EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
+
+/// O pedido parseado de `lina effort @<Nome> <nível>`.
+#[derive(Debug, PartialEq, Eq)]
+struct EffortAssignment {
+    target: String,
+    effort: String,
+}
+
+/// Parseia `lina effort @<Nome> <low|medium|high>`. Normaliza o `@` (aceita "QA"/"@QA") e valida o
+/// nível no contrato neutro. `Err` NOMEIA o que faltou.
+fn parse_effort_args(args: &[String]) -> Result<EffortAssignment, String> {
+    let mut positional = args.iter().filter(|a| !a.starts_with("--"));
+    let raw_target = positional
+        .next()
+        .ok_or("lina effort exige o terminal alvo (ex.: lina effort @QA high)")?;
+    let effort = positional
+        .next()
+        .ok_or("lina effort exige o nivel (low|medium|high)")?
+        .to_string();
+    if !EFFORT_LEVELS.contains(&effort.as_str()) {
+        return Err(format!(
+            "nivel de effort desconhecido: {effort:?} — use um de: {}",
+            EFFORT_LEVELS.join("|")
+        ));
+    }
+    let target = if raw_target.starts_with('@') {
+        raw_target.clone()
+    } else {
+        format!("@{raw_target}")
+    };
+    Ok(EffortAssignment { target, effort })
+}
+
+/// Monta o envelope do contrato aprovado: intent `effort.assign`, payload {target, effort}, alvo
+/// sentinela `"effort"` (o supervisor intercepta por INTENT, como em params/plan). O bin NÃO carimba
+/// `by`/`origin` — `handle_effort` emite `EffortAssigned{origin:"assigned", by server-side}` (ADR 0007).
+fn build_effort_envelope(from: &str, a: &EffortAssignment) -> MailMessage {
+    let payload = serde_json::json!({ "target": a.target, "effort": a.effort }).to_string();
+    MailMessage::new(from, "effort", "effort.assign", payload)
+}
+
+/// `lina effort @<Nome> <low|medium|high>` (F3-0-5 Parte 2). Parseia o pedido, aplica o gate de
+/// autonomia (`manual` recusa — o agente PROPÕE ao humano; reusa o gate das mutações de parâmetro,
+/// pois `effort` É um parâmetro) e ENFILEIRA o envelope `effort.assign`. O supervisor (`handle_effort`)
+/// resolve o alvo, valida, carimba `by`/`origin` server-side, RECUSA auto-atribuição e emite o evento.
+fn run_effort(args: &[String]) -> ExitCode {
+    let a = match parse_effort_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match load_identity() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'/autonomia): {e}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(refusal) = params_mutation_gate(input.autonomy) {
+        eprintln!("lina: {refusal}");
+        return ExitCode::from(1);
+    }
+    let msg = build_effort_envelope(&input.terminal_name, &a);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &input.terminal_name, &msg) {
+        Ok(()) => {
+            println!(
+                "ok: effort {} de {} enfileirado (msg {}) — o supervisor valida e aplica",
+                a.effort, a.target, msg.id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod f305_scaffold_tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_effort_normaliza_arroba_e_valida_nivel() {
+        let a = parse_effort_args(&argv(&["QA", "high"])).expect("valido");
+        assert_eq!(a.target, "@QA", "normaliza o @ ausente");
+        assert_eq!(a.effort, "high");
+        let a2 = parse_effort_args(&argv(&["@Dev", "low"])).expect("valido com @");
+        assert_eq!(a2.target, "@Dev");
+    }
+
+    #[test]
+    fn parse_effort_recusa_nivel_invalido() {
+        let err =
+            parse_effort_args(&argv(&["@QA", "turbo"])).expect_err("nivel fora do contrato falha");
+        assert!(err.contains("turbo"), "nomeia o nivel invalido: {err}");
+    }
+
+    #[test]
+    fn parse_effort_sem_nivel_falha() {
+        let err = parse_effort_args(&argv(&["@QA"])).expect_err("sem nivel falha");
+        assert!(err.contains("nivel"), "pede o nivel: {err}");
+    }
+
+    #[test]
+    fn effort_envelope_do_contrato_aprovado() {
+        let a = EffortAssignment {
+            target: "@QA".to_string(),
+            effort: "high".to_string(),
+        };
+        let env = build_effort_envelope("Terminal I", &a);
+        assert_eq!(env.intent, "effort.assign");
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["target"], "@QA");
+        assert_eq!(p["effort"], "high");
+        assert!(
+            env.payload.find("by").is_none(),
+            "o bin nunca carimba `by`: {}",
+            env.payload
+        );
+    }
+
+    #[test]
+    fn render_show_efetivo_com_origem_e_precedencia() {
+        let mut led = ParamsLedger::default();
+        led.workspace.fanout_gate = Some(8);
+        led.terminal.fanout_gate = Some(12); // terminal vence (precedência mais alta)
+        let out = render_params_show(&led);
+        assert!(
+            out.contains("fanout_gate = 12"),
+            "efetivo é o de terminal: {out}"
+        );
+        assert!(out.contains("terminal"), "origem é terminal: {out}");
+        assert!(
+            !out.contains("= 8"),
+            "o 8 do workspace foi sobreposto, não é efetivo: {out}"
+        );
+    }
+
+    #[test]
+    fn render_show_sem_override_e_tudo_default() {
+        let out = render_params_show(&ParamsLedger::default());
+        assert!(
+            out.to_lowercase().contains("default"),
+            "sem override = tudo default: {out}"
+        );
+    }
+
+    #[test]
+    fn parse_set_extrai_key_value_scope() {
+        let m = parse_params_mutation("set", &argv(&["fanout_gate", "8", "--scope", "workspace"]))
+            .expect("set valido");
+        assert_eq!(m.key, "fanout_gate");
+        assert_eq!(m.value, "8");
+        assert_eq!(m.scope, "workspace");
+        assert_eq!(m.target, None);
+    }
+
+    #[test]
+    fn parse_reset_tem_value_vazio() {
+        // reset = set com valor vazio (no replay vira None -> default, via set_from_event do core).
+        let m = parse_params_mutation("reset", &argv(&["fanout_gate", "--scope", "workspace"]))
+            .expect("reset valido");
+        assert_eq!(m.key, "fanout_gate");
+        assert_eq!(
+            m.value, "",
+            "reset limpa o override desta camada (valor vazio)"
+        );
+    }
+
+    #[test]
+    fn parse_recusa_scope_desconhecido() {
+        let err = parse_params_mutation("set", &argv(&["fanout_gate", "8", "--scope", "galaxy"]))
+            .expect_err("scope fora do enum deve falhar");
+        assert!(
+            err.contains("galaxy"),
+            "o erro nomeia o escopo invalido: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_terminal_exige_target() {
+        let err = parse_params_mutation("set", &argv(&["fanout_gate", "8", "--scope", "terminal"]))
+            .expect_err("scope=terminal sem --target deve falhar");
+        assert!(err.contains("target"), "o erro pede o alvo: {err}");
+    }
+
+    #[test]
+    fn parse_set_sem_scope_falha() {
+        let err = parse_params_mutation("set", &argv(&["fanout_gate", "8"]))
+            .expect_err("set sem --scope deve falhar");
+        assert!(err.contains("scope"), "o erro pede o escopo: {err}");
+    }
+
+    #[test]
+    fn envelope_carrega_intent_e_payload_do_contrato_b() {
+        let m = ParamsMutation {
+            key: "fanout_gate".to_string(),
+            scope: "workspace".to_string(),
+            value: "8".to_string(),
+            target: None,
+        };
+        let env = build_params_envelope("Terminal I", "params.set", &m);
+        assert_eq!(env.intent, "params.set");
+        // Contrato (b): payload JSON {key,scope,value,target?}. `by` é carimbo server-side do
+        // supervisor (handle_params), NUNCA do bin — não viaja aqui.
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["key"], "fanout_gate");
+        assert_eq!(p["scope"], "workspace");
+        assert_eq!(p["value"], "8");
+        assert!(
+            env.payload.find("by").is_none(),
+            "o bin nunca carimba `by`: {}",
+            env.payload
+        );
+    }
+
+    #[test]
+    fn gate_manual_recusa_demais_seguem() {
+        assert!(
+            params_mutation_gate(Autonomy::Manual).is_some(),
+            "manual recusa localmente (o agente PROPÕE ao humano, não altera sozinho)"
+        );
+        assert!(
+            params_mutation_gate(Autonomy::Assisted).is_none(),
+            "assistido segue no CLI (o propõe->confirma é a narração do agente, como no spawn)"
+        );
+        assert!(
+            params_mutation_gate(Autonomy::Autonomous).is_none(),
+            "autônomo segue"
+        );
     }
 }
 

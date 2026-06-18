@@ -142,6 +142,14 @@ impl PtyCommand {
         self
     }
 
+    /// Os pares `(chave, valor)` de ENV já carimbados (read-only). Para inspeção/teste do que o
+    /// spawn injeta no processo filho (ex.: `LINA_NODE_ID`/`LINA_AUTONOMY`/`LINA_EFFORT` — ADR 0026
+    /// / F3-0-4), sem expor o `Vec` mutável.
+    #[must_use]
+    pub fn envs(&self) -> &[(String, String)] {
+        &self.env
+    }
+
     /// Define o diretório de trabalho (builder).
     #[must_use]
     pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {

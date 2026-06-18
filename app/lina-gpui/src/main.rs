@@ -2161,6 +2161,20 @@ impl WorkspaceView {
         };
         let cards_by_node: BTreeMap<NodeId, dashboard::AgentCard> =
             cards.into_iter().map(|c| (c.node, c)).collect();
+        // F3-0-6: badge modelo·effort por nó — `EffortAssigned` é META (fora da projeção do
+        // canvas), então o painel o reconstrói varrendo o log com a MESMA disciplina de cache do
+        // custo (re-varre SÓ com evento novo; nunca por frame). Chave = `NodeId.to_string()`, que é
+        // o que ambos os emissores (router/spawn) carimbam no evento.
+        let effort_by_node = {
+            let mut cache = lock(&self.dash.effort);
+            let count = self.nodes.store_event_count();
+            if dashboard::projection_cache_is_stale(cache.as_ref().map(|(c, _)| *c), count) {
+                if let (Some(c), Ok(recs)) = (count, lock(&self.nodes.store_handle()).events()) {
+                    *cache = Some((c, dashboard::effort_badges(&recs)));
+                }
+            }
+            cache.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
+        };
         // Total "Hoje:": sessões sob o ws_root + sessões dos cwds ADOTADOS pelos nós do
         // Espaço (parcela de fora rotulada no próprio texto — honesto, nunca soma muda).
         let total =
@@ -2255,6 +2269,20 @@ impl WorkspaceView {
                     .text_color(rgb(th.text.primary))
                     .child(format!("{}  ● {}", row.name, row.state.label())),
             );
+            // F3-0-6: pílula do nível de raciocínio (modelo·effort) em pt-br leigo — chip neutro
+            // (não compete com a cor SEMÂNTICA do estado), modelo muted quando o log o correlaciona.
+            if let Some(badge) = effort_by_node.get(&node_id.to_string()) {
+                name_line = name_line.child(
+                    div()
+                        .id(("dash-effort", i as u64))
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .text_size(px(f32::from(th.typography.size.small)))
+                        .text_color(rgb(th.text.secondary))
+                        .child(text!(badge.surface_text())),
+                );
+            }
             if is_terminal {
                 name_line = name_line.child(
                     div()
@@ -2426,6 +2454,14 @@ impl WorkspaceView {
     fn modal_set_autonomy(&mut self, a: Autonomy, cx: &mut Context<Self>) {
         if let Some(m) = self.agent_modal.as_mut() {
             m.set_autonomy(a);
+            cx.notify();
+        }
+    }
+
+    /// F3-0-6: clique numa opção do controle nomeado de Raciocínio (espelha `modal_set_autonomy`).
+    fn modal_set_effort(&mut self, e: lina_core::Effort, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.set_effort(e);
             cx.notify();
         }
     }
@@ -5314,6 +5350,7 @@ fn main() {
                 position: Some((x, y)),
                 requested_by: None,
                 autonomy: Autonomy::Assisted, // carga de profiling — autonomia default
+                effort: lina_core::Effort::Medium, // F3-0-4: carga de profiling no default neutro
             };
             if let Err(e) = nodes.admit_node(admission) {
                 eprintln!(

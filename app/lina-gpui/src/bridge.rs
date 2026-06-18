@@ -41,7 +41,9 @@ use lina_cli_profiles::ProfileRegistry;
 use lina_core::scrollback::{FlushGuard, FlushGuardConfig, ScrollbackStore};
 // FIX-2 (Criar Espaço): o seam ÚNICO de precedência de cwd do core (F1-4-1/ADR 0022) —
 // `default_cwd` do Espaço vence; sem ele, dir gerenciado virgem. Consumido no funil de admissão.
-use lina_core::{resolve_spawn_cwd, ResolvedCwd};
+use lina_core::{
+    resolve_from_store, resolve_spawn_cwd, Effort, EffortOrigin, ResolvedCwd, SystemParams,
+};
 use lina_host::{BusTarget, HostEvent, InputSink, NodeId, NodeKind, NodeStatus, UiHost, WriteOp};
 // W3-6c (ADR 0004): cofre de segredos — o broker lê o token daqui (o agente nunca o tem no env).
 use lina_secrets::{SecretStore, SecretVault};
@@ -708,13 +710,31 @@ impl MailboxPump {
         // SEAM-1: o funil de admissão (ADR 0022) — `SpawnApproved` cria o terminal por aqui.
         nodes: Arc<NodeManager>,
     ) -> Self {
+        // F3-0-2 (SEAM-1'): a config dos 13 params de orquestração é PROJEÇÃO do event log (invariante
+        // #4) — `resolve_from_store` reconstrói o `RouterConfig` varrendo os `SystemParamsChanged`,
+        // matando o `..RouterConfig::default()` que deixava 13 campos como knob morto. Sem nenhum
+        // evento, cai EXATAMENTE nos defaults (compat total). Falha de leitura do log → defaults +
+        // aviso (nunca derruba o boot). `token_budget_day` segue vindo do bootstrap (fonte legada;
+        // F3-0-5 migra-o para `params`); `autonomy` vem do bootstrap por design (spec 51 §2).
+        let level = autonomy_to_level(autonomy);
+        let resolved = match resolve_from_store(&lock(&store), level) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("lina-gpui: falha ao resolver params do log (usando defaults): {e}");
+                SystemParams::default().into_resolved(level)
+            }
+        };
+        for w in &resolved.warnings {
+            eprintln!(
+                "lina-gpui: parâmetro fora da faixa, clampado: {} {} → {}",
+                w.key, w.requested, w.clamped
+            );
+        }
         // W3-7c (TETO DE CUSTO): `token_budget_day > 0` ARMA o teto no Router (0 = desligado). O
         // `CostLedger` soma os `TokenUsageReported` (emitidos pela bomba) e PAUSA na transição.
-        // SEAM-1 (M2): `autonomy` REAL fiada — `Manual` agora bloqueia spawn/delegação DE FATO.
         let config = RouterConfig {
             token_budget_day,
-            autonomy: autonomy_to_level(autonomy),
-            ..RouterConfig::default()
+            ..resolved.router_config
         };
         let mut router = Router::with_config(Arc::clone(&sup), mailbox, config);
         // W4-3: o freio é event-sourced — reconstrói `paused` do ÚLTIMO Orchestration{Paused,Resumed}.
@@ -1815,8 +1835,11 @@ pub struct AttentionHub {
     store: Arc<Mutex<EventStore>>,
     desk: Desk,
     model: Model,
-    /// `event_count` do último replay (re-replay SÓ com evento novo — padrão CostLedger).
-    last_ec: Mutex<u64>,
+    /// Cursor da projeção INCREMENTAL: maior `seq` já aplicado à `queue`. Cada `sync` busca SÓ
+    /// `events_since(last_seq)` e faz `observe_records` do delta na fila viva — NUNCA full-replay
+    /// na thread de UI (era o `O(N)` a 30Hz que travava o app). `seq` (não `count`) é o cursor
+    /// correto inclusive p/ appends de outro processo — mesma garantia do cache de `project`.
+    last_seq: Mutex<u64>,
     /// Espelho da custódia: id → (nó autenticado, display, first_seen ms). O first_seen
     /// é cunhado no 1º sync que viu o id e SOBREVIVE a re-replays (escalação estável).
     custody_seen: Mutex<BTreeMap<String, (String, String, u64)>>,
@@ -1841,20 +1864,19 @@ impl AttentionHub {
         // SEAM-1: o funil de admissão — aprovar um banner de spawn cria o terminal por aqui.
         nodes: Arc<NodeManager>,
     ) -> Self {
-        let (queue, ec) = {
+        let (queue, last_seq) = {
             let s = lock(&store);
             let records = s.events().unwrap_or_default();
-            (
-                lina_core::AttentionQueue::replay(&records),
-                s.event_count().unwrap_or(0),
-            )
+            // Cursor inicial = maior seq reconstruído; daí em diante o `sync` só aplica o delta.
+            let last_seq = records.last().map(|r| r.seq).unwrap_or(0);
+            (lina_core::AttentionQueue::replay(&records), last_seq)
         };
         Self {
             queue: Mutex::new(queue),
             store,
             desk,
             model,
-            last_ec: Mutex::new(ec),
+            last_seq: Mutex::new(last_seq),
             custody_seen: Mutex::new(BTreeMap::new()),
             approval,
             nodes,
@@ -1926,20 +1948,33 @@ impl AttentionHub {
     /// (novos ids entram com `first_seen = now`; resolvidos pelo ⌘⏎ saem). Chamado pelo
     /// heartbeat da view (~4 Hz) — re-replay só quando o `event_count` mudou.
     pub fn sync(&self, now_ms: u64) -> Vec<lina_core::AttentionItem> {
-        let ec = lock(&self.store).event_count().unwrap_or(0);
-        let stale = {
-            let mut last = lock(&self.last_ec);
-            let stale = *last != ec;
-            *last = ec;
-            stale
-        };
-        if stale {
-            let records = lock(&self.store).events().unwrap_or_default();
-            let mut q = lina_core::AttentionQueue::replay(&records);
-            for (id, (node, display, ts)) in lock(&self.custody_seen).iter() {
-                q.custody_enqueued(id.clone(), node.clone(), display.clone(), *ts);
+        // Projeção INCREMENTAL (fix P0 anti-travamento): busca SÓ o delta `seq > last_seq` e o
+        // aplica à fila VIVA via `observe_records` — NUNCA reconstrói o log inteiro na thread de
+        // UI (o full-replay `O(N)` a até 30Hz era a causa raiz do freeze). Ocioso ⇒ delta vazio ⇒
+        // só uma query indexada barata, sem segurar o lock do store. A custódia NÃO precisa ser
+        // re-injetada (como no antigo wipe+replay): a fila persiste entre ticks e a seção de
+        // custódia viva abaixo já a reconcilia a cada chamada.
+        let new_events = {
+            let after = *lock(&self.last_seq);
+            // NÃO-BLOQUEANTE na thread de UI (fix freeze do `lina ask`): a entrega A2A é faseada e
+            // SÍNCRONA sob o lock do store (espera o alvo ficar pronto, até `ready_timeout` ~2s +
+            // `submit_delay`) — segurar esse long-hold é por design. Se este tick não consegue o
+            // lock JÁ, PULA a leitura e usa a fila já projetada; o delta entra no próximo tick. O
+            // render JAMAIS bloqueia num lock de caminho de fundo. (O carimbo de `delivered_root`
+            // e a marcação de Busy seguem síncronos no router — invariante de segurança intacta.)
+            match self.store.try_lock() {
+                Ok(s) => s.events_since(after).unwrap_or_default(),
+                // Poisoned: recupera o guard (mesma política do `lock()`) e segue.
+                Err(std::sync::TryLockError::Poisoned(p)) => {
+                    p.into_inner().events_since(after).unwrap_or_default()
+                }
+                // Store ocupado (entrega em curso) → sem delta neste tick; sem freeze.
+                Err(std::sync::TryLockError::WouldBlock) => Vec::new(),
             }
-            *lock(&self.queue) = q;
+        };
+        if let Some(max_seq) = new_events.last().map(|r| r.seq) {
+            lock(&self.queue).observe_records(&new_events);
+            *lock(&self.last_seq) = max_seq;
         }
         // Custódia viva (origem AUTENTICADA do drain — `requester()`, nunca payload).
         let live: Vec<(String, String, String)> = lock(&self.desk)
@@ -2174,6 +2209,13 @@ impl AttentionHub {
     #[cfg(test)]
     pub fn events_for_test(&self) -> Vec<EventRecord> {
         lock(&self.store).events().expect("events de teste")
+    }
+
+    /// (teste) Clona o `Arc` do store p/ simular CONTENÇÃO do lock (ex.: entrega A2A em curso)
+    /// e provar que o `sync` da UI não bloqueia.
+    #[cfg(test)]
+    pub fn store_arc_for_test(&self) -> Arc<Mutex<EventStore>> {
+        Arc::clone(&self.store)
     }
 }
 
@@ -2624,6 +2666,7 @@ fn node_identity_env(
     role: &str,
     key: &str,
     autonomy: Autonomy,
+    effort: Effort,
     lina_home: &std::path::Path,
 ) -> PtyCommand {
     cmd.env("VIBE_ROLE", role)
@@ -2642,6 +2685,11 @@ fn node_identity_env(
         // autoridade do APP no spawn; um agente que reexporte a var só afeta o próprio gate
         // local (a custódia de ações irreversíveis — ADR 0004 — não muda).
         .env("LINA_AUTONOMY", autonomy.label())
+        // F3-0-4 (ADR 0031): o effort do nó vira env por-spawn — o CLI filho lê `LINA_EFFORT`
+        // (low/medium/high, contrato neutro; o mapeamento p/ a flag real de cada CLI é do CLI
+        // Profile, invariante #3). Mesma postura de autoridade-do-APP-no-spawn do ADR 0026: um
+        // agente que reexporte a var só afeta o próprio processo; nenhuma autoridade nova nasce aqui.
+        .env("LINA_EFFORT", effort.label())
 }
 
 #[cfg(windows)]
@@ -3582,6 +3630,11 @@ pub struct NodeAdmission {
     /// usam `Assisted` (default do produto); só ⌘N (`create_agent_with_autonomy`) propaga a
     /// escolha do usuário.
     pub autonomy: Autonomy,
+    /// F3-0-4 (ADR 0031): o effort ESCOLHIDO para este nó (do modal → `CreatePlan.effort`, ou do
+    /// envelope de spawn). `admit_node` o carimba em `LINA_EFFORT` (env do PTY) e emite o
+    /// `EffortAssigned{origin:assigned}` no log. Construtores ⌘T/seed usam `Effort::Medium` (default
+    /// neutro do produto); a seleção real (modal/preset) chega pela F3-0-6.
+    pub effort: Effort,
 }
 
 impl NodeAdmission {
@@ -3600,6 +3653,7 @@ impl NodeAdmission {
             position: None,
             requested_by: None,
             autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
         }
     }
 
@@ -3614,6 +3668,7 @@ impl NodeAdmission {
             position: Some((x, y)),
             requested_by: None,
             autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
         }
     }
 
@@ -3639,6 +3694,7 @@ impl NodeAdmission {
             position: None,
             requested_by: Some(requested_by),
             autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
         }
     }
 }
@@ -4004,6 +4060,9 @@ impl NodeManager {
                 position, // colisão de coordenada → None → `next_free_slot` (re-layout durável)
                 requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
                 autonomy: Autonomy::Assisted,
+                // F3-0-4: restore não re-deriva o effort do log ainda (Medium neutro); quando o
+                // badge (F3-0-6) ler o último `EffortAssigned` por nó, o restore o reidrata daqui.
+                effort: Effort::Medium,
             };
             // Reescrita do kit em LOTE (1× após o loop): com N restores, o rewrite por-admissão
             // era O(N²) de I/O — o vilão do boot lento medido em 2026-06-11 (~80 nós).
@@ -4636,6 +4695,9 @@ impl NodeManager {
             position: None,
             requested_by: None, // criação pelo modal humano (⌘N) — não é spawn agente-pede
             autonomy,
+            // F3-0-4: o effort escolhido no modal (CreatePlan.effort) é fiado pela F3-0-6 (UI);
+            // por ora o ⌘N nasce no default neutro (Medium).
+            effort: Effort::Medium,
         })
     }
 
@@ -4769,6 +4831,7 @@ impl NodeManager {
             &role,
             &key,
             plan.autonomy,
+            plan.effort,
             &self.lina_dir, // LINA_HOME por spawn: o `.lina` DESTE Espaço (veredito §3)
         );
 
@@ -4926,7 +4989,7 @@ impl NodeManager {
         // 6) PERSISTE a sequência CANÔNICA (§2) antes de projetar — log = fonte da verdade.
         //    Falha em QUALQUER append → compensação (§5): `retire_pty` desregistra do roster
         //    vivo e mata o PTY — nada de nó no agents.json sem rastro no log.
-        let events = admission_events(
+        let mut events = admission_events(
             node,
             f64::from(x),
             f64::from(y),
@@ -4936,6 +4999,18 @@ impl NodeManager {
             cwd_real.as_deref(),
             plan.requested_by, // SEAM-1: carimba quem pediu o spawn (None na origem humana)
         );
+        // F3-0-4 (ADR 0031): o effort de NASCIMENTO do nó vira fato no log (par do `NodeAdded`).
+        // `origin:Assigned` = foi DEFINIDO na admissão; `by` = quem pediu o spawn (carimbo
+        // server-side do binding — `None` na origem humana), JAMAIS lido do payload de um agente
+        // (regra-mãe ADR 0007). O badge `modelo·effort` (F3-0-6) varre estes eventos por nó.
+        events.push(DomainEvent::EffortAssigned {
+            node: node.to_string(),
+            effort: plan.effort,
+            model: None,
+            origin: EffortOrigin::Assigned,
+            task_difficulty: None,
+            by: plan.requested_by,
+        });
         let count = {
             let mut s = lock(&self.store);
             let mut appended = Ok(());
@@ -5513,6 +5588,42 @@ pub fn spawn_pump(
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    /// F3-0-4 (ADR 0031): `node_identity_env` carimba `LINA_EFFORT=<low|medium|high>` no ENV do PTY
+    /// filho, ao lado de `LINA_AUTONOMY`/`LINA_NODE_*` (sem regredir nenhum). Prova o carimbo do ENV
+    /// sem spawnar processo (testa a função pura que monta o comando).
+    #[test]
+    fn node_identity_env_stamps_lina_effort() {
+        let cmd = node_identity_env(
+            PtyCommand::new("sh"),
+            "@QA",
+            "qa",
+            "n-test",
+            Autonomy::Assisted,
+            Effort::High,
+            std::path::Path::new("/tmp/ws"),
+        );
+        let envs: std::collections::HashMap<&str, &str> = cmd
+            .envs()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            envs.get("LINA_EFFORT"),
+            Some(&"high"),
+            "effort=High → LINA_EFFORT=high"
+        );
+        assert_eq!(
+            envs.get("LINA_AUTONOMY"),
+            Some(&"assistido"),
+            "autonomy não regrediu"
+        );
+        assert_eq!(
+            envs.get("LINA_NODE_NAME"),
+            Some(&"@QA"),
+            "identidade não regrediu"
+        );
+    }
 
     thread_local! {
         /// **Fault-injection da janela pós-`register` de [`wire_terminal`]** (red-team 360, inv 4).
@@ -7316,8 +7427,9 @@ mod tests {
         );
         assert_eq!(
             lock(&store).event_count().expect("count"),
-            before + 4,
-            "persiste a sequência canônica: NodeAdded + TerminalSpawned + NodeRenamed + NodeRoleAssigned"
+            before + 5,
+            "persiste a sequência canônica: NodeAdded + TerminalSpawned + NodeRenamed + \
+             NodeRoleAssigned + EffortAssigned (F3-0-4: effort de nascimento do nó)"
         );
         let projected = lock(&store).project().expect("project");
         assert!(
@@ -8492,6 +8604,9 @@ mod tests {
                 root_cause_id: "R".into(),
                 hops: 1,
                 prompt: "valide o checkout".into(),
+                model: None,
+                effort: None,
+                goal_id: None,
             })
             .unwrap();
             s.append(&DomainEvent::SpawnGated {
@@ -8688,6 +8803,42 @@ mod tests {
         let items = hub2.sync(2_000);
         assert_eq!(items.len(), 1, "pendência reconstruída do log");
         assert_eq!(items[0].stable_id, "s1");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// INVARIANTE do fix do freeze no `lina ask`: a entrega A2A faseada segura o lock do store por
+    /// até ~2s (espera o alvo ficar pronto — por design). O `sync` da UI (heartbeat ~4–30Hz) NÃO
+    /// pode bloquear nesse lock. Com o store contendido, `sync` PULA a leitura do delta e devolve a
+    /// fila já projetada (sem freeze); quando o lock libera, o tick seguinte aplica o delta.
+    #[test]
+    fn sync_skips_delta_when_store_is_contended_then_catches_up() {
+        let (hub, _desk, base) = attention_hub("nonblock");
+        hub.store_append_for_test(&ask_event("s1", "Terminal B", "deploy"));
+        assert_eq!(hub.sync(1_000).len(), 1, "baseline: 1 pendência projetada");
+
+        // Evento NOVO no log, mas o store fica TRAVADO por outra thread (simula a entrega A2A).
+        hub.store_append_for_test(&ask_event("s2", "Terminal C", "push"));
+        let store = hub.store_arc_for_test();
+        let (tx_locked, rx_locked) = std::sync::mpsc::channel();
+        let (tx_release, rx_release) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _g = lock(&store);
+            tx_locked.send(()).expect("sinaliza travado");
+            rx_release.recv().expect("segura até liberar");
+        });
+        rx_locked.recv().expect("store travado pela outra thread");
+
+        // sync com o store contendido: não bloqueia, não vê s2 ainda.
+        let items = hub.sync(2_000);
+        assert_eq!(items.len(), 1, "store ocupado → tick pula a leitura (sem freeze)");
+        assert!(items.iter().all(|i| i.stable_id != "s2"), "s2 ainda não entrou");
+
+        tx_release.send(()).expect("libera o lock");
+        holder.join().expect("thread do lock encerra");
+
+        // store livre → próximo tick aplica o delta represado.
+        let items = hub.sync(3_000);
+        assert_eq!(items.len(), 2, "store livre → s2 entra no tick seguinte");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -9191,6 +9342,8 @@ mod tests {
             "TerminalSpawned",
             "NodeRenamed",
             "NodeRoleAssigned",
+            // F3-0-4: o effort de nascimento do nó fecha o lote atômico de admissão (par do NodeAdded).
+            "EffortAssigned",
         ];
 
         // Porta 1 — ⌘T / botão +.
@@ -9258,9 +9411,12 @@ mod tests {
                 "TerminalSpawned",
                 "NodeRenamed",
                 "NodeRoleAssigned",
-                "CliProfileSet"
+                // O `CliProfileSet` (motor) é parte do lote de `admission_events`; o `EffortAssigned`
+                // (F3-0-4) é o PUSH final do lote → fecha a sequência por último.
+                "CliProfileSet",
+                "EffortAssigned"
             ],
-            "profile conhecido → CliProfileSet SEMPRE que houver"
+            "profile conhecido → CliProfileSet no lote; EffortAssigned fecha (F3-0-4)"
         );
         // Payloads do motor: o RÓTULO no TerminalSpawned.cli e o id no CliProfileSet.
         let engine_events: Vec<_> = lock(&store)
@@ -9889,6 +10045,7 @@ mod tests {
             "BUG_FIXER",
             "n-0197-deadbeef",
             Autonomy::Manual,
+            Effort::Medium,
             std::path::Path::new("/tmp/ws-do-no/.lina"),
         );
         let dbg = format!("{cmd:?}");
@@ -10335,6 +10492,7 @@ mod tests {
                 position: None,
                 requested_by: None,
                 autonomy: Autonomy::Assisted,
+                effort: Effort::Medium,
             })
             .expect("admite o terminal puro");
 
@@ -10859,6 +11017,7 @@ mod tests {
             position: Some((10.0, 20.0)),
             requested_by: None,
             autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
         })
         .expect("admissão");
         let proj = lock(&store).project().expect("project");
@@ -10893,6 +11052,7 @@ mod tests {
             position: None,
             requested_by: None,
             autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
         })
         .expect("nó restaurado com nome 'Terminal D'");
         let node = nm.add_node().expect("⌘T");

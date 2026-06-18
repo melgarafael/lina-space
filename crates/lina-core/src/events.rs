@@ -79,6 +79,94 @@ pub enum AwaitReason {
     Deadlock,
 }
 
+/// [12]/[9] Nível de raciocínio que o Maestro pede a um terminal (cap. 09, ponto [9] de
+/// Meadows — delay-de-raciocínio). Contrato **NEUTRO** entre CLIs: o mapeamento para a flag
+/// real de cada CLI (`--reasoning high`, env de thinking, …) é do **CLI Profile** (invariante
+/// #3). O core NUNCA conhece a sintaxe de um CLI específico — só `low/medium/high`. Serializa
+/// em `lowercase` para casar o vocabulário dos eventos (`EffortAssigned.effort: "high"`) e do
+/// `params.json` do expert. Default `Medium` (espelha [`SystemParams`](crate::SystemParams)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Effort {
+    /// O rótulo neutro `low`/`medium`/`high` — o vocabulário do `LINA_EFFORT` (ENV do PTY filho,
+    /// F3-0-4) e do campo `effort` dos eventos. Mantido como `&'static str` (espelha
+    /// `Autonomy::label`) para carimbar o ENV sem alocar nem depender do serializador.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+}
+
+/// F3-0-4 ([12]/[9]): de ONDE veio o effort de um [`DomainEvent::EffortAssigned`]. `Observed` = o
+/// app LEU o effort que o CLI já usa (linha 57 do doc-fonte — captura via session-watch); `Assigned`
+/// = o Maestro/humano/preset ESCOLHEU (linha 58 — atribuição). Serializa `lowercase`
+/// (`"observed"`/`"assigned"`) para a F3-0-7 auditar por string. Default CONSERVADOR `Observed`: um
+/// payload degradado/antigo NUNCA replaya como uma atribuição com autoridade (regra-mãe ADR 0007).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortOrigin {
+    #[default]
+    Observed,
+    Assigned,
+}
+
+/// F3-1 ([3] Objetivos, spec 52 §1): um critério de aceite OBSERVÁVEL de uma Goal/item — "algo que
+/// roda e se mede", NÃO "implementado". É o *setpoint* do laço de qualidade ([8] Feedback): o
+/// [`DomainEvent::ReviewVerdict`] confere a entrega contra estes critérios. `Debug` derivado (estilo
+/// da casa; exigido por [`crate::PlanItem`], que o contém e deriva `Debug`/`Eq`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceCriterion {
+    /// Legível ao humano leigo (narrado no card, sem jargão).
+    pub desc: String,
+    /// Como o critério é VERIFICADO. Aditivo: default `HumanReview` (degrada honesto — exige gate).
+    #[serde(default)]
+    pub check_kind: CheckKind,
+    /// Argumento do check: comando a rodar, caminho ou glob de teste. `None` em `HumanReview`.
+    #[serde(default)]
+    pub check_arg: Option<String>,
+}
+
+/// F3-1 ([3]/[8], spec 52 §1): COMO um [`AcceptanceCriterion`] é verificado. Default CONSERVADOR
+/// `HumanReview` (replay/payload sem o campo degrada para "exige humano", nunca para um check
+/// automático que se auto-aprova). **Segurança (spec 52 §Segurança 3):** `Command` é o VERIFICADOR,
+/// não um portal de execução arbitrária — o comando roda sob o mesmo `guard::decide` de qualquer
+/// ação; um critério `GatedHard` (deploy/pay/`rm -rf`) continua pedindo `Ask`. O critério verifica;
+/// ele não autoriza.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CheckKind {
+    /// Julgado por um humano (default seguro — exige gate).
+    #[default]
+    HumanReview,
+    /// Roda um comando; PASS sse exit 0. NUNCA roda ação `GatedHard` (ver doc do tipo).
+    Command,
+    /// Existência de um arquivo (caminho em `check_arg`).
+    FileExists,
+    /// Uma suíte de teste passa (glob/cmd em `check_arg`).
+    TestPass,
+}
+
+/// F3-1 ([8] Feedback negativo, spec 52 §3): o veredito de uma revisão — o sinal de erro do
+/// termostato de qualidade. `Pass` fecha o item; `Fail` realimenta o laço (re-despacho informado →
+/// escala de effort → gate humano no teto). É DADO transportado por [`DomainEvent::ReviewVerdict`],
+/// JAMAIS autoridade: um `Pass` NUNCA libera uma ação `GatedHard` (spec 52 §Segurança 1; o gate de
+/// `guard.rs` permanece soberano).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    Pass,
+    Fail,
+}
+
 /// F1-1-6: QUAL camada detectou o pedido de permissão (campo `evidence` do
 /// [`DomainEvent::PermissionAsked`]). Serializa em `snake_case` (`"hook"`/`"grid"`).
 /// `Hook` = detecção primária (Notification correlacionada ao `PreToolUse` pendente);
@@ -410,6 +498,63 @@ pub enum DomainEvent {
     CostCeilingResumed {
         day: String,
     },
+    /// F3-0-2 ([12] Parâmetros, spec 51 §4): um parâmetro do sistema foi sobrescrito acima do
+    /// default, numa das 4 camadas. META — sem efeito na projeção do canvas; o [`ParamsLedger`]
+    /// (`params.rs`) reconstrói a camada efetiva por replay (mesmo padrão do `CostLedger`). Livro-
+    /// razão das calibrações: apendado SÓ quando o valor MUDA (anti-amplificação, como o
+    /// `RouteBlocked`). ADITIVO: `#[serde(default)]` nos opcionais → logs antigos sem o evento
+    /// replayam intactos.
+    ///
+    /// **Segurança (regra-mãe, família ADR 0007):** `by`/`scope`/`target` são CARIMBO server-side
+    /// derivado do binding de quem aplica (humano via CLI = `"human"`; agente em cascata =
+    /// `"maestro"`; preset = `"preset:<slug>"`), JAMAIS lidos do payload de um agente — um nó não
+    /// forja `by:"human"` nem escala de camada. O carimbo é do emissor (F3-0-5); o evento transporta.
+    SystemParamsChanged {
+        /// Chave canônica do parâmetro (ex.: `"fanout_gate"`, `"effort"`).
+        key: String,
+        /// Camada que aplicou: `"global"` | `"workspace"` | `"preset"` | `"terminal"`.
+        scope: String,
+        /// Valor APLICADO, serializado como string (auditável sem schema rígido — espelha `old`).
+        new: String,
+        /// Alvo quando `scope="terminal"` (NodeId) ou `"preset"` (slug); `None` p/ workspace/global.
+        #[serde(default)]
+        target: Option<String>,
+        /// Valor ANTERIOR efetivo nesta camada (`""` = era None/herdado).
+        #[serde(default)]
+        old: String,
+        /// Quem aplicou (carimbo server-side): `"human"` | `"maestro"` | `"preset:<slug>"`.
+        #[serde(default)]
+        by: Option<String>,
+    },
+    /// F3-0-4 ([12]/[9], spec 51 §4): effort (e modelo correlacionado) OBSERVADO ou ATRIBUÍDO a um
+    /// nó. É a PROJEÇÃO por-nó que alimenta o badge `modelo·effort` do card (linha 57) e o knob de
+    /// atribuição do Maestro (linha 58). META — sem efeito na projeção do canvas (o badge varre o
+    /// log, padrão CostLedger). ADITIVO (`#[serde(default)]` nos opcionais).
+    ///
+    /// **Segurança (regra-mãe, ADR 0007):** `origin`/`by`/`task_difficulty` são CARIMBO server-side
+    /// (do binding de quem atribui), JAMAIS lidos do payload de um agente — um nó não se
+    /// auto-atribui `origin:assigned`/`effort:high` para gastar mais tokens (a auto-declaração é, no
+    /// máximo, `observed`). O carimbo é do emissor (admit_node / `lina effort`); o evento transporta.
+    EffortAssigned {
+        /// O nó alvo (nome `@Nome` ou a `key` durável — o que o emissor tiver no momento).
+        node: String,
+        /// Nível efetivo (low/medium/high).
+        effort: Effort,
+        /// Modelo correlacionado, se conhecido (`None` = só o effort).
+        #[serde(default)]
+        model: Option<String>,
+        /// Origem do carimbo: observado (leitura) vs atribuído (escolha). Default `observed`.
+        #[serde(default)]
+        origin: EffortOrigin,
+        /// Dificuldade que motivou a atribuição (`"trivial"`/`"standard"`/`"hard"`) — só em
+        /// `assigned`, carimbado server-side. `None` em `observed`.
+        #[serde(default)]
+        task_difficulty: Option<String>,
+        /// Quem atribuiu (carimbo server-side do binding): `Some(NodeId)` = um agente/Maestro;
+        /// `None` = gesto humano direto OU observação. Nunca lido do payload do agente.
+        #[serde(default)]
+        by: Option<NodeId>,
+    },
     /// W3-5: um item foi semeado no plano compartilhado (`status:todo`, `@owner:?`).
     PlanItemAdded {
         item: String,
@@ -431,6 +576,112 @@ pub enum DomainEvent {
         id: String,
         item: String,
         by: String,
+    },
+    /// F3-1 ([3] Objetivos, spec 52 §1): a Goal foi DECLARADA — âncora de todos os eventos da meta.
+    /// Variante NOVA → sem `serde(default)` nos campos (replay antigo nunca a encontra; precedente
+    /// `SpawnRequested`). META no `apply` do canvas; a projeção [`crate::Goal`] reconstrói por replay.
+    GoalDefined {
+        /// UUIDv7 estável, cunhado pelo SUPERVISOR (NÃO pelo payload do agente — spec 52 §Segurança 2).
+        goal_id: String,
+        /// O pedido bruto do humano/origem (doc-fonte linha 10). Dado, JAMAIS autoridade.
+        statement: String,
+        /// Liga a Goal ao âncora de escopo existente (`Router::derive_root_hops`). Carimbado pelo
+        /// binding interno — NUNCA de `msg.root_cause_id` (spec 52 §Segurança 2).
+        root_cause_id: String,
+        /// Quem originou: `"@Maestro"` | `"@Tradutor"` | `"cron:<id>"` (ponto 5 / doc linha 86).
+        /// Rótulo de PROVENIÊNCIA, não credencial.
+        origin: String,
+        /// Orçamento de tokens da meta. `0` = herda o `token_budget_day` do workspace.
+        budget_tokens: u64,
+    },
+    /// F3-1 ([3], spec 52 §1): o Maestro/Tradutor INTERPRETOU a meta e propõe estratégia + critérios.
+    /// SUGERE — não autoriza nada (o gate é o `GoalConfirmed` seguinte). Variante NOVA → sem
+    /// `serde(default)` nos campos.
+    GoalInterpreted {
+        goal_id: String,
+        /// O que o Maestro ENTENDEU do statement (doc linha 11). Dado transportado.
+        interpretation: String,
+        /// Estratégia de execução multi-terminal proposta (texto livre).
+        strategy: String,
+        /// Papéis sugeridos para o time (doc linha 12): `["Arquiteto","Backend",...]`.
+        proposed_team: Vec<String>,
+        /// Critérios OBSERVÁVEIS — o setpoint do laço (não "implementado").
+        acceptance_criteria: Vec<AcceptanceCriterion>,
+    },
+    /// F3-1 ([3]/[5], spec 52 §1): GATE HUMANO — o humano confirmou ou corrigiu a interpretação
+    /// (doc linha 11). Variante NOVA → sem `serde(default)` nos campos (exceto o marcado).
+    GoalConfirmed {
+        goal_id: String,
+        /// IDENTIDADE da camada de auth — carimbada pelo dir-dono do outbox autenticado (mesmo
+        /// binding de [`DomainEvent::SpawnRequested`]`.requested_by`), JAMAIS lida do campo `from`
+        /// do payload (spec 52 §Segurança 2). DADO transportado no evento, mas a AUTORIDADE é do
+        /// binding server-side: um `GoalConfirmed` forjado com `by` de outro nó é ignorado.
+        by: NodeId,
+        /// Se o humano corrigiu o entendimento antes de confirmar.
+        #[serde(default)]
+        amended_statement: Option<String>,
+    },
+    /// F3-1 ([3]/[4], spec 52 §1): a Goal foi decomposta em itens do plano (liga Goal → plano).
+    /// Variante NOVA → sem `serde(default)` nos campos.
+    GoalDecomposed {
+        goal_id: String,
+        /// ids dos `PlanItem` gerados (cada um atribuído via [`DomainEvent::PlanItemAttributed`]).
+        plan_items: Vec<String>,
+    },
+    /// F3-1 ([8] Feedback negativo, spec 52 §1): a Goal FECHOU. Só emitido quando TODO item da Goal
+    /// tem [`DomainEvent::ReviewVerdict`] `Pass` — fecha o termostato de qualidade. Variante NOVA →
+    /// sem `serde(default)` nos campos.
+    GoalAchieved {
+        goal_id: String,
+        /// Total de voltas do OUTER loop (turn-budget gasto).
+        iterations: u32,
+        /// id do `EventRecord` do `ReviewVerdict::Pass` que fechou o último item.
+        verdict_event_id: String,
+    },
+    /// F3-1 ([8]/[9], spec 52 §1): a Goal foi ESCALADA ao humano sem fechar (backstop do loop).
+    /// PAUSA, não mata — resumível (mesma doutrina de `CostCeilingHit`/`CircuitOpened`: gate, nunca
+    /// kill). Variante NOVA → sem `serde(default)` nos campos.
+    GoalEscalated {
+        goal_id: String,
+        /// String tolerante a evolução (precedente `SpawnGated.reason`): razões novas não quebram
+        /// replay. Vocabulário canônico: `"turn_budget_exhausted"` | `"budget_exceeded"` |
+        /// `"human_cancelled"` | `"judge_unreliable"` | `"stalled"`.
+        reason: String,
+    },
+    /// F3-1 ([3]/[4], spec 52 §2): atribui Goal + dependências + DoD a um item JÁ semeado.
+    /// Idempotente por item (último vence). EFETIVO no `apply` (muta o [`crate::Plan`] projetado).
+    /// Variante NOVA → sem `serde(default)` nos campos.
+    PlanItemAttributed {
+        item: String,
+        goal_id: Option<String>,
+        parents: Vec<String>,
+        acceptance: Vec<AcceptanceCriterion>,
+        budget_tokens: u64,
+    },
+    /// F3-1 ([8] Feedback negativo, spec 52 §3): veredito de revisão sobre a entrega de um item — o
+    /// sinal de erro do laço de qualidade. Variante NOVA → sem `serde(default)` nos campos (exceto os
+    /// marcados). META no `apply`; a projeção [`crate::Goal`] varre por `goal_id`.
+    ///
+    /// **Segurança (spec 52 §Segurança 1):** `evidence`/`defect_class` são DADO transportado, JAMAIS
+    /// autoridade — um `verdict: Pass` NUNCA libera uma ação `GatedHard` (`guard.rs` segue soberano).
+    ReviewVerdict {
+        goal_id: String,
+        plan_item: String,
+        /// Nó revisado (o "desenvolvedor" do doc).
+        target: NodeId,
+        /// Quem emitiu o veredito — juiz estrutural (supervisor) ou nó QA. Carimbado server-side,
+        /// NUNCA o `target` (juiz ≠ executor, spec 52 §3): o auto-veredito é rejeitado pela lógica.
+        reviewer: NodeId,
+        verdict: Verdict,
+        /// Evidência arquivo:linha do FAIL (vazia em `Pass`) — saída OBSERVADA do check, não "ok".
+        #[serde(default)]
+        evidence: String,
+        /// `qualidade` | `seguranca` | `regressao` | `criterio_nao_cumprido`.
+        #[serde(default)]
+        defect_class: String,
+        /// nº da iteração do OUTER loop para este item (ganho corrente do termostato).
+        #[serde(default)]
+        iteration: u32,
     },
     NoteUpdated {
         name: String,
@@ -728,6 +979,22 @@ pub enum DomainEvent {
         /// `serde(default)`: `SpawnRequested` de logs F1-3-6 (sem o campo) replaya com `""`.
         #[serde(default)]
         prompt: String,
+        /// F3-0-3 (ADR 0031): modelo PEDIDO para o novo terminal (alias do CLI Profile, invariante
+        /// #3) — preferência de EXECUÇÃO, NÃO autoridade (a autoridade de origem é `requested_by`/
+        /// `root_cause_id`, server-side). `None` = o que o CLI já usa. ADITIVO via `serde(default)`:
+        /// logs de spawn pré-F3-0-3 replayam com `None`.
+        #[serde(default)]
+        model: Option<String>,
+        /// F3-0-3 (ADR 0031): nível de raciocínio PEDIDO (contrato neutro low/medium/high). Mesma
+        /// natureza de `model`: preferência transportada, não autoridade. O effort EFETIVO (ENV +
+        /// `EffortAssigned`) é aplicado em F3-0-4; aqui só transita o pedido. ADITIVO.
+        #[serde(default)]
+        effort: Option<Effort>,
+        /// F3-1 (spec 52 §4): a Goal que JUSTIFICA o recurso — auditoria (`SpawnRequested` ligado à
+        /// meta que o motivou). `None` = spawn não atrelado a Goal (comportamento legado). ADITIVO
+        /// via `serde(default)`: logs de spawn pré-F3-1 replayam com `None`.
+        #[serde(default)]
+        goal_id: Option<String>,
     },
     /// F1-3-6 (ADR 0019 §6): o gate barrou/adiou um spawn (livro-razão da DECISÃO, par do
     /// `SpawnRequested`). `reason` ∈ {`cascade`,`over_cap`,`manual`,`cost`} — String (não enum) de
@@ -878,10 +1145,20 @@ impl DomainEvent {
             DomainEvent::TokenUsageReported { .. } => "TokenUsageReported",
             DomainEvent::CostCeilingHit { .. } => "CostCeilingHit",
             DomainEvent::CostCeilingResumed { .. } => "CostCeilingResumed",
+            DomainEvent::SystemParamsChanged { .. } => "SystemParamsChanged",
+            DomainEvent::EffortAssigned { .. } => "EffortAssigned",
             DomainEvent::PlanItemAdded { .. } => "PlanItemAdded",
             DomainEvent::PlanDecisionAdded { .. } => "PlanDecisionAdded",
             DomainEvent::PlanClaimed { .. } => "PlanClaimed",
             DomainEvent::PlanChecked { .. } => "PlanChecked",
+            DomainEvent::GoalDefined { .. } => "GoalDefined",
+            DomainEvent::GoalInterpreted { .. } => "GoalInterpreted",
+            DomainEvent::GoalConfirmed { .. } => "GoalConfirmed",
+            DomainEvent::GoalDecomposed { .. } => "GoalDecomposed",
+            DomainEvent::GoalAchieved { .. } => "GoalAchieved",
+            DomainEvent::GoalEscalated { .. } => "GoalEscalated",
+            DomainEvent::PlanItemAttributed { .. } => "PlanItemAttributed",
+            DomainEvent::ReviewVerdict { .. } => "ReviewVerdict",
             DomainEvent::NoteUpdated { .. } => "NoteUpdated",
             DomainEvent::DiscoveryIndexed { .. } => "DiscoveryIndexed",
             DomainEvent::NoteCreated { .. } => "NoteCreated",
@@ -1182,6 +1459,21 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::PlanDecisionAdded { text } => state.plan.apply_decision_added(text.clone()),
         DomainEvent::PlanClaimed { item, by, .. } => state.plan.apply_claimed(item, by),
         DomainEvent::PlanChecked { item, by, .. } => state.plan.apply_checked(item, by),
+        // F3-1 (spec 52 §2): atributos da Goal são EFETIVOS no plano projetado (último vence por
+        // item) — mesma família validada-no-comando/infalível-no-replay dos demais `Plan*`.
+        DomainEvent::PlanItemAttributed {
+            item,
+            goal_id,
+            parents,
+            acceptance,
+            budget_tokens,
+        } => state.plan.apply_item_attributed(
+            item,
+            goal_id.clone(),
+            parents.clone(),
+            acceptance.clone(),
+            *budget_tokens,
+        ),
         // W4-1: a indexação corrente substitui a anterior (último check-up vence).
         DomainEvent::DiscoveryIndexed { clis } => state.discovered_clis = clis.clone(),
         // W4-2 (P4): o CLI Profile do nó é projetado no campo `cli` (idempotente por nó).
@@ -1241,6 +1533,22 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::TokenUsageReported { .. }
         | DomainEvent::CostCeilingHit { .. }
         | DomainEvent::CostCeilingResumed { .. }
+        // F3-0-2: mudança de parâmetro é META — o `ParamsLedger` (params.rs) reconstrói a config
+        // efetiva varrendo o log (padrão CostLedger); sem efeito na projeção do canvas.
+        | DomainEvent::SystemParamsChanged { .. }
+        // F3-0-4: effort observado/atribuído é META — o badge `modelo·effort` varre o log; o nó
+        // não muda de status nem de posição por isto (sem efeito na projeção do canvas).
+        | DomainEvent::EffortAssigned { .. }
+        // F3-1: o ciclo da Goal é META no apply do canvas; a projeção `Goal` (goal.rs) reconstrói por
+        // replay varrendo por `goal_id` — padrão CostLedger/ParamsLedger; sem efeito na projeção do
+        // canvas. (`PlanItemAttributed` é a exceção EFETIVA — muta o Plan, tratado acima.)
+        | DomainEvent::GoalDefined { .. }
+        | DomainEvent::GoalInterpreted { .. }
+        | DomainEvent::GoalConfirmed { .. }
+        | DomainEvent::GoalDecomposed { .. }
+        | DomainEvent::GoalAchieved { .. }
+        | DomainEvent::GoalEscalated { .. }
+        | DomainEvent::ReviewVerdict { .. }
         | DomainEvent::NoteUpdated { .. }
         // W4-2 (M3/M4): criação de nota/pasta é META (o nó é criado via `NodeAdded`); registra o
         // fato do artefato no log, sem efeito na projeção do canvas (mesmo padrão de `NoteUpdated`).
@@ -1675,6 +1983,38 @@ impl EventStore {
         Ok(out)
     }
 
+    /// Registros do log com `seq > after_seq`, em ordem de `seq` (só-leitura). É a leitura
+    /// INCREMENTAL: o consumidor mantém um cursor do último `seq` aplicado e busca só o delta —
+    /// `seq > último` é sempre correto, inclusive para appends de OUTRO processo (mesma garantia
+    /// do cache de [`project`]). Tira o `O(N)` do full-`events()` dos consumidores quentes
+    /// (ex.: o heartbeat da Fila de Atenção, que roda na thread de UI a até 30Hz).
+    pub fn events_since(&self, after_seq: u64) -> Result<Vec<EventRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, ts, kind, version, payload FROM events WHERE seq > ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([after_seq as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, ts, kind, version, payload_str) = row?;
+            out.push(EventRecord {
+                seq: seq as u64,
+                ts: ts as u64,
+                kind,
+                version: version as u32,
+                payload: serde_json::from_str(&payload_str)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Caminho do diretório do workspace.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -1928,6 +2268,36 @@ mod tests {
             store.project().expect("project quente"),
             "snapshot + delta = fold completo"
         );
+    }
+
+    /// `events_since(cursor)` devolve SÓ o delta `seq > cursor`, em ordem, e concatenar os deltas
+    /// reconstitui `events()` — a leitura incremental que substitui o full-replay na thread de UI.
+    #[test]
+    fn events_since_returns_only_delta_in_order() {
+        let tmp = TempDir::new("events-since");
+        let mut store = EventStore::open(tmp.path()).expect("abrir");
+        for i in 0..6u64 {
+            store
+                .append(&DomainEvent::TokenUsageReported {
+                    node: format!("n{i}"),
+                    tokens: i,
+                })
+                .expect("append");
+        }
+        let all = store.events().expect("events");
+        assert_eq!(all.len(), 6);
+
+        // delta a partir do 3º seq → só os de seq maior, em ordem ASC.
+        let cursor = all[2].seq;
+        let delta = store.events_since(cursor).expect("events_since");
+        assert_eq!(delta.len(), 3, "três eventos após o cursor");
+        assert!(delta.iter().all(|r| r.seq > cursor), "todos seq > cursor");
+        assert!(delta.windows(2).all(|w| w[0].seq < w[1].seq), "ordem ASC");
+
+        // cursor no topo → vazio (ocioso: nada novo, custo desprezível).
+        assert!(store.events_since(all[5].seq).expect("vazio").is_empty());
+        // cursor 0 → equivale ao log inteiro.
+        assert_eq!(store.events_since(0).expect("desde 0").len(), all.len());
     }
 
     /// **r5 perf-ws — `WorkspaceUnloaded` é META e aditivo:** replay com o evento no log
@@ -3242,6 +3612,9 @@ mod tests {
                     root_cause_id: "msg_root".into(),
                     hops: 1,
                     prompt: "valide o checkout".into(),
+                    model: Some("opus".into()),
+                    effort: Some(Effort::High),
+                    goal_id: None,
                 },
                 "SpawnRequested",
             ),
@@ -3292,5 +3665,106 @@ mod tests {
             state, before,
             "eventos de spawn/skill são META (apply não projeta)"
         );
+    }
+
+    /// F3-0-3 (ADR 0031) / F3-1 (spec 52 §4): `SpawnRequested` ganhou `model`/`effort` (preferência de
+    /// execução) e `goal_id` (a Goal que justifica o recurso) — TODOS ADITIVOS. Roundtrip preserva; e
+    /// um log F1-3-6 SEM as chaves replaya com `None` (serde default) — compat total com spawns já no
+    /// log.
+    #[test]
+    fn spawn_requested_model_effort_are_additive() {
+        let ev = DomainEvent::SpawnRequested {
+            id: "msg_x".into(),
+            requested_by: Uuid::now_v7(),
+            name: "@QA".into(),
+            role: "qa".into(),
+            root_cause_id: "msg_root".into(),
+            hops: 0,
+            prompt: "valide".into(),
+            model: Some("opus".into()),
+            effort: Some(Effort::High),
+            goal_id: Some("g_01".into()),
+        };
+        let back: DomainEvent = serde_json::from_value(serde_json::to_value(&ev).unwrap()).unwrap();
+        assert_eq!(back, ev, "roundtrip preserva model/effort/goal_id");
+
+        // Log ANTIGO (sem as chaves) → replaya com None.
+        let mut v = serde_json::to_value(&ev).unwrap();
+        let obj = v.as_object_mut().expect("objeto");
+        obj.remove("model");
+        obj.remove("effort");
+        obj.remove("goal_id");
+        match serde_json::from_value::<DomainEvent>(v).expect("desserializa log antigo") {
+            DomainEvent::SpawnRequested {
+                model,
+                effort,
+                goal_id,
+                ..
+            } => {
+                assert_eq!(model, None, "log antigo sem model → None");
+                assert_eq!(effort, None, "log antigo sem effort → None");
+                assert_eq!(goal_id, None, "log antigo sem goal_id → None");
+            }
+            other => panic!("variante errada: {other:?}"),
+        }
+    }
+
+    /// F3-0-4 (ADR 0031): `EffortAssigned` é META, roundtripa, serializa as strings que a F3-0-7
+    /// audita (`effort:"high"`, `origin:"assigned"`), e seus campos opcionais são ADITIVOS — um log
+    /// parcial (só `node`+`effort`) replaya com `origin` no default CONSERVADOR (`observed`, nunca
+    /// `assigned`) e o resto `None`.
+    #[test]
+    fn effort_assigned_roundtrips_meta_and_additive() {
+        let ev = DomainEvent::EffortAssigned {
+            node: "@QA".into(),
+            effort: Effort::High,
+            model: Some("opus".into()),
+            origin: EffortOrigin::Assigned,
+            task_difficulty: Some("hard".into()),
+            by: Some(Uuid::now_v7()),
+        };
+        assert_eq!(ev.kind(), "EffortAssigned");
+        let back: DomainEvent =
+            serde_json::from_value(serde_json::to_value(&ev).unwrap()).unwrap();
+        assert_eq!(back, ev, "roundtrip preserva todos os campos");
+
+        // META: apply não toca a projeção.
+        let mut state = ProjectedState::default();
+        let before = state.clone();
+        apply(&mut state, &ev);
+        assert_eq!(state, before, "EffortAssigned é META");
+
+        // A superfície serializada casa o que a F3-0-7 audita (`ev["origin"].as_str()` etc.).
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["effort"].as_str(), Some("high"));
+        assert_eq!(v["origin"].as_str(), Some("assigned"));
+
+        // Log PARCIAL (só node+effort) → origin default conservador (observed), resto None.
+        let legacy = serde_json::json!({"event":"EffortAssigned","node":"@X","effort":"low"});
+        match serde_json::from_value::<DomainEvent>(legacy).expect("parcial") {
+            DomainEvent::EffortAssigned {
+                effort,
+                origin,
+                by,
+                model,
+                task_difficulty,
+                ..
+            } => {
+                assert_eq!(effort, Effort::Low);
+                assert_eq!(origin, EffortOrigin::Observed, "default conservador ≠ assigned");
+                assert_eq!(by, None);
+                assert_eq!(model, None);
+                assert_eq!(task_difficulty, None);
+            }
+            other => panic!("variante errada: {other:?}"),
+        }
+    }
+
+    /// `Effort::label()` é o vocabulário neutro low/medium/high do `LINA_EFFORT` e dos eventos.
+    #[test]
+    fn effort_label_is_lowercase_neutral() {
+        assert_eq!(Effort::Low.label(), "low");
+        assert_eq!(Effort::Medium.label(), "medium");
+        assert_eq!(Effort::High.label(), "high");
     }
 }

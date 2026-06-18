@@ -12,6 +12,7 @@
 //!   rodam no replay ([`crate::apply`]). Comando e aplicador partilham a mutação-núcleo, então o
 //!   `plan.md` ao-vivo e o reconstruído convergem byte-a-byte.
 
+use crate::events::AcceptanceCriterion;
 use serde::{Deserialize, Serialize};
 
 /// Versão do formato canônico de `.lina/plan.md` (parser rígido).
@@ -94,6 +95,20 @@ pub struct PlanItem {
     /// Dono atual (`@Nome`) ou `None` para `@owner:?`.
     pub owner: Option<String>,
     pub status: ItemState,
+    /// F3-1 (spec 52 §2): a qual Goal este item serve (`None` = item avulso, comportamento legado).
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    /// F3-1 (spec 52 §2): dependências ESTRUTURADAS (ids de outros `PlanItem`) — corrige a
+    /// incoerência skill↔código (`lina-orchestration` já fala `parents:`; o código passa a tê-lo).
+    /// A guarda que bloqueia despacho até os parents estarem `Done` é da fatia CORE-Plan.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    /// F3-1 (spec 52 §2): DoD por item — critérios verificados para emitir o `ReviewVerdict`.
+    #[serde(default)]
+    pub acceptance: Vec<AcceptanceCriterion>,
+    /// F3-1 (spec 52 §2): orçamento de tokens deste item (`0` = sem teto próprio; herda a Goal).
+    #[serde(default)]
+    pub budget_tokens: u64,
 }
 
 /// O plano compartilhado — projeção do event log, serializável em `.lina/plan.md`.
@@ -232,7 +247,30 @@ impl Plan {
                 desc,
                 owner: None,
                 status: ItemState::Todo,
+                goal_id: None,
+                parents: Vec::new(),
+                acceptance: Vec::new(),
+                budget_tokens: 0,
             });
+        }
+    }
+
+    /// F3-1 (spec 52 §2): projeta `PlanItemAttributed` (replay) — atribui Goal + dependências + DoD a
+    /// um item já semeado. Idempotente por item (último vence); item inexistente → no-op (espelha a
+    /// robustez de [`Self::apply_claimed`]).
+    pub(crate) fn apply_item_attributed(
+        &mut self,
+        item: &str,
+        goal_id: Option<String>,
+        parents: Vec<String>,
+        acceptance: Vec<AcceptanceCriterion>,
+        budget_tokens: u64,
+    ) {
+        if let Some(it) = self.find_mut(item) {
+            it.goal_id = goal_id;
+            it.parents = parents;
+            it.acceptance = acceptance;
+            it.budget_tokens = budget_tokens;
         }
     }
 
@@ -423,6 +461,13 @@ fn parse_item(line: &str) -> Result<PlanItem, PlanError> {
         desc,
         owner,
         status: state,
+        // F3-1: os atributos da Goal não vivem na gramática rígida desta fatia (a serialização dos
+        // sufixos `@goal:`/`@parents:`/`@accept:` é da fatia CORE-Plan); a linha legada parseia com
+        // os defaults, preservando o round-trip byte-a-byte.
+        goal_id: None,
+        parents: Vec::new(),
+        acceptance: Vec::new(),
+        budget_tokens: 0,
     })
 }
 
@@ -489,24 +534,40 @@ mod tests {
             desc: "a".into(),
             owner: None,
             status: ItemState::Todo,
+            goal_id: None,
+            parents: Vec::new(),
+            acceptance: Vec::new(),
+            budget_tokens: 0,
         });
         p.itens.push(PlanItem {
             id: "B".into(),
             desc: "b".into(),
             owner: Some("@x".into()),
             status: ItemState::Doing,
+            goal_id: None,
+            parents: Vec::new(),
+            acceptance: Vec::new(),
+            budget_tokens: 0,
         });
         p.itens.push(PlanItem {
             id: "C".into(),
             desc: "c".into(),
             owner: Some("@y".into()),
             status: ItemState::Done,
+            goal_id: None,
+            parents: Vec::new(),
+            acceptance: Vec::new(),
+            budget_tokens: 0,
         });
         p.itens.push(PlanItem {
             id: "D".into(),
             desc: "d".into(),
             owner: None,
             status: ItemState::Blocked,
+            goal_id: None,
+            parents: Vec::new(),
+            acceptance: Vec::new(),
+            budget_tokens: 0,
         });
         let back = Plan::parse(&p.render()).unwrap();
         assert_eq!(back, p);
