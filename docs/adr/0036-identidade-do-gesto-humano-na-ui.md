@@ -1,6 +1,6 @@
 # ADR 0036 — Identidade do gesto humano direto na UI (confirm/correct da Goal)
 
-- **Status:** Proposto (decisão de PORTA; a IMPLEMENTAÇÃO do disparo-UI vem em fatia dedicada).
+- **Status:** ✅ Aceito (2026-06-18, pelo fundador) — destrava a fatia do confirm-1-toque pela UI (`human_intent` in-process carimba `by="human"`).
 - **Onda/Story:** F3-1-7 (card da Goal) — escalado pelo Terminal G no wiring (recusou-se a forjar `by`, escalou).
 - **Data:** 2026-06-18
 - **Fontes:** spec 52 §Seg2 (proíbe escolher `by` no cliente) · família ADR 0007 (campo escrito por agente nunca decide autoridade) · ADR 0021 (aprovação custodiada) · invariante de stack (processo único, GPU-first) · código: `app/lina-gpui/src/goal_card.rs` (`on_confirm`), `crates/lina-core/src/router.rs` (handler `goal.confirm`, `derive_root_hops`), `mailbox.rs` (auth por dir-dono).
