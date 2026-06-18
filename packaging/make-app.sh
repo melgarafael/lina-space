@@ -58,14 +58,19 @@ echo "==> [2/4] montando $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp "$GPUI_BIN" "$APP/Contents/MacOS/$EXE_NAME"
+# O binário GUI real entra como "lina-gpui-bin". O CFBundleExecutable ($EXE_NAME =
+# "lina-gpui") é o LAUNCHER (packaging/bundle-launcher.sh): recompila automaticamente
+# quando o app é aberto de DENTRO do repo e dá exec no binário real. Fora do repo
+# (ex.: copiado p/ /Applications) o launcher só executa — seguro p/ distribuição.
+cp "$GPUI_BIN" "$APP/Contents/MacOS/lina-gpui-bin"
 cp "$LINA_BIN" "$APP/Contents/MacOS/lina"
+cp "$REPO_ROOT/packaging/bundle-launcher.sh" "$APP/Contents/MacOS/$EXE_NAME"
 # REGRA F1-4-7: o bundle copia por ALLOWLIST (acima). lina-keygen (ferramenta do fundador,
 # assina licencas) NUNCA entra no bundle — nao adicione cp dele aqui.
-chmod +x "$APP/Contents/MacOS/$EXE_NAME" "$APP/Contents/MacOS/lina"
+chmod +x "$APP/Contents/MacOS/lina-gpui-bin" "$APP/Contents/MacOS/lina" "$APP/Contents/MacOS/$EXE_NAME"
 # Guarda anti-colisão (APFS case-insensitive): o GUI e o CLI têm de ser arquivos DISTINTOS.
-if [[ "$(stat -f%z "$APP/Contents/MacOS/$EXE_NAME")" == "$(stat -f%z "$APP/Contents/MacOS/lina")" ]]; then
-  echo "AVISO: $EXE_NAME e lina têm o mesmo tamanho — possível colisão de nome (case-insensitive)." >&2
+if [[ "$(stat -f%z "$APP/Contents/MacOS/lina-gpui-bin")" == "$(stat -f%z "$APP/Contents/MacOS/lina")" ]]; then
+  echo "AVISO: lina-gpui-bin e lina têm o mesmo tamanho — possível colisão de nome (case-insensitive)." >&2
 fi
 
 # assets/ (doutrina + skill) ao lado do executável → o resolver acha por ancestral. Sem .git/target.
