@@ -124,6 +124,17 @@ pub fn escalation_notice(budget: u32) -> String {
     )
 }
 
+// ───────────────────────────── Microcopy do ciclo de correção ─────────────────────────────
+
+/// Título da seção quando o usuário clicou "Quero ajustar": deixa ÓBVIO que corrigir abre uma NOVA
+/// rodada de interpretação (o ciclo propor→corrigir→re-propor), não um simples "salvar texto". 1ª
+/// pessoa do sistema (mesma voz de "O que entendi" / "Tentei N vezes…"). Sem jargão — testado.
+pub const CORRECTION_TITLE: &str = "Me corrija que eu repenso";
+
+/// Dica de ação do editor de correção. O verbo é "envia" — não "salva" — porque o texto vai ao
+/// Maestro RE-INTERPRETAR, fechando o ciclo numa proposta nova; guia as duas teclas. Sem jargão.
+pub const CORRECTION_HINT: &str = "Escreva do seu jeito · Enter envia · Esc cancela";
+
 // ───────────────────────────── Barra de progresso por iteração ─────────────────────────────
 
 /// O tom da barra de progresso — cada um carrega um SIGNIFICADO (não decoração), espelhando os
@@ -180,10 +191,21 @@ pub fn progress(goal: &Goal, budget: u32) -> Progress {
         },
         GoalPhase::InLoop => {
             // `iterations` = voltas JÁ gastas; a tentativa em curso é a próxima (limitada ao budget).
-            let attempt = (goal.iterations + 1).min(budget.max(1));
+            // A FRAÇÃO carrega o avanço pelo orçamento; o RÓTULO traduz a rodada em ESTADO humano — o
+            // leigo nunca lê "tentativa N de M" (despacho F3-2-7): a 1ª passada é só trabalho; uma
+            // rodada do meio é um reajuste; a última admite o limite e PREPARA a escalada sem assustar.
+            let budget = budget.max(1);
+            let attempt = (goal.iterations + 1).min(budget);
+            let label = if attempt == 1 {
+                "Trabalhando nisso"
+            } else if attempt >= budget {
+                "Última tentativa antes de chamar você"
+            } else {
+                "Revisando e tentando de novo"
+            };
             Progress {
                 fraction: attempt_fraction(attempt, budget),
-                label: format!("Tentativa {attempt} de {}", budget.max(1)),
+                label: label.to_string(),
                 tone: ProgressTone::Working,
             }
         }
@@ -467,7 +489,7 @@ impl RenderOnce for GoalCard {
                     .flex()
                     .flex_col()
                     .gap(px(Space::Xs.px(&t)))
-                    .child(section_label(&t, "Ajustando o que entendi"))
+                    .child(section_label(&t, CORRECTION_TITLE))
                     .child(
                         Panel::surface()
                             .bg(Surface::RaisedAlt)
@@ -480,7 +502,7 @@ impl RenderOnce for GoalCard {
                             .font_family(t.typography.family.ui)
                             .text_size(px(f32::from(t.typography.size.small)))
                             .text_color(rgb(t.text.muted))
-                            .child(gpui::text!("Enter salva · Esc cancela")),
+                            .child(gpui::text!(CORRECTION_HINT)),
                     ),
             )
         } else {
@@ -759,6 +781,40 @@ mod tests {
         }
     }
 
+    /// O microcopy de "Quero ajustar" deixa ÓBVIO que o ajuste dispara uma RE-interpretação (o ciclo
+    /// propor→corrigir→re-propor, não um mero "salvar texto"), guia as duas teclas e não vaza jargão.
+    #[test]
+    fn correction_microcopy_signals_the_reinterpret_loop() {
+        assert!(!CORRECTION_TITLE.is_empty(), "a seção de ajuste tem título");
+        // A dica guia as duas teclas do ciclo (enviar a correção / cancelar).
+        assert!(CORRECTION_HINT.contains("Enter"), "diz como enviar");
+        assert!(CORRECTION_HINT.contains("Esc"), "diz como cancelar");
+        // "envia" (vai ao Maestro REPENSAR), nunca "salva" (mero texto): é o verbo que revela o loop.
+        let hint_low = CORRECTION_HINT.to_lowercase();
+        assert!(
+            hint_low.contains("envia") && !hint_low.contains("salva"),
+            "o verbo deixa claro que dispara nova interpretação, não só persiste texto: {CORRECTION_HINT:?}"
+        );
+        for jargon in [
+            "interpret",
+            "goal",
+            "reinterpret",
+            "payload",
+            "intent",
+            "verdict",
+            "loop",
+        ] {
+            assert!(
+                !CORRECTION_TITLE.to_lowercase().contains(jargon),
+                "título vazou jargão: {CORRECTION_TITLE:?}"
+            );
+            assert!(
+                !hint_low.contains(jargon),
+                "dica vazou jargão: {CORRECTION_HINT:?}"
+            );
+        }
+    }
+
     /// O aviso de escalada usa o budget vivo, admite a tentativa e oferece ESCOLHA (não erro cru).
     #[test]
     fn escalation_notice_narrates_with_live_budget() {
@@ -786,14 +842,28 @@ mod tests {
         assert_eq!(progress(&g, 3).fraction, 0.0);
         assert_eq!(progress(&g, 3).tone, ProgressTone::Working);
 
-        // No laço: tentativa 1 de 3 → 1/3; tentativa 3 de 3 → cheia (último ensaio em curso).
+        // No laço: a barra avança POR rodada (a FRAÇÃO é o sinal), mas o texto fala humano — o leigo
+        // lê um ESTADO, nunca "tentativa N de M" (despacho F3-2-7: traduzir, não expor o número).
         g.phase = GoalPhase::InLoop;
         g.iterations = 0;
         let p = progress(&g, 3);
-        assert_eq!(p.label, "Tentativa 1 de 3");
+        assert_eq!(
+            p.label, "Trabalhando nisso",
+            "1ª passada: trabalho, não 'tentativa'"
+        );
         assert!((p.fraction - 1.0 / 3.0).abs() < f32::EPSILON);
+        g.iterations = 1;
+        assert_eq!(
+            progress(&g, 3).label,
+            "Revisando e tentando de novo",
+            "rodada do meio: houve um ajuste, segue tentando"
+        );
         g.iterations = 2;
-        assert_eq!(progress(&g, 3).label, "Tentativa 3 de 3");
+        assert_eq!(
+            progress(&g, 3).label,
+            "Última tentativa antes de chamar você",
+            "última rodada: honesto sobre o limite, prepara a escalada sem assustar"
+        );
         assert!((progress(&g, 3).fraction - 1.0).abs() < f32::EPSILON);
 
         // Fechou: cheia e verde, não importa quantas voltas.
@@ -806,6 +876,48 @@ mod tests {
         // Escalou: congela cheia, tom de atenção (pausa, não erro).
         g.phase = GoalPhase::Escalated;
         assert_eq!(progress(&g, 3).tone, ProgressTone::Attention);
+    }
+
+    /// O rótulo da barra é estado em pt-br do leigo em TODA fase/rodada: zero jargão e **zero dígito**
+    /// — o número técnico da iteração ("tentativa N de M", o `effort`) nunca chega à tela; a FRAÇÃO
+    /// carrega o avanço, o TEXTO carrega o significado (despacho F3-2-7 · invariante #6).
+    #[test]
+    fn progress_label_is_layman_without_jargon_or_digits() {
+        let mut g = mock_goal();
+        for (phase, iters) in [
+            (GoalPhase::Defined, 0),
+            (GoalPhase::Interpreted, 0),
+            (GoalPhase::Confirmed, 0),
+            (GoalPhase::Decomposed, 0),
+            (GoalPhase::InLoop, 0),
+            (GoalPhase::InLoop, 1),
+            (GoalPhase::InLoop, 2),
+            (GoalPhase::InLoop, 9),
+            (GoalPhase::Achieved, 2),
+            (GoalPhase::Escalated, 3),
+        ] {
+            g.phase = phase;
+            g.iterations = iters;
+            let label = progress(&g, 3).label;
+            assert!(!label.is_empty(), "{phase:?}/{iters} tem rótulo");
+            let low = label.to_lowercase();
+            for jargon in [
+                "iteration",
+                "effort",
+                "loop",
+                "verdict",
+                "budget",
+                "goal",
+                "phase",
+                "review",
+            ] {
+                assert!(!low.contains(jargon), "{phase:?} vazou jargão: {label:?}");
+            }
+            assert!(
+                !label.chars().any(|c| c.is_ascii_digit()),
+                "{phase:?}/{iters} expôs número técnico de iteração: {label:?}"
+            );
+        }
     }
 
     /// A fração nunca estoura 0..=1 nem divide por zero (budget degenerado).
