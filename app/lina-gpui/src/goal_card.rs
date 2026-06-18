@@ -285,11 +285,16 @@ pub fn mock_goal() -> Goal {
 pub struct GoalCard {
     goal: Goal,
     iteration_budget: u32,
+    /// Recolhido = só o cabeçalho + a meta (faixa fina), para o card não cobrir o canvas. O estado
+    /// vive na view (por `goal_id`); o card só REFLETE e oferece o toggle.
+    collapsed: bool,
     /// Decisão afirmativa da fase (confirmar interpretação / reforçar time). `None` = botão inerte
     /// (pré-visualização). Recebe `cx.listener(...)`.
     on_confirm: Option<ClickHandler>,
     /// Decisão de ajuste (corrigir interpretação / olhar junto). `None` = botão inerte.
     on_correct: Option<ClickHandler>,
+    /// Toggle recolher/expandir (botão do cabeçalho). `None` = sem toggle (pré-visualização).
+    on_toggle: Option<ClickHandler>,
 }
 
 impl GoalCard {
@@ -300,9 +305,28 @@ impl GoalCard {
         Self {
             goal,
             iteration_budget: DEFAULT_ITERATION_BUDGET,
+            collapsed: false,
             on_confirm: None,
             on_correct: None,
+            on_toggle: None,
         }
+    }
+
+    /// Reflete o estado recolhido (a view é a dona). Recolhido esconde tudo menos o cabeçalho + a meta.
+    #[must_use]
+    pub fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+
+    /// Handler do toggle recolher/expandir (botão do cabeçalho). Passe `cx.listener(...)`.
+    #[must_use]
+    pub fn on_toggle(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle = Some(Box::new(handler));
+        self
     }
 
     /// O teto de iterações vivo (parâmetro de sistema, spec 51) — alimenta a barra e o aviso de escalada.
@@ -358,8 +382,19 @@ impl RenderOnce for GoalCard {
         let t = theme::active();
         let status = phase_status(self.goal.phase);
         let prog = progress(&self.goal, self.iteration_budget);
+        let collapsed = self.collapsed;
 
-        // Cabeçalho: rótulo "Sua meta" + selo de estado (Badge, que já anuncia troca via live-region).
+        // Botão recolher/expandir (discreto, ghost) — só quando a view fia o toggle.
+        let toggle = self.on_toggle.map(|h| {
+            Button::new(
+                "goal-collapse",
+                if collapsed { "expandir" } else { "recolher" },
+            )
+            .ghost()
+            .on_click(h)
+        });
+
+        // Cabeçalho: rótulo "Sua meta" + selo de estado + toggle (Badge anuncia troca via live-region).
         let header = div()
             .flex()
             .flex_row()
@@ -367,14 +402,22 @@ impl RenderOnce for GoalCard {
             .items_center()
             .gap(px(Space::Sm.px(&t)))
             .child(section_label(&t, "Sua meta"))
-            .child({
-                let badge = Badge::new("goal-phase", status.label, status.tone);
-                if status.needs_you {
-                    badge.needs_you()
-                } else {
-                    badge
-                }
-            });
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(Space::Sm.px(&t)))
+                    .child({
+                        let badge = Badge::new("goal-phase", status.label, status.tone);
+                        if status.needs_you {
+                            badge.needs_you()
+                        } else {
+                            badge
+                        }
+                    })
+                    .children(toggle),
+            );
 
         // Hero: a meta COMO O USUÁRIO DISSE — o "momento" do fundador (Fraunces autorizado aqui).
         let hero = div()
@@ -449,18 +492,21 @@ impl RenderOnce for GoalCard {
         // passamos a lista a `children`.
         let mut kids: Vec<gpui::AnyElement> =
             vec![header.into_any_element(), hero.into_any_element()];
-        if let Some(u) = understanding {
-            kids.push(u.into_any_element());
-        }
-        if let Some(c) = criteria {
-            kids.push(c.into_any_element());
-        }
-        kids.push(bar.into_any_element());
-        if let Some(e) = escalation {
-            kids.push(e.into_any_element());
-        }
-        if let Some(a) = actions {
-            kids.push(a.into_any_element());
+        // Recolhido: para no cabeçalho + a meta (faixa fina). Expandido: o card inteiro.
+        if !collapsed {
+            if let Some(u) = understanding {
+                kids.push(u.into_any_element());
+            }
+            if let Some(c) = criteria {
+                kids.push(c.into_any_element());
+            }
+            kids.push(bar.into_any_element());
+            if let Some(e) = escalation {
+                kids.push(e.into_any_element());
+            }
+            if let Some(a) = actions {
+                kids.push(a.into_any_element());
+            }
         }
 
         Panel::surface()

@@ -488,6 +488,9 @@ struct WorkspaceView {
     drag: Option<((f32, f32), (f32, f32))>,
     /// F2-3-1: gesto de MOVER um card (arrasto pela barra de título). `None` = sem gesto ativo.
     card_drag: Option<canvas::drag::CardDrag>,
+    /// F3-1-7: cards de Goal RECOLHIDOS (por `goal_id`) — estado de sessão (não persiste no log).
+    /// Recolhido = só cabeçalho + meta, para o card não cobrir o canvas.
+    collapsed_goals: std::collections::HashSet<String>,
     /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
     z_order: BTreeMap<NodeId, u64>,
     z_next: u64,
@@ -684,6 +687,7 @@ impl WorkspaceView {
             camera: Camera::default(),
             drag: None,
             card_drag: None,
+            collapsed_goals: std::collections::HashSet::new(),
             z_order: BTreeMap::new(),
             z_next: 0,
             sel: None,
@@ -2124,13 +2128,20 @@ impl WorkspaceView {
         for goal in goals {
             let gid_confirm = goal.goal_id.clone();
             let gid_correct = goal.goal_id.clone();
+            let gid_toggle = goal.goal_id.clone();
+            let is_collapsed = self.collapsed_goals.contains(&goal.goal_id);
             let card = goal_card::GoalCard::new(goal)
                 .iteration_budget(budget)
+                .collapsed(is_collapsed)
                 .on_confirm(cx.listener(move |view, _ev, window, cx| {
                     view.confirm_goal(&gid_confirm, window, cx);
                 }))
                 .on_correct(cx.listener(move |view, _ev, _window, cx| {
                     view.correct_goal(&gid_correct, cx);
+                }))
+                .on_toggle(cx.listener(move |view, _ev, _window, cx| {
+                    view.toggle_goal_collapsed(&gid_toggle);
+                    cx.notify();
                 }));
             // Largura amigável (≈42% da viewport): `relative` evita px mágico; o card centra na coluna.
             col = col.child(div().w(gpui::relative(0.42)).child(card));
@@ -2160,6 +2171,14 @@ impl WorkspaceView {
             "[GOAL] ajuste para goal {goal_id} — re-abrir goal.interpret (disparo autenticado pendente de costura)"
         );
         cx.notify();
+    }
+
+    /// F3-1-7: recolhe/expande o card de uma Goal (estado de sessão, por `goal_id`) — toggle puro
+    /// (presente no conjunto = recolhido). Não persiste no log: é preferência de visualização.
+    fn toggle_goal_collapsed(&mut self, goal_id: &str) {
+        if !self.collapsed_goals.remove(goal_id) {
+            self.collapsed_goals.insert(goal_id.to_string());
+        }
     }
 
     /// F1-1-5 (P6/fluxo c — wiring): o painel "Atividade e custos". Hierarquia do
