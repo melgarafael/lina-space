@@ -508,6 +508,9 @@ struct WorkspaceView {
     /// F3-1-7: editor inline do entendimento de uma Goal ("Quero ajustar") — `Some((goal_id, buffer))`
     /// enquanto o humano DIGITA a correção. Enter re-envia `goal.interpret` pelo canal humano; Esc fecha.
     editing_goal: Option<(String, String)>,
+    /// F3-1-7: metas FECHADAS (dispensadas) do canvas pelo usuário — DURÁVEL (espelha os settings). O
+    /// card não é mostrado; a meta segue no log (preferência de visualização). Carregado no boot.
+    dismissed_goals: std::collections::HashSet<String>,
     /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
     z_order: BTreeMap<NodeId, u64>,
     z_next: u64,
@@ -708,6 +711,11 @@ impl WorkspaceView {
             goal_drag: None,
             goal_offsets: std::collections::HashMap::new(),
             editing_goal: None,
+            // F3-1-7: restaura as metas que o usuário fechou em sessões anteriores (durável).
+            dismissed_goals: persistence_ui::load_settings(&settings_dir)
+                .dismissed_goals
+                .into_iter()
+                .collect(),
             z_order: BTreeMap::new(),
             z_next: 0,
             sel: None,
@@ -2129,10 +2137,12 @@ impl WorkspaceView {
     /// `confirm_goal`/`correct_goal`.
     fn render_goals_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         self.refresh_goals_cache();
-        let (goals, budget) = match &self.goals_cache {
+        let (mut goals, budget) = match &self.goals_cache {
             Some((_, g, b)) => (goal_card::surfaced(g.clone()), *b),
             None => return None,
         };
+        // F3-1-7: respeita as metas FECHADAS pelo usuário (durável) — somem da tela, seguem no log.
+        goals.retain(|g| !self.dismissed_goals.contains(&g.goal_id));
         if goals.is_empty() {
             return None;
         }
@@ -2149,6 +2159,7 @@ impl WorkspaceView {
             let gid_confirm = goal.goal_id.clone();
             let gid_correct = goal.goal_id.clone();
             let gid_toggle = goal.goal_id.clone();
+            let gid_dismiss = goal.goal_id.clone();
             let gid_drag = goal.goal_id.clone();
             let is_collapsed = self.collapsed_goals.contains(&goal.goal_id);
             let (ox, oy) = self
@@ -2171,6 +2182,10 @@ impl WorkspaceView {
                 }))
                 .on_toggle(cx.listener(move |view, _ev, _window, cx| {
                     view.toggle_goal_collapsed(&gid_toggle);
+                    cx.notify();
+                }))
+                .on_dismiss(cx.listener(move |view, _ev, _window, cx| {
+                    view.dismiss_goal(&gid_dismiss);
                     cx.notify();
                 }));
             // Largura amigável (≈42% da viewport). `relative` + left/top desloca o card pelo arrasto
@@ -2242,6 +2257,17 @@ impl WorkspaceView {
     fn toggle_goal_collapsed(&mut self, goal_id: &str) {
         if !self.collapsed_goals.remove(goal_id) {
             self.collapsed_goals.insert(goal_id.to_string());
+        }
+    }
+
+    /// F3-1-7: o usuário FECHA (dispensa) o card de uma meta — some da tela DURAVELMENTE (settings), sem
+    /// apagar a meta do log (segue auditável; é preferência de visualização). Idempotente: só re-grava
+    /// os settings na 1ª vez que aquela meta é fechada.
+    fn dismiss_goal(&mut self, goal_id: &str) {
+        if self.dismissed_goals.insert(goal_id.to_string()) {
+            let mut settings = persistence_ui::load_settings(&self.settings_dir);
+            settings.dismissed_goals = self.dismissed_goals.iter().cloned().collect();
+            persistence_ui::save_settings(&self.settings_dir, &settings);
         }
     }
 

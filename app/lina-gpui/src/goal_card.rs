@@ -295,6 +295,9 @@ pub struct GoalCard {
     on_correct: Option<ClickHandler>,
     /// Toggle recolher/expandir (botão do cabeçalho). `None` = sem toggle (pré-visualização).
     on_toggle: Option<ClickHandler>,
+    /// Fechar (dispensar) o card da tela — gesto DURÁVEL (a view persiste nos settings). `None` = sem
+    /// botão (pré-visualização).
+    on_dismiss: Option<ClickHandler>,
     /// Editor inline do entendimento ATIVO (`Some(buffer)` = o usuário clicou "Quero ajustar" e digita
     /// a correção). O buffer e o teclado vivem na view; o card só RENDERIZA o campo no lugar de "O que
     /// entendi".
@@ -313,8 +316,19 @@ impl GoalCard {
             on_confirm: None,
             on_correct: None,
             on_toggle: None,
+            on_dismiss: None,
             editing: None,
         }
+    }
+
+    /// Handler do botão fechar/dispensar (cabeçalho). Passe `cx.listener(...)`.
+    #[must_use]
+    pub fn on_dismiss(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_dismiss = Some(Box::new(handler));
+        self
     }
 
     /// Reflete o editor inline do entendimento (`Some(buffer)` = em edição). A view é a dona do buffer
@@ -406,6 +420,10 @@ impl RenderOnce for GoalCard {
             .ghost()
             .on_click(h)
         });
+        // Botão fechar/dispensar — tira o card da tela (durável; a meta segue no log).
+        let dismiss = self
+            .on_dismiss
+            .map(|h| Button::new("goal-dismiss", "fechar").ghost().on_click(h));
 
         // Cabeçalho: rótulo "Sua meta" + selo de estado + toggle (Badge anuncia troca via live-region).
         let header = div()
@@ -429,7 +447,8 @@ impl RenderOnce for GoalCard {
                             badge
                         }
                     })
-                    .children(toggle),
+                    .children(toggle)
+                    .children(dismiss),
             );
 
         // Hero: a meta COMO O USUÁRIO DISSE — o "momento" do fundador (Fraunces autorizado aqui).

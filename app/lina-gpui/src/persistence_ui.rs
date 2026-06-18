@@ -248,6 +248,11 @@ pub struct Settings {
     /// graciosamente sem MRU — tiers alias/fuzzy seguem).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub palette_mru: Vec<String>,
+    /// F3-1-7: metas que o usuário FECHOU (dispensou) do canvas — DURÁVEL entre sessões (por `goal_id`).
+    /// Preferência de VISUALIZAÇÃO (a meta segue no event log, intacta e auditável); o card só não é
+    /// mostrado. Aditivo: settings antigos carregam vazio (nada dispensado — todo card aparece).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_goals: Vec<String>,
 }
 
 fn default_accent_setting() -> String {
@@ -271,6 +276,7 @@ impl Default for Settings {
             // Instalação nova já nasce em "sistema" — nada a migrar (e o load não re-grava).
             theme_migrated_to_system: true,
             palette_mru: Vec::new(),
+            dismissed_goals: Vec::new(),
         }
     }
 }
