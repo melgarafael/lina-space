@@ -63,7 +63,11 @@ fn run(ws: &TempWs, args: &[&str]) -> std::process::Output {
         .args(args)
         .current_dir(&ws.cwd)
         .env("LINA_HOME", &ws.home)
+        // ADR 0026 / #17: o gate de autonomia testado aqui é o da FICHA — isola do env de spawn que
+        // um terminal do Lina injeta (rodar `cargo test` dentro do Espaço não pode mudar o `from`
+        // nem o nível; o env-first é provado em unit-test puro).
         .env_remove("LINA_NODE_NAME")
+        .env_remove("LINA_AUTONOMY")
         .output()
         .expect("executar o binário lina")
 }

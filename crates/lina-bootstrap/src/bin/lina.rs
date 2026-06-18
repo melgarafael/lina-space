@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use lina_bootstrap::{
     autonomy_from_env, canonical_role, classify_retro_args, parse_log_records, pretooluse_result,
     project_retro, render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk,
-    RetroInvocation,
+    RetroInvocation, AUTONOMY_ENV,
 };
 use lina_core::{
     check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, CheckKind,
@@ -128,12 +128,47 @@ fn resolved_name(env_name: Option<&str>, ficha_name: &str) -> String {
     }
 }
 
+/// Valor de [`AUTONOMY_ENV`] (`LINA_AUTONOMY`, trim; vazio = ausente — env vazio não apaga a ficha).
+fn env_autonomy() -> Option<String> {
+    let v = std::env::var(AUTONOMY_ENV).ok()?;
+    let t = v.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Rótulo de autonomia → enum. Aceita o pt-br do `Autonomy::label()` (o que o app injeta no env) e
+/// as formas serde en. Desconhecido → `None` (cai na ficha; NUNCA inventa um nível).
+fn parse_autonomy_label(s: &str) -> Option<Autonomy> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "manual" => Some(Autonomy::Manual),
+        "assistido" | "assisted" => Some(Autonomy::Assisted),
+        "autonomo" | "autônomo" | "autonomous" => Some(Autonomy::Autonomous),
+        _ => None,
+    }
+}
+
+/// **#17 residual (ADR 0026 / FIX-3) — autonomia env-first, função PURA:** o app injeta
+/// `LINA_AUTONOMY` POR-NÓ no PTY (`bridge.rs::node_identity_env`; autoridade do APP, por-processo).
+/// O GATE local de handoff/spawn/params/goal precisa honrar o nível DESTE nó — não o do
+/// `bootstrap.json` do cwd COMPARTILHADO, que é último-escritor-vence: com N terminais no mesmo cwd,
+/// um colega sobrescreve a ficha e o gate leria a autonomia ERRADA (liberar onde devia recusar).
+/// Env presente/legível vence; ausente/desconhecido → a ficha (compat standalone). Espelha
+/// [`resolved_name`] — mesma doutrina de identidade-no-env do ADR 0026.
+fn resolved_autonomy(env: Option<&str>, ficha: Autonomy) -> Autonomy {
+    env.and_then(parse_autonomy_label).unwrap_or(ficha)
+}
+
 /// Ficha com a IDENTIDADE RESOLVIDA (ADR 0026): carrega `.lina/bootstrap.json` e aplica a
-/// preferência de env SÓ em `terminal_name` — whoami/handshake/`enqueue_as` (outbox por-nó)
-/// passam a usar o nome certo mesmo com a ficha sobrescrita por um colega de cwd.
+/// preferência de env em `terminal_name` E `autonomy` (#17) — whoami/handshake/`enqueue_as`
+/// (outbox por-nó) e os GATES de delegação passam a usar o nome E o nível certos mesmo com a ficha
+/// sobrescrita por um colega de cwd. Demais campos (roster/vault/plano) seguem da ficha.
 fn load_identity() -> Result<BootstrapInput, String> {
     let mut input = load_input()?;
     input.terminal_name = resolved_name(env_node_name().as_deref(), &input.terminal_name);
+    input.autonomy = resolved_autonomy(env_autonomy().as_deref(), input.autonomy);
     Ok(input)
 }
 
@@ -300,6 +335,23 @@ fn enqueue_and_report(from: &str, msg: MailMessage) -> ExitCode {
             println!("ok: {dst} recebeu a mensagem (id {}).", msg.id);
             ExitCode::SUCCESS
         }
+        RouteConfirm::Routed { to_node } => {
+            // #22c: o Espaço ACEITOU e roteou a msg, mas a injeção física no terminal do destino
+            // ainda NÃO foi confirmada (sem `MessageDelivered`). NÃO dizemos "recebeu" — seria o
+            // falso-entregue que cegava o orquestrador. Honesto: roteada, entrega ainda pendente.
+            let dst = if to_node.is_empty() {
+                msg.to.clone()
+            } else {
+                to_node
+            };
+            println!(
+                "ok: a mensagem foi ROTEADA para {dst} (id {}), mas a entrega no terminal dele \
+                 ainda NAO foi confirmada. NAO conclua que ja virou trabalho — confirme o 1o \
+                 progresso com `lina check` antes de marcar como entregue.",
+                msg.id
+            );
+            ExitCode::SUCCESS
+        }
         RouteConfirm::Blocked { reason } => {
             eprintln!(
                 "lina: a mensagem NAO chegou a {} — o Espaco a bloqueou ({}).\n{}",
@@ -445,12 +497,14 @@ fn run_handoff(args: &[String]) -> ExitCode {
 /// (F1-0-3/ADR 0019 §5: o veredito vem do log, nunca de view cacheada) + última
 /// atividade A2A. **Leitura PURA** de `agents.json` + `log.jsonl` — não injeta NADA no
 /// terminal do colega (espiar ≠ interromper; é o anti-"cutucar pra ver se está vivo").
-/// **PURO (r4 achado #13) — resolve um NOME para o node-id CERTO do log.** Nome reusado entre
-/// sessões gera homônimos: o `check` apontava o lifecycle MORTO da sessão antiga. Semântica:
-/// o nome ATUAL de um nó é o seu ÚLTIMO `NodeRenamed`; entre os nós cujo nome atual casa com
-/// `target` (tolerante a `@`/caixa — espelho do `normalize_name` do roster vivo), vence o
+/// **PURO (r4 achado #13; r-confiab #4/#14/#23c) — resolve um NOME para o node-id CERTO do log.**
+/// Nome reusado entre sessões gera homônimos: o `check` apontava o lifecycle MORTO da sessão antiga.
+/// Semântica: o nome ATUAL de um nó é o seu ÚLTIMO `NodeRenamed`; entre os nós cujo nome atual casa
+/// com `target` (tolerante a `@`/caixa — espelho do `normalize_name` do roster vivo), vence o
 /// **vivo** mais recentemente batizado; sem vivo, o último batizado (exibe o morto, honesto).
-/// Tolera linhas parciais/inválidas (arquivo sob append).
+/// MORTE = `NodeStatusChanged(Dead)` OU `TerminalExited` OU `NodeRemoved` (não só o 1º — senão um nó
+/// que saiu com último status "Idle" parecia vivo). Tolera linhas parciais/inválidas (arquivo sob
+/// append).
 fn resolve_check_node(content: &str, target: &str) -> Option<String> {
     fn norm(s: &str) -> String {
         s.trim().trim_start_matches('@').trim().to_ascii_lowercase()
@@ -459,25 +513,47 @@ fn resolve_check_node(content: &str, target: &str) -> Option<String> {
     if want.is_empty() {
         return None;
     }
-    // (node → nome atual), mantido em ordem de RECÊNCIA do último batismo; último status por nó.
+    // (node → nome atual), mantido em ordem de RECÊNCIA do último batismo.
     let mut names: Vec<(String, String)> = Vec::new();
+    // Último SINAL DE VIDA por nó (último vence), espelhando a projeção do core (`events.rs`):
+    // `NodeStatusChanged` e `TerminalSpawned`("Running") dão status; `TerminalExited`("Dead") e
+    // `NodeRemoved` são MORTE. #4/#14/#23c: antes só `NodeStatusChanged` era lido — um nó que SAIU
+    // por `TerminalExited`/`NodeRemoved` com último status "Idle" parecia VIVO, e o `check` apontava
+    // o lifecycle da sessão ANTIGA. Agora a morte conta por qualquer um dos três sinais.
     let mut last_status: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         let p = &v["payload"];
+        let node = p["node"].as_str();
         match v["kind"].as_str().unwrap_or_default() {
             "NodeRenamed" => {
-                if let (Some(node), Some(name)) = (p["node"].as_str(), p["name"].as_str()) {
+                if let (Some(node), Some(name)) = (node, p["name"].as_str()) {
                     names.retain(|(n, _)| n != node);
                     names.push((node.to_string(), name.to_string()));
                 }
             }
             "NodeStatusChanged" => {
-                if let (Some(node), Some(st)) = (p["node"].as_str(), p["status"].as_str()) {
+                if let (Some(node), Some(st)) = (node, p["status"].as_str()) {
                     last_status.insert(node.to_string(), st.to_string());
+                }
+            }
+            "TerminalSpawned" => {
+                if let Some(node) = node {
+                    last_status.insert(node.to_string(), "Running".to_string());
+                }
+            }
+            "TerminalExited" => {
+                if let Some(node) = node {
+                    last_status.insert(node.to_string(), "Dead".to_string());
+                }
+            }
+            "NodeRemoved" => {
+                if let Some(node) = node {
+                    removed.insert(node.to_string());
                 }
             }
             _ => {}
@@ -488,14 +564,26 @@ fn resolve_check_node(content: &str, target: &str) -> Option<String> {
         .filter(|(_, name)| norm(name) == want)
         .map(|(node, _)| node.as_str())
         .collect();
-    // Vivo = último status ≠ Dead (sem status registrado = recém-batizado → vivo).
-    let alive = |node: &str| last_status.get(node).map(String::as_str) != Some("Dead");
+    // Prioridade de seleção (maior vence; empate → batismo mais recente, i.e. maior índice):
+    //   2 = VIVO com status conhecido não-morto;  1 = sem sinal (desconhecido — não vence um vivo
+    //   provado, mas vence um morto);  0 = MORTO (status Dead, `TerminalExited` ou `NodeRemoved`).
+    // "status ausente não é vivo por default quando há homônimo com status" (#4/#14): tier 1 < 2.
+    // Todos mortos → o de maior índice (último batizado) — exibe o morto, honesto.
+    let priority = |node: &str| -> u8 {
+        if removed.contains(node) || last_status.get(node).map(String::as_str) == Some("Dead") {
+            0
+        } else if last_status.contains_key(node) {
+            2
+        } else {
+            1
+        }
+    };
     candidates
         .iter()
-        .rev()
-        .find(|n| alive(n))
-        .or_else(|| candidates.last())
-        .map(|n| (*n).to_string())
+        .copied()
+        .enumerate()
+        .max_by_key(|&(idx, node)| (priority(node), idx))
+        .map(|(_, node)| node.to_string())
 }
 
 fn run_check(args: &[String]) -> ExitCode {
@@ -605,8 +693,13 @@ fn run_check(args: &[String]) -> ExitCode {
 /// Desfecho REAL do roteamento de uma `lina ask`, lido do espelho `log.jsonl`.
 #[derive(Debug, PartialEq, Eq)]
 enum RouteConfirm {
-    /// O Espaço entregou/roteou a mensagem ao destino.
+    /// **Entrega REAL**: `MessageDelivered` no log — a injeção física no PTY do destino ocorreu
+    /// (ready:true + submit). É a ÚNICA confirmação que autoriza dizer "recebeu".
     Delivered { to_node: String },
+    /// **Roteada, aguardando entrega**: o roteador aceitou e emitiu `MessageRouted` (gravado ANTES
+    /// da injeção física — `router.rs`), mas NÃO há `MessageDelivered`. O remetente NÃO pode
+    /// concluir "entregue" daqui (#22c: era o falso-entregue que cegava o orquestrador).
+    Routed { to_node: String },
     /// O roteador bloqueou a mensagem (`reason` = `unknown_sender`/`no_target`/`hop_limit`/…).
     Blocked { reason: String },
     /// Sem evento de desfecho no tempo de espera (o app pode estar ocupado/lento).
@@ -619,10 +712,23 @@ fn event_log_path() -> PathBuf {
     mailbox_root().join("events").join("log.jsonl")
 }
 
-/// **PURO** (testável, sem I/O/timing): varre o conteúdo do `log.jsonl` pelo desfecho de `msg_id`.
-/// `Delivered` vence `Blocked` (se a msg foi entregue em alguma tentativa, chegou); `None` se ainda não
-/// há desfecho. Tolera linhas parciais/inválidas (arquivo sob append).
+/// **PURO** (testável, sem I/O/timing): varre o `log.jsonl` pelo desfecho de `msg_id`.
+///
+/// **"Entregue" exige `MessageDelivered`** (injeção física real). `MessageRouted` (gravado ANTES da
+/// injeção no `router.rs`) vira no MÁXIMO `Routed` ("roteada, aguardando entrega"). Antes os dois
+/// viravam `Delivered` e o remetente via "recebeu" mesmo quando NADA foi injetado (#22c: o report
+/// mentia e o orquestrador seguia cego, marcando como feito o que nunca começou). Precedência:
+/// `Delivered` (injeção confirmada, vence tudo) > `Routed` (roteada, sem entrega) > `Blocked`.
+/// `None` se ainda não há desfecho. Tolera linhas parciais/inválidas (arquivo sob append).
 fn scan_log_outcome(content: &str, msg_id: &str) -> Option<RouteConfirm> {
+    let dest = |p: &serde_json::Value| {
+        p.get("to_node")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| p.get("to").and_then(serde_json::Value::as_str))
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut routed: Option<String> = None;
     let mut last_block: Option<String> = None;
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -633,15 +739,10 @@ fn scan_log_outcome(content: &str, msg_id: &str) -> Option<RouteConfirm> {
             continue;
         }
         match v.get("kind").and_then(serde_json::Value::as_str) {
-            Some("MessageDelivered" | "MessageRouted") => {
-                let to = p
-                    .get("to_node")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| p.get("to").and_then(serde_json::Value::as_str))
-                    .unwrap_or("")
-                    .to_string();
-                return Some(RouteConfirm::Delivered { to_node: to }); // sucesso vence bloqueio
-            }
+            // Injeção física confirmada → entregue de fato; vence qualquer outro desfecho.
+            Some("MessageDelivered") => return Some(RouteConfirm::Delivered { to_node: dest(p) }),
+            // Roteada (pré-injeção): guarda, mas SEGUE varrendo — um Delivered posterior vence.
+            Some("MessageRouted") => routed = Some(dest(p)),
             Some("RouteBlocked") => {
                 last_block = p
                     .get("reason")
@@ -651,7 +752,10 @@ fn scan_log_outcome(content: &str, msg_id: &str) -> Option<RouteConfirm> {
             _ => {}
         }
     }
-    last_block.map(|reason| RouteConfirm::Blocked { reason })
+    // Sem Delivered: roteada (aguardando entrega) vence bloqueio; senão, o bloqueio.
+    routed
+        .map(|to_node| RouteConfirm::Routed { to_node })
+        .or_else(|| last_block.map(|reason| RouteConfirm::Blocked { reason }))
 }
 
 /// Aguarda (poll bounded ~3s) o desfecho do roteamento de `msg_id` no `log.jsonl`. Retorna `Delivered`
@@ -666,9 +770,15 @@ fn poll_route_outcome(msg_id: &str) -> RouteConfirm {
             .ok()
             .and_then(|c| scan_log_outcome(&c, msg_id));
         match outcome {
-            // Entregue → conclui já. Bloqueado → só conclui no prazo (pode ser re-tentado e entregar).
+            // Entregue (injeção real) → conclui já. Roteada/Bloqueada NÃO concluem cedo: a injeção
+            // física emite `MessageDelivered` logo após `MessageRouted` — seguimos no poll até o
+            // prazo para CAPTURAR esse upgrade (senão reportaríamos "roteada" no caminho feliz).
             Some(o @ RouteConfirm::Delivered { .. }) => return o,
-            Some(o @ RouteConfirm::Blocked { .. }) if Instant::now() >= deadline => return o,
+            Some(o @ (RouteConfirm::Routed { .. } | RouteConfirm::Blocked { .. }))
+                if Instant::now() >= deadline =>
+            {
+                return o
+            }
             _ if Instant::now() >= deadline => return RouteConfirm::Pending,
             _ => std::thread::sleep(Duration::from_millis(150)),
         }
@@ -3064,6 +3174,44 @@ mod identity_tests {
         );
     }
 
+    /// **#17 residual (ADR 0026 / FIX-3) — autonomia env-first:** o env `LINA_AUTONOMY` (injetado
+    /// POR-NÓ pelo app) VENCE a ficha do cwd compartilhado; ausente/desconhecido cai na ficha.
+    /// Remover a preferência de env faz o 1º assert falhar (não-vacuoso). Aceita o rótulo pt-br do
+    /// `Autonomy::label()` (o que o app injeta) e as formas serde en.
+    #[test]
+    fn env_autonomy_wins_over_ficha_and_unknown_falls_back() {
+        assert_eq!(
+            resolved_autonomy(Some("manual"), Autonomy::Autonomous),
+            Autonomy::Manual,
+            "o env por-nó (autoridade do app) vence a ficha sobrescrita por um colega de cwd"
+        );
+        assert_eq!(
+            resolved_autonomy(Some("autonomo"), Autonomy::Manual),
+            Autonomy::Autonomous,
+            "rótulo pt-br do label() que o app injeta"
+        );
+        assert_eq!(
+            resolved_autonomy(Some("  assisted  "), Autonomy::Manual),
+            Autonomy::Assisted,
+            "forma serde en, aparada"
+        );
+        assert_eq!(
+            resolved_autonomy(None, Autonomy::Manual),
+            Autonomy::Manual,
+            "sem env → a ficha manda (compat standalone)"
+        );
+        assert_eq!(
+            resolved_autonomy(Some("xyz"), Autonomy::Assisted),
+            Autonomy::Assisted,
+            "rótulo desconhecido NÃO inventa nível — cai na ficha"
+        );
+        assert_eq!(
+            resolved_autonomy(Some(""), Autonomy::Autonomous),
+            Autonomy::Autonomous,
+            "env vazio não apaga a autonomia da ficha"
+        );
+    }
+
     /// **ADR 0026 — outbox POR-NÓ usa o nome RESOLVIDO:** com env divergente da ficha, a
     /// mensagem deposita no subdir do NOME DO ENV (e nada no da ficha); controle sem env →
     /// subdir da ficha. É o caminho real do `lina ask` (`resolved_name` → `enqueue_per_node`).
@@ -3221,12 +3369,14 @@ mod vault_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `scan_log_outcome` (núcleo da confirmação de `lina ask`): lê o desfecho real do `log.jsonl`.
-    /// Formato verbatim do espelho (`kind` + `payload.id`/`reason`/`to_node`).
+    /// `scan_log_outcome` (núcleo da confirmação de `lina ask`/`handoff`): lê o desfecho real do
+    /// `log.jsonl`. **#22c — "entregue" exige `MessageDelivered`** (injeção física); `MessageRouted`
+    /// sozinho (pré-injeção) vira no máximo `Routed`. Formato verbatim do espelho.
     #[test]
-    fn scan_log_outcome_reads_real_route_events() {
+    fn scan_log_outcome_requires_delivered_for_entregue() {
         let blocked = r#"{"seq":3,"ts":1,"kind":"RouteBlocked","version":1,"payload":{"event":"RouteBlocked","id":"msg_X","reason":"unknown_sender","from":"Terminal B","to":"@Terminal C"}}"#;
-        let delivered = r#"{"seq":4,"ts":2,"kind":"MessageRouted","version":1,"payload":{"event":"MessageRouted","id":"msg_Y","from":"Terminal B","to":"@Terminal C","to_node":"019e-uuid","intent":"ask","hops":0,"root_cause_id":"msg_Y"}}"#;
+        let routed = r#"{"seq":4,"ts":2,"kind":"MessageRouted","version":1,"payload":{"event":"MessageRouted","id":"msg_Y","from":"Terminal B","to":"@Terminal C","to_node":"019e-uuid","intent":"ask","hops":0,"root_cause_id":"msg_Y"}}"#;
+        let delivered = r#"{"seq":5,"ts":3,"kind":"MessageDelivered","version":1,"payload":{"event":"MessageDelivered","id":"msg_D","from":"Terminal B","to":"@Terminal C","to_node":"019e-uuid"}}"#;
 
         // Bloqueada → reporta o motivo.
         assert_eq!(
@@ -3235,22 +3385,42 @@ mod vault_tests {
                 reason: "unknown_sender".into()
             })
         );
-        // Entregue → reporta o nó destino.
+        // SÓ `MessageRouted` (pré-injeção) → ROTEADA, jamais entregue (mata o falso-entregue #22c).
         assert_eq!(
-            scan_log_outcome(delivered, "msg_Y"),
+            scan_log_outcome(routed, "msg_Y"),
+            Some(RouteConfirm::Routed {
+                to_node: "019e-uuid".into()
+            }),
+            "MessageRouted sozinho nunca vira Delivered — a injeção física ainda não ocorreu"
+        );
+        // `MessageDelivered` → ENTREGUE de fato (reporta o nó destino).
+        assert_eq!(
+            scan_log_outcome(delivered, "msg_D"),
             Some(RouteConfirm::Delivered {
                 to_node: "019e-uuid".into()
             })
         );
-        // Entrega VENCE bloqueio quando a mesma msg tem os dois (re-tentada e entregue).
-        let both = format!(
+        // Roteada + entregue (mesmo id) → Delivered vence (a injeção foi confirmada depois).
+        let routed_then_delivered = format!(
             "{}\n{}",
-            blocked.replace("msg_X", "msg_Z"),
-            delivered.replace("msg_Y", "msg_Z")
+            routed.replace("msg_Y", "msg_Z"),
+            delivered.replace("msg_D", "msg_Z")
         );
         assert_eq!(
-            scan_log_outcome(&both, "msg_Z"),
+            scan_log_outcome(&routed_then_delivered, "msg_Z"),
             Some(RouteConfirm::Delivered {
+                to_node: "019e-uuid".into()
+            })
+        );
+        // Bloqueada + roteada (mesmo id, re-tentada) → Routed vence o bloqueio, mas NÃO é Delivered.
+        let blocked_then_routed = format!(
+            "{}\n{}",
+            blocked.replace("msg_X", "msg_W"),
+            routed.replace("msg_Y", "msg_W")
+        );
+        assert_eq!(
+            scan_log_outcome(&blocked_then_routed, "msg_W"),
+            Some(RouteConfirm::Routed {
                 to_node: "019e-uuid".into()
             })
         );
@@ -3307,6 +3477,16 @@ mod check_resolution_tests {
     fn status(node: &str, st: &str) -> String {
         format!(
             r#"{{"seq":1,"ts":1,"kind":"NodeStatusChanged","version":1,"payload":{{"event":"NodeStatusChanged","node":"{node}","status":"{st}","from":"Running","reason":"t"}}}}"#
+        )
+    }
+    fn exited(node: &str) -> String {
+        format!(
+            r#"{{"seq":1,"ts":1,"kind":"TerminalExited","version":1,"payload":{{"event":"TerminalExited","node":"{node}"}}}}"#
+        )
+    }
+    fn removed(node: &str) -> String {
+        format!(
+            r#"{{"seq":1,"ts":1,"kind":"NodeRemoved","version":1,"payload":{{"event":"NodeRemoved","node":"{node}"}}}}"#
         )
     }
 
@@ -3371,6 +3551,71 @@ mod check_resolution_tests {
         );
         assert_eq!(resolve_check_node(&log, "Ninguem"), None);
         assert_eq!(resolve_check_node("", "Bug Finder"), None);
+    }
+
+    /// **#4/#14/#23c:** a morte de um nó também é registrada por `TerminalExited`/`NodeRemoved`,
+    /// NÃO só por `NodeStatusChanged(Dead)`. Um nó que SAIU com último status "Idle" não pode
+    /// vencer o homônimo vivo — antes vencia (o `check` apontava o lifecycle da sessão antiga).
+    #[test]
+    fn exited_or_removed_node_is_dead_even_with_idle_status() {
+        // n-velho: status "Idle", mas SAIU (`TerminalExited`) → morto. n-novo vivo → vence.
+        let log_exit = [
+            rename("n-velho", "QA"),
+            status("n-velho", "Idle"),
+            exited("n-velho"),
+            rename("n-novo", "@QA"),
+            status("n-novo", "Idle"),
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&log_exit, "QA").as_deref(),
+            Some("n-novo"),
+            "TerminalExited mata o nó mesmo com último NodeStatusChanged = Idle"
+        );
+        // n-velho REMOVIDO (`NodeRemoved`) → morto, mesmo batizado DEPOIS e com status "Idle".
+        let log_remove = [
+            rename("n-novo", "QA"),
+            status("n-novo", "Idle"),
+            rename("n-velho", "@QA"), // batizado depois (mais recente)
+            status("n-velho", "Idle"),
+            removed("n-velho"),
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&log_remove, "QA").as_deref(),
+            Some("n-novo"),
+            "NodeRemoved derruba o homônimo mais recente: o vivo provado vence"
+        );
+    }
+
+    /// **#4/#14 — "status ausente não é vivo por default quando há homônimo COM status":** entre um
+    /// homônimo provado vivo (com status) e outro sem nenhum sinal, o COM-status vence — mesmo se o
+    /// sem-sinal foi batizado depois. (Um MORTO, porém, perde até para o sem-sinal.)
+    #[test]
+    fn status_present_beats_statusless_homonym() {
+        let alive_vs_unknown = [
+            rename("n-vivo", "QA"),
+            status("n-vivo", "Busy"),
+            rename("n-sem", "@QA"), // batizado depois, mas SEM status algum
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&alive_vs_unknown, "QA").as_deref(),
+            Some("n-vivo"),
+            "o homônimo com status provado vence o sem-sinal mais recente"
+        );
+        // Controle: o sem-sinal (desconhecido) ainda vence um MORTO mais recente.
+        let dead_vs_unknown = [
+            rename("n-sem", "QA"), // sem status
+            rename("n-morto", "@QA"),
+            status("n-morto", "Dead"),
+        ]
+        .join("\n");
+        assert_eq!(
+            resolve_check_node(&dead_vs_unknown, "QA").as_deref(),
+            Some("n-sem"),
+            "desconhecido (não provado morto) vence o homônimo provado morto"
+        );
     }
 }
 
