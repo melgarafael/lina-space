@@ -39,6 +39,15 @@ const PASTE_BEGIN_STR: &str = "\x1b[200~";
 /// (`CliProfile::ready_timeout`, default 2s) — F1-0-2: timeout → **não injeta** (o
 /// "injeta mesmo assim" histórico era o mecanismo do texto-colado 18/20 da baseline).
 const READY_POLL: Duration = Duration::from_millis(10);
+/// **Anti-engolimento (#22/#23) — prontidão CONFIRMADA, não um único snapshot.** Quantas
+/// leituras CONSECUTIVAS prontas a região de input precisa sustentar antes de injetar. UM
+/// snapshot pronto NÃO basta: no instante em que um turno FECHA, a região pisca byte-idêntica
+/// ao idle (só o sufixo `· esc to interrupt` sai por um frame) e o `ready_now` a aprova — então
+/// o paste é engolido (o turno seguia em curso) e o `MessageDelivered` é uma entrega FALSA. Uma
+/// releitura denuncia o flicker (o `busy_marker` volta); um idle REAL sustenta a prontidão
+/// sempre, então a entrega legítima NÃO regride (só ganha 1 `READY_POLL` de latência). `2` é o
+/// mínimo que filtra o flicker — calibrável na tela do fundador (gate g) sem mexer no `ready_now`.
+const READY_CONFIRMATIONS: u32 = 2;
 /// Timeout para adquirir o lock lógico do PTY do alvo.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -200,9 +209,18 @@ fn wait_ready(
     timeout: Duration,
 ) -> bool {
     let start = Instant::now();
+    // Anti-engolimento (#22/#23): só confia na prontidão que PERSISTE por leituras
+    // consecutivas. O flicker do turno-fechando (idle por 1 frame, depois `esc to interrupt`
+    // de volta) zera o contador; um idle REAL o satura sempre. NÃO toca `ready_now` (snapshot).
+    let mut confirmations = 0u32;
     loop {
         if ready_now(&grid.input_region_text(), prompt, busy_markers) {
-            return true;
+            confirmations += 1;
+            if confirmations >= READY_CONFIRMATIONS {
+                return true;
+            }
+        } else {
+            confirmations = 0; // ocupado/flicker → a prontidão não estava firme; recomeça
         }
         if start.elapsed() >= timeout {
             return false;
