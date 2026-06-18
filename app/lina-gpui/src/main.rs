@@ -472,6 +472,15 @@ const IDLE_GAP_MS: f64 = 250.0;
 
 /// O canvas gpui — a ÚNICA parte que conhece o toolkit. O estado dos nós (add/remove, model,
 /// grids) vive no [`NodeManager`] gpui-free; a view só renderiza, roteia input e foca.
+/// F3-1-7: gesto de ARRASTAR um card de Goal (overlay de tela, FORA do canvas/câmera — por isso não
+/// reusa o [`canvas_drag::CardDrag`], que opera em coordenadas de mundo). Guarda a âncora do gesto
+/// para o `on_mouse_move` do root computar o novo deslocamento (mouse atual − mouse inicial).
+struct GoalDrag {
+    goal_id: String,
+    start_mouse: (f32, f32),
+    start_offset: (f32, f32),
+}
+
 struct WorkspaceView {
     // SEAM-1: `Arc` — o `NodeManager` (funil de admissão) é COMPARTILHADO com a `MailboxPump`/
     // `AttentionHub` (threads gpui-free) para `SpawnApproved`/banner criarem terminais pelo MESMO
@@ -491,6 +500,11 @@ struct WorkspaceView {
     /// F3-1-7: cards de Goal RECOLHIDOS (por `goal_id`) — estado de sessão (não persiste no log).
     /// Recolhido = só cabeçalho + meta, para o card não cobrir o canvas.
     collapsed_goals: std::collections::HashSet<String>,
+    /// F3-1-7: arrasto em curso de um card de Goal (`None` = sem gesto).
+    goal_drag: Option<GoalDrag>,
+    /// F3-1-7: deslocamento (px de tela) de cada card de Goal pela posição base, por `goal_id` —
+    /// estado de sessão (o usuário arrastou o card para fora do caminho; não persiste no log).
+    goal_offsets: std::collections::HashMap<String, (f32, f32)>,
     /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
     z_order: BTreeMap<NodeId, u64>,
     z_next: u64,
@@ -688,6 +702,8 @@ impl WorkspaceView {
             drag: None,
             card_drag: None,
             collapsed_goals: std::collections::HashSet::new(),
+            goal_drag: None,
+            goal_offsets: std::collections::HashMap::new(),
             z_order: BTreeMap::new(),
             z_next: 0,
             sel: None,
@@ -2129,7 +2145,13 @@ impl WorkspaceView {
             let gid_confirm = goal.goal_id.clone();
             let gid_correct = goal.goal_id.clone();
             let gid_toggle = goal.goal_id.clone();
+            let gid_drag = goal.goal_id.clone();
             let is_collapsed = self.collapsed_goals.contains(&goal.goal_id);
+            let (ox, oy) = self
+                .goal_offsets
+                .get(&goal.goal_id)
+                .copied()
+                .unwrap_or((0.0, 0.0));
             let card = goal_card::GoalCard::new(goal)
                 .iteration_budget(budget)
                 .collapsed(is_collapsed)
@@ -2143,8 +2165,36 @@ impl WorkspaceView {
                     view.toggle_goal_collapsed(&gid_toggle);
                     cx.notify();
                 }));
-            // Largura amigável (≈42% da viewport): `relative` evita px mágico; o card centra na coluna.
-            col = col.child(div().w(gpui::relative(0.42)).child(card));
+            // Largura amigável (≈42% da viewport). `relative` + left/top desloca o card pelo arrasto
+            // SEM tirá-lo do empilhamento (os vizinhos não se mexem). `on_mouse_down` ancora o gesto e
+            // PARA a propagação (senão o root iniciaria o pan da câmera embaixo); o move/up vivem no
+            // root (captura global) — o card não "gruda" quando o cursor escapa dele.
+            col = col.child(
+                div()
+                    .relative()
+                    .left(px(ox))
+                    .top(px(oy))
+                    .w(gpui::relative(0.42))
+                    .child(card)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, ev: &MouseDownEvent, _w, cx| {
+                            let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                            let start_offset = view
+                                .goal_offsets
+                                .get(&gid_drag)
+                                .copied()
+                                .unwrap_or((0.0, 0.0));
+                            view.goal_drag = Some(GoalDrag {
+                                goal_id: gid_drag.clone(),
+                                start_mouse: pos,
+                                start_offset,
+                            });
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
         Some(col.into_any_element())
     }
@@ -3719,6 +3769,20 @@ impl Render for WorkspaceView {
             )
             .on_mouse_move(cx.listener(|view, ev: &MouseMoveEvent, window, cx| {
                 let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                // F3-1-7: arrasto de card de Goal (overlay) tem PRIORIDADE sobre o gesto do canvas. O
+                // root captura o move globalmente → o offset acompanha o cursor mesmo fora do card.
+                if let Some(g) = view.goal_drag.as_ref() {
+                    if ev.dragging() {
+                        let offset = (
+                            g.start_offset.0 + pos.0 - g.start_mouse.0,
+                            g.start_offset.1 + pos.1 - g.start_mouse.1,
+                        );
+                        let gid = g.goal_id.clone();
+                        view.goal_offsets.insert(gid, offset);
+                        cx.notify();
+                    }
+                    return;
+                }
                 let zoom = view.camera.zoom;
                 // F2-3-1: gesto de MOVER card tem prioridade — recalcula o PREVIEW (move só o
                 // NodeView em memória; NÃO emite evento). O event log só recebe no `mouse_up`.
@@ -3781,6 +3845,11 @@ impl Render for WorkspaceView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, ev: &MouseUpEvent, _w, cx| {
+                    // F3-1-7: solta o arrasto de um card de Goal (o offset já foi persistido no move).
+                    if view.goal_drag.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
                     // F2-3-1: encerra o gesto de MOVER card e EMITE no FIM (posição final). `finish`
                     // devolve None se cancelado (Esc) ou clique sem deslocamento → ZERO NodeMoved.
                     if let Some(g) = view.card_drag.take() {
