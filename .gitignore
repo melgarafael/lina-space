@@ -16,6 +16,12 @@ spikes/*/target/
 # artefatos efemeros da orquestracao Maestri (nao versionar)
 .entrega-*.md
 .crosscheck-*.md
+# markers efemeros de "rodada iniciada" (orquestracao multi-terminal)
+.iniciado-*
+# cache do MCP playwright
+/.playwright-mcp/
+# screenshots de sessao/demo soltos na raiz (evidencia efemera, nao codigo)
+/*.png
 
 # artefatos de empacotamento (Lina.app, .dmg) — gerados por packaging/make-app.sh
 /dist/
