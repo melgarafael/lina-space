@@ -2197,12 +2197,20 @@ impl Router {
         Ok(())
     }
 
-    /// **F3-1-4 (spec 52 §3/§4, gate e): escala de effort no `Fail`** abaixo do turn-budget. Sobe um
-    /// degrau de `effort_ladder` por iteração (capado no topo; `Effort: Ord` torna "estritamente
-    /// maior" uma comparação) e emite um `SpawnRequested` informado (re-despacho com evidência +
-    /// defect_class no prompt) — o "novo desenvolvedor com effort maior" do doc-fonte (linha 12). A
-    /// admissão física do re-spawn (LINA_EFFORT no PTY filho) é do app (`handle_spawn`/`admit_node`);
-    /// aqui só o LIVRO-RAZÃO do pedido, com `goal_id` que o justifica.
+    /// **F3-1-4/F3-2-5 (spec 52 §3/§4, gate d/e): escala no `Fail`** abaixo do turn-budget. O degrau de
+    /// `effort_ladder` sobe com a iteração (capado no topo; `Effort: Ord` torna "estritamente maior"
+    /// uma comparação). Distingue, como o doc-fonte (linha 12):
+    /// - **re-despacho ao MESMO** dev — o degrau NÃO subiu desde a iteração anterior: re-injeta no
+    ///   `target` (mesmo `name`) com evidência no prompt ("Corrija e re-submeta").
+    /// - **NOVO desenvolvedor** — o degrau SUBIU (effort estritamente maior): `name` distinto e prompt
+    ///   carregando as "tentativas anteriores" (o "novo desenvolvedor com effort maior").
+    ///
+    /// **Breaker sticky:** nunca emite um re-spawn IDÊNTICO (mesma tarefa+effort — [`count_respawns_with_effort`]).
+    /// Quando a escada satura no topo, o re-spawn repetiria o mesmo effort → SUPRIME e defere ao
+    /// turn-budget/gate humano (com escada de 1 degrau, morde já na 2ª falha: "pare de auto-escalar").
+    ///
+    /// A admissão física (LINA_EFFORT no PTY filho; criar o terminal do novo dev) é do app
+    /// (`handle_spawn`/`admit_node`); aqui só o LIVRO-RAZÃO do pedido, com `goal_id` que o justifica.
     #[allow(clippy::too_many_arguments)]
     fn escalate_on_fail(
         &mut self,
@@ -2221,8 +2229,18 @@ impl Router {
         // degrau pela iteração, capado no topo da escada (1ª falha → degrau 0; sobe a cada volta).
         let degrau = (iteration as usize).min(ladder.len()).saturating_sub(1);
         let effort = ladder[degrau];
+        // BREAKER STICKY: repetir um re-spawn idêntico (mesma tarefa+effort) não adianta — defere ao
+        // turn-budget/gate humano. Capa a auto-escalada quando a escada satura (gate d, doc-fonte 12).
+        if count_respawns_with_effort(store, goal_id, &item.id, effort)? >= 1 {
+            return Ok(());
+        }
+        // re-mesmo vs novo-dev: o degrau SUBIU em relação à iteração anterior?
+        let prev_degrau = (iteration.saturating_sub(1) as usize)
+            .min(ladder.len())
+            .saturating_sub(1);
+        let novo_dev = degrau > prev_degrau;
         // name/role do alvo via projeção (a admissão física resolve os finais — fronteira core/shell).
-        let (name, role) = match store.project()?.nodes.get(&target) {
+        let (target_name, role) = match store.project()?.nodes.get(&target) {
             Some(n) => (
                 n.name
                     .clone()
@@ -2231,13 +2249,31 @@ impl Router {
             ),
             None => (item.owner.clone().unwrap_or_default(), String::new()),
         };
-        let prompt = format!(
-            "Revisão do item {} FALHOU (iteração {iteration}). Evidência: {evidence}. \
-             Defeito: {defect_class}. Corrija e re-submeta.",
-            item.id
-        );
+        let (id, name, prompt) = if novo_dev {
+            (
+                format!("goal-newdev:{goal_id}:{}:{degrau}", item.id),
+                // `name` distinto e determinístico (replay idempotente) → o app cria um NOVO terminal.
+                format!("{target_name}#reforco{degrau}"),
+                format!(
+                    "NOVO desenvolvedor (effort reforçado) para o item {}. As tentativas anteriores \
+                     não fecharam — última evidência: {evidence}. Defeito: {defect_class}. Assuma \
+                     com mais cuidado.",
+                    item.id
+                ),
+            )
+        } else {
+            (
+                format!("goal-respawn:{goal_id}:{}:{iteration}", item.id),
+                target_name,
+                format!(
+                    "Revisão do item {} FALHOU (iteração {iteration}). Evidência: {evidence}. \
+                     Defeito: {defect_class}. Corrija e re-submeta.",
+                    item.id
+                ),
+            )
+        };
         store.append(&DomainEvent::SpawnRequested {
-            id: format!("goal-respawn:{goal_id}:{}:{iteration}", item.id),
+            id,
             requested_by: STRUCTURAL_JUDGE,
             name,
             role,
@@ -2498,8 +2534,11 @@ impl Router {
                 if goal_id.is_empty() {
                     return RouteOutcome::GoalRejected("goal.interpret exige 'goal_id'".into());
                 }
+                // Chave `proposed_team` — a MESMA que a CLI serializa (`lina.rs`); o `get("team")`
+                // anterior era um descasamento CLI↔core (o time nunca era persistido pelo caminho
+                // real), no molde do bug de `accept`↔`acceptance` que a GL-2 já corrigiu.
                 let proposed_team = payload
-                    .get("team")
+                    .get("proposed_team")
                     .and_then(serde_json::Value::as_array)
                     .map(|arr| {
                         arr.iter()
@@ -2559,10 +2598,66 @@ impl Router {
         if let Err(e) = store.append(&goal_event) {
             return RouteOutcome::PersistFailed(e.to_string());
         }
+        // F3-2-3 (spec 52 §3/§4, gate c): a confirmação é o GATILHO da MONTAGEM do time. §327: a
+        // EXECUÇÃO (gastar recurso com spawns) respeita a autonomia — dispara automaticamente SÓ com
+        // o GESTO HUMANO (`HUMAN_GESTURE`, qualquer nível) ou em `autonomo`. Em manual/assistido, um
+        // agente que confirma REGISTRA o fato (`GoalConfirmed`, `by` server-side) mas a montagem
+        // espera o toque humano (a tabela §327: "PROPÕE → humano confirma"). O `GoalConfirmed` é o
+        // gate (auditável); a montagem é a AÇÃO gated — separá-los preserva o `by` inforjável sem
+        // bloquear o registro do fato. A admissão FÍSICA dos spawns (PTY/custo/cap) é do app.
+        if msg.intent == "goal.confirm"
+            && (sender == HUMAN_GESTURE || self.config.autonomy == AutonomyLevel::Autonomous)
+        {
+            if let Err(e) = self.assemble_team(&goal_id, sender, store) {
+                eprintln!("lina-core: CRÍTICO — montagem do time da Goal {goal_id} falhou: {e}");
+            }
+        }
         RouteOutcome::GoalApplied {
             intent: msg.intent.clone(),
             goal_id,
         }
+    }
+
+    /// **F3-2-3 (spec 52 §3/§4, gate c): monta o time INICIAL de uma Goal confirmada.** Consome o
+    /// `proposed_team` da ÚLTIMA `GoalInterpreted` ([`proposed_team_of`] — a correção via re-`interpret`
+    /// faz a última vencer) e emite UM `SpawnRequested` por papel. O `effort` é o DEGRAU BASE da escada
+    /// (`effort_ladder.first()`) — o classificador de dificuldade POR PAPEL é porta aberta F3+ (spec 52
+    /// §4: "esta spec define o CANAL, o classificador fica plugável"); o que importa aqui é o `effort`
+    /// no envelope. `goal_id` JUSTIFICA o recurso (auditoria). `requested_by` = quem confirmou (carimbo
+    /// server-side: `HUMAN_GESTURE` no toque da UI, ou o agente em `autonomo`), JAMAIS do payload.
+    /// `hops:0` — é a 1ª leva AUTORIZADA pelo gate, NÃO cascata (cascata = spawn-de-spawn de um MEMBRO,
+    /// `hops>=1`, que segue exigindo aval humano por [`Router::handle_spawn`]/admit_node). A admissão
+    /// FÍSICA (PTY + `LINA_EFFORT` + cost/cap) é do app; aqui só o LIVRO-RAZÃO. Idempotente: re-confirm
+    /// não duplica spawns já montados ([`spawn_id_exists`] sobre o `id` determinístico).
+    fn assemble_team(
+        &mut self,
+        goal_id: &str,
+        by: NodeId,
+        store: &mut EventStore,
+    ) -> Result<(), StoreError> {
+        let effort = self.config.effort_ladder.first().copied();
+        for role in proposed_team_of(store, goal_id)? {
+            let id = format!("goal-team:{goal_id}:{role}");
+            if spawn_id_exists(store, &id)? {
+                continue; // já montado — re-confirm é idempotente (não duplica o time).
+            }
+            store.append(&DomainEvent::SpawnRequested {
+                id,
+                requested_by: by,
+                name: format!("@{role}"),
+                role: role.clone(),
+                root_cause_id: goal_id.to_string(),
+                hops: 0,
+                prompt: format!(
+                    "Você é {role} nesta meta. Assuma os itens do plano atribuídos ao seu papel \
+                     e entregue conforme os critérios de aceite."
+                ),
+                model: None,
+                effort,
+                goal_id: Some(goal_id.to_string()),
+            })?;
+        }
+        Ok(())
     }
 
     /// **F1-3-6 (ADR 0019 §6): gate INFORJÁVEL do `lina spawn`** (molde de [`Router::handle_plan`]).
@@ -2970,6 +3065,67 @@ fn max_goal_iteration(store: &EventStore, goal_id: &str) -> Result<u32, StoreErr
         max = max.max(it);
     }
     Ok(max)
+}
+
+/// F3-2-3: o `proposed_team` da ÚLTIMA `GoalInterpreted` da `goal_id` — a correção via re-`interpret`
+/// faz a última vencer (replay em ordem sobrescreve). Vazio se não houve interpretação ou time
+/// proposto. É DADO transportado: o time é uma SUGESTÃO, não autoridade (a montagem é gated por §327).
+fn proposed_team_of(store: &EventStore, goal_id: &str) -> Result<Vec<String>, StoreError> {
+    let mut team: Vec<String> = Vec::new();
+    for rec in store.events()? {
+        if rec.kind != "GoalInterpreted"
+            || rec.payload.get("goal_id").and_then(|v| v.as_str()) != Some(goal_id)
+        {
+            continue;
+        }
+        if let Some(arr) = rec.payload.get("proposed_team").and_then(|v| v.as_array()) {
+            team = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+    }
+    Ok(team)
+}
+
+/// F3-2-3: `true` se já existe um `SpawnRequested` com este `id` — idempotência da montagem do time
+/// (re-confirm não duplica os spawns do papel; o `id` `goal-team:{goal}:{role}` é determinístico).
+fn spawn_id_exists(store: &EventStore, id: &str) -> Result<bool, StoreError> {
+    for rec in store.events()? {
+        if rec.kind == "SpawnRequested"
+            && rec.payload.get("id").and_then(|v| v.as_str()) == Some(id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// F3-2-5 (breaker sticky): conta os `SpawnRequested` de RE-ESCALONAMENTO já emitidos para
+/// `(goal_id, item)` com este `effort` — o anti-re-spawn-idêntico (mesma tarefa+effort). Filtra pelo
+/// prefixo do `id` (`goal-respawn:`/`goal-newdev:`) para NÃO contar a montagem inicial (`goal-team:`).
+fn count_respawns_with_effort(
+    store: &EventStore,
+    goal_id: &str,
+    item: &str,
+    effort: Effort,
+) -> Result<u32, StoreError> {
+    let respawn = format!("goal-respawn:{goal_id}:{item}:");
+    let newdev = format!("goal-newdev:{goal_id}:{item}:");
+    let want = serde_json::to_value(effort).ok();
+    let mut n = 0u32;
+    for rec in store.events()? {
+        if rec.kind != "SpawnRequested" {
+            continue;
+        }
+        let id = rec.payload.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if (id.starts_with(&respawn) || id.starts_with(&newdev))
+            && rec.payload.get("effort") == want.as_ref()
+        {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// F1-3-6: loga `SpawnGated{reason}` (livro-razão da decisão do gate, par do `SpawnRequested`).
@@ -7832,6 +7988,398 @@ mod tests {
             HUMAN_GESTURE,
             "um agente NUNCA produz o sentinel humano (by inforjavel)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────── F3-2: o loop do Maestro nativo (CORE) ─────────────────────
+
+    /// define + interpreta uma Goal com `team` proposto, devolvendo o `goal_id`. PARA antes do
+    /// confirm — o teste decide QUEM confirma (gesto humano vs agente) e em qual autonomia.
+    fn interpreta_com_time(
+        router: &mut Router,
+        ts: &mut TmpStore,
+        statement: &str,
+        team: &[&str],
+    ) -> String {
+        let (_rec, mut deliver) = recorder();
+        let goal_id = match router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.define",
+                format!(r#"{{"statement":"{statement}"}}"#),
+            ),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        ) {
+            RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+            o => panic!("define: {o:?}"),
+        };
+        let interp = serde_json::json!({
+            "goal_id": goal_id, "interpretation": "entendi", "strategy": "time",
+            "proposed_team": team, "acceptance": [],
+        })
+        .to_string();
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp),
+            &mut ts.store,
+            1001,
+            &mut deliver,
+        );
+        goal_id
+    }
+
+    /// Os `SpawnRequested` da MONTAGEM do time (id `goal-team:`), em ordem de log.
+    fn team_spawns(events: &[EventRecord]) -> Vec<&EventRecord> {
+        recs_of(events, "SpawnRequested")
+            .into_iter()
+            .filter(|r| field(r, "id").is_some_and(|id| id.starts_with("goal-team:")))
+            .collect()
+    }
+
+    /// F3-2-3 (gate c): ao confirmar (gesto humano), a montagem emite UM `SpawnRequested` por papel
+    /// do `proposed_team`, com `effort` no envelope (degrau base da escada) e `goal_id` que justifica
+    /// o recurso. Gate (b): os spawns vêm DEPOIS do `GoalConfirmed`.
+    #[test]
+    fn f3_2_3_confirm_humano_monta_um_spawn_por_papel_com_effort() {
+        let (mut router, sup, dir) = router_with("f323-team");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("f323-team");
+        let goal_id = interpreta_com_time(
+            &mut router,
+            &mut ts,
+            "criar landing",
+            &["Frontend", "Backend"],
+        );
+        // Gesto humano (UI) confirma → executa a montagem mesmo em assistido (autonomia default).
+        let out = router.human_intent(
+            "goal.confirm",
+            &format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            &mut ts.store,
+        );
+        assert!(
+            matches!(out, RouteOutcome::GoalApplied { .. }),
+            "confirm aplicou: {out:?}"
+        );
+
+        let events = ts.store.events().unwrap();
+        let spawns = team_spawns(&events);
+        assert_eq!(
+            spawns.len(),
+            2,
+            "um SpawnRequested por papel do proposed_team"
+        );
+        let roles: Vec<&str> = spawns.iter().filter_map(|s| field(s, "role")).collect();
+        assert!(
+            roles.contains(&"Frontend") && roles.contains(&"Backend"),
+            "um spawn por papel: {roles:?}"
+        );
+        for s in &spawns {
+            assert_eq!(
+                field(s, "effort"),
+                Some("medium"),
+                "effort no envelope (degrau base da escada)"
+            );
+            assert_eq!(
+                field(s, "goal_id"),
+                Some(goal_id.as_str()),
+                "goal_id que justifica o recurso"
+            );
+            assert_eq!(
+                field(s, "root_cause_id"),
+                Some(goal_id.as_str()),
+                "raiz = a Goal"
+            );
+        }
+        let conf_seq = recs_of(&events, "GoalConfirmed")[0].seq;
+        assert!(
+            spawns.iter().all(|s| s.seq > conf_seq),
+            "gate (b): montagem só APÓS o GoalConfirmed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-2 (gate b): ANTES do `GoalConfirmed` não há montagem de time nem decomposição; `plan.seed`
+    /// pré-confirm é recusado. DEPOIS do confirm humano, a montagem aparece.
+    #[test]
+    fn f3_2_2_zero_spawn_de_time_antes_do_confirmed() {
+        let (mut router, sup, dir) = router_with("f322-ordem");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("f322-ordem");
+        let goal_id = interpreta_com_time(&mut router, &mut ts, "criar x", &["Frontend"]);
+
+        let pre = ts.store.events().unwrap();
+        assert!(
+            team_spawns(&pre).is_empty(),
+            "zero SpawnRequested de time antes do GoalConfirmed"
+        );
+        assert!(
+            recs_of(&pre, "GoalDecomposed").is_empty(),
+            "zero GoalDecomposed antes do GoalConfirmed"
+        );
+        let (_r, mut deliver) = recorder();
+        let seed = router.route_message(
+            &MailMessage::new(
+                "@User",
+                "plan",
+                "plan.seed",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1500,
+            &mut deliver,
+        );
+        assert!(
+            matches!(seed, RouteOutcome::GoalRejected(_)),
+            "seed pré-confirm recusado: {seed:?}"
+        );
+
+        router.human_intent(
+            "goal.confirm",
+            &format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            &mut ts.store,
+        );
+        let post = ts.store.events().unwrap();
+        assert_eq!(
+            team_spawns(&post).len(),
+            1,
+            "1 spawn de time após o confirm humano"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-2 (§327): em `assistido`, a EXECUÇÃO (montar o time) espera o GESTO HUMANO. Um agente
+    /// confirmando via `route_message` REGISTRA o `GoalConfirmed` (fato, `by` server-side) mas NÃO
+    /// dispara a montagem — propõe, o humano executa.
+    #[test]
+    fn f3_2_2_confirm_de_agente_em_assistido_nao_monta_o_time() {
+        let (mut router, sup, dir) = router_with("f322-assist");
+        // autonomia default = Assisted.
+        let _maestro = sup.register("@Maestro", Some("maestro".into()), sink());
+        let mut ts = TmpStore::new("f322-assist");
+        let goal_id = {
+            let (_rec, mut deliver) = recorder();
+            let gid = match router.route_message(
+                &MailMessage::new(
+                    "@Maestro",
+                    "goal",
+                    "goal.define",
+                    r#"{"statement":"criar x"}"#,
+                ),
+                &mut ts.store,
+                1000,
+                &mut deliver,
+            ) {
+                RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+                o => panic!("define: {o:?}"),
+            };
+            let interp = serde_json::json!({
+                "goal_id": gid, "interpretation": "entendi", "strategy": "time",
+                "proposed_team": ["Frontend"], "acceptance": [],
+            })
+            .to_string();
+            router.route_message(
+                &MailMessage::new("@Maestro", "goal", "goal.interpret", &interp),
+                &mut ts.store,
+                1001,
+                &mut deliver,
+            );
+            gid
+        };
+        let (_r, mut deliver) = recorder();
+        router.route_message(
+            &MailMessage::new(
+                "@Maestro",
+                "goal",
+                "goal.confirm",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1002,
+            &mut deliver,
+        );
+        let events = ts.store.events().unwrap();
+        assert_eq!(
+            recs_of(&events, "GoalConfirmed").len(),
+            1,
+            "o GoalConfirmed é REGISTRADO (by server-side), mesmo de um agente"
+        );
+        assert!(
+            team_spawns(&events).is_empty(),
+            "§327: em assistido a montagem do time espera o gesto humano — agente não executa"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-2 (§327): em `autonomo`, o agente confirma E monta o time (auto, dentro do escopo).
+    #[test]
+    fn f3_2_2_autonomo_confirm_de_agente_monta_o_time() {
+        let (mut router, sup, dir) = router_with("f322-auto");
+        let _maestro = sup.register("@Maestro", Some("maestro".into()), sink());
+        let mut ts = TmpStore::new("f322-auto");
+        router.config.autonomy = AutonomyLevel::Autonomous;
+        let goal_id = {
+            let (_rec, mut deliver) = recorder();
+            let gid = match router.route_message(
+                &MailMessage::new(
+                    "@Maestro",
+                    "goal",
+                    "goal.define",
+                    r#"{"statement":"criar x"}"#,
+                ),
+                &mut ts.store,
+                1000,
+                &mut deliver,
+            ) {
+                RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+                o => panic!("define: {o:?}"),
+            };
+            let interp = serde_json::json!({
+                "goal_id": gid, "interpretation": "entendi", "strategy": "time",
+                "proposed_team": ["Backend"], "acceptance": [],
+            })
+            .to_string();
+            router.route_message(
+                &MailMessage::new("@Maestro", "goal", "goal.interpret", &interp),
+                &mut ts.store,
+                1001,
+                &mut deliver,
+            );
+            gid
+        };
+        let (_r, mut deliver) = recorder();
+        router.route_message(
+            &MailMessage::new(
+                "@Maestro",
+                "goal",
+                "goal.confirm",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1002,
+            &mut deliver,
+        );
+        let events = ts.store.events().unwrap();
+        assert_eq!(
+            team_spawns(&events).len(),
+            1,
+            "§327: em autonomo o agente monta o time (auto)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-2 ("Quero ajustar"): re-enviar `goal.interpret` faz a ÚLTIMA interpretação vencer, e a
+    /// montagem usa o time CORRIGIDO (o antigo é descartado).
+    #[test]
+    fn f3_2_2_re_interpret_ultima_interpretacao_vence() {
+        let (mut router, sup, dir) = router_with("f322-reinterp");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("f322-reinterp");
+        let goal_id = interpreta_com_time(&mut router, &mut ts, "criar x", &["Frontend"]);
+        let (_r, mut deliver) = recorder();
+        let interp2 = serde_json::json!({
+            "goal_id": goal_id, "interpretation": "ajustado", "strategy": "outro",
+            "proposed_team": ["Backend", "QA"], "acceptance": [],
+        })
+        .to_string();
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp2),
+            &mut ts.store,
+            1010,
+            &mut deliver,
+        );
+        let goals = crate::project_goals(&ts.store.events().unwrap());
+        let g = goals.iter().find(|g| g.goal_id == goal_id).unwrap();
+        assert_eq!(
+            g.interpretation.as_deref(),
+            Some("ajustado"),
+            "última interpretação vence na projeção"
+        );
+
+        router.human_intent(
+            "goal.confirm",
+            &format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            &mut ts.store,
+        );
+        let events = ts.store.events().unwrap();
+        let roles: Vec<&str> = team_spawns(&events)
+            .iter()
+            .filter_map(|s| field(s, "role"))
+            .collect();
+        assert_eq!(roles.len(), 2, "time corrigido tem 2 papéis");
+        assert!(
+            roles.contains(&"Backend") && roles.contains(&"QA"),
+            "monta pelo time da ÚLTIMA interpretação: {roles:?}"
+        );
+        assert!(
+            !roles.contains(&"Frontend"),
+            "o time antigo (Frontend) foi descartado pela correção"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-5 (gate d): 1ª falha re-despacha ao MESMO dev (effort do degrau base); ao SUBIR o degrau,
+    /// é um NOVO desenvolvedor com effort estritamente maior (`Ord`) e prompt carregando "tentativas
+    /// anteriores".
+    #[test]
+    fn f3_2_5_re_mesmo_no_degrau_base_depois_novo_dev_com_effort_maior() {
+        let (mut router, _sup, mut ts, dir) = seed_goal("f325-newdev", &[("T1", "false")]);
+        router.config.effort_ladder = &[Effort::Medium, Effort::High];
+        router.config.goal_max_iterations = 5;
+        check(&mut router, &mut ts, "T1", 2000); // Fail iter1 → re-despacho ao MESMO (Medium).
+        check(&mut router, &mut ts, "T1", 2001); // Fail iter2 → NOVO dev (High, estritamente maior).
+
+        let events = ts.store.events().unwrap();
+        let spawns = recs_of(&events, "SpawnRequested");
+        assert_eq!(spawns.len(), 2, "dois re-escalonamentos");
+        // 1ª volta: re-despacho ao MESMO dev (@Dev), effort do degrau base.
+        assert_eq!(field(spawns[0], "effort"), Some("medium"));
+        assert_eq!(
+            field(spawns[0], "name"),
+            Some("@Dev"),
+            "re-despacho ao MESMO target"
+        );
+        // 2ª volta: NOVO dev, effort estritamente maior, prompt com tentativas anteriores.
+        assert_eq!(
+            field(spawns[1], "effort"),
+            Some("high"),
+            "effort Ord crescente (medium→high)"
+        );
+        assert_ne!(
+            field(spawns[1], "name"),
+            Some("@Dev"),
+            "NOVO desenvolvedor (não re-despacho ao mesmo)"
+        );
+        assert!(
+            field(spawns[1], "prompt")
+                .unwrap()
+                .contains("tentativas anteriores"),
+            "prompt do novo dev carrega as tentativas anteriores"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-5 (breaker sticky): com a escada no TOPO (effort não tem para onde subir), o re-spawn
+    /// IDÊNTICO (mesma tarefa+effort) é SUPRIMIDO — deixa o turn-budget/gate humano resolver.
+    #[test]
+    fn f3_2_5_breaker_sticky_suprime_re_spawn_identico() {
+        let (mut router, _sup, mut ts, dir) = seed_goal("f325-sticky", &[("T1", "false")]);
+        // escada de 1 degrau: o effort não tem para onde subir → o 2º re-spawn seria IDÊNTICO.
+        router.config.effort_ladder = &[Effort::High];
+        router.config.goal_max_iterations = 5; // alto p/ o breaker morder ANTES do turn-budget.
+        check(&mut router, &mut ts, "T1", 2000); // Fail iter1 → re-spawn High.
+        check(&mut router, &mut ts, "T1", 2001); // Fail iter2 → seria High IDÊNTICO → suprimido.
+        check(&mut router, &mut ts, "T1", 2002); // Fail iter3 → idem, suprimido.
+
+        let events = ts.store.events().unwrap();
+        let spawns = recs_of(&events, "SpawnRequested");
+        assert_eq!(
+            spawns.len(),
+            1,
+            "breaker sticky: após o 1º re-spawn no topo da escada, idênticos são suprimidos"
+        );
+        assert_eq!(field(spawns[0], "effort"), Some("high"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
