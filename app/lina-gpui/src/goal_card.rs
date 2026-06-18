@@ -295,6 +295,10 @@ pub struct GoalCard {
     on_correct: Option<ClickHandler>,
     /// Toggle recolher/expandir (botão do cabeçalho). `None` = sem toggle (pré-visualização).
     on_toggle: Option<ClickHandler>,
+    /// Editor inline do entendimento ATIVO (`Some(buffer)` = o usuário clicou "Quero ajustar" e digita
+    /// a correção). O buffer e o teclado vivem na view; o card só RENDERIZA o campo no lugar de "O que
+    /// entendi".
+    editing: Option<SharedString>,
 }
 
 impl GoalCard {
@@ -309,7 +313,16 @@ impl GoalCard {
             on_confirm: None,
             on_correct: None,
             on_toggle: None,
+            editing: None,
         }
+    }
+
+    /// Reflete o editor inline do entendimento (`Some(buffer)` = em edição). A view é a dona do buffer
+    /// e do teclado; o card só RENDERIZA o campo.
+    #[must_use]
+    pub fn editing(mut self, buffer: Option<SharedString>) -> Self {
+        self.editing = buffer;
+        self
     }
 
     /// Reflete o estado recolhido (a view é a dona). Recolhido esconde tudo menos o cabeçalho + a meta.
@@ -427,15 +440,40 @@ impl RenderOnce for GoalCard {
             .text_color(rgb(t.text.bright))
             .child(gpui::text!(SharedString::from(self.goal.statement.clone())));
 
-        // "O que entendi" — só quando o Maestro já devolveu o entendimento.
-        let understanding = self.goal.interpretation.clone().map(|interp| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(Space::Xs.px(&t)))
-                .child(section_label(&t, "O que entendi"))
-                .child(body_text(&t, SharedString::from(interp)))
-        });
+        // "O que entendi" — ou o EDITOR inline quando o usuário clicou "Quero ajustar" (F3-1-7). O
+        // cursor "|" marca onde o texto cresce; o teclado (Enter salva · Esc cancela) é tratado na view.
+        let understanding = if let Some(buf) = self.editing.clone() {
+            Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::Xs.px(&t)))
+                    .child(section_label(&t, "Ajustando o que entendi"))
+                    .child(
+                        Panel::surface()
+                            .bg(Surface::RaisedAlt)
+                            .border(t.accent.primary)
+                            .pad(Space::Md, Space::Sm)
+                            .child(body_text(&t, SharedString::from(format!("{buf}|")))),
+                    )
+                    .child(
+                        div()
+                            .font_family(t.typography.family.ui)
+                            .text_size(px(f32::from(t.typography.size.small)))
+                            .text_color(rgb(t.text.muted))
+                            .child(gpui::text!("Enter salva · Esc cancela")),
+                    ),
+            )
+        } else {
+            self.goal.interpretation.clone().map(|interp| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::Xs.px(&t)))
+                    .child(section_label(&t, "O que entendi"))
+                    .child(body_text(&t, SharedString::from(interp)))
+            })
+        };
 
         // "Como vou saber que deu certo" — critérios em linguagem clara, marcados feito quando fechou.
         let achieved = self.goal.phase == GoalPhase::Achieved;

@@ -505,6 +505,9 @@ struct WorkspaceView {
     /// F3-1-7: deslocamento (px de tela) de cada card de Goal pela posição base, por `goal_id` —
     /// estado de sessão (o usuário arrastou o card para fora do caminho; não persiste no log).
     goal_offsets: std::collections::HashMap<String, (f32, f32)>,
+    /// F3-1-7: editor inline do entendimento de uma Goal ("Quero ajustar") — `Some((goal_id, buffer))`
+    /// enquanto o humano DIGITA a correção. Enter re-envia `goal.interpret` pelo canal humano; Esc fecha.
+    editing_goal: Option<(String, String)>,
     /// Z-order (profundidade) por nó: maior = mais à frente. O focado é bombeado ao topo.
     z_order: BTreeMap<NodeId, u64>,
     z_next: u64,
@@ -704,6 +707,7 @@ impl WorkspaceView {
             collapsed_goals: std::collections::HashSet::new(),
             goal_drag: None,
             goal_offsets: std::collections::HashMap::new(),
+            editing_goal: None,
             z_order: BTreeMap::new(),
             z_next: 0,
             sel: None,
@@ -2152,9 +2156,13 @@ impl WorkspaceView {
                 .get(&goal.goal_id)
                 .copied()
                 .unwrap_or((0.0, 0.0));
+            let editing = self.editing_goal.as_ref().and_then(|(gid, buf)| {
+                (gid == &goal.goal_id).then(|| gpui::SharedString::from(buf.clone()))
+            });
             let card = goal_card::GoalCard::new(goal)
                 .iteration_budget(budget)
                 .collapsed(is_collapsed)
+                .editing(editing)
                 .on_confirm(cx.listener(move |view, _ev, window, cx| {
                     view.confirm_goal(&gid_confirm, window, cx);
                 }))
@@ -2217,9 +2225,15 @@ impl WorkspaceView {
     /// F3-1-7: o fundador quer AJUSTAR a interpretação (re-abrir `goal.interpret`). Mesma costura
     /// pendente do [`Self::confirm_goal`] (intent autenticado pelo `Mailbox` da bomba). Registra por DADOS.
     fn correct_goal(&mut self, goal_id: &str, cx: &mut Context<Self>) {
-        eprintln!(
-            "[GOAL] ajuste para goal {goal_id} — re-abrir goal.interpret (disparo autenticado pendente de costura)"
-        );
+        // ADR 0036: abre o editor inline do entendimento (pré-preenchido com a interpretação atual). O
+        // usuário reescreve e o Enter re-envia `goal.interpret` pelo canal humano (ver `handle_key`).
+        let current = self
+            .goals_cache
+            .as_ref()
+            .and_then(|(_, goals, _)| goals.iter().find(|g| g.goal_id == goal_id))
+            .and_then(|g| g.interpretation.clone())
+            .unwrap_or_default();
+        self.editing_goal = Some((goal_id.to_string(), current));
         cx.notify();
     }
 
@@ -3155,6 +3169,51 @@ impl WorkspaceView {
                 cx.notify();
                 return;
             }
+        }
+        // F3-1-7 — EDITOR DO ENTENDIMENTO da Goal ("Quero ajustar"): digita a correção; Enter re-envia
+        // `goal.interpret` pelo canal humano (ADR 0036); Esc cancela; Backspace apaga. Modal leve, mesma
+        // precedência do modo criação (consome a tecla p/ o IME não vazar a letra ao PTY focado).
+        if self.editing_goal.is_some() {
+            match ks.key.as_str() {
+                "escape" => self.editing_goal = None,
+                "enter" | "return" => {
+                    if let Some((goal_id, buf)) = self.editing_goal.take() {
+                        let understanding = buf.trim();
+                        if !understanding.is_empty() {
+                            // `by="human"` é carimbado SERVER-SIDE na MailboxPump; a view só enfileira o
+                            // intent. `serde_json` escapa o texto livre do usuário (aspas etc.) com segurança.
+                            let payload = serde_json::json!({
+                                "goal_id": goal_id,
+                                "interpretation": understanding,
+                                "strategy": "ajustado por voce",
+                            })
+                            .to_string();
+                            self.nodes.push_human_intent("goal.interpret", payload);
+                        }
+                    }
+                }
+                "backspace" => {
+                    if let Some((_, buf)) = self.editing_goal.as_mut() {
+                        buf.pop();
+                    }
+                }
+                _ => {
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(kc) = ks
+                            .key_char
+                            .as_ref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                        {
+                            if let Some((_, buf)) = self.editing_goal.as_mut() {
+                                buf.push_str(kc);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
         // W4-2 · M3/M4 — MODO CRIAÇÃO de nota/pasta (disparado pela paleta): digita o título; Enter cria
         // (semeia o nó VIVO + foca); Esc cancela; Backspace apaga. Modal leve, irmão do naming (M2).
