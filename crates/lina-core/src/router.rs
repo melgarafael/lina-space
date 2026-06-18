@@ -1848,6 +1848,14 @@ impl Router {
     /// projeção atual (fonte da verdade), loga o evento ANTES de tocar o disco, e reescreve o
     /// `.lina/plan.md` (escritor único). NÃO entrega a nenhuma PTY.
     fn handle_plan(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        // `plan.add`/`plan.seed` carregam os dados no PAYLOAD (não no `--ref` de claim/check) — ramifica
+        // ANTES do `plan_ref()` obrigatório, senão seriam recusados por "sem ref" (o caminho de produção
+        // que faltava: até aqui só os testes os exercitavam, montando os eventos à mão).
+        match msg.intent.as_str() {
+            "plan.add" => return self.handle_plan_add(msg, store),
+            "plan.seed" => return self.handle_plan_seed(msg, store),
+            _ => {}
+        }
         let Some(item) = msg.plan_ref() else {
             return RouteOutcome::PlanRejected("mensagem de plano sem campo 'ref'".into());
         };
@@ -1910,6 +1918,196 @@ impl Router {
         RouteOutcome::PlanApplied {
             intent: msg.intent.clone(),
             item,
+        }
+    }
+
+    /// Núcleo compartilhado de `plan.add`/`plan.seed`: semeia o item (`PlanItemAdded`) e o ATRIBUI à
+    /// Goal/parents/DoD (`PlanItemAttributed`), mutando o `plan` que o caller projetou (e que ele depois
+    /// reescreve no `plan.md` — o `plan.seed` emite o `GoalDecomposed` no meio). `Some(_)` = rejeição
+    /// (id duplicado) ou persistência, pronto para o caller `return`; `None` = item criado e logado
+    /// (COD-5: sem duplicar a sequência log-antes-de-projetar do invariante #4).
+    fn attribute_item(
+        &mut self,
+        store: &mut EventStore,
+        plan: &mut Plan,
+        attr: ItemAttribution,
+    ) -> Option<RouteOutcome> {
+        let ItemAttribution {
+            item,
+            desc,
+            goal_id,
+            parents,
+            acceptance,
+            budget_tokens,
+        } = attr;
+        if let Err(e) = plan.add_item(item.clone(), desc.clone()) {
+            return Some(RouteOutcome::PlanRejected(e.to_string()));
+        }
+        if let Err(e) = store.append(&DomainEvent::PlanItemAdded {
+            item: item.clone(),
+            desc,
+        }) {
+            return Some(RouteOutcome::PersistFailed(e.to_string()));
+        }
+        plan.apply_item_attributed(
+            &item,
+            goal_id.clone(),
+            parents.clone(),
+            acceptance.clone(),
+            budget_tokens,
+        );
+        if let Err(e) = store.append(&DomainEvent::PlanItemAttributed {
+            item,
+            goal_id,
+            parents,
+            acceptance,
+            budget_tokens,
+        }) {
+            return Some(RouteOutcome::PersistFailed(e.to_string()));
+        }
+        None
+    }
+
+    /// **F3-1-6 (spec 52 §2): `plan.add`** — promove um item ao plano e o ATRIBUI a uma Goal (DoD por
+    /// item). Ao contrário do nível-Goal (HumanReview forçado em `handle_goal`), aqui o `check_kind` é
+    /// RESPEITADO: este é o critério verificável por máquina — quando o item é `check`ado, o juiz o roda
+    /// sob `guard::decide` (um `Command` `GatedHard` continua pedindo `Ask`; o critério verifica, não autoriza).
+    fn handle_plan_add(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let item = payload
+            .get("item")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if item.is_empty() {
+            return RouteOutcome::PlanRejected("plan.add exige o campo 'item'".into());
+        }
+        let desc = payload
+            .get("desc")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+        let parents = payload
+            .get("parents")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let acceptance: Vec<AcceptanceCriterion> = payload
+            .get("acceptance")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        let budget_tokens = payload
+            .get("budget_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+
+        let mut plan = match store.project() {
+            Ok(state) => state.plan,
+            Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+        };
+        if let Some(outcome) = self.attribute_item(
+            store,
+            &mut plan,
+            ItemAttribution {
+                item: item.clone(),
+                desc,
+                goal_id,
+                parents,
+                acceptance,
+                budget_tokens,
+            },
+        ) {
+            return outcome;
+        }
+        if let Err(e) = self.mailbox.write_plan(&plan.render()) {
+            eprintln!("lina-core: CRÍTICO — plan.add logado mas plan.md não reescrito: {e}");
+        }
+        RouteOutcome::PlanApplied {
+            intent: msg.intent.clone(),
+            item,
+        }
+    }
+
+    /// **F3-1-6 (spec 52 §2, gate de saída (a)): `plan.seed`** — DECOMPÕE uma Goal CONFIRMADA em ≥1 item
+    /// do plano. A decomposição é DETERMINÍSTICA (invariante #1: ZERO LLM no core): 1 item espelha a meta
+    /// e herda seus critérios de aceite. A decomposição RICA em N sub-tarefas é do Maestro-agente via
+    /// `plan add` (porta aberta da F3-2), JAMAIS de cognição no core. Emite `PlanItemAdded` +
+    /// `PlanItemAttributed` + `GoalDecomposed`. Recusa meta fora de `Confirmed` (a fase é o trinco
+    /// idempotente — re-seed de uma meta já `Decomposed` é recusado pelo gate de ciclo, não pelo bin).
+    fn handle_plan_seed(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if goal_id.is_empty() {
+            return RouteOutcome::GoalRejected("plan.seed exige o campo 'goal_id'".into());
+        }
+        let events = match store.events() {
+            Ok(events) => events,
+            Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+        };
+        let goals = crate::project_goals(&events);
+        let Some(goal) = goals.iter().find(|g| g.goal_id == goal_id) else {
+            return RouteOutcome::GoalRejected(format!("meta {goal_id} nao existe no log"));
+        };
+        // GATE DE CICLO (a recusa é do supervisor, não do bin): só decompõe a meta CONFIRMADA — antes do
+        // gate humano não há o que decompor; depois (`Decomposed`/`InLoop`/...) a fase barra o re-seed.
+        if goal.phase != crate::GoalPhase::Confirmed {
+            return RouteOutcome::GoalRejected(format!(
+                "meta {goal_id} precisa estar confirmada para decompor (fase atual nao permite)"
+            ));
+        }
+        // Item id DETERMINÍSTICO derivado do goal_id (`chars().take(8)` — nunca panica, COD-4): único
+        // entre metas e idempotente no replay (o evento carrega o id literal). 1 item herda o statement
+        // + os critérios da Goal (vazio → o juiz defere ao humano via turn-budget).
+        let short: String = goal_id.chars().take(8).collect();
+        let item = format!("g{short}");
+        let desc = goal.statement.clone();
+        let acceptance = goal.acceptance.clone();
+
+        let mut plan = match store.project() {
+            Ok(state) => state.plan,
+            Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+        };
+        if let Some(outcome) = self.attribute_item(
+            store,
+            &mut plan,
+            ItemAttribution {
+                item: item.clone(),
+                desc,
+                goal_id: Some(goal_id.clone()),
+                parents: Vec::new(),
+                acceptance,
+                budget_tokens: 0,
+            },
+        ) {
+            return outcome;
+        }
+        if let Err(e) = store.append(&DomainEvent::GoalDecomposed {
+            goal_id: goal_id.clone(),
+            plan_items: vec![item],
+        }) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        if let Err(e) = self.mailbox.write_plan(&plan.render()) {
+            eprintln!("lina-core: CRÍTICO — plan.seed logado mas plan.md não reescrito: {e}");
+        }
+        RouteOutcome::GoalApplied {
+            intent: msg.intent.clone(),
+            goal_id,
         }
     }
 
@@ -2276,22 +2474,23 @@ impl Router {
                             .collect()
                     })
                     .unwrap_or_default();
-                // Critérios da interpretação nascem como HumanReview (gate); o DoD verificável por
-                // máquina é atribuído por item via `PlanItemAttributed` (CheckKind real).
+                // A CLI serializa os critérios como `acceptance:[AcceptanceCriterion]` (mesma chave/forma
+                // de `plan.add`). Aqui extraímos só a `desc` e FORÇAMOS `HumanReview`: na interpretação da
+                // Goal todo critério nasce confirmado por humano (gate, spec 52 §1) — o DoD verificável por
+                // máquina (`Command`/`TestPass`) entra por ITEM via `PlanItemAttributed`, NUNCA pela Goal
+                // (um agente não injeta um `Command` no nível da meta).
                 let acceptance_criteria = payload
-                    .get("accept")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .map(|desc| AcceptanceCriterion {
-                                desc: desc.to_string(),
-                                check_kind: CheckKind::HumanReview,
-                                check_arg: None,
-                            })
-                            .collect()
+                    .get("acceptance")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<Vec<AcceptanceCriterion>>(v).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| AcceptanceCriterion {
+                        desc: c.desc,
+                        check_kind: CheckKind::HumanReview,
+                        check_arg: None,
                     })
-                    .unwrap_or_default();
+                    .collect();
                 let goal_event = DomainEvent::GoalInterpreted {
                     goal_id: goal_id.clone(),
                     interpretation: text("interpretation"),
@@ -2518,9 +2717,26 @@ impl Router {
     }
 }
 
+/// F3-1-6 (spec 52 §2): os dados de um item a semear E atribuir (`plan.add`/`plan.seed`) — agrupa o
+/// que vira `PlanItemAdded` + `PlanItemAttributed` para [`Router::attribute_item`] (sem assinatura de
+/// muitos args). `goal_id: None` = item avulso (legado); `acceptance` vazio defere ao humano.
+struct ItemAttribution {
+    item: String,
+    desc: String,
+    goal_id: Option<String>,
+    parents: Vec<String>,
+    acceptance: Vec<AcceptanceCriterion>,
+    budget_tokens: u64,
+}
+
 /// `true` se o intent é uma operação de plano (aplicada ao `plan.md`, nunca entregue a PTY).
+/// `claim`/`check` mutam um item via `--ref`; `add`/`seed` (F3-1-6) carregam os dados no payload e
+/// nascem do `lina plan add`/`lina plan seed` — todos interceptados por INTENT (não por alvo).
 fn is_plan_intent(intent: &str) -> bool {
-    matches!(intent, "plan.claim" | "plan.check")
+    matches!(
+        intent,
+        "plan.claim" | "plan.check" | "plan.add" | "plan.seed"
+    )
 }
 
 /// F1-3-6 (ADR 0019 §6): `true` se o intent é um pedido de SPAWN (`lina spawn`). Interceptado no
@@ -7182,6 +7398,304 @@ mod tests {
         assert_eq!(live[0].goal_id, goal_id);
         assert_eq!(live[0].phase, crate::GoalPhase::Achieved);
         assert_eq!(live[0].items, vec!["T1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Roda define→interpret→confirm pelo CAMINHO REAL (route_message) e devolve o goal_id CONFIRMADO.
+    // `descs` viram critérios de aceite no formato EXATO que a CLI serializa (`acceptance:[objeto]`).
+    fn confirma_goal(
+        router: &mut Router,
+        ts: &mut TmpStore,
+        statement: &str,
+        descs: &[&str],
+    ) -> String {
+        let (_rec, mut deliver) = recorder();
+        let goal_id = match router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.define",
+                format!(r#"{{"statement":"{statement}"}}"#),
+            ),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        ) {
+            RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+            o => panic!("define: {o:?}"),
+        };
+        let crits: Vec<AcceptanceCriterion> = descs
+            .iter()
+            .map(|d| AcceptanceCriterion {
+                desc: (*d).into(),
+                check_kind: CheckKind::HumanReview,
+                check_arg: None,
+            })
+            .collect();
+        let acc = serde_json::to_value(&crits).unwrap();
+        let interp = serde_json::json!({
+            "goal_id": goal_id, "interpretation": "entendi", "strategy": "1 dev",
+            "proposed_team": [], "acceptance": acc,
+        })
+        .to_string();
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp),
+            &mut ts.store,
+            1001,
+            &mut deliver,
+        );
+        router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.confirm",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1002,
+            &mut deliver,
+        );
+        goal_id
+    }
+
+    /// GL-2 (descasamento CLI↔core): `goal.interpret` PERSISTE os critérios no formato que a CLI
+    /// realmente serializa (`acceptance:[AcceptanceCriterion]`), não a chave fantasma `accept`.
+    #[test]
+    fn goal_interpret_persiste_acceptance_no_formato_da_cli() {
+        let (mut router, sup, dir) = router_with("gl2-acc");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("gl2-acc");
+        let (_rec, mut deliver) = recorder();
+        let goal_id = match router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.define",
+                r#"{"statement":"criar a landing"}"#,
+            ),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        ) {
+            RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+            o => panic!("define: {o:?}"),
+        };
+        // Payload IDÊNTICO ao da CLI: `acceptance` é array de objetos AcceptanceCriterion serializados.
+        let acc = serde_json::to_value(vec![AcceptanceCriterion {
+            desc: "a pagina abre sem erro".into(),
+            check_kind: CheckKind::HumanReview,
+            check_arg: None,
+        }])
+        .unwrap();
+        let interp = serde_json::json!({
+            "goal_id": goal_id, "interpretation": "LP simples", "strategy": "1 dev",
+            "proposed_team": [], "acceptance": acc,
+        })
+        .to_string();
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp),
+            &mut ts.store,
+            1001,
+            &mut deliver,
+        );
+        let goals = crate::project_goals(&ts.store.events().unwrap());
+        let g = goals
+            .iter()
+            .find(|g| g.goal_id == goal_id)
+            .expect("goal existe");
+        assert_eq!(
+            g.acceptance.len(),
+            1,
+            "o criterio de aceite da CLI foi persistido"
+        );
+        assert_eq!(g.acceptance[0].desc, "a pagina abre sem erro");
+        assert_eq!(
+            g.acceptance[0].check_kind,
+            CheckKind::HumanReview,
+            "Goal = HumanReview (invariante spec 52 §1)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GL-1 (intent `plan.seed` sem handler): a meta CONFIRMADA decompõe em ≥1 `PlanItemAttributed`
+    /// com goal_id (gate de saída F3-1 (a)) pelo CAMINHO REAL (route_message), não montado à mão.
+    #[test]
+    fn plan_seed_decompoe_goal_confirmada_em_item_atribuido() {
+        let (mut router, sup, dir) = router_with("gl1-seed");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("gl1-seed");
+        let goal_id = confirma_goal(&mut router, &mut ts, "criar a landing", &["a pagina abre"]);
+        let (_rec, mut deliver) = recorder();
+        let out = router.route_message(
+            &MailMessage::new(
+                "@User",
+                "plan",
+                "plan.seed",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1003,
+            &mut deliver,
+        );
+        assert!(
+            matches!(out, RouteOutcome::GoalApplied { .. }),
+            "seed aplicou: {out:?}"
+        );
+        let events = ts.store.events().unwrap();
+        assert_eq!(
+            events.iter().filter(|r| r.kind == "GoalDecomposed").count(),
+            1,
+            "exatamente um GoalDecomposed"
+        );
+        assert!(
+            events.iter().any(|r| r.kind == "PlanItemAttributed"),
+            "ao menos um PlanItemAttributed"
+        );
+        let goals = crate::project_goals(&events);
+        let g = goals.iter().find(|g| g.goal_id == goal_id).unwrap();
+        assert_eq!(
+            g.phase,
+            crate::GoalPhase::Decomposed,
+            "fase avancou para decomposta"
+        );
+        assert_eq!(g.items.len(), 1, "um item semeado");
+        let plan = ts.store.project().unwrap().plan;
+        let item = plan
+            .itens
+            .iter()
+            .find(|i| i.id == g.items[0])
+            .expect("item no plano");
+        assert_eq!(
+            item.goal_id.as_deref(),
+            Some(goal_id.as_str()),
+            "item atribuido a goal"
+        );
+        assert_eq!(item.acceptance.len(), 1, "item herdou o criterio da goal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GL-1 (gate de ciclo): `plan.seed` de meta AINDA NÃO confirmada é recusado — zero decomposição.
+    #[test]
+    fn plan_seed_recusa_meta_nao_confirmada() {
+        let (mut router, sup, dir) = router_with("gl1-naoconf");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("gl1-naoconf");
+        let (_rec, mut deliver) = recorder();
+        let goal_id = match router.route_message(
+            &MailMessage::new("@User", "goal", "goal.define", r#"{"statement":"x"}"#),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        ) {
+            RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+            o => panic!("{o:?}"),
+        };
+        // interpreta, mas NÃO confirma (fase Interpreted).
+        let interp = format!(r#"{{"goal_id":"{goal_id}","interpretation":"i","strategy":"s"}}"#);
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp),
+            &mut ts.store,
+            1001,
+            &mut deliver,
+        );
+        let out = router.route_message(
+            &MailMessage::new(
+                "@User",
+                "plan",
+                "plan.seed",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1002,
+            &mut deliver,
+        );
+        assert!(
+            matches!(out, RouteOutcome::GoalRejected(_)),
+            "recusou meta nao confirmada: {out:?}"
+        );
+        let events = ts.store.events().unwrap();
+        assert_eq!(
+            events.iter().filter(|r| r.kind == "GoalDecomposed").count(),
+            0,
+            "nenhuma decomposicao"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GL-1 + invariante #4: após `plan.seed` REAL, reabrir o store e re-projetar reconstrói a Goal E o
+    /// Plan idênticos (replay = verdade), incluindo o item semeado e sua atribuição.
+    #[test]
+    fn plan_seed_real_reconstroi_no_replay() {
+        let (mut router, sup, dir) = router_with("gl1-replay");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("gl1-replay");
+        let goal_id = confirma_goal(&mut router, &mut ts, "criar x", &["abre"]);
+        let (_rec, mut deliver) = recorder();
+        router.route_message(
+            &MailMessage::new(
+                "@User",
+                "plan",
+                "plan.seed",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1003,
+            &mut deliver,
+        );
+        let live_goals = crate::project_goals(&ts.store.events().unwrap());
+        let live_plan = ts.store.project().unwrap().plan;
+        let reopened = EventStore::open(&ts.dir).expect("reabrir store");
+        let replayed_goals = crate::project_goals(&reopened.events().unwrap());
+        let replayed_plan = reopened.project().unwrap().plan;
+        assert_eq!(live_goals, replayed_goals, "Goal identica no replay");
+        assert_eq!(
+            live_plan, replayed_plan,
+            "Plan identico no replay (round-trip)"
+        );
+        assert_eq!(live_goals[0].phase, crate::GoalPhase::Decomposed);
+        assert!(!live_plan.itens.is_empty(), "plano tem o item semeado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GL-1: `plan.add` cria o item E o atribui à Goal (`PlanItemAdded` + `PlanItemAttributed`). Ao
+    /// contrário do nível-Goal (HumanReview forçado), o ITEM RESPEITA o `check_kind` — é o DoD real.
+    #[test]
+    fn plan_add_cria_item_atribuido_a_goal() {
+        let (mut router, sup, dir) = router_with("gl1-add");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("gl1-add");
+        let goal_id = confirma_goal(&mut router, &mut ts, "criar x", &[]);
+        let (_rec, mut deliver) = recorder();
+        let acc = serde_json::to_value(vec![AcceptanceCriterion {
+            desc: "compila".into(),
+            check_kind: CheckKind::Command,
+            check_arg: Some("true".into()),
+        }])
+        .unwrap();
+        let payload = serde_json::json!({
+            "item": "T9", "desc": "montar a API", "goal_id": goal_id,
+            "parents": [], "acceptance": acc, "budget_tokens": 0,
+        })
+        .to_string();
+        let out = router.route_message(
+            &MailMessage::new("@User", "plan", "plan.add", &payload),
+            &mut ts.store,
+            1003,
+            &mut deliver,
+        );
+        assert!(
+            matches!(out, RouteOutcome::PlanApplied { .. }),
+            "add aplicou: {out:?}"
+        );
+        let plan = ts.store.project().unwrap().plan;
+        let item = plan.itens.iter().find(|i| i.id == "T9").expect("T9 existe");
+        assert_eq!(item.goal_id.as_deref(), Some(goal_id.as_str()));
+        assert_eq!(item.acceptance.len(), 1);
+        assert_eq!(
+            item.acceptance[0].check_kind,
+            CheckKind::Command,
+            "item RESPEITA o check_kind (DoD verificavel por maquina)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
