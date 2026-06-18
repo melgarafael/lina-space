@@ -127,3 +127,21 @@ A costura crítica é `router.rs` (OUTER loop) — **dono único = CORE (B/Ultra
 - Decisão de arquiteto: reusar `GoalInterpreted`/`GoalConfirmed` (SEM `InterpretationProposed`); proveniência do Tradutor via `GoalDefined.origin` (já existe, `events.rs:591`). **Sem contrato novo a fixar.**
 
 **➡️ AÇÃO PÓS-REBUILD (re-despachar a F3-2):** com o fix de confiabilidade NO AR, re-disparar as 5 frentes via os despachos acima (`lina handoff @<terminal> ... --ref plan:F2X`). Confirmar o 1º progresso de cada (`lina list` → Busy; não confiar no ack). Monitorar via `lina list` + reportes push (NÃO via `lina plan read`, que está stale). Os terminais B/H/I/G/R (+ J/K reserva) seguem no roster.
+
+---
+
+## CONCLUSÃO — F3-2 EXECUTADA e COMMITADA (2026-06-18)
+
+**O rebuild NÃO foi necessário no meio:** a **retenção** do app recuperou os handoffs "engolidos" (4/5 entregaram com atraso; o 5º na 2ª tentativa) — a F3-2 rodou sobre o app atual e fechou. (Prova de produto: a retenção é a rede de segurança parcial que o fix de confiabilidade torna *confiável* em vez de *sortuda*.)
+
+**Gate de código FECHADO ✅:**
+- Validação de fora (exit codes): lina-core **412**, bootstrap, role-discovery 19, app 537+14+2 — todos verdes; clippy `-D warnings` 0 (crates + app); fmt `--all` 0. (2 ajustes pegos pelo gate global: fmt do R, 1 lint trivial do I corrigido pelo Maestro — dono ocioso, documentado.)
+- **Revisão CEGA (revisor isolado): PASS, score 96, 0 ALTA.** Provou por mutação/caminho real: regra-mãe enforçada (`@Superuser` no `proposed_team` não vira autoridade; `by`/`reviewer` server-side; `ReviewVerdict{Pass}` não libera `GatedHard`); ZERO LLM no core (juiz = exit code); bug da chave `team`→`proposed_team` corrigido; `lina history` respeita pertencimento (ADR 0006).
+- **Commitado por fatia:** `24f6d90` F2CORE (loop) · `6cc3a3b` F2BRIEF (briefing + `lina history`/#15) · `0a803b0` F2TRAD (papel Tradutor) · `8abea53` F2UI (tela do loop) · `260aa8a` F2QA (segurança + adoção + repro residual).
+
+**DEFERIDO com mapa (3 fiações de "ativação" — porta aberta, fatia rápida de fechamento):**
+1. **Fiação do `entry_origin` ao core** — `handle_goal` (`router.rs:~2517`) ainda usa `msg.from` para o `origin`; trocar por `entry_origin(roster)` faz o `GoalDefined{origin:"@Tradutor"}` acontecer de fato (a função já está pronta e testada). É o que completa o gate (a). BAIXA.
+2. **Skill `lina-translator` (Camada 2 do Tradutor)** — redigida e validada (896B) em `tasks/epico-f3/despachos/f3-2/lina-translator.SKILL.md`; registrar no catálogo (`skills.rs` + contador `lib.rs`), diff em `f2trad-costura-camada2.md`.
+3. **Seção "Como vou fazer" (strategy) na tela** — exige `strategy:Option<String>` aditivo no struct `Goal` (com `#[derive(Default)]`/`..Default` p/ não quebrar literais) + braço em `project_goals`; consumidor de UI já pronto.
+
+**PENDENTE BLOQUEANTE (gate h, diferido ao fundador):** validação na TELA do cenário do loop (interpretação → confirmar/corrigir → progresso → escalada narrada) — junto com o gate g da confiabilidade, fecha no rebuild + olho do fundador. gpui não roda headless.
