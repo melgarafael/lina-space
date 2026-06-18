@@ -65,7 +65,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -1518,6 +1518,7 @@ fn run_goal(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("define") => run_goal_define(&args[1..]),
         Some("interpret") => run_goal_interpret(&args[1..]),
+        Some("confirm") => run_goal_confirm(args.get(1)),
         Some("status") => run_goal_status(&args[1..]),
         _ => {
             usage();
@@ -1703,9 +1704,30 @@ fn run_goal_interpret(args: &[String]) -> ExitCode {
     }
 }
 
+/// Monta o envelope `goal.confirm`: o GATE HUMANO passou — payload `{goal_id}`, alvo sentinela "goal".
+/// `handle_goal` valida o ciclo (só confirma meta `Interpreted`), carimba `by` server-side (ADR 0007 —
+/// quem confirma é autoridade, JAMAIS o payload) e emite `GoalConfirmed`, que habilita a decomposição (`plan seed`).
+fn build_goal_confirm_envelope(from: &str, goal_id: &str) -> MailMessage {
+    let payload = serde_json::json!({ "goal_id": goal_id }).to_string();
+    MailMessage::new(from, "goal", "goal.confirm", payload)
+}
+
+/// `lina goal confirm <goal_id>` — enfileira a confirmação (gate humano) que libera a decomposição.
+/// Reusa o gate/tail dos writers da Goal: em `manual` o agente PROPÕE, não confirma a meta sozinho.
+/// Sem `goal_id`, sai com código 2 (uso).
+fn run_goal_confirm(goal_id: Option<&String>) -> ExitCode {
+    let Some(goal_id) = goal_id else {
+        eprintln!("lina: 'goal confirm' exige o goal_id (ex.: lina goal confirm g-7)");
+        usage();
+        return ExitCode::from(2);
+    };
+    let label = format!("goal confirm {goal_id}");
+    enqueue_goal_write(&label, |from| build_goal_confirm_envelope(from, goal_id))
+}
+
 /// `lina goal status <goal_id> [--json]` — LEITURA PURA da projeção `Goal` (replay do log, SÓ-LEITURA,
-/// como `params show`/`retro`). Esqueleto Rα-0: `project_goals` ainda devolve vazio (a varredura por
-/// `goal_id` é a fatia CORE-Goal-lógica) — o CABEAMENTO read é o que esta fatia entrega e testa.
+/// como `params show`/`retro`). `project_goals` (CORE-Goal) varre o log por `goal_id` e reconstrói o
+/// ciclo da meta; este verbo renderiza a projeção sem mutar.
 fn run_goal_status(args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
     let Some(goal_id) = args.iter().find(|a| !a.starts_with("--")) else {
@@ -1738,9 +1760,9 @@ fn goal_phase_label(phase: GoalPhase) -> &'static str {
     }
 }
 
-/// Render legível (leigo) do status. `None` = nenhuma meta com esse id no log (no esqueleto Rα-0,
-/// sempre — a projeção real vem depois). Mostra os campos que a projeção EXPÕE hoje (fase/enunciado/
-/// entendimento/iteracoes/aceite/itens); budget e vereditos por item entram quando a projeção os reconstruir.
+/// Render legível (leigo) do status. `None` = nenhuma meta com esse id no log. Mostra os campos da
+/// projeção (fase/enunciado/entendimento/iteracoes/aceite/itens); budget e vereditos por item entram
+/// quando a projeção os reconstruir.
 fn render_goal_status(goal_id: &str, goal: Option<&Goal>) -> String {
     let Some(g) = goal else {
         return format!("Meta {goal_id}: nenhuma com esse id no log do Espaco ainda.\n");
@@ -2026,6 +2048,22 @@ mod f31_goal_surface_tests {
         assert_eq!(p["interpretation"], "u");
         assert_eq!(p["strategy"], "s");
         assert_eq!(p["proposed_team"][0], "A");
+    }
+
+    // ── goal confirm ──
+    #[test]
+    fn goal_confirm_envelope_enfileira_intent_so_com_goal_id() {
+        let env = build_goal_confirm_envelope("Terminal I", "g-7");
+        assert_eq!(env.intent, "goal.confirm");
+        assert_eq!(env.to, "goal", "alvo sentinela 'goal'");
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["goal_id"], "g-7");
+        // o bin NUNCA carimba `by` — quem confirma é autoridade server-side (ADR 0007).
+        assert!(
+            !env.payload.contains("\"by\""),
+            "o bin nao carimba a autoridade da confirmacao: {}",
+            env.payload
+        );
     }
 
     // ── plan add ──

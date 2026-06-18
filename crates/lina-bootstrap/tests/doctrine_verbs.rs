@@ -48,6 +48,10 @@ const BIN_VERBS: &[&str] = &[
 /// (promoção de `seed_plan_item` a verbo real + decomposição da Goal) ao ciclo de leitura read/claim/check.
 const PLAN_SUBVERBS: &[&str] = &["read", "claim", "check", "add", "seed"];
 
+/// Sub-verbos do `lina goal` implementados (`run_goal`). F3-1-6: a superfície da Meta — leitura
+/// (`status`) + os WRITERS do ciclo `define`→`interpret`→`confirm` (a decomposição é via `plan seed`).
+const GOAL_SUBVERBS: &[&str] = &["define", "interpret", "confirm", "status"];
+
 fn doctrine_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/lina-doctrine")
 }
@@ -87,6 +91,22 @@ fn promised_plan_subverbs(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for (idx, _) in text.match_indices("`lina plan ") {
         let rest = &text[idx + "`lina plan ".len()..];
+        let sub: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase())
+            .collect();
+        if !sub.is_empty() {
+            out.insert(sub);
+        }
+    }
+    out
+}
+
+/// Sub-verbos prometidos como "`lina goal <sub>" num texto (paralelo de [`promised_plan_subverbs`]).
+fn promised_goal_subverbs(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (idx, _) in text.match_indices("`lina goal ") {
+        let rest = &text[idx + "`lina goal ".len()..];
         let sub: String = rest
             .chars()
             .take_while(|c| c.is_ascii_lowercase())
@@ -150,6 +170,25 @@ fn doctrine_plan_subverbs_exist_in_bin() {
         assert!(
             ghosts.is_empty(),
             "{name} promete sub-verbos de `lina plan` inexistentes: {ghosts:?}"
+        );
+    }
+}
+
+/// Sub-verbos da Goal: a doutrina só ensina o ciclo que o binário tem (define/interpret/confirm/
+/// status) — mesma trava anti-fantasma de `plan`, agora para `goal` (F3-1-6: habilita o e2e
+/// define→interpret→confirm→seed sem prometer verbo que o `run_goal` não despacha).
+#[test]
+fn doctrine_goal_subverbs_exist_in_bin() {
+    let subs: BTreeSet<&str> = GOAL_SUBVERBS.iter().copied().collect();
+    for (name, text) in templates() {
+        let promised = promised_goal_subverbs(&text);
+        let ghosts: Vec<&String> = promised
+            .iter()
+            .filter(|v| !subs.contains(v.as_str()))
+            .collect();
+        assert!(
+            ghosts.is_empty(),
+            "{name} promete sub-verbos de `lina goal` inexistentes: {ghosts:?}"
         );
     }
 }
