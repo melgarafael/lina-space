@@ -2157,10 +2157,10 @@ impl WorkspaceView {
     /// forjamos um aqui. Por ora registra a decisão por DADOS (`[GOAL]`, o Maestro valida o fluxo na
     /// tela); o disparo autenticado é costura do Maestro (DEP do despacho). [SEAM: identidade do confirm].
     fn confirm_goal(&mut self, goal_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        eprintln!(
-            "[GOAL] confirm (1 toque) para goal {goal_id} — pendente da costura de disparo \
-             autenticado (by carimbado server-side; o shell não tem identidade de nó)"
-        );
+        // ADR 0036: a view DISPARA o gesto pelo canal in-process; a `MailboxPump` carimba `by="human"`
+        // SERVER-SIDE (a view NÃO escolhe `by`). `goal_id` é UUID cunhado server-side — sem escape JSON.
+        self.nodes
+            .push_human_intent("goal.confirm", format!(r#"{{"goal_id":"{goal_id}"}}"#));
         cx.notify();
     }
 

@@ -124,6 +124,16 @@ pub(crate) fn new_reinject_queue() -> ReinjectQueue {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
+/// F3-1-7 (ADR 0036): um GESTO HUMANO DIRETO da UI (confirmar/ajustar uma Goal) a caminho do core.
+/// A view (gpui) enfileira; a [`MailboxPump`] drena e chama `Router::human_intent`, que carimba
+/// `by="human"` pela NATUREZA do canal in-process. `intent`/`payload` são DADO transportado — a
+/// autoridade é o canal local (em-processo), JAMAIS estes campos: um agente não alcança esta fila.
+#[derive(Debug, Clone)]
+struct HumanIntentItem {
+    intent: String,
+    payload: String,
+}
+
 /// O texto de doutrina re-injetado no PTY vivo ao trocar de papel. Conciso (uma linha — a doutrina
 /// completa vive no `CLAUDE.md` reescrito): aponta o papel novo e que o CLAUDE.md foi atualizado.
 /// É DADO transportado (jamais autoridade): o que injeta é o gate humano + o app confiável.
@@ -1063,7 +1073,45 @@ impl MailboxPump {
         self.post_process_spawns(now_ms());
         // F1-2-4: entrega as re-injeções de doutrina represadas (respeita o freio: pausado = não drena).
         self.drain_reinject();
+        // F3-1-7 (ADR 0036): aplica os gestos humanos diretos da UI (confirmar/ajustar Goal).
+        self.drain_human_intents();
         self.refresh_cost_paused();
+    }
+
+    /// **F3-1-7 (ADR 0036) — aplica os GESTOS HUMANOS DIRETOS da UI** (confirmar/ajustar uma Goal).
+    /// Escritor único do log: drena a fila em-processo do `NodeManager` e roteia cada gesto por
+    /// `Router::human_intent`, que carimba `by="human"` pela NATUREZA do canal (in-process; nenhum
+    /// agente o alcança). Recusa NARRADA (stderr), nunca silenciosa; ao aplicar, bumpa o `event_count`
+    /// da UI para o card re-projetar a Goal no próximo tick.
+    fn drain_human_intents(&mut self) {
+        let items = self.nodes.drain_human_intents();
+        if items.is_empty() {
+            return;
+        }
+        let mut applied = false;
+        {
+            let mut store = lock(&self.store);
+            for item in items {
+                match self
+                    .router
+                    .human_intent(&item.intent, &item.payload, &mut store)
+                {
+                    RouteOutcome::GoalApplied { .. } => applied = true,
+                    other => eprintln!(
+                        "lina-gpui: gesto humano '{}' nao aplicou: {other:?}",
+                        item.intent
+                    ),
+                }
+            }
+        }
+        if applied {
+            let count = lock(&self.store).event_count().ok();
+            let mut m = lock(&self.model);
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
     }
 
     /// **F1-2-4 / FIX-A3 — drena+injeta as re-injeções de doutrina represadas, respeitando o FREIO
@@ -4222,6 +4270,10 @@ pub struct NodeManager {
     /// com a `MailboxPump` (consumidor) via [`NodeManager::reinject_queue`] — substitui a mailbox
     /// de filesystem, que era drop-zone gravável por qualquer agente do mesmo usuário de SO.
     reinject_queue: ReinjectQueue,
+    /// F3-1-7 (ADR 0036): fila EM-PROCESSO de GESTOS HUMANOS DIRETOS (confirmar/ajustar Goal). A view
+    /// gpui enfileira pelo `Arc<NodeManager>` compartilhado; a `MailboxPump` (escritor único do log)
+    /// drena e carimba `by="human"`. Mesmo padrão do `reinject_queue`, sem superfície de filesystem.
+    human_intents: Mutex<VecDeque<HumanIntentItem>>,
     /// #7 dogfooding r2: o MOTOR de spawns agente-pede. Default de produção = discovery
     /// ([`default_spawn_engine`]); os testes injetam fixa via [`Self::set_spawn_engine_factory`].
     spawn_engine: SpawnEngineFactory,
@@ -4305,6 +4357,7 @@ impl NodeManager {
             bootstrap,
             lina_dir,
             reinject_queue: new_reinject_queue(),
+            human_intents: Mutex::new(VecDeque::new()),
             // #7: produção resolve o motor do spawn por DISCOVERY no momento do spawn (sem
             // mudança de assinatura — o main não precisa de fiação para o default correto).
             spawn_engine: Arc::new(|| default_spawn_engine(&discover_clis())),
@@ -4329,6 +4382,22 @@ impl NodeManager {
     #[must_use]
     pub(crate) fn reinject_queue(&self) -> ReinjectQueue {
         Arc::clone(&self.reinject_queue)
+    }
+
+    /// F3-1-7 (ADR 0036): a UI empurra um GESTO HUMANO DIRETO (confirmar/ajustar uma Goal). A
+    /// `MailboxPump` (escritor único do log) drena e o carimba `by="human"` pelo canal in-process —
+    /// a view NÃO escolhe `by`, só enfileira o intent + payload. Produtor→consumidor sem filesystem.
+    pub(crate) fn push_human_intent(&self, intent: impl Into<String>, payload: impl Into<String>) {
+        lock(&self.human_intents).push_back(HumanIntentItem {
+            intent: intent.into(),
+            payload: payload.into(),
+        });
+    }
+
+    /// F3-1-7: a `MailboxPump` (mesmo módulo) drena os gestos humanos pendentes (FIFO) para roteá-los
+    /// pelo core. Privado (não pub) para não expor `HumanIntentItem` na superfície do crate.
+    fn drain_human_intents(&self) -> Vec<HumanIntentItem> {
+        lock(&self.human_intents).drain(..).collect()
     }
 
     /// **W4-2 · M3/M4 — cria uma NOTA ou PASTA** pelo nome e a torna VIVA no canvas (não só na
