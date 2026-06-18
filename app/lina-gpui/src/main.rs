@@ -8,6 +8,10 @@
 mod bridge;
 // W4-2: modelo de cena do canvas T4 (zonas foco/periferia/suspenso + badge) — gpui-free, testável.
 mod canvas;
+// F3-1-7: card da Goal na tela do leigo (meta + "o que entendi" + critérios + barra de iteração +
+// confirmar/escalar). Componente sobre o catálogo `ui/` + tokens F2; lógica de tela em funções puras.
+// A projeção `Goal` viva é ligada na integração do Maestro (DEP do despacho).
+mod goal_card;
 // W4-2 · M1: paleta de comandos (Cmd-K) sobre o canvas — modelo puro testável + render gpui.
 mod palette;
 // W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
@@ -583,6 +587,11 @@ struct WorkspaceView {
     /// F1-5-1: sonda [PROF] (decomposição do frametime). `LINA_PROF=1` liga; desligada, o
     /// custo por frame é UM check de bool (o protocolo de overhead compara o [FPS] 0×1).
     prof: prof::Probe,
+    /// F3-1-7: cache das Goals VIVAS do painel — `(event_count, goals, iteration_budget)`. As Goals
+    /// e o budget (`goal_max_iterations` dos `SystemParams`) são META do log (fora da projeção do
+    /// canvas), então o painel os reconstrói varrendo o log com a MESMA disciplina de cache do
+    /// custo/effort: re-varre SÓ com evento novo (`projection_cache_is_stale`), NUNCA por frame.
+    goals_cache: Option<(u64, Vec<lina_core::Goal>, u32)>,
 }
 
 impl WorkspaceView {
@@ -750,6 +759,7 @@ impl WorkspaceView {
             create_space_modal: None,
             archive_toast: None,
             prof: prof::Probe::from_env(),
+            goals_cache: None,
         };
         // r5 · plug do Descarregar (contrato combinado C↔Core A2A): botão do rail →
         // executor `runtime::unload_workspace` (Busy preservado por re-checagem no seam);
@@ -2051,6 +2061,105 @@ impl WorkspaceView {
     fn toggle_dashboard(&mut self, cx: &mut Context<Self>) {
         self.dashboard_open = !self.dashboard_open;
         cx.notify(); // o heartbeat do painel (new) cuida do refresh enquanto aberto
+    }
+
+    /// F3-1-7: o `AutonomyLevel` vivo do workspace (espelha `bridge::autonomy_to_level`, privado da
+    /// bomba) — alimenta `resolve_from_store` para ler o `goal_max_iterations` vivo.
+    fn autonomy_level(&self) -> lina_core::AutonomyLevel {
+        match self.ws_autonomy {
+            Autonomy::Manual => lina_core::AutonomyLevel::Manual,
+            Autonomy::Assisted => lina_core::AutonomyLevel::Assisted,
+            Autonomy::Autonomous => lina_core::AutonomyLevel::Autonomous,
+        }
+    }
+
+    /// F3-1-7: re-projeta as Goals VIVAS + o budget de iteração SÓ quando o log mudou (disciplina
+    /// `projection_cache_is_stale` — NUNCA por frame; mesma do custo/effort). Goals e budget são META
+    /// (fora da projeção do canvas), reconstruídos por replay do event log.
+    fn refresh_goals_cache(&mut self) {
+        let count = self.nodes.store_event_count();
+        if !dashboard::projection_cache_is_stale(
+            self.goals_cache.as_ref().map(|(c, _, _)| *c),
+            count,
+        ) {
+            return;
+        }
+        let Some(c) = count else { return };
+        let level = self.autonomy_level();
+        // Bind do `Arc` antes do lock: o guard segura o store por VÁRIAS linhas (events + resolve),
+        // então o handle não pode ser um temporário (cairia ao fim do statement).
+        let handle = self.nodes.store_handle();
+        let store = lock(&handle);
+        let Ok(recs) = store.events() else { return };
+        let goals = lina_core::project_goals(&recs);
+        // `goal_max_iterations` vivo (SystemParams, spec 51); falha de replay → default da spec.
+        let budget = lina_core::resolve_from_store(&store, level)
+            .map(|r| r.router_config.goal_max_iterations)
+            .unwrap_or(goal_card::DEFAULT_ITERATION_BUDGET);
+        self.goals_cache = Some((c, goals, budget));
+    }
+
+    /// F3-1-7: o painel das Goals VIVAS sobre o canvas — um card por meta que merece rosto
+    /// ([`goal_card::surfaced`]), em pt-br sem jargão, na identidade F2. `None` quando não há meta
+    /// viva (sem painel). Coluna top-center, sob os modais/paleta. Confirmar/ajustar é 1 toque →
+    /// `confirm_goal`/`correct_goal`.
+    fn render_goals_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.refresh_goals_cache();
+        let (goals, budget) = match &self.goals_cache {
+            Some((_, g, b)) => (goal_card::surfaced(g.clone()), *b),
+            None => return None,
+        };
+        if goals.is_empty() {
+            return None;
+        }
+        let mut col = div()
+            .absolute()
+            .top_16()
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_3();
+        for goal in goals {
+            let gid_confirm = goal.goal_id.clone();
+            let gid_correct = goal.goal_id.clone();
+            let card = goal_card::GoalCard::new(goal)
+                .iteration_budget(budget)
+                .on_confirm(cx.listener(move |view, _ev, window, cx| {
+                    view.confirm_goal(&gid_confirm, window, cx);
+                }))
+                .on_correct(cx.listener(move |view, _ev, _window, cx| {
+                    view.correct_goal(&gid_correct, cx);
+                }));
+            // Largura amigável (≈42% da viewport): `relative` evita px mágico; o card centra na coluna.
+            col = col.child(div().w(gpui::relative(0.42)).child(card));
+        }
+        Some(col.into_any_element())
+    }
+
+    /// F3-1-7 (gate humano da meta): o fundador confirmou a interpretação com 1 toque. O efeito REAL
+    /// (`goal.confirm` → `GoalConfirmed`, com `by` carimbado SERVER-SIDE pelo supervisor) depende de
+    /// uma costura de boot que o app ainda NÃO tem: o workspace-shell não é um nó (logo não há
+    /// identidade autenticada de outbox para o confirm humano), e o `Mailbox` vive na bomba, fora da
+    /// view. Doutrina (spec 52 §Segurança 2): `by` JAMAIS é escolhido pelo cliente — então NÃO
+    /// forjamos um aqui. Por ora registra a decisão por DADOS (`[GOAL]`, o Maestro valida o fluxo na
+    /// tela); o disparo autenticado é costura do Maestro (DEP do despacho). [SEAM: identidade do confirm].
+    fn confirm_goal(&mut self, goal_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        eprintln!(
+            "[GOAL] confirm (1 toque) para goal {goal_id} — pendente da costura de disparo \
+             autenticado (by carimbado server-side; o shell não tem identidade de nó)"
+        );
+        cx.notify();
+    }
+
+    /// F3-1-7: o fundador quer AJUSTAR a interpretação (re-abrir `goal.interpret`). Mesma costura
+    /// pendente do [`Self::confirm_goal`] (intent autenticado pelo `Mailbox` da bomba). Registra por DADOS.
+    fn correct_goal(&mut self, goal_id: &str, cx: &mut Context<Self>) {
+        eprintln!(
+            "[GOAL] ajuste para goal {goal_id} — re-abrir goal.interpret (disparo autenticado pendente de costura)"
+        );
+        cx.notify();
     }
 
     /// F1-1-5 (P6/fluxo c — wiring): o painel "Atividade e custos". Hierarquia do
@@ -4740,6 +4849,11 @@ impl Render for WorkspaceView {
                 &th,
                 cx,
             ));
+        }
+        // F3-1-7: painel das Goals VIVAS (card que o leigo confirma com 1 toque). Sobre o canvas,
+        // sob os modais/paleta; ausente quando não há meta viva (sem tela vazia forçada).
+        if let Some(panel) = self.render_goals_panel(cx) {
+            root = root.child(panel);
         }
         // F1-1-5 (P6/fluxo c): painel "Atividade e custos" — zona lateral direita, sob os modais.
         // Geometria clampada ao viewport REAL (fix: o painel fixo vazava a borda direita).
