@@ -70,6 +70,14 @@ pub const EFFORT_LADDER: &[Effort] = &[Effort::Medium, Effort::High];
 /// construção para o juiz automático (o executor nunca se auto-avalia).
 const STRUCTURAL_JUDGE: NodeId = NodeId::nil();
 
+/// ADR 0036: `NodeId` SENTINELA do GESTO HUMANO DIRETO via UI (o `by` de um confirm/ajuste vindo do
+/// BOTÃO do card, não de um agente). NÃO é um nó do roster: a autenticação é a NATUREZA do canal
+/// ([`Router::human_intent`], chamada LOCAL in-process — processo único, GPU-first; nenhum agente, que
+/// entra por `route_message`→`node_by_name`, o produz). Determinístico (replay reconstrói idêntico),
+/// distinto de [`STRUCTURAL_JUDGE`] (`nil`); como os nós reais nascem `Uuid::now_v7()`, este valor fixo
+/// (os bytes soletram "HUMAN") nunca colide com um nó real. `by` = carimbo server-side, jamais do cliente.
+const HUMAN_GESTURE: NodeId = NodeId::from_u128(0x4855_4d41_4e00_0000_0000_0000_0000_0000);
+
 /// Nível de autonomia do workspace (espelho leve do `lina_bootstrap::Autonomy` — o core NÃO
 /// depende do bootstrap; o app traduz). Só `Manual` muda o roteamento (recusa delegação).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2416,6 +2424,31 @@ impl Router {
     /// **`by` é CARIMBADO com o `sender` AUTENTICADO** (server-side), JAMAIS lido do payload (ADR 0007
     /// / spec 52 §Segurança 2 — um `GoalConfirmed` forjado com `by` de outro nó é impossível aqui).
     /// NUNCA entregue a PTY (verbo estruturado, como plan/params/effort).
+    /// **ADR 0036: dispara um GESTO HUMANO DIRETO da UI** (confirmar/ajustar uma Goal pelo botão do
+    /// card). Diferente do A2A: o humano não é um nó nem escreve no outbox — a autenticação é a NATUREZA
+    /// do canal (chamada LOCAL in-process; processo único, GPU-first — nenhum remoto alcança). Carimba
+    /// `by` = [`HUMAN_GESTURE`] server-side, JAMAIS uma identidade escolhida pelo cliente (spec 52 §Seg2):
+    /// um agente entra por `route_message`→`node_by_name` e NUNCA produz este `by`. Só aceita os intents
+    /// de Goal que são gesto humano legítimo (`goal.confirm`/`goal.interpret`); recusa o resto.
+    pub fn human_intent(
+        &mut self,
+        intent: &str,
+        payload: &str,
+        store: &mut EventStore,
+    ) -> RouteOutcome {
+        if !matches!(intent, "goal.confirm" | "goal.interpret") {
+            return RouteOutcome::GoalRejected(format!(
+                "gesto humano direto nao suporta o intent {intent}"
+            ));
+        }
+        // `from`/`to` são RÓTULOS de proveniência (o canal autentica, não a string). O `by` real é o
+        // sentinel [`HUMAN_GESTURE`] passado como sender — `handle_goal` o carimba no `GoalConfirmed`,
+        // e `goal.confirm`/`goal.interpret` não derivam root/hops (só `goal.define` o faz), então o
+        // sentinel sem binding de roster é seguro aqui.
+        let msg = MailMessage::new("human", "goal", intent, payload);
+        self.handle_goal(&msg, HUMAN_GESTURE, store)
+    }
+
     fn handle_goal(
         &mut self,
         msg: &MailMessage,
@@ -7695,6 +7728,109 @@ mod tests {
             item.acceptance[0].check_kind,
             CheckKind::Command,
             "item RESPEITA o check_kind (DoD verificavel por maquina)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Leva uma Goal a Interpreted via @User (route_message) e devolve o goal_id (aguardando o gate humano).
+    fn interpreta_goal(router: &mut Router, ts: &mut TmpStore, statement: &str) -> String {
+        let (_rec, mut deliver) = recorder();
+        let goal_id = match router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.define",
+                format!(r#"{{"statement":"{statement}"}}"#),
+            ),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        ) {
+            RouteOutcome::GoalApplied { goal_id, .. } => goal_id,
+            o => panic!("define: {o:?}"),
+        };
+        let interp = format!(r#"{{"goal_id":"{goal_id}","interpretation":"i","strategy":"s"}}"#);
+        router.route_message(
+            &MailMessage::new("@User", "goal", "goal.interpret", &interp),
+            &mut ts.store,
+            1001,
+            &mut deliver,
+        );
+        goal_id
+    }
+
+    fn last_confirmed_by(ts: &TmpStore) -> NodeId {
+        let ev = ts
+            .store
+            .events()
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|r| r.kind == "GoalConfirmed")
+            .map(|r| serde_json::from_value::<DomainEvent>(r.payload).unwrap())
+            .expect("GoalConfirmed emitido");
+        match ev {
+            DomainEvent::GoalConfirmed { by, .. } => by,
+            other => panic!("esperava GoalConfirmed, veio {other:?}"),
+        }
+    }
+
+    /// ADR 0036: o GESTO HUMANO DIRETO (botão do card) confirma a Goal carimbando `by` = sentinel
+    /// HUMANO server-side, pelo canal in-process `human_intent` — NÃO por `route_message` (A2A).
+    #[test]
+    fn human_intent_confirma_goal_com_by_sentinel_humano() {
+        let (mut router, sup, dir) = router_with("human-confirm");
+        let _user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("human-confirm");
+        let goal_id = interpreta_goal(&mut router, &mut ts, "criar x");
+        let out = router.human_intent(
+            "goal.confirm",
+            &format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            &mut ts.store,
+        );
+        assert!(
+            matches!(out, RouteOutcome::GoalApplied { .. }),
+            "gesto humano confirmou: {out:?}"
+        );
+        assert_eq!(
+            last_confirmed_by(&ts),
+            HUMAN_GESTURE,
+            "by carimbado com o sentinel humano (ADR 0036), nao escolhido pelo cliente"
+        );
+        let goals = crate::project_goals(&ts.store.events().unwrap());
+        assert_eq!(goals[0].phase, crate::GoalPhase::Confirmed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Red-team (spec 52 §Seg2 / ADR 0007): um AGENTE confirmando via `route_message` carimba o PRÓPRIO
+    /// NodeId autenticado — NUNCA o sentinel humano. O `by="human"` só nasce do canal in-process.
+    #[test]
+    fn agente_nao_forja_by_humano_no_confirm() {
+        let (mut router, sup, dir) = router_with("human-redteam");
+        let user = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("human-redteam");
+        let goal_id = interpreta_goal(&mut router, &mut ts, "x");
+        let (_rec, mut deliver) = recorder();
+        router.route_message(
+            &MailMessage::new(
+                "@User",
+                "goal",
+                "goal.confirm",
+                format!(r#"{{"goal_id":"{goal_id}"}}"#),
+            ),
+            &mut ts.store,
+            1002,
+            &mut deliver,
+        );
+        assert_eq!(
+            last_confirmed_by(&ts),
+            user,
+            "o agente carimba o PROPRIO NodeId autenticado"
+        );
+        assert_ne!(
+            last_confirmed_by(&ts),
+            HUMAN_GESTURE,
+            "um agente NUNCA produz o sentinel humano (by inforjavel)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
