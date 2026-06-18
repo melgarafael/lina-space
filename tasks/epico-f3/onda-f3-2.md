@@ -87,7 +87,7 @@ A costura crítica é `router.rs` (OUTER loop) — **dono único = CORE (B/Ultra
 
 ## GATE DE SAÍDA F3-2 (roda e se mede — do épico §V)
 
-(a) **Tradutor intercepta:** Espaço com Tradutor no roster → 1ª mensagem do leigo roteia primeiro a ele (`GoalInterpreted{origin:"@Tradutor"}`); **sem** Tradutor → degrada ao Maestro (rótulo de proveniência, nunca credencial). Provado por teste de role-discovery + roteamento.
+(a) **Tradutor intercepta:** Espaço com Tradutor no roster → 1ª mensagem do leigo roteia primeiro a ele e a Goal nasce com `GoalDefined{origin:"@Tradutor"}` (campo JÁ existente, `events.rs:591` — sem contrato novo); **sem** Tradutor → degrada ao Maestro (rótulo de proveniência, nunca credencial). Provado por teste de role-discovery + roteamento.
 (b) **Gate antes de agir:** nenhuma `GoalDecomposed`/`SpawnRequested` de membro do time aparece no log **antes** do `GoalConfirmed` (teste do ciclo).
 (c) **Time montado por effort:** após `GoalConfirmed`, a montagem do `proposed_team` emite um `SpawnRequested` por papel **com `effort` no envelope** (resolvido contra SystemParams); ENV `LINA_EFFORT` no PTY de cada filho.
 (d) **Correção informada:** `ReviewVerdict{Fail}` → re-despacho ao MESMO dev com `evidence` não-vazio; ao esgotar o degrau → **novo** `SpawnRequested` com `effort` **estritamente maior** (`Ord`) + prompt com "tentativas anteriores"; **breaker sticky** impede re-spawn idêntico.
@@ -117,4 +117,13 @@ A costura crítica é `router.rs` (OUTER loop) — **dono único = CORE (B/Ultra
 
 ---
 
-## STATUS DA EXECUÇÃO — (a preencher pelo Maestro durante a rodada)
+## STATUS DA EXECUÇÃO — 2026-06-18 (PONTO DE RETOMADA pós-rebuild)
+
+**Onde paramos:** F3-2 desenhada e DESPACHADA (5 frentes), mas os handoffs foram **engolidos pelo bug #22/#23 ao vivo** — o fix de confiabilidade está COMMITADO (`c45b90e`..`3e880f2`) mas NÃO estava no ar (app rodava o binário antigo). Evidência: dos 5 handoffs, 2 `MessageDelivered`-sem-Busy + 3 `MessageRouted`-sem-`Delivered`; roster 100% Idle (zero progresso). O fundador optou por **rebuildar o app** (fecha/reabre → fix no ar + valida o gate g da confiabilidade na tela). Nada se perde: nenhum worker começou.
+
+**Estado durável (sobrevive ao rebuild):**
+- Itens F2 no **event log** (seq 6717-6725: `PlanItemAdded`/`Attributed` para F2CORE/F2TRAD/F2BRIEF/F2UI/F2QA). ⚠️ achado: `lina plan read` não os reflete (projeção/cache stale vs log) — confiar no log; os `RouteBlocked{no_target,to:plan}` são ruído de retentativa.
+- Despachos prontos: `tasks/epico-f3/despachos/f3-2/` — 10-core-loop (B/F2CORE) · 20-papel-tradutor (H/F2TRAD) · 30-briefing-history (I/F2BRIEF) · 40-ui-narracao-loop (G/F2UI) · 50-seguranca-qa (R/F2QA).
+- Decisão de arquiteto: reusar `GoalInterpreted`/`GoalConfirmed` (SEM `InterpretationProposed`); proveniência do Tradutor via `GoalDefined.origin` (já existe, `events.rs:591`). **Sem contrato novo a fixar.**
+
+**➡️ AÇÃO PÓS-REBUILD (re-despachar a F3-2):** com o fix de confiabilidade NO AR, re-disparar as 5 frentes via os despachos acima (`lina handoff @<terminal> ... --ref plan:F2X`). Confirmar o 1º progresso de cada (`lina list` → Busy; não confiar no ack). Monitorar via `lina list` + reportes push (NÃO via `lina plan read`, que está stale). Os terminais B/H/I/G/R (+ J/K reserva) seguem no roster.

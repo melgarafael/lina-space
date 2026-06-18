@@ -14,7 +14,8 @@ Você é o **dono do papel Tradutor** no role-discovery. Entrega: a entrada no r
 
 ## DIRECIONAMENTO (regras do jogo)
 - **Mexa SÓ em** `crates/lina-role-discovery/` e na skill nova em `assets/` (alinhe o caminho exato com o Maestro). **O ROTEAMENTO da 1ª mensagem ao Tradutor é costura de `router.rs` → é do CORE (Terminal B).** Você define o PAPEL e a regra de classificação; não toque router.rs. Se precisar que o CORE leia `origin:"@Tradutor"`, **peça ao Maestro**.
-- **Regra-mãe:** o papel Tradutor é **rótulo de proveniência**, JAMAIS autoridade. Ter o papel não concede permissão; a autenticação em duas camadas segue soberana. `GoalInterpreted{origin:"@Tradutor"}` é só proveniência.
+- **Regra-mãe:** o papel Tradutor é **rótulo de proveniência**, JAMAIS autoridade. Ter o papel não concede permissão; a autenticação em duas camadas segue soberana.
+- **Onde a proveniência mora (confirmado no fonte):** `GoalDefined.origin` (`events.rs:591`) JÁ EXISTE e aceita `"@Maestro"|"@Tradutor"|"cron:<id>"` — é de **quem ORIGINA** a Goal. `GoalInterpreted` **NÃO tem** campo `origin`. Portanto a proveniência do Tradutor usa `GoalDefined.origin` — **sem contrato novo, NÃO toque `events.rs`**. (A spec 52 §"Portas que NÃO fecha" fala "origin natural de GoalInterpreted" como intenção; o canal real já existente é `GoalDefined.origin`.) Se você achar que precisa registrar "quem interpretou" separado, **peça ao Maestro** antes de inventar campo.
 - Convenções: `cargo fmt -p lina-role-discovery`, `clippy -D` limpo, teste que prova a classificação (input do leigo → papel Tradutor; ausência → fallback).
 
 ## OBJETIVO (o porquê de negócio)
