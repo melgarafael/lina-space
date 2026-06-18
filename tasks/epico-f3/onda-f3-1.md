@@ -109,3 +109,20 @@ O Maestro casa dificuldade↔effort exatamente como a F3-0 automatiza — *"defi
 
 Escopo recomendado: **a onda F3-1 inteira** nas 5 frentes + contrato do Maestro — entrega o loop COMPLETO do doc-fonte 12 (Goal nasce → interpreta → confirma → decompõe → executa → juiz → escala effort → fecha). Precede F3-2 (o loop do Maestro nativo + papel Tradutor costura tudo numa cena real de ponta a ponta).
 Alternativa conservadora (se preferir menor superfície por rodada): **α-focada** = só a Goal durável + verbos + card (F3-1-1/2/3/6/7), deferindo o termostato (F3-1-4/5/8) para a rodada β.
+
+---
+
+## STATUS DA EXECUÇÃO — 2026-06-18 (rodada α COMPLETA, escopo cheio)
+
+✅ **F3-1 implementada, auditada e commitada** — 11 commits (`cc452cf`→`7c9bd0c`):
+- CORE-Plan `c097ab7` · CORE-Goal `0b3cc13` · CLI verbos `541e9bc` + confirm `7c9bd0c` · QA segurança `4d658ec` · UI card-vivo `d40b929` · fix-forward Ord+doc `4a0eb7a` · ADR 0033/0032 aceitos (`0943674`) + ADR 0036 (`ea3f016`).
+- **Gate de onda: PASSOU** — 2 auditores independentes (read-only, não construíram), **0 ALTA**. Confirmados por re-derivação no fonte: invariante #1 (ZERO LLM no core; juiz = `std::process::Command`/exit code) e a regra-mãe (`by`/`reviewer`/`effort` nunca autoridade — impossível por *tipo*, `guard.rs::decide` não recebe verdict). Achados BAIXA (Effort sem `Ord`; doc-comments stale) corrigidos no fix-forward.
+- 480 testes lina-core / 0 falhas (gate_d **por mutação**, integração `route_message` zero-mock); clippy 0; fmt limpo; token_ratchet intacto; suíte de segurança do Router 4/4.
+
+⏳ **PENDENTE (porta desenhada, não dívida cega):**
+- **Gate (h) — validação de tela do fundador:** código provado; e2e AO VIVO precisa do Lina.app rebuildado (binário/supervisor em execução ainda são pré-rodada).
+- **Confirm 1-toque pela UI:** deferido sob **ADR 0036** (identidade do gesto humano na UI); por ora confirm via `lina goal confirm` (CLI).
+
+➡️ **Próximo:** F3-2 (loop do Maestro nativo + papel Tradutor — cenário real de ponta a ponta na tela).
+
+> Atualizar também o §II do épico `39` (vault) e o `_HANDOFF` quando possível — fora do alcance de escrita do Maestro (vault é read-only exceto `Lina/`).
