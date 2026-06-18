@@ -85,7 +85,10 @@ pub fn badge_view(items: &[AttentionItem]) -> BadgeView {
 pub fn is_goto_only(item: &AttentionItem) -> bool {
     // FIX-2: GuardAsk (ask do guard via hook PreToolUse) é SEMPRE goto-only — o y/n é respondido NO
     // terminal (injeção remota não existe nesta fase). Permissão não-Yn (Choice/Trust) idem.
+    // W3 (#22): DeliveredNoProgress é OBSERVABILIDADE — nunca aprovável (alerta + foco; o Maestro age
+    // re-despachando, não com y/n). Reusa o caminho não-aprovável: a ação primária é olhar o terminal.
     item.kind == AttentionKind::GuardAsk
+        || item.kind == AttentionKind::DeliveredNoProgress
         || (item.kind == AttentionKind::Permission && item.prompt_kind != PromptKind::Yn)
 }
 
@@ -122,6 +125,12 @@ pub fn toast_copy(item: &AttentionItem) -> String {
                 item.node_id
             ),
         },
+        // W3 (#22): o nó recebeu o handoff e voltou a Idle SEM começar (despacho engolido). Aviso
+        // honesto — não interrompe com decisão; convida a olhar (o Maestro re-despacha, nunca y/n).
+        AttentionKind::DeliveredNoProgress => format!(
+            "{} recebeu a tarefa e ainda não começou — vale dar uma olhada",
+            item.node_id
+        ),
         AttentionKind::Permission => match item.prompt_kind {
             PromptKind::Choice => format!(
                 "{} fez uma pergunta e aguarda sua escolha — vá até o terminal",
@@ -604,6 +613,8 @@ pub fn render_toast(
             let is_custody = item.kind == AttentionKind::Custody;
             let selo = if is_custody {
                 "custódia"
+            } else if item.kind == AttentionKind::DeliveredNoProgress {
+                "aviso"
             } else {
                 "permissão"
             };
@@ -777,10 +788,15 @@ pub fn render_panel(
         let i64id = i as u64;
         let is_custody = item.kind == AttentionKind::Custody;
         let escalated = item.state == lina_core::AttentionState::Escalated;
-        let selo = match (is_custody, item.evidence) {
-            (true, _) => "custódia".to_string(),
-            (false, AttentionEvidence::Grid) => "permissão · não verificado".to_string(),
-            (false, _) => "permissão".to_string(),
+        let selo = if item.kind == AttentionKind::DeliveredNoProgress {
+            // W3 (#22): aviso de monitoramento (recebeu, não começou) — nem custódia nem permissão.
+            "aviso".to_string()
+        } else {
+            match (is_custody, item.evidence) {
+                (true, _) => "custódia".to_string(),
+                (false, AttentionEvidence::Grid) => "permissão · não verificado".to_string(),
+                (false, _) => "permissão".to_string(),
+            }
         };
         let mut row = div()
             .id(("att-row", i64id))
@@ -1019,6 +1035,8 @@ mod tests {
             evidence: match kind {
                 AttentionKind::Custody | AttentionKind::Spawn => AttentionEvidence::Custody,
                 AttentionKind::Permission | AttentionKind::GuardAsk => AttentionEvidence::Hook,
+                // Espelha a projeção real do core (estrutural, derivado do log — não heurístico).
+                AttentionKind::DeliveredNoProgress => AttentionEvidence::Hook,
             },
             created_ts: ts,
             state: AttentionState::Pending,

@@ -4123,6 +4123,12 @@ impl Render for WorkspaceView {
                 .queue
                 .iter()
                 .any(|p| p.requester() == nv.name);
+            // #22 (tela honesta): este nó recebeu um handoff e voltou a Idle SEM começar? O W3
+            // publica isso na fila de atenção (`DeliveredNoProgress`); o card consome a projeção e
+            // mostra um badge honesto — um Idle "engolido" deixa de parecer um Ocioso qualquer.
+            let delivery_stalled = self.attention_items.iter().any(|i| {
+                i.node_id == nv.name && i.kind == lina_core::AttentionKind::DeliveredNoProgress
+            });
             // F2-2-5 (toolbar contextual): captura o rect (espaço de tela) + o contexto do card
             // FOCADO — a toolbar é ancorada DEPOIS do loop (overlay screen-space, só no nó em
             // Zone::Focus; o `continue` de Suspenso acima já garante que o focado aqui está visível).
@@ -4197,11 +4203,17 @@ impl Render for WorkspaceView {
                         .truncate()
                         .child(text!(nv.name.clone())),
                 )
+                // Tela honesta (#22): estado em pt-br do leigo, a MESMA voz do leitor de tela —
+                // antes era o `Debug` cru do enum (`· Terminal · Busy`), jargão em inglês na tela.
                 .child(
                     div()
                         .flex_shrink_0()
                         .text_color(rgb(th.text.muted))
-                        .child(text!(format!("· {:?} · {:?}", nv.kind, nv.status))),
+                        .child(text!(format!(
+                            "· {} · {}",
+                            node_kind_label(nv.kind),
+                            node_status_label(nv.status)
+                        ))),
                 );
             // P0 (F2-2-2 / ADR 0028 — prioridade soberana da r6): o estado MAIS crítico do produto —
             // "precisa de você" (gate de custódia humano pendente) — ganha VOZ SEM FOCO via `Badge`
@@ -4222,6 +4234,16 @@ impl Render for WorkspaceView {
                     ("card-needs", card_eid),
                     "precisa de você",
                     ui::BadgeTone::Danger,
+                ));
+            }
+            // #22: o despacho engolido ganha VOZ no card — âmbar (atenção, não erro): o nó recebeu e
+            // ainda não começou. Distinto de "precisa de você" (custódia): aqui ninguém está bloqueado
+            // num gate; é o Maestro que deve re-despachar. Badge informacional (Polite, como os demais).
+            if delivery_stalled {
+                title = title.child(ui::Badge::new(
+                    ("card-stalled", card_eid),
+                    DELIVERY_STALLED_BADGE,
+                    ui::BadgeTone::Warning,
                 ));
             }
             // BUG D: affordance ✎ DESCOBRÍVEL no próprio CARD (antes só no painel ⌘K → o fundador não
@@ -5856,6 +5878,42 @@ fn main() {
     drop(pty);
 }
 
+// ═══════════════════════ Rodada confiabilidade · tela honesta (#22/#21/#4) ═══════════════════════
+
+/// Estado VISÍVEL do nó no cabeçalho do card, em pt-br do leigo — a MESMA voz que o leitor
+/// de tela já fala (a a11y usa `canvas::aggregate_badge(...).label()`). Antes o card despejava
+/// o `Debug` cru do enum (`Busy`/`Idle`/`Dead`/`Crashed`) — jargão em inglês na tela do fundador
+/// (#22, "tela mente"). `needs_human=false`: o badge "precisa de você" (renderizado à parte) é o
+/// dono daquele anúncio; aqui vai só o estado de vida. `unseen=0`: a contagem de linhas novas é
+/// da periferia, não do título.
+fn node_status_label(status: NodeStatus) -> String {
+    canvas::aggregate_badge(status, false, 0).label()
+}
+
+/// Tipo do nó em pt-br do leigo — o card mostrava `WebBrowser`/`TaskPanel` crus (Debug do enum).
+/// `#[non_exhaustive]`: um tipo FUTURO do core cai no fallback honesto "item" (vivo, sem fingir
+/// um nome que não temos), nunca o identificador Rust.
+fn node_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Terminal => "Terminal",
+        NodeKind::Note => "Nota",
+        NodeKind::WebBrowser => "Navegador",
+        NodeKind::Folder => "Pasta",
+        NodeKind::Attachment => "Anexo",
+        NodeKind::Trigger => "Gatilho",
+        NodeKind::TaskPanel => "Painel",
+        NodeKind::Feed => "Feed",
+        _ => "item",
+    }
+}
+
+/// #22 — texto do badge honesto "recebeu, não começou": um nó que recebeu um handoff
+/// (`MessageDelivered`) e voltou a Idle SEM produzir trabalho não é um Ocioso comum — é um
+/// despacho engolido. Alimentado pelo `AttentionKind::DeliveredNoProgress` que o W3
+/// (`attention.rs`) publica na fila. Const isolada → o anti-vazamento testa a frase REAL que o
+/// card renderiza (zero jargão de `DeliveredNoProgress`/`AttentionKind` na superfície).
+const DELIVERY_STALLED_BADGE: &str = "recebeu, ainda não começou";
+
 #[cfg(test)]
 mod ime_tests {
     use super::*;
@@ -6090,6 +6148,128 @@ mod keymap_tests {
         assert_ne!(
             keystroke_to_bytes(&ks_mod("backspace", cmd), false),
             vec![0x7f]
+        );
+    }
+}
+
+#[cfg(test)]
+mod honest_state_tests {
+    use super::*;
+
+    /// Jargão de estado que NUNCA pode aparecer na superfície (identificadores crus do enum +
+    /// vocabulário técnico do core). Extensão do anti-vazamento de `goal_card.rs` aos estados
+    /// do card do canvas (#22) e aos textos dos estados novos (#21/#22).
+    const STATE_JARGON: &[&str] = &[
+        "busy",
+        "idle",
+        "blocked",
+        "dead",
+        "crashed",
+        "starting",
+        "running",
+        "stalled",
+        "deliverystalled",
+        "attentionkind",
+        "circuit",
+        "breaker",
+        "uuid",
+        "debug",
+    ];
+
+    fn assert_no_jargon(text: &str, who: &str) {
+        let low = text.to_lowercase();
+        for j in STATE_JARGON {
+            assert!(!low.contains(j), "{who} vazou jargão {j:?}: {text:?}");
+        }
+    }
+
+    /// O cabeçalho do card fala o estado em pt-br do leigo — nunca o `Debug` cru do enum
+    /// (`Busy`/`Idle`/`Dead`). É a MESMA palavra do leitor de tela (a a11y já usa
+    /// `aggregate_badge(...).label()`): visual e a11y deixam de divergir.
+    #[test]
+    fn card_status_label_speaks_layman_without_jargon() {
+        for status in [
+            NodeStatus::Starting,
+            NodeStatus::Idle,
+            NodeStatus::Busy,
+            NodeStatus::Running,
+            NodeStatus::Crashed,
+            NodeStatus::Dead,
+        ] {
+            let label = node_status_label(status);
+            assert!(
+                !label.trim().is_empty(),
+                "todo estado tem palavra: {status:?}"
+            );
+            assert_no_jargon(&label, "status do card");
+        }
+        // Não-vacuoso: estados distintos produzem palavras distintas (não é constante).
+        assert_ne!(
+            node_status_label(NodeStatus::Busy),
+            node_status_label(NodeStatus::Dead),
+            "trabalhando ≠ encerrado"
+        );
+    }
+
+    /// O tipo do nó também é pt-br — antes `WebBrowser`/`TaskPanel` saíam crus.
+    #[test]
+    fn card_kind_label_is_layman() {
+        for kind in [
+            NodeKind::Terminal,
+            NodeKind::Note,
+            NodeKind::WebBrowser,
+            NodeKind::Folder,
+            NodeKind::Attachment,
+            NodeKind::Trigger,
+            NodeKind::TaskPanel,
+            NodeKind::Feed,
+        ] {
+            let label = node_kind_label(kind);
+            assert!(!label.trim().is_empty(), "todo tipo tem nome: {kind:?}");
+            // Os identificadores compostos em inglês são o sintoma do Debug cru.
+            for raw in [
+                "webbrowser",
+                "taskpanel",
+                "attachment",
+                "trigger",
+                "note",
+                "folder",
+            ] {
+                assert!(
+                    !label.to_lowercase().contains(raw),
+                    "tipo vazou identificador cru {raw:?}: {label:?}"
+                );
+            }
+        }
+    }
+
+    /// Copy do disjuntor (#21) — DECIDIDA e guardada aqui à espera do sinal que a dispara: a
+    /// projeção do `Blocked{circuit_breaker}` que hoje o `bridge.rs` colapsa em Busy (fronteira do
+    /// B/W1) + um verbo de liberação no core. `DELIVERY_STALLED_BADGE` (#22) já é produção (o card
+    /// o consome). Manter ESTA em `#[cfg(test)]` evita dead-code antes de o consumidor existir.
+    const CIRCUIT_BREAKER_LABEL: &str = "pausado por segurança — clique para liberar";
+
+    /// Os textos dos estados NOVOS (#22 "recebeu, não começou" · #21 disjuntor) são humanos,
+    /// sem jargão, e carregam o caminho de recuperação onde se aplica.
+    #[test]
+    fn new_state_copies_are_human_and_actionable() {
+        assert_no_jargon(DELIVERY_STALLED_BADGE, "badge recebeu-não-começou");
+        assert_no_jargon(CIRCUIT_BREAKER_LABEL, "estado de disjuntor");
+        // #22: a frase admite o recebimento E o não-início (é a diferença de um Ocioso comum).
+        assert!(
+            DELIVERY_STALLED_BADGE.contains("recebeu")
+                && DELIVERY_STALLED_BADGE.contains("começou"),
+            "o badge precisa dizer recebeu-mas-não-começou: {DELIVERY_STALLED_BADGE:?}"
+        );
+        // #21: estado humano ("segurança") + caminho de saída ("liberar") no MESMO texto.
+        assert!(
+            CIRCUIT_BREAKER_LABEL.contains("segurança")
+                && CIRCUIT_BREAKER_LABEL.contains("liberar"),
+            "o disjuntor precisa do estado + a saída: {CIRCUIT_BREAKER_LABEL:?}"
+        );
+        assert_ne!(
+            DELIVERY_STALLED_BADGE, CIRCUIT_BREAKER_LABEL,
+            "estados distintos, textos distintos"
         );
     }
 }

@@ -43,6 +43,8 @@ pub use crate::events::PromptKind;
 use crate::events::{
     ApprovalDecision, DomainEvent, EventRecord, PermissionEvidence, ResolutionVia,
 };
+use crate::lifecycle::reason;
+use crate::NodeStatus;
 
 /// SLA de escalação VISUAL (ADR 0021 §3): pendência sem resposta há ≥ 5 min vira
 /// [`AttentionState::Escalated`] (badge pulsante/entrada persistente na UI). O auto-deny
@@ -85,6 +87,17 @@ pub const LAYER_MERGE_WINDOW_MS: u64 = 10_000;
 /// ask, o item some antes de responder; e pode persistir até o TTL após já respondido.
 pub const GUARD_ASK_TTL_MS: u64 = 180_000;
 
+/// W3 (ponto-cego do ADR 0019 §4) — **graça do "despacho engolido"**: quanto tempo um nó pode
+/// ficar parado em `Idle`, DEPOIS de receber um handoff (`MessageDelivered{to}`) e sem produzir
+/// UM ÚNICO progresso atribuível, antes de virar o alarme "recebeu, não começou". O relógio corre
+/// a partir do RETORNO a `Idle` (não da entrega): assim a janela absorve o gap natural
+/// fim-de-turno → [`DomainEvent::TokenUsageReported`] de um turno REAL (o app emite o uso de tokens
+/// alguns segundos após o `Idle`), sem gritar falso-positivo. 90s: bem abaixo de
+/// [`ESCALATE_AFTER_MS`] (o Maestro enxerga o engolido cedo) e folgado sobre o atraso típico do
+/// sinal de progresso. **Conservador e tunável** (futuro `RouterConfig`); um turno real consome
+/// tokens → desarma, então o engolido (zero turno, zero token) é o que sobra.
+pub const DELIVERED_NO_PROGRESS_WINDOW_MS: u64 = 90_000;
+
 /// Classe do item na fila — define a precedência (custódia > permissão > spawn > guard-ask).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionKind {
@@ -106,6 +119,13 @@ pub enum AttentionKind {
     /// Precedência mais baixa (responder y/n no terminal pode esperar atrás dos gates que travam um
     /// turno), mas NUNCA invisível (direção do fundador 2026-06-07: todo bloqueante alerta).
     GuardAsk,
+    /// W3 (ponto-cego do ADR 0019 §4): um handoff foi ENTREGUE (`MessageDelivered{to}`), o nó voltou
+    /// a `Idle` e ficou parado ≥ [`DELIVERED_NO_PROGRESS_WINDOW_MS`] sem UM ÚNICO progresso atribuível
+    /// — o "despacho engolido" (#22/#23). É OBSERVABILIDADE, não bloqueante humano: o stall detector
+    /// só vigia `Busy` (`lifecycle.rs`), então delivered→Idle→silêncio era cego e o Maestro PERGUNTAVA
+    /// ao humano "o terminal recebeu?" (#15). Precedência MAIS BAIXA (alerta de monitoramento, nunca
+    /// trava um turno); NUNCA aprovável (alerta + foco — o Maestro age re-despachando, não com y/n).
+    DeliveredNoProgress,
 }
 
 /// Camada de origem da evidência — confiabilidade NÃO-uniforme por design: `Hook` é
@@ -244,6 +264,24 @@ struct PendingGuardAsk {
     last_ts: u64,
 }
 
+/// W3 (ponto-cego do ADR 0019 §4): vigia de um handoff ENTREGUE que pode ter sido **engolido**.
+/// Projeção PURA derivada do log (decisão de arquiteto: SEM evento novo): o stall detector só corre
+/// em `Busy` (`lifecycle.rs`), então `delivered → Idle → silêncio` é cego. Armado por
+/// `MessageDelivered{to}` (a entrega mais nova vence; 1 vigia por nó), desarmado por progresso
+/// atribuível (token de turno, output novo, mensagem enviada — ADR 0019 §2b).
+#[derive(Debug, Clone)]
+struct PendingDispatch {
+    /// NodeId (serializado) do alvo da entrega — a CHAVE (1 vigia por nó; re-entrega re-arma).
+    node_id: String,
+    /// `ts` da entrega (`MessageDelivered`) — idade do "engolido" exibida na fila.
+    delivered_ts: u64,
+    /// `ts` do 1º retorno a `Idle` após a entrega — abre o ponto-cego E é o relógio do alarme
+    /// (`now − idle_ts ≥ janela`). `None` = ainda em `Busy`/trabalhando (turf do stall detector,
+    /// não deste alarme — zero sobreposição). Medir daqui (não da entrega) absorve o gap natural
+    /// fim-de-turno → `TokenUsageReported` de um turno REAL.
+    idle_ts: Option<u64>,
+}
+
 /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
 #[derive(Debug, Default)]
 pub struct AttentionQueue {
@@ -261,6 +299,10 @@ pub struct AttentionQueue {
     /// FIX-2: asks do guard (hook `PreToolUse`) pendentes, um por nó (dedup N→1). Em ordem de
     /// chegada (= `created_ts`); somem por TTL no [`AttentionQueue::items`].
     guard_asks: Vec<PendingGuardAsk>,
+    /// W3: vigias de handoffs entregues (1 por nó, ordem de chegada) — viram alarme
+    /// [`AttentionKind::DeliveredNoProgress`] no [`AttentionQueue::items`] quando o nó voltou a
+    /// `Idle` e ficou parado ≥ [`DELIVERED_NO_PROGRESS_WINDOW_MS`] sem progresso atribuível.
+    dispatches: Vec<PendingDispatch>,
     /// Allowlist por nó (`NodeDetectionMuted`, último vence): `true` = fallback de
     /// grid DESLIGADO para o nó.
     muted: HashMap<String, bool>,
@@ -359,6 +401,37 @@ impl AttentionQueue {
                 node: Some(node),
                 ..
             } if decision == "ask" => self.fold_guard_ask(node, cmd, ts),
+            // ───────── W3 (ponto-cego do ADR 0019 §4): o alarme do "despacho engolido" ─────────
+            // Projeção PURA derivada (SEM evento novo). 3 facetas: ARMAR (entrega), DESARMAR
+            // (progresso atribuível — virou trabalho) e ABRIR o ponto-cego (retorno a `Idle`).
+            DomainEvent::MessageDelivered { to, .. } => self.arm_dispatch(&to.to_string(), ts),
+            // `TokenUsageReported` é o sinal POR-TURNO (todo turno real consome tokens; o engolido
+            // não roda turno → zero tokens → nunca chega aqui). `node` já é o NodeId serializado.
+            DomainEvent::TokenUsageReported { node, .. } => self.remove_dispatch(node),
+            // `MessageRouted{from}` = o nó DELEGOU adiante (agiu) — progresso atribuível ao remetente.
+            DomainEvent::MessageRouted { from, .. } => self.remove_dispatch(&from.to_string()),
+            DomainEvent::NodeStatusChanged {
+                node,
+                status,
+                reason: why,
+                ..
+            } => {
+                let node = node.to_string();
+                if status == NodeStatus::Busy.as_str() && why == reason::PTY_OUTPUT {
+                    // Output novo no PTY (proxy do `tail_hash`, que é efêmero/fora do log) = progresso.
+                    // Filtra o carimbo `a2a_delivery` da própria entrega (router.rs), que NÃO é trabalho.
+                    self.remove_dispatch(&node);
+                } else if status == NodeStatus::Idle.as_str() {
+                    // Voltou a `Idle`: abre o ponto-cego (o relógio de stall não corre fora de `Busy`).
+                    self.mark_dispatch_idle(&node, ts);
+                } else if status == NodeStatus::Dead.as_str() {
+                    self.remove_dispatch(&node); // nó morto: sem alarme (nada a re-despachar)
+                }
+            }
+            // Nó removido/terminal encerrado → sem alarme (sem terminal para o Maestro re-despachar).
+            DomainEvent::NodeRemoved { node } | DomainEvent::TerminalExited { node } => {
+                self.remove_dispatch(&node.to_string());
+            }
             // Pós-decisão do executor (F1-1-8): sem efeito na fila — o item já saiu
             // no `PermissionResolved`. Um abort (`screen_changed`) reapresenta via
             // RE-DETECÇÃO (novo `PermissionAsked`, novo stable_id — ADR 0021 §1).
@@ -469,6 +542,36 @@ impl AttentionQueue {
             created_ts: ts,
             last_ts: ts,
         });
+    }
+
+    // ───────────────────── W3: vigia do "despacho engolido" (ponto-cego ADR 0019) ─────────────────────
+
+    /// ARMA o vigia de um handoff entregue ao nó: a entrega MAIS NOVA vence (re-arma, zerando o
+    /// estado anterior — `idle_ts` volta a `None`). 1 vigia por nó (a chave é o nó).
+    fn arm_dispatch(&mut self, node: &str, ts: u64) {
+        self.dispatches.retain(|d| d.node_id != node);
+        self.dispatches.push(PendingDispatch {
+            node_id: node.to_string(),
+            delivered_ts: ts,
+            idle_ts: None,
+        });
+    }
+
+    /// DESARMA o vigia do nó — sem alarme. Dois chamadores, mesma ação, intenções distintas: o
+    /// nó PROGREDIU (token de turno, output novo, mensagem enviada — virou trabalho) OU MORREU
+    /// (`Dead`/removido — nada a re-despachar). Remover (vs. marcar) mantém o fold mínimo e
+    /// idempotente: sem vigia = sem alarme.
+    fn remove_dispatch(&mut self, node: &str) {
+        self.dispatches.retain(|d| d.node_id != node);
+    }
+
+    /// O nó voltou a `Idle` após a entrega → registra o instante (abre o ponto-cego: o relógio de
+    /// stall não corre fora de `Busy`). O 1º `Idle` vence (`get_or_insert` não reabre a janela se
+    /// o nó oscilar Idle→Busy→Idle sem progresso). No-op se não há vigia para o nó.
+    fn mark_dispatch_idle(&mut self, node: &str, ts: u64) {
+        if let Some(d) = self.dispatches.iter_mut().find(|d| d.node_id == node) {
+            d.idle_ts.get_or_insert(ts);
+        }
     }
 
     // ───────────────────────── espelho da custódia (pump do app) ─────────────────────────
@@ -632,10 +735,36 @@ impl AttentionQueue {
                 prompt_kind: PromptKind::Choice,
                 vt_snapshot_hash: None,
             });
+        // W3 (ponto-cego do ADR 0019): despachos ENTREGUES que voltaram a `Idle` e ficaram parados
+        // ≥ DELIVERED_NO_PROGRESS_WINDOW_MS (desde o `Idle`) sem UM ÚNICO progresso atribuível → o
+        // "engolido". Precedência MAIS BAIXA (alerta de observabilidade, nunca bloqueante). 1 por nó
+        // (a entrega mais nova venceu no fold) ⇒ anti-amplificação por construção (padrão `NodeStalled`).
+        // `idle_ts == None` (nó ainda `Busy`) NÃO entra: aí quem vigia é o stall detector — zero
+        // sobreposição. PURO de `now_ms` ⇒ replay reconstrói a fila idêntica.
+        let swallowed = self.dispatches.iter().filter_map(|d| {
+            let idle_ts = d.idle_ts?;
+            (now_ms.saturating_sub(idle_ts) >= DELIVERED_NO_PROGRESS_WINDOW_MS).then(|| {
+                AttentionItem {
+                    stable_id: format!("delivered-no-progress:{}", d.node_id),
+                    node_id: d.node_id.clone(),
+                    kind: AttentionKind::DeliveredNoProgress,
+                    detail: Some("recebeu a tarefa e ainda não começou".to_string()),
+                    // Projeção ESTRUTURAL do log (não-heurística), como o ask do guard — não é grid.
+                    evidence: AttentionEvidence::Hook,
+                    created_ts: d.delivered_ts, // idade = desde a ENTREGA (há quanto está engolido)
+                    state: state_of(d.delivered_ts),
+                    // Choice: alerta + foco, NUNCA aprovável daqui (`resolve`/`auto_deny_due` só olham
+                    // permissões `Yn`) — o Maestro age re-despachando, não com y/n.
+                    prompt_kind: PromptKind::Choice,
+                    vt_snapshot_hash: None,
+                }
+            })
+        });
         let mut out = round_robin_by_node(custody.collect());
         out.extend(round_robin_by_node(perms.collect()));
         out.extend(round_robin_by_node(spawns.collect()));
         out.extend(round_robin_by_node(guard.collect()));
+        out.extend(round_robin_by_node(swallowed.collect()));
         out
     }
 
@@ -1576,5 +1705,297 @@ mod tests {
             .collect();
         assert_eq!(items.len(), 1, "GuardAsk reconstruído do log");
         assert_eq!(items[0].node_id, "Bug Finder");
+    }
+
+    // ───────────── W3 · alarme do "despacho engolido" (ponto-cego do ADR 0019 §4) ─────────────
+
+    use crate::{lifecycle::reason as lc_reason, NodeId, NodeStatus as NS};
+
+    fn nid(n: u128) -> NodeId {
+        NodeId::from_u128(n)
+    }
+    /// `MessageDelivered{to}` — ARMA o vigia (o `id` não importa para o alarme).
+    fn delivered(to: NodeId) -> DomainEvent {
+        DomainEvent::MessageDelivered { id: "m".into(), to }
+    }
+    fn status_ev(node: NodeId, status: NS, why: &str) -> DomainEvent {
+        DomainEvent::NodeStatusChanged {
+            node,
+            status: status.as_str().to_string(),
+            from: String::new(),
+            reason: why.to_string(),
+        }
+    }
+    /// Retorno a `Idle` por fim-de-resposta (o que abre o ponto-cego no #22/#23).
+    fn idle(node: NodeId) -> DomainEvent {
+        status_ev(node, NS::Idle, lc_reason::END_OF_RESPONSE)
+    }
+    /// Uso de tokens de um turno REAL (o app emite ao fim do turno) — o discriminador.
+    fn token(node: NodeId, tokens: u64) -> DomainEvent {
+        DomainEvent::TokenUsageReported {
+            node: node.to_string(),
+            tokens,
+        }
+    }
+    /// Os `node_id`s dos alarmes de engolido visíveis em `now`.
+    fn swallowed(q: &AttentionQueue, now: u64) -> Vec<String> {
+        q.items(now)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::DeliveredNoProgress)
+            .map(|i| i.node_id)
+            .collect()
+    }
+
+    /// Critério-1 da story: entregue → voltou a Idle → janela sem progresso → **1** alarme. Antes
+    /// da janela (medida do retorno a Idle), nada. O item é Choice (alerta+foco), NUNCA aprovável
+    /// pela fila e NUNCA candidato a auto-deny — defesa em profundidade além do tipo.
+    #[test]
+    fn swallowed_dispatch_raises_one_alarm_after_window() {
+        let a = nid(1);
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        // No #22/#23 o nó volta a Idle logo (o turno ANTERIOR fechando), sem rodar o despacho.
+        q.observe(&idle(a), T0 + 1_000);
+
+        let idle_ts = T0 + 1_000;
+        assert!(
+            swallowed(&q, idle_ts + DELIVERED_NO_PROGRESS_WINDOW_MS - 1).is_empty(),
+            "dentro da graça: ainda não alarma"
+        );
+
+        let now = idle_ts + DELIVERED_NO_PROGRESS_WINDOW_MS;
+        let items: Vec<_> = q
+            .items(now)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::DeliveredNoProgress)
+            .collect();
+        assert_eq!(
+            items.len(),
+            1,
+            "engolido dispara 1 item (anti-amplificação)"
+        );
+        assert_eq!(
+            items[0].node_id,
+            a.to_string(),
+            "stable_id do nó, nunca posição"
+        );
+        assert_eq!(items[0].prompt_kind, PromptKind::Choice);
+        assert_eq!(
+            items[0].detail.as_deref(),
+            Some("recebeu a tarefa e ainda não começou")
+        );
+        assert!(
+            q.resolve(
+                &items[0].stable_id,
+                ApprovalDecision::Deny,
+                ResolutionVia::Timeout
+            )
+            .is_none(),
+            "alarme de observabilidade NÃO é aprovável/recusável pela fila"
+        );
+        assert!(
+            q.auto_deny_due(now).is_empty(),
+            "engolido nunca entra no driver de auto-deny (só permissões Yn)"
+        );
+    }
+
+    /// Sem retorno a `Idle` (nó segue `Busy`/trabalhando) → NUNCA alarma, por mais que demore: esse
+    /// é o turf do stall detector (ADR 0019 §3). ZERO sobreposição — o W3 só cobre o ponto-cego.
+    #[test]
+    fn busy_without_idle_never_alarms() {
+        let a = nid(1);
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        assert!(
+            swallowed(&q, T0 + 20 * DELIVERED_NO_PROGRESS_WINDOW_MS).is_empty(),
+            "Busy sem Idle é do stall detector, não deste alarme"
+        );
+    }
+
+    /// Critério-2 da story (turno legítimo NÃO dispara): o turno real consome tokens → o app emite
+    /// `TokenUsageReported` → desarma. O engolido (zero turno, zero token) é o que sobra. Vale nas
+    /// DUAS ordens (token antes OU depois do Idle) — o fold é robusto à ordem de chegada no log.
+    #[test]
+    fn token_usage_disarms_legit_turn_either_order() {
+        let a = nid(1);
+        let b = nid(2);
+
+        // (i) Idle e DEPOIS o uso de tokens (ordem comum: fim-de-turno → contabilização).
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        q.observe(&idle(a), T0 + 5_000);
+        q.observe(&token(a, 1_234), T0 + 6_000);
+        assert!(
+            swallowed(&q, T0 + 5 * DELIVERED_NO_PROGRESS_WINDOW_MS).is_empty(),
+            "turno real (tokens após Idle) não dispara"
+        );
+
+        // (ii) Uso de tokens ANTES do Idle — também desarma (sem vigia = sem alarme).
+        let mut q2 = AttentionQueue::new();
+        q2.observe(&delivered(b), T0);
+        q2.observe(&token(b, 99), T0 + 4_000);
+        q2.observe(&idle(b), T0 + 5_000);
+        assert!(
+            swallowed(&q2, T0 + 5 * DELIVERED_NO_PROGRESS_WINDOW_MS).is_empty(),
+            "turno real (tokens antes do Idle) não dispara"
+        );
+    }
+
+    /// Progresso por OUTPUT novo (`NodeStatusChanged{Busy, pty_output}` — proxy do tail_hash, que é
+    /// efêmero/fora do log) desarma. E o carimbo `a2a_delivery` da PRÓPRIA entrega (router.rs) NÃO
+    /// é trabalho: não pode desarmar — senão todo despacho se auto-limparia.
+    #[test]
+    fn pty_output_disarms_but_a2a_delivery_stamp_does_not() {
+        let a = nid(1);
+        let b = nid(2);
+
+        // pty_output = trabalho real → desarma.
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        q.observe(&status_ev(a, NS::Busy, lc_reason::PTY_OUTPUT), T0 + 2_000);
+        q.observe(&idle(a), T0 + 50_000);
+        assert!(
+            swallowed(&q, T0 + 5 * DELIVERED_NO_PROGRESS_WINDOW_MS).is_empty(),
+            "output novo desarma"
+        );
+
+        // a2a_delivery (carimbo do router, antes E depois da entrega) NÃO conta como progresso.
+        let mut q2 = AttentionQueue::new();
+        q2.observe(&status_ev(b, NS::Busy, "a2a_delivery"), T0);
+        q2.observe(&delivered(b), T0 + 100);
+        q2.observe(&status_ev(b, NS::Busy, "a2a_delivery"), T0 + 200);
+        q2.observe(&idle(b), T0 + 1_000);
+        assert_eq!(
+            swallowed(&q2, T0 + 1_000 + DELIVERED_NO_PROGRESS_WINDOW_MS).len(),
+            1,
+            "o carimbo da entrega não é trabalho — o engolido segue alarmando"
+        );
+    }
+
+    /// O nó que DELEGOU adiante (`MessageRouted{from}`) agiu → progresso atribuível ao remetente,
+    /// desarma. Receber (ser `to`) NÃO é progresso (é o gatilho).
+    #[test]
+    fn node_sending_message_disarms() {
+        let a = nid(1);
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        q.observe(&idle(a), T0 + 1_000);
+        q.observe(
+            &DomainEvent::MessageRouted {
+                id: "x".into(),
+                from: a,
+                to: "B".into(),
+                intent: "handoff".into(),
+                root_cause_id: String::new(),
+                hops: 0,
+                to_node: None,
+            },
+            T0 + 2_000,
+        );
+        assert!(
+            swallowed(&q, T0 + 5 * DELIVERED_NO_PROGRESS_WINDOW_MS).is_empty(),
+            "delegar adiante é progresso"
+        );
+    }
+
+    /// A 2ª tentativa idêntica do #22/#23 (que "funciona") RE-ARMA: a entrega mais nova zera o
+    /// relógio (idle_ts volta a None) e o progresso seguinte limpa — sem alarme órfão da 1ª.
+    #[test]
+    fn redelivery_rearms_and_clears() {
+        let a = nid(1);
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        q.observe(&idle(a), T0 + 1_000);
+        assert_eq!(
+            swallowed(&q, T0 + 100_000).len(),
+            1,
+            "a 1ª entrega foi engolida — alarma"
+        );
+
+        // 2ª entrega (a que funciona): re-arma, zerando o relógio no MESMO instante.
+        q.observe(&delivered(a), T0 + 100_000);
+        assert!(
+            swallowed(&q, T0 + 100_000).is_empty(),
+            "re-entrega zera o relógio (idle_ts = None)"
+        );
+        // E agora progride de verdade.
+        q.observe(&token(a, 50), T0 + 101_000);
+        assert!(
+            swallowed(&q, T0 + 500_000).is_empty(),
+            "a 2ª entrega virou trabalho"
+        );
+    }
+
+    /// Nó MORTO/removido após a entrega → sem alarme (não há terminal para o Maestro re-despachar).
+    #[test]
+    fn dead_or_removed_node_disarms() {
+        let a = nid(1);
+        let b = nid(2);
+
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        q.observe(&idle(a), T0 + 1_000);
+        q.observe(&status_ev(a, NS::Dead, lc_reason::PTY_EXIT), T0 + 2_000);
+        assert!(swallowed(&q, T0 + 500_000).is_empty(), "nó Dead não alarma");
+
+        let mut q2 = AttentionQueue::new();
+        q2.observe(&delivered(b), T0);
+        q2.observe(&idle(b), T0 + 1_000);
+        q2.observe(&DomainEvent::NodeRemoved { node: b }, T0 + 2_000);
+        assert!(
+            swallowed(&q2, T0 + 500_000).is_empty(),
+            "nó removido não alarma"
+        );
+    }
+
+    /// Atribuição correta + 1-por-nó: A engolido, B trabalhou (tokens) → só A alarma. Dois nós, um
+    /// alarme — prova que o progresso de B não silencia A nem vice-versa.
+    #[test]
+    fn two_nodes_only_the_swallowed_one_alarms() {
+        let a = nid(1);
+        let b = nid(2);
+        let mut q = AttentionQueue::new();
+        q.observe(&delivered(a), T0);
+        q.observe(&delivered(b), T0);
+        q.observe(&idle(a), T0 + 1_000);
+        q.observe(&idle(b), T0 + 1_000);
+        q.observe(&token(b, 100), T0 + 2_000); // B trabalhou; A não
+
+        assert_eq!(
+            swallowed(&q, T0 + 200_000),
+            vec![a.to_string()],
+            "só o engolido (A); B desarmou"
+        );
+    }
+
+    /// Critério-3 da story (replay reconstrói a fila idêntica): num `EventStore` real, entregar +
+    /// voltar a Idle; `replay` ≡ live e o alarme do engolido sobrevive à reconstrução.
+    #[test]
+    #[serial]
+    fn replay_rebuilds_swallowed_alarm() {
+        let tmp = TempDir::new("w3-swallowed");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let mut live = AttentionQueue::new();
+        let a = nid(7);
+
+        for ev in [delivered(a), idle(a)] {
+            store.append(&ev).expect("append");
+        }
+        let records = store.events().expect("events");
+        for rec in &records {
+            if let Ok(ev) = DomainEvent::from_record(&rec.kind, rec.version, rec.payload.clone()) {
+                live.observe(&ev, rec.ts);
+            }
+        }
+
+        let idle_ts = records.last().map(|r| r.ts).unwrap_or(T0);
+        let now = idle_ts + DELIVERED_NO_PROGRESS_WINDOW_MS + 1;
+        let rebuilt = AttentionQueue::replay(&records);
+        assert_eq!(rebuilt.items(now), live.items(now), "replay ≡ live");
+        assert_eq!(
+            swallowed(&rebuilt, now),
+            vec![a.to_string()],
+            "o engolido sobrevive ao replay"
+        );
     }
 }
