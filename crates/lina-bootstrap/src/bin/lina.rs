@@ -19,8 +19,9 @@ use lina_bootstrap::{
     RetroInvocation,
 };
 use lina_core::{
-    check_action, lookup_action, parse_autonomy, DomainEvent, EventStore, HandoffContract,
-    MailMessage, Mailbox, ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
+    check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, CheckKind,
+    DomainEvent, EventStore, Goal, GoalPhase, HandoffContract, MailMessage, Mailbox, ParamsLedger,
+    SystemParams, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -54,6 +55,7 @@ fn main() -> ExitCode {
         Some("retro") => run_retro(&args[1..]),
         Some("params") => run_params(&args[1..]),
         Some("effort") => run_effort(&args[1..]),
+        Some("goal") => run_goal(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -63,7 +65,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -1031,6 +1033,8 @@ fn run_plan(args: &[String]) -> ExitCode {
         Some("read") => run_plan_read(),
         Some("claim") => run_plan_intent("plan.claim", args.get(1)),
         Some("check") => run_plan_intent("plan.check", args.get(1)),
+        Some("add") => run_plan_add(&args[1..]),
+        Some("seed") => run_plan_seed(args.get(1)),
         _ => {
             usage();
             ExitCode::from(2)
@@ -1421,6 +1425,727 @@ fn run_effort(args: &[String]) -> ExitCode {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+// ── F3-1-6: superfície CLI da Goal — `lina goal define|interpret|status` + `lina plan add|seed` ──
+// O loop da Goal (épico 39): o Lina deixa de executar pedidos e passa a perseguir metas. Estes verbos
+// são a BOCA da Goal: `define`/`interpret` e `plan add`/`seed` ENFILEIRAM o intent (o supervisor cunha
+// os ids e emite os eventos — `handle_goal`/`handle_plan`, fatia CORE-Goal); `goal status` é LEITURA
+// PURA da projeção (estilo `params show`/`retro`). Alvo sentinela "goal"/"plan": o supervisor intercepta
+// por INTENT, não por alvo (como params/effort/plan). NENHUM evento nasce aqui — o bin é processo à parte.
+
+/// Critérios de aceite (`--accept`) → `Vec<AcceptanceCriterion>` do contrato: a CLI só dá a `desc`
+/// (legível ao leigo); `check_kind` cai no default CONSERVADOR `HumanReview` e `check_arg` em `None`
+/// (a CLI não decide COMO verificar — degrada honesto, exige gate). Constrói o tipo REAL do core (acopla
+/// em tempo de compilação ao schema que o handler desserializa; sem duplicar o mapa de verificação, COD-5).
+fn acceptance_from_descs(descs: &[String]) -> Vec<AcceptanceCriterion> {
+    descs
+        .iter()
+        .map(|desc| AcceptanceCriterion {
+            desc: desc.clone(),
+            check_kind: CheckKind::default(),
+            check_arg: None,
+        })
+        .collect()
+}
+
+/// Quebra um valor `--team A,B,C` / `--parents T1,T2` em itens (vírgula), aparando espaços e
+/// descartando vazios (`"A,,B"` → `["A","B"]`). Repetir a flag ESTENDE a lista (acumulável).
+fn split_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `--budget <N>` → `u64`. Erro LEGÍVEL (nunca `unwrap`/`expect`, COD-4) num valor não-numérico.
+fn parse_budget(raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|_| format!("--budget espera um numero inteiro de tokens, recebi {raw:?}"))
+}
+
+/// Gate de autonomia dos WRITERS da Goal (`goal define|interpret`, `plan add|seed`): em `manual` o
+/// agente NÃO cria nem altera metas/itens sozinho — PROPÕE ao humano (espelha `params_mutation_gate`/
+/// `run_spawn`; o router é o backstop durável). `Some(msg)` = recusa legível; `None` = pode seguir.
+fn goal_write_gate(autonomy: Autonomy) -> Option<String> {
+    matches!(autonomy, Autonomy::Manual).then(|| {
+        "no modo MANUAL voce NAO cria nem altera metas/itens do plano sozinho — proponha a mudanca \
+         ao usuario/Maestro (ou peca para subir a autonomia)."
+            .to_string()
+    })
+}
+
+/// Tail comum dos WRITERS da Goal (`goal define|interpret`, `plan add|seed`): carrega a identidade
+/// (origem do `from`), aplica o [`goal_write_gate`] (`manual` recusa — o agente PROPÕE) e ENFILEIRA o
+/// envelope que `build` monta. Espelha o tail de `run_params_mutation`/`run_effort`; centralizado para
+/// não duplicar o I/O (COD-5). `label` nomeia a ação na confirmação ao agente.
+fn enqueue_goal_write(label: &str, build: impl FnOnce(&str) -> MailMessage) -> ExitCode {
+    let input = match load_identity() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!(
+                "lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'/autonomia): {e}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(refusal) = goal_write_gate(input.autonomy) {
+        eprintln!("lina: {refusal}");
+        return ExitCode::from(1);
+    }
+    let msg = build(&input.terminal_name);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &input.terminal_name, &msg) {
+        Ok(()) => {
+            println!(
+                "ok: {label} enfileirado (msg {}) — o supervisor cunha os ids, valida o ciclo e emite os eventos",
+                msg.id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `lina goal define|interpret|status` (F3-1-6). `define`/`interpret` MUTAM (enfileiram o intent, gate
+/// de autonomia); `status` é LEITURA PURA da projeção.
+fn run_goal(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("define") => run_goal_define(&args[1..]),
+        Some("interpret") => run_goal_interpret(&args[1..]),
+        Some("status") => run_goal_status(&args[1..]),
+        _ => {
+            usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// O pedido parseado de `lina goal define "<statement>" [--budget N] [--accept "<>"]...` (PURO).
+#[derive(Debug, PartialEq, Eq)]
+struct GoalDefinition {
+    statement: String,
+    budget_tokens: Option<u64>,
+    acceptance: Vec<String>,
+}
+
+/// Parseia `goal define`. `statement` é o único posicional (o pedido bruto da meta); `--budget` é
+/// numérico; `--accept` é REPETÍVEL (um critério por ocorrência). `Err` NOMEIA o que faltou/falhou.
+fn parse_goal_define(args: &[String]) -> Result<GoalDefinition, String> {
+    let mut budget_tokens: Option<u64> = None;
+    let mut acceptance: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--budget" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or("--budget exige um numero de tokens (ex.: --budget 50000)")?;
+                budget_tokens = Some(parse_budget(v)?);
+            }
+            "--accept" => {
+                i += 1;
+                acceptance.push(
+                    args.get(i)
+                        .ok_or(
+                            "--accept exige o criterio (ex.: --accept \"a landing abre em <2s\")",
+                        )?
+                        .clone(),
+                );
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let statement = positional.into_iter().next().ok_or(
+        "lina goal define exige o enunciado da meta (ex.: lina goal define \"dobrar os leads em 30 dias\")",
+    )?;
+    Ok(GoalDefinition {
+        statement,
+        budget_tokens,
+        acceptance,
+    })
+}
+
+/// Monta o envelope `goal.define`: payload `{statement, budget_tokens?, acceptance:[AcceptanceCriterion]}`,
+/// alvo sentinela "goal". O bin NÃO cunha `goal_id` nem decompõe — `handle_goal` (escritor único) cunha o
+/// id, carimba `origin`/`root_cause_id` server-side (ADR 0007) e emite `GoalDefined`, que espera a interpretação.
+fn build_goal_define_envelope(from: &str, d: &GoalDefinition) -> MailMessage {
+    let payload = serde_json::json!({
+        "statement": d.statement,
+        "budget_tokens": d.budget_tokens,
+        "acceptance": acceptance_from_descs(&d.acceptance),
+    })
+    .to_string();
+    MailMessage::new(from, "goal", "goal.define", payload)
+}
+
+/// `lina goal define` — parseia e enfileira; erro de forma sai com código 2 (uso).
+fn run_goal_define(args: &[String]) -> ExitCode {
+    match parse_goal_define(args) {
+        Ok(d) => enqueue_goal_write("goal define", |from| build_goal_define_envelope(from, &d)),
+        Err(e) => {
+            eprintln!("lina: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// O pedido parseado de `lina goal interpret <goal_id> --understanding "<>" --strategy "<>" [--team ..] [--accept ..]`.
+#[derive(Debug, PartialEq, Eq)]
+struct GoalInterpretation {
+    goal_id: String,
+    interpretation: String,
+    strategy: String,
+    proposed_team: Vec<String>,
+    acceptance: Vec<String>,
+}
+
+/// Parseia `goal interpret`. `goal_id` é posicional; `--understanding` (vira `interpretation` no evento)
+/// e `--strategy` são OBRIGATÓRIOS — o Maestro devolve o entendimento ANTES de executar (doc-fonte 11).
+/// `--team` é CSV acumulável; `--accept` é repetível. `Err` NOMEIA a flag faltante.
+fn parse_goal_interpret(args: &[String]) -> Result<GoalInterpretation, String> {
+    let mut understanding: Option<String> = None;
+    let mut strategy: Option<String> = None;
+    let mut proposed_team: Vec<String> = Vec::new();
+    let mut acceptance: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--understanding" => {
+                i += 1;
+                understanding = Some(
+                    args.get(i)
+                        .ok_or("--understanding exige o texto do que o Maestro entendeu da meta")?
+                        .clone(),
+                );
+            }
+            "--strategy" => {
+                i += 1;
+                strategy = Some(
+                    args.get(i)
+                        .ok_or("--strategy exige o texto da estrategia de ataque")?
+                        .clone(),
+                );
+            }
+            "--team" => {
+                i += 1;
+                proposed_team
+                    .extend(split_csv(args.get(i).ok_or(
+                        "--team exige a lista de papeis/terminais (ex.: --team A,B,C)",
+                    )?));
+            }
+            "--accept" => {
+                i += 1;
+                acceptance.push(
+                    args.get(i)
+                        .ok_or("--accept exige o criterio de aceite")?
+                        .clone(),
+                );
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let goal_id = positional.into_iter().next().ok_or(
+        "lina goal interpret exige o goal_id (ex.: lina goal interpret g-7 --understanding \"...\" --strategy \"...\")",
+    )?;
+    let interpretation = understanding
+        .ok_or("lina goal interpret exige --understanding \"<o que voce entendeu>\"")?;
+    let strategy = strategy.ok_or("lina goal interpret exige --strategy \"<como vai atacar>\"")?;
+    Ok(GoalInterpretation {
+        goal_id,
+        interpretation,
+        strategy,
+        proposed_team,
+        acceptance,
+    })
+}
+
+/// Monta o envelope `goal.interpret`: payload `{goal_id, interpretation, strategy, proposed_team,
+/// acceptance:[AcceptanceCriterion]}`, alvo sentinela "goal". `handle_goal` valida o ciclo (só interpreta
+/// meta `Defined`), carimba `by` server-side e emite `GoalInterpreted` (que SUGERE — confirmação é gate humano).
+fn build_goal_interpret_envelope(from: &str, g: &GoalInterpretation) -> MailMessage {
+    let payload = serde_json::json!({
+        "goal_id": g.goal_id,
+        "interpretation": g.interpretation,
+        "strategy": g.strategy,
+        "proposed_team": g.proposed_team,
+        "acceptance": acceptance_from_descs(&g.acceptance),
+    })
+    .to_string();
+    MailMessage::new(from, "goal", "goal.interpret", payload)
+}
+
+/// `lina goal interpret` — parseia e enfileira; erro de forma sai com código 2 (uso).
+fn run_goal_interpret(args: &[String]) -> ExitCode {
+    match parse_goal_interpret(args) {
+        Ok(g) => {
+            let label = format!("goal interpret {}", g.goal_id);
+            enqueue_goal_write(&label, |from| build_goal_interpret_envelope(from, &g))
+        }
+        Err(e) => {
+            eprintln!("lina: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina goal status <goal_id> [--json]` — LEITURA PURA da projeção `Goal` (replay do log, SÓ-LEITURA,
+/// como `params show`/`retro`). Esqueleto Rα-0: `project_goals` ainda devolve vazio (a varredura por
+/// `goal_id` é a fatia CORE-Goal-lógica) — o CABEAMENTO read é o que esta fatia entrega e testa.
+fn run_goal_status(args: &[String]) -> ExitCode {
+    let json = args.iter().any(|a| a == "--json");
+    let Some(goal_id) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("lina: 'goal status' exige o goal_id (ex.: lina goal status g-7 [--json])");
+        usage();
+        return ExitCode::from(2);
+    };
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let records = parse_log_records(&content);
+    let goals = project_goals(&records);
+    let found = goals.iter().find(|g| &g.goal_id == goal_id);
+    if json {
+        print!("{}", render_goal_status_json(goal_id, found));
+    } else {
+        print!("{}", render_goal_status(goal_id, found));
+    }
+    ExitCode::SUCCESS
+}
+
+/// Rótulo pt-br da fase do ciclo (narra ao leigo, sem o jargão do enum).
+fn goal_phase_label(phase: GoalPhase) -> &'static str {
+    match phase {
+        GoalPhase::Defined => "definida (aguardando interpretacao)",
+        GoalPhase::Interpreted => "interpretada (aguardando confirmacao)",
+        GoalPhase::Confirmed => "confirmada",
+        GoalPhase::Decomposed => "decomposta em itens",
+        GoalPhase::InLoop => "em execucao",
+        GoalPhase::Achieved => "concluida",
+        GoalPhase::Escalated => "escalada ao humano",
+    }
+}
+
+/// Render legível (leigo) do status. `None` = nenhuma meta com esse id no log (no esqueleto Rα-0,
+/// sempre — a projeção real vem depois). Mostra os campos que a projeção EXPÕE hoje (fase/enunciado/
+/// entendimento/iteracoes/aceite/itens); budget e vereditos por item entram quando a projeção os reconstruir.
+fn render_goal_status(goal_id: &str, goal: Option<&Goal>) -> String {
+    let Some(g) = goal else {
+        return format!("Meta {goal_id}: nenhuma com esse id no log do Espaco ainda.\n");
+    };
+    let mut out = format!("Meta {} · {}\n", g.goal_id, goal_phase_label(g.phase));
+    out.push_str(&format!("  enunciado: {}\n", g.statement));
+    if let Some(interp) = &g.interpretation {
+        out.push_str(&format!("  entendimento: {interp}\n"));
+    }
+    out.push_str(&format!("  iteracoes: {}\n", g.iterations));
+    if g.acceptance.is_empty() {
+        out.push_str("  criterios de aceite: (nenhum)\n");
+    } else {
+        out.push_str("  criterios de aceite:\n");
+        for c in &g.acceptance {
+            out.push_str(&format!("    - {}\n", c.desc));
+        }
+    }
+    if g.items.is_empty() {
+        out.push_str("  itens do plano: (nenhum)\n");
+    } else {
+        out.push_str(&format!("  itens do plano: {}\n", g.items.join(", ")));
+    }
+    out
+}
+
+/// Render `--json` do status (para scripts/UI). Reusa a projeção `Goal` (deriva `Serialize`); `goal`
+/// é `null` quando a meta não existe. Forma estável: `{"goal_id":..,"found":bool,"goal":Goal|null}`.
+fn render_goal_status_json(goal_id: &str, goal: Option<&Goal>) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "goal_id": goal_id,
+            "found": goal.is_some(),
+            "goal": goal,
+        })
+    )
+}
+
+/// O pedido parseado de `lina plan add <id> "<desc>" [--goal G] [--parents T1,T2] [--accept ..] [--budget N]`.
+#[derive(Debug, PartialEq, Eq)]
+struct PlanAddition {
+    item: String,
+    desc: String,
+    goal_id: Option<String>,
+    parents: Vec<String>,
+    acceptance: Vec<String>,
+    budget_tokens: Option<u64>,
+}
+
+/// Parseia `plan add`. `item` e `desc` são posicionais (id + descrição); `--goal` liga à meta,
+/// `--parents` é CSV acumulável, `--accept` repetível, `--budget` numérico. `Err` NOMEIA o que faltou.
+fn parse_plan_add(args: &[String]) -> Result<PlanAddition, String> {
+    let mut goal_id: Option<String> = None;
+    let mut parents: Vec<String> = Vec::new();
+    let mut acceptance: Vec<String> = Vec::new();
+    let mut budget_tokens: Option<u64> = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--goal" => {
+                i += 1;
+                goal_id = Some(
+                    args.get(i)
+                        .ok_or("--goal exige o goal_id que o item serve")?
+                        .clone(),
+                );
+            }
+            "--parents" => {
+                i += 1;
+                parents
+                    .extend(split_csv(args.get(i).ok_or(
+                        "--parents exige a lista de ids (ex.: --parents T1,T2)",
+                    )?));
+            }
+            "--accept" => {
+                i += 1;
+                acceptance.push(
+                    args.get(i)
+                        .ok_or("--accept exige o criterio de aceite")?
+                        .clone(),
+                );
+            }
+            "--budget" => {
+                i += 1;
+                let v = args.get(i).ok_or("--budget exige um numero de tokens")?;
+                budget_tokens = Some(parse_budget(v)?);
+            }
+            other => positional.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let mut positional = positional.into_iter();
+    let item = positional
+        .next()
+        .ok_or("lina plan add exige o id do item (ex.: lina plan add T4 \"montar a API\")")?;
+    let desc = positional.next().ok_or(
+        "lina plan add exige a descricao do item (ex.: lina plan add T4 \"montar a API de leads\")",
+    )?;
+    Ok(PlanAddition {
+        item,
+        desc,
+        goal_id,
+        parents,
+        acceptance,
+        budget_tokens,
+    })
+}
+
+/// Monta o envelope `plan.add`: promove `seed_plan_item` (router, hoje só-teste) a verbo real — payload
+/// `{item, desc, goal_id?, parents, acceptance:[AcceptanceCriterion], budget_tokens?}`. `handle_plan`
+/// emite `PlanItemAdded` + `PlanItemAttributed` (a atribuição à Goal/parents/aceite, spec 52 §2).
+fn build_plan_add_envelope(from: &str, a: &PlanAddition) -> MailMessage {
+    let payload = serde_json::json!({
+        "item": a.item,
+        "desc": a.desc,
+        "goal_id": a.goal_id,
+        "parents": a.parents,
+        "acceptance": acceptance_from_descs(&a.acceptance),
+        "budget_tokens": a.budget_tokens,
+    })
+    .to_string();
+    MailMessage::new(from, "plan", "plan.add", payload)
+}
+
+/// `lina plan add` — parseia e enfileira (reusa o gate/tail dos writers da Goal); erro de forma → código 2.
+fn run_plan_add(args: &[String]) -> ExitCode {
+    match parse_plan_add(args) {
+        Ok(a) => {
+            let label = format!("plan add {}", a.item);
+            enqueue_goal_write(&label, |from| build_plan_add_envelope(from, &a))
+        }
+        Err(e) => {
+            eprintln!("lina: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Monta o envelope `plan.seed`: decompõe o `GoalInterpreted` CONFIRMADO em itens — payload `{goal_id}`,
+/// alvo sentinela "plan". `handle_plan` emite `GoalDecomposed` + N `PlanItemAttributed` (spec 52). Recusar
+/// uma meta não-confirmada é do supervisor (validação de ciclo), não do bin.
+fn build_plan_seed_envelope(from: &str, goal_id: &str) -> MailMessage {
+    let payload = serde_json::json!({ "goal_id": goal_id }).to_string();
+    MailMessage::new(from, "plan", "plan.seed", payload)
+}
+
+/// `lina plan seed <goal_id>` — enfileira a decomposição (reusa o gate/tail dos writers da Goal). Sem
+/// `goal_id`, sai com código 2 (uso).
+fn run_plan_seed(goal_id: Option<&String>) -> ExitCode {
+    let Some(goal_id) = goal_id else {
+        eprintln!("lina: 'plan seed' exige o goal_id (ex.: lina plan seed g-7)");
+        usage();
+        return ExitCode::from(2);
+    };
+    let label = format!("plan seed {goal_id}");
+    enqueue_goal_write(&label, |from| build_plan_seed_envelope(from, goal_id))
+}
+
+#[cfg(test)]
+mod f31_goal_surface_tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    // ── goal define ──
+    #[test]
+    fn parse_goal_define_pega_statement_budget_e_aceites_repetidos() {
+        let d = parse_goal_define(&argv(&[
+            "dobrar os leads",
+            "--budget",
+            "50000",
+            "--accept",
+            "abre em <2s",
+            "--accept",
+            "form envia",
+        ]))
+        .expect("valido");
+        assert_eq!(d.statement, "dobrar os leads");
+        assert_eq!(d.budget_tokens, Some(50000));
+        assert_eq!(
+            d.acceptance,
+            vec!["abre em <2s".to_string(), "form envia".to_string()],
+            "--accept repetido acumula"
+        );
+    }
+
+    #[test]
+    fn parse_goal_define_sem_statement_falha() {
+        let err = parse_goal_define(&argv(&["--budget", "10"])).expect_err("sem enunciado falha");
+        assert!(err.contains("enunciado"), "nomeia o que faltou: {err}");
+    }
+
+    #[test]
+    fn parse_goal_define_budget_nao_numerico_falha() {
+        let err = parse_goal_define(&argv(&["meta", "--budget", "muito"]))
+            .expect_err("budget invalido falha");
+        assert!(err.contains("numero"), "explica o erro de budget: {err}");
+    }
+
+    #[test]
+    fn goal_define_envelope_enfileira_intent_e_aceites_estruturados() {
+        let d = GoalDefinition {
+            statement: "meta".into(),
+            budget_tokens: Some(7),
+            acceptance: vec!["c1".into()],
+        };
+        let env = build_goal_define_envelope("Terminal I", &d);
+        assert_eq!(env.intent, "goal.define");
+        assert_eq!(
+            env.to, "goal",
+            "alvo sentinela 'goal' (intercept por intent)"
+        );
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["statement"], "meta");
+        assert_eq!(p["budget_tokens"], 7);
+        // acceptance vira AcceptanceCriterion: desc + check_kind default HumanReview (degrada honesto).
+        assert_eq!(p["acceptance"][0]["desc"], "c1");
+        assert_eq!(p["acceptance"][0]["check_kind"], "HumanReview");
+        // o bin NUNCA cunha goal_id nem carimba `by` (autoridade do supervisor, ADR 0007).
+        assert!(
+            !env.payload.contains("goal_id") && !env.payload.contains("\"by\""),
+            "o bin nao cunha id nem carimba autoridade: {}",
+            env.payload
+        );
+    }
+
+    // ── goal interpret ──
+    #[test]
+    fn parse_goal_interpret_exige_goal_id_understanding_strategy_e_aceita_time_csv() {
+        let g = parse_goal_interpret(&argv(&[
+            "g-7",
+            "--understanding",
+            "entendi X",
+            "--strategy",
+            "ataco Y",
+            "--team",
+            "A,B , C",
+            "--accept",
+            "criterio",
+        ]))
+        .expect("valido");
+        assert_eq!(g.goal_id, "g-7");
+        assert_eq!(
+            g.interpretation, "entendi X",
+            "--understanding vira interpretation"
+        );
+        assert_eq!(g.strategy, "ataco Y");
+        assert_eq!(
+            g.proposed_team,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            "csv apara espacos e descarta vazios"
+        );
+        assert_eq!(g.acceptance, vec!["criterio".to_string()]);
+    }
+
+    #[test]
+    fn parse_goal_interpret_sem_strategy_falha() {
+        let err = parse_goal_interpret(&argv(&["g-1", "--understanding", "x"]))
+            .expect_err("sem strategy falha");
+        assert!(err.contains("strategy"), "nomeia a flag faltante: {err}");
+    }
+
+    #[test]
+    fn goal_interpret_envelope_carrega_entendimento_e_time() {
+        let g = GoalInterpretation {
+            goal_id: "g-7".into(),
+            interpretation: "u".into(),
+            strategy: "s".into(),
+            proposed_team: vec!["A".into()],
+            acceptance: vec![],
+        };
+        let env = build_goal_interpret_envelope("Terminal I", &g);
+        assert_eq!(env.intent, "goal.interpret");
+        assert_eq!(env.to, "goal");
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["goal_id"], "g-7");
+        assert_eq!(p["interpretation"], "u");
+        assert_eq!(p["strategy"], "s");
+        assert_eq!(p["proposed_team"][0], "A");
+    }
+
+    // ── plan add ──
+    #[test]
+    fn parse_plan_add_pega_id_desc_e_atribuicao() {
+        let a = parse_plan_add(&argv(&[
+            "T4",
+            "montar a API",
+            "--goal",
+            "g-7",
+            "--parents",
+            "T1,T2",
+            "--budget",
+            "1000",
+            "--accept",
+            "responde 200",
+        ]))
+        .expect("valido");
+        assert_eq!(a.item, "T4");
+        assert_eq!(a.desc, "montar a API");
+        assert_eq!(a.goal_id, Some("g-7".to_string()));
+        assert_eq!(a.parents, vec!["T1".to_string(), "T2".to_string()]);
+        assert_eq!(a.budget_tokens, Some(1000));
+        assert_eq!(a.acceptance, vec!["responde 200".to_string()]);
+    }
+
+    #[test]
+    fn parse_plan_add_sem_desc_falha() {
+        let err = parse_plan_add(&argv(&["T4"])).expect_err("sem descricao falha");
+        assert!(err.contains("descricao"), "nomeia o que faltou: {err}");
+    }
+
+    #[test]
+    fn plan_add_envelope_enfileira_plan_add_com_atribuicao() {
+        let a = PlanAddition {
+            item: "T4".into(),
+            desc: "d".into(),
+            goal_id: Some("g-7".into()),
+            parents: vec!["T1".into()],
+            acceptance: vec!["c".into()],
+            budget_tokens: Some(9),
+        };
+        let env = build_plan_add_envelope("Terminal I", &a);
+        assert_eq!(env.intent, "plan.add");
+        assert_eq!(env.to, "plan");
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["item"], "T4");
+        assert_eq!(p["desc"], "d");
+        assert_eq!(p["goal_id"], "g-7");
+        assert_eq!(p["parents"][0], "T1");
+        assert_eq!(p["acceptance"][0]["desc"], "c");
+        assert_eq!(p["budget_tokens"], 9);
+    }
+
+    // ── plan seed ──
+    #[test]
+    fn plan_seed_envelope_enfileira_plan_seed_do_goal() {
+        let env = build_plan_seed_envelope("Terminal I", "g-7");
+        assert_eq!(env.intent, "plan.seed");
+        assert_eq!(env.to, "plan");
+        let p: serde_json::Value = serde_json::from_str(&env.payload).expect("payload é JSON");
+        assert_eq!(p["goal_id"], "g-7");
+    }
+
+    // ── gate de autonomia (writers) ──
+    #[test]
+    fn goal_write_gate_recusa_em_manual_e_libera_no_resto() {
+        assert!(
+            goal_write_gate(Autonomy::Manual).is_some(),
+            "manual recusa o write — o agente PROPOE"
+        );
+        assert!(
+            goal_write_gate(Autonomy::Assisted).is_none(),
+            "assistido segue (propoe->confirma e a narracao do agente)"
+        );
+        assert!(
+            goal_write_gate(Autonomy::Autonomous).is_none(),
+            "autonomo segue"
+        );
+    }
+
+    // ── goal status (leitura pura) ──
+    #[test]
+    fn goal_status_de_meta_inexistente_e_legivel_e_json() {
+        assert!(
+            render_goal_status("g-x", None).contains("nenhuma"),
+            "legivel: meta ausente"
+        );
+        let j: serde_json::Value =
+            serde_json::from_str(render_goal_status_json("g-x", None).trim()).expect("JSON valido");
+        assert_eq!(j["found"], false);
+        assert_eq!(j["goal_id"], "g-x");
+        assert!(j["goal"].is_null());
+    }
+
+    #[test]
+    fn goal_status_renderiza_fase_aceite_e_itens() {
+        let g = Goal {
+            goal_id: "g-7".into(),
+            statement: "dobrar leads".into(),
+            phase: GoalPhase::Decomposed,
+            interpretation: Some("entendi".into()),
+            acceptance: vec![AcceptanceCriterion {
+                desc: "abre <2s".into(),
+                check_kind: CheckKind::default(),
+                check_arg: None,
+            }],
+            items: vec!["T1".into(), "T2".into()],
+            iterations: 2,
+        };
+        let out = render_goal_status("g-7", Some(&g));
+        assert!(out.contains("dobrar leads"), "mostra o enunciado: {out}");
+        assert!(out.contains("decomposta"), "rotula a fase em pt-br: {out}");
+        assert!(out.contains("abre <2s"), "lista os criterios: {out}");
+        assert!(out.contains("T1, T2"), "lista os itens: {out}");
+        let j: serde_json::Value =
+            serde_json::from_str(render_goal_status_json("g-7", Some(&g)).trim())
+                .expect("JSON valido");
+        assert_eq!(j["found"], true);
+        assert_eq!(j["goal"]["iterations"], 2);
     }
 }
 

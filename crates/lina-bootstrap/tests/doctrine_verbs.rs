@@ -39,10 +39,14 @@ const BIN_VERBS: &[&str] = &[
     // F3-0-5 Parte 2: `lina effort @T <low|medium|high>` (cognição por terminal — envelope
     // `effort.assign` → supervisor emite `EffortAssigned`). Registrado no dispatch + usage().
     "effort",
+    // F3-1-6: `lina goal define|interpret|status` (a Meta como primitiva — `goal.define`/`goal.interpret`
+    // enfileiram p/ o supervisor; `status` lê a projeção Goal). Registrado no dispatch + usage().
+    "goal",
 ];
 
-/// Sub-verbos do `lina plan` implementados (`run_plan`).
-const PLAN_SUBVERBS: &[&str] = &["read", "claim", "check"];
+/// Sub-verbos do `lina plan` implementados (`run_plan`). F3-1-6 acrescenta os WRITERS `add`/`seed`
+/// (promoção de `seed_plan_item` a verbo real + decomposição da Goal) ao ciclo de leitura read/claim/check.
+const PLAN_SUBVERBS: &[&str] = &["read", "claim", "check", "add", "seed"];
 
 fn doctrine_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/lina-doctrine")
