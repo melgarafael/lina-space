@@ -1,6 +1,6 @@
 # ADR 0032 — dependências (`parents`) no `PlanItem` e verbos de escrita do plano (`add`/`seed`)
 
-- **Status:** Proposto (é GATE — ainda não aceito)
+- **Status:** ✅ Aceito (2026-06-18, pelo fundador via Maestro Terminal A) — destrava F3-1-3 (parents) + os verbos de escrita do plano
 - **Onda/Story:** habilitador do Goal-and-Loop (spec `52`); pré-requisito de orquestração estruturada (skills `lina-orchestration`/`lina-dispatch`)
 - **Data:** 2026-06-16
 - **Fontes:** spec `52` (Goal-and-Loop) · invariante #4 (event log fonte da verdade; eventos aditivos `serde(default)`) · família ADR 0007 (campo escrito por agente nunca decide autoridade) · ADR 0001 (plano por event-sourcing; supervisor escritor único) · código: `crates/lina-core/src/plan.rs:88-97`, `crates/lina-core/src/router.rs:1767-1819`, `crates/lina-bootstrap/src/bin/lina.rs:1026-1036`

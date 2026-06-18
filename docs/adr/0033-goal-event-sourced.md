@@ -1,6 +1,6 @@
 # ADR 0033 — Goal como entidade event-sourced de primeira classe (loop-até-aceite com juiz separado)
 
-- **Status:** Proposto (gate — ainda NÃO aceito)
+- **Status:** ✅ Aceito (2026-06-18, pelo fundador via Maestro Terminal A) — destrava a onda F3-1 inteira (Goal-and-Loop)
 - **Onda/Story:** spec 52 (objetivo como primitiva) · precede o loop autônomo da F5
 - **Data:** 2026-06-16
 - **Fontes:** spec `52` (Goal como primitiva; ponto 3 de Meadows — objetivo do sistema) · insumo Hermes (`hermes_cli/goals.py`: juiz LLM auxiliar separado do executor, fail-open, turn-budget, auto-pause por parse-failure) · ADR 0001 (plan event-sourced) · ADR 0020 (recovery por event log, sem durable execution) · ADR 0007 (campo de agente não decide segurança/autoridade) · ADR 0019 (definições mensuráveis, não impressões de LLM)
