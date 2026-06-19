@@ -2241,9 +2241,10 @@ impl WorkspaceView {
     /// F3-CONF-2 (#21): o fundador clicou "liberar" no nó pausado pelo disjuntor. MESMA costura do
     /// [`Self::confirm_goal`] (ADR 0036): a view só DISPARA o gesto pelo canal in-process; a
     /// `MailboxPump` carimba `by="human"` SERVER-SIDE (a view NUNCA escolhe `by` — a doutrina de
-    /// segurança: nenhum campo escrito pela UI decide autoridade). O verbo `breaker.reset` é tratado
-    /// no CORE (`router.rs::human_intent`, item CONF-CORE): fecha o disjuntor e tira o nó de
-    /// `Blocked`. `node` é UUID cunhado server-side — sem escape JSON.
+    /// segurança: nenhum campo escrito pela UI decide autoridade). O gesto `breaker.reset` é roteado
+    /// pela `MailboxPump` (`drain_human_intents`, bridge) para `Router::reset_breaker` — NÃO pelo
+    /// `human_intent` (que é de Goal e o rejeitaria): fecha o disjuntor e tira o nó de `Blocked`.
+    /// `node` é UUID cunhado server-side — sem escape JSON.
     fn release_breaker(&mut self, node: NodeId, _window: &mut Window, cx: &mut Context<Self>) {
         self.nodes
             .push_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#));
