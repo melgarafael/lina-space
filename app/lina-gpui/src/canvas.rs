@@ -69,6 +69,10 @@ pub enum Zone {
 pub enum BadgeKind {
     /// "precisa de você" — bloqueado aguardando uma decisão humana (ex.: gate de custódia pendente).
     NeedsYou,
+    /// "pausado por segurança" (#21) — o CORE pausou o nó (disjuntor de entrega). VIVO mas
+    /// PARADO: distinto de `Running` (não está trabalhando) e de `Stopped` (não morreu). A saída
+    /// é um gesto humano (liberar); a copy de superfície carrega esse caminho de recuperação.
+    Paused,
     /// "rodando" — vivo e produzindo saída.
     Running,
     /// "aguardando" — VIVO mas sem saída recente (o agente terminou e espera você). **NÃO é
@@ -92,6 +96,9 @@ impl Badge {
     pub fn label(&self) -> String {
         match self.kind {
             BadgeKind::NeedsYou => "precisa de você".to_string(),
+            // #21: a copy canônica (estado + saída de 1 clique) vive em produção no crate root e
+            // é ASSERTADA pelo gate (`honest_state_tests`); a11y e header leem a MESMA frase.
+            BadgeKind::Paused => crate::CIRCUIT_BREAKER_LABEL.to_string(),
             BadgeKind::Running => {
                 if self.unseen > 0 {
                     format!("rodando · {} novas", self.unseen)
@@ -120,6 +127,9 @@ impl Badge {
         let th = crate::theme::active();
         match self.kind {
             BadgeKind::NeedsYou => th.state.warning, // o mesmo do gate de custódia
+            // #21: cor de ATENÇÃO própria — o acento do produto (≠ âmbar de "rodando", ≠ vermelho
+            // de "encerrado"). O glifo + o texto carregam o sentido sem depender só da cor (1.4.1).
+            BadgeKind::Paused => th.accent.primary,
             BadgeKind::Running => th.accent.confirm,
             BadgeKind::Waiting => th.surface.raised_alt, // neutro, NÃO alarmante
             BadgeKind::Stopped => th.surface.danger_muted,
@@ -154,6 +164,9 @@ pub fn aggregate_badge(status: NodeStatus, needs_human: bool, unseen: u32) -> Ba
             // BUG 1: VIVO mas sem saída recente = "aguardando" (NÃO "dormindo"). Um chat aberto que
             // terminou a resposta está vivo/pronto — nunca "dormindo" por falta de foco ou de output.
             NodeStatus::Idle => BadgeKind::Waiting,
+            // #21: o CORE pausou este nó (disjuntor) — VIVO mas parado. Sem este braço o `_`
+            // abaixo o leria como "rodando" (a MESMA mentira que o #21 corrige).
+            NodeStatus::Blocked => BadgeKind::Paused,
             NodeStatus::Crashed | NodeStatus::Dead => BadgeKind::Stopped,
             // `NodeStatus` é `#[non_exhaustive]`: um estado FUTURO do core cai aqui → assume "rodando"
             // (vivo, neutro) em vez de fingir encerrado.
@@ -221,6 +234,11 @@ mod tests {
             aggregate_badge(NodeStatus::Idle, false, 0).kind,
             BadgeKind::Waiting,
             "BUG 1: VIVO mas idle = aguardando, NUNCA dormindo"
+        );
+        assert_eq!(
+            aggregate_badge(NodeStatus::Blocked, false, 0).kind,
+            BadgeKind::Paused,
+            "#21: pausado pelo disjuntor NÃO pode cair em 'rodando' (o `_` mentiria)"
         );
         assert_eq!(
             aggregate_badge(NodeStatus::Dead, false, 0).kind,

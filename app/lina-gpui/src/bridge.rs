@@ -2276,7 +2276,10 @@ fn map_status(s: CoreStatus) -> NodeStatus {
         CoreStatus::Ready => NodeStatus::Idle,
         CoreStatus::Idle => NodeStatus::Idle,
         CoreStatus::Busy => NodeStatus::Busy,
-        CoreStatus::Blocked => NodeStatus::Busy,
+        // F3-CONF-2 (#21): PARA de colapsar em Busy. Um nó pausado pelo disjuntor é VIVO porém
+        // PARADO — a tela honesta o pinta "pausado por segurança", nunca "trabalhando". O motivo
+        // viaja à parte no `reason` do `HostEvent` (a variante segue `Copy`).
+        CoreStatus::Blocked => NodeStatus::Blocked,
         CoreStatus::Dead => NodeStatus::Dead,
     }
 }
@@ -2297,9 +2300,9 @@ pub fn bus_to_host(ev: &BusEvent) -> Option<HostEvent> {
         } => Some(HostEvent::NodeStatusChanged {
             node: *node,
             status: map_status(*status),
-            // F3-CONF-2: o reason flui do Bus ao HostEvent (a UI-HONESTA o consome no render).
-            // `map_status` ainda colapsa Blocked→Busy nesta camada de contrato — a frente UI
-            // destrava o `map_status` + o badge "pausado por segurança".
+            // F3-CONF-2: o reason flui do Bus ao HostEvent (disponível p/ discriminar pausas
+            // futuras). `map_status` já mapeia Blocked→Blocked — a tela honesta lê o STATUS
+            // (hoje a única pausa é o disjuntor) e renderiza "pausado por segurança".
             reason: reason.clone(),
         }),
         BusEvent::Message { from, to, .. } => Some(HostEvent::BusMessage {

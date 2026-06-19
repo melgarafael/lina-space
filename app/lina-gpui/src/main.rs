@@ -2238,6 +2238,18 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// F3-CONF-2 (#21): o fundador clicou "liberar" no nó pausado pelo disjuntor. MESMA costura do
+    /// [`Self::confirm_goal`] (ADR 0036): a view só DISPARA o gesto pelo canal in-process; a
+    /// `MailboxPump` carimba `by="human"` SERVER-SIDE (a view NUNCA escolhe `by` — a doutrina de
+    /// segurança: nenhum campo escrito pela UI decide autoridade). O verbo `breaker.reset` é tratado
+    /// no CORE (`router.rs::human_intent`, item CONF-CORE): fecha o disjuntor e tira o nó de
+    /// `Blocked`. `node` é UUID cunhado server-side — sem escape JSON.
+    fn release_breaker(&mut self, node: NodeId, _window: &mut Window, cx: &mut Context<Self>) {
+        self.nodes
+            .push_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#));
+        cx.notify();
+    }
+
     /// F3-1-7: o fundador quer AJUSTAR a interpretação (re-abrir `goal.interpret`). Mesma costura
     /// pendente do [`Self::confirm_goal`] (intent autenticado pelo `Mailbox` da bomba). Registra por DADOS.
     fn correct_goal(&mut self, goal_id: &str, cx: &mut Context<Self>) {
@@ -2279,6 +2291,26 @@ impl WorkspaceView {
     /// evento — o Maestro valida por DADOS, o fundador pelo olho.
     /// Geometria: `dashboard::dashboard_panel_rect` (PURA, clampada à janela — bug da
     /// rodada: o painel fixo vazava a borda direita) + clip + scroll interno das linhas.
+    /// F3-0-6: mapa `NodeId.to_string() → EffortBadge` (modelo·effort por nó). `EffortAssigned` é
+    /// META (fora da projeção do canvas), então é reconstruído varrendo o log com a MESMA disciplina
+    /// de cache do custo (re-varre SÓ com evento novo; nunca por frame). NÃO-BLOQUEANTE no render
+    /// (fix do freeze do `lina ask`): store ocupado → mantém o cache e re-varre no próximo quadro.
+    /// Fonte ÚNICA consumida pelo PAINEL (linha do nó) E pelo HEADER do card (pílula).
+    fn effort_badges_cached(&self) -> BTreeMap<String, dashboard::EffortBadge> {
+        let mut cache = lock(&self.dash.effort);
+        let cached = cache.as_ref().map(|(c, _)| *c);
+        if let Some(v) = self.nodes.try_with_store(|store| {
+            let count = store.event_count().ok()?;
+            if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                return None;
+            }
+            Some((count, dashboard::effort_badges(&store.events().ok()?)))
+        }) {
+            *cache = Some(v);
+        }
+        cache.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
+    }
+
     fn render_dashboard(
         &mut self,
         th: &theme::Theme,
@@ -2317,6 +2349,10 @@ impl WorkspaceView {
                     NodeStatus::Dead => "Dead",
                     NodeStatus::Crashed => "Crashed",
                     NodeStatus::Idle => "Idle",
+                    // #21: o disjuntor passou a chegar aqui (o bridge parou de colapsar Blocked→Busy);
+                    // sem este braço cairia em "Running" — mentira. `from_projection` já o lê como
+                    // "Esperando você" (a voz do painel; ≠ "pausado por segurança" do card).
+                    NodeStatus::Blocked => "Blocked",
                     NodeStatus::Starting | NodeStatus::Running => "Running",
                     _ => "Running", // variantes futuras: vivo sem distinção (fallback honesto)
                 };
@@ -2387,26 +2423,8 @@ impl WorkspaceView {
         };
         let cards_by_node: BTreeMap<NodeId, dashboard::AgentCard> =
             cards.into_iter().map(|c| (c.node, c)).collect();
-        // F3-0-6: badge modelo·effort por nó — `EffortAssigned` é META (fora da projeção do
-        // canvas), então o painel o reconstrói varrendo o log com a MESMA disciplina de cache do
-        // custo (re-varre SÓ com evento novo; nunca por frame). Chave = `NodeId.to_string()`, que é
-        // o que ambos os emissores (router/spawn) carimbam no evento.
-        let effort_by_node = {
-            let mut cache = lock(&self.dash.effort);
-            // NÃO-BLOQUEANTE no render (fix freeze do `lina ask`): mesma disciplina do custo acima —
-            // store ocupado → mantém o cache; re-varre o effort no próximo quadro.
-            let cached = cache.as_ref().map(|(c, _)| *c);
-            if let Some(v) = self.nodes.try_with_store(|store| {
-                let count = store.event_count().ok()?;
-                if !dashboard::projection_cache_is_stale(cached, Some(count)) {
-                    return None;
-                }
-                Some((count, dashboard::effort_badges(&store.events().ok()?)))
-            }) {
-                *cache = Some(v);
-            }
-            cache.as_ref().map(|(_, m)| m.clone()).unwrap_or_default()
-        };
+        // F3-0-6: badge modelo·effort por nó (fonte única — painel E header do card).
+        let effort_by_node = self.effort_badges_cached();
         // Total "Hoje:": sessões sob o ws_root + sessões dos cwds ADOTADOS pelos nós do
         // Espaço (parcela de fora rotulada no próprio texto — honesto, nunca soma muda).
         let total =
@@ -4082,6 +4100,9 @@ impl Render for WorkspaceView {
         // F2-2-5: rect+contexto do card FOCADO, capturado no loop e consumido na ancoragem da
         // toolbar contextual (overlay screen-space) após o desenho dos cards.
         let mut focused_toolbar: Option<(ui::CardRect, palette::NodeCtx, String)> = None;
+        // F3-0-6: modelo·effort por nó (mesmo cache do painel) — o header do card mostra com que
+        // motor cada terminal pensa, num relance. Reconstruído 1× por frame (cache não-bloqueante).
+        let effort_by_node = self.effort_badges_cached();
         for (idx, (id, nv)) in cards.iter().enumerate() {
             // F1-5-1: cronômetro POR PAINEL da fase assemble (inclui lock do grid + screen()).
             let prof_panel_start = self.prof.enabled.then(Instant::now);
@@ -4168,6 +4189,9 @@ impl Render for WorkspaceView {
                 match nv.status {
                     NodeStatus::Idle => rgb(th.state.success),
                     NodeStatus::Busy | NodeStatus::Running => rgb(th.state.warning),
+                    // #21: pausado pelo disjuntor = cor de ATENÇÃO própria (≠ âmbar de "trabalhando",
+                    // ≠ vermelho de "morto"); o chip clicável abaixo carrega o estado + a saída.
+                    NodeStatus::Blocked => rgb(th.accent.primary),
                     NodeStatus::Crashed | NodeStatus::Dead => rgb(th.state.danger),
                     _ => rgb(th.accent.primary),
                 }
@@ -4202,19 +4226,65 @@ impl Render for WorkspaceView {
                         .min_w(px(0.0))
                         .truncate()
                         .child(text!(nv.name.clone())),
-                )
-                // Tela honesta (#22): estado em pt-br do leigo, a MESMA voz do leitor de tela —
-                // antes era o `Debug` cru do enum (`· Terminal · Busy`), jargão em inglês na tela.
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(rgb(th.text.muted))
-                        .child(text!(format!(
-                            "· {} · {}",
-                            node_kind_label(nv.kind),
-                            node_status_label(nv.status)
-                        ))),
                 );
+            // Tela honesta (#22/#21): estado em pt-br do leigo, a MESMA voz do leitor de tela —
+            // antes era o `Debug` cru do enum (`· Terminal · Busy`), jargão em inglês na tela.
+            // #21: a pausa do disjuntor é um chip CLICÁVEL na cor de atenção que dispara a
+            // liberação (gesto humano, igual ao `confirm_goal`); os demais estados ficam em texto
+            // fosco. `node_status_label` = `aggregate_badge(..).label()` — UI e a11y, MESMA palavra.
+            if matches!(nv.status, NodeStatus::Blocked) {
+                title = title
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(th.text.muted))
+                            .child(text!(format!("· {} ·", node_kind_label(nv.kind)))),
+                    )
+                    .child(
+                        div()
+                            .id(("card-breaker", card_eid))
+                            .flex_shrink_0()
+                            .px_2()
+                            .rounded_md()
+                            .bg(rgb(th.accent.primary))
+                            .text_color(rgb(th.text.on_accent))
+                            .text_size(px(f32::from(th.typography.size.caption) * z))
+                            .cursor_pointer()
+                            // A11y: o gesto de liberação anuncia o estado + a saída.
+                            .aria_label(CIRCUIT_BREAKER_LABEL)
+                            .on_click(cx.listener(move |view, _ev: &ClickEvent, window, cx| {
+                                view.release_breaker(node_id, window, cx);
+                            }))
+                            .child(text!(CIRCUIT_BREAKER_LABEL)),
+                    );
+            } else {
+                title = title.child(div().flex_shrink_0().text_color(rgb(th.text.muted)).child(
+                    text!(format!(
+                        "· {} · {}",
+                        node_kind_label(nv.kind),
+                        node_status_label(nv.status)
+                    )),
+                ));
+            }
+            // F3-0-6: pílula modelo·effort no HEADER — com que MOTOR (e quanto cuidado) este
+            // terminal pensa, num relance (antes só no painel). Chip neutro (não compete com a cor
+            // SEMÂNTICA do estado); a chave do mapa é `NodeId.to_string()` e só nós com
+            // `EffortAssigned` (terminais) aparecem — nota/pasta caem fora naturalmente. A11y leva a
+            // frase rica (nível + porquê + origem + modelo).
+            if let Some(badge) = effort_by_node.get(&node_id.to_string()) {
+                title = title.child(
+                    div()
+                        .id(("card-effort", card_eid))
+                        .flex_shrink_0()
+                        .px_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised))
+                        .text_size(px(f32::from(th.typography.size.caption) * z))
+                        .text_color(rgb(th.text.secondary))
+                        .aria_label(badge.a11y_label())
+                        .child(text!(badge.surface_text())),
+                );
+            }
             // P0 (F2-2-2 / ADR 0028 — prioridade soberana da r6): o estado MAIS crítico do produto —
             // "precisa de você" (gate de custódia humano pendente) — ganha VOZ SEM FOCO via `Badge`
             // Danger (vermelho + "precisa de você"), que compõe o live-region. Os dot/borda vermelhos
@@ -5914,6 +5984,14 @@ fn node_kind_label(kind: NodeKind) -> &'static str {
 /// card renderiza (zero jargão de `DeliveredNoProgress`/`AttentionKind` na superfície).
 const DELIVERY_STALLED_BADGE: &str = "recebeu, ainda não começou";
 
+/// #21 — copy do disjuntor (circuit breaker): o estado MAIS crítico do produto aparecia como
+/// âmbar "trabalhando" (o fundador concluiu "já terminou" e perdeu um worker). A frase carrega o
+/// ESTADO ("pausado por segurança") + a SAÍDA de 1 clique ("liberar") no MESMO texto. Fonte única:
+/// o card a renderiza no chip clicável; a `canvas::aggregate_badge` (a11y/header) lê ESTA const;
+/// o gate `honest_state_tests` a assere (zero jargão, estado + saída). `pub(crate)` porque o
+/// `canvas` a consome como a voz do leitor de tela.
+pub(crate) const CIRCUIT_BREAKER_LABEL: &str = "pausado por segurança — clique para liberar";
+
 #[cfg(test)]
 mod ime_tests {
     use super::*;
@@ -6193,6 +6271,9 @@ mod honest_state_tests {
             NodeStatus::Idle,
             NodeStatus::Busy,
             NodeStatus::Running,
+            // #21: o estado novo também fala pt-br sem jargão ("pausado por segurança…", nunca
+            // "blocked"/"circuit"/"breaker" — proibidos no STATE_JARGON).
+            NodeStatus::Blocked,
             NodeStatus::Crashed,
             NodeStatus::Dead,
         ] {
@@ -6242,12 +6323,6 @@ mod honest_state_tests {
             }
         }
     }
-
-    /// Copy do disjuntor (#21) — DECIDIDA e guardada aqui à espera do sinal que a dispara: a
-    /// projeção do `Blocked{circuit_breaker}` que hoje o `bridge.rs` colapsa em Busy (fronteira do
-    /// B/W1) + um verbo de liberação no core. `DELIVERY_STALLED_BADGE` (#22) já é produção (o card
-    /// o consome). Manter ESTA em `#[cfg(test)]` evita dead-code antes de o consumidor existir.
-    const CIRCUIT_BREAKER_LABEL: &str = "pausado por segurança — clique para liberar";
 
     /// Os textos dos estados NOVOS (#22 "recebeu, não começou" · #21 disjuntor) são humanos,
     /// sem jargão, e carregam o caminho de recuperação onde se aplica.
