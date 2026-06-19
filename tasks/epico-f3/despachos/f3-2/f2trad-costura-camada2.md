@@ -1,11 +1,18 @@
-# F2TRAD · Camada 2 — costura da skill `lina-translator` (precisa de aval do Maestro)
+# F2TRAD · Camada 2 — costura da skill `lina-translator`
 
-A **Camada 1** (papel TRADUTOR no registry + `entry_origin` de degradação + testes) está
-ENTREGUE e VERDE na minha fronteira (`crates/lina-role-discovery/`). Esta Camada 2 instala a
+> ✅ **APLICADO E VALIDADO** (Maestro autorizou; Terminal I confirmou zero colisão).
+> Resultado: `test -p lina-role-discovery` = 19 passed · `test -p lina-bootstrap` = exit 0
+> (`catalog_matches_assets_dir`, `installs_all_skills_with_references` (12), `descriptions_fit_codex`
+> (896B), `role_skill_promises` todos ok; lib 59) · `clippy -D` = 0 · `fmt --check` = 0.
+> Pontos finais: skill em `assets/lina-skills/lina-translator/SKILL.md`; catálogo `skills.rs:58`;
+> contadores `skills.rs:175` + `lib.rs:1299` = 12; TRADUTOR `skills:[lina-translator, lina-orchestration]`.
+> Workers não commitam — pronto para o gate de onda do Maestro.
+
+A **Camada 1** (papel TRADUTOR no registry + `entry_origin` de degradação + testes) ficou
+ENTREGUE e VERDE na fronteira `crates/lina-role-discovery/`. Esta Camada 2 instalou a
 **doutrina própria** do Tradutor e cruza `crates/lina-bootstrap/` — que inclui `src/lib.rs`
-(costura de dono único) e tem o **Terminal I** ativo (`bin/lina.rs`, `briefing.rs`). Por isso
-**não costuro unilateralmente**: segue o diff exato para aplicar numa fatia só (árvore nunca
-fica vermelha entre passos — aplique todos os 4 pontos juntos).
+(costura de dono único). O Terminal I confirmou não tocar `skills.rs`/`lib.rs`/`assets/`, então a
+costura abaixo foi aplicada sem colisão. Diff aplicado (4 pontos, atômico):
 
 ## Diff (4 pontos, atômico)
 
