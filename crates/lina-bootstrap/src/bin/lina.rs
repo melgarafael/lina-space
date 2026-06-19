@@ -21,9 +21,9 @@ use lina_bootstrap::{
 use lina_core::history::{self, ExportFormat, HistoryLimits, HistoryPage, SearchPage};
 use lina_core::scrollback::ScrollbackStore;
 use lina_core::{
-    check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, CheckKind,
-    DomainEvent, EventStore, Goal, GoalPhase, HandoffContract, MailMessage, Mailbox, NodeId,
-    ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
+    check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, AgentPresence,
+    CheckKind, DomainEvent, EventStore, Goal, GoalPhase, HandoffContract, MailMessage, Mailbox,
+    NodeId, ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -496,97 +496,162 @@ fn run_handoff(args: &[String]) -> ExitCode {
     enqueue_and_report(&from, msg)
 }
 
+/// Normaliza um NOME para comparar entre superfícies (roster vs log): apara, tira o sigil `@` e a
+/// caixa. Espelho ÚNICO usado por `check`/`list` (#4/#14/#23c) — para o mesmo nome casar em todas.
+fn norm_name(s: &str) -> String {
+    s.trim().trim_start_matches('@').trim().to_ascii_lowercase()
+}
+
+/// **Definição ÚNICA de MORTE** de um nó (#4/#14/#23c): foi REMOVIDO (`NodeRemoved`) ou seu último
+/// status é `Dead` (de `NodeStatusChanged(Dead)` OU `TerminalExited`). Centralizá-la impede que duas
+/// superfícies (`check` vs `list`) divirjam — a raiz do #23c. Todas as projeções abaixo a chamam.
+fn node_is_dead(
+    node: &str,
+    last_status: &std::collections::HashMap<String, String>,
+    removed: &std::collections::HashSet<String>,
+) -> bool {
+    removed.contains(node) || last_status.get(node).map(String::as_str) == Some("Dead")
+}
+
+/// Projeção do lifecycle por-nó a partir do espelho `log.jsonl` (UMA passada, tolerante a linha
+/// parcial — o arquivo está sob append). Centraliza a resolução "vivo-vence-morto" que `lina check`
+/// e `lina list` compartilham, para não haver duas leituras divergentes do mesmo nome (#23c).
+struct LifecycleProjection {
+    /// (node → nome atual), em ordem de RECÊNCIA do último batismo (`NodeRenamed`).
+    names: Vec<(String, String)>,
+    /// Último SINAL DE VIDA por nó: `NodeStatusChanged.status`, `TerminalSpawned`→"Running",
+    /// `TerminalExited`→"Dead". Carrega aliveness + morte; o status RICO p/ exibição sai de `status_for`.
+    last_status: std::collections::HashMap<String, String>,
+    /// Nós com `NodeRemoved`.
+    removed: std::collections::HashSet<String>,
+}
+
+impl LifecycleProjection {
+    /// Varre o log UMA vez (espelha a projeção do core em `events.rs`). #4/#14/#23c: a morte conta por
+    /// qualquer um dos três sinais — antes só `NodeStatusChanged(Dead)` era lido e um nó que SAIU com
+    /// último status "Idle" parecia vivo.
+    fn from_log(content: &str) -> Self {
+        use std::collections::{HashMap, HashSet};
+        let mut names: Vec<(String, String)> = Vec::new();
+        let mut last_status: HashMap<String, String> = HashMap::new();
+        let mut removed: HashSet<String> = HashSet::new();
+        for line in content.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let p = &v["payload"];
+            let node = p["node"].as_str();
+            match v["kind"].as_str().unwrap_or_default() {
+                "NodeRenamed" => {
+                    if let (Some(node), Some(name)) = (node, p["name"].as_str()) {
+                        names.retain(|(n, _)| n != node);
+                        names.push((node.to_string(), name.to_string()));
+                    }
+                }
+                "NodeStatusChanged" => {
+                    if let (Some(node), Some(st)) = (node, p["status"].as_str()) {
+                        last_status.insert(node.to_string(), st.to_string());
+                    }
+                }
+                "TerminalSpawned" => {
+                    if let Some(node) = node {
+                        last_status.insert(node.to_string(), "Running".to_string());
+                    }
+                }
+                "TerminalExited" => {
+                    if let Some(node) = node {
+                        last_status.insert(node.to_string(), "Dead".to_string());
+                    }
+                }
+                "NodeRemoved" => {
+                    if let Some(node) = node {
+                        removed.insert(node.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            names,
+            last_status,
+            removed,
+        }
+    }
+
+    /// Prioridade do homônimo (maior vence; empate → batismo mais recente, i.e. maior índice):
+    /// 2 = VIVO com status provado; 1 = sem sinal (não vence o vivo provado, mas vence um morto);
+    /// 0 = MORTO. "status ausente não é vivo por default quando há homônimo com status" (#4/#14).
+    fn priority(&self, node: &str) -> u8 {
+        if node_is_dead(node, &self.last_status, &self.removed) {
+            0
+        } else if self.last_status.contains_key(node) {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// O node-id (string crua do log) cujo nome ATUAL casa `target`, escolhendo o VIVO mais
+    /// recentemente batizado; sem vivo, o último batizado (exibe o morto, honesto). `None` se o
+    /// nome é vazio/ausente. Tolerante a `@`/caixa (espelho do roster vivo).
+    fn resolve(&self, target: &str) -> Option<&str> {
+        let want = norm_name(target);
+        if want.is_empty() {
+            return None;
+        }
+        self.names
+            .iter()
+            .filter(|(_, name)| norm_name(name) == want)
+            .map(|(node, _)| node.as_str())
+            .enumerate()
+            .max_by_key(|&(idx, node)| (self.priority(node), idx))
+            .map(|(_, node)| node)
+    }
+
+    /// Status RICO do nó VIVO de `target`, p/ reconciliar o `lina list` com o `lina check` (#23c).
+    /// Morto → "Dead" (honesto). "Running" (só a semente do spawn, sem `NodeStatusChanged`) e nome
+    /// ausente → `None`: não há status assentado a sobrescrever (o `agents.json` do supervisor manda).
+    fn status_for(&self, target: &str) -> Option<String> {
+        let node = self.resolve(target)?;
+        if node_is_dead(node, &self.last_status, &self.removed) {
+            return Some("Dead".to_string());
+        }
+        match self.last_status.get(node).map(String::as_str) {
+            None | Some("Running") => None,
+            Some(s) => Some(s.to_string()),
+        }
+    }
+}
+
 /// **F1-0-6 — `lina check @<alvo>`**: estado VIVO do colega pela PROJEÇÃO do lifecycle
 /// (F1-0-3/ADR 0019 §5: o veredito vem do log, nunca de view cacheada) + última
 /// atividade A2A. **Leitura PURA** de `agents.json` + `log.jsonl` — não injeta NADA no
 /// terminal do colega (espiar ≠ interromper; é o anti-"cutucar pra ver se está vivo").
 /// **PURO (r4 achado #13; r-confiab #4/#14/#23c) — resolve um NOME para o node-id CERTO do log.**
 /// Nome reusado entre sessões gera homônimos: o `check` apontava o lifecycle MORTO da sessão antiga.
-/// Semântica: o nome ATUAL de um nó é o seu ÚLTIMO `NodeRenamed`; entre os nós cujo nome atual casa
-/// com `target` (tolerante a `@`/caixa — espelho do `normalize_name` do roster vivo), vence o
-/// **vivo** mais recentemente batizado; sem vivo, o último batizado (exibe o morto, honesto).
-/// MORTE = `NodeStatusChanged(Dead)` OU `TerminalExited` OU `NodeRemoved` (não só o 1º — senão um nó
-/// que saiu com último status "Idle" parecia vivo). Tolera linhas parciais/inválidas (arquivo sob
-/// append).
+/// Wrapper fino sobre [`LifecycleProjection`] (a MESMA resolução que o `lina list` agora reusa).
 fn resolve_check_node(content: &str, target: &str) -> Option<String> {
-    fn norm(s: &str) -> String {
-        s.trim().trim_start_matches('@').trim().to_ascii_lowercase()
-    }
-    let want = norm(target);
-    if want.is_empty() {
-        return None;
-    }
-    // (node → nome atual), mantido em ordem de RECÊNCIA do último batismo.
-    let mut names: Vec<(String, String)> = Vec::new();
-    // Último SINAL DE VIDA por nó (último vence), espelhando a projeção do core (`events.rs`):
-    // `NodeStatusChanged` e `TerminalSpawned`("Running") dão status; `TerminalExited`("Dead") e
-    // `NodeRemoved` são MORTE. #4/#14/#23c: antes só `NodeStatusChanged` era lido — um nó que SAIU
-    // por `TerminalExited`/`NodeRemoved` com último status "Idle" parecia VIVO, e o `check` apontava
-    // o lifecycle da sessão ANTIGA. Agora a morte conta por qualquer um dos três sinais.
-    let mut last_status: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for line in content.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let p = &v["payload"];
-        let node = p["node"].as_str();
-        match v["kind"].as_str().unwrap_or_default() {
-            "NodeRenamed" => {
-                if let (Some(node), Some(name)) = (node, p["name"].as_str()) {
-                    names.retain(|(n, _)| n != node);
-                    names.push((node.to_string(), name.to_string()));
-                }
+    LifecycleProjection::from_log(content)
+        .resolve(target)
+        .map(str::to_string)
+}
+
+/// **#23c** — reconcilia o status do roster (`agents.json`, escrito pelo supervisor) contra o nó VIVO
+/// do log. Em homônimo morto+vivo, o `agents.json` pode carimbar o status do MORTO; o log (fonte da
+/// verdade, ADR 0019 §5) tem o do vivo — então `lina list` passava a MENTIR vs `lina check`, e o
+/// Maestro re-despachava quem estava trabalhando. PURO/testável. Nome sem status assentado no log →
+/// mantém o `agents.json` (o supervisor é a autoridade de MEMBRESIA; não inventamos morte aqui).
+fn reconcile_roster_status(agents: Vec<AgentPresence>, content: &str) -> Vec<AgentPresence> {
+    let proj = LifecycleProjection::from_log(content);
+    agents
+        .into_iter()
+        .map(|mut a| {
+            if let Some(live) = proj.status_for(&a.name) {
+                a.status = live;
             }
-            "NodeStatusChanged" => {
-                if let (Some(node), Some(st)) = (node, p["status"].as_str()) {
-                    last_status.insert(node.to_string(), st.to_string());
-                }
-            }
-            "TerminalSpawned" => {
-                if let Some(node) = node {
-                    last_status.insert(node.to_string(), "Running".to_string());
-                }
-            }
-            "TerminalExited" => {
-                if let Some(node) = node {
-                    last_status.insert(node.to_string(), "Dead".to_string());
-                }
-            }
-            "NodeRemoved" => {
-                if let Some(node) = node {
-                    removed.insert(node.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    let candidates: Vec<&str> = names
-        .iter()
-        .filter(|(_, name)| norm(name) == want)
-        .map(|(node, _)| node.as_str())
-        .collect();
-    // Prioridade de seleção (maior vence; empate → batismo mais recente, i.e. maior índice):
-    //   2 = VIVO com status conhecido não-morto;  1 = sem sinal (desconhecido — não vence um vivo
-    //   provado, mas vence um morto);  0 = MORTO (status Dead, `TerminalExited` ou `NodeRemoved`).
-    // "status ausente não é vivo por default quando há homônimo com status" (#4/#14): tier 1 < 2.
-    // Todos mortos → o de maior índice (último batizado) — exibe o morto, honesto.
-    let priority = |node: &str| -> u8 {
-        if removed.contains(node) || last_status.get(node).map(String::as_str) == Some("Dead") {
-            0
-        } else if last_status.contains_key(node) {
-            2
-        } else {
-            1
-        }
-    };
-    candidates
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by_key(|&(idx, node)| (priority(node), idx))
-        .map(|(_, node)| node.to_string())
+            a
+        })
+        .collect()
 }
 
 // ───────────────── #15 (achado dogfooding): `lina history` — o Maestro vê a tela do colega ─────────────────
@@ -602,6 +667,20 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// **#27 (dogfood 2026-06-19)** — parser TOLERANTE do `LINA_NODE_ID`. O app carimba o env como
+/// `n-<uuid>` (ADR 0026; `format!("n-{uuid}")` em `workspace.rs`/`bridge.rs`), mas `NodeId` é um
+/// `Uuid` e seu `FromStr` não aceita o prefixo `n-` → `lina history` morria com "invalido" no
+/// caminho REAL do spawn, deixando o Maestro cego (o verbo #15 que a F3-2 entregou). Aceita o uuid
+/// puro E o `n-<uuid>`: o `n-` é só o ENVELOPE do app (e `n` não é dígito hex, então nunca colide com
+/// um uuid válido). **NÃO relaxa a segurança** — o conteúdo após o prefixo ainda precisa ser um uuid
+/// válido; lixo (`n-banana`, `""`) é rejeitado. A AUTORIDADE segue sendo o env do app, não uma flag.
+fn parse_node_id_lenient(raw: &str) -> Result<NodeId, String> {
+    let trimmed = raw.trim();
+    let core = trimmed.strip_prefix("n-").unwrap_or(trimmed);
+    core.parse::<NodeId>()
+        .map_err(|_| format!("{NODE_ID_ENV} invalido: {raw:?}"))
+}
+
 /// Identidade do LEITOR, do env injetado pelo app (ADR 0026 — autoridade do app, JAMAIS de flag/
 /// arquivo de agente: campo de agente não decide autorização). Sem ele não há como provar quem lê →
 /// a leitura cross é negada (fail-safe — nunca espia às cegas).
@@ -609,9 +688,7 @@ fn reader_node_id() -> Result<NodeId, String> {
     let raw = std::env::var(NODE_ID_ENV).map_err(|_| {
         format!("{NODE_ID_ENV} ausente — nao sei quem e este terminal (rode dentro do Espaco).")
     })?;
-    raw.trim()
-        .parse::<NodeId>()
-        .map_err(|_| format!("{NODE_ID_ENV} invalido: {raw:?}"))
+    parse_node_id_lenient(&raw)
 }
 
 /// NodeIds VIVOS do Espaço — os MEMBROS da fronteira de pertencimento (ADR 0006). Projeção do log
@@ -656,7 +733,7 @@ fn live_member_ids(content: &str) -> Vec<NodeId> {
         }
     }
     seen.into_iter()
-        .filter(|n| !removed.contains(n) && last_status.get(n).map(String::as_str) != Some("Dead"))
+        .filter(|n| !node_is_dead(n, &last_status, &removed))
         .filter_map(|n| n.parse::<NodeId>().ok())
         .collect()
 }
@@ -3169,6 +3246,11 @@ fn run_list(json: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // #23c: reconcilia o status contra o nó VIVO do log (fonte da verdade) — em homônimo morto+vivo o
+    // `agents.json` pode trazer o status do morto, e `lina list` mentiria vs `lina check`. Log
+    // ausente/ilegível → vazio → mantém o `agents.json` (degrada ao comportamento de hoje, sem panic).
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let agents = reconcile_roster_status(agents, &content);
     if json {
         match serde_json::to_string_pretty(&agents) {
             Ok(s) => {
@@ -3352,12 +3434,135 @@ fn vault_read(nota: Option<&str>) -> ExitCode {
     }
 }
 
-/// Teto de resultados do `search` — evita varredura sem fim e flood na saída do agente.
+/// Teto de RESULTADOS do `search` — evita flood na saída do agente.
 const VAULT_SEARCH_MAX_HITS: usize = 40;
+/// Teto de TEMPO wall-clock do `search`. Sem ele, a varredura recursiva síncrona PENDURAVA em vault
+/// grande (#21/#21c: 50min57s, 0 bytes, processo vivo até kill manual). Ao estourar → saída PARCIAL
+/// honesta + dica do índice determinístico, com exit 0 (nunca pendura).
+const VAULT_SEARCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+/// Teto de ARQUIVOS `.md` visitados — defesa em profundidade DETERMINÍSTICA (mais estável no CI que o
+/// relógio): mesmo dentro do tempo, um vault gigante não floda nem trava. Calibrado ACIMA do vault
+/// real do fundador (~2724 notas `.md` medidas — buscas legítimas varrem inteiro) e ABAIXO do repro
+/// sintético do QA (5000 notas minúsculas, que varrem em <1s e não acionariam o teto de TEMPO). O
+/// deadline acima continua sendo a proteção PRIMÁRIA do hang real (#21 foi por tempo: 50min).
+const VAULT_SEARCH_MAX_FILES: usize = 4000;
+
+/// Por que a varredura do `vault search` parou — decide a mensagem final honesta.
+enum SearchStop {
+    /// Varreu o vault inteiro (vault pequeno: resultados COMPLETOS, comportamento de sempre).
+    Exhausted,
+    /// Bateu o teto de RESULTADOS (`max_hits`).
+    Hits,
+    /// Estourou o teto de TEMPO wall-clock.
+    Time,
+    /// Estourou o teto de ARQUIVOS visitados.
+    Files,
+}
+
+/// Núcleo do `vault search` — PARAMETRIZADO (deadline/tetos/saída) para a propriedade "nunca pendura"
+/// (#21/#21c) ser testável em ms, sem esperar o relógio real. Faz **flush por hit** (streaming: o
+/// agente vê cada resultado na hora, em vez de minutos de silêncio) e PARA no 1º de {resultados,
+/// tempo, arquivos}, com saída PARCIAL honesta. Escreve TUDO (hits + mensagem final) em `out`.
+fn vault_search_into(
+    vaults: &[VaultLinkJson],
+    termo: &str,
+    deadline: std::time::Duration,
+    max_files: usize,
+    max_hits: usize,
+    out: &mut impl std::io::Write,
+) -> SearchStop {
+    let start = std::time::Instant::now();
+    let needle = termo.to_lowercase();
+    let mut hits = 0usize;
+    let mut files = 0usize;
+    let stop = 'scan: {
+        for v in vaults {
+            let root = PathBuf::from(&v.path);
+            let mut stack = vec![root.clone()];
+            while let Some(dir) = stack.pop() {
+                if start.elapsed() >= deadline {
+                    break 'scan SearchStop::Time;
+                }
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in rd.flatten() {
+                    if hits >= max_hits {
+                        break 'scan SearchStop::Hits;
+                    }
+                    if start.elapsed() >= deadline {
+                        break 'scan SearchStop::Time;
+                    }
+                    let p = entry.path();
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if p.is_dir() {
+                        if !name.starts_with('.') && name != ".trash" {
+                            stack.push(p);
+                        }
+                    } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                        files += 1;
+                        if files > max_files {
+                            break 'scan SearchStop::Files;
+                        }
+                        let Ok(content) = std::fs::read_to_string(&p) else {
+                            continue;
+                        };
+                        let rel = p
+                            .strip_prefix(&root)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        for (n, line) in content.lines().enumerate() {
+                            if line.to_lowercase().contains(&needle) {
+                                let _ = writeln!(out, "{rel}:{}: {}", n + 1, line.trim());
+                                let _ = out.flush(); // streaming por hit (#21): nada de silêncio longo
+                                hits += 1;
+                                if hits >= max_hits {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SearchStop::Exhausted
+    };
+    // Mensagem final HONESTA: diz exatamente onde parou (o chamador devolve exit 0 sempre).
+    match stop {
+        SearchStop::Hits => {
+            let _ = writeln!(out, "… (parei em {max_hits} resultados — refine o termo)");
+        }
+        SearchStop::Time => {
+            let _ = writeln!(
+                out,
+                "… parei após {}s e {files} arquivo(s) — busca grande demais. Refine o termo ou use `lina vault index` (mapa determinístico, instantâneo).",
+                deadline.as_secs().max(1)
+            );
+        }
+        SearchStop::Files => {
+            let _ = writeln!(
+                out,
+                "… parei em {max_files} arquivos — vault grande demais. Refine o termo ou use `lina vault index` (mapa determinístico, instantâneo)."
+            );
+        }
+        SearchStop::Exhausted if hits == 0 => {
+            let _ = writeln!(
+                out,
+                "(sem resultados para \"{termo}\" — tente `lina vault index` para ver a estrutura)"
+            );
+        }
+        SearchStop::Exhausted => {}
+    }
+    let _ = out.flush();
+    stop
+}
 
 /// `lina vault search <termo>` — busca case-insensitive de uma substring no CONTEÚDO das notas `.md`
-/// (read-only, ignora `.obsidian/`/`.trash/`/ocultos). Para com teto de resultados. Para NAVEGAR a
-/// estrutura (mais barato que ler tudo) o agente deve preferir `lina vault index`.
+/// (read-only, ignora `.obsidian/`/`.trash/`/ocultos). NUNCA pendura: para no 1º de {resultados,
+/// tempo, arquivos} e faz flush por hit (#21). Para NAVEGAR a estrutura (mais barato que ler tudo) o
+/// agente deve preferir `lina vault index`.
 fn vault_search(termo: Option<&str>) -> ExitCode {
     let Some(termo) = termo.map(str::trim).filter(|t| !t.is_empty()) else {
         eprintln!("uso: lina vault search <termo>");
@@ -3370,60 +3575,52 @@ fn vault_search(termo: Option<&str>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let needle = termo.to_lowercase();
-    let mut hits = 0usize;
-    for v in &cfg.vaults {
-        let root = PathBuf::from(&v.path);
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                if hits >= VAULT_SEARCH_MAX_HITS {
-                    println!("… (parei em {VAULT_SEARCH_MAX_HITS} resultados — refine o termo)");
-                    return ExitCode::SUCCESS;
-                }
-                let p = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if p.is_dir() {
-                    if !name.starts_with('.') && name != ".trash" {
-                        stack.push(p);
-                    }
-                } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
-                    let Ok(content) = std::fs::read_to_string(&p) else {
-                        continue;
-                    };
-                    let rel = p
-                        .strip_prefix(&root)
-                        .unwrap_or(&p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    for (n, line) in content.lines().enumerate() {
-                        if line.to_lowercase().contains(&needle) {
-                            println!("{rel}:{}: {}", n + 1, line.trim());
-                            hits += 1;
-                            if hits >= VAULT_SEARCH_MAX_HITS {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if hits == 0 {
-        println!(
-            "(sem resultados para \"{termo}\" — tente `lina vault index` para ver a estrutura)"
-        );
-    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    vault_search_into(
+        &cfg.vaults,
+        termo,
+        VAULT_SEARCH_DEADLINE,
+        VAULT_SEARCH_MAX_FILES,
+        VAULT_SEARCH_MAX_HITS,
+        &mut out,
+    );
     ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    /// **#27 (dogfood 2026-06-19)** — o app carimba `LINA_NODE_ID` como `n-<uuid>` (ADR 0026); o
+    /// parser tem que aceitar ESSE formato E o uuid puro, mas seguir rejeitando lixo (a autoridade é
+    /// o env do app, não uma flag forjável). Antes, `lina history` morria com "invalido" no spawn
+    /// real e o Maestro ficava cego (o verbo #15 que a F3-2 entregou não funcionava na prática).
+    #[test]
+    fn node_id_parser_accepts_app_prefix_and_bare_uuid_rejects_garbage() {
+        let uuid = "019edde3-faa9-7c51-bd5a-9f53c18addc0";
+        let bare = parse_node_id_lenient(uuid).expect("uuid puro deve parsear");
+        let prefixed =
+            parse_node_id_lenient(&format!("n-{uuid}")).expect("n-<uuid> do spawn (ADR 0026)");
+        assert_eq!(
+            bare, prefixed,
+            "o envelope `n-` do app não muda a identidade"
+        );
+        assert_eq!(
+            prefixed.to_string(),
+            uuid,
+            "o NodeId é o UUID, sem o envelope"
+        );
+        assert!(
+            parse_node_id_lenient(&format!("  n-{uuid}  ")).is_ok(),
+            "tolera o whitespace que pode vir no env"
+        );
+        // Segurança (não relaxa): o conteúdo após o prefixo AINDA precisa ser um uuid válido.
+        assert!(parse_node_id_lenient("n-not-a-uuid").is_err());
+        assert!(parse_node_id_lenient("banana").is_err());
+        assert!(parse_node_id_lenient("n-").is_err());
+        assert!(parse_node_id_lenient("").is_err());
+    }
 
     /// **ADR 0026 (BUG-1) — resolução de nome:** env do spawn VENCE a ficha; env
     /// ausente/vazio/whitespace cai na ficha (controle). Remover a preferência de env
@@ -3609,6 +3806,103 @@ mod identity_tests {
 #[cfg(test)]
 mod vault_tests {
     use super::*;
+
+    /// Cria um vault temporário com `n` notas `.md`, cada uma com `needle` numa linha. Caminho único
+    /// por (pid, thread, n) — seguro sob execução paralela dos testes.
+    fn temp_vault_with(n: usize, needle: &str) -> (std::path::PathBuf, VaultLinkJson) {
+        let root = std::env::temp_dir().join(format!(
+            "lina-vaultsearch-{}-{:?}-{n}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir vault temp");
+        for i in 0..n {
+            std::fs::write(
+                root.join(format!("nota{i}.md")),
+                format!("linha solta\nfoo {needle} bar\n"),
+            )
+            .expect("write nota");
+        }
+        let link = VaultLinkJson {
+            name: "t".into(),
+            path: root.to_string_lossy().into_owned(),
+        };
+        (root, link)
+    }
+
+    /// Vault pequeno: resultados COMPLETOS, sem mensagem de corte — não regredir o caminho feliz (#21).
+    #[test]
+    fn search_small_vault_returns_all_hits() {
+        let (root, link) = temp_vault_with(3, "agulha");
+        let mut buf: Vec<u8> = Vec::new();
+        let stop = vault_search_into(
+            std::slice::from_ref(&link),
+            "agulha",
+            std::time::Duration::from_secs(60),
+            10_000,
+            40,
+            &mut buf,
+        );
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            matches!(stop, SearchStop::Exhausted),
+            "varreu o vault inteiro"
+        );
+        assert_eq!(out.matches("agulha").count(), 3, "um hit por nota");
+        assert!(!out.contains("parei"), "vault pequeno não corta");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **#21** — teto de TEMPO: deadline ZERO força parada imediata com saída parcial honesta. Prova a
+    /// propriedade "NUNCA pendura" em ms, sem esperar os 8s reais (o hang medido foi de ~51min).
+    #[test]
+    fn search_time_cap_never_hangs() {
+        let (root, link) = temp_vault_with(50, "agulha");
+        let mut buf: Vec<u8> = Vec::new();
+        let stop = vault_search_into(
+            std::slice::from_ref(&link),
+            "agulha",
+            std::time::Duration::ZERO,
+            10_000,
+            40,
+            &mut buf,
+        );
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(matches!(stop, SearchStop::Time), "parou pelo relógio");
+        assert!(
+            out.contains("parei após") && out.contains("vault index"),
+            "saída parcial honesta + dica do índice determinístico"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **#21** — teto de ARQUIVOS: para após `max_files`, ainda emitindo os hits já varridos (streaming)
+    /// + mensagem honesta. Deadline largo isola a causa da parada nos arquivos.
+    #[test]
+    fn search_file_cap_stops_with_partial_output() {
+        let (root, link) = temp_vault_with(10, "agulha");
+        let mut buf: Vec<u8> = Vec::new();
+        let stop = vault_search_into(
+            std::slice::from_ref(&link),
+            "agulha",
+            std::time::Duration::from_secs(60),
+            2,
+            40,
+            &mut buf,
+        );
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(matches!(stop, SearchStop::Files), "parou pelos arquivos");
+        assert!(
+            out.contains("parei em 2 arquivos"),
+            "mensagem honesta do teto de arquivos"
+        );
+        assert!(
+            out.contains("agulha"),
+            "os hits já varridos saíram (streaming) antes do corte"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// O `vault.json` que o app escreve (formato de `obsidian.rs::write_vault_config`) desserializa,
     /// expondo o `primary` e os caminhos — campos extras (`writable`) são ignorados sem quebrar.
@@ -3898,6 +4192,64 @@ mod check_resolution_tests {
             resolve_check_node(&dead_vs_unknown, "QA").as_deref(),
             Some("n-sem"),
             "desconhecido (não provado morto) vence o homônimo provado morto"
+        );
+    }
+
+    /// **#23c** — `lina list` mentia vs `lina check`: o `agents.json` (escrito pelo supervisor) podia
+    /// trazer o status do homônimo MORTO; a reconciliação contra o log passa a mostrar o do VIVO,
+    /// fechando a divergência que fazia o Maestro re-despachar quem estava trabalhando.
+    #[test]
+    fn list_status_reconciles_to_live_homonym() {
+        let log = [
+            rename("n-velho", "Terminal D"),
+            status("n-velho", "Idle"),
+            exited("n-velho"),
+            rename("n-novo", "@Terminal D"),
+            status("n-novo", "Busy"),
+        ]
+        .join("\n");
+        let roster = vec![AgentPresence {
+            name: "Terminal D".into(),
+            role: None,
+            status: "Idle".into(), // o agents.json carimbou o status do MORTO — a "mentira" do #23c
+        }];
+        let fixed = reconcile_roster_status(roster, &log);
+        assert_eq!(
+            fixed[0].status, "Busy",
+            "list passa a mostrar o nó VIVO, igual `lina check`"
+        );
+        // Paridade explícita com o check: ambos resolvem o mesmo nó vivo.
+        assert_eq!(
+            resolve_check_node(&log, "Terminal D").as_deref(),
+            Some("n-novo")
+        );
+    }
+
+    /// Bordas da reconciliação: nome ausente do log → mantém o `agents.json` (o supervisor é a
+    /// autoridade de MEMBRESIA, não inventamos morte); todos os homônimos mortos → "Dead" honesto.
+    #[test]
+    fn list_status_keeps_unknown_and_shows_dead_when_all_dead() {
+        let ghost = vec![AgentPresence {
+            name: "Fantasma".into(),
+            role: None,
+            status: "Idle".into(),
+        }];
+        assert_eq!(
+            reconcile_roster_status(ghost, "")[0].status,
+            "Idle",
+            "log vazio não inventa estado — preserva o agents.json"
+        );
+
+        let log = [rename("n1", "X"), status("n1", "Dead")].join("\n");
+        let dead = vec![AgentPresence {
+            name: "X".into(),
+            role: None,
+            status: "Busy".into(),
+        }];
+        assert_eq!(
+            reconcile_roster_status(dead, &log)[0].status,
+            "Dead",
+            "sem homônimo vivo → exibe o morto, honesto (= check)"
         );
     }
 }
