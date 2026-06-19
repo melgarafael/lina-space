@@ -139,9 +139,11 @@ A costura crítica é `router.rs` (OUTER loop) — **dono único = CORE (B/Ultra
 - **Revisão CEGA (revisor isolado): PASS, score 96, 0 ALTA.** Provou por mutação/caminho real: regra-mãe enforçada (`@Superuser` no `proposed_team` não vira autoridade; `by`/`reviewer` server-side; `ReviewVerdict{Pass}` não libera `GatedHard`); ZERO LLM no core (juiz = exit code); bug da chave `team`→`proposed_team` corrigido; `lina history` respeita pertencimento (ADR 0006).
 - **Commitado por fatia:** `24f6d90` F2CORE (loop) · `6cc3a3b` F2BRIEF (briefing + `lina history`/#15) · `0a803b0` F2TRAD (papel Tradutor) · `8abea53` F2UI (tela do loop) · `260aa8a` F2QA (segurança + adoção + repro residual).
 
-**DEFERIDO com mapa (3 fiações de "ativação" — porta aberta, fatia rápida de fechamento):**
-1. **Fiação do `entry_origin` ao core** — `handle_goal` (`router.rs:~2517`) ainda usa `msg.from` para o `origin`; trocar por `entry_origin(roster)` faz o `GoalDefined{origin:"@Tradutor"}` acontecer de fato (a função já está pronta e testada). É o que completa o gate (a). BAIXA.
-2. **Skill `lina-translator` (Camada 2 do Tradutor)** — redigida e validada (896B) em `tasks/epico-f3/despachos/f3-2/lina-translator.SKILL.md`; registrar no catálogo (`skills.rs` + contador `lib.rs`), diff em `f2trad-costura-camada2.md`.
-3. **Seção "Como vou fazer" (strategy) na tela** — exige `strategy:Option<String>` aditivo no struct `Goal` (com `#[derive(Default)]`/`..Default` p/ não quebrar literais) + braço em `project_goals`; consumidor de UI já pronto.
+**FIAÇÕES DE ATIVAÇÃO — FECHADAS ✅ (2026-06-18, pelo Maestro; gate verde + grep de fronteira):**
+1. **`entry_origin` fiado ao core** (`2b7f566`) — `handle_goal` carimba `origin` = canal de entrada (entry_origin do roster, SERVER-SIDE): @Tradutor se há um, senão @Maestro. Acopla `lina-core → lina-role-discovery` (leaf, sem ciclo). **Completa o gate (a).** 2 testes pelo caminho real (sem/com Tradutor).
+2. **Skill `lina-translator`** (`ada696c`) — registrada no catálogo embutido (`assets/lina-skills/lina-translator`, 896B ≤ limite Codex); contadores 11→12; skills do TRADUTOR `[lina-translator, lina-orchestration]`. Paridade catálogo×disco verde.
+3. **Seção "Como vou fazer" (strategy)** (`854eda2`) — `Goal.strategy: Option<String>` aditivo + projeção do `GoalInterpreted` + seção no card. 3º literal de Goal (`lina.rs`) pego no grep de fronteira (escapou ao inicial — lição: campo novo = fronteira maior que a declarada).
+
+**Gate das fiações:** lina-core 413 · lina-bootstrap · role-discovery · app — todos verdes; clippy `-D` 0; fmt 0. Restou só o gate (h) bloqueante: a tela do fundador (rebuild).
 
 **PENDENTE BLOQUEANTE (gate h, diferido ao fundador):** validação na TELA do cenário do loop (interpretação → confirmar/corrigir → progresso → escalada narrada) — junto com o gate g da confiabilidade, fecha no rebuild + olho do fundador. gpui não roda headless.
