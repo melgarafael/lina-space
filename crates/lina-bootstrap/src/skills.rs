@@ -1,6 +1,6 @@
 //! **F1-3 (ACHADO-1 do gate) — a safra COMPLETA de skills da Lina, embutida.**
 //!
-//! O instalador antigo levava SÓ `lina-agent-bus`: as 11 skills da F1-3 (orquestração,
+//! O instalador antigo levava SÓ `lina-agent-bus`: as 12 skills (11 da F1-3 + lina-translator da F3-2: orquestração,
 //! cold-review, dispatch, spawn, retro, verification + as 4 doutrinas transversais) NÃO
 //! chegavam ao terminal — o cenário do gate só funcionou porque o Maestro copiou na mão.
 //! Princípio-base (Lina universal): TODAS as capacidades acessíveis em tudo; o ENFORCEMENT
@@ -54,6 +54,8 @@ pub const LINA_SKILLS: &[EmbeddedSkill] = &[
     ),
     embed!("lina-retro", ["SKILL.md"]),
     embed!("lina-spawn-terminal", ["SKILL.md"]),
+    // F3-2-1: a doutrina da porta de entrada (Tradutor). Ordem alfabética.
+    embed!("lina-translator", ["SKILL.md"]),
     embed!("lina-verification", ["SKILL.md"]),
 ];
 
@@ -161,13 +163,17 @@ mod tests {
         }
     }
 
-    /// O instalador cria as 11 skills (+`references/`) sob o root dado.
+    /// O instalador cria as 12 skills (+`references/`) sob o root dado.
     #[test]
     fn installs_all_skills_with_references() {
         let root = std::env::temp_dir().join(format!("lina-skills-all-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dirs = install_skills_into(&root).expect("instala");
-        assert_eq!(dirs.len(), 11, "as 11 skills da 1ª safra");
+        assert_eq!(
+            dirs.len(),
+            12,
+            "as 12 skills (11 da F1-3 + lina-translator da F3-2)"
+        );
         for skill in LINA_SKILLS {
             assert!(
                 root.join(skill.name).join("SKILL.md").is_file(),

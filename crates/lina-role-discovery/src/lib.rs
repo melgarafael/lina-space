@@ -715,7 +715,7 @@ mod tests {
         ] {
             let a = infer(name);
             assert_eq!(a.role, "TRADUTOR", "{name:?} deve ser TRADUTOR");
-            assert_eq!(a.skills, vec!["lina-orchestration"]);
+            assert_eq!(a.skills, vec!["lina-translator", "lina-orchestration"]);
             assert!(
                 !a.needs_confirmation,
                 "{name:?}: papel declarado é confiável"

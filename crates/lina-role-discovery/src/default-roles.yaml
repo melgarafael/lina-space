@@ -89,4 +89,5 @@ roles:
     # seu keyword primeiro ("backend interprete" -> BACKEND, nao TRADUTOR), e so um nome SEM
     # nenhum sinal especifico cai aqui. E o catch-all de interpretacao, acima do fallback.
     patterns: [tradutor, translator, interprete, interpreter]
-    skills: [lina-orchestration]
+    # F3-2 Camada 2: a doutrina da porta de entrada vem PRIMEIRO; orquestração como apoio.
+    skills: [lina-translator, lina-orchestration]
