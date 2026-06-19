@@ -2514,12 +2514,14 @@ impl Router {
                     .get("budget_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                // `origin` é PROVENIÊNCIA (rótulo), não credencial — o nome de quem pediu.
-                let origin = if msg.from.is_empty() {
-                    "human".to_string()
-                } else {
-                    msg.from.clone()
-                };
+                // `origin` é PROVENIÊNCIA = o CANAL de entrada do Espaço (não quem enviou — isso é o
+                // `by`/root): @Tradutor se há um Tradutor no roster (a porta do leigo), senão @Maestro.
+                // Rótulo, JAMAIS credencial. Carimbado SERVER-SIDE (do roster projetado), nunca do payload.
+                let roles: Vec<String> = store
+                    .project()
+                    .map(|p| p.nodes.values().filter_map(|n| n.role.clone()).collect())
+                    .unwrap_or_default();
+                let origin = lina_role_discovery::entry_origin(&roles).to_string();
                 let goal_event = DomainEvent::GoalDefined {
                     goal_id: goal_id.clone(),
                     statement,
@@ -7476,6 +7478,56 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert_eq!(field(defs[0], "statement"), Some("criar landing"));
         assert_eq!(field(defs[0], "goal_id"), Some(goal_id.as_str()));
+        // F3-2-1: `origin` é o CANAL de entrada carimbado server-side (do roster), não o sender.
+        // Sem Tradutor no roster → @Maestro (a porta padrão).
+        assert_eq!(
+            field(defs[0], "origin"),
+            Some("@Maestro"),
+            "sem Tradutor no roster, o canal de entrada é o Maestro"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3-2-1 (fiação `entry_origin`): com um Tradutor no roster, a Goal nasce com `origin:"@Tradutor"`
+    /// — o canal de entrada do leigo, carimbado SERVER-SIDE pela projeção do roster (não pelo payload).
+    #[test]
+    fn handle_goal_define_carimba_origin_tradutor_quando_ha_tradutor_no_roster() {
+        let (mut router, sup, dir) = router_with("goal-trad");
+        let _u = sup.register("@User", None, sink());
+        let mut ts = TmpStore::new("goal-trad");
+        // Setup: um nó com papel TRADUTOR no roster projetado (estado pré-existente do Espaço).
+        let trad = NodeId::from_u128(0x5452_4144);
+        ts.store
+            .append(&DomainEvent::NodeAdded {
+                node: trad,
+                kind: "terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::NodeRoleAssigned {
+                node: trad,
+                role: "TRADUTOR".into(),
+            })
+            .unwrap();
+        let (_rec, mut deliver) = recorder();
+        let msg = MailMessage::new(
+            "@User",
+            "goal",
+            "goal.define",
+            r#"{"statement":"criar landing"}"#,
+        );
+        router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+        let events = ts.store.events().unwrap();
+        let defs = recs_of(&events, "GoalDefined");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            field(defs[0], "origin"),
+            Some("@Tradutor"),
+            "com Tradutor no roster, o canal de entrada da Goal é o Tradutor"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

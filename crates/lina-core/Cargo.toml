@@ -8,6 +8,9 @@ publish = false
 lina-pty = { path = "../lina-pty" }
 lina-vt = { path = "../lina-vt" }
 lina-host = { path = "../lina-host" }
+# F3-2-1: proveniência do canal de entrada da Goal — `entry_origin` carimba @Tradutor (se há um no
+# roster) senão @Maestro. role-discovery é leaf (não depende de lina-core): sem ciclo de crate.
+lina-role-discovery = { path = "../lina-role-discovery" }
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

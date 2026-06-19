@@ -3349,6 +3349,7 @@ dependencies = [
  "lina-cli-profiles",
  "lina-host",
  "lina-pty",
+ "lina-role-discovery",
  "lina-secrets",
  "lina-vt",
  "regex",
