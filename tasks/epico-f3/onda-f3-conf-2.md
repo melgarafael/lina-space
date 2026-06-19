@@ -67,3 +67,21 @@ A F3 é o salto de **orquestração-por-skill** para **orquestração-como-mecan
 - **Candidata oportunista (se folga):** #17b residual (roster/vault/plano ainda do bootstrap.json por-cwd — já env-first p/ nome).
 - **Deferida com porta:** validação na tela do fundador (gate g) + Modo C repro determinístico do pump (toca agendamento do pump = CORE, encaixe se B tiver folga).
 - **Fora do escopo:** #25 ENOSPC → F3-5-8; F3-3 Mentality → próxima rodada (sobre esta fundação).
+
+---
+
+## STATUS DA EXECUÇÃO — F3-CONF-2 FECHADA EM CÓDIGO (2026-06-19)
+
+**Gate de código FECHADO ✅ + Gate de onda PASS (2 revisores CEGOS, lentes diversas):**
+- **Validação final consolidada (de fora, HEAD limpo `1b4042b`):** workspace `cargo test` 82 suites ok; app 554/0; `clippy --all-targets -D warnings` 0 (workspace + app); `fmt --all --check` 0 (workspace + app).
+- **Cold-review:** SEGURANÇA **PASS 92, 0 ALTA** (regra-mãe ADR 0007 enforced e provada por mutação nos 5 pontos: agente não forja `GoalEscalated`, não reseta o próprio breaker, re-despacho não escala effort, `node` é DADO, `set_status` não confia em campo de agente). QUALIDADE/FREEZE **PASS 96** (caminho quente do pump é delta-O(1), scan O(N) só sob engolimento — freeze evitado e provado; UI honesta sem jargão da mesma fonte da a11y; zero `unwrap` de produção/erro engolido).
+- **Achados BAIXA do gate, FECHADOS:** comentário impreciso de `release_breaker` (corrigido, `…`); teste POSITIVO do disarm (`gate_a_discriminador_progresso_real…` por R — fecha o falso-positivo de interromper trabalho legítimo).
+- **1 BAIXA registrada como PORTA ABERTA:** durabilidade do arm de stall pós-crash (`dispatched_at` in-memory, não reconstruído no restart — igual ao `breaker_open` pré-existente; não-regressão, não contraria o gate (a)).
+
+**Commits por fatia:** `26d68a8` Rβ-0 contrato (reason core→host→UI) · `5cf47ad` CONF-UI (G) · `eb75e1e` CONF-HARNESS (I) · `c113f36` CONF-CORE (B) · `81f0422` CONF-QA (R) · `a5e3041` integração final do botão liberar (G) · `1b4042b` teste positivo (R) · `c9863ec` achados de dogfooding.
+
+**Gates (a–f) fechados; gate (g) BLOQUEANTE DIFERIDO ao fundador:** validação na tela ao vivo (terminal pausado pelo disjuntor → "pausado por segurança — clique para liberar" → o clique libera; badge `modelo·effort` no card). Junto da pendência de tela de F3-1/F3-2. gpui não roda headless; precisa do rebuild + olho do fundador.
+
+**Limitação registrada (porta aberta, narrada ao fundador):** o protocolo AUTOMÁTICO é **goal-driven v1** (re-despacho/escala exige `goal_id` auditável — ADR 0007); handoff fora de Goal mantém só a DETECÇÃO (alarme da UI). Estender o automático a todo handoff = rodada futura (exigiria um root auditável para handoffs avulsos).
+
+**Evidência de produto (achado #28):** a família #22/#23 **NÃO se manifestou** na largada de 4 frentes (0 despacho engolido; reportes chegaram). A rodada que mecaniza o anti-engolimento rodou sobre um #22/#23 já domado pelo fix W1 + o protocolo manual do Maestro — que o CONF-CORE agora torna mecanismo.
