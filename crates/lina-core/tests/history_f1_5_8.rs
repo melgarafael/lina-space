@@ -8,20 +8,27 @@
 use lina_core::history::{self, ExportFormat, HistoryError, HistoryLimits, HistoryPage};
 use lina_core::scrollback::{ScrollbackConfig, ScrollbackStore};
 use lina_core::{EventStore, NodeId};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PANEL: &str = "Terminal A";
+
+/// Contador global de tempdirs — junto com `thread::id` garante unicidade do path
+/// mesmo entre duas chamadas na mesma thread.
+static TEMPDIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Tempdir manual (sem dep externa) — mesmo padrão dos gates F1-0.
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> Self {
+        // pid + thread::id + contador atômico = path único por chamada. O `nanos`
+        // sozinho colide sob `cargo test` paralelo (a resolução do relógio não
+        // garante unicidade entre threads), e o `remove_dir_all` de um teste
+        // apaga o tempdir do vizinho → falso-vermelho. Modelo: router.rs / f3_1_goal_adversarial.rs.
         let p = std::env::temp_dir().join(format!(
-            "lina-hist158-{}-{:?}",
+            "lina-hist158-{}-{:?}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
+            std::thread::current().id(),
+            TEMPDIR_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("criar tempdir");
