@@ -1078,11 +1078,13 @@ impl MailboxPump {
         self.refresh_cost_paused();
     }
 
-    /// **F3-1-7 (ADR 0036) — aplica os GESTOS HUMANOS DIRETOS da UI** (confirmar/ajustar uma Goal).
-    /// Escritor único do log: drena a fila em-processo do `NodeManager` e roteia cada gesto por
-    /// `Router::human_intent`, que carimba `by="human"` pela NATUREZA do canal (in-process; nenhum
-    /// agente o alcança). Recusa NARRADA (stderr), nunca silenciosa; ao aplicar, bumpa o `event_count`
-    /// da UI para o card re-projetar a Goal no próximo tick.
+    /// **F3-1-7 (ADR 0036) — aplica os GESTOS HUMANOS DIRETOS da UI** (confirmar/ajustar uma Goal;
+    /// F3-CONF-2: liberar o disjuntor). Escritor único do log: drena a fila em-processo do
+    /// `NodeManager` e roteia cada gesto. `goal.*` vai por `Router::human_intent`; `breaker.reset`
+    /// (o "clique para liberar") vai por `Router::reset_breaker` — ambos carimbam `by="human"` pela
+    /// NATUREZA do canal (in-process; nenhum agente o alcança), nunca por um campo do payload. Recusa
+    /// NARRADA (stderr), nunca silenciosa; ao aplicar, bumpa o `event_count` da UI para o card
+    /// re-projetar no próximo tick.
     fn drain_human_intents(&mut self) {
         let items = self.nodes.drain_human_intents();
         if items.is_empty() {
@@ -1092,6 +1094,31 @@ impl MailboxPump {
         {
             let mut store = lock(&self.store);
             for item in items {
+                // F3-CONF-2 (gate c): o "clique para liberar" do card. `human_intent` (Goal) NÃO
+                // conhece este verbo — roteamos LOCAL para `reset_breaker` ANTES dele. A AUTORIDADE
+                // `by=human` é a NATUREZA do canal (chamada in-process, igual ao `human_intent`); o
+                // `node` é DADO (UUID cunhado server-side), jamais autoridade.
+                if item.intent == "breaker.reset" {
+                    let node = serde_json::from_str::<serde_json::Value>(&item.payload)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("node")
+                                .and_then(serde_json::Value::as_str)
+                                .and_then(|s| s.parse::<NodeId>().ok())
+                        });
+                    match node {
+                        Some(node) => match self.router.reset_breaker(node, &mut store) {
+                            Ok(true) => applied = true,
+                            Ok(false) => {} // idempotente: nada pausado a liberar (clique duplo)
+                            Err(e) => eprintln!("lina-gpui: reset do disjuntor falhou: {e}"),
+                        },
+                        None => eprintln!(
+                            "lina-gpui: gesto 'breaker.reset' com payload invalido: {}",
+                            item.payload
+                        ),
+                    }
+                    continue;
+                }
                 match self
                     .router
                     .human_intent(&item.intent, &item.payload, &mut store)
@@ -7304,6 +7331,70 @@ mod tests {
         // spawn de teste LANÇARIA o CLI de verdade. `None` = fábrica `cat` (como sempre).
         nm.set_spawn_engine_factory(Arc::new(|| None));
         (nm, store, model, sup)
+    }
+
+    /// **F3-CONF-2 (gate c) — ponta-a-ponta do "clique para liberar":** o gesto humano
+    /// `breaker.reset` enfileirado pela UI atravessa `drain_human_intents` (roteado para
+    /// `Router::reset_breaker`, NÃO o `human_intent` de Goal que o rejeitaria) → o nó SAI de
+    /// `Blocked` (→ `Idle`) e o log carimba `NodeStatusChanged{reason:breaker_reset}`. Prova a
+    /// COSTURA que faltava: sem o ramo novo no pump, o intent caía em "gesto humano nao aplicou" e o
+    /// reset nunca rodava (o card ficaria preso em "pausado por segurança").
+    #[test]
+    fn breaker_reset_gesture_routes_to_core_and_unblocks_node() {
+        let dir = std::env::temp_dir().join(format!("lina-breakerreset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+        let sup = Arc::new(Supervisor::new());
+        let node = sup.register("Terminal A", None, Box::new(std::io::sink()));
+        // Pré-condição: o disjuntor pausou o nó (o estado que o card mostra "pausado por segurança").
+        sup.set_status(node, CoreStatus::Blocked).expect("blocked");
+        assert_eq!(
+            sup.get(node).map(|i| i.status),
+            Some(CoreStatus::Blocked),
+            "pré-condição: nó PAUSADO pelo disjuntor"
+        );
+
+        // O pump compartilha o MESMO `Arc<NodeManager>` que a UI usa para enfileirar o gesto.
+        let nodes = test_nodes(Arc::clone(&store));
+        let mut pump = MailboxPump::new(
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Mailbox::new(dir.join(".lina")),
+            new_reinject_queue(),
+            Arc::new(Mutex::new(SharedModel::default())),
+            crate::wiring::new_brake(),
+            0,
+            demo_profile(),
+            Arc::new(ProfileRegistry::new()),
+            Autonomy::Assisted,
+            Arc::clone(&nodes),
+        );
+
+        // O "clique para liberar" do card: a view só ENFILEIRA o gesto (by=human é a NATUREZA do
+        // canal in-process, jamais o payload). `node` é o UUID cunhado server-side.
+        nodes.push_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#));
+        pump.tick();
+
+        // (1) o nó SAIU de Blocked → Idle: o card volta ao estado normal (a projeção do card lê o
+        // status do supervisor, atualizado por `reset_breaker`).
+        assert_eq!(
+            sup.get(node).map(|i| i.status),
+            Some(CoreStatus::Idle),
+            "após liberar, o nó deixa de estar pausado (→ ocioso)"
+        );
+        // (2) o reset foi REGISTRADO no log (carimbo server-side), nunca silencioso.
+        assert!(
+            lock(&store)
+                .events()
+                .expect("eventos")
+                .iter()
+                .any(|r| r.kind == "NodeStatusChanged" && r.payload["reason"] == "breaker_reset"),
+            "NodeStatusChanged{{reason:breaker_reset}} apendado pelo reset humano"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEAM-1: `Arc<NodeManager>` de teste compartilhando o `store` dado — para os testes do
