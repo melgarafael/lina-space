@@ -271,3 +271,73 @@ fn gate_b_redespacho_de_engolido_nao_e_barrado_como_loop() {
         "gate (b): zero RouteBlocked{{loop_detected}} para a correção legítima"
     );
 }
+
+// ════════════════════ GATE (a) DISCRIMINADOR — progresso REAL não é interrompido ════════════════════
+
+/// **(gate a, vertente POSITIVA) um nó que FAZ progresso real após a entrega NÃO é re-despachado nem
+/// escalado.** Os gate(a/b) acima provam a vertente NEGATIVA (zero progresso → re-despacha + escala);
+/// este fecha o FALSO-POSITIVO complementar — o protocolo não pode interromper trabalho legítimo. O
+/// `dispatch_watch` (reusa a `AttentionQueue` W3) DESARMA com um sinal de progresso atribuível:
+/// `TokenUsageReported` (todo turno real consome tokens, `attention.rs:410`) — ∨ `MessageRouted{from}`
+/// (412) ∨ `NodeStatusChanged{Busy,pty_output}` (421). Setup IDÊNTICO ao gate (a), só que com progresso
+/// dentro da janela; mesmo com `pump.tick` repetido muito além da janela, o protocolo NÃO age.
+///
+/// QUEBRA SE… o protocolo ignorasse o progresso e re-despachasse/escalasse mesmo assim → apareceria um
+/// `SpawnRequested{stall-respawn:…}` ou um `GoalEscalated{stalled}` e os asserts cairiam. Não-vacuoso por
+/// CONTRASTE: o gate (a) prova que ESTE MESMO setup, SEM o progresso, dispara o re-despacho + escala.
+#[test]
+fn gate_a_discriminador_progresso_real_nao_e_re_despachado_nem_escalado() {
+    let mut e = env("gate-a-disarm");
+    let _a = e.sup.register("@A", Some("maestro".into()), sink());
+    let b = e.sup.register("@B", Some("dev".into()), sink());
+    e.sup.set_status(b, NodeStatus::Idle).expect("B idle");
+    seed_item_owned_by_b(&mut e);
+
+    let mut deliver = ok_deliver();
+    let janela = lina_core::attention::DELIVERED_NO_PROGRESS_WINDOW_MS;
+
+    // entrega real (arma o vigia) → o nó FAZ progresso DENTRO da janela (TokenUsageReported: turno
+    // real consumiu tokens) → desarma; depois fecha o turno (Idle). Caminho real.
+    entrega_engolida(&mut e, "assuma a tarefa T1", 1_000); // entrega + Idle; o "engolido" só se faltar progresso
+    let b_id = e.sup.node_by_name("@B").expect("@B");
+    e.store
+        .append(&DomainEvent::TokenUsageReported {
+            node: b_id.to_string(),
+            tokens: 1_234,
+        })
+        .expect("progresso real (tokens) dentro da janela");
+
+    // pump.tick REPETIDO, muito além da janela: o protocolo NÃO deve agir em nenhum tick.
+    for k in 1..=3u64 {
+        let _ = e
+            .router
+            .pump(&mut e.store, 1_000 + k * janela + 1, &mut deliver);
+    }
+
+    let recs = e.store.events().expect("events");
+    // ZERO re-despacho de stall (id com o prefixo `stall-respawn:` — o livro-razão do protocolo).
+    let stall_respawns = recs
+        .iter()
+        .filter(|r| r.kind == "SpawnRequested")
+        .filter(|r| {
+            r.payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.starts_with("stall-respawn"))
+        })
+        .count();
+    assert_eq!(
+        stall_respawns, 0,
+        "progresso real (tokens na janela) NÃO é re-despachado — zero stall-respawn (sem falso-positivo)"
+    );
+    // ZERO escala por stall.
+    let stalled = recs
+        .iter()
+        .filter(|r| r.kind == "GoalEscalated")
+        .filter(|r| r.payload.get("reason").and_then(|v| v.as_str()) == Some("stalled"))
+        .count();
+    assert_eq!(
+        stalled, 0,
+        "trabalho legítimo NÃO é escalado — zero GoalEscalated{{stalled}} (o protocolo não mata turno válido)"
+    );
+}
