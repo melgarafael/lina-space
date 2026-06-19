@@ -78,6 +78,21 @@ const STRUCTURAL_JUDGE: NodeId = NodeId::nil();
 /// (os bytes soletram "HUMAN") nunca colide com um nó real. `by` = carimbo server-side, jamais do cliente.
 const HUMAN_GESTURE: NodeId = NodeId::from_u128(0x4855_4d41_4e00_0000_0000_0000_0000_0000);
 
+/// F3-CONF-2 (gate a): prefixo dos `SpawnRequested` de RE-DESPACHO anti-engolimento — DISTINTO de
+/// `goal-respawn:`/`goal-newdev:` (escalonamento por `Fail`, [`count_respawns_with_effort`]), então as
+/// duas escadas nunca se misturam na contagem. O id completo é `stall-respawn:{node}:{delivered_ts}`:
+/// o `delivered_ts` (epoch da entrega) torna o re-despacho idempotente POR ENTREGA (uma re-injeção
+/// abre um epoch novo; o gap entre o pedido e a re-injeção não re-escala).
+const STALL_RESPAWN_PREFIX: &str = "stall-respawn";
+
+/// F3-CONF-2 (gate c): `reason` do `NodeStatusChanged{Idle}` emitido pelo RESET HUMANO do breaker.
+/// Duplo papel: (1) registra durável o desbloqueio (a tela honesta volta de "pausado por segurança"
+/// a ativo); (2) é o MARCADOR que ZERA a contagem de re-despachos de stall do nó — após o gesto
+/// humano o protocolo recomeça do "1ª tentativa" (re-despacha), em vez de re-escalar de imediato a
+/// entrega antiga ainda engolida. A AUTORIDADE do gesto é o CANAL ([`Router::reset_breaker`] é
+/// chamado LOCAL in-process pela UI, como [`Router::human_intent`]; nenhum agente o alcança).
+const BREAKER_RESET_REASON: &str = "breaker_reset";
+
 /// Nível de autonomia do workspace (espelho leve do `lina_bootstrap::Autonomy` — o core NÃO
 /// depende do bootstrap; o app traduz). Só `Manual` muda o roteamento (recusa delegação).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,8 +414,21 @@ pub struct Router {
     node_failures: HashMap<NodeId, u32>,
     /// F1-0-7: nós com circuit breaker ABERTO (distinto de `Blocked` por custódia/W3-6 —
     /// não conflamos as semânticas). Reset: ator externo tira o nó de `Blocked`
-    /// (lifecycle/humano) → detectado e limpo no veredito.
+    /// (lifecycle/humano) → detectado e limpo no veredito; ou o gesto humano explícito
+    /// ([`Router::reset_breaker`]). O breaker de ENGOLIMENTO (F3-CONF-2) reusa este mesmo conjunto.
     breaker_open: HashSet<NodeId>,
+    /// **F3-CONF-2: o vigia de despachos ENGOLIDOS, no relógio do router (`now_ms`).** `node →
+    /// (delivered_at_ms, arm_seq)`: o instante LÓGICO da entrega mais nova ao nó (re-armado a cada
+    /// entrega) + o `seq` do `MessageDelivered` que a armou. O `now_ms` (não o `ts` wall-clock do
+    /// evento) é a base da janela — alinhado ao relógio que o app dirige o `pump`/`route_message`,
+    /// e DETERMINÍSTICO em teste (o store carimba wall-clock; o protocolo não pode depender disso).
+    /// O `arm_seq` GUARDA o disarm: só progresso APÓS a arma (`seq > arm_seq`) desarma — uma re-arma
+    /// não é desfeita por um sinal de progresso ANTERIOR a ela (anti-corrida de ordenação). Disarm
+    /// em [`Router::sync_dispatch_progress`] (token/output/delegou/morte). Hot-path O(delta)/tick.
+    dispatched_at: HashMap<NodeId, (u64, u64)>,
+    /// F3-CONF-2: maior `seq` já varrido por [`Router::sync_dispatch_progress`] — disarm incremental
+    /// (delta only; NUNCA full-replay — o `O(N)` por tick foi a causa-raiz documentada do freeze).
+    dispatch_progress_seq: u64,
 }
 
 /// **F1-0-7 — backoff exponencial com jitter DETERMINÍSTICO** por (id, attempt):
@@ -478,6 +506,8 @@ impl Router {
             retries: HashMap::new(),
             node_failures: HashMap::new(),
             breaker_open: HashSet::new(),
+            dispatched_at: HashMap::new(),
+            dispatch_progress_seq: 0,
         }
     }
 
@@ -570,6 +600,16 @@ impl Router {
     {
         // W3-7b (ADR 0002): fecha tickets de `await` vencidos (Timeout) antes de processar o tick.
         self.sweep_await_timeouts(store, now_ms);
+        // F3-CONF-2 (gate a): o protocolo ANTI-ENGOLIMENTO, manutenção temporal como o sweep acima.
+        // Desarma os vigias por PROGRESSO (delta do log — NUNCA full-replay) e CONSOME o engolido:
+        // re-despacho informado 1×, depois breaker sticky + escala ao humano. Falha de I/O é VISÍVEL
+        // (stderr), nunca silenciosa; o tick segue (um log lento não derruba a auto-orquestração).
+        if let Err(e) = self.sync_dispatch_progress(store) {
+            eprintln!("lina-core: pump não desarmou vigias por progresso (retentará): {e}");
+        }
+        if let Err(e) = self.enforce_dispatch_protocol(store, now_ms) {
+            eprintln!("lina-core: pump falhou no protocolo anti-engolimento (retentará): {e}");
+        }
         // A6: drena de forma RECUPERÁVEL — move para `.inflight` e reprocessa órfãos de um crash.
         let msgs = self.mailbox.drain_to_inflight().unwrap_or_else(|e| {
             // Falha de I/O ao listar o outbox (disco/permissão): as mensagens NÃO são perdidas
@@ -1100,8 +1140,23 @@ impl Router {
             if let Some(&target) = preview.first() {
                 match handoff_would_tight_loop(store, &root, sender, target, MAX_CYCLE_REVISITS) {
                     Ok(true) => {
-                        log_block(store, msg, BlockReason::LoopDetected);
-                        return RouteOutcome::LoopDetected;
+                        // F3-CONF-2 (gate b): o anti-loop é CEGO ao progresso (#22c) — barraria o
+                        // Maestro de RE-DESPACHAR um worker ENGOLIDO (correção legítima de um
+                        // despacho que não virou trabalho). ISENTA se o alvo tem entrega PENDENTE
+                        // sem progresso desde então (vigia armado); a tempestade real (saltos COM
+                        // atividade no meio) DESARMA o vigia → sem entrega pendente → SEGUE barrada.
+                        // O vigia é o discriminador estrutural (zero LLM); backstops `hops`/budget
+                        // continuam cobrindo o loop infinito mesmo na isenção.
+                        if let Err(e) = self.sync_dispatch_progress(store) {
+                            eprintln!(
+                                "lina-core: route_message não desarmou vigias (barra o loop): {e}"
+                            );
+                        }
+                        if !self.dispatched_at.contains_key(&target) {
+                            log_block(store, msg, BlockReason::LoopDetected);
+                            return RouteOutcome::LoopDetected;
+                        }
+                        // engolido → re-despacho de correção ISENTO (cai através do anti-loop).
                     }
                     Ok(false) => {}
                     // Não conseguimos LER o log para verificar o ciclo → falha segura (não roteia).
@@ -1277,17 +1332,24 @@ impl Router {
                         self.delivered_root
                             .insert(target, (root.clone(), hops, now_ms));
                     }
-                    if let Err(e) = store.append(&DomainEvent::MessageDelivered {
+                    match store.append(&DomainEvent::MessageDelivered {
                         id: msg.id.clone(),
                         to: target,
                     }) {
+                        // F3-CONF-2: ARMA o vigia de engolimento (só rota 1-a-1 = handoff/ask, não
+                        // broadcast best-effort) no relógio do router (`now_ms`) + o `seq` da entrega.
+                        Ok(seq) => {
+                            if single_target {
+                                self.dispatched_at.insert(target, (now_ms, seq));
+                            }
+                        }
                         // A entrega ao PTY já ocorreu (irreversível) mas não foi logada — o event
                         // log é a fonte da verdade, então a inconsistência é ALTA e VISÍVEL (stderr),
                         // nunca um warn silencioso de tracing.
-                        eprintln!(
+                        Err(e) => eprintln!(
                             "lina-core: CRÍTICO — entregue mas NÃO logado (MessageDelivered {} → {target}): {e}",
                             msg.id
-                        );
+                        ),
                     }
                 }
                 // ACHADO-2: prompt-NÃO-pronto (`Ok(Injected{ready:false})`) = alvo OCUPADO, NÃO
@@ -1643,11 +1705,19 @@ impl Router {
                 Ok(o) if o.injected() => {
                     self.node_failures.insert(target, 0);
                     self.retries.remove(&id);
-                    if let Err(e) = store.append(&DomainEvent::MessageDelivered {
+                    match store.append(&DomainEvent::MessageDelivered {
                         id: id.clone(),
                         to: target,
                     }) {
-                        eprintln!("lina-core: CRÍTICO — retry entregue mas NÃO logado ({id}): {e}");
+                        // F3-CONF-2: re-arma o vigia de engolimento (entrega via retry conta igual).
+                        Ok(seq) => {
+                            self.dispatched_at.insert(target, (now_ms, seq));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "lina-core: CRÍTICO — retry entregue mas NÃO logado ({id}): {e}"
+                            )
+                        }
                     }
                     // Mesmos efeitos da entrega original: binding A2 + busy-mark.
                     let keep_existing = matches!(
@@ -2291,6 +2361,244 @@ impl Router {
             goal_id: Some(goal_id.to_string()),
         })?;
         Ok(())
+    }
+
+    /// **F3-CONF-2: desarma os vigias de engolimento por PROGRESSO** lendo o DELTA do log
+    /// (`seq > dispatch_progress_seq`) — incremental, JAMAIS full-replay (o `O(N)` por tick foi a
+    /// causa-raiz documentada do freeze). Progresso atribuível ao nó (mesma noção do `attention.rs`):
+    /// `TokenUsageReported{node}` (todo turno real consome tokens), `MessageRouted{from}` (delegou
+    /// adiante), `NodeStatusChanged{Busy,pty_output}` (output novo) — ou morte (`Dead`/removido). O
+    /// `seq` GUARDA contra corrida: só desarma se o progresso veio APÓS a arma (`P > arm_seq`); um
+    /// sinal ANTERIOR a uma re-arma não a desfaz. Idempotente: chamar no `pump` E no `route_message`
+    /// (caminho do loop) avança o cursor uma vez por evento.
+    ///
+    /// # Errors
+    /// Falha ao ler o event log.
+    fn sync_dispatch_progress(&mut self, store: &EventStore) -> Result<(), StoreError> {
+        let delta = store.events_since(self.dispatch_progress_seq)?;
+        let Some(max_seq) = delta.last().map(|r| r.seq) else {
+            return Ok(()); // ocioso: nada novo
+        };
+        for rec in &delta {
+            let p = rec.seq;
+            let str_field = |k: &str| rec.payload.get(k).and_then(|v| v.as_str());
+            // O nó cujo progresso o evento atesta (None = evento sem relevância p/ o vigia).
+            let node: Option<NodeId> = match rec.kind.as_str() {
+                "TokenUsageReported" => str_field("node").and_then(|s| s.parse().ok()),
+                "MessageRouted" => str_field("from").and_then(|s| s.parse().ok()),
+                "NodeRemoved" | "TerminalExited" => str_field("node").and_then(|s| s.parse().ok()),
+                "NodeStatusChanged" => {
+                    // Output novo (Busy+pty_output) = progresso; Dead = morte. O carimbo `a2a_delivery`
+                    // da própria entrega NÃO é trabalho (filtrado, espelha attention.rs).
+                    let busy_output = str_field("status") == Some(NodeStatus::Busy.as_str())
+                        && str_field("reason") == Some(crate::lifecycle::reason::PTY_OUTPUT);
+                    let dead = str_field("status") == Some(NodeStatus::Dead.as_str());
+                    if busy_output || dead {
+                        str_field("node").and_then(|s| s.parse::<NodeId>().ok())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(n) = node {
+                // GUARDA de ordenação: só desarma se o progresso veio DEPOIS da arma corrente.
+                if self
+                    .dispatched_at
+                    .get(&n)
+                    .is_some_and(|(_, arm_seq)| p > *arm_seq)
+                {
+                    self.dispatched_at.remove(&n);
+                }
+            }
+        }
+        self.dispatch_progress_seq = max_seq;
+        Ok(())
+    }
+
+    /// **F3-CONF-2: os nós ENGOLIDOS em `now_ms`** — entrega pendente (sem progresso, `dispatched_at`)
+    /// há ≥ [`crate::attention::DELIVERED_NO_PROGRESS_WINDOW_MS`] E nó de volta a `Idle` (um nó `Busy`
+    /// é turf do stall detector, zero sobreposição). A janela conta desde a ENTREGA no relógio do
+    /// router (`now_ms`); um turno real consome tokens → o disarm o tira daqui antes de alarmar.
+    fn swallowed_nodes(&self, now_ms: u64) -> Vec<(NodeId, u64)> {
+        let window = crate::attention::DELIVERED_NO_PROGRESS_WINDOW_MS;
+        self.dispatched_at
+            .iter()
+            .filter(|(_, (delivered_at, _))| now_ms.saturating_sub(*delivered_at) >= window)
+            .filter(|(node, _)| {
+                matches!(self.sup.get(**node), Some(info) if info.status == NodeStatus::Idle)
+            })
+            .map(|(node, (delivered_at, _))| (*node, *delivered_at))
+            .collect()
+    }
+
+    /// **F3-CONF-2 (gate a): o protocolo ANTI-ENGOLIMENTO — o OUTER loop CONSOME o alarme W3.**
+    /// Mecaniza no core o que hoje só vive em skill (`lina-orchestration` 6-7): um despacho ENTREGUE
+    /// que voltou a `Idle` e ficou ≥ janela sem progresso (`DeliveredNoProgress`) é re-despachado **1×
+    /// informado**; se a re-tentativa TAMBÉM engole, abre o breaker (sticky, impede a 3ª tentativa
+    /// automática) e ESCALA ao humano (`GoalEscalated{stalled}`). O Maestro deixa de descobrir o
+    /// despacho engolido só "olhando o disco vazio" (#22c, reunião real com cliente).
+    ///
+    /// **ZERO LLM (inv #1):** o juiz é ESTRUTURAL (ausência de evento de progresso na janela), nunca
+    /// um modelo. **ADR 0007:** o re-despacho/escala é DADO (reusa `SpawnRequested`/`GoalEscalated`,
+    /// carimbados server-side), JAMAIS autoridade. **Idempotente por replay:** a decisão deriva do log
+    /// (re-despachos por epoch de entrega + reset humano), nunca de estado efêmero — replay reconstrói.
+    /// **Escopo v1:** goal-driven (o nó precisa possuir um item de uma Goal — `GoalEscalated` exige
+    /// `goal_id` auditável); handoff fora de Goal mantém só a DETECÇÃO (alarme da UI).
+    ///
+    /// Custo: O(1) na tick comum (sem engolido); só paga a leitura do log/projeção quando HÁ engolido
+    /// (raro — 90s sem progresso).
+    ///
+    /// # Errors
+    /// Falha ao ler/persistir no event log.
+    fn enforce_dispatch_protocol(
+        &mut self,
+        store: &mut EventStore,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let swallowed = self.swallowed_nodes(now_ms);
+        if swallowed.is_empty() {
+            return Ok(()); // caminho comum: O(1), nada lido do log
+        }
+        // Só AQUI (raro) pagamos a leitura do log + a projeção do plano/roster.
+        let records = store.events()?;
+        let proj = store.project()?;
+        for (node, delivered_at) in swallowed {
+            // Nó já pausado pelo breaker → não re-despacha NEM re-escala (idempotência da escala: uma
+            // vez aberto/Blocked, o nó sai daqui até o reset humano).
+            if self.breaker_open.contains(&node) {
+                continue;
+            }
+            // O protocolo é do OUTER loop, PLANO-cêntrico: re-despacho/escala precisam da Goal que
+            // justifica o recurso. Sem item de Goal → só a detecção (UI) cobre (v1 goal-driven).
+            let Some(item) = proj.plan.itens.iter().find(|it| {
+                it.owner.as_deref().and_then(|o| self.sup.node_by_name(o)) == Some(node)
+            }) else {
+                continue;
+            };
+            let Some(goal_id) = item.goal_id.clone() else {
+                continue;
+            };
+            let item_id = item.id.clone();
+            // Idempotência POR EPOCH: o `now_ms` da entrega na chave. Contagem escopada ao pós-reset.
+            let respawn_id = format!("{STALL_RESPAWN_PREFIX}:{node}:{delivered_at}");
+            let prior = stall_respawn_ids_since_reset(&records, node);
+            if prior.contains(&respawn_id) {
+                continue; // ESTE epoch já foi re-despachado — aguarda a re-injeção (não escala no gap)
+            }
+            if prior.is_empty() {
+                // 1ª tentativa: RE-DESPACHO informado ao MESMO dev (reusa `SpawnRequested`).
+                let (name, role) = match proj.nodes.get(&node) {
+                    Some(n) => (
+                        n.name
+                            .clone()
+                            .unwrap_or_else(|| item.owner.clone().unwrap_or_default()),
+                        n.role.clone().unwrap_or_default(),
+                    ),
+                    None => (item.owner.clone().unwrap_or_default(), String::new()),
+                };
+                store.append(&DomainEvent::SpawnRequested {
+                    id: respawn_id,
+                    requested_by: STRUCTURAL_JUDGE,
+                    name,
+                    role,
+                    root_cause_id: goal_id.clone(),
+                    hops: 1,
+                    prompt: format!(
+                        "Não recebi nenhum sinal de progresso do item {item_id} desde a entrega — o \
+                         turno não começou. Reassuma a tarefa e comece a trabalhar agora."
+                    ),
+                    model: None,
+                    effort: None,
+                    goal_id: Some(goal_id),
+                })?;
+            } else {
+                // A re-tentativa TAMBÉM engoliu → breaker sticky (3ª tentativa NÃO sai sozinha) +
+                // escala ao humano. O reset do breaker exige gesto humano (`reset_breaker`).
+                self.open_stall_breaker(store, node)?;
+                store.append(&DomainEvent::GoalEscalated {
+                    goal_id,
+                    reason: "stalled".to_string(),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// **F3-CONF-2: abre o circuit breaker por ENGOLIMENTO** — reusa o MESMO mecanismo do breaker de
+    /// entrega (conjunto `breaker_open` + `Blocked` com `reason:"circuit_breaker"`), para a tela
+    /// honesta pintar "pausado por segurança" e o [`Router::reset_breaker`] liberar por igual. NÃO
+    /// emite `CircuitOpened` (esse é específico de falhas de ENTREGA por PTY): o registro durável do
+    /// stall é o `GoalEscalated{stalled}` que o chamador apenda em seguida. `reason` server-side.
+    ///
+    /// # Errors
+    /// Falha ao persistir o `NodeStatusChanged{Blocked}` no event log.
+    fn open_stall_breaker(
+        &mut self,
+        store: &mut EventStore,
+        node: NodeId,
+    ) -> Result<(), StoreError> {
+        self.breaker_open.insert(node);
+        if let Some(info) = self.sup.get(node) {
+            if info.status != NodeStatus::Blocked && info.status != NodeStatus::Dead {
+                store.append(&DomainEvent::NodeStatusChanged {
+                    node,
+                    status: NodeStatus::Blocked.as_str().to_string(),
+                    from: info.status.as_str().to_string(),
+                    reason: "circuit_breaker".to_string(),
+                })?;
+                if let Err(e) = self.sup.set_status_with_reason(
+                    node,
+                    NodeStatus::Blocked,
+                    Some("circuit_breaker".to_string()),
+                ) {
+                    eprintln!("lina-core: falha ao bloquear {node} (breaker de engolimento): {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **F3-CONF-2 (gate c): RESET do circuit breaker sob GESTO HUMANO.** O "clique para liberar" do
+    /// card (UI/G) chama isto LOCAL in-process (como [`Router::human_intent`]): tira o nó de `Blocked`,
+    /// fecha o breaker e zera as falhas, para a auto-orquestração voltar a despachá-lo; e marca o
+    /// reset (`reason:"breaker_reset"`) — que REINICIA o protocolo anti-engolimento do nó (volta ao
+    /// "1ª tentativa", em vez de re-escalar a entrega antiga). Devolve `true` se liberou, `false` se
+    /// não havia nada a resetar (idempotente — clique duplo não re-loga).
+    ///
+    /// **Segurança (ADR 0007):** um AGENTE NUNCA reabre o próprio breaker — este caminho não passa por
+    /// `route_message`/`node_by_name` (nenhum sender de roster o produz); a AUTORIDADE é a NATUREZA do
+    /// canal (chamada in-process; processo único, GPU-first). O `by` é, por construção, o gesto humano
+    /// ([`HUMAN_GESTURE`]); o `reason` é carimbado server-side, jamais lido do cliente.
+    ///
+    /// # Errors
+    /// Falha ao persistir o `NodeStatusChanged{Idle}` no event log.
+    pub fn reset_breaker(
+        &mut self,
+        node: NodeId,
+        store: &mut EventStore,
+    ) -> Result<bool, StoreError> {
+        let was_open = self.breaker_open.remove(&node);
+        let blocked = matches!(self.sup.get(node), Some(i) if i.status == NodeStatus::Blocked);
+        if !was_open && !blocked {
+            return Ok(false); // idempotente: nada pausado a liberar
+        }
+        self.node_failures.remove(&node);
+        if blocked {
+            store.append(&DomainEvent::NodeStatusChanged {
+                node,
+                status: NodeStatus::Idle.as_str().to_string(),
+                from: NodeStatus::Blocked.as_str().to_string(),
+                reason: BREAKER_RESET_REASON.to_string(),
+            })?;
+            if let Err(e) = self
+                .sup
+                .set_status_with_reason(node, NodeStatus::Idle, None)
+            {
+                eprintln!("lina-core: falha ao liberar {node} (reset humano do breaker): {e}");
+            }
+        }
+        Ok(true)
     }
 
     /// **F3-0-5: `lina params set/reset`** (molde de [`Router::handle_plan`]). Parseia o contrato
@@ -3134,6 +3442,32 @@ fn count_respawns_with_effort(
         }
     }
     Ok(n)
+}
+
+/// **F3-CONF-2: os ids de RE-DESPACHO de stall (`stall-respawn:{node}:…`) emitidos para `node` APÓS o
+/// último RESET HUMANO do breaker dele** (`NodeStatusChanged{reason:"breaker_reset"}`). Escopar ao
+/// pós-reset faz o gesto humano REINICIAR o protocolo (volta ao "1ª tentativa": lista vazia ⇒
+/// re-despacha; já contém este epoch ⇒ aguarda; contém OUTRO epoch ⇒ a re-tentativa engoliu ⇒
+/// escala). Derivável do log (invariante #4) — varre uma vez (custo só pago quando HÁ engolido).
+fn stall_respawn_ids_since_reset(records: &[EventRecord], node: NodeId) -> Vec<String> {
+    let node_str = node.to_string();
+    let prefix = format!("{STALL_RESPAWN_PREFIX}:{node_str}:");
+    let mut last_reset_seq = 0u64;
+    for rec in records {
+        if rec.kind == "NodeStatusChanged"
+            && rec.payload.get("node").and_then(|v| v.as_str()) == Some(node_str.as_str())
+            && rec.payload.get("reason").and_then(|v| v.as_str()) == Some(BREAKER_RESET_REASON)
+        {
+            last_reset_seq = rec.seq;
+        }
+    }
+    records
+        .iter()
+        .filter(|rec| rec.seq > last_reset_seq && rec.kind == "SpawnRequested")
+        .filter_map(|rec| rec.payload.get("id").and_then(|v| v.as_str()))
+        .filter(|id| id.starts_with(&prefix))
+        .map(String::from)
+        .collect()
 }
 
 /// F1-3-6: loga `SpawnGated{reason}` (livro-razão da decisão do gate, par do `SpawnRequested`).
@@ -4734,6 +5068,327 @@ mod tests {
             "o ping-pong repetido além de MAX_CYCLE_REVISITS é cortado"
         );
         assert!(blocked_reasons(&ts.store).contains(&"loop_detected".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ═══════════════════ F3-CONF-2 · protocolo ANTI-ENGOLIMENTO (gates a/b/c) ═══════════════════
+
+    const STALL_WINDOW: u64 = crate::attention::DELIVERED_NO_PROGRESS_WINDOW_MS;
+
+    /// Cena base: @Maestro + @B vivos, uma Goal `g` com o item `T1` ATRIBUÍDO e reivindicado por @B
+    /// (owner=@B). É o terreno goal-driven que o protocolo exige (a escala precisa de `goal_id`).
+    fn seed_swallow_goal(
+        tag: &str,
+    ) -> (
+        Router,
+        Arc<Supervisor>,
+        TmpStore,
+        NodeId,
+        std::path::PathBuf,
+    ) {
+        let (mut router, sup, dir) = router_with(tag);
+        let _m = sup.register("@Maestro", None, sink());
+        let b = sup.register("@B", None, sink());
+        sup.set_status(b, NodeStatus::Idle).expect("B Idle");
+        let mut ts = TmpStore::new(tag);
+        ts.store
+            .append(&DomainEvent::GoalDefined {
+                goal_id: "g".into(),
+                statement: "meta de teste".into(),
+                root_cause_id: "r".into(),
+                origin: "@Maestro".into(),
+                budget_tokens: 0,
+            })
+            .unwrap();
+        router
+            .seed_plan_item(&mut ts.store, "T1", "tarefa")
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::PlanItemAttributed {
+                item: "T1".into(),
+                goal_id: Some("g".into()),
+                parents: vec![],
+                acceptance: vec![],
+                budget_tokens: 0,
+            })
+            .unwrap();
+        let (_rec, mut deliver) = recorder();
+        router.route_message(
+            &MailMessage::new("@B", "plan", "plan.claim", "").with_ref("plan:T1"),
+            &mut ts.store,
+            1,
+            &mut deliver,
+        );
+        (router, sup, ts, b, dir)
+    }
+
+    /// Caminho REAL: entrega um handoff @Maestro→@B em `now_ms` (arma o vigia no relógio do router)
+    /// e marca o retorno a `Idle` SEM progresso (o lifecycle real faria — input ambiental do teste).
+    /// O `now_ms` é o relógio LÓGICO do protocolo (o store carimba wall-clock, mas o vigia usa o
+    /// `now_ms` da entrega — determinístico, sem `sleep`).
+    fn deliver_and_idle(
+        router: &mut Router,
+        sup: &Supervisor,
+        store: &mut EventStore,
+        now_ms: u64,
+    ) {
+        let (_rec, mut deliver) = recorder();
+        let b = sup.node_by_name("@B").expect("@B vivo");
+        let m = MailMessage::new("@Maestro", "@B", "handoff", "assuma T1");
+        let out = router.route_message(&m, store, now_ms, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "entrega real arma o vigia; veio {out:?}"
+        );
+        store
+            .append(&DomainEvent::NodeStatusChanged {
+                node: b,
+                status: NodeStatus::Idle.as_str().to_string(),
+                from: NodeStatus::Busy.as_str().to_string(),
+                reason: "end_of_response".to_string(),
+            })
+            .unwrap();
+        sup.set_status(b, NodeStatus::Idle).expect("idle roster");
+    }
+    /// Os PROMPTS dos `SpawnRequested` de re-despacho de stall (`stall-respawn:{node}:…`) no log.
+    fn stall_respawns(store: &EventStore, node: NodeId) -> Vec<String> {
+        let prefix = format!("{STALL_RESPAWN_PREFIX}:{node}:");
+        store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "SpawnRequested")
+            .filter(|r| field(r, "id").is_some_and(|id| id.starts_with(&prefix)))
+            .filter_map(|r| field(&r, "prompt").map(String::from))
+            .collect()
+    }
+    /// Os `reason` dos `GoalEscalated` no log.
+    fn goal_escalations(store: &EventStore) -> Vec<String> {
+        store
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "GoalEscalated")
+            .filter_map(|r| field(&r, "reason").map(String::from))
+            .collect()
+    }
+
+    /// **Gate (a) WIRING — caminho real:** `route_message` entrega o handoff (arma o vigia no relógio
+    /// do router), @B volta a `Idle` sem trabalhar e o `pump` (após a janela) emite UM `SpawnRequested`
+    /// de re-despacho INFORMADO. Prova a costura `route_message`→arm→`pump`→enforce ponta-a-ponta.
+    #[test]
+    fn pump_redispatches_swallowed_dispatch_through_real_path() {
+        let (mut router, sup, mut ts, b, dir) = seed_swallow_goal("pumpredisp");
+        let (_rec, mut deliver) = recorder();
+
+        deliver_and_idle(&mut router, &sup, &mut ts.store, 1_000);
+        router.pump(&mut ts.store, 1_000 + STALL_WINDOW + 1, &mut deliver);
+
+        let respawns = stall_respawns(&ts.store, b);
+        assert_eq!(
+            respawns.len(),
+            1,
+            "o pump CONSOME o engolido e re-despacha 1×"
+        );
+        assert!(
+            respawns[0].contains("Não recebi nenhum sinal de progresso"),
+            "re-despacho INFORMADO (prompt diz por que): {:?}",
+            respawns[0]
+        );
+        assert!(
+            goal_escalations(&ts.store).is_empty(),
+            "1ª tentativa não escala"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Gate (a) — re-despacho 1× → escala + breaker sticky.** Epoch 1 engolido → re-despacho;
+    /// epoch 2 (a re-entrega TAMBÉM engoliu) → `GoalEscalated{stalled}` + nó `Blocked`; a 3ª tentativa
+    /// automática NÃO sai (sticky). Caminho real, epochs por `now_ms` LÓGICO distinto (determinístico).
+    #[test]
+    fn redispatch_then_escalate_with_sticky_breaker() {
+        let (mut router, sup, mut ts, b, dir) = seed_swallow_goal("escalate");
+        let (_rec, mut deliver) = recorder();
+
+        // Epoch 1 (entrega @1_000): engolido → re-despacho, sem escala.
+        deliver_and_idle(&mut router, &sup, &mut ts.store, 1_000);
+        router.pump(&mut ts.store, 1_000 + STALL_WINDOW + 1, &mut deliver);
+        assert_eq!(
+            stall_respawns(&ts.store, b).len(),
+            1,
+            "epoch 1: re-despacho"
+        );
+        assert!(
+            goal_escalations(&ts.store).is_empty(),
+            "1ª tentativa NÃO escala"
+        );
+
+        // Epoch 2 (re-entrega @2_000+janela, epoch distinto) que TAMBÉM engole.
+        let t2 = 2_000 + STALL_WINDOW;
+        deliver_and_idle(&mut router, &sup, &mut ts.store, t2);
+        router.pump(&mut ts.store, t2 + STALL_WINDOW + 1, &mut deliver);
+        assert_eq!(
+            goal_escalations(&ts.store),
+            vec!["stalled".to_string()],
+            "epoch 2 engoliu → escala ao humano com reason=stalled"
+        );
+        assert_eq!(
+            stall_respawns(&ts.store, b).len(),
+            1,
+            "breaker sticky: NÃO há 2º re-despacho automático"
+        );
+        assert_eq!(
+            sup.get(b).unwrap().status,
+            NodeStatus::Blocked,
+            "o breaker PAUSA o nó (tela honesta pinta 'pausado por segurança')"
+        );
+
+        // 3ª tentativa: com o nó Blocked pelo breaker, mais um tick NÃO produz novo re-despacho
+        // (o nó pausado sai do vigia; só o reset humano o reabre). Sticky comprovado.
+        router.pump(&mut ts.store, t2 + 3 * STALL_WINDOW, &mut deliver);
+        assert_eq!(
+            stall_respawns(&ts.store, b).len(),
+            1,
+            "breaker sticky impede a 3ª tentativa (só o humano libera)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Idempotência do GAP:** entre o re-despacho e a re-entrega, o MESMO epoch continua engolido.
+    /// `pump` repetido NÃO re-despacha nem escala (espera a re-entrega) — sem isto, o protocolo
+    /// escalaria prematuramente a cada tick durante o gap async. Caminho real (mesma entrega, 2 pumps).
+    #[test]
+    fn same_epoch_does_not_redispatch_or_escalate_in_gap() {
+        let (mut router, sup, mut ts, b, dir) = seed_swallow_goal("gap");
+        let (_rec, mut deliver) = recorder();
+
+        deliver_and_idle(&mut router, &sup, &mut ts.store, 1_000);
+        router.pump(&mut ts.store, 1_000 + STALL_WINDOW + 1, &mut deliver);
+        assert_eq!(stall_respawns(&ts.store, b).len(), 1);
+        // GAP: a re-entrega ainda não landou (MESMO epoch). Vários ticks depois → nada novo.
+        router.pump(&mut ts.store, 1_000 + 5 * STALL_WINDOW, &mut deliver);
+        assert_eq!(
+            stall_respawns(&ts.store, b).len(),
+            1,
+            "mesmo epoch não re-despacha de novo (aguarda a re-entrega)"
+        );
+        assert!(
+            goal_escalations(&ts.store).is_empty(),
+            "NÃO escala no gap (a re-entrega do epoch 1 ainda não engoliu)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Gate (c) — reset sob gesto humano REINICIA o protocolo.** Após escalar (nó `Blocked`), o
+    /// `reset_breaker` (chamado in-process pela UI) libera o nó e zera a contagem de stall: a entrega
+    /// ainda engolida vira nova 1ª tentativa (re-despacho), NÃO re-escala de imediato. Idempotente.
+    #[test]
+    fn human_reset_unblocks_and_restarts_protocol() {
+        let (mut router, sup, mut ts, b, dir) = seed_swallow_goal("reset");
+        let (_rec, mut deliver) = recorder();
+
+        deliver_and_idle(&mut router, &sup, &mut ts.store, 1_000);
+        router.pump(&mut ts.store, 1_000 + STALL_WINDOW + 1, &mut deliver);
+        let t2 = 2_000 + STALL_WINDOW;
+        deliver_and_idle(&mut router, &sup, &mut ts.store, t2);
+        router.pump(&mut ts.store, t2 + STALL_WINDOW + 1, &mut deliver);
+        assert_eq!(sup.get(b).unwrap().status, NodeStatus::Blocked, "escalou");
+
+        // RESET humano (gesto local in-process — nenhum agente o alcança).
+        assert!(
+            router.reset_breaker(b, &mut ts.store).unwrap(),
+            "reset liberou o nó"
+        );
+        assert_eq!(
+            sup.get(b).unwrap().status,
+            NodeStatus::Idle,
+            "o nó volta a ativo (tela honesta: deixa de 'pausado por segurança')"
+        );
+        assert!(
+            !router.reset_breaker(b, &mut ts.store).unwrap(),
+            "reset é idempotente (clique duplo não re-loga)"
+        );
+
+        // Pós-reset o protocolo RECOMEÇA: a entrega ainda engolida (epoch 2) vira RE-DESPACHO, não
+        // re-escala. (`now_ms` ainda além da janela do epoch 2 → o vigia segue armado.)
+        router.pump(&mut ts.store, t2 + 3 * STALL_WINDOW, &mut deliver);
+        assert_eq!(
+            goal_escalations(&ts.store).len(),
+            1,
+            "o gesto humano NÃO causa re-escala imediata da entrega antiga"
+        );
+        assert_eq!(
+            stall_respawns(&ts.store, b).len(),
+            2,
+            "reset reinicia: o nó ganha uma nova 1ª tentativa"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Escopo v1 (goal-driven):** um handoff engolido a um nó SEM item de Goal não auto-re-despacha
+    /// (a DETECÇÃO/alarme da UI cobre); o auto-protocolo exige a Goal que justifica o recurso (a escala
+    /// precisa de `goal_id` auditável — ADR 0007). Trava a decisão de escopo (não é acidente).
+    #[test]
+    fn swallowed_non_goal_handoff_is_detection_only() {
+        let (mut router, sup, dir) = router_with("nongoal");
+        let _m = sup.register("@Maestro", None, sink());
+        let b = sup.register("@B", None, sink());
+        sup.set_status(b, NodeStatus::Idle).expect("B Idle");
+        let mut ts = TmpStore::new("nongoal");
+        let (_rec, mut deliver) = recorder();
+        // SEM Goal/item: @B não possui nada no plano — mas a entrega é real e engole.
+        deliver_and_idle(&mut router, &sup, &mut ts.store, 1_000);
+        router.pump(&mut ts.store, 1_000 + STALL_WINDOW + 1, &mut deliver);
+        assert!(
+            stall_respawns(&ts.store, b).is_empty(),
+            "handoff fora de Goal: sem auto-re-despacho (só a detecção cobre)"
+        );
+        assert!(goal_escalations(&ts.store).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Gate (b) — re-despacho a um worker ENGOLIDO é ISENTO do anti-loop** (#22c). MESMA topologia
+    /// que BARRA a tempestade (`tight_loop_blocked_after_revisit_limit`: revisits≥2 + ciclo), mas o
+    /// último despacho a @B foi ENGOLIDO (entregue, @B não respondeu) → @B tem vigia pendente → a
+    /// repetição que FECHARIA o ciclo NÃO é `LoopDetected`: o Maestro corrige o worker preso.
+    #[test]
+    fn redispatch_to_swallowed_worker_is_exempt_from_loop_guard() {
+        let (mut router, sup, dir) = router_with("loopexempt");
+        let a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("loopexempt");
+        let (_rec, mut deliver) = recorder();
+
+        // A→B, B→A, A→B: estabelece revisits(A→B)=2 + a aresta B→A (fecha ciclo). O ÚLTIMO A→B é
+        // entregue e ENGOLIDO (@B não responde) → o vigia de @B fica armado (entrega pendente).
+        let legs = [("@A", "@B"), ("@B", "@A"), ("@A", "@B")];
+        for (i, (from, to)) in legs.iter().enumerate() {
+            turn_done(&sup, a);
+            turn_done(&sup, b);
+            let m = MailMessage::new(*from, *to, "ask", "ping");
+            assert!(
+                matches!(
+                    router.route_message(&m, &mut ts.store, 1000 + i as u64, &mut deliver),
+                    RouteOutcome::Delivered { .. }
+                ),
+                "perna {i} entrega (real)"
+            );
+        }
+        // @B está ENGOLIDO. A repetição A→B fecharia o ciclo → o anti-loop CEGO barraria; a isenção
+        // de engolido deixa passar (a correção legítima de um worker preso).
+        turn_done(&sup, a);
+        turn_done(&sup, b);
+        let correction =
+            MailMessage::new("@A", "@B", "handoff", "reassuma — sem sinal de progresso");
+        let out = router.route_message(&correction, &mut ts.store, 1010, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "correção de worker engolido é ISENTA do anti-loop (não LoopDetected): {out:?}"
+        );
+        assert!(
+            !blocked_reasons(&ts.store).contains(&"loop_detected".to_string()),
+            "nenhum RouteBlocked{{loop_detected}} para a correção legítima"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
