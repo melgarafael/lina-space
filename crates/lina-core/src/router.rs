@@ -1538,7 +1538,13 @@ impl Router {
                     }) {
                         eprintln!("lina-core: falha ao logar Blocked(circuit_breaker): {e}");
                     }
-                    if let Err(e) = self.sup.set_status(target, NodeStatus::Blocked) {
+                    // F3-CONF-2 (#21): o reason "circuit_breaker" viaja no Bus (não só no log),
+                    // para a tela honesta surfacar "pausado por segurança" em vez de âmbar "trabalhando".
+                    if let Err(e) = self.sup.set_status_with_reason(
+                        target,
+                        NodeStatus::Blocked,
+                        Some("circuit_breaker".to_string()),
+                    ) {
                         eprintln!("lina-core: falha ao bloquear {target} (breaker): {e}");
                     }
                 }

@@ -69,6 +69,10 @@ pub enum NodeStatus {
     Idle,
     /// Processo vivo e produzindo saída.
     Busy,
+    /// F3-CONF-2 (#21): vivo, porém PAUSADO pelo core (ex.: disjuntor de entrega). Distinto de
+    /// `Busy` — a tela honesta mostra "pausado por segurança", não "trabalhando". O motivo viaja
+    /// no `reason` de `HostEvent::NodeStatusChanged`, não nesta variante (mantém `Copy`).
+    Blocked,
     /// Vivo, sem distinção idle/busy disponível.
     Running,
     /// O painel quebrou (panic contido pelo pty-host); o processo, não.
@@ -97,7 +101,13 @@ pub enum HostEvent {
     /// Um nó passou a existir no canvas.
     NodeAdded { node: NodeId, kind: NodeKind },
     /// Mudança de presença/status de um nó (idle↔busy, crashed, dead…).
-    NodeStatusChanged { node: NodeId, status: NodeStatus },
+    /// F3-CONF-2 (#21): `reason` carrega o motivo surfacável (ex.: `"circuit_breaker"`) quando há um
+    /// — DADO para a tela honesta, nunca autoridade. `None` na maioria das transições.
+    NodeStatusChanged {
+        node: NodeId,
+        status: NodeStatus,
+        reason: Option<String>,
+    },
     /// Um nó deixou de existir (removido / `node.died`).
     NodeRemoved { node: NodeId },
     /// Linhas sujas no grid de um terminal — a UI re-renderiza só o delta.
@@ -241,6 +251,7 @@ mod tests {
             HostEvent::NodeStatusChanged {
                 node: n,
                 status: NodeStatus::Starting,
+                reason: None,
             },
             HostEvent::GridDelta {
                 node: n,
@@ -249,6 +260,7 @@ mod tests {
             HostEvent::NodeStatusChanged {
                 node: n,
                 status: NodeStatus::Busy,
+                reason: None,
             },
             HostEvent::GridDelta {
                 node: n,
@@ -261,6 +273,7 @@ mod tests {
             HostEvent::NodeStatusChanged {
                 node: n,
                 status: NodeStatus::Idle,
+                reason: None,
             },
             HostEvent::NodeRemoved { node: n },
             HostEvent::Recovered,

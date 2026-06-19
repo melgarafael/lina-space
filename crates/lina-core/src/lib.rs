@@ -1089,6 +1089,10 @@ pub enum BusEvent {
     NodeStatus {
         node: NodeId,
         status: NodeStatus,
+        /// F3-CONF-2: motivo da transição (ex.: `"circuit_breaker"`) — DADO p/ a tela honesta
+        /// (#21), nunca autoridade. `None` na maioria das transições; `Some(..)` quando há causa
+        /// surfacável ao leigo. O canal vivo (Bus) é o que o render usa, então o reason viaja aqui.
+        reason: Option<String>,
     },
     Message {
         id: String,
@@ -1461,8 +1465,20 @@ impl Supervisor {
         }
     }
 
-    /// Atualiza o status de um nó e publica `NodeStatus`.
+    /// Atualiza o status de um nó e publica `NodeStatus` (sem reason surfacável).
     pub fn set_status(&self, node: NodeId, status: NodeStatus) -> Result<(), SupervisorError> {
+        self.set_status_with_reason(node, status, None)
+    }
+
+    /// F3-CONF-2: atualiza o status e publica `NodeStatus` carregando um `reason` opcional
+    /// para a tela honesta (#21 — ex.: `"circuit_breaker"`). O reason é DADO transportado ao
+    /// render, nunca autoridade; quem decide o status é sempre o core, server-side.
+    pub fn set_status_with_reason(
+        &self,
+        node: NodeId,
+        status: NodeStatus,
+        reason: Option<String>,
+    ) -> Result<(), SupervisorError> {
         {
             let mut reg = lock(&self.registry);
             let info = reg
@@ -1470,7 +1486,11 @@ impl Supervisor {
                 .ok_or(SupervisorError::NodeNotFound(node))?;
             info.status = status;
         }
-        self.publish(BusEvent::NodeStatus { node, status });
+        self.publish(BusEvent::NodeStatus {
+            node,
+            status,
+            reason,
+        });
         Ok(())
     }
 
@@ -1986,7 +2006,7 @@ mod bus_tests {
         );
         assert!(
             events.iter().any(
-                |e| matches!(e, BusEvent::NodeStatus { node, status: NodeStatus::Busy } if *node == n)
+                |e| matches!(e, BusEvent::NodeStatus { node, status: NodeStatus::Busy, .. } if *node == n)
             ),
             "deveria ter NodeStatus(Busy)"
         );

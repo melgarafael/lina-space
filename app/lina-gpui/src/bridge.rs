@@ -320,7 +320,7 @@ impl UiHost for GpuiBridgeHost {
                 }
                 m.touch();
             }
-            HostEvent::NodeStatusChanged { node, status } => {
+            HostEvent::NodeStatusChanged { node, status, .. } => {
                 let mut m = lock(&self.model);
                 if let Some(nv) = m.nodes.get_mut(&node) {
                     nv.status = status;
@@ -2290,9 +2290,17 @@ pub fn bus_to_host(ev: &BusEvent) -> Option<HostEvent> {
             kind: NodeKind::Terminal,
         }),
         BusEvent::NodeDied { node } => Some(HostEvent::NodeRemoved { node: *node }),
-        BusEvent::NodeStatus { node, status } => Some(HostEvent::NodeStatusChanged {
+        BusEvent::NodeStatus {
+            node,
+            status,
+            reason,
+        } => Some(HostEvent::NodeStatusChanged {
             node: *node,
             status: map_status(*status),
+            // F3-CONF-2: o reason flui do Bus ao HostEvent (a UI-HONESTA o consome no render).
+            // `map_status` ainda colapsa Blocked→Busy nesta camada de contrato — a frente UI
+            // destrava o `map_status` + o badge "pausado por segurança".
+            reason: reason.clone(),
         }),
         BusEvent::Message { from, to, .. } => Some(HostEvent::BusMessage {
             from: *from,
@@ -5578,6 +5586,7 @@ pub fn spawn_pump(
                             bridge.on_event(HostEvent::NodeStatusChanged {
                                 node: delta.node,
                                 status: NodeStatus::Busy,
+                                reason: None,
                             });
                         }
                         worked = true;
@@ -5641,6 +5650,7 @@ pub fn spawn_pump(
                         bridge.on_event(HostEvent::NodeStatusChanged {
                             node,
                             status: NodeStatus::Idle,
+                            reason: None,
                         });
                     }
                     if !worked {
