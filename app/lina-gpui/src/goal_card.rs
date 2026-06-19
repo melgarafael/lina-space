@@ -277,6 +277,10 @@ pub fn mock_goal() -> Goal {
              compra que leva ao pagamento."
                 .to_string(),
         ),
+        strategy: Some(
+            "Um time enxuto: alguém monta a página, alguém revisa o texto, e eu confiro no fim."
+                .to_string(),
+        ),
         acceptance: vec![
             AcceptanceCriterion {
                 desc: "A página abre sem erro no navegador".to_string(),
@@ -516,6 +520,21 @@ impl RenderOnce for GoalCard {
             })
         };
 
+        // "Como vou fazer" — a estratégia proposta (só fora do editor e quando há estratégia).
+        let strategy_section = self
+            .editing
+            .is_none()
+            .then(|| self.goal.strategy.clone())
+            .flatten()
+            .map(|strat| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::Xs.px(&t)))
+                    .child(section_label(&t, "Como vou fazer"))
+                    .child(body_text(&t, SharedString::from(strat)))
+            });
+
         // "Como vou saber que deu certo" — critérios em linguagem clara, marcados feito quando fechou.
         let achieved = self.goal.phase == GoalPhase::Achieved;
         let criteria_rows: Vec<_> = self
@@ -575,6 +594,9 @@ impl RenderOnce for GoalCard {
         if !collapsed {
             if let Some(u) = understanding {
                 kids.push(u.into_any_element());
+            }
+            if let Some(s) = strategy_section {
+                kids.push(s.into_any_element());
             }
             if let Some(c) = criteria {
                 kids.push(c.into_any_element());

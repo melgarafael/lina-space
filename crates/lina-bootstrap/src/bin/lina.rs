@@ -2558,6 +2558,7 @@ mod f31_goal_surface_tests {
             statement: "dobrar leads".into(),
             phase: GoalPhase::Decomposed,
             interpretation: Some("entendi".into()),
+            strategy: None,
             acceptance: vec![AcceptanceCriterion {
                 desc: "abre <2s".into(),
                 check_kind: CheckKind::default(),

@@ -44,6 +44,8 @@ pub struct Goal {
     pub phase: GoalPhase,
     /// O que o Maestro entendeu (`None` até o `GoalInterpreted`).
     pub interpretation: Option<String>,
+    /// A estratégia de execução proposta — o "como vou fazer" (`None` até o `GoalInterpreted`).
+    pub strategy: Option<String>,
     /// Critérios de aceite OBSERVÁVEIS — o setpoint do laço de qualidade.
     pub acceptance: Vec<AcceptanceCriterion>,
     /// ids dos `PlanItem` que servem a esta Goal.
@@ -83,6 +85,7 @@ pub fn project_goals(events: &[EventRecord]) -> Vec<Goal> {
                     statement,
                     phase: GoalPhase::Defined,
                     interpretation: None,
+                    strategy: None,
                     acceptance: Vec::new(),
                     items: Vec::new(),
                     iterations: 0,
@@ -91,11 +94,14 @@ pub fn project_goals(events: &[EventRecord]) -> Vec<Goal> {
             DomainEvent::GoalInterpreted {
                 goal_id,
                 interpretation,
+                strategy,
                 acceptance_criteria,
                 ..
             } => {
                 if let Some(g) = find_goal_mut(&mut goals, &goal_id) {
                     g.interpretation = Some(interpretation);
+                    // `None` quando vazia: o card só mostra "Como vou fazer" se há estratégia.
+                    g.strategy = (!strategy.is_empty()).then_some(strategy);
                     g.acceptance = acceptance_criteria;
                     g.phase = GoalPhase::Interpreted;
                 }
@@ -259,6 +265,11 @@ mod tests {
         assert_eq!(
             g.interpretation.as_deref(),
             Some("landing simples de captura")
+        );
+        assert_eq!(
+            g.strategy.as_deref(),
+            Some("1 dev frontend"),
+            "a estratégia do GoalInterpreted é projetada e preservada até o fim"
         );
         assert_eq!(g.acceptance, vec![crit("a página abre sem erro")]);
         assert_eq!(g.items, vec!["T1".to_string(), "T2".to_string()]);
