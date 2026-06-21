@@ -252,11 +252,13 @@ fn relight_unloaded(rt: &WsRuntime) -> usize {
     if pending.is_empty() {
         return 0;
     }
-    let plans: Vec<bridge::RestoredTerminal> =
+    let mut plans: Vec<bridge::RestoredTerminal> =
         bridge::plan_restore(&proj, &rt.profile_registry, rt.nodes.scrollback().as_ref())
             .into_iter()
             .filter(|p| pending.contains(&p.node))
             .collect();
+    // ADR 0037: re-lançar o CLI por caminho absoluto (o PATH pode estar pobre no boot via Dock).
+    crate::absolutize_restore_commands(&mut plans);
     rt.nodes.restore_terminals(&plans)
 }
 
@@ -571,7 +573,11 @@ pub fn boot_ws_runtime(
         && !std::env::var("LINA_NO_RESTORE").is_ok_and(|v| v.trim() == "1")
     {
         if let Some(proj) = &restore_proj {
-            let plans = bridge::plan_restore(proj, &profile_registry, nodes.scrollback().as_ref());
+            let mut plans =
+                bridge::plan_restore(proj, &profile_registry, nodes.scrollback().as_ref());
+            // ADR 0037: re-lançar o CLI por caminho absoluto — no boot via Dock o PATH é mínimo e
+            // o nome nu (`claude`) não resolveria; busca em dirs canônicos + nvm.
+            crate::absolutize_restore_commands(&mut plans);
             if plans.is_empty() {
                 eprintln!("lina-gpui: [RESTORE] nada a re-erguer (Espaço novo ou sem terminais)");
             } else {

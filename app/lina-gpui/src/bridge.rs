@@ -3928,6 +3928,21 @@ pub struct RestoredTerminal {
 /// do store): satisfaz "limpar projeções → replay → mesmo restore" (critério 4) e é testável
 /// headless (critérios 1/2/3). A FIAÇÃO no boot (chamar isto e re-spawnar) + o render do badge na
 /// tela moram no `main.rs` (território EXTERNO) — registrados como costura na entrega.
+/// **ADR 0037 / F1-4-3** — resolve o `profile id` de um nó a partir do seu `cli` projetado: o id
+/// direto (quando houve `CliProfileSet`), ou o SLUG do rótulo legado ("Claude Code" →
+/// "claude-code", gerações pré-`CliProfileSet`). `None` = sem profile conhecido no registry (nó
+/// shell puro / CLI ausente). Fonte ÚNICA da resolução — `plan_restore` (boot) e
+/// `restart_node_in_dir` (troca de pasta) leem a MESMA regra, nunca divergem.
+#[must_use]
+fn resolve_profile_id(registry: &ProfileRegistry, cli: &str) -> Option<String> {
+    if registry.get(cli).is_some() {
+        Some(cli.to_string())
+    } else {
+        let slug = cli.trim().to_lowercase().replace(' ', "-");
+        registry.get(&slug).is_some().then_some(slug)
+    }
+}
+
 #[allow(dead_code)] // ver nota em `RestoreBadge` (consumido pela costura de boot externa).
 #[must_use]
 pub fn plan_restore(
@@ -4023,17 +4038,14 @@ pub fn plan_restore(
         let has_prior_session = !scrollback_tail.is_empty();
 
         // `info.cli` é o profile id quando houve `CliProfileSet` (reducer: último vence); senão
-        // é o RÓTULO do motor ("Claude Code", gerações pré-CliProfileSet) ou o nome. Fallback
-        // pelo slug do rótulo ("Claude Code" → "claude-code"): sem ele, um claude de geração
-        // antiga re-erguia como shell puro silencioso (metade do bug "terminal empilhado").
-        let resolved_id = info.cli.as_deref().and_then(|c| {
-            if registry.get(c).is_some() {
-                Some(c.to_string())
-            } else {
-                let slug = c.trim().to_lowercase().replace(' ', "-");
-                registry.get(&slug).is_some().then_some(slug)
-            }
-        });
+        // é o RÓTULO do motor ("Claude Code", gerações pré-CliProfileSet) ou o nome. A resolução
+        // (id direto OU slug do rótulo) é fonte ÚNICA em `resolve_profile_id` — restore E o
+        // restart-in-dir do ADR 0037 leem a mesma regra (sem ele, um claude de geração antiga
+        // re-erguia como shell puro silencioso — metade do bug "terminal empilhado").
+        let resolved_id = info
+            .cli
+            .as_deref()
+            .and_then(|c| resolve_profile_id(registry, c));
         let profile = resolved_id.as_deref().and_then(|id| registry.get(id));
         let profile_id = resolved_id;
 
@@ -4632,6 +4644,123 @@ impl NodeManager {
         Ok(())
     }
 
+    /// **ADR 0037** — persiste a nova **Pasta de Trabalho** de um nó vivo: append de `NodeCwdSet`.
+    /// A projeção (`ProjectedNode.cwd`) passa a refletir a pasta editada e o restore re-entra nela
+    /// na próxima abertura (o caminho "só na próxima vez" da escolha do fundador). NÃO respawna —
+    /// o PID é preservado; quem re-ergue o nó AGORA na nova pasta é [`Self::restart_node_in_dir`],
+    /// sob escolha explícita do usuário. A cwd é DADO, nunca autoridade (identidade vem do env de
+    /// spawn, ADR 0026).
+    pub fn set_node_cwd(&self, node: NodeId, cwd: &Path) -> Result<(), String> {
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| format!("pasta com caminho não-UTF8: {}", cwd.display()))?;
+        let count = {
+            let mut s = lock(&self.store);
+            s.append(&DomainEvent::NodeCwdSet {
+                node,
+                cwd: cwd.to_string(),
+            })
+            .map_err(|e| e.to_string())?;
+            s.event_count().ok()
+        };
+        {
+            let mut m = lock(&self.model);
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
+        Ok(())
+    }
+
+    /// **ADR 0037/0039 — re-erguer um nó vivo (nova pasta e/ou novo motor).** O cwd e o "cérebro"
+    /// (CLI) de um processo Unix não mudam por fora, então trocar qualquer um = encerrar o nó VIVO
+    /// e re-erguer um sucessor, preservando nome/papel/posição/autonomia (a continuidade que o
+    /// usuário vê é a IDENTIDADE-NOME — ADR 0022 §2, não o PID). `new_cwd`: `Some` muda a pasta,
+    /// `None` mantém a atual (caso "só trocar motor"). `engine_override`: `Some` aplica o novo
+    /// motor, `None` reconstrói o motor ATUAL do nó (caso "só trocar pasta"). NÃO reusa
+    /// `restore_terminals` (desenhado p/ o boot com o model vazio): re-erguer um nó já no model
+    /// causaria re-layout. Removemos o vivo (libera nome + coordenada) e admitimos o sucessor na
+    /// MESMA posição; o novo `TerminalSpawned{cwd}` persiste a pasta. FreshStart deliberado (sem
+    /// `--resume`): reiniciar com novo cérebro/pasta é um recomeço. Devolve o `NodeId` do sucessor.
+    pub fn restart_node_in_dir(
+        &self,
+        node: NodeId,
+        new_cwd: Option<&Path>,
+        engine_override: Option<AgentEngine>,
+        registry: &ProfileRegistry,
+    ) -> Result<NodeId, String> {
+        // Estado a preservar: nome/papel/posição/CLI/cwd (projeção) + autonomia (model de UI).
+        let (name, role, cli, cwd_atual, x, y) = {
+            let proj = lock(&self.store).project().map_err(|e| e.to_string())?;
+            let info = proj
+                .nodes
+                .get(&node)
+                .ok_or_else(|| "este Agente não existe mais".to_string())?;
+            (
+                info.name
+                    .clone()
+                    .ok_or_else(|| "Agente sem nome — não reinicio às cegas".to_string())?,
+                info.role.clone().unwrap_or_else(|| "terminal".into()),
+                info.cli.clone(),
+                info.cwd.clone(),
+                info.x,
+                info.y,
+            )
+        };
+        // Pasta de destino: a nova (se trocou) ou a atual do nó (trocar só o motor não muda a pasta).
+        let cwd = match new_cwd {
+            Some(p) => p.to_path_buf(),
+            None => PathBuf::from(
+                cwd_atual
+                    .ok_or_else(|| "não sei a pasta deste Agente para reiniciá-lo".to_string())?,
+            ),
+        };
+        let autonomy = lock(&self.model)
+            .nodes
+            .get(&node)
+            .map_or(Autonomy::Assisted, |v| v.autonomy);
+        // Motor: o novo escolhido (troca de motor) OU o atual reconstruído do CLI (mesma resolução
+        // do restore). Sem `--resume`: reiniciar com novo cérebro/pasta é um recomeço.
+        let engine = engine_override.or_else(|| {
+            cli.as_deref().and_then(|c| {
+                let pid = resolve_profile_id(registry, c)?;
+                let p = registry.get(&pid)?;
+                Some(AgentEngine {
+                    program: p.program.clone(),
+                    args: p.args.clone(),
+                    profile_id: Some(pid),
+                    label: c.to_string(),
+                })
+            })
+        });
+        let mk = |position| NodeAdmission {
+            name: Some(name.clone()),
+            role: role.clone(),
+            engine: engine.clone(),
+            cwd: CwdPolicy::UserDir {
+                path: cwd.clone(),
+                // a pasta anterior já era consentida; re-entrar/trocar não é consentimento novo.
+                consent: true,
+            },
+            position,
+            requested_by: None, // gesto humano (edição), não spawn agente-pede
+            autonomy,
+            effort: Effort::Medium,
+        };
+        // Ordem: aposentar o vivo ANTES de admitir libera o NOME (admit não deduplica nome
+        // explícito) e a COORDENADA (o sucessor entra na MESMA posição). O único nó é a exceção
+        // (`remove_node` recusa esvaziar o canvas): admite-se primeiro, na vaga livre.
+        if self.count() > 1 {
+            self.remove_node(node)?;
+            self.admit_node(mk(Some((x, y))))
+        } else {
+            let new = self.admit_node(mk(None))?;
+            self.remove_node(node)?;
+            Ok(new)
+        }
+    }
+
     /// O `.lina/` do Espaço vivo (F1-2-2: os CLI Profiles do usuário moram em `<aqui>/profiles`).
     #[must_use]
     pub fn lina_home(&self) -> &std::path::Path {
@@ -4654,6 +4783,29 @@ impl NodeManager {
             .project()
             .ok()
             .and_then(|st| st.nodes.get(&node).and_then(|n| n.role.clone()))
+    }
+
+    /// **ADR 0037** — o cwd REAL corrente do nó (último `TerminalSpawned.cwd`/`NodeCwdSet`),
+    /// lido da PROJEÇÃO do log (o `NodeView` de UI não carrega cwd — projection-only, como o
+    /// role). Replay sob demanda: chamado só ao ABRIR o modal de edição, nunca por frame. O
+    /// modal mostra esta pasta de verdade e a usa de referência para detectar a troca no Salvar.
+    #[must_use]
+    pub fn node_cwd(&self, node: NodeId) -> Option<String> {
+        lock(&self.store)
+            .project()
+            .ok()
+            .and_then(|st| st.nodes.get(&node).and_then(|n| n.cwd.clone()))
+    }
+
+    /// **ADR 0039** — o CLI corrente do nó (`profile_id` quando houve `CliProfileSet`, senão o
+    /// rótulo legado), da PROJEÇÃO do log. O modal de edição usa para pré-selecionar o motor atual
+    /// e detectar a troca no Salvar. `None` = terminal sem motor (shell puro).
+    #[must_use]
+    pub fn node_cli(&self, node: NodeId) -> Option<String> {
+        lock(&self.store)
+            .project()
+            .ok()
+            .and_then(|st| st.nodes.get(&node).and_then(|n| n.cli.clone()))
     }
 
     /// **F1-2-3 p2 (seam p/ o modal de papéis)** — persiste um papel CUSTOM do usuário:
@@ -11122,6 +11274,67 @@ mod tests {
         assert_eq!(
             RestoreBadge::FreshStart.hover(),
             "A conversa de antes continua guardada aqui na tela — é só rolar para cima."
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **ADR 0037 — `restart_node_in_dir` re-ergue o nó na nova pasta.** Prova: o sucessor é um
+    /// nó NOVO (identidade-nome preservada, não o PID), com o MESMO nome/papel, na pasta NOVA
+    /// (novo `TerminalSpawned{cwd}` — a pasta persiste); o antigo é aposentado e a contagem do
+    /// canvas se mantém (um entra, um sai).
+    #[test]
+    fn restart_node_in_dir_re_ergue_preservando_identidade_na_nova_pasta() {
+        let base = std::env::temp_dir().join(format!("lina-restart-{}", std::process::id()));
+        let old_cwd = base.join("antiga");
+        let new_cwd = base.join("nova");
+        std::fs::create_dir_all(&old_cwd).expect("mkdir antiga");
+        std::fs::create_dir_all(&new_cwd).expect("mkdir nova");
+
+        let (nm, store, _model) = test_manager("restart", None);
+        // um agente "Worker" na pasta ANTIGA (engine None = shell `cat` da fábrica de teste).
+        let node = nm
+            .create_agent_with("Worker", None, Some(&old_cwd), Some("backend"), false)
+            .expect("cria Worker");
+        let cwd0 = lock(&store)
+            .project()
+            .unwrap()
+            .nodes
+            .get(&node)
+            .and_then(|n| n.cwd.clone());
+        assert!(
+            cwd0.as_deref().is_some_and(|p| p.ends_with("antiga")),
+            "sanity: o Worker nasceu na pasta antiga (cwd={cwd0:?})"
+        );
+        let antes = nm.count();
+
+        // reinicia na pasta NOVA (sem trocar motor → engine_override None; registry vazio →
+        // reconstrói como shell, suficiente p/ o teste).
+        let novo = nm
+            .restart_node_in_dir(node, Some(&new_cwd), None, &ProfileRegistry::new())
+            .expect("restart");
+        assert_ne!(
+            novo, node,
+            "o sucessor é um nó NOVO — continuidade é por identidade-nome, não pelo PID"
+        );
+        assert_eq!(
+            nm.count(),
+            antes,
+            "o canvas mantém a contagem (1 entra, 1 sai)"
+        );
+
+        let proj = lock(&store).project().unwrap();
+        let n = proj.nodes.get(&novo).expect("sucessor projetado");
+        assert_eq!(n.name.as_deref(), Some("Worker"), "nome preservado");
+        assert_eq!(n.role.as_deref(), Some("backend"), "papel preservado");
+        assert!(
+            n.cwd.as_deref().is_some_and(|p| p.ends_with("nova")),
+            "o novo TerminalSpawned persiste a pasta nova (cwd={:?})",
+            n.cwd
+        );
+        assert!(
+            !proj.nodes.contains_key(&node),
+            "o nó antigo foi aposentado (NodeRemoved)"
         );
 
         let _ = std::fs::remove_dir_all(&base);

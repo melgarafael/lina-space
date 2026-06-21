@@ -2636,6 +2636,11 @@ impl WorkspaceView {
             return; // nó sumiu entre o build da paleta e o clique — nada a editar.
         };
         let role = self.nodes.node_role(node);
+        // ADR 0037: o cwd REAL do nó (projeção do log) — o modal mostra a pasta de verdade e a
+        // usa para detectar a troca no Salvar.
+        let cwd = self.nodes.node_cwd(node);
+        // ADR 0039: o motor atual do nó — pré-seleciona o chip certo e detecta a troca de motor.
+        let cli = self.nodes.node_cli(node);
         let modal = agent_modal::AgentModal::new_edit(
             Arc::new(role_suggester::W31Suggester),
             node,
@@ -2644,6 +2649,8 @@ impl WorkspaceView {
             // FIX-3 costura: o nível REAL do nó (per-Agente, `NodeView.autonomy`) — o modal de
             // edição mostra o MESMO que o badge do card (consistência badge↔modal).
             node_autonomy,
+            cwd.as_deref().map(std::path::Path::new),
+            cli.as_deref(),
             self.live_names(),
         );
         self.open_agent_modal(modal, cx);
@@ -2761,6 +2768,14 @@ impl WorkspaceView {
         }
     }
 
+    /// ADR 0037: liga/desliga "reiniciar agora na nova pasta" (toggle do modal de edição).
+    fn modal_toggle_restart_now(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.toggle_restart_now();
+            cx.notify();
+        }
+    }
+
     fn modal_focus(&mut self, f: agent_modal::FocusField, cx: &mut Context<Self>) {
         if let Some(m) = self.agent_modal.as_mut() {
             m.set_focus(f);
@@ -2850,14 +2865,65 @@ impl WorkspaceView {
                     p.autonomy,
                 )
                 .map(Some),
-            Plan::Save(p) => self
-                .nodes
-                .rename_node(p.node, &p.name)
-                .and_then(|()| match &p.role {
-                    Some(role) => self.nodes.assign_role(p.node, role),
-                    None => Ok(()),
-                })
-                .map(|()| None),
+            Plan::Save(p) => {
+                // ADR 0037: valida a nova Pasta de Trabalho ANTES de qualquer mutação —
+                // atomicidade (não renomeia para depois falhar na pasta) E segurança (NUNCA
+                // remove o nó vivo do `restart` se a pasta for inválida → o terminal não some).
+                // `validate_workdir` canonicaliza + PROVA escrita (mesma garantia do M9). `None`
+                // = a pasta não mudou.
+                let cwd_validated: Result<Option<std::path::PathBuf>, String> = match &p.cwd {
+                    Some(c) => workspace_boot::validate_workdir(c.as_path())
+                        .map(Some)
+                        .map_err(|e| e.to_string()),
+                    None => Ok(None),
+                };
+                match cwd_validated {
+                    Err(e) => Err(e),
+                    Ok(cwd) => {
+                        let renamed =
+                            self.nodes
+                                .rename_node(p.node, &p.name)
+                                .and_then(|()| match &p.role {
+                                    Some(role) => self.nodes.assign_role(p.node, role),
+                                    None => Ok(()),
+                                });
+                        if let Err(e) = renamed {
+                            Err(e)
+                        } else if let Some(new_engine) = p.engine.clone() {
+                            // ADR 0039: o MOTOR mudou → re-ergue o Agente com o novo CLI (e na nova
+                            // pasta, se também trocou; senão `None` mantém a pasta atual). Trocar o
+                            // cérebro de um terminal vivo é encerrá-lo e recriá-lo com o novo motor.
+                            let profiles = agent_modal::load_profiles(&agent_modal::profiles_dir(
+                                self.nodes.lina_home(),
+                            ));
+                            self.nodes
+                                .restart_node_in_dir(
+                                    p.node,
+                                    cwd.as_deref(),
+                                    Some(new_engine),
+                                    &profiles,
+                                )
+                                .map(Some)
+                        } else if let Some(c) = cwd {
+                            // ADR 0037: `restart_now` re-ergue na nova pasta AGORA (o novo
+                            // `TerminalSpawned{cwd}` persiste); senão só grava `NodeCwdSet` (a pasta
+                            // passa a valer na próxima abertura — o caminho "só na próxima vez").
+                            if p.restart_now {
+                                let profiles = agent_modal::load_profiles(
+                                    &agent_modal::profiles_dir(self.nodes.lina_home()),
+                                );
+                                self.nodes
+                                    .restart_node_in_dir(p.node, Some(&c), None, &profiles)
+                                    .map(Some)
+                            } else {
+                                self.nodes.set_node_cwd(p.node, &c).map(|()| None)
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                }
+            }
         };
         match result {
             Ok(created) => {
@@ -2896,7 +2962,13 @@ impl WorkspaceView {
                 // a mensagem genérica e o detalhe técnico vai ao stderr).
                 eprintln!("lina-gpui: M6 — commit falhou: {e}");
                 if let Some(m) = self.agent_modal.as_mut() {
-                    let leiga = if e.starts_with("não consigo trabalhar nessa pasta") {
+                    // Mensagens LEIGAS de pasta (spawn ou `WorkdirError` da edição ADR 0037)
+                    // aparecem inteiras; o resto cai na genérica (detalhe técnico só no stderr).
+                    let lower = e.to_lowercase();
+                    let leiga = if lower.starts_with("não consigo trabalhar nessa pasta")
+                        || lower.starts_with("essa pasta não está acessível")
+                        || lower.starts_with("não consegui criar a pasta")
+                    {
                         e
                     } else {
                         agent_modal::COPY_ERR_COMMIT.to_string()
@@ -4772,17 +4844,13 @@ impl Render for WorkspaceView {
                 .bg(rgb(th.accent.confirm))
                 .text_color(rgb(th.text.on_accent))
                 .cursor_pointer()
-                .on_click(cx.listener(|view, _ev: &ClickEvent, window, _cx| {
-                    // Cria um shell real novo, idêntico aos demais, foca e o TRAZ p/ a viewport.
-                    match view.nodes.add_node() {
-                        Ok(node) => {
-                            view.focus(node);
-                            view.reveal(node, window);
-                        }
-                        Err(e) => eprintln!("lina-gpui: add_node: {e}"),
-                    }
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                    // Criar abre o MODAL de configuração (motor/papel/pasta) — a porta RICA. Antes
+                    // criava um shell puro DIRETO (sem escolher CLI), e o leigo ficava sem o claude
+                    // (bug de tela 2026-06-20). O atalho ⌘T segue criando o shell rápido p/ avançados.
+                    view.open_agent_modal_create(cx);
                 }))
-                .child(text!("➕ Terminal")),
+                .child(text!("➕ Novo Terminal")),
         );
 
         // F1-2-2 · M6 "Novo Agente": o botão abre o MODAL (evoluiu o modo-nomeação M2; ⌘N idem).
@@ -5318,13 +5386,14 @@ fn path_looks_hydrated(path: &str) -> bool {
 /// nvm fica de fora de propósito (dirs versionados, sem `current/bin` estável).
 fn known_cli_dir_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
     vec![
-        home.join(".local/bin"),
+        home.join(".local/bin"), // claude, agy (instaladores oficiais) — bug de tela 2026-06-20
         std::path::PathBuf::from("/opt/homebrew/bin"),
         std::path::PathBuf::from("/usr/local/bin"),
         home.join(".cargo/bin"),
         home.join(".bun/bin"),
         home.join(".volta/bin"),
         home.join(".deno/bin"),
+        home.join(".opencode/bin"), // opencode (instalador próprio) — fora do PATH do Dock
     ]
 }
 
@@ -5338,33 +5407,134 @@ fn existing_dirs(candidates: &[std::path::PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// **Fallback determinístico da hidratação (bug de tela 2026-06-11).** O `zsh -lic` é
-/// best-effort com timeout de 2s; sob carga (quit pesado + reabertura imediata) ele estoura
-/// e o app ficava com o PATH mínimo do launchd — NENHUM motor (`claude`/`codex`/`gemini`,
-/// declarados por NOME no CLI Profile) spawnava, e o restore descartava os nós em silêncio.
-/// Aqui, se o PATH efetivo ainda não está rico, unimos os dirs conhecidos que EXISTEM no
-/// disco — instantâneo e suficiente para o exec achar o binário; o rc do usuário deixa de
-/// ser ponto único de falha do boot.
+/// **Garante os dirs de CLI conhecidos no PATH — SEMPRE, não só quando o PATH "parece pobre".**
+///
+/// Bug de tela 2026-06-11: o `zsh -lic` é best-effort com timeout de 2s; sob carga ele estoura e
+/// o app ficava com o PATH mínimo do launchd — nenhum motor spawnava no restore.
+///
+/// Bug de tela 2026-06-20 (a razão do `path_looks_hydrated` ter saído daqui): "parece hidratado"
+/// (tem `/opt/homebrew/bin`) NÃO garante `~/.local/bin` (onde mora o `claude`/`agy`) nem
+/// `~/.opencode/bin`. Um login shell não-interativo costuma exportar o Homebrew mas não esses —
+/// então a DESCOBERTA de CLIs (modal) e o restore só enxergavam codex/gemini, e claude/opencode/
+/// antigravity SUMIAM da lista de motores. Agora unimos SEMPRE os dirs conhecidos que EXISTEM,
+/// adicionando só os que FALTAM no PATH atual. Determinístico (`is_dir`, sem shell).
 #[cfg(unix)]
-fn hydrate_path_fallback_known_dirs() {
+fn ensure_known_cli_dirs_in_path() {
     let effective = std::env::var("PATH").unwrap_or_default();
-    if path_looks_hydrated(&effective) {
-        return;
-    }
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let known = existing_dirs(&known_cli_dir_candidates(std::path::Path::new(&home)));
-    if known.is_empty() {
+    let missing = missing_cli_dirs(&effective, std::path::Path::new(&home));
+    if missing.is_empty() {
         return;
     }
-    let augmented = augmented_verify_path(&effective, &known);
+    let augmented = augmented_verify_path(&effective, &missing);
     // edition 2021: `set_var` é seguro (e rodamos antes de qualquer thread/janela subir).
     std::env::set_var("PATH", augmented.as_str());
     eprintln!(
-        "lina-gpui: PATH completado com {} dir(s) conhecidos de CLI (shell de login indisponível)",
-        known.len()
+        "lina-gpui: PATH completado com {} dir(s) de CLI ({}) — descoberta e spawn agora os enxergam",
+        missing.len(),
+        missing.join(", ")
     );
+}
+
+/// Núcleo PURO de [`ensure_known_cli_dirs_in_path`]: os dirs de CLI conhecidos que EXISTEM e
+/// FALTAM no `path_env`. Puro (depende só de `path_env` + `home` + FS) → testável sem mexer no
+/// ambiente. É o que prova a regressão do bug de tela 2026-06-20: `~/.local/bin` precisa entrar
+/// AINDA QUE o PATH já tenha o Homebrew ("parecer rico" ≠ ter o dir do `claude`).
+#[cfg(unix)]
+fn missing_cli_dirs(path_env: &str, home: &std::path::Path) -> Vec<String> {
+    let known = existing_dirs(&known_cli_dir_candidates(home));
+    let present: std::collections::HashSet<String> = std::env::split_paths(path_env)
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    known.into_iter().filter(|d| !present.contains(d)).collect()
+}
+
+/// **ADR 0037 / Melhoria CLI-no-boot** — os dirs `bin` das versões de Node instaladas via **nvm**
+/// (`~/.nvm/versions/node/<v>/bin`). O fallback de hidratação os exclui de propósito (não há
+/// `current/bin` estável), MAS é exatamente aí que um `claude` instalado por `npm i -g` sob nvm
+/// vive — e onde o restore via Dock o perdia (PATH mínimo do launchd + login shell estourando o
+/// timeout). Determinístico (`read_dir`, sem shell). Vazio se não houver nvm. **Puro** (depende
+/// só do home + FS), testável injetando um `home` sintético.
+#[cfg(unix)]
+fn nvm_bin_dirs(home: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path().join("bin"))
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    out.sort(); // determinístico (qualquer versão serve — é o mesmo CLI; só precisamos achar UM).
+    out
+}
+
+/// **ADR 0037 / Melhoria CLI-no-boot** — resolve o programa de um CLI (nome nu como `claude`)
+/// para o seu CAMINHO ABSOLUTO, buscando ALÉM do `PATH` do processo: dirs canônicos de CLI
+/// (`known_cli_dir_candidates`) + os dirs versionados do nvm. É o que faz o restore re-lançar o
+/// `claude` mesmo quando o app sobe pelo Dock com o PATH mínimo e o login shell falhou. O `PATH`
+/// vem PRIMEIRO (quando o login shell funcionou, ele já é a verdade); os extras são fallback.
+/// `None` = nada a trocar (já tem `/` → o exec resolve sozinho; ou não foi encontrado em lugar
+/// nenhum → o restore degrada honestamente como hoje). Best-effort; `find_in_path` é puro.
+#[cfg(unix)]
+pub(crate) fn resolve_cli_program(program: &str) -> Option<String> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    resolve_cli_program_in(program, &path_env, home.as_deref())
+}
+
+/// Núcleo PURO de [`resolve_cli_program`] (injeta `path_env` + `home` p/ teste determinístico,
+/// sem tocar o ambiente do processo). O `PATH` vem primeiro; os dirs canônicos + nvm são fallback.
+#[cfg(unix)]
+fn resolve_cli_program_in(
+    program: &str,
+    path_env: &str,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
+    if program.contains('/') {
+        return None; // caminho (absoluto/relativo) já é resolvível pelo exec — não mexe.
+    }
+    let mut search = path_env.to_string();
+    if let Some(home) = home {
+        let mut extra = existing_dirs(&known_cli_dir_candidates(home));
+        extra.extend(nvm_bin_dirs(home));
+        for d in extra {
+            if !d.is_empty() {
+                search.push(':');
+                search.push_str(&d);
+            }
+        }
+    }
+    lina_core::find_in_path(program, &search).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// No-op fora de unix (Windows resolve o exe pelo PATH/extensões do SO — sem o problema do launchd).
+#[cfg(not(unix))]
+pub(crate) fn resolve_cli_program(_program: &str) -> Option<String> {
+    None
+}
+
+/// **ADR 0037 / Melhoria CLI-no-boot** — reescreve o programa (`command[0]`) de cada terminal a
+/// re-erguer para o caminho ABSOLUTO resolvido por [`resolve_cli_program`], quando encontrável.
+/// Aplicado entre `plan_restore` e `restore_terminals` nos DOIS caminhos de restore (boot e
+/// religação de Espaço descarregado): blinda o re-lançamento do CLI contra o PATH pobre do Dock.
+pub(crate) fn absolutize_restore_commands(plans: &mut [bridge::RestoredTerminal]) {
+    for p in plans {
+        if let Some(first) = p.command.first() {
+            if let Some(abs) = resolve_cli_program(first) {
+                if abs != *first {
+                    eprintln!(
+                        "lina-gpui: [RESTORE] CLI '{first}' resolvido para caminho absoluto \
+                         (PATH do boot não o cobria): {abs}"
+                    );
+                    p.command[0] = abs;
+                }
+            }
+        }
+    }
 }
 
 /// Extrai o PATH carimbado pela sentinela `marker` no stdout do shell de login (ignora ruído de rc).
@@ -5438,22 +5608,24 @@ pub(crate) fn resolve_login_shell_path() -> Option<String> {
 #[cfg(unix)]
 fn hydrate_path_from_login_shell() {
     let current = std::env::var("PATH").unwrap_or_default();
-    if path_looks_hydrated(&current) {
-        return; // já rico (terminal ou já hidratado) → não mexe.
-    }
-    if let Some(resolved) = resolve_login_shell_path() {
-        if resolved != current {
-            // edition 2021: `set_var` é seguro (e rodamos antes de qualquer thread/janela subir).
-            std::env::set_var("PATH", resolved.as_str());
-            eprintln!(
-                "lina-gpui: PATH hidratado do shell de login ({} entradas) — CLIs/npm agora visíveis",
-                resolved.split(':').count()
-            );
+    // Resolução via login shell só quando o PATH parece POBRE (evita o custo do subshell quando
+    // já estamos num terminal). NÃO retornamos aqui: mesmo com o PATH "rico" (Homebrew presente),
+    // ~/.local/bin (claude/agy) e ~/.opencode/bin podem estar de fora — o `ensure` abaixo SEMPRE
+    // roda. (bug de tela 2026-06-20: o `return` antigo aqui pulava o `ensure` e claude sumia.)
+    if !path_looks_hydrated(&current) {
+        if let Some(resolved) = resolve_login_shell_path() {
+            if resolved != current {
+                // edition 2021: `set_var` é seguro (rodamos antes de qualquer thread/janela subir).
+                std::env::set_var("PATH", resolved.as_str());
+                eprintln!(
+                    "lina-gpui: PATH hidratado do shell de login ({} entradas) — CLIs/npm agora visíveis",
+                    resolved.split(':').count()
+                );
+            }
         }
     }
-    // Defesa em profundidade: timeout/falha do shell de login (ou rc que devolve PATH pobre)
-    // NÃO pode deixar o boot sem os motores — o restore descartava nós por isso (2026-06-11).
-    hydrate_path_fallback_known_dirs();
+    // SEMPRE garante os dirs de CLI conhecidos — independente de o PATH "parecer hidratado".
+    ensure_known_cli_dirs_in_path();
 }
 
 /// No-op fora de unix (Windows não tem o problema do PATH de `launchd`; o de-risk do ConPTY é à parte).
@@ -6047,6 +6219,7 @@ mod path_tests {
             "/Users/x/.bun/bin",
             "/Users/x/.volta/bin",
             "/Users/x/.deno/bin",
+            "/Users/x/.opencode/bin",
         ] {
             assert!(
                 got.iter().any(|p| p == std::path::Path::new(want)),
@@ -6068,6 +6241,100 @@ mod path_tests {
         let got = existing_dirs(&[real.clone(), ghost]);
         assert_eq!(got, vec![real.to_string_lossy().into_owned()]);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ADR 0037 / Melhoria CLI-no-boot: `nvm_bin_dirs` enxerga os `bin` versionados do nvm que o
+    /// fallback canônico ignora — é onde um `claude` instalado por `npm i -g` sob nvm vive.
+    #[cfg(unix)]
+    #[test]
+    fn nvm_bin_dirs_finds_versioned_node_bins() {
+        let home = std::env::temp_dir().join(format!("lina-nvm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let v20 = home.join(".nvm/versions/node/v20.1.0/bin");
+        let v18 = home.join(".nvm/versions/node/v18.0.0/bin");
+        std::fs::create_dir_all(&v20).expect("v20");
+        std::fs::create_dir_all(&v18).expect("v18");
+        let got = nvm_bin_dirs(&home);
+        assert!(
+            got.iter().any(|d| d.ends_with("v20.1.0/bin")),
+            "viu v20: {got:?}"
+        );
+        assert!(
+            got.iter().any(|d| d.ends_with("v18.0.0/bin")),
+            "viu v18: {got:?}"
+        );
+        // sem nvm → vazio (degrada honestamente, nunca panica).
+        let nada = std::env::temp_dir().join(format!("lina-sem-nvm-{}", std::process::id()));
+        assert!(nvm_bin_dirs(&nada).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ADR 0037 / Melhoria CLI-no-boot: o cerne do fix — `resolve_cli_program_in` acha o `claude`
+    /// num dir nvm do home QUANDO o `PATH` do boot (mínimo do Dock) NÃO o contém. É o que faz o
+    /// restore re-lançar o CLI por caminho absoluto em vez de degradar para shell.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_cli_program_finds_binary_outside_minimal_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("lina-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let nvm_bin = home.join(".nvm/versions/node/v20.1.0/bin");
+        std::fs::create_dir_all(&nvm_bin).expect("nvm bin");
+        let claude = nvm_bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").expect("write claude");
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        // PATH mínimo do launchd (sem claude) → resolve pelo dir nvm do home.
+        let got = resolve_cli_program_in("claude", "/usr/bin:/bin", Some(&home));
+        assert_eq!(
+            got.as_deref(),
+            claude.to_str(),
+            "acha o claude no dir nvm fora do PATH mínimo"
+        );
+        // já-caminho não é tocado (o exec resolve sozinho).
+        assert_eq!(
+            resolve_cli_program_in("/usr/local/bin/claude", "/usr/bin", Some(&home)),
+            None
+        );
+        // binário inexistente → None: o restore degrada honestamente (não inventa caminho).
+        assert_eq!(
+            resolve_cli_program_in("binario-que-nao-existe-xyz", "/usr/bin", Some(&home)),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// **Regressão do bug de tela 2026-06-20** (claude/opencode/agy somem do modal): `~/.local/bin`
+    /// e `~/.opencode/bin` TÊM que entrar no PATH mesmo quando ele já "parece rico" (tem Homebrew)
+    /// — "parecer hidratado" ≠ "ter o dir do claude". O `return` antigo na hidratação pulava isso.
+    #[cfg(unix)]
+    #[test]
+    fn missing_cli_dirs_includes_local_bin_even_with_homebrew_present() {
+        let home = std::env::temp_dir().join(format!("lina-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/bin")).expect(".local/bin");
+        std::fs::create_dir_all(home.join(".opencode/bin")).expect(".opencode/bin");
+
+        // PATH "rico" (Homebrew) mas SEM ~/.local/bin nem ~/.opencode/bin → ambos faltam.
+        let missing = missing_cli_dirs("/opt/homebrew/bin:/usr/bin", &home);
+        assert!(
+            missing.iter().any(|d| d.ends_with("/.local/bin")),
+            "faltou ~/.local/bin (onde mora o claude): {missing:?}"
+        );
+        assert!(
+            missing.iter().any(|d| d.ends_with("/.opencode/bin")),
+            "faltou ~/.opencode/bin: {missing:?}"
+        );
+        // já-presente não re-entra (idempotente).
+        let local = home.join(".local/bin");
+        let with_local = format!("{}:/opt/homebrew/bin", local.display());
+        assert!(
+            !missing_cli_dirs(&with_local, &home)
+                .iter()
+                .any(|d| d.ends_with("/.local/bin")),
+            "~/.local/bin já estava no PATH — não deve re-entrar"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Fim-a-fim puro: PATH mínimo do launchd + fallback de dirs conhecidos existentes →

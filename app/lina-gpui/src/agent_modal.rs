@@ -89,6 +89,15 @@ pub fn copy_tpl_dup_name(label: &str) -> String {
 pub const COPY_CWD_LABEL: &str = "Pasta de trabalho";
 pub const COPY_CWD_DEFAULT: &str = "a pasta deste Espaço";
 pub const COPY_CWD_PICK: &str = "Trocar…";
+// ADR 0037 — "reiniciar agora na nova pasta": só aparece no Editar quando a pasta MUDOU. A pasta
+// é salva de qualquer forma (vale na próxima abertura); ligar isto re-ergue o Agente já na pasta
+// nova, encerrando o que estiver rodando (opt-in explícito — nada se encerra por inércia).
+pub const COPY_RESTART_LABEL: &str = "Reiniciar este Agente na nova pasta agora";
+pub const COPY_RESTART_DETAIL_ON: &str =
+    "Ao salvar, o Agente fecha e abre de novo já na pasta nova. O que estiver rodando agora é \
+     encerrado.";
+pub const COPY_RESTART_DETAIL_OFF: &str =
+    "A pasta nova passa a valer na próxima vez que você abrir o Lina. Nada é encerrado agora.";
 // Rodada 360 (ADR 0022 §4) — consentimento do kit em pasta própria. RASCUNHO: o texto
 // final passa pelo fundador no gate (escrever na pasta do usuário é decisão de produto).
 pub const COPY_CONSENT_LABEL: &str = "Deixar a Lina preparar esta pasta para o time";
@@ -197,7 +206,8 @@ pub const COPY_DISCARD_ARMED: &str = "Descartar este Agente? (Esc de novo descar
 /// o detalhe técnico vai ao stderr.
 pub const COPY_ERR_COMMIT: &str =
     "Não consegui criar agora — o motor pode ter mudado. Tente de novo ou escolha outro.";
-pub const COPY_EDIT_ENGINE_LOCKED: &str = "⚠ trocar o motor reinicia o Agente — em breve";
+pub const COPY_EDIT_ENGINE_RESTART_WARN: &str =
+    "⚠ Trocar o motor reinicia este Agente com o novo CLI. O que estiver rodando agora é encerrado.";
 pub const COPY_EDIT_APPLY_NOTE: &str = "Mudanças de nome e papel valem agora.";
 pub const COPY_WHY_PREFIX: &str = "ⓘ por quê?";
 
@@ -895,6 +905,16 @@ pub struct SavePlan {
     pub role: Option<String>,
     /// FIX-3: autonomia a aplicar (None = não mudou) — mesma semântica do `role`.
     pub autonomy: Option<Autonomy>,
+    /// ADR 0037: nova Pasta de Trabalho a gravar (`None` = não mudou — mesma semântica de
+    /// `role`/`autonomy`). Persiste via `NodeCwdSet`; o restore re-entra nela. `Some` só
+    /// quando o caminho escolhido DIFERE do cwd atual do nó.
+    pub cwd: Option<PathBuf>,
+    /// ADR 0037: o usuário pediu para RE-ERGUER o nó na nova pasta AGORA (`false` = só na
+    /// próxima abertura, default conservador). Só tem efeito com `cwd: Some`.
+    pub restart_now: bool,
+    /// ADR 0039: novo MOTOR a aplicar (`None` = não mudou). Trocar o motor re-ergue o Agente com
+    /// o novo CLI (o cérebro de um terminal vivo não troca sem reiniciar o processo).
+    pub engine: Option<AgentEngine>,
 }
 
 /// O modal M6/M6-E — estado puro (nenhum gpui; nenhum evento até Criar/Salvar).
@@ -911,8 +931,23 @@ pub struct AgentModal {
     role_pinned: bool,
     engines: EngineScan,
     selected_engine: usize,
-    /// Pasta escolhida (None = default leigo "a pasta deste Espaço").
+    /// ADR 0039: o `profile_id` do motor ATUAL do nó (modo EDITAR) — referência para detectar a
+    /// troca de motor no Salvar e para pré-selecionar o chip certo quando a descoberta chega.
+    /// `None` no Create ou em nó sem CLI (shell puro).
+    original_profile_id: Option<String>,
+    /// ADR 0039: o usuário CLICOU num chip de motor (no Editar). Sem isto, o reset de
+    /// `selected_engine` para 0 quando a descoberta chega marcaria uma "troca" que ninguém pediu.
+    engine_touched: bool,
+    /// Pasta escolhida (None = default leigo "a pasta deste Espaço"). No modo EDITAR nasce com
+    /// o cwd REAL do nó (ADR 0037) — o campo mostra a pasta de verdade, não o default genérico.
     cwd: Option<PathBuf>,
+    /// ADR 0037: o cwd ORIGINAL do nó ao abrir o Editar — para detectar mudança real no Salvar
+    /// (mesmo papel do `original` para nome/papel). `None` no Create.
+    original_cwd: Option<PathBuf>,
+    /// ADR 0037: o usuário marcou "reiniciar agora na nova pasta" (toggle que só aparece no
+    /// Editar quando a pasta mudou). Default `false` = só na próxima abertura (não encerra um
+    /// processo vivo por inércia).
+    restart_now: bool,
     /// Rodada 360 (ADR 0022 §4): consentimento p/ a Lina criar os arquivos de orquestração
     /// na pasta própria. Opt-in EXPLÍCITO (nasce `false`); irrelevante com `cwd: None`.
     kit_consent: bool,
@@ -955,7 +990,11 @@ impl AgentModal {
             role_pinned: false,
             engines: EngineScan::Scanning,
             selected_engine: 0,
+            original_profile_id: None,
+            engine_touched: false,
             cwd: None,
+            original_cwd: None,
+            restart_now: false,
             kit_consent: false,
             advanced: false,
             command: None,
@@ -978,6 +1017,9 @@ impl AgentModal {
 
     /// Modal em modo EDITAR (M6-E): pré-preenchido com o estado atual do nó.
     /// `autonomy` = o nível EFETIVO do Agente hoje (fonte: workspace, até a costura por-agente).
+    // Construtor que ESPELHA o estado do nó (nome/papel/autonomia/cwd/motor) — cada parâmetro é um
+    // campo distinto pré-preenchido; agrupá-los num struct só p/ o lint seria cerimônia sem ganho.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new_edit(
         suggester: Arc<dyn RoleSuggester>,
@@ -985,11 +1027,20 @@ impl AgentModal {
         name: &str,
         role_canon: Option<&str>,
         autonomy: Autonomy,
+        cwd: Option<&Path>,
+        current_profile_id: Option<&str>,
         existing: Vec<String>,
     ) -> Self {
         let mut m = Self::new_create(suggester, existing);
         m.mode = ModalMode::Edit { node };
         m.name = name.to_string();
+        // ADR 0037: o campo "Pasta de trabalho" mostra o cwd REAL do nó (não o default leigo);
+        // `original_cwd` é a referência para detectar a troca no Salvar.
+        m.cwd = cwd.map(Path::to_path_buf);
+        m.original_cwd = cwd.map(Path::to_path_buf);
+        // ADR 0039: o motor ATUAL do nó — referência da troca + pré-seleção do chip quando a
+        // descoberta chega (`set_engines`).
+        m.original_profile_id = current_profile_id.map(str::to_string);
         m.role = role_canon.map(|r| {
             let (label, blurb) = humanize(r);
             RoleSuggestion {
@@ -1360,18 +1411,58 @@ impl AgentModal {
             if idx < v.len() {
                 self.selected_engine = idx;
                 self.command = None; // o comando derivado segue o motor novo
+                self.engine_touched = true; // ADR 0039: clique consciente — habilita a troca no Salvar
             }
         }
     }
 
-    /// Resultado da descoberta off-thread (ou snapshot injetado em teste).
+    /// Resultado da descoberta off-thread (ou snapshot injetado em teste). No modo EDITAR,
+    /// pré-seleciona o motor ATUAL do nó (ADR 0039) — senão o reset para 0 (1º da lista, claude)
+    /// marcaria uma troca falsa para um nó que já é codex/gemini.
     pub fn set_engines(&mut self, engines: Vec<Engine>) {
+        self.selected_engine = self
+            .original_profile_id
+            .as_deref()
+            .and_then(|pid| {
+                engines
+                    .iter()
+                    .position(|e| e.profile_id.as_deref() == Some(pid))
+            })
+            .unwrap_or(0);
         self.engines = EngineScan::Ready(engines);
-        self.selected_engine = 0;
     }
 
     pub fn set_cwd(&mut self, p: PathBuf) {
         self.cwd = Some(p);
+    }
+
+    /// ADR 0039: o motor foi trocado em relação ao do nó? (gate do aviso de reinício). Só conta
+    /// se o usuário CLICOU num chip (`engine_touched`) E o profile selecionado difere do atual.
+    #[must_use]
+    pub fn engine_changed(&self) -> bool {
+        self.engine_touched
+            && self
+                .build_engine()
+                .is_some_and(|e| e.profile_id != self.original_profile_id)
+    }
+
+    /// ADR 0037: a Pasta de Trabalho foi trocada em relação ao estado ORIGINAL do nó? Gate do
+    /// toggle "reiniciar agora" — ele só aparece (no Editar) quando há de fato pasta nova a aplicar.
+    #[must_use]
+    pub fn cwd_changed(&self) -> bool {
+        self.cwd != self.original_cwd
+    }
+
+    /// ADR 0037: o usuário marcou "reiniciar este Agente na nova pasta agora"? (só efetivo com
+    /// a pasta trocada — ver `save_plan`).
+    #[must_use]
+    pub fn restart_now(&self) -> bool {
+        self.restart_now
+    }
+
+    /// ADR 0037: liga/desliga o "reiniciar agora" (clique na linha do modal de edição).
+    pub fn toggle_restart_now(&mut self) {
+        self.restart_now = !self.restart_now;
     }
 
     /// Rodada 360 (ADR 0022 §4): há pasta PRÓPRIA escolhida? (gate da linha de consentimento —
@@ -1402,18 +1493,16 @@ impl AgentModal {
         false
     }
 
-    /// Valida e monta o plano de CRIAÇÃO (critérios 1/3/4/5): nome leigo obrigatório, motor
-    /// detectado obrigatório (estado vazio aponta o caminho de instalar — nunca beco), dedup de
-    /// nome com sufixo. **Nenhum evento aqui** — quem commita é o caller com o plano.
-    pub fn create_plan(&mut self) -> Result<CreatePlan, String> {
-        let name = self.name.trim().to_string();
-        if name.is_empty() {
-            return Err(COPY_ERR_EMPTY_NAME.to_string());
-        }
+    /// Monta o [`AgentEngine`] do motor SELECIONADO, respeitando o override de comando do
+    /// Avançado. `None` se a descoberta ainda não terminou ou não há motor. Fonte ÚNICA da
+    /// montagem do motor — `create_plan` (criar) e `save_plan` (trocar motor, ADR 0039) usam-na.
+    #[must_use]
+    fn build_engine(&self) -> Option<AgentEngine> {
         let engine = match &self.engines {
-            EngineScan::Scanning => return Err(COPY_ERR_SCANNING.to_string()),
-            EngineScan::Ready(v) if v.is_empty() => return Err(COPY_ERR_NO_ENGINE.to_string()),
-            EngineScan::Ready(v) => v[self.selected_engine.min(v.len() - 1)].clone(),
+            EngineScan::Ready(v) if !v.is_empty() => {
+                v[self.selected_engine.min(v.len() - 1)].clone()
+            }
+            _ => return None,
         };
         // Comando final: override do Avançado (split simples; modo técnico) ou o do profile.
         let (program, args) = match &self.command {
@@ -1424,17 +1513,36 @@ impl AgentModal {
             }
             _ => (engine.program.clone(), engine.args.clone()),
         };
+        Some(AgentEngine {
+            program,
+            args,
+            profile_id: engine.profile_id.clone(),
+            label: engine.label.clone(),
+        })
+    }
+
+    /// Valida e monta o plano de CRIAÇÃO (critérios 1/3/4/5): nome leigo obrigatório, motor
+    /// detectado obrigatório (estado vazio aponta o caminho de instalar — nunca beco), dedup de
+    /// nome com sufixo. **Nenhum evento aqui** — quem commita é o caller com o plano.
+    pub fn create_plan(&mut self) -> Result<CreatePlan, String> {
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            return Err(COPY_ERR_EMPTY_NAME.to_string());
+        }
+        match &self.engines {
+            EngineScan::Scanning => return Err(COPY_ERR_SCANNING.to_string()),
+            EngineScan::Ready(v) if v.is_empty() => return Err(COPY_ERR_NO_ENGINE.to_string()),
+            EngineScan::Ready(_) => {}
+        }
+        let engine = self
+            .build_engine()
+            .ok_or_else(|| COPY_ERR_NO_ENGINE.to_string())?;
         let unique = unique_name(&name, &self.existing);
         let dup_note = (unique != name).then(|| copy_dup_note(&unique));
         Ok(CreatePlan {
             name: unique,
             dup_note,
-            engine: AgentEngine {
-                program,
-                args,
-                profile_id: engine.profile_id.clone(),
-                label: engine.label.clone(),
-            },
+            engine,
             cwd: self.cwd.clone(),
             role: self.role.as_ref().map(|r| r.role.clone()),
             kit_consent: self.kit_consent,
@@ -1469,11 +1577,27 @@ impl AgentModal {
             .filter(|n| **n != orig_name)
             .cloned()
             .collect();
+        // ADR 0037: a Pasta de Trabalho mudou? `cwd` só entra no plano quando DIFERE do cwd
+        // original do nó (renomear para a mesma pasta é no-op). `restart_now` só vale se mudou.
+        let cwd_changed = self.cwd != self.original_cwd;
+        let cwd = cwd_changed.then(|| self.cwd.clone()).flatten();
+        // ADR 0039: o MOTOR mudou? Só quando o usuário CLICOU num chip (engine_touched) E o
+        // profile selecionado difere do atual do nó. O novo motor RE-ERGUE o Agente (restart) no
+        // commit — trocar o cérebro de um terminal vivo é encerrá-lo e recriá-lo com o novo CLI.
+        let engine = if self.engine_touched {
+            self.build_engine()
+                .filter(|e| e.profile_id != self.original_profile_id)
+        } else {
+            None
+        };
         Ok(SavePlan {
             node,
             name: unique_name(&name, &others),
             role: (role_now != orig_role).then_some(role_now).flatten(),
             autonomy: (self.autonomy != orig_autonomy).then_some(self.autonomy),
+            cwd,
+            restart_now: cwd_changed && self.restart_now,
+            engine,
         })
     }
 
@@ -1664,12 +1788,13 @@ pub fn render(
         }
     }
 
-    // (M6-E) motor travado nesta story: troca exige reinício — F1-2-4 (nunca silencioso).
-    if is_edit {
+    // ADR 0039: trocar o motor de um Agente vivo o reinicia com o novo CLI. O aviso só aparece
+    // quando o motor foi DE FATO trocado (não polui quem só abriu o Editar) — nunca silencioso.
+    if is_edit && modal.engine_changed() {
         col = col.child(
             div()
                 .text_color(rgb(th.state.warning))
-                .child(text!(COPY_EDIT_ENGINE_LOCKED)),
+                .child(text!(COPY_EDIT_ENGINE_RESTART_WARN)),
         );
     }
 
@@ -2158,6 +2283,44 @@ pub fn render(
                             COPY_CONSENT_DETAIL
                         } else {
                             COPY_CONSENT_OFF_WARN
+                        })),
+                ),
+        );
+    }
+
+    // ── ADR 0037: "reiniciar agora na nova pasta" — SÓ no Editar e SÓ quando a pasta MUDOU.
+    //    Default DESLIGADO: trocar a pasta já persiste (vale na próxima abertura); ligar =
+    //    re-erguer o Agente já na pasta nova (encerra o que está rodando — opt-in explícito).
+    if is_edit && modal.cwd_changed() {
+        let on = modal.restart_now();
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .id("m6-restart-now")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_color(rgb(th.text.primary))
+                        .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                            v.modal_toggle_restart_now(cx);
+                        }))
+                        .child(text!(if on { "☑" } else { "☐" }))
+                        .child(text!(COPY_RESTART_LABEL)),
+                )
+                .child(
+                    div()
+                        .text_size(px(f32::from(th.typography.size.small)))
+                        .text_color(rgb(if on { th.state.warning } else { th.text.muted }))
+                        .child(text!(if on {
+                            COPY_RESTART_DETAIL_ON
+                        } else {
+                            COPY_RESTART_DETAIL_OFF
                         })),
                 ),
         );
@@ -3703,6 +3866,8 @@ kind = "idle"
             "Ajudante",
             Some("WRITER"),
             Autonomy::Assisted,
+            None,
+            None,
             vec!["Ajudante".into(), "Outro".into()],
         );
         assert_eq!(m.role().unwrap().role, "WRITER");
@@ -3717,6 +3882,111 @@ kind = "idle"
         let role_now = m.role().unwrap().role.clone();
         let p = m.save_plan().expect("plano");
         assert_eq!(p.role.as_deref(), Some(role_now.as_str()));
+    }
+
+    /// ADR 0037: editar a Pasta de Trabalho. `new_edit` pré-carrega o cwd REAL do nó (o campo
+    /// mostra a pasta de verdade, não o default genérico); sem troca, `cwd` não entra no plano;
+    /// trocar carrega `cwd` no `SavePlan`; `restart_now` só vale com a pasta trocada; voltar à
+    /// pasta original zera a mudança (nunca persiste troca falsa).
+    #[test]
+    fn edit_mode_save_plan_detects_cwd_change() {
+        let node = uuid::Uuid::now_v7();
+        let mut m = AgentModal::new_edit(
+            Arc::new(W31Suggester),
+            node,
+            "Ajudante",
+            Some("WRITER"),
+            Autonomy::Assisted,
+            Some(Path::new("/Users/founder/pasta-original")),
+            None,
+            vec!["Ajudante".into()],
+        );
+        // O campo mostra a pasta REAL (não o default genérico) e, sem troca, não entra no plano.
+        assert_eq!(m.cwd_display(), "/Users/founder/pasta-original");
+        assert!(!m.cwd_changed());
+        let p = m.save_plan().expect("plano");
+        assert_eq!(p.cwd, None, "pasta intocada → não persiste troca");
+        assert!(!p.restart_now);
+
+        // "reiniciar agora" SEM trocar a pasta é inerte (não há pasta nova a aplicar).
+        m.toggle_restart_now();
+        assert!(!m.save_plan().expect("plano").restart_now);
+
+        // trocar a pasta → entra no plano; com o toggle já ligado, `restart_now` passa a valer.
+        m.set_cwd(PathBuf::from("/Users/founder/pasta-nova"));
+        assert!(m.cwd_changed());
+        let p = m.save_plan().expect("plano");
+        assert_eq!(
+            p.cwd.as_deref(),
+            Some(Path::new("/Users/founder/pasta-nova"))
+        );
+        assert!(
+            p.restart_now,
+            "pasta trocada + toggle ligado → reinicia agora"
+        );
+
+        // voltar para a pasta original zera a mudança (nunca persiste troca falsa).
+        m.set_cwd(PathBuf::from("/Users/founder/pasta-original"));
+        assert!(!m.cwd_changed());
+        assert_eq!(m.save_plan().expect("plano").cwd, None);
+    }
+
+    /// ADR 0039: trocar o MOTOR no Editar. `set_engines` pré-seleciona o motor ATUAL (sem troca
+    /// falsa quando a lista vem com outro 1º); clicar o mesmo motor não conta; clicar OUTRO
+    /// carrega o engine no `SavePlan` (que re-ergue o Agente com o novo CLI no commit).
+    #[test]
+    fn edit_mode_save_plan_detects_engine_change() {
+        let node = uuid::Uuid::now_v7();
+        let mut m = AgentModal::new_edit(
+            Arc::new(W31Suggester),
+            node,
+            "Ajudante",
+            Some("WRITER"),
+            Autonomy::Assisted,
+            None,
+            Some("codex"), // motor ATUAL do nó = codex (não o 1º da lista)
+            vec!["Ajudante".into()],
+        );
+        // a descoberta chega com claude (1º) + codex — a pré-seleção tem que casar o ATUAL (codex).
+        let engines = vec![
+            Engine {
+                id: "claude".into(),
+                label: "Claude Code".into(),
+                version: None,
+                program: "claude".into(),
+                args: vec![],
+                profile_id: Some("claude-code".into()),
+            },
+            Engine {
+                id: "codex".into(),
+                label: "Codex".into(),
+                version: None,
+                program: "codex".into(),
+                args: vec![],
+                profile_id: Some("codex".into()),
+            },
+        ];
+        m.set_engines(engines);
+        // sem clique → motor não mudou (a pré-seleção do atual NÃO marca troca falsa).
+        assert!(
+            !m.engine_changed(),
+            "pré-seleção do motor atual não é troca"
+        );
+        assert_eq!(m.save_plan().expect("plano").engine, None);
+        // clicar o MESMO motor (codex, idx 1) → não conta.
+        m.select_engine(1);
+        assert!(!m.engine_changed(), "clicar o mesmo motor não é troca");
+        assert_eq!(m.save_plan().expect("plano").engine, None);
+        // clicar OUTRO (claude, idx 0) → troca; o SavePlan carrega o engine claude.
+        m.select_engine(0);
+        assert!(m.engine_changed());
+        let eng = m
+            .save_plan()
+            .expect("plano")
+            .engine
+            .expect("engine trocado");
+        assert_eq!(eng.profile_id.as_deref(), Some("claude-code"));
+        assert_eq!(eng.program, "claude");
     }
 
     /// FIX-3 (entrega 1, render headless): a seção AUTONOMIA tem as 3 opções na ordem canônica,
@@ -3813,6 +4083,8 @@ kind = "idle"
             "Ajudante",
             Some("WRITER"),
             Autonomy::Assisted,
+            None,
+            None,
             vec!["Ajudante".into()],
         );
         assert_eq!(m.autonomy(), Autonomy::Assisted, "prefill do nível efetivo");
@@ -3982,7 +4254,7 @@ kind = "idle"
             COPY_ERR_SCANNING,
             COPY_ERR_NO_ENGINE,
             COPY_DISCARD_ARMED,
-            COPY_EDIT_ENGINE_LOCKED,
+            COPY_EDIT_ENGINE_RESTART_WARN,
             COPY_EDIT_APPLY_NOTE,
             COPY_WHY_PREFIX,
             // FIX-3: seção AUTONOMIA — rótulo, descrições leigas e explicação do card.

@@ -707,6 +707,16 @@ pub enum DomainEvent {
         node: NodeId,
         profile: String,
     },
+    /// ADR 0037: a **Pasta de Trabalho POR-NÓ** foi editada/trocada DEPOIS da criação. Projeta o
+    /// `cwd` do nó (último vence — mesma semântica de `TerminalSpawned.cwd`); o restore
+    /// (`plan_restore` lê `ProjectedNode.cwd`) re-entra na nova pasta na próxima abertura, sem
+    /// re-spawn. Evento ISOLADO em vez de campo novo em `TerminalSpawned` (18 construções
+    /// literais em gates de várias ondas): editar o cwd é um gesto humano pontual, como
+    /// `CliProfileSet`. A cwd é DADO (nunca autoridade — identidade vem do env de spawn, ADR 0026).
+    NodeCwdSet {
+        node: NodeId,
+        cwd: String,
+    },
     /// W4-4 (T6 Switcher): o foco de workspace mudou. Projeta `focused_workspace`. (O event store
     /// é por-workspace; este evento registra o foco vigente para a projeção do Switcher.)
     WorkspaceFocusSet {
@@ -1164,6 +1174,7 @@ impl DomainEvent {
             DomainEvent::NoteCreated { .. } => "NoteCreated",
             DomainEvent::FolderCreated { .. } => "FolderCreated",
             DomainEvent::CliProfileSet { .. } => "CliProfileSet",
+            DomainEvent::NodeCwdSet { .. } => "NodeCwdSet",
             DomainEvent::WorkspaceFocusSet { .. } => "WorkspaceFocusSet",
             DomainEvent::WorkspaceUnloaded { .. } => "WorkspaceUnloaded",
             DomainEvent::OrchestrationPaused => "OrchestrationPaused",
@@ -1480,6 +1491,14 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         DomainEvent::CliProfileSet { node, profile } => {
             if let Some(n) = state.nodes.get_mut(node) {
                 n.cli = Some(profile.clone());
+            }
+        }
+        // ADR 0037: a edição da Pasta de Trabalho por-nó projeta o `cwd` (último vence). O
+        // restore consome `ProjectedNode.cwd`, então a nova pasta passa a valer na próxima
+        // abertura mesmo sem re-spawn (o caminho "só na próxima vez" da escolha do fundador).
+        DomainEvent::NodeCwdSet { node, cwd } => {
+            if let Some(n) = state.nodes.get_mut(node) {
+                n.cwd = Some(cwd.clone());
             }
         }
         // W4-4 (T6): o foco de workspace é projetado (último vence).
@@ -3027,6 +3046,64 @@ mod tests {
             n.cwd.as_deref(),
             Some("/Users/founder/projeto"),
             "a projeção expõe o binding node↔cwd"
+        );
+    }
+
+    /// ADR 0037: editar a Pasta de Trabalho por-nó (`NodeCwdSet`) projeta o `cwd` novo
+    /// (último vence sobre o `TerminalSpawned.cwd` original) — é o caminho "só na próxima
+    /// abertura": o restore lê `ProjectedNode.cwd`, então a pasta editada sobrevive ao
+    /// fechar/reabrir mesmo sem re-spawn. Evento ADITIVO: log antigo sem ele replaya intacto.
+    #[test]
+    #[serial]
+    fn node_cwd_set_projeta_cwd_editado_ultimo_vence() {
+        let node = Uuid::now_v7();
+        let tmp = TempDir::new("node-cwd-set");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::NodeAdded {
+                node,
+                kind: "Terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .expect("append NodeAdded");
+        store
+            .append(&DomainEvent::TerminalSpawned {
+                node,
+                cli: "claude".into(),
+                cwd: Some("/Users/founder/pasta-original".into()),
+            })
+            .expect("append TerminalSpawned");
+        // A edição da pasta: vira o cwd projetado (o que o restore re-aplica).
+        store
+            .append(&DomainEvent::NodeCwdSet {
+                node,
+                cwd: "/Users/founder/pasta-nova".into(),
+            })
+            .expect("append NodeCwdSet");
+        let state = store.project().expect("project");
+        let n = state.nodes.get(&node).expect("nó projetado");
+        assert_eq!(
+            n.cwd.as_deref(),
+            Some("/Users/founder/pasta-nova"),
+            "NodeCwdSet (último) vence o cwd do spawn original — o restore re-entra na pasta editada"
+        );
+
+        // Aditivo: um payload sem a variante (log de geração anterior) nunca foi `NodeCwdSet`;
+        // a desserialização de um `NodeCwdSet` real round-trips pelo store sem upcast.
+        let rec = DomainEvent::from_record(
+            "NodeCwdSet",
+            1,
+            serde_json::json!({ "event": "NodeCwdSet", "node": node, "cwd": "/x" }),
+        )
+        .expect("NodeCwdSet desserializa");
+        assert_eq!(
+            rec,
+            DomainEvent::NodeCwdSet {
+                node,
+                cwd: "/x".into()
+            }
         );
     }
 
