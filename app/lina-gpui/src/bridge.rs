@@ -1198,6 +1198,31 @@ impl MailboxPump {
                     }
                     continue;
                 }
+                // F3-3 (gate h): "esquecer isso" no painel de Mentalidade. `human_intent` (Goal) não
+                // conhece este verbo — roteamos LOCAL para `retire_belief` ANTES dele, igual ao
+                // `breaker.reset`. `belief_id` é DADO (endereçamento de QUAL crença); a AUTORIDADE é a
+                // NATUREZA do canal in-process (humano); o `reason` é carimbado server-side no core.
+                if item.intent == "belief.retire" {
+                    let belief_id = serde_json::from_str::<serde_json::Value>(&item.payload)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("belief_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string)
+                        });
+                    match belief_id {
+                        Some(id) => match self.router.retire_belief(&id, &mut store) {
+                            Ok(true) => applied = true,
+                            Ok(false) => {} // gesto malformado/vazio (idempotente)
+                            Err(e) => eprintln!("lina-gpui: aposentar crenca falhou: {e}"),
+                        },
+                        None => eprintln!(
+                            "lina-gpui: gesto 'belief.retire' com payload invalido: {}",
+                            item.payload
+                        ),
+                    }
+                    continue;
+                }
                 match self
                     .router
                     .human_intent(&item.intent, &item.payload, &mut store)

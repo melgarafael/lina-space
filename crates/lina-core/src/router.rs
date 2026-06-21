@@ -2617,6 +2617,34 @@ impl Router {
         Ok(true)
     }
 
+    /// **F3-3 (gate h) — aposentar uma crença por gesto humano (spec 35 §6.7).** O clique "esquecer
+    /// isso" no painel "Como o [papel] pensa" emite `BeliefRetired{reason:"retired_by_human"}`: a
+    /// crença some da PRÓXIMA injeção, mas NÃO é deletada (rebaixada, reconstruível por replay, inv #4).
+    /// `belief_id` é DADO (endereçamento de QUAL crença), jamais autoridade — o humano é o árbitro.
+    ///
+    /// **Segurança (ADR 0007):** um AGENTE NUNCA aposenta uma crença — este caminho não passa por
+    /// `route_message`/`node_by_name` (nenhum sender de roster o produz); a AUTORIDADE é a NATUREZA do
+    /// canal (gesto humano in-process, `push_human_intent`, igual ao [`Router::reset_breaker`]). O
+    /// `reason` é carimbado server-side aqui, jamais lido do cliente. Devolve `false` se `belief_id`
+    /// vazio (gesto malformado — não loga evento órfão).
+    ///
+    /// # Errors
+    /// Falha ao persistir o `BeliefRetired` no event log.
+    pub fn retire_belief(
+        &mut self,
+        belief_id: &str,
+        store: &mut EventStore,
+    ) -> Result<bool, StoreError> {
+        if belief_id.trim().is_empty() {
+            return Ok(false); // gesto malformado: não emite evento órfão
+        }
+        store.append(&DomainEvent::BeliefRetired {
+            belief_id: belief_id.to_string(),
+            reason: "retired_by_human".to_string(),
+        })?;
+        Ok(true)
+    }
+
     /// **F3-0-5: `lina params set/reset`** (molde de [`Router::handle_plan`]). Parseia o contrato
     /// `{key, scope, value, target?}` do payload (DADO do envelope), valida a faixa pelo core
     /// ([`crate::params::validate_range`] — o bin não duplica as faixas), e emite um
