@@ -1,6 +1,6 @@
 # Despacho M-PROMO · Projeção Mentality + Política de Promoção — Terminal I (opus · high)
 
-> Rodada **F3-3 Mentality — "A Lina aprende com você"**. Maestro: Terminal B (Ultra Code).
+> Rodada **F3-3 Mentality — "A Lina aprende com você"**. Maestro desta rodada: **Terminal A** (reporte a ele; o Terminal B agora é worker da M-DETECTOR).
 > ⛔ **NÃO INICIE** até o Maestro avisar "contrato commitado" (as 6 variantes de crença em events.rs + `mod mentality` já no lib.rs). Você consome o contrato; sem ele, `mentality.rs` não compila.
 > Marcador OBRIGATÓRIO ao terminar: `PRONTO: <resumo>` ou `BLOCKED: <motivo>`.
 
@@ -40,6 +40,6 @@ Materializar "corrigiu uma vez, nunca mais repete" como mecanismo confiável e a
 
 - `crates/lina-core/src/mentality.rs`: projeção `Mentality(papel)` + política de promoção + seleção top-K, com testes de mecanismo (controle +/-).
 - Prova local (exits limpos, sem pipe mascarando): `cargo test -p lina-core --lib mentality 2>&1 | tail` + exit; `cargo clippy -p lina-core --all-targets -- -D warnings`; `cargo fmt -p lina-core`.
-- Reporte: `lina ask "@Terminal B - Effort: Ultra Code" "M-PROMO: <o que entregou + exits>" --intent status` terminando com **`PRONTO: M-PROMO — projeção+promoção determinística, N-distintos/challenge-zera/TTL/cap-K provados por contraste, replay idêntico`** ou **`BLOCKED: <motivo>`**.
+- Reporte: `lina ask "@Terminal A" "M-PROMO: <o que entregou + exits>" --intent status` terminando com **`PRONTO: M-PROMO — projeção+promoção determinística, N-distintos/challenge-zera/TTL/cap-K provados por contraste, replay idêntico`** ou **`BLOCKED: <motivo>`**.
 
 > Anti-vacuosidade (spec 35 §7): cada teste com controle positivo E negativo. Um teste que só prova "promove" sem provar "mesma situação NÃO promove" é vacuoso. Prove o mecanismo, não a feliz coincidência.

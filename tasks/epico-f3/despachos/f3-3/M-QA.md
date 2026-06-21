@@ -1,6 +1,6 @@
 # Despacho M-QA · Anti-poisoning + Eval-first + Segurança — Terminal R (opus · high)
 
-> Rodada **F3-3 Mentality**. Maestro: Terminal B (Ultra Code).
+> Rodada **F3-3 Mentality**. Maestro desta rodada: **Terminal A** (reporte a ele).
 > ⛔ **NÃO INICIE** o GREEN até M-PROMO (I) e M-DETECTOR (H) entregarem; mas você PODE escrever o cenário binário (gate a) e os controles eval-first em paralelo (eles definem o alvo). Depende de **M-PROMO/M-INJETOR** para o GREEN completo.
 > Marcador OBRIGATÓRIO: `PRONTO: <resumo>` ou `BLOCKED: <motivo>`.
 

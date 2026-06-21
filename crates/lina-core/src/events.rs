@@ -1115,6 +1115,87 @@ pub enum DomainEvent {
     PaletteCommandInvoked {
         key: String,
     },
+
+    // ───────────────────────── F3-3 Mentality (spec 35 §3) ─────────────────────────
+    // Ciclo de vida da CRENÇA de um papel. Variantes TOTALMENTE novas (não campos
+    // aditivos a um evento existente): nenhum log F0/F1/F2/F3-anterior as contém, então
+    // o replay nunca as encontra (precedente `SpawnRequested`) — por isso os campos
+    // OBRIGATÓRIOS não levam `serde(default)`; só os EXTENSÍVEIS (refs/evidence/flag) o
+    // levam, para a própria variante crescer barato depois. REGRA-MÃE (spec 35 §6.1;
+    // família ADR 0007): a crença é DADO comportamental ("como pensar"), JAMAIS
+    // autoridade — `role`/proveniência são carimbados server-side por quem EMITE
+    // (M-DETECTOR/Refletor), nunca lidos do payload do agente. A projeção
+    // `Mentality(papel)` é por REPLAY externo (módulo `mentality`, padrão `CostLedger`):
+    // estes eventos NÃO tocam `ProjectedState` (reducer no-op).
+    /// PORTA DE ENTRADA do aprendizado (spec 35 §3/§4.1): o usuário corrigiu o terminal
+    /// de um papel — captado pela sentinela `[LINA::CORRECTION ...]` (M-DETECTOR). `role`
+    /// é o binding server-side do nó (ADR 0007/0026), JAMAIS o texto do agente. `summary`
+    /// e `refs` são DADO (o "o quê" + ids dos eventos-fonte), nunca decidem nada.
+    CorrectionObserved {
+        /// Papel do roster cujo terminal foi corrigido — server-side, não do payload.
+        role: String,
+        /// Resumo curto da correção observada (o "o quê"). Dado, não autoridade.
+        summary: String,
+        /// Refs às fontes (ids de eventos/transcript) que evidenciam a correção.
+        #[serde(default)]
+        refs: Vec<String>,
+    },
+    /// O Refletor (job assíncrono FORA do caminho crítico, 1 CLI-call — inv #1: NÃO é
+    /// LLM no core) destilou a correção numa crença PROVISÓRIA (spec 35 §3/§4.2). Entra
+    /// em quarentena: só vira regra por evidência diversa (política determinística,
+    /// M-PROMO). `statement` é falseável (Why/How-to-apply, 1-2 frases) e nunca instrução
+    /// de segurança/permissão (anti-poisoning §6.3 — barrado no Refletor antes de virar
+    /// evento).
+    BeliefProposed {
+        /// Id durável da crença (gerado na emissão, persistido — replay lê do log).
+        belief_id: String,
+        /// Papel dono da crença (server-side; liga `belief_id`→papel na projeção).
+        role: String,
+        /// Statement falseável ("como pensar"), Why/How-to-apply. DADO comportamental.
+        statement: String,
+        /// Proveniência humanizável (de qual correção/quando nasceu) — para o painel.
+        provenance: String,
+        /// §6.3: crença nascida em sessão que processou conteúdo externo não-confiável
+        /// leva flag de origem (sinaliza, não bloqueia). Default `false` (origem confiável).
+        #[serde(default)]
+        untrusted_origin: bool,
+    },
+    /// A crença se aplicou com sucesso numa situação DISTINTA (spec 35 §3/§6.4). O
+    /// `situation_hash` é o anti-gaming: a MESMA situação 2× NÃO conta — a política
+    /// M-PROMO só promove com N hashes distintos (default N=2). `evidence` é auditável.
+    BeliefReinforced {
+        belief_id: String,
+        /// Hash-de-situação — exige diversidade real de evidência (anti-gaming §6.4).
+        situation_hash: String,
+        /// Evidência textual do reforço (auditoria/painel). Opcional.
+        #[serde(default)]
+        evidence: String,
+    },
+    /// O usuário corrigiu DE NOVO no mesmo tema (spec 35 §3): a crença foi contestada —
+    /// ZERA o progresso de promoção (política M-PROMO). Crença nunca é deletada, só
+    /// rebaixada — o histórico permanece reconstruível por replay (inv #4).
+    BeliefChallenged {
+        belief_id: String,
+        #[serde(default)]
+        evidence: String,
+    },
+    /// Política DETERMINÍSTICA (sem LLM, inv #1): N situações distintas confirmaram
+    /// (default N=2) → a crença vira ESTABELECIDA (spec 35 §3/§4.3) e entra na doutrina
+    /// renderizada como REGRA do papel (M-INJETOR). Só o `belief_id` — o "como/porquê" se
+    /// reconstrói pelos eventos anteriores do mesmo id no replay.
+    BeliefEstablished {
+        belief_id: String,
+    },
+    /// A crença saiu de circulação (spec 35 §3): refutada, TTL de provisória expirado
+    /// (default 30d sem reforço — mesmo vocabulário stale do `lina retro`), ou APOSENTADA
+    /// pelo humano no painel (1 clique — humano é o árbitro, §6.7). `reason` ∈
+    /// {`refuted`,`expired`,`retired_by_human`} — String (não enum), como o `reason` de
+    /// `SpawnGated`. Não é deletada: some da injeção, mas o histórico replaya intacto.
+    BeliefRetired {
+        belief_id: String,
+        /// Motivo da aposentadoria. String aberta (precedente `SpawnGated.reason`).
+        reason: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -1208,6 +1289,13 @@ impl DomainEvent {
             DomainEvent::WorkspaceArchived => "WorkspaceArchived",
             DomainEvent::ProfWindowMetric { .. } => "ProfWindowMetric",
             DomainEvent::PaletteCommandInvoked { .. } => "PaletteCommandInvoked",
+            // F3-3 Mentality (spec 35 §3): ciclo de vida da crença.
+            DomainEvent::CorrectionObserved { .. } => "CorrectionObserved",
+            DomainEvent::BeliefProposed { .. } => "BeliefProposed",
+            DomainEvent::BeliefReinforced { .. } => "BeliefReinforced",
+            DomainEvent::BeliefChallenged { .. } => "BeliefChallenged",
+            DomainEvent::BeliefEstablished { .. } => "BeliefEstablished",
+            DomainEvent::BeliefRetired { .. } => "BeliefRetired",
         }
     }
 
@@ -1634,7 +1722,16 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::ProfWindowMetric { .. }
         // F2-2-4: uso de comando da paleta é META (livro-razão do ranking; o shell projeta
         // hit-count varrendo o log ao abrir a paleta) — sem efeito na projeção do canvas.
-        | DomainEvent::PaletteCommandInvoked { .. } => {}
+        | DomainEvent::PaletteCommandInvoked { .. }
+        // F3-3 Mentality (spec 35 §3): o ciclo de vida da crença é META no apply do canvas — a
+        // projeção `Mentality(papel)` reconstrói por REPLAY externo (módulo `mentality`, padrão
+        // `CostLedger`). Estes eventos NÃO tocam `ProjectedState`.
+        | DomainEvent::CorrectionObserved { .. }
+        | DomainEvent::BeliefProposed { .. }
+        | DomainEvent::BeliefReinforced { .. }
+        | DomainEvent::BeliefChallenged { .. }
+        | DomainEvent::BeliefEstablished { .. }
+        | DomainEvent::BeliefRetired { .. } => {}
     }
 }
 

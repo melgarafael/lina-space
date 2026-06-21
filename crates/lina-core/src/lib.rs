@@ -172,6 +172,12 @@ pub mod history;
 /// — montagem PURA de texto acima do CLI (inv #1), projeção do log (inv #4). Hermes §6.1/§6.2.
 pub mod briefing;
 
+/// F3-3 Mentality (spec 35): projeção `Mentality(papel)` por REPLAY + política de promoção
+/// DETERMINÍSTICA (sem LLM, inv #1) sobre o ciclo de vida da crença (`events.rs` §3). Padrão
+/// `CostLedger`/`intelligence_adoption` — fonte de leitura para o injetor e o painel. Crença é
+/// DADO comportamental, nunca autoridade (§6.1). Implementado em F3-3 (M-PROMO).
+pub mod mentality;
+
 /// F1-5-5: suspensão real de ociosos — máquina `Active → Idle → Suspended` (overlay ortogonal ao
 /// [`NodeStatus`]; só o render pausa, a drenagem nunca para).
 pub mod suspend;

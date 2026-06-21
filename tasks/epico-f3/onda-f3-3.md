@@ -66,7 +66,7 @@ A Mentality colide com o Terminal A em **3 costuras quentes**: `crates/lina-core
 ## Pendências / deferidas
 
 - **Cortado de propósito (spec 35 §8, NÃO implementar):** aprender com falhas próprias (build/teste) = v2; camadas combinadas shipped+espaço+indivíduo; RAG/recall semântico; detector estatístico de correção; transferência entre espaços/marketplace; edição do texto da crença (só aposentar no MVP).
-- **Gate do fundador na ativação (spec 35 §2):** promoção automática vs badge-de-confirmação-na-fila é decisão do fundador na F3 — o design suporta os dois trocando 1 política; default proposto = badge de confirmação (conservador), perguntar ao fundador no gate.
+- **Gate do fundador na ativação (spec 35 §2) — ✅ DECIDIDO (fundador, 2026-06-21): PROMOÇÃO AUTOMÁTICA.** Crença que atinge N situações distintas vira regra do papel **sem fila de confirmação** — é injetada direto no próximo spawn daquele papel. Os limites de segurança (§6) e o **aposentar-1-clique** (humano árbitro *post-hoc*) PERMANECEM intactos. Implicação por frente: **M-PROMO** emite `BeliefEstablished` e ele **já habilita a injeção** (sem estado intermediário "pendente de OK"); **M-INJETOR** injeta estabelecidas como regra direto (sem gate de confirmação); **M-UI** mostra estabelecidas como "já vale" (não "aguardando seu OK"), provisórias como "ainda testando", e mantém o aposentar-1-clique. (O design ainda suporta o modo badge-de-confirmação trocando 1 política — não foi o escolhido.)
 - **Próxima após esta:** F3-4 (coordenação de código multi-agente) ou F3-5 (sessões/auto-aprimoramento) — escolha no fim desta onda.
 
 ---

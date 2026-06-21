@@ -1,6 +1,6 @@
 # Despacho M-UI · Painel "Como o [papel] pensa" — Terminal G (opus · medium)
 
-> Rodada **F3-3 Mentality**. Maestro: Terminal B (Ultra Code).
+> Rodada **F3-3 Mentality**. Maestro desta rodada: **Terminal A** (reporte a ele; o Terminal B é worker da M-DETECTOR).
 > ⛔ **NÃO INICIE** até o Maestro avisar: (a) "contrato commitado" E (b) "main.rs liberado pelo Terminal A" (você fia o painel em main.rs, costura que o A edita).
 > Marcador OBRIGATÓRIO: `PRONTO: <resumo>` ou `BLOCKED: <motivo>`.
 

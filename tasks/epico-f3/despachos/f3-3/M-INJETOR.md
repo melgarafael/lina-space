@@ -1,6 +1,6 @@
 # Despacho M-INJETOR · Injetor de Mentalidade no spawn — Terminal J (opus · medium)
 
-> Rodada **F3-3 Mentality**. Maestro: Terminal B (Ultra Code).
+> Rodada **F3-3 Mentality**. Maestro desta rodada: **Terminal A** (reporte a ele; o Terminal B é worker da M-DETECTOR).
 > ⛔ **NÃO INICIE** até o Maestro avisar: (a) "contrato commitado" E (b) "bridge.rs liberado pelo Terminal A". Você toca `bridge.rs`, costura que o A está editando (ADR 0037/0038).
 > ⛔ Depende de **M-PROMO** (Terminal I): você consome a função de seleção top-K da projeção `Mentality(papel)`. Confirme com o Maestro que I já entregou a interface antes de fiar.
 > Marcador OBRIGATÓRIO: `PRONTO: <resumo>` ou `BLOCKED: <motivo>`.

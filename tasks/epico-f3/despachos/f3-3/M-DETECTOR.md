@@ -1,6 +1,7 @@
-# Despacho M-DETECTOR · Detector de correção + Refletor — Terminal H (opus · high)
+# Despacho M-DETECTOR · Detector de correção + Refletor — Terminal B — Effort: Ultra Code (opus · high)
 
-> Rodada **F3-3 Mentality**. Maestro: Terminal B (Ultra Code).
+> Rodada **F3-3 Mentality**. Maestro desta rodada: **Terminal A** (reporte a ele).
+> **Reatribuição:** esta frente passou de H para **você, Terminal B** — é a parte de backend mais sensível da onda (toca o caminho crítico `router.rs`/`a2a.rs`); o Maestro virou o A, então você (Ultra Code) assume a captação. O Refletor assíncrono fora do caminho crítico é o ponto mais delicado de toda a rodada — é seu.
 > ⛔ **NÃO INICIE** até o Maestro avisar "contrato commitado" (variantes de crença em events.rs).
 > Marcador OBRIGATÓRIO: `PRONTO: <resumo>` ou `BLOCKED: <motivo>`.
 
