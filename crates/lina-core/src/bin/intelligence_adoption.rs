@@ -79,8 +79,9 @@ pub struct IntelligenceReport {
     pub effort_by_level: BTreeMap<String, u64>,
     /// Distribuição de effort por origem do carimbo (`observed`/`assigned`).
     pub effort_by_origin: BTreeMap<String, u64>,
-    /// Correções da Mentality (`[LINA::CORRECTION]`) — **slot futuro F3-3**, hoje sempre 0 (o evento
-    /// ainda não existe). Reportado explícito para o gate enxergar o slot, não um silêncio.
+    /// Correções da Mentality (F3-3): contagem de `CorrectionObserved` no log — a sentinela
+    /// `[LINA::CORRECTION]` (detector M-DETECTOR) medida desde o dia 1. Métrica acompanhada (§5 taxa
+    /// de correção por papel), nunca gate binário. 0 quando não houve correção — nunca inventado.
     pub corrections: u64,
 }
 
@@ -493,13 +494,14 @@ mod tests {
         );
     }
 
-    /// O render humano carrega o rótulo anti-gate e o slot futuro — o texto é parte do contrato
-    /// (o número precisa circular como métrica acompanhada, não como critério binário).
+    /// O render humano carrega o rótulo anti-gate e o slot de correção da Mentality — o texto é parte
+    /// do contrato (o número precisa circular como métrica acompanhada, não como critério binário).
+    /// F3-3: o slot deixou de ser "futuro" e passou a CONTAR `CorrectionObserved` no log.
     #[test]
-    fn render_labels_metric_as_non_gate_and_future_slot() {
+    fn render_labels_metric_as_non_gate() {
         let out = render(&intelligence_report(&[]));
         assert!(out.contains("MÉTRICA ACOMPANHADA"), "{out}");
         assert!(out.contains("nunca gate"), "{out}");
-        assert!(out.contains("F3-3"), "{out}");
+        assert!(out.contains("CORREÇÃO/Mentality"), "{out}");
     }
 }
