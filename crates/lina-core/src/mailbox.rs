@@ -1038,6 +1038,26 @@ fn neutralize_sentinels(s: &str) -> String {
         .replace("[LINA::MSG]", "[LINA:MSG]")
 }
 
+/// **Sentinela de CORREÇÃO (F3-3 Mentality, spec 35 §4.1).** O agente, instruído pela doutrina do
+/// papel, declara que o usuário o corrigiu emitindo `[LINA::CORRECTION] <resumo>` no payload de uma
+/// mensagem A2A. Mesma família do `[LINA::MSG]` (mesmo trust boundary) — reusa o mecanismo, não
+/// inventa formato. O marcador deve ABRIR o payload (determinístico; evita falso-positivo de um
+/// agente que apenas MENCIONA a sentinela no meio do texto). O `::` neutralizado (`[LINA:CORRECTION]`,
+/// um só `:`) NÃO casa — defesa contra eco do próprio bloco.
+pub const CORRECTION_SENTINEL: &str = "[LINA::CORRECTION]";
+
+/// Extrai o RESUMO de uma sentinela de correção (`[LINA::CORRECTION] <resumo>`). `Some(resumo)`
+/// quando a sentinela abre o payload e há texto não-vazio depois; `None` caso contrário. O resumo
+/// é DADO (o "o quê" da correção) — nunca autoridade: `role`/origem são carimbados server-side por
+/// quem EMITE `CorrectionObserved` (o router), JAMAIS lidos daqui (regra-mãe, ADR 0007). Achatado
+/// em uma linha (mesma defesa do `[LINA::MSG]`): nenhum `\n` no resumo quebra estrutura a jusante.
+#[must_use]
+pub fn parse_correction(payload: &str) -> Option<String> {
+    let rest = payload.trim_start().strip_prefix(CORRECTION_SENTINEL)?;
+    let summary = one_line(rest).trim().to_string();
+    (!summary.is_empty()).then_some(summary)
+}
+
 /// Classifica o texto `to` de uma [`MailMessage`] em um destino estruturado, SEM resolver `NodeId`
 /// (a resolução final é do `Supervisor`, que conhece o roster): `*` → broadcast; `role:X`/`@role:X`
 /// → papel; o resto → nome de nó (`@` opcional é parte do nome no roster, ex.: `@Dev Backend`).
@@ -1327,6 +1347,33 @@ mod tests {
             !b2.contains('\u{0085}') && !b2.contains('\u{000b}') && !b2.contains('\u{000c}'),
             "NEL/VT/FF achatados"
         );
+    }
+
+    /// F3-3 (M-DETECTOR): a sentinela `[LINA::CORRECTION]` extrai o RESUMO só quando ABRE o payload;
+    /// o `::` neutralizado não casa (defesa contra eco); newline embutido é achatado; resumo vazio ou
+    /// marcador no MEIO do texto NÃO disparam (determinístico — evita falso-positivo de quem MENCIONA).
+    #[test]
+    fn parse_correction_extracts_summary_only_when_sentinel_opens_payload() {
+        assert_eq!(
+            parse_correction("[LINA::CORRECTION] use pnpm, não npm").as_deref(),
+            Some("use pnpm, não npm")
+        );
+        assert_eq!(
+            parse_correction("   [LINA::CORRECTION]   use pnpm   ").as_deref(),
+            Some("use pnpm")
+        );
+        // newline embutido é achatado (uma linha — mesma defesa do [LINA::MSG]).
+        assert_eq!(
+            parse_correction("[LINA::CORRECTION] linha1\nlinha2").as_deref(),
+            Some("linha1 linha2")
+        );
+        assert_eq!(parse_correction("oi, tudo certo"), None);
+        // `::` neutralizado (um só `:`) NÃO casa — defesa contra eco do bloco.
+        assert_eq!(parse_correction("[LINA:CORRECTION] x"), None);
+        // marcador no MEIO não abre o payload (não dispara em quem só MENCIONA a sentinela).
+        assert_eq!(parse_correction("terminei. [LINA::CORRECTION] x"), None);
+        // resumo vazio.
+        assert_eq!(parse_correction("[LINA::CORRECTION]    "), None);
     }
 
     /// B1: `enqueue` com id de path-traversal é rejeitado SEM escrever nada (nem cria o outbox).

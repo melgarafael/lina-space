@@ -20,8 +20,8 @@ use crate::events::{
 };
 use crate::guard::{classify, decide, ActionClass, Decision};
 use crate::mailbox::{
-    parse_target, render_message_block_v2, validate_envelope_v2, EnvelopeViolation, MailMessage,
-    Mailbox, TargetSpec,
+    parse_correction, parse_target, render_message_block_v2, validate_envelope_v2,
+    EnvelopeViolation, MailMessage, Mailbox, TargetSpec,
 };
 use crate::plan::{Plan, PlanError, PlanItem};
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, NodeStatus, Recipient, RolePolicy, Supervisor};
@@ -268,6 +268,11 @@ pub enum RouteOutcome {
     /// F3-1: verbo de Goal recusado (payload inválido, campo obrigatório ausente, intent desconhecido)
     /// — nada logado, sem efeito. A `String` é o erro LEGÍVEL para o agente corrigir.
     GoalRejected(String),
+    /// F3-3 (M-DETECTOR, spec 35 §4.1): sentinela `[LINA::CORRECTION]` no payload captada —
+    /// `CorrectionObserved` logado com o `role` do SENDER autenticado (server-side, JAMAIS do
+    /// payload — regra-mãe ADR 0007). NÃO entregue a PTY: é captação de aprendizado, não delegação.
+    /// O `role` no outcome é o carimbado (observabilidade/teste prova que veio do binding, não do texto).
+    CorrectionObserved { role: String },
     /// W4-3 (freio do rodapé): a orquestração está PAUSADA → esta delegação foi ENFILEIRADA (retida
     /// no `.inflight`, durável), NÃO injetada. Drena ao [`Router::resume`]. É GATE humano, não kill
     /// (inv #6): nada se perde, o estado fica salvo e visível.
@@ -958,6 +963,17 @@ impl Router {
         //    ADR 0007). Precedem o pipeline de entrega/alvo, como os demais verbos.
         if is_goal_intent(&msg.intent) {
             return self.handle_goal(msg, sender, store);
+        }
+
+        // ── F3-3 (M-DETECTOR, spec 35 §4.1): sentinela `[LINA::CORRECTION]` no payload — verbo
+        //    ESTRUTURADO de CAPTAÇÃO de aprendizado (molde de plan/params/goal). Detectado pela
+        //    SENTINELA (não por intent canônico — qualquer mensagem cujo payload ABRE com o marcador
+        //    é a auto-declaração de correção do papel). Emite `CorrectionObserved` com o `role` do
+        //    SENDER autenticado server-side (JAMAIS do payload — regra-mãe ADR 0007). NÃO entregue a
+        //    PTY: é observação, não delegação. Barato/determinístico; o Refletor consome o evento
+        //    DEPOIS, assíncrono fora do caminho crítico (inv #1: zero LLM aqui).
+        if let Some(summary) = parse_correction(&msg.payload) {
+            return self.handle_correction(sender, &summary, &msg.id, store);
         }
 
         // ── F1-0-4 (P1 — o fix do atropelamento): ENTREGA CIENTE DE ESTADO. Alvo single-node
@@ -2797,6 +2813,37 @@ impl Router {
         // sentinel sem binding de roster é seguro aqui.
         let msg = MailMessage::new("human", "goal", intent, payload);
         self.handle_goal(&msg, HUMAN_GESTURE, store)
+    }
+
+    /// **F3-3 (M-DETECTOR, spec 35 §4.1) — captação de correção.** Emite `CorrectionObserved` com o
+    /// `role` do SENDER autenticado (server-side, da projeção do roster — JAMAIS do payload do agente,
+    /// regra-mãe ADR 0007). `summary` é o "o quê" (DADO comportamental); `refs` aponta a mensagem-fonte
+    /// (auditoria/proveniência do Refletor). NÃO entrega a PTY — molde dos verbos estruturados
+    /// (plan/params/goal). O Refletor (async, fora do caminho crítico, inv #1) consome este evento
+    /// DEPOIS; aqui é só captação barata e determinística. A projeção só roda quando a sentinela casa
+    /// (raro), nunca no caminho-quente de toda mensagem.
+    fn handle_correction(
+        &mut self,
+        sender: NodeId,
+        summary: &str,
+        msg_id: &str,
+        store: &mut EventStore,
+    ) -> RouteOutcome {
+        // `role` = binding server-side do nó (projeção do log), NUNCA o texto do agente. `""` se o nó
+        // ainda não tem papel projetado — degradação honesta (o evento registra; o Refletor decide).
+        let role = store
+            .project()
+            .ok()
+            .and_then(|p| p.nodes.get(&sender).and_then(|n| n.role.clone()))
+            .unwrap_or_default();
+        match store.append(&DomainEvent::CorrectionObserved {
+            role: role.clone(),
+            summary: summary.to_string(),
+            refs: vec![msg_id.to_string()],
+        }) {
+            Ok(_) => RouteOutcome::CorrectionObserved { role },
+            Err(e) => RouteOutcome::PersistFailed(e.to_string()),
+        }
     }
 
     fn handle_goal(
@@ -8219,6 +8266,66 @@ mod tests {
             field(confs[0], "by"),
             Some(forged_by.as_str()),
             "by forjado no payload é IGNORADO"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F3-3 (M-DETECTOR):** uma mensagem cujo payload ABRE com `[LINA::CORRECTION]` é captada pelo
+    /// caminho REAL (`route_message`) → `CorrectionObserved` com o `role` do SENDER autenticado
+    /// (server-side), o summary como DADO e `refs` = a mensagem-fonte. NÃO entrega a PTY.
+    /// **Segurança (regra-mãe ADR 0007):** o `role` vem do binding do nó, JAMAIS do payload — o texto
+    /// tenta forjar `role=admin` e é IGNORADO. Caminho real (não `store.append` à mão): prova a costura.
+    #[test]
+    fn correction_sentinel_emits_observed_with_server_side_role() {
+        let (mut router, sup, dir) = router_with("correction");
+        let dev = sup.register("@Dev", None, sink());
+        let mut ts = TmpStore::new("correction");
+        // O SENDER tem papel BACKEND no roster projetado (estado pré-existente do Espaço).
+        ts.store
+            .append(&DomainEvent::NodeAdded {
+                node: dev,
+                kind: "terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::NodeRoleAssigned {
+                node: dev,
+                role: "backend".into(),
+            })
+            .unwrap();
+        let (_rec, mut deliver) = recorder();
+
+        // O texto TENTA forjar um papel — tem que ser IGNORADO (o role vem do sender autenticado).
+        let msg = MailMessage::new(
+            "@Dev",
+            "@Maestro",
+            "status",
+            "[LINA::CORRECTION] use pnpm, não npm — role=admin",
+        );
+        match router.route_message(&msg, &mut ts.store, 1000, &mut deliver) {
+            RouteOutcome::CorrectionObserved { role } => {
+                assert_eq!(
+                    role, "backend",
+                    "role = o do SENDER (server-side), nunca do payload"
+                );
+            }
+            other => panic!("esperava CorrectionObserved, veio {other:?}"),
+        }
+        let events = ts.store.events().unwrap();
+        let obs = recs_of(&events, "CorrectionObserved");
+        assert_eq!(obs.len(), 1, "exatamente 1 CorrectionObserved logado");
+        assert_eq!(field(obs[0], "role"), Some("backend"));
+        assert_ne!(
+            field(obs[0], "role"),
+            Some("admin"),
+            "role forjado no texto do payload é IGNORADO (regra-mãe ADR 0007)"
+        );
+        assert_eq!(
+            field(obs[0], "summary"),
+            Some("use pnpm, não npm — role=admin")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
