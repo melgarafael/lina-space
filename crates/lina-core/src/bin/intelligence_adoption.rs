@@ -117,6 +117,10 @@ pub fn intelligence_report(records: &[EventRecord]) -> IntelligenceReport {
     let mut effort_assigned = 0u64;
     let mut effort_by_level: BTreeMap<String, u64> = BTreeMap::new();
     let mut effort_by_origin: BTreeMap<String, u64> = BTreeMap::new();
+    // F3-3 gate (g): adoção da sentinela `[LINA::CORRECTION]` medida desde o dia 1 — conta o
+    // evento próprio `CorrectionObserved` no log (a porta de entrada da Mentality). Lição plan.md
+    // (F1-3): medir uso REAL, não assumir adoção.
+    let mut corrections = 0u64;
 
     for rec in records {
         match rec.kind.as_str() {
@@ -155,6 +159,9 @@ pub fn intelligence_report(records: &[EventRecord]) -> IntelligenceReport {
                 *effort_by_level.entry(level.to_string()).or_insert(0) += 1;
                 *effort_by_origin.entry(origin.to_string()).or_insert(0) += 1;
             }
+            // F3-3 gate (g): cada `CorrectionObserved` é uma correção do usuário captada pela
+            // sentinela — a porta de entrada do aprendizado da Mentality.
+            "CorrectionObserved" => corrections += 1,
             _ => {}
         }
     }
@@ -208,9 +215,10 @@ pub fn intelligence_report(records: &[EventRecord]) -> IntelligenceReport {
         effort_assigned,
         effort_by_level,
         effort_by_origin,
-        // Gancho futuro F3-3: quando a Mentality emitir `[LINA::CORRECTION]` num evento próprio,
-        // some-se a contagem aqui. Hoje o evento não existe → 0 observado (não inventamos número).
-        corrections: 0,
+        // F3-3 gate (g): contagem REAL de `CorrectionObserved` no log (a sentinela
+        // `[LINA::CORRECTION]` já é evento próprio desde o contrato `bb52cae`). 0 quando não houve
+        // nenhuma correção — nunca um número inventado.
+        corrections,
     }
 }
 
@@ -262,7 +270,7 @@ fn render(report: &IntelligenceReport) -> String {
          · por origem: {}\n\
          EFFORT (motor por papel, F3-0-4):\n\
          · atribuições: {} · por nível: {} · por origem: {}\n\
-         CORREÇÃO/Mentality: {} (slot futuro F3-3 — sentinela [LINA::CORRECTION] ainda não emitida)",
+         CORREÇÃO/Mentality (sentinela [LINA::CORRECTION] → CorrectionObserved): {}",
         report.goals_defined,
         report.goals_interpreted,
         report.goals_confirmed,
