@@ -71,8 +71,35 @@ A Mentality colide com o Terminal A em **3 costuras quentes**: `crates/lina-core
 
 ---
 
-## STATUS — F3-3 PREPARADA (aguardando A liberar events.rs/bridge.rs/main.rs)
+## STATUS — F3-3 LANÇADA (2026-06-21 · Maestro: Terminal A)
 
-- **Plano:** este doc. **Despachos:** `tasks/epico-f3/despachos/f3-3/{M-PROMO,M-DETECTOR,M-INJETOR,M-UI,M-QA}.md` (o Contrato é do Maestro, descrito no Setup acima).
-- **Disparo:** assim que `git status` limpar events.rs/bridge.rs/main.rs → Maestro fixa o contrato + `mod mentality` → commita → fan-out das 5 frentes (M-DETECTOR/M-PROMO/M-QA podem iniciar; M-INJETOR/M-UI dependem de bridge.rs/main.rs já limpos).
-- **Donos:** I (promo), H (detector), J (injetor), G (ui), R (qa); B (maestro/contrato); K reserva.
+- **Gate de largada cumprido:** `bridge.rs` fechado no commit `fe9ec90` (ADR 0038, validado de fora: ws build + app build/test + clippy `-D warnings` exit 0). `events.rs`/`main.rs` já limpos.
+- **Contrato commitado = largada:** `bb52cae` — 6 variantes do ciclo de crença em `events.rs` (`CorrectionObserved`/`BeliefProposed`/`BeliefReinforced`/`BeliefChallenged`/`BeliefEstablished`/`BeliefRetired`) + braços `kind()` + no-op no reducer `apply` + `pub mod mentality` (stub). Validado: ws build, app build, `lina-core` clippy `--all-targets -D warnings` + suíte completa (0 failed) — exit 0.
+- **Decisão do fundador (2026-06-21):** PROMOÇÃO AUTOMÁTICA (ver §Pendências). Limites §6 + aposentar-1-clique permanecem.
+- **Roster reatribuído (eu virei Maestro):** Contrato+costura **A** ✅ · M-PROMO **I** · M-DETECTOR **B (Ultra Code)** (era H — assume a captação, frente de backend mais sensível) · M-INJETOR **J** · M-UI **G** · M-QA **R** · reservas **H, K, M, Especialista em Telas**.
+- **Fan-out Onda A disparado** (handoffs fire-and-forget, plano F33-*): I (M-PROMO), B (M-DETECTOR), R (M-QA), G (M-UI) iniciam com o contrato pronto. **Onda B:** J (M-INJETOR) espera I entregar a interface top-K de `mentality.rs`.
+- **Itens no plano:** `F33-PROMO`, `F33-DETECTOR` (sem parents) · `F33-INJETOR`, `F33-UI` (parent F33-PROMO) · `F33-QA` (parents F33-PROMO+F33-INJETOR).
+- **Próximos passos do Maestro:** confirmar 1º evento de progresso (não o ack); quando I entregar a interface → despachar J; validar cada PRONTO de fora (disco/exits, cold-review isolado); gate de onda (4 lentes) + cenário binário na tela do fundador (gate h).
+
+## FECHAMENTO — F3-3 FECHADA EM CÓDIGO (2026-06-21 · Maestro: Terminal A)
+
+**Commits por fatia (Maestro validou de fora; workers não commitaram):**
+- `fe9ec90` ADR 0038 (kit-lina — destravou bridge.rs) · `bb52cae` contrato de eventos (largada)
+- `1f12761` M-PROMO + M-QA (cérebro determinístico + provas, I+R) · `2503c49` gate (g) bin + `706a210` fix do render
+- `1b3977e` M-DETECTOR (detector da sentinela, B) · `9276316` M-INJETOR + M-UI (injetor + painel, J+G) · `a1f2f94` gate (g) na suíte padrão (R)
+- `60edd6e` gate (h) COSTURA `belief.retire`→`BeliefRetired` (Maestro fechou lacuna órfã entre M-UI e M-INJETOR — aposentar-1-clique FUNCIONAL + teste `f3_3_aposentar_gate_h` pelo caminho real; achado do G)
+
+**Gate de onda (4 lentes) — PASS:**
+1. **Visão/fios:** auto-aprimoramento que SUGERE e aprende por evidência, humano como árbitro (aposentar-1-clique "esquecer isso"). Promoção automática (decisão do fundador) — limites §6 intactos.
+2. **Arquitetura:** ZERO-LLM na política (cold-review do Maestro confirmou: contadores sobre replay, BTree determinístico, ts-do-evento, now_ms só na seleção); projeção por replay (padrão CostLedger); crença nunca deletada. Refletor (único LLM) DEFERIDO p/ fatia 2.
+3. **Segurança (0 ALTA):** crença é dado comportamental, nunca autoridade — `role` server-side no detector (regra-mãe explícita no texto injetado pelo J); gate (e) por MUTAÇÃO verde (R: crença maliciosa estabelecida inerte); suíte de segurança do router VERDE (445 passed). Anti-poisoning SEMÂNTICO = fatia 2 (com o Refletor); backstop de profundidade já provado.
+4. **Specs:** spec 35 §3-§7 implementado; nada do §8 ("Fora do MVP") re-entrou. Cap top-K=5 (gate c); filtro PII+ruído estrutural ("use pnpm, não npm" capturável).
+
+**Validado de fora:** lina-core 445+ testes 0 failed; app build/test/clippy --all-targets -D warnings + token_ratchet + fmt --check; bin gate (g) na suíte padrão — todos exit 0. Cold-review do cérebro absorvido pelo Maestro (H travou em permission_prompt): PASS.
+
+**PENDÊNCIAS / FATIA 2:**
+- **Refletor (spec 35 §4.2):** `CorrectionObserved → BeliefProposed` por 1 CLI-call async fora do caminho crítico. Decisão de escopo do worker (B perguntou "terminais reais vs prova basta"). O detector capta; o cérebro/injetor processam; só a DESTILAÇÃO automática falta. Mecanismo 100% provado pelo R com eventos sintéticos. → próxima fatia, junto com o **gate (d) anti-poisoning semântico** (filtro do Refletor barra instrução maliciosa).
+- **Gate (h):** parte FUNCIONAL fechada (aposentar-1-clique → `BeliefRetired` provado por teste de caminho real; cenário binário provado pelo R contra a API real). Parte VISUAL pendente do **fundador na tela**: o painel "Como o [papel] pensa" validado a olho (gpui não roda headless; computer-use por pixel bloqueado por TCC — o fundador captura). É o ok final.
+- **Achado de dogfooding (gargalo):** workers param em `permission_prompt` local (AskUserQuestion/yn) em vez de perguntar ao Maestro via `lina ask` → trava a orquestração autônoma; e `lina history` nega leitura cross do Maestro. Ver `despachos/f3-3/achados-dogfooding.md`.
+
+**Próxima onda:** F3-4 (coordenação de código multi-agente) ou F3-5 (sessões/auto-aprimoramento) OU a fatia 2 da Mentality (Refletor + anti-poisoning semântico) — escolha do fundador.
