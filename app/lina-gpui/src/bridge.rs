@@ -206,9 +206,10 @@ pub struct NodeView {
     pub status: NodeStatus,
     pub x: f32,
     pub y: f32,
-    /// Rodada 360 (ADR 0022 §4): `true` = agente em pasta própria SEM o kit de integração
-    /// (sem consentimento no modal, ou kit recusado por arquivo pré-existente do usuário) —
-    /// o card pinta o badge "sem doutrina/observabilidade". NUNCA silencioso. Estado de UI
+    /// Rodada 360 (ADR 0022 §4) + ADR 0038: `true` = agente em pasta própria SEM o kit de
+    /// integração completo — kit recusado por arquivo pré-existente do usuário (merge-safe), ou
+    /// bootstrap desativado no boot (degradado). O card pinta o badge "sem doutrina/observabilidade".
+    /// NUNCA silencioso. Estado de UI
     /// por sessão (não persistido; nós reconstruídos por replay nascem `false`).
     pub kit_missing: bool,
     /// FIX-1 (dogfooding 2026-06-10): `true` = este agente divide o cwd de TRABALHO (a pasta
@@ -2755,7 +2756,15 @@ fn node_identity_env(
     effort: Effort,
     lina_home: &std::path::Path,
 ) -> PtyCommand {
-    cmd.env("VIBE_ROLE", role)
+    // Capacidade de cor para TODO nó (shell E agente). O Lina.app sobe pela GUI do macOS, que
+    // NÃO herda `TERM` — então o `+ Novo Agente`, que dá `exec` no CLI DIRETO (sem o shell que
+    // setava `TERM` em `shell_cmd`), nascia "terminal incapaz" e o Claude Code desligava o tema:
+    // tela monocromática/ilegível (bug de tela do fundador, 2026-06-21). Carimbar aqui — no funil
+    // único — dá paridade: o agente fica colorido igual ao `+ Novo terminal`. `COLORTERM=truecolor`
+    // libera as cores 24-bit do tema nativo do CLI. Um CLI que reexporte as vars só afeta a si.
+    cmd.env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .env("VIBE_ROLE", role)
         .env("LINA_NODE_NAME", name)
         .env("LINA_NODE_ID", key)
         // F1-4-4 fatia ii (veredito §3): LINA_HOME POR SPAWN — o terminal nasce apontando
@@ -3566,8 +3575,19 @@ impl BootstrapWriter {
                 dir.display()
             );
         }
-        // Skill A2A turno-0 — namespace `.claude/skills/` (idempotente, best-effort visível).
-        install_agent_bus_skill(dir);
+        // ADR 0038: a safra COMPLETA de skills (embutida via `include_str!` — funciona no app
+        // DISTRIBUÍDO, sem depender de `LINA_ASSETS`/dir de assets no disco) no namespace
+        // `.claude/skills/`. Aditivo + idempotente: cada skill mora em pasta própria, nunca
+        // colide com skill do usuário. Substitui a cópia-de-disco de SÓ a `lina-agent-bus` (o
+        // Gap B do ADR 0038) — todo terminal de PROJETO nasce com a Inteligência inteira
+        // (orquestração/gates/cold-review/verification…), não só o A2A. Idêntico ao caminho
+        // gerenciado (`write_terminal_files_with_hooks`), agora uniforme por política de cwd.
+        if let Err(e) = lina_bootstrap::install_skills_into(&dir.join(".claude").join("skills")) {
+            eprintln!(
+                "lina-gpui: instalar a safra de skills em {} falhou: {e}",
+                dir.display()
+            );
+        }
         if refused.is_empty() {
             KitOutcome::Full
         } else {
@@ -3673,9 +3693,11 @@ pub enum CwdPolicy {
     /// `.lina`/`.claude` no home — não poluir o diretório pessoal). Sem dir gerenciado, sem kit,
     /// sem badge de degradação (não é agente meio-cidadão: é um shell limpo por design).
     UserHome { path: PathBuf },
-    /// Pasta REAL do usuário (picker do M6). `consent` = o usuário autorizou no modal a
-    /// Lina criar os arquivos de orquestração nela; sem consentimento o nó nasce com a
-    /// degradação VISÍVEL (badge "sem doutrina/observabilidade") — nunca silenciosa.
+    /// Pasta REAL do usuário (picker do M6). **ADR 0038:** um `UserDir` é sempre escolhido por
+    /// HUMANO (spawns de agente nascem `Managed`), então o kit COMPLETO é provisionado SEMPRE,
+    /// merge-safe — o consentimento deixou de ser pré-requisito. `consent` ficou VESTIGIAL (ainda
+    /// construído em 5 sites + na UI `kit_consent` do modal; arrancá-lo é refactor fora do escopo
+    /// mínimo do ADR — DEFERIDO de propósito) e não é mais lido na decisão do kit.
     UserDir { path: PathBuf, consent: bool },
 }
 
@@ -4303,9 +4325,10 @@ pub struct NodeManager {
     pub model: Model,
     pub grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
     keys: Mutex<BTreeMap<NodeId, String>>,
-    /// Rodada 360 (ADR 0022 §4): a POLÍTICA de cwd de cada nó admitido — o `rewrite_bootstrap`
-    /// itera por ela (kit no cwd REAL para `UserDir` consentido; nada para não-consentido —
-    /// FIM do dir-fantasma `t{seq}`). Nó ausente do mapa (seeds legados de teste) = `Managed`.
+    /// Rodada 360 (ADR 0022 §4) + ADR 0038: a POLÍTICA de cwd de cada nó admitido — o
+    /// `rewrite_bootstrap` itera por ela (kit merge-safe no cwd REAL para TODO `UserDir`;
+    /// `UserHome` intocado; FIM do dir-fantasma `t{seq}`). Nó ausente do mapa (seeds legados de
+    /// teste) = `Managed`.
     cwds: Mutex<BTreeMap<NodeId, CwdPolicy>>,
     delta_tx: Sender<GridDelta>,
     cmd_factory: CmdFactory,
@@ -4532,9 +4555,9 @@ impl NodeManager {
     /// W3-2: reescreve o `CLAUDE.md`/estado de TODOS os terminais (o arquivo é a âncora a cada
     /// mudança de roster). No-op se o bootstrap não está configurado.
     ///
-    /// Rodada 360 (ADR 0022 §4): itera o binding node→cwd-REAL — nó `UserDir` consentido recebe
-    /// o kit merge-safe NA PASTA DELE; não-consentido não recebe NADA (fim do dir-fantasma
-    /// `<ws_root>/t{seq}` órfão que ninguém lia). `Managed` segue o caminho histórico.
+    /// Rodada 360 (ADR 0022 §4) + ADR 0038: itera o binding node→cwd-REAL — TODO nó `UserDir`
+    /// recebe o kit merge-safe NA PASTA DELE (consent deixou de ser gate); `UserHome` (Terminal
+    /// puro) fica intocado. `Managed` segue o caminho histórico.
     pub fn rewrite_bootstrap(&self) {
         let Some(bw) = &self.bootstrap else { return };
         let snapshot = self.terminals_snapshot_with_policy();
@@ -4544,13 +4567,11 @@ impl NodeManager {
         for (key, name, policy) in &snapshot {
             match policy {
                 CwdPolicy::Managed => bw.write_one(key, name, &roster),
-                CwdPolicy::UserDir {
-                    path,
-                    consent: true,
-                } => {
+                // ADR 0038: UserDir é pasta humana → kit SEMPRE reescrito (merge-safe), sem gate
+                // de consentimento. Roster muda → a doutrina local de todo nó de projeto acompanha.
+                CwdPolicy::UserDir { path, .. } => {
                     let _ = bw.write_user_dir(path, name, &roster);
                 }
-                CwdPolicy::UserDir { consent: false, .. } => {}
                 // Terminal PURO: NUNCA escreve no HOME do usuário (nem na admissão, nem aqui no
                 // rewrite por mudança de roster). Continua listado como colega no `roster`, mas
                 // o home dele fica intocado — invariante do `+ Terminal`.
@@ -4982,8 +5003,9 @@ impl NodeManager {
     /// intenção "quero um terminal" em nó vivo.** Encapsula:
     ///
     /// - validação de nome + alocação de seq/key;
-    /// - política de cwd (§4): `Managed` = kit completo no dir gerenciado; `UserDir` = kit
-    ///   merge-safe no cwd REAL mediante consentimento, senão badge VISÍVEL (nunca silencioso);
+    /// - política de cwd (§4): `Managed` = kit completo no dir gerenciado; `UserDir` (ADR 0038) =
+    ///   o MESMO kit completo, merge-safe no cwd REAL SEMPRE (consent não é mais gate; recusa de
+    ///   arquivo do usuário → badge VISÍVEL, nunca silencioso); `UserHome` = shell limpo;
     /// - write-before-spawn + `wire_terminal`;
     /// - a sequência CANÔNICA e COMPLETA de eventos (§2): `NodeAdded`, `TerminalSpawned`
     ///   com o cwd REAL, `NodeRoleAssigned` SEMPRE ("terminal" também é papel) e
@@ -5171,43 +5193,39 @@ impl NodeManager {
                 cmd = cmd.cwd(path.clone());
                 Some(path.clone())
             }
-            CwdPolicy::UserDir { path, consent } => {
+            CwdPolicy::UserDir { path, .. } => {
                 if let Err(e) = std::fs::create_dir_all(path) {
                     return Err(format!("não consigo trabalhar nessa pasta: {e}"));
                 }
                 cmd = cmd.cwd(path.clone());
-                if *consent {
-                    match &self.bootstrap {
-                        Some(bw) => {
-                            let mut roster: Vec<String> = self
-                                .terminals_snapshot()
-                                .into_iter()
-                                .map(|(_, n)| n)
-                                .collect();
-                            roster.push(name.clone());
-                            // Kit no cwd REAL, merge-safe: arquivo pré-existente do usuário é
-                            // PRESERVADO (aviso + badge) — jamais sobrescrito (§4).
-                            if bw.write_user_dir(path, &name, &roster) != KitOutcome::Full {
-                                kit_missing = true;
-                            }
-                        }
-                        None => {
-                            // Consentiu mas o bootstrap do boot DEGRADOU → o kit não tem como
-                            // ser entregue. Badge liga do mesmo jeito — nunca silencioso (§4).
+                // ADR 0038: um `UserDir` é SEMPRE uma pasta escolhida por HUMANO (spawns de
+                // agente nascem `Managed`). O kit completo é entregue SEMPRE — o consentimento
+                // deixou de ser pré-requisito (decisão do fundador: "auto-instalar sempre, sem
+                // perguntar"). A proteção do usuário continua sendo a escrita MERGE-SAFE: um
+                // arquivo pré-existente NÃO-Lina é PRESERVADO (recusa → `kit_missing` → badge),
+                // jamais sobrescrito.
+                match &self.bootstrap {
+                    Some(bw) => {
+                        let mut roster: Vec<String> = self
+                            .terminals_snapshot()
+                            .into_iter()
+                            .map(|(_, n)| n)
+                            .collect();
+                        roster.push(name.clone());
+                        if bw.write_user_dir(path, &name, &roster) != KitOutcome::Full {
+                            // Recusa merge-safe REAL de um arquivo do usuário → badge honesto.
                             kit_missing = true;
-                            eprintln!(
-                                "lina-gpui: agente '{name}' consentiu o kit, mas o bootstrap \
-                                 está desativado neste boot — sem doutrina/observabilidade"
-                            );
                         }
                     }
-                } else {
-                    // Sem consentimento → degradação VISÍVEL (badge no card), nunca silenciosa.
-                    kit_missing = true;
-                    eprintln!(
-                        "lina-gpui: agente '{name}' em pasta própria SEM kit de integração \
-                         (sem consentimento) — sem doutrina/observabilidade nesta pasta"
-                    );
+                    None => {
+                        // Boot degradado (bootstrap desativado) → o kit não tem como ser
+                        // entregue. Badge liga do mesmo jeito — nunca silencioso (§4).
+                        kit_missing = true;
+                        eprintln!(
+                            "lina-gpui: agente '{name}' em pasta própria, mas o bootstrap \
+                             está desativado neste boot — sem doutrina/observabilidade"
+                        );
+                    }
                 }
                 Some(path.clone())
             }
@@ -9917,12 +9935,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **UserDir SEM consentimento (ADR 0022 §4):** o agente nasce na pasta do usuário SEM
-    /// nenhum arquivo escrito nela (a Lina não toca a pasta sem o toque no modal), com a
-    /// degradação VISÍVEL (`kit_missing` → badge no card) — e SEM o dir-fantasma
-    /// `<ws_root>/t{seq}` órfão (nem na admissão, nem no rewrite de roster).
+    /// **ADR 0038 — UserDir app-spawned recebe o kit COMPLETO (consent não é mais gate):** um
+    /// agente numa pasta própria escolhida por humano nasce com a doutrina + a safra inteira de
+    /// skills, MESMO com `kit_consent=false` no modal (o consentimento deixou de ser pré-requisito
+    /// — a proteção é a escrita merge-safe). Pasta LIMPA → nada recusado → `kit_missing=false`. E
+    /// SEM o dir-fantasma `<ws_root>/n-<uuid>` órfão (nem na admissão, nem no rewrite de roster).
     #[test]
-    fn userdir_sem_consentimento_degrada_visivel_sem_dir_fantasma() {
+    fn userdir_app_spawn_recebe_kit_completo_sem_dir_fantasma() {
         let ws = std::env::temp_dir().join(format!("lina-noconsent-{}", std::process::id()));
         // Dir SUFIXADO pelo teste: o mesmo PID roda a suíte inteira — compartilhar
         // `lina-userdir-{pid}` com outro teste cria corrida de remove_dir_all (flake real).
@@ -9944,12 +9963,17 @@ mod tests {
             .expect("⌘N pasta própria sem consentimento");
 
         assert!(
-            !user.join("CLAUDE.md").exists() && !user.join(".claude").exists(),
-            "SEM consentimento a Lina não escreve NADA na pasta do usuário"
+            user.join("CLAUDE.md").exists(),
+            "ADR 0038: a doutrina é escrita na pasta do projeto (consent não é mais gate)"
         );
         assert!(
-            lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
-            "degradação VISÍVEL: kit_missing liga o badge no card"
+            user.join(".claude/skills/lina-orchestration/SKILL.md")
+                .is_file(),
+            "ADR 0038: a safra COMPLETA chega ao UserDir (não só a lina-agent-bus)"
+        );
+        assert!(
+            !lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
+            "pasta limpa → nada recusado → kit_missing=false (sem badge de degradação)"
         );
         // Fim do dir-fantasma: a admissão de um UserDir não-consentido NÃO cunha dir-casa
         // gerenciado algum. Pós-fix, o slot gerenciado é `<ws>/n-<uuid>` (único, não mais o
@@ -10444,6 +10468,36 @@ mod tests {
                 "env de identidade ausente no comando do PTY: {var}={val} em {dbg}"
             );
         }
+    }
+
+    /// **Bug de tela (fundador, 2026-06-21) — cores no terminal do AGENTE.** O `+ Novo terminal`
+    /// (shell) nasce com `TERM` (via [`shell_cmd`]) e o `claude` rodado nele HERDA as cores; o
+    /// `+ Novo Agente` roda o CLI DIRETO (`PtyCommand::new(&e.program)`, ver `admit_node` §3) e,
+    /// sem `TERM`/`COLORTERM`, o Claude Code detectava terminal incapaz e desligava o tema —
+    /// monocromático e ilegível. O funil único [`node_identity_env`] (por onde TODO nó passa —
+    /// shell E agente) carimba a capacidade de cor, dando PARIDADE: todo terminal nasce colorido
+    /// como o CLI nativo. NÃO-VACUOSO: a base `cat` não seta cor, então sem a injeção os 2 asserts
+    /// falham (o agente real idem — só o shell setava TERM por conta própria).
+    #[test]
+    fn pty_env_enables_color_for_every_node() {
+        let cmd = node_identity_env(
+            PtyCommand::new("cat"), // simula o motor do agente, que NÃO seta TERM por conta própria
+            "Confeiteira",
+            "DEVELOPER",
+            "n-0197-cafe",
+            Autonomy::Assisted,
+            Effort::Medium,
+            std::path::Path::new("/tmp/ws/.lina"),
+        );
+        let dbg = format!("{cmd:?}");
+        assert!(
+            dbg.contains("xterm-256color"),
+            "todo nó (inclusive o agente) nasce com TERM p/ o CLI mostrar cores: {dbg}"
+        );
+        assert!(
+            dbg.contains("COLORTERM") && dbg.contains("truecolor"),
+            "COLORTERM=truecolor dá paridade de cor 24-bit com o tema nativo do CLI: {dbg}"
+        );
     }
 
     /// **FIX-1 (dogfooding 2026-06-10) — admissões no MESMO cwd de TRABALHO são DETECTADAS e
@@ -11971,6 +12025,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&ws);
         let _ = std::fs::remove_dir_all(&user_dir);
+    }
+
+    /// **ADR 0038 — kit COMPLETO em qualquer pasta de projeto:** `write_user_dir` numa pasta
+    /// LIMPA (fora do namespace gerenciado = `UserDir` real) instala a safra INTEIRA de skills
+    /// (as 12 de `LINA_SKILLS`), não só a `lina-agent-bus`. Antes do ADR 0038 só a agent-bus
+    /// chegava ao `UserDir` → o terminal nascia sem a inteligência (orquestração/gates/cold-review).
+    /// Amarrado ao catálogo do crate (anti-drift): skill nova na safra precisa chegar aqui também.
+    #[test]
+    fn write_user_dir_installs_full_skill_crop_in_clean_project_dir() {
+        let ws = std::env::temp_dir().join(format!("lina-fullcrop-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+
+        // Pasta de projeto LIMPA, FORA do namespace gerenciado (= UserDir real do usuário).
+        let proj = std::env::temp_dir().join(format!("lina-fullcrop-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).expect("mkdir proj");
+
+        let roster = vec!["Maestro".to_string()];
+        let outcome = bw.write_user_dir(&proj, "Maestro", &roster);
+        assert_eq!(outcome, KitOutcome::Full, "pasta limpa → nada a recusar → kit Full");
+
+        let skills_root = proj.join(".claude/skills");
+        for skill in lina_bootstrap::LINA_SKILLS {
+            assert!(
+                skills_root.join(skill.name).join("SKILL.md").is_file(),
+                "ADR 0038: a skill {} tem que chegar ao UserDir (kit completo), não só a lina-agent-bus",
+                skill.name
+            );
+        }
+        // A rubrica transversal do cold-review viaja junto (references/).
+        assert!(
+            skills_root
+                .join("lina-cold-review/references/rubrica.md")
+                .is_file(),
+            "ADR 0038: as references/ da safra também chegam ao UserDir"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&proj);
     }
 
     // ───────────────────── F2-1-1b: célula re-derivada (JetBrains Mono 13px) ─────────────────────
