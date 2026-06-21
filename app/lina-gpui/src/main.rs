@@ -12,6 +12,11 @@ mod canvas;
 // confirmar/escalar). Componente sobre o catálogo `ui/` + tokens F2; lógica de tela em funções puras.
 // A projeção `Goal` viva é ligada na integração do Maestro (DEP do despacho).
 mod goal_card;
+// F3-3-5: painel "Como o [papel] pensa" — a janela do leigo para o que cada papel APRENDEU com ele
+// (proveniência humanizada + aposentar-1-clique → `BeliefRetired`). Componente sobre o catálogo `ui/`
+// + tokens F2; lógica de tela em funções puras. A projeção viva (`lina_core::mentality`, M-PROMO) é
+// mapeada para o view-model por um adaptador fino em `mentality_views` (costura alinhada com o dono).
+mod mentality_panel;
 // W4-2 · M1: paleta de comandos (Cmd-K) sobre o canvas — modelo puro testável + render gpui.
 mod palette;
 // W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
@@ -615,6 +620,11 @@ struct WorkspaceView {
     /// canvas), então o painel os reconstrói varrendo o log com a MESMA disciplina de cache do
     /// custo/effort: re-varre SÓ com evento novo (`projection_cache_is_stale`), NUNCA por frame.
     goals_cache: Option<(u64, Vec<lina_core::Goal>, u32)>,
+    /// F3-3-5: cache do painel "Como o [papel] pensa" — `(event_count, mentalidades por papel)`. A
+    /// projeção `Mentality` é reconstruída por REPLAY (O(N)); como `render` roda por frame, re-projeta
+    /// SÓ com evento novo (`projection_cache_is_stale`), NUNCA por frame — mesma disciplina do
+    /// custo/effort/goals (fix do freeze do `lina ask`: store ocupado mantém o cache).
+    mentality_cache: Option<(u64, Vec<mentality_panel::RoleMentality>)>,
 }
 
 impl WorkspaceView {
@@ -792,6 +802,7 @@ impl WorkspaceView {
             archive_toast: None,
             prof: prof::Probe::from_env(),
             goals_cache: None,
+            mentality_cache: None,
         };
         // r5 · plug do Descarregar (contrato combinado C↔Core A2A): botão do rail →
         // executor `runtime::unload_workspace` (Busy preservado por re-checagem no seam);
@@ -2221,6 +2232,130 @@ impl WorkspaceView {
             );
         }
         Some(col.into_any_element())
+    }
+
+    /// F3-3-5: re-projeta a Mentality VIVA por papel SÓ quando o log mudou (disciplina
+    /// `projection_cache_is_stale` — NUNCA por frame; mesma do custo/effort/goals; fix do freeze do
+    /// `lina ask`). Enumera os papéis pelo ROSTER vivo (`cards`→`node_role`) — a fonte certa para
+    /// "Como o [papel] pensa": os papéis do time. Para cada um, delega à projeção do core
+    /// (`lina_core::mentality`, M-PROMO/Terminal I) o QUÊ mostrar via `top_k_for_role` (estabelecidas
+    /// primeiro, exclui aposentadas/expiradas/não-capturáveis), humaniza o nome do papel
+    /// (`role_suggester::humanize`) e MAPEIA `Belief`→`BeliefView` (o painel não conhece o shape do
+    /// core). Não-bloqueante: store ocupado mantém o cache (entrega NÃO trava a UI).
+    fn refresh_mentality_cache(&mut self) {
+        // Teto de exibição por papel: generoso (o fundador vê essencialmente todas as crenças ativas
+        // do papel, já ordenadas). É o mesmo `top_k` do injetor — deve casar/superar o K dele.
+        const PANEL_CAP: usize = 24;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // Papéis distintos do roster vivo (fora do borrow do store).
+        let roles: std::collections::BTreeSet<String> = self
+            .nodes
+            .cards()
+            .into_iter()
+            .filter_map(|(id, _)| self.nodes.node_role(id))
+            .collect();
+        let cached = self.mentality_cache.as_ref().map(|(c, _)| *c);
+        if let Some(v) = self.nodes.try_with_store(|store| {
+            let count = store.event_count().ok()?;
+            if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                return None;
+            }
+            let recs = store.events().ok()?;
+            let mentality = lina_core::mentality::Mentality::from_records(
+                &recs,
+                lina_core::mentality::PromotionPolicy::default(),
+            );
+            let views: Vec<mentality_panel::RoleMentality> = roles
+                .iter()
+                .filter_map(|role| {
+                    let beliefs: Vec<mentality_panel::BeliefView> = mentality
+                        .top_k_for_role(role, PANEL_CAP, now_ms)
+                        .into_iter()
+                        .map(|b| mentality_panel::BeliefView {
+                            belief_id: b.belief_id.clone(),
+                            statement: b.statement.clone(),
+                            provenance: b.provenance.clone(),
+                            // `top_k_for_role` já exclui aposentadas; só `Established`/`Provisional`
+                            // chegam aqui. O `_` cobre `Provisional` (e o `Retired` impossível).
+                            standing: match b.status {
+                                lina_core::mentality::BeliefStatus::Established => {
+                                    mentality_panel::Standing::Established
+                                }
+                                _ => mentality_panel::Standing::Provisional,
+                            },
+                            untrusted_origin: b.untrusted_origin,
+                        })
+                        .collect();
+                    if beliefs.is_empty() {
+                        // Papel sem crença ativa não vira painel (sem tela vazia forçada).
+                        return None;
+                    }
+                    Some(mentality_panel::RoleMentality {
+                        // Nome do papel humanizado em pt-br (nunca o código cru na tela, inv #6).
+                        role_label: role_suggester::humanize(role).0,
+                        beliefs: mentality_panel::ordered(beliefs),
+                    })
+                })
+                .collect();
+            Some((count, views))
+        }) {
+            self.mentality_cache = Some(v);
+        }
+    }
+
+    /// F3-3-5: o painel "Como o [papel] pensa" sobre o canvas — um painel por papel que aprendeu algo
+    /// com o fundador, em pt-br sem jargão, na identidade F2. `None` quando nenhum papel tem crença
+    /// ativa (sem tela vazia forçada). O gesto "esquecer isso" dispara `belief.retire` via
+    /// [`Self::retire_belief`]. A posição (flanco direito) é provisória — o lugar/abertura final do
+    /// painel (toggle/inspector) é polimento de UX para quando o ciclo completo estiver na tela.
+    fn render_mentality_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.refresh_mentality_cache();
+        let roles = match &self.mentality_cache {
+            Some((_, v)) if !v.is_empty() => v.clone(),
+            _ => return None,
+        };
+        let mut col = div()
+            .absolute()
+            .top_16()
+            .right_0()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_3();
+        for role in roles {
+            // As crenças já vêm ordenadas (estabelecidas primeiro) do cache.
+            let cards: Vec<mentality_panel::BeliefCard> = role
+                .beliefs
+                .into_iter()
+                .map(|belief| {
+                    let bid = belief.belief_id.clone();
+                    mentality_panel::BeliefCard::new(belief).on_retire(cx.listener(
+                        move |view, _ev, _window, cx| {
+                            view.retire_belief(&bid, cx);
+                        },
+                    ))
+                })
+                .collect();
+            let panel = mentality_panel::MentalityPanel::new(role.role_label).beliefs(cards);
+            col = col.child(div().w(gpui::relative(0.42)).child(panel));
+        }
+        Some(col.into_any_element())
+    }
+
+    /// F3-3-5 (humano árbitro, spec 35 §6.7): o fundador clicou "esquecer isso" numa crença. MESMA
+    /// costura do [`Self::confirm_goal`]/[`Self::release_breaker`] (ADR 0036): a view só DISPARA o gesto
+    /// pelo canal in-process (`belief.retire`); a `MailboxPump` carimba a autoridade SERVER-SIDE e
+    /// roteia para emitir `BeliefRetired{reason:"retired_by_human"}` — a view NUNCA escolhe autoridade
+    /// nem `reason` (doutrina de segurança: campo escrito pela UI jamais decide). O roteamento
+    /// `belief.retire`→`BeliefRetired` é costura do `bridge.rs::drain_human_intents` (M-INJETOR).
+    /// `belief_id` é id cunhado server-side (vem da projeção) — sem escape JSON, como o `goal_id`.
+    fn retire_belief(&mut self, belief_id: &str, cx: &mut Context<Self>) {
+        self.nodes
+            .push_human_intent("belief.retire", format!(r#"{{"belief_id":"{belief_id}"}}"#));
+        cx.notify();
     }
 
     /// F3-1-7 (gate humano da meta): o fundador confirmou a interpretação com 1 toque. O efeito REAL
@@ -5201,6 +5336,12 @@ impl Render for WorkspaceView {
         // F3-1-7: painel das Goals VIVAS (card que o leigo confirma com 1 toque). Sobre o canvas,
         // sob os modais/paleta; ausente quando não há meta viva (sem tela vazia forçada).
         if let Some(panel) = self.render_goals_panel(cx) {
+            root = root.child(panel);
+        }
+        // F3-3-5: painel "Como o [papel] pensa" — o que cada papel APRENDEU com o fundador (estabelecidas
+        // "já vale", provisórias "ainda testando", aposentar-1-clique). Ausente até a projeção viva
+        // alimentar a tela (Camada 2); sem tela vazia forçada.
+        if let Some(panel) = self.render_mentality_panel(cx) {
             root = root.child(panel);
         }
         // F1-1-5 (P6/fluxo c): painel "Atividade e custos" — zona lateral direita, sob os modais.
