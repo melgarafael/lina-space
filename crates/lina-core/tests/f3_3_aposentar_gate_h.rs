@@ -29,7 +29,11 @@ fn store_and_router(tag: &str) -> (PathBuf, EventStore, Router) {
     let lina = tmp.join(".lina");
     let store = EventStore::open(lina.join("events")).expect("abrir event store");
     let sup = Arc::new(Supervisor::new());
-    let router = Router::with_config(Arc::clone(&sup), Mailbox::new(&lina), RouterConfig::default());
+    let router = Router::with_config(
+        Arc::clone(&sup),
+        Mailbox::new(&lina),
+        RouterConfig::default(),
+    );
     (tmp, store, router)
 }
 
@@ -87,7 +91,11 @@ fn aposentar_remove_a_crenca_da_injecao_pelo_caminho_real() {
         router.retire_belief("b-1", &mut store).expect("retire"),
         "retire_belief devolve true ao aposentar"
     );
-    assert_eq!(count_retired(&store), 1, "exatamente 1 BeliefRetired emitido");
+    assert_eq!(
+        count_retired(&store),
+        1,
+        "exatamente 1 BeliefRetired emitido"
+    );
 
     // Controle -: após aposentar, a crença SOME da injeção — mas NÃO foi deletada (inv #4).
     let after = Mentality::replay(&store, PromotionPolicy::default()).expect("replay 2");
@@ -121,7 +129,9 @@ fn gesto_vazio_e_inerte_nao_loga_evento_orfao() {
         "gesto vazio devolve false"
     );
     assert!(
-        !router.retire_belief("   ", &mut store).expect("retire whitespace"),
+        !router
+            .retire_belief("   ", &mut store)
+            .expect("retire whitespace"),
         "gesto só-espaços devolve false"
     );
     assert_eq!(
