@@ -101,15 +101,15 @@ fn g_bin_roda_black_box_e_le_o_log() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// **(g-ALVO, eval-first) O slot `corrections` CONTA `CorrectionObserved` no log.** Escrevo 4 correções
-/// e 1 meta-ruído; o relatório tem de reportar `corrections == 4` (controle +), e a meta NÃO infla a
-/// contagem (controle −). Mede a adoção da sentinela desde o dia 1 (lição plan.md 0%).
+/// **(g) O slot `corrections` CONTA `CorrectionObserved` no log.** Escrevo 4 correções e 1 meta-ruído;
+/// o relatório reporta `corrections == 4` (controle +), e a meta NÃO infla a contagem (controle −).
+/// Mede a adoção da sentinela `[LINA::CORRECTION]` desde o dia 1 (lição plan.md 0%: medir, não assumir).
 ///
-/// `#[ignore]` ENQUANTO o bin fixa `corrections: 0` (slot "futuro F3-3" da R2). Flipa para verde com a
-/// fiação de ~3 linhas em `intelligence_adoption.rs` (contar o kind `CorrectionObserved`) — ver o
-/// relatório M-QA ao Maestro. QUEBRA SE… a fiação contasse o kind errado ou inflasse com ruído.
+/// VERDE desde a fiação do bin `intelligence_adoption` (contar o kind `CorrectionObserved`, commit
+/// "gate (g) bin conta CorrectionObserved"). Antes era `#[ignore]` (slot hard-coded 0) — eval-first:
+/// o alvo nasceu RED-provado (`Some(0)` ≠ `Some(4)`) e flipou ao ligar a contagem. QUEBRA SE… a fiação
+/// contasse o kind errado ou inflasse com ruído (a meta entra na contagem).
 #[test]
-#[ignore = "AWAITING fiação do slot corrections em intelligence_adoption.rs (bin J/CV3R2): contar CorrectionObserved. Hoje hard-coded 0 — ver relatório M-QA."]
 fn g_corrections_conta_a_sentinela() {
     let (tmp, dir) = write_log("conta-sentinela", 4);
     let report = run_bin(&dir);
