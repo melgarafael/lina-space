@@ -13,6 +13,12 @@
 
 use std::path::{Path, PathBuf};
 
+use lina_core::skill_factory::{
+    classify_skill_load, validate_format, SkillFormatError, FACTORY_METHOD,
+};
+use lina_core::skill_index::{parse_frontmatter, SkillIndexEntry};
+use lina_core::{ActionClass, MailMessage};
+
 /// Uma skill embutida: nome da pasta + arquivos `(caminho relativo, conteúdo)`.
 /// `files` é relativo à pasta da skill (ex.: `SKILL.md`, `references/rubrica.md`).
 pub struct EmbeddedSkill {
@@ -91,6 +97,119 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)
+}
+
+// ───────────── F3-5-4/5: índice de skills + verbos `lina skill` (anti-ciclo: AQUI) ─────────────
+// O catálogo (LINA_SKILLS) e a leitura do disco vivem no bootstrap; o core só recebe o índice
+// pronto e roda o seletor PURO (`bootstrap → core`, sem ciclo). Os verbos enfileiram um contrato;
+// o supervisor emite SkillSelected/SkillFactoryProposed carimbando o `node` SERVER-SIDE.
+
+/// Alvo sentinela dos verbos de skill — o supervisor intercepta por INTENT, não pelo alvo.
+const SKILL_TARGET: &str = "skill";
+
+/// Constrói o índice de skills do seletor (F3-5-4) a partir do catálogo EMBUTIDO
+/// ([`LINA_SKILLS`]) + as skills do usuário em `<disk_skills_root>/<nome>/SKILL.md`. Lê o
+/// frontmatter neutro via parser do CORE; skills legadas (só `name`+`description`) entram com
+/// `triggers`/`requires` vazios — sempre capazes, sem gatilho automático.
+#[must_use]
+pub fn build_skill_index(disk_skills_root: Option<&Path>) -> Vec<SkillIndexEntry> {
+    let mut index: Vec<SkillIndexEntry> = LINA_SKILLS
+        .iter()
+        .filter_map(|skill| {
+            skill
+                .files
+                .iter()
+                .find(|(rel, _)| *rel == "SKILL.md")
+                .map(|(_, body)| index_entry(skill.name, body))
+        })
+        .collect();
+    if let Some(root) = disk_skills_root {
+        index.extend(read_disk_skills(root));
+    }
+    index
+}
+
+/// Uma entrada do índice: `name` autoritativo (da pasta) + triggers/requires do frontmatter.
+fn index_entry(name: &str, skill_md: &str) -> SkillIndexEntry {
+    let fm = parse_frontmatter(skill_md);
+    SkillIndexEntry {
+        name: name.to_string(),
+        triggers: fm.triggers,
+        requires: fm.requires,
+    }
+}
+
+/// As skills do usuário em `<root>/<nome>/SKILL.md`. Ausência de `root`/`SKILL.md` é DEGRADAÇÃO
+/// intencional (o seletor cai no catálogo embutido), não erro engolido: um Espaço sem skills no
+/// disco simplesmente não acrescenta entradas.
+fn read_disk_skills(root: &Path) -> Vec<SkillIndexEntry> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let md = std::fs::read_to_string(e.path().join("SKILL.md")).ok()?;
+            Some(index_entry(&name, &md))
+        })
+        .collect()
+}
+
+/// Monta o envelope `skill.select` (F3-5-4): o supervisor emite `SkillSelected{node,...}`
+/// carimbando o `node` SERVER-SIDE (identidade autenticada) — o payload NUNCA carrega `node`
+/// (dado forjável ≠ autoridade, igual `code.changed` omite `author_node`). `source` = de onde a
+/// skill veio (catálogo/hub/fábrica).
+#[must_use]
+pub fn build_skill_select_envelope(
+    from: &str,
+    skill: &str,
+    trigger: Option<&str>,
+    source: &str,
+) -> MailMessage {
+    let payload = serde_json::json!({
+        "skill": skill,
+        "trigger": trigger,
+        "source": source,
+    })
+    .to_string();
+    MailMessage::new(from, SKILL_TARGET, "skill.select", payload)
+}
+
+/// Monta o envelope `skill.propose` (F3-5-5): o supervisor emite `SkillFactoryProposed`. SUGERE,
+/// nunca aplica — habilitar a skill é gesto humano. `via` é sempre o método da fábrica.
+#[must_use]
+pub fn build_skill_propose_envelope(
+    from: &str,
+    skill_name: &str,
+    references: &[String],
+) -> MailMessage {
+    let payload = serde_json::json!({
+        "skill_name": skill_name,
+        "via": FACTORY_METHOD,
+        "references": references,
+    })
+    .to_string();
+    MailMessage::new(from, SKILL_TARGET, "skill.propose", payload)
+}
+
+/// Veredito de inspecionar uma skill (`lina skill check`): o FORMATO (validação do core) + a
+/// CLASSE de risco de carga (guard de inline-shell). Read-only — não cria nem habilita nada.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SkillCheck {
+    pub format: Result<(), SkillFormatError>,
+    pub load_class: ActionClass,
+}
+
+/// Inspeciona uma SKILL.md (PURA): valida o formato e classifica o risco de carga. O caller
+/// (`lina skill check`) imprime e mapeia para `ExitCode`; nunca carrega/instala.
+#[must_use]
+pub fn skill_check(skill_md: &str) -> SkillCheck {
+    SkillCheck {
+        format: validate_format(skill_md),
+        load_class: classify_skill_load(skill_md),
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +388,106 @@ mod tests {
                 skill.name
             );
         }
+    }
+
+    // ════════════ F3-5-4/5: índice de skills + verbos `lina skill` ════════════
+
+    /// O índice inclui TODO o catálogo embutido; skills legadas (doutrinas) entram sem requisito
+    /// de tool — sempre capazes.
+    #[test]
+    fn index_includes_embedded_catalog() {
+        let index = build_skill_index(None);
+        assert_eq!(index.len(), LINA_SKILLS.len());
+        let bus = index
+            .iter()
+            .find(|e| e.name == "lina-agent-bus")
+            .expect("lina-agent-bus no índice");
+        assert!(bus.requires.is_empty(), "doutrina legada = sempre capaz");
+    }
+
+    /// CRITÉRIO DE ACEITE: o caller (bootstrap) popula o índice do disco lendo o frontmatter
+    /// neutro (trigger/requires) — anti-ciclo: o core só recebe o índice pronto.
+    #[test]
+    fn index_reads_disk_skills_with_trigger_and_requires() {
+        let root = std::env::temp_dir().join(format!("lina-skill-idx-disk-{}", std::process::id()));
+        let dir = root.join("deploy-helper");
+        std::fs::create_dir_all(&dir).expect("cria dir da skill");
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: deploy-helper\ntrigger: faz o deploy\nrequires: Bash, Vercel\n---\ncorpo\n",
+        )
+        .expect("escreve SKILL.md");
+        let index = build_skill_index(Some(&root));
+        let found = index
+            .iter()
+            .find(|e| e.name == "deploy-helper")
+            .expect("skill do disco no índice");
+        assert_eq!(found.triggers, vec!["faz o deploy"]);
+        assert_eq!(found.requires, vec!["Bash", "Vercel"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Root de disco inexistente degrada para só o catálogo embutido (não derruba o índice).
+    #[test]
+    fn index_tolerates_missing_disk_root() {
+        let index = build_skill_index(Some(Path::new("/caminho/inexistente/lina-xyz-999")));
+        assert_eq!(index.len(), LINA_SKILLS.len());
+    }
+
+    /// CRITÉRIO DE ACEITE: o envelope de seleção carrega skill/trigger/source e OMITE o `node`
+    /// (carimbado server-side, igual `code.changed` omite o autor).
+    #[test]
+    fn select_envelope_omits_node_and_carries_selection() {
+        let msg = build_skill_select_envelope(
+            "Terminal J",
+            "lina-code-doctrine",
+            Some("conserta esse bug"),
+            "catalog",
+        );
+        assert_eq!(msg.intent, "skill.select");
+        assert_eq!(
+            msg.to, "skill",
+            "alvo sentinela — supervisor intercepta por intent"
+        );
+        let p: serde_json::Value = serde_json::from_str(&msg.payload).expect("payload json");
+        assert_eq!(p["skill"], "lina-code-doctrine");
+        assert_eq!(p["trigger"], "conserta esse bug");
+        assert_eq!(p["source"], "catalog");
+        assert!(
+            p.get("node").is_none(),
+            "node é carimbado SERVER-SIDE, nunca vem do payload"
+        );
+    }
+
+    /// CRITÉRIO DE ACEITE: a proposta da fábrica é via deep-research e carrega as referências.
+    #[test]
+    fn propose_envelope_carries_deep_research_proposal() {
+        let refs = vec!["https://doc.rust-lang.org/book".to_string()];
+        let msg = build_skill_propose_envelope("Terminal J", "senior-architect", &refs);
+        assert_eq!(msg.intent, "skill.propose");
+        assert_eq!(msg.to, "skill");
+        let p: serde_json::Value = serde_json::from_str(&msg.payload).expect("payload json");
+        assert_eq!(p["skill_name"], "senior-architect");
+        assert_eq!(p["via"], "deep-research");
+        assert_eq!(
+            p["references"],
+            serde_json::json!(["https://doc.rust-lang.org/book"])
+        );
+    }
+
+    /// CRITÉRIO DE ACEITE: `lina skill check` aponta inline-shell como gate (gated-hard) mesmo
+    /// com formato válido.
+    #[test]
+    fn skill_check_flags_inline_shell_as_gated_hard() {
+        let check = skill_check("---\nname: x\n---\nrodar !`rm -rf /`\n");
+        assert_eq!(check.format, Ok(()));
+        assert_eq!(check.load_class, ActionClass::GatedHard);
+    }
+
+    #[test]
+    fn skill_check_passes_plain_skill() {
+        let check = skill_check("---\nname: doutrina\ndescription: texto\n---\nsó texto\n");
+        assert_eq!(check.format, Ok(()));
+        assert_eq!(check.load_class, ActionClass::Routine);
     }
 }
