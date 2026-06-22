@@ -213,6 +213,7 @@ fn outer_loop_review_verdict_judge_is_never_the_executor() {
                 check_arg: Some("true".into()),
             }],
             budget_tokens: 0,
+            paths: vec![],
         })
         .expect("PlanItemAttributed");
     e.store

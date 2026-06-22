@@ -146,31 +146,40 @@ const PROTECTED_BRANCHES: &[&str] = &["main", "master"];
 /// Defaultar desconhecido para `ask` violaria "nunca tela em branco / local rotineiro segue".
 #[must_use]
 pub fn classify(cmd: &str) -> ActionClass {
-    let lower = cmd.to_ascii_lowercase();
     // FIX #1 (encadeamento): um comando shell pode encadear vários via `;`, `&&`, `||`, `|`, `&` e
     // newline. Classificar o token-soup global inteiro mistura os fragmentos — um indicador de força/
     // destino vaza entre comandos (falso-positivo) e, pior, a severidade de um fragmento pode ser
     // diluída (falso-negativo). Então fragmentamos e classificamos CADA pedaço; a classe final é a
     // MAIS SEVERA (`Ord`: Routine < GatedSoft < GatedHard). Monotônico: encadear NUNCA rebaixa.
-    split_shell_fragments(&lower)
+    // F3-4-6: fragmentamos o comando ORIGINAL (case preservado) — o lowercase é aplicado DENTRO de
+    // cada fragmento. Flags git são case-SENSITIVE (`-D` força-apaga vs `-d` seguro): lowercasear
+    // antes da tokenização confundiria as duas.
+    split_shell_fragments(cmd)
         .iter()
         .map(|frag| classify_fragment(frag))
         .max()
         .unwrap_or(ActionClass::Routine)
 }
 
-/// Classifica UM fragmento de comando (já sem separadores de shell e em minúsculas).
+/// Classifica UM fragmento de comando (já sem separadores de shell, com o case ORIGINAL).
 fn classify_fragment(frag: &str) -> ActionClass {
     // FIX #5 (anti-evasão por aspas): remove `"` e `'` antes de tokenizar — `"main"`/`'main'` → main;
     // `"$HOME"` → $HOME; `'/etc'` → /etc. Sem isto, aspas em volta do alvo derrotavam o fix #2
     // (destino do refspec), o fix #4 (`$var`) e a checagem de path do `rm`. Remover os chars é
     // conservador: só APROXIMA de gated-hard (severidade monotônica), nunca esconde perigo.
-    let unquoted = frag.replace(['"', '\''], "");
+    //
+    // Duas vistas do fragmento: `tokens` em minúsculas (maioria dos matches é case-insensitive —
+    // paths, branches, `$var`) e `raw_tokens` com o case PRESERVADO (F3-4-6: só as flags git
+    // case-sensitive, como `-D`, consultam esta).
+    let lower = frag.to_ascii_lowercase();
+    let unquoted = lower.replace(['"', '\''], "");
     let tokens: Vec<&str> = unquoted.split_whitespace().collect();
+    let raw_unquoted = frag.replace(['"', '\''], "");
+    let raw_tokens: Vec<&str> = raw_unquoted.split_whitespace().collect();
     if tokens.is_empty() {
         return ActionClass::Routine;
     }
-    if is_gated_hard(&unquoted, &tokens) {
+    if is_gated_hard(&unquoted, &tokens, &raw_tokens) {
         ActionClass::GatedHard
     } else if is_gated_soft(&tokens) {
         ActionClass::GatedSoft
@@ -222,12 +231,19 @@ pub fn check_action(cmd: &str, autonomy: AutonomyLevel) -> GateDecision {
 
 // ───────────────────────────── classificadores (pattern-match puro) ─────────────────────────────
 
-fn is_gated_hard(lower: &str, tokens: &[&str]) -> bool {
+fn is_gated_hard(lower: &str, tokens: &[&str], raw_tokens: &[&str]) -> bool {
     // 1+2) `git push` perigoso: por FORÇA (flags `--force`/`-f`/`--force-with-lease` OU prefixo `+`
     //      num refspec — FIX #3) OU por DESTINO protegido (`main`/`master`), inclusive via refspec
     //      `src:dst`/`HEAD:main`/`refs/heads/main`/`:main` (FIX #2) ou destino expansível
     //      `$branch`/`{a,b}` (FIX #6). O `contains("main")` por token inteiro perdia tudo isso.
     if is_git_push(tokens) && (has_force_flag(tokens) || push_targets_protected(tokens)) {
+        return true;
+    }
+    // 2.5) F3-4-6 (spec 36 §3): descartes IRREVERSÍVEIS de git — `reset --hard`, `checkout
+    //      --force`, `branch -D`. Mesma família do push --force acima: apagam trabalho sem rede,
+    //      então gated-hard em TODO nível (autônomo nunca afrouxa). "Nunca perder trabalho em
+    //      silêncio" é doutrina do integrador (inv#4/#6 estendidos ao código).
+    if is_destructive_git(tokens, raw_tokens) {
         return true;
     }
     // 3) `rm` recursivo OU forçado (FIX #7) em alvo FORA do workspace (absoluto/home/parent/glob raiz
@@ -358,6 +374,39 @@ fn is_gated_soft(tokens: &[&str]) -> bool {
 /// `git push` em qualquer forma (`git push`, `git -C dir push`, `sudo git push`).
 fn is_git_push(tokens: &[&str]) -> bool {
     tokens.contains(&"git") && tokens.contains(&"push")
+}
+
+/// F3-4-6 (spec 36 §3): formas de git que descartam trabalho de modo IRREVERSÍVEL → gated-hard.
+/// CONSERVADOR por desenho — só as variantes `--hard`/forçadas disparam; as recuperáveis (`reset`
+/// soft/mixed, `branch -d` de branch já mergeada, `checkout`/`switch` sem `--force`) NÃO casam,
+/// para não treinar o humano a aprovar no automático.
+fn is_destructive_git(tokens: &[&str], raw_tokens: &[&str]) -> bool {
+    if !tokens.contains(&"git") {
+        return false;
+    }
+    // `git reset --hard` — joga fora working tree + index sem rede de recuperação.
+    if tokens.contains(&"reset") && tokens.contains(&"--hard") {
+        return true;
+    }
+    // `git checkout --force`/`-f` — sobrescreve mudanças locais à força (sem o git recusar).
+    if tokens.contains(&"checkout") && (tokens.contains(&"--force") || tokens.contains(&"-f")) {
+        return true;
+    }
+    // `git branch -D`/`--delete --force` — apaga branch NÃO-mergeada (= trabalho órfão perdido).
+    tokens.contains(&"branch") && branch_force_deletes(tokens, raw_tokens)
+}
+
+/// `true` se um `git branch` apaga À FORÇA: o atalho `-D`, ou `--delete`/`-d` combinado com
+/// `--force`/`-f`. O `-d`/`--delete` SOZINHO (só apaga branch mergeada) é recuperável → NÃO casa.
+/// `-D` é case-SENSITIVE (atalho de `--delete --force`); consulta os `raw_tokens` (case preservado),
+/// senão o lowercase global o confundiria com o `-d` seguro.
+fn branch_force_deletes(tokens: &[&str], raw_tokens: &[&str]) -> bool {
+    if raw_tokens.contains(&"-D") {
+        return true;
+    }
+    let deletes = tokens.contains(&"--delete") || tokens.contains(&"-d");
+    let forced = tokens.contains(&"--force") || tokens.contains(&"-f");
+    deletes && forced
 }
 
 /// Força de um `git push`: flags clássicas (`--force`, `-f`, `--force-with-lease`) OU — FIX #3 — o
@@ -943,6 +992,59 @@ mod tests {
                 check_action(cmd, AutonomyLevel::Autonomous).decision,
                 Decision::Allow,
                 "{cmd}"
+            );
+        }
+    }
+
+    // ════════════ F3-4-6: salvaguardas da worktree (família gated-hard #19) ════════════
+
+    /// F3-4-6 (spec 36 §3): os descartes IRREVERSÍVEIS de git — `reset --hard` (joga fora
+    /// working tree + index), `checkout --force` (sobrescreve mudanças locais) e `branch -D`
+    /// (apaga branch não-mergeada → trabalho órfão perdido) — são `gated-hard`: ask em TODO
+    /// nível, autônomo NUNCA afrouxa. Espelha o precedente do `git push --force` (já gated) e a
+    /// doutrina "nunca perder trabalho em silêncio" do integrador.
+    #[test]
+    fn f3_4_6_destructive_git_is_gated_hard() {
+        for cmd in [
+            "git reset --hard",
+            "git reset --hard HEAD~3",
+            "git reset --hard origin/main",
+            "git -C ../wt reset --hard",
+            "git checkout --force",
+            "git checkout -f main",
+            "git checkout --force feature/x",
+            "git branch -D feature",
+            "git branch --delete --force feature",
+            "git branch -d --force feature",
+            "git branch -d -f feature",
+        ] {
+            assert_eq!(classify(cmd), ActionClass::GatedHard, "{cmd}");
+            assert!(ask_in_autonomous(cmd), "{cmd} deve ser ask até em autônomo");
+        }
+    }
+
+    /// F3-4-6 — CONSERVADOR (não classificar demais): as formas RECUPERÁVEIS dos mesmos verbos
+    /// seguem `routine`. `reset` soft/mixed preserva o trabalho; `branch -d` (lowercase) só apaga
+    /// branch JÁ mergeada; `checkout`/`switch` sem `--force` nunca descartam à força (o git recusa
+    /// se houver conflito local). Gatear estas treinaria o humano a aprovar no automático — o
+    /// oposto do objetivo do gate.
+    #[test]
+    fn f3_4_6_recoverable_git_is_not_gated() {
+        for cmd in [
+            "git reset",
+            "git reset HEAD~1",
+            "git reset --soft HEAD~1",
+            "git reset --mixed",
+            "git branch -d merged",
+            "git branch --delete merged",
+            "git checkout main",
+            "git checkout -b new-feature",
+            "git switch main",
+        ] {
+            assert_eq!(
+                classify(cmd),
+                ActionClass::Routine,
+                "{cmd} é recuperável — gatear treina o humano a aprovar no automático"
             );
         }
     }

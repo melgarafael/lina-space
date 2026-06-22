@@ -178,6 +178,12 @@ pub mod briefing;
 /// DADO comportamental, nunca autoridade (§6.1). Implementado em F3-3 (M-PROMO).
 pub mod mentality;
 
+/// F3-4-5 (spec 36 §3): coordenação de código — projeção `branches_nao_integradas` + gatilho
+/// determinístico do DevOps integrador (molde `CostLedger`/`Mentality`, ZERO LLM). O core DECIDE;
+/// o disparo é do caminho de spawn governado. `branch`/`paths` são DADO, jamais autoridade.
+pub mod code;
+pub use code::{CodeIntegration, IntegratorDispatch, INTEGRATOR_ROLE, INTEGRATOR_SETTLE_MS};
+
 /// F1-5-5: suspensão real de ociosos — máquina `Active → Idle → Suspended` (overlay ortogonal ao
 /// [`NodeStatus`]; só o render pausa, a drenagem nunca para).
 pub mod suspend;

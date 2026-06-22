@@ -154,6 +154,7 @@ impl Env {
                     check_arg: Some(cmd.to_string()),
                 }],
                 budget_tokens: 0,
+                paths: vec![],
             })
             .expect("PlanItemAttributed");
         self.store
