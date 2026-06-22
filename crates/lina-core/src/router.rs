@@ -975,6 +975,15 @@ impl Router {
             return self.handle_code_changed(msg, sender, store, deliver);
         }
 
+        // ── F3-4-5 (spec 36 §3): `lina branch-integrated` — PROVA DE FECHAMENTO de uma branch
+        //    integrada na linha de develop (DevOps integrador, após um merge PROVADO). Verbo
+        //    ESTRUTURADO: apenda `BranchIntegrated` — a ÚNICA prova de "branch fechada" (a projeção
+        //    `code::branches_nao_integradas` só a remove do pendente com este evento, nunca por
+        //    suposição). NÃO é delegação A2A entregue a um `to`; é registro no log, como code.changed.
+        if is_branch_integrated_intent(&msg.intent) {
+            return self.handle_branch_integrated(msg, store);
+        }
+
         // ── F3-3 (M-DETECTOR, spec 35 §4.1): sentinela `[LINA::CORRECTION]` no payload — verbo
         //    ESTRUTURADO de CAPTAÇÃO de aprendizado (molde de plan/params/goal). Detectado pela
         //    SENTINELA (não por intent canônico — qualquer mensagem cujo payload ABRE com o marcador
@@ -2119,6 +2128,53 @@ impl Router {
             }
         }
         RouteOutcome::Delivered { targets }
+    }
+
+    /// **F3-4-5 (spec 36 §3): handler da prova de integração `branch.integrated`.** Apenda
+    /// `BranchIntegrated{branch, into, commit}` — a ÚNICA prova de que uma branch foi fechada (a
+    /// projeção [`crate::code::branches_nao_integradas`] só a remove do pendente com este evento,
+    /// nunca por suposição). `branch`/`into`/`commit` são DADO descritivo do git (os fatos do merge),
+    /// não identidade: diferente de `code.changed`, aqui não há autor a carimbar nem pertencimento a
+    /// cruzar — a AUTORIDADE da integração é o gate humano das salvaguardas git (ADR 0042: nunca
+    /// push --force/reset --hard/apagar não-mergeada), não este registro. `branch` vazio é rejeitado.
+    fn handle_branch_integrated(
+        &mut self,
+        msg: &MailMessage,
+        store: &mut EventStore,
+    ) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let branch = payload
+            .get("branch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if branch.is_empty() {
+            return RouteOutcome::ContractRejected(
+                "branch.integrated exige 'branch' no payload".into(),
+            );
+        }
+        let into = payload
+            .get("into")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let commit = payload
+            .get("commit")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Err(e) = store.append(&DomainEvent::BranchIntegrated {
+            branch,
+            into,
+            commit,
+        }) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        // Registro puro: ninguém é notificado (a prova vive no log; a projeção de pendências a lê).
+        RouteOutcome::Delivered {
+            targets: Vec::new(),
+        }
     }
 
     /// Núcleo compartilhado de `plan.add`/`plan.seed`: semeia o item (`PlanItemAdded`) e o ATRIBUI à
@@ -3412,6 +3468,13 @@ fn is_code_changed_intent(intent: &str) -> bool {
     intent == "code.changed"
 }
 
+/// F3-4-5 (spec 36 §3): `true` se o intent é a PROVA DE FECHAMENTO de uma branch
+/// (`lina branch-integrated`). Interceptado no router — apenda `BranchIntegrated` (registro puro;
+/// a projeção `code::branches_nao_integradas` o consome). Molde de [`is_code_changed_intent`].
+fn is_branch_integrated_intent(intent: &str) -> bool {
+    intent == "branch.integrated"
+}
+
 /// F3-1-2 (spec 52 §1/§3): o JUIZ ESTRUTURAL — roda os critérios de aceite de um item, ZERO LLM.
 /// `None` = DEFERE ao humano/QA (algum critério é `HumanReview`, ou o juiz não pôde avaliar →
 /// fail-open; o turn-budget é o backstop). `Some(Pass)` sse TODOS os critérios automáticos passam;
@@ -4176,6 +4239,60 @@ mod tests {
             cc.payload.get("author_node").and_then(|v| v.as_str()),
             Some("@A"),
             "author = remetente autenticado, NUNCA o @EVIL forjado no payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F3-4-5 (costura intent→handler fechada pelo Maestro na integração):** `branch.integrated`
+    /// percorre `route_message` → apenda `BranchIntegrated` (a ÚNICA prova de fechamento, spec 36 §3)
+    /// → a projeção `code` deixa de listar a branch como pendente. End-to-end (NÃO `store.append` à
+    /// mão): prova a COSTURA (o verbo de B chegava órfão sem este handler), não só o evento.
+    #[test]
+    fn branch_integrated_emits_event_and_closes_branch_end_to_end() {
+        let (mut router, sup, dir) = router_with("bi-close");
+        let _d = sup.register("@DevOps", None, sink());
+        let mut ts = TmpStore::new("bi-close");
+        let (_rec, mut deliver) = recorder();
+        // 1) um commit deixa a branch PENDENTE (CodeChanged sem BranchIntegrated).
+        let cc = r#"{"branch":"lina/a","commit":"c1","paths":["src/x.rs"]}"#;
+        let _ = router.route_message(
+            &MailMessage::new("@DevOps", "@workspace", "code.changed", cc),
+            &mut ts.store,
+            1000,
+            &mut deliver,
+        );
+        assert!(
+            crate::code::CodeIntegration::replay(&ts.store)
+                .expect("proj")
+                .is_branch_pending("lina/a"),
+            "pendente após CodeChanged"
+        );
+        // 2) branch.integrated PELO CAMINHO REAL → BranchIntegrated no log (handler LIGADO).
+        let bi = r#"{"branch":"lina/a","into":"develop","commit":"m1"}"#;
+        let out = router.route_message(
+            &MailMessage::new("@DevOps", "@workspace", "branch.integrated", bi),
+            &mut ts.store,
+            2000,
+            &mut deliver,
+        );
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "intent processado pelo handler (não fica órfão)"
+        );
+        assert!(
+            ts.store
+                .events()
+                .expect("events")
+                .into_iter()
+                .any(|r| r.kind == "BranchIntegrated"),
+            "BranchIntegrated emitido pelo handler (a costura está LIGADA)"
+        );
+        // 3) a projeção fecha a branch — prova de fechamento (spec 36 §3).
+        assert!(
+            !crate::code::CodeIntegration::replay(&ts.store)
+                .expect("proj")
+                .is_branch_pending("lina/a"),
+            "branch fechada após BranchIntegrated"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
