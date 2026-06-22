@@ -39,9 +39,19 @@ use lina_core::{
 // aprendizado. Só CONSUMIDA aqui (seleção top-K + leitura de status); a política e a projeção
 // vivem em `lina-core::mentality` (dono: Terminal I).
 use lina_core::mentality::{Belief, BeliefStatus, Mentality, PromotionPolicy};
-// F3-5-3: a projeção das conversas `--resume` salvas (dono: Terminal B). Só CONSUMIDA aqui — a
-// regra de admissão/poda e o replay vivem no core; o app lista e religa pelo funil `admit_node`.
-use lina_core::resume_session::ResumeSessionStore;
+// F3-5-3: a projeção das conversas `--resume` salvas (dono: Terminal B). O app LISTA/religa (replay)
+// e, no tick do pump, GERA o `SessionPersisted` do 1º prompt (`persist_after_first_prompt`) — fiação
+// desta fatia; a regra de admissão/poda vive no core.
+use lina_core::resume_session::{ResumeSessionStore, DEFAULT_SESSION_STORE_MAX_ENTRIES};
+// F3-5-7 (`BufferGauge`, spec 53 §11.A): amostrador de ocupação dos buffers. O app coleta as leituras
+// cruas (scrollback/mailbox) e apenda `BufferOccupancySampled` no tick, com o `prev` CACHEADO em
+// memória (delta — `replay` por tick seria O(N)/tick = freeze). Maquinaria do core: dono Terminal K.
+use lina_core::buffer_registry::{
+    self, BufferRegistry, GaugeReading, GaugeSnapshot, GAUGE_WARN_RATIO,
+};
+// F3-5-1: o snapshot de sessões `--resume` observadas no disco (global da máquina) — correlacionado
+// por `cwd` ao nó do Espaço para nascer o `SessionPersisted`.
+use lina_session_watch::Session;
 // A2A UNIVERSAL: o registry de TODOS os CLI Profiles — a entrega resolve o profile do ALVO
 // por aqui (CliProfile vem re-exportado do core; ProfileRegistry é o índice por `id`).
 use lina_cli_profiles::ProfileRegistry;
@@ -752,7 +762,31 @@ pub struct MailboxPump {
     /// SEAM-1: `event_count` do último `post_process_spawns` — só re-varre o log quando há evento
     /// novo (padrão do `last_cost_ec`; evita ler o log a cada tick sem mudança).
     last_spawn_ec: u64,
+    /// F3-5-1: snapshot vivo das sessões `--resume` observadas no disco (alimentado pelo `SessionHub`,
+    /// o mesmo `Arc` do dashboard). Correlacionado por `cwd` ao nó do Espaço para nascer o
+    /// `SessionPersisted` do 1º prompt (`persist_first_prompts`).
+    sessions: Arc<Mutex<Vec<Session>>>,
+    /// F3-5-1: `session_id`s para os quais o `SessionPersisted` já nasceu — cache DELTA que dá o
+    /// short-circuit anti-freeze (todas conhecidas ⇒ zero `project`/`replay` no tick). O `plan_persist`
+    /// é idempotente no core; este cache evita até o custo de tentar.
+    persisted_sessions: std::collections::HashSet<String>,
+    /// F3-5-1: `now_ms` do último `project` de correlação sessão↔nó. O `lina-session-watch` é GLOBAL
+    /// (vê sessões da máquina inteira, muitas sem nó no Espaço); throttlar o `project` evita varrer a
+    /// projeção a cada tick por causa dessas órfãs permanentes (anti-freeze, par do `last_cost_ec`).
+    last_session_scan_ms: u64,
+    /// F3-5-7: cache do ÚLTIMO `BufferRegistry` amostrado (o `prev` de `buffer_registry::sample`). É a
+    /// projeção "último por buffer_id vence" mantida em memória por DELTA — jamais `BufferRegistry::
+    /// replay(store)` por tick (O(N)/tick foi a causa-raiz documentada do freeze).
+    buffer_gauge: BufferRegistry,
+    /// F3-5-7: `now_ms` da última amostragem de buffers. `mailbox.gauge_readings()` faz I/O (lista o
+    /// outbox) — throttlar ao [`BUFFER_SAMPLE_INTERVAL_MS`] mantém o medidor barato no tick de 120ms.
+    last_buffer_sample_ms: u64,
 }
+
+/// F3-5-1: passo do throttle do `project` de correlação sessão↔nó (anti-freeze; ver `sessions`).
+const SESSION_SCAN_INTERVAL_MS: u64 = 2_000;
+/// F3-5-7: passo do throttle da amostragem de buffers (o `gauge_readings` da mailbox faz I/O).
+const BUFFER_SAMPLE_INTERVAL_MS: u64 = 1_000;
 
 /// SEAM-1: detalhes INFORJÁVEIS de um pedido de spawn (do `SpawnRequested`), usados por
 /// `post_process_spawns` p/ fiar o binding de cascata (M4) + o 1º prompt.
@@ -770,6 +804,32 @@ fn autonomy_to_level(a: lina_bootstrap::Autonomy) -> lina_core::AutonomyLevel {
         lina_bootstrap::Autonomy::Manual => lina_core::AutonomyLevel::Manual,
         lina_bootstrap::Autonomy::Assisted => lina_core::AutonomyLevel::Assisted,
         lina_bootstrap::Autonomy::Autonomous => lina_core::AutonomyLevel::Autonomous,
+    }
+}
+
+/// F3-5-7: aplica um `BufferOccupancySampled` ao cache do registry em memória (DELTA — mantém o `prev`
+/// de [`buffer_registry::sample`] sem `replay`). Espelha a projeção do core (último por `buffer_id`
+/// vence); chamado só para os eventos que o `sample` JÁ decidiu emitir.
+fn apply_gauge_event(reg: &mut BufferRegistry, ev: &DomainEvent) {
+    if let DomainEvent::BufferOccupancySampled {
+        buffer_id,
+        used,
+        capacity,
+        unit,
+        pressure_ratio,
+        sampled_at_ms,
+    } = ev
+    {
+        reg.gauges.insert(
+            buffer_id.clone(),
+            GaugeSnapshot {
+                used: *used,
+                capacity: *capacity,
+                unit: unit.clone(),
+                pressure_ratio: *pressure_ratio,
+                sampled_at_ms: *sampled_at_ms,
+            },
+        );
     }
 }
 
@@ -801,6 +861,9 @@ impl MailboxPump {
         autonomy: lina_bootstrap::Autonomy,
         // SEAM-1: o funil de admissão (ADR 0022) — `SpawnApproved` cria o terminal por aqui.
         nodes: Arc<NodeManager>,
+        // F3-5-1: snapshot vivo das sessões `--resume` (mesmo `Arc` que o dashboard recebe do hub) —
+        // a fonte do `session_id` correlacionado por `cwd` ao nó para nascer o `SessionPersisted`.
+        sessions: Arc<Mutex<Vec<Session>>>,
     ) -> Self {
         // F3-0-2 (SEAM-1'): a config dos 13 params de orquestração é PROJEÇÃO do event log (invariante
         // #4) — `resolve_from_store` reconstrói o `RouterConfig` varrendo os `SystemParamsChanged`,
@@ -834,6 +897,25 @@ impl MailboxPump {
             eprintln!("lina-gpui: falha ao restaurar o estado do freio (segue despausado): {e}");
         }
         lock(&brake).paused = router.is_paused();
+        // F3-5-1/-7: semeia os caches de longa duração a partir do log UMA vez no boot (jamais por
+        // tick — replay/tick é O(N)/tick, a causa-raiz do freeze). Falha de leitura → cache vazio + aviso
+        // (degrada: o 1º tick re-tenta, e `plan_persist`/`sample` são idempotentes/aditivos), nunca panica.
+        let persisted_sessions = match ResumeSessionStore::replay(&lock(&store)) {
+            Ok(s) => s.sessions.into_iter().map(|x| x.session_id).collect(),
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: cache de sessões salvas não semeado ({e}); o 1º tick re-tenta"
+                );
+                std::collections::HashSet::new()
+            }
+        };
+        let buffer_gauge = match BufferRegistry::replay(&lock(&store)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("lina-gpui: cache de buffers não semeado ({e}); começa vazio");
+                BufferRegistry::default()
+            }
+        };
         Self {
             router,
             sup,
@@ -849,6 +931,11 @@ impl MailboxPump {
             nodes,
             seeded_spawns: std::collections::HashSet::new(),
             last_spawn_ec: 0,
+            sessions,
+            persisted_sessions,
+            last_session_scan_ms: 0,
+            buffer_gauge,
+            last_buffer_sample_ms: 0,
         }
     }
 
@@ -1158,6 +1245,112 @@ impl MailboxPump {
         // F3-1-7 (ADR 0036): aplica os gestos humanos diretos da UI (confirmar/ajustar Goal).
         self.drain_human_intents();
         self.refresh_cost_paused();
+        // F3-5-1: nasce o `SessionPersisted` do 1º prompt de cada nó (idempotente; throttle anti-freeze).
+        self.persist_first_prompts(now_ms());
+        // F3-5-7: amostra a ocupação dos buffers (anti-amplificação + cache delta do prev; throttle I/O).
+        self.sample_buffers(now_ms());
+    }
+
+    /// **F3-5-1 (fiação da GERAÇÃO): nasce o `SessionPersisted` do 1º prompt de cada nó.** Correlaciona
+    /// as sessões `--resume` observadas no disco (por `cwd`) ao nó do Espaço e, na borda do 1º prompt,
+    /// chama [`ResumeSessionStore::persist_after_first_prompt`] (idempotente). Sem isto a projeção de
+    /// sessões salvas seria sempre VAZIA em produção (gate a morto — só os testes a alimentavam).
+    ///
+    /// Anti-freeze (lição do `attention_heartbeat`): short-circuit barato quando toda sessão já nasceu
+    /// (zero `project`/`replay`); e como o `lina-session-watch` é GLOBAL (vê sessões da máquina sem nó
+    /// no Espaço), o `project` de correlação é throttlado a [`SESSION_SCAN_INTERVAL_MS`].
+    fn persist_first_prompts(&mut self, now_ms: u64) {
+        let snapshot = lock(&self.sessions).clone();
+        // Short-circuit: nada novo (toda sessão já tem seu SessionPersisted) → sem project nem replay.
+        if snapshot
+            .iter()
+            .all(|s| self.persisted_sessions.contains(&s.session_id))
+        {
+            return;
+        }
+        // Há sessão nova (talvez de outro projeto, sem nó): throttla o project p/ não varrer por tick.
+        if now_ms.saturating_sub(self.last_session_scan_ms) < SESSION_SCAN_INTERVAL_MS {
+            return;
+        }
+        self.last_session_scan_ms = now_ms;
+        let project = match lock(&self.store).project() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("lina-gpui: persist_first_prompts não projetou o roster ({e})");
+                return;
+            }
+        };
+        for s in &snapshot {
+            if self.persisted_sessions.contains(&s.session_id) {
+                continue;
+            }
+            let Some(cwd) = s.cwd.as_deref() else {
+                continue; // sessão sem cwd → não correlaciona a um nó
+            };
+            // Correlação por `cwd` (o mesmo binding que o dashboard de custo usa): o nó terminal cujo
+            // cwd casa. Sessão da máquina sem nó no Espaço → ignorada (não é deste workspace).
+            let node = project.nodes.iter().find(|(_, n)| {
+                n.kind.eq_ignore_ascii_case("terminal") && n.cwd.as_deref() == Some(cwd)
+            });
+            let Some((node_id, _)) = node else {
+                continue;
+            };
+            let node_id = node_id.to_string();
+            let mut store = lock(&self.store);
+            match ResumeSessionStore::persist_after_first_prompt(
+                &mut store,
+                &node_id,
+                &s.cli,
+                &s.session_id,
+                None,
+                now_ms,
+                DEFAULT_SESSION_STORE_MAX_ENTRIES,
+            ) {
+                Ok(_) => {
+                    drop(store);
+                    self.persisted_sessions.insert(s.session_id.clone());
+                }
+                Err(e) => eprintln!("lina-gpui: persist da sessão {} falhou: {e}", s.session_id),
+            }
+        }
+    }
+
+    /// **F3-5-7 (fiação da AMOSTRAGEM): apenda `BufferOccupancySampled` da ocupação dos buffers.**
+    /// Coleta as leituras cruas (scrollback por painel + mailbox/DLQ por nó), passa por
+    /// [`buffer_registry::sample`] (anti-amplificação A4 — só emite ao cruzar bucket de 10%/warn) e
+    /// apenda o que sobra. Sem isto, `lina check --buffers` seria sempre vazio em produção (gate d morto).
+    ///
+    /// Anti-freeze: o `prev` é o cache [`Self::buffer_gauge`] (delta, NUNCA `BufferRegistry::replay`
+    /// por tick); a coleta (a da mailbox faz I/O no outbox) é throttlada a [`BUFFER_SAMPLE_INTERVAL_MS`].
+    fn sample_buffers(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_buffer_sample_ms) < BUFFER_SAMPLE_INTERVAL_MS {
+            return;
+        }
+        self.last_buffer_sample_ms = now_ms;
+        let mut readings: Vec<GaugeReading> = Vec::new();
+        if let Some(sb) = self.nodes.scrollback() {
+            readings.extend(lock(&sb).gauge_readings());
+        }
+        match self.router.mailbox().gauge_readings() {
+            Ok(r) => readings.extend(r),
+            Err(e) => eprintln!("lina-gpui: leituras de buffer da mailbox falharam ({e})"),
+        }
+        if readings.is_empty() {
+            return;
+        }
+        let events =
+            buffer_registry::sample(&self.buffer_gauge, &readings, GAUGE_WARN_RATIO, now_ms);
+        if events.is_empty() {
+            return; // anti-amplificação: nenhuma leitura cruzou bucket/warn
+        }
+        let mut store = lock(&self.store);
+        for ev in &events {
+            if let Err(e) = store.append(ev) {
+                eprintln!("lina-gpui: falha ao apendar BufferOccupancySampled ({e})");
+                continue;
+            }
+            apply_gauge_event(&mut self.buffer_gauge, ev);
+        }
     }
 
     /// **F3-1-7 (ADR 0036) — aplica os GESTOS HUMANOS DIRETOS da UI** (confirmar/ajustar uma Goal;
@@ -7346,6 +7539,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -7513,6 +7707,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -7722,6 +7917,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -7829,6 +8025,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let outbox = Mailbox::new(&mailbox_root);
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -8219,6 +8416,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()),
             Autonomy::Assisted,
             Arc::clone(&nodes),
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
 
         // O "clique para liberar" do card: a view só ENFILEIRA o gesto (by=human é a NATUREZA do
@@ -8241,6 +8439,184 @@ mod tests {
                 .iter()
                 .any(|r| r.kind == "NodeStatusChanged" && r.payload["reason"] == "breaker_reset"),
             "NodeStatusChanged{{reason:breaker_reset}} apendado pelo reset humano"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F3-5 (fiação das costuras no app): persist do 1º prompt + amostragem de buffers ──────────
+
+    /// Um `MailboxPump` mínimo (sem PTY) para exercitar as costuras F3-5 — store/sessions injetáveis.
+    fn pump_for_test(
+        tag: &str,
+        sessions: Arc<Mutex<Vec<Session>>>,
+    ) -> (MailboxPump, Arc<Mutex<EventStore>>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-f35aw-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("abrir store"),
+        ));
+        let pump = MailboxPump::new(
+            Arc::new(Supervisor::new()),
+            Arc::clone(&store),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Mailbox::new(dir.join(".lina")),
+            new_reinject_queue(),
+            Arc::new(Mutex::new(SharedModel::default())),
+            crate::wiring::new_brake(),
+            0,
+            demo_profile(),
+            Arc::new(ProfileRegistry::new()),
+            Autonomy::Assisted,
+            test_nodes(Arc::clone(&store)),
+            sessions,
+        );
+        (pump, store, dir)
+    }
+
+    /// Uma `Session` do `lina-session-watch` com o `cwd`/`session_id`/`cli` dados (demais campos zerados).
+    fn test_session(cwd: &str, session_id: &str, cli: &str) -> Session {
+        Session {
+            cli: cli.to_string(),
+            session_id: session_id.to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cache: 0,
+            tokens_thinking: 0,
+            cost_usd: 0.0,
+            cost_estimated: false,
+            model: None,
+            cwd: Some(cwd.to_string()),
+            last_ts: None,
+            subagents: Vec::new(),
+            tools: Vec::new(),
+            source: lina_session_watch::CostSource::Jsonl,
+        }
+    }
+
+    /// Semeia um nó terminal com `cwd` na projeção (NodeAdded + TerminalSpawned) — o alvo da correlação.
+    fn seed_terminal_cwd(store: &Arc<Mutex<EventStore>>, node: NodeId, cli: &str, cwd: &str) {
+        let mut s = lock(store);
+        s.append(&DomainEvent::NodeAdded {
+            node,
+            kind: "Terminal".into(),
+            x: 0.0,
+            y: 0.0,
+            requested_by: None,
+        })
+        .expect("NodeAdded");
+        s.append(&DomainEvent::TerminalSpawned {
+            node,
+            cli: cli.into(),
+            cwd: Some(cwd.into()),
+        })
+        .expect("TerminalSpawned");
+    }
+
+    fn count_kind(store: &Arc<Mutex<EventStore>>, kind: &str) -> usize {
+        lock(store)
+            .events()
+            .expect("eventos")
+            .iter()
+            .filter(|r| r.kind == kind)
+            .count()
+    }
+
+    /// **Gate (a) — fiação da geração: 1 prompt observado ⇒ exatamente 1 `SessionPersisted`.** A sessão
+    /// do disco (mesmo `cwd` do nó) nasce o evento; re-chamar é idempotente (cache + `plan_persist`).
+    #[test]
+    fn persist_first_prompt_births_session_persisted_idempotent() {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let (mut pump, store, dir) = pump_for_test("persist", Arc::clone(&sessions));
+        let node = NodeId::from_u128(0x7e51);
+        seed_terminal_cwd(&store, node, "claude-code", "/proj/vendas");
+        // O `lina-session-watch` materializa o 1º prompt: uma sessão no MESMO cwd do nó.
+        *lock(&sessions) = vec![test_session("/proj/vendas", "sess-1", "claude-code")];
+
+        pump.persist_first_prompts(10_000);
+        assert_eq!(
+            count_kind(&store, "SessionPersisted"),
+            1,
+            "1 prompt observado ⇒ 1 SessionPersisted (a costura está LIGADA)"
+        );
+
+        // Idempotente: re-chamar (mesma sessão) não nasce outro evento.
+        pump.persist_first_prompts(20_000);
+        assert_eq!(
+            count_kind(&store, "SessionPersisted"),
+            1,
+            "mesma sessão ⇒ sem novo evento"
+        );
+
+        // A projeção do core lista a sessão salva do nó (o que o modal "Sessões salvas" consome).
+        let saved = ResumeSessionStore::replay(&lock(&store)).expect("replay");
+        assert_eq!(
+            saved
+                .active_for(&node.to_string())
+                .expect("sessão ativa")
+                .session_id,
+            "sess-1"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uma sessão da máquina SEM nó no Espaço (outro projeto) não nasce evento — o `cwd` não casa.
+    #[test]
+    fn session_without_node_does_not_persist() {
+        let sessions = Arc::new(Mutex::new(vec![test_session(
+            "/proj/orfa",
+            "sess-x",
+            "claude-code",
+        )]));
+        let (mut pump, store, dir) = pump_for_test("orfa", Arc::clone(&sessions));
+        pump.persist_first_prompts(10_000);
+        assert_eq!(
+            count_kind(&store, "SessionPersisted"),
+            0,
+            "sessão sem nó no Espaço ⇒ nada nasce"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Gate (d) — fiação da amostragem: o tick apenda `BufferOccupancySampled`.** A 1ª amostragem
+    /// emite (a DLQ é sempre lida); amostragens repetidas de MESMA ocupação NÃO inflam o log
+    /// (anti-amplificação A4 + cache delta do `prev` + throttle) — a defesa contra o freeze por replay/tick.
+    #[test]
+    fn sample_buffers_emits_then_does_not_amplify() {
+        let (mut pump, store, dir) = pump_for_test("buffers", Arc::new(Mutex::new(Vec::new())));
+        pump.sample_buffers(5_000);
+        let after_first = count_kind(&store, "BufferOccupancySampled");
+        assert!(
+            after_first >= 1,
+            "1ª amostragem emite ≥1 BufferOccupancySampled (a costura está LIGADA)"
+        );
+        // 50 "ticks" de mesma ocupação (well além do throttle): zero eventos novos — não infla o log.
+        for i in 1..=50 {
+            pump.sample_buffers(5_000 + i * BUFFER_SAMPLE_INTERVAL_MS * 2);
+        }
+        assert_eq!(
+            count_kind(&store, "BufferOccupancySampled"),
+            after_first,
+            "ocupação estável ⇒ zero eventos novos (anti-amplificação + delta, sem freeze)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anti-freeze do throttle: duas amostragens dentro de [`BUFFER_SAMPLE_INTERVAL_MS`] não reamostram
+    /// (a 2ª nem chega a ler I/O da mailbox) — o tick de 120ms não vira O(N)/tick.
+    #[test]
+    fn sample_buffers_throttles_within_interval() {
+        let (mut pump, store, dir) = pump_for_test("throttle", Arc::new(Mutex::new(Vec::new())));
+        pump.sample_buffers(5_000);
+        let baseline = count_kind(&store, "BufferOccupancySampled");
+        pump.sample_buffers(5_000 + BUFFER_SAMPLE_INTERVAL_MS / 2); // dentro do intervalo
+        assert_eq!(
+            count_kind(&store, "BufferOccupancySampled"),
+            baseline,
+            "dentro do throttle ⇒ sem reamostragem"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1477,6 +1477,11 @@ fn explain_spawn_gate(reason: &str) -> String {
              terminais"
             .to_string(),
         "manual" => "o Espaco esta em modo manual — voce nao cria terminais sozinho".to_string(),
+        // F3-4: auto-organização — o time terminou e ha codigo a juntar; o integrador (DevOps) so
+        // NASCE com o aval do usuario (a auto-organizacao SUGERE, nunca aplica).
+        "auto_integrate" => "a equipe terminou e ha trabalho de codigo a juntar; criar o terminal \
+             integrador (DevOps) sozinho exige o aval do usuario"
+            .to_string(),
         other => format!("motivo: {other}"),
     }
 }
@@ -1486,6 +1491,7 @@ fn spawn_gate_hint(reason: &str) -> &'static str {
     match reason {
         "cost" => "→ peca ao usuario para retomar o custo (`lina resume --confirm`); nao insista.",
         "manual" => "→ sugira a criacao ao usuario/Maestro (ou peca para subir a autonomia).",
+        "auto_integrate" => "→ avise o usuario que o time terminou e aguarde o aval para integrar; nao crie em loop.",
         _ => "→ explique ao usuario POR QUE falta o papel e aguarde o aval; nao recrie em loop.",
     }
 }
@@ -2083,7 +2089,8 @@ fn run_template_create(slug: Option<&String>) -> ExitCode {
     // `requested_by = HUMAN_GESTURE`: instanciar um gabarito é um GESTO DE CONFIGURAÇÃO do usuário
     // (consistente com a galeria da UI, que também carimba HUMAN_GESTURE) — não auto-orquestração de
     // agente. O carimbo faz os spawns do roster nascerem com origem humana (passam o gate de spawn).
-    match lina_core::workspace_template::instanciar(&template, &mut store, lina_core::HUMAN_GESTURE) {
+    match lina_core::workspace_template::instanciar(&template, &mut store, lina_core::HUMAN_GESTURE)
+    {
         Ok(n) => {
             println!(
                 "ok: gabarito '{}' instanciado ({n} eventos: roster + parametros + pistas + backlog)",
