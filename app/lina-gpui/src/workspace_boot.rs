@@ -208,7 +208,13 @@ fn unique_workspace_name(parent: &Path, name: &str, registry: &WorkspaceRegistry
 /// de falha de pasta ([`WorkdirError::CreateFailed`]).
 // Aguardando o WIRING do switch/M9 (fatia ii) — exercida pelos testes até lá,
 // mesmo padrão de `gallery.rs`. Remover o allow ao wirar.
+// F3-5-10: `template` opcional — quando `Some`, o MESMO funil gated semeia o gabarito (roster +
+// params + pistas + backlog) via o core, em vez do time do Foco; quando `None`, o caminho é
+// EXATAMENTE o de hoje (gate f: "sem template = criação atual inalterada").
 #[allow(dead_code)]
+// F3-5-10: +1 arg (template) levou de 7→8 — mesma natureza dos campos da criação (cada um é um
+// dado distinto do plano de criação), agrupá-los num struct seria cerimônia sem ganho.
+#[allow(clippy::too_many_arguments)]
 pub fn create_workspace(
     parent: &Path,
     name: &str,
@@ -217,6 +223,7 @@ pub fn create_workspace(
     registry: &mut WorkspaceRegistry,
     _now_ms: u64,
     tier: LicenseTier,
+    template: Option<&lina_core::workspace_template::WorkspaceTemplate>,
 ) -> Result<PathBuf, String> {
     // (a) Gating PRIMEIRO — o limite aparece antes do esforço; Blocked = zero side effects.
     can_create_workspace(tier, registry.active_count()).map_err(|e| e.to_string())?;
@@ -239,16 +246,37 @@ pub fn create_workspace(
     // (c) Pasta + store + eventos (a fonte da verdade nasce aqui).
     std::fs::create_dir_all(&ws_root).map_err(|_| WorkdirError::CreateFailed.to_string())?;
     let mut store = EventStore::open(Workspace::events_dir(&ws_root)).map_err(|e| e.to_string())?;
-    let roles = RoleRegistry::with_defaults().map_err(|e| e.to_string())?;
-    let placed: Vec<gallery::PlacedAgent> = gallery::preset_team(*preset, &roles)
-        .into_iter()
-        .map(|a| gallery::PlacedAgent {
-            node: Uuid::now_v7(),
-            name: a.name,
-            role: a.role,
-        })
-        .collect();
-    gallery::apply_preset(*preset, &final_name, &placed, &mut store).map_err(|e| e.to_string())?;
+    match template {
+        // F3-5-10: gabarito → `WorkspaceCreated{foco do template}` + semeia roster/params/pistas/
+        // backlog pelo core. O roster vira `SpawnRequested` (PEDIDOS): o terminal físico só nasce
+        // pelo funil `admit_node`/gate (ADR 0022), sem escalar privilégio. O instanciador é o
+        // sentinela canônico `HUMAN_GESTURE` (origem auditável = gesto humano, JAMAIS autoridade —
+        // o usuário criou o Espaço pela tela; nada de NodeId fantasma nem forja, regra-mãe da onda).
+        Some(t) => {
+            store
+                .append(&DomainEvent::WorkspaceCreated {
+                    name: final_name.clone(),
+                    focus_preset: t.focus_preset.clone(),
+                })
+                .map_err(|e| e.to_string())?;
+            lina_core::workspace_template::instanciar(t, &mut store, lina_core::HUMAN_GESTURE)
+                .map_err(|e| e.to_string())?;
+        }
+        // Sem gabarito: o caminho de hoje, INALTERADO (time do Foco).
+        None => {
+            let roles = RoleRegistry::with_defaults().map_err(|e| e.to_string())?;
+            let placed: Vec<gallery::PlacedAgent> = gallery::preset_team(*preset, &roles)
+                .into_iter()
+                .map(|a| gallery::PlacedAgent {
+                    node: Uuid::now_v7(),
+                    name: a.name,
+                    role: a.role,
+                })
+                .collect();
+            gallery::apply_preset(*preset, &final_name, &placed, &mut store)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     store
         .append(&DomainEvent::WorkspaceIdAssigned {
             workspace_id: Uuid::now_v7().to_string(),
@@ -541,6 +569,7 @@ mod tests {
             &mut reg,
             1_000,
             LicenseTier::Pro,
+            None,
         )
         .expect("criação feliz");
         assert_eq!(ws_root, parent.join("Cliente X"), "pasta = slug do nome");
@@ -621,6 +650,7 @@ mod tests {
             &mut reg,
             1_000,
             LicenseTier::Free,
+            None,
         )
         .expect_err("free=1 com 1 ativo bloqueia");
         assert!(
@@ -652,6 +682,7 @@ mod tests {
             &mut reg,
             1_000,
             LicenseTier::Pro,
+            None,
         )
         .expect("primeiro");
         let second = create_workspace(
@@ -662,6 +693,7 @@ mod tests {
             &mut reg,
             2_000,
             LicenseTier::Pro,
+            None,
         )
         .expect("segundo");
 
@@ -726,6 +758,83 @@ mod tests {
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod de volta");
         }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **F3-5-10 (gate f + regra-mãe):** criar COM gabarito pelo MESMO funil gated → o foco é o do
+    /// gabarito, o roster é SEMEADO como `SpawnRequested` (PEDIDOS, sem nó vivo), o instanciador é
+    /// `HUMAN_GESTURE` (origem honesta, não forja), e o Espaço ENTRA no registry (não some da lista).
+    #[test]
+    fn create_workspace_from_template_seeds_roster_with_human_gesture_and_registers() {
+        let base = temp_base("template");
+        let parent = base.join("espacos");
+        let mut reg = registry_at(&base);
+        let saas = lina_core::workspace_template::template_saas();
+
+        let ws_root = create_workspace(
+            &parent,
+            "Meu SaaS",
+            &gallery::FocusPreset::Blank, // ignorado quando há gabarito (o foco vem do template)
+            None,
+            &mut reg,
+            1_000,
+            LicenseTier::Pro,
+            Some(&saas),
+        )
+        .expect("criação com gabarito");
+
+        let store = EventStore::open(Workspace::events_dir(&ws_root)).expect("reabrir");
+        let records = store.events().expect("events");
+        assert_eq!(
+            records.first().map(|r| r.kind.as_str()),
+            Some("WorkspaceCreated"),
+            "WorkspaceCreated abre a sequência (liga as doutrinas pelo foco)"
+        );
+        let proj = store.project().expect("replay");
+        assert_eq!(
+            proj.workspace_name.as_deref(),
+            Some("Meu SaaS"),
+            "o nome do usuário vence o nome do gabarito"
+        );
+        assert_eq!(
+            proj.focus_preset.as_deref(),
+            Some("dev_app"),
+            "o foco vem do gabarito (doutrinas-como-hooks)"
+        );
+
+        // Roster semeado como PEDIDOS, não nós vivos — só o gate `admit_node` materializa terminal.
+        let spawns: Vec<_> = records
+            .iter()
+            .filter(|r| r.kind == "SpawnRequested")
+            .collect();
+        assert_eq!(
+            spawns.len(),
+            saas.roster.len(),
+            "um pedido por papel do gabarito"
+        );
+        assert_eq!(
+            records.iter().filter(|r| r.kind == "NodeAdded").count(),
+            0,
+            "gabarito não cria nó vivo (sem escalar privilégio)"
+        );
+
+        // Regra-mãe: o instanciador é HUMAN_GESTURE — origem auditável, JAMAIS um id forjado.
+        // Comparo pelo payload serializado (from_record é privado fora do core): o `requested_by`
+        // gravado tem de bater com a serialização do sentinela.
+        let expected = serde_json::to_value(lina_core::HUMAN_GESTURE).expect("serializa NodeId");
+        assert_eq!(
+            spawns[0].payload.get("requested_by"),
+            Some(&expected),
+            "instanciador = gesto humano (origem honesta), não forja"
+        );
+
+        // Gating + registry preservados pelo funil único (não furou o gate, não sumiu da lista).
+        assert_eq!(
+            reg.active_count(),
+            1,
+            "o Espaço do gabarito entra no registry"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

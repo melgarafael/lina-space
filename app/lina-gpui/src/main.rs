@@ -1531,7 +1531,8 @@ impl WorkspaceView {
             // Cards de Foco (3 presets — os 5 do ux-flows são backlog §6-B4).
             let mut cards = div().flex().flex_row().gap_2();
             for (idx, preset) in gallery::FocusPreset::all().into_iter().enumerate() {
-                let selected = idx == m.preset_idx;
+                // F3-5-10: um gabarito escolhido APAGA a seleção de Foco (mutuamente exclusivos).
+                let selected = !m.has_template() && idx == m.preset_idx;
                 cards = cards.child(
                     div()
                         .id(("m9-card", idx))
@@ -1570,8 +1571,67 @@ impl WorkspaceView {
                         ),
                 );
             }
+            // F3-5-10: galeria de gabaritos prontos (doc-fonte 59) — escolher um SEMEIA o Espaço
+            // (roster + config + pistas) pelo MESMO funil gated; mouse-clicável (teclado é follow-up).
+            let mut tpl_cards = div().flex().flex_row().gap_2();
+            for (idx, t) in gallery::CreateSpaceModal::templates()
+                .into_iter()
+                .enumerate()
+            {
+                let selected = m.is_template_selected(idx);
+                tpl_cards = tpl_cards.child(
+                    div()
+                        .id(("m9-tpl-card", idx))
+                        .flex_1()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(if selected {
+                            th.accent.action
+                        } else {
+                            th.surface.border
+                        }))
+                        .bg(rgb(if selected {
+                            th.surface.raised
+                        } else {
+                            th.surface.card
+                        }))
+                        .cursor_pointer()
+                        .aria_label(format!("modelo pronto: {}", t.name))
+                        .on_click(cx.listener(move |v, _ev: &gpui::ClickEvent, _w, cx| {
+                            if let Some(m) = v.create_space_modal.as_mut() {
+                                m.select_template(idx);
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(th.text.primary))
+                                .child(t.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(th.text.muted))
+                                .child(gallery::template_blurb(&t.slug).to_string()),
+                        ),
+                );
+            }
+            let tpl_section = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(th.text.muted))
+                        .child(gallery::COPY_M9_TEMPLATES_LABEL.to_string()),
+                )
+                .child(tpl_cards);
             panel = panel
                 .child(cards)
+                .child(tpl_section)
                 .child(
                     field(
                         gallery::COPY_M9_NAME_LABEL,

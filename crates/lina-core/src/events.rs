@@ -1239,12 +1239,166 @@ pub enum DomainEvent {
         /// SHA do commit de merge resultante (prova auditável no log).
         commit: String,
     },
+    // ─────────── F3-5 Auto-aprimoramento, Sessões & Contexto (spec 53 §11) ───────────
+    // Buffers geridos + sessões --resume + disco custodiado + skills/pistas. Variantes
+    // TOTALMENTE novas (precedente `SpawnRequested`/`CodeChanged`): campos OBRIGATÓRIOS sem
+    // `#[serde(default)]` (replay antigo nunca as encontra); só os EXTENSÍVEIS (`*_at_ms`,
+    // `after_first_prompt`, Option, Vec opcional) levam default. REGRA-MÃE (spec 53 §Segurança;
+    // família ADR 0007): `session_id`/`approved_by`/`pressure`/`paths`/conteúdo de skill/pista é
+    // DADO transportado, JAMAIS autoridade — a identidade do nó é `LINA_NODE_ID` (ADR 0026); a
+    // poda de disco exige o gesto CUSTODIADO (`AttentionKind::Custody`), nunca o campo. ZERO LLM
+    // no core (inv #1): tempo/pressão/seleção/validação são determinísticos; julgamento semântico
+    // é 1 CLI-call fora do caminho crítico. As projeções (`ResumeSessionStore`/`BufferRegistry`/
+    // `DiskBudget`/skill_index — frentes paralelas) reconstroem por REPLAY externo (padrão
+    // `CostLedger`): estes eventos NÃO tocam `ProjectedState` (reducer no-op).
+    /// F3-5-1 (§11.B): uma sessão `--resume` de um nó ficou retomável. Emitido pelo core SÓ após
+    /// o nó receber ≥1 prompt (o shell observa o 1º turno via `lina-session-watch`). `session_id`
+    /// é PROJEÇÃO (ponteiro de --resume validado pelo funil `admit_node`, ADR 0022), nunca
+    /// identidade — forjá-lo não confere nada (a identidade segue `LINA_NODE_ID`, ADR 0026).
+    SessionPersisted {
+        /// node_id do nó cuja sessão foi salva (binding server-side, não do payload).
+        node: String,
+        /// CLI Profile (os `resume_args` vivem lá — `lina-cli-profiles`).
+        cli: String,
+        /// id capturado do JSONL pelo `lina-session-watch` — DADO, jamais autoridade.
+        session_id: String,
+        /// Invariante de admissão legível e auditável: só emitido após ≥1 prompt. Sempre `true`.
+        #[serde(default = "default_true")]
+        after_first_prompt: bool,
+        #[serde(default)]
+        first_prompt_at_ms: u64,
+        /// Nome amigável p/ o leigo escolher no modal "Sessões salvas".
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        persisted_at_ms: u64,
+    },
+    /// F3-5-1 (§11.B): poda EXPLÍCITA de uma sessão salva. Sessão "ativa" = `SessionPersisted`
+    /// sem `SessionRetired` posterior (projeção `ResumeSessionStore`). Nunca deletada do log.
+    SessionRetired {
+        node: String,
+        session_id: String,
+        /// `"lru"` | `"ttl"` | `"user_discarded"` | `"cli_invalidated"`. String aberta (precedente `SpawnGated.reason`).
+        reason: String,
+        #[serde(default)]
+        retired_at_ms: u64,
+    },
+    /// F3-5-7 (§11.A): amostra de ocupação de UM buffer (poliforme via `buffer_id`).
+    /// Anti-amplificação (doutrina `CostCeilingHit`): só emitido quando `pressure_ratio` cruza um
+    /// bucket (passos de 10%) OU muda warn/critical — nunca um evento por linha. META (projeção
+    /// `BufferRegistry` por replay; último por `buffer_id` vence).
+    BufferOccupancySampled {
+        /// `"scrollback:<panel>"` | `"mailbox:<node>"` | `"dlq"` | `"disk:<scope>"` | `"session_store"` | `"cost:day"` | `"pending"`.
+        buffer_id: String,
+        /// ocupação atual, na unidade de `unit`.
+        used: u64,
+        /// capacidade declarada; `0` = ilimitado/desligado (convenção de `token_budget_day`).
+        capacity: u64,
+        /// `"lines"` | `"bytes"` | `"messages"` | `"tokens"`.
+        unit: String,
+        /// `used/capacity`; `0.0` quando `capacity==0` (evita div-por-zero e sinaliza "off").
+        pressure_ratio: f32,
+        #[serde(default)]
+        sampled_at_ms: u64,
+    },
+    /// F3-5-8 (§11.C): sinal de pressão de disco. DETECTAR/sinalizar é livre em todo nível de
+    /// autonomia; APAGAR exige o gate humano custodiado (ver `DiskReclaimApproved`). META.
+    DiskPressureSignaled {
+        /// `"workspace_target"` | `"app_target"` | `"disk_total"`.
+        path: String,
+        used_bytes: u64,
+        free_bytes: u64,
+        /// `used/total` (o campo pedido no critério de aceite).
+        used_pct: f32,
+        /// `"warn"` | `"critical"`.
+        threshold_crossed: String,
+        #[serde(default)]
+        signaled_at_ms: u64,
+    },
+    /// F3-5-8 (§11.C): o Lina PROPÕE candidatos de poda; jamais apaga sozinho. Proposta ≠ execução.
+    DiskReclaimProposed {
+        candidates: Vec<ReclaimCandidate>,
+        reclaimable_bytes: u64,
+        #[serde(default)]
+        proposed_at_ms: u64,
+    },
+    /// F3-5-8 (§11.C): o GATE HUMANO — a ÚNICA porta para a execução. `approved_by` é EXIBIÇÃO;
+    /// a AUTORIDADE é o gesto custodiado (`AttentionKind::Custody`, attention.rs), nunca este
+    /// campo (forjar `approved_by` NÃO dispara poda — ADR 0007). Gate humano em TODOS os níveis.
+    DiskReclaimApproved {
+        candidate_paths: Vec<String>,
+        /// EXIBIÇÃO, não autoridade — quem aprovou (humanizável), carimbado pelo gesto custodiado.
+        approved_by: String,
+        #[serde(default)]
+        approved_at_ms: u64,
+    },
+    /// F3-5-8 (§11.C): a poda IRREVERSÍVEL aconteceu — SÓ após `DiskReclaimApproved` (zero
+    /// `Executed` sem `Approved`; inv #6: apagar é irreversível). Prova auditável no log.
+    DiskReclaimExecuted {
+        reclaimed_bytes: u64,
+        paths: Vec<String>,
+        #[serde(default)]
+        executed_at_ms: u64,
+    },
+    /// F3-5-4 (Hermes C.1): o seletor escolheu uma skill por gatilho DETERMINÍSTICO (ZERO LLM:
+    /// match de gatilho + filtro por tools presentes). DADO observável de adoção; nunca autoridade.
+    SkillSelected {
+        node: String,
+        skill: String,
+        /// gatilho que casou (palavra-chave/contexto), se houver.
+        #[serde(default)]
+        trigger: Option<String>,
+        /// de onde a skill veio (catálogo/hub/fábrica).
+        source: String,
+    },
+    /// F3-5-5 (Hermes C.4): faltou skill especialista → a fábrica PROPÕE uma via deep-research.
+    /// SUGERE, nunca aplica (gate humano antes de carregar; `inline-shell` passa pelo guard,
+    /// Hermes C.2). `references` são as fontes da pesquisa — DADO, não autoridade.
+    SkillFactoryProposed {
+        skill_name: String,
+        /// `"deep-research"` (o método de proposta).
+        via: String,
+        /// fontes/referências que a pesquisa reuniu.
+        #[serde(default)]
+        references: Vec<String>,
+    },
+    /// F3-5-6 (doc-fonte 65): pistas — pastas/arquivos que o terminal de um escopo passa a
+    /// enxergar no briefing. `paths` é DADO de contexto, nunca autoridade (não concede acesso
+    /// além do que o nó já tem — só informa o que a IA olha).
+    ClueSetDefined {
+        /// escopo da pista (ex.: nó/projeto/foco).
+        scope: String,
+        /// pastas/arquivos que entram no contexto.
+        paths: Vec<String>,
+        #[serde(default)]
+        label: Option<String>,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
 /// payload mínimo casar com a semântica do nome do evento.
 fn default_muted() -> bool {
     true
+}
+
+/// Default de `after_first_prompt` em [`DomainEvent::SessionPersisted`] (F3-5-1, spec 53 §11.B):
+/// a invariante de admissão ("só após ≥1 prompt") é sempre `true` — o campo existe para tornar a
+/// regra legível e auditável no log, e o default cobre payloads mínimos.
+fn default_true() -> bool {
+    true
+}
+
+/// Tipo de apoio de [`DomainEvent::DiskReclaimProposed`] (F3-5-8, spec 53 §11.C): um candidato de
+/// poda de disco. DADO descritivo (caminho/tamanho/tipo), NUNCA autoridade — a poda só ocorre após
+/// o gesto custodiado (`DiskReclaimApproved`). Aditivo (serde): proposta antiga sem o campo carrega.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReclaimCandidate {
+    /// caminho do candidato (ex.: `target/` de cargo — o dominante do ENOSPC #25).
+    pub path: String,
+    /// tamanho recuperável em bytes.
+    pub bytes: u64,
+    /// `"cargo_target"` | `"old_scrollback_db"` | `"dlq_archive"`.
+    pub kind: String,
 }
 
 impl DomainEvent {
@@ -1342,6 +1496,17 @@ impl DomainEvent {
             // F3-4 Coordenação de código (spec 36): sinal de mudança + prova de integração.
             DomainEvent::CodeChanged { .. } => "CodeChanged",
             DomainEvent::BranchIntegrated { .. } => "BranchIntegrated",
+            // F3-5 Auto-aprimoramento, Sessões & Contexto (spec 53 §11).
+            DomainEvent::SessionPersisted { .. } => "SessionPersisted",
+            DomainEvent::SessionRetired { .. } => "SessionRetired",
+            DomainEvent::BufferOccupancySampled { .. } => "BufferOccupancySampled",
+            DomainEvent::DiskPressureSignaled { .. } => "DiskPressureSignaled",
+            DomainEvent::DiskReclaimProposed { .. } => "DiskReclaimProposed",
+            DomainEvent::DiskReclaimApproved { .. } => "DiskReclaimApproved",
+            DomainEvent::DiskReclaimExecuted { .. } => "DiskReclaimExecuted",
+            DomainEvent::SkillSelected { .. } => "SkillSelected",
+            DomainEvent::SkillFactoryProposed { .. } => "SkillFactoryProposed",
+            DomainEvent::ClueSetDefined { .. } => "ClueSetDefined",
         }
     }
 
@@ -1784,7 +1949,21 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // são META no apply do canvas — as projeções (`code`) reconstroem por REPLAY externo
         // (padrão `CostLedger`/`Mentality`). Estes eventos NÃO tocam `ProjectedState`.
         | DomainEvent::CodeChanged { .. }
-        | DomainEvent::BranchIntegrated { .. } => {}
+        | DomainEvent::BranchIntegrated { .. }
+        // F3-5 Auto-aprimoramento, Sessões & Contexto (spec 53 §11): buffers/sessões/disco/skills/
+        // pistas são META no apply do canvas — as projeções (`ResumeSessionStore`/`BufferRegistry`/
+        // `DiskBudget`/skill_index, frentes paralelas) reconstroem por REPLAY externo. NÃO tocam
+        // `ProjectedState`.
+        | DomainEvent::SessionPersisted { .. }
+        | DomainEvent::SessionRetired { .. }
+        | DomainEvent::BufferOccupancySampled { .. }
+        | DomainEvent::DiskPressureSignaled { .. }
+        | DomainEvent::DiskReclaimProposed { .. }
+        | DomainEvent::DiskReclaimApproved { .. }
+        | DomainEvent::DiskReclaimExecuted { .. }
+        | DomainEvent::SkillSelected { .. }
+        | DomainEvent::SkillFactoryProposed { .. }
+        | DomainEvent::ClueSetDefined { .. } => {}
     }
 }
 
@@ -3996,5 +4175,74 @@ mod tests {
         assert_eq!(Effort::Low.label(), "low");
         assert_eq!(Effort::Medium.label(), "medium");
         assert_eq!(Effort::High.label(), "high");
+    }
+
+    /// F3-5 (FUNDAÇÃO/largada, spec 53 §11): as 10 variantes novas são META, fazem round-trip
+    /// serde (incl. `ReclaimCandidate` aninhado) e são ADITIVAS — um payload PARCIAL de
+    /// `SessionPersisted` carrega com defaults seguros (`after_first_prompt=true`, `*_at_ms=0`,
+    /// `label=None`), e um log ANTIGO (variante pré-F3-5) replaya intacto. Prova que a largada
+    /// não quebra o replay F0/F1/F2/F3.
+    #[test]
+    fn f3_5_contract_is_additive_meta_and_roundtrips() {
+        let session = DomainEvent::SessionPersisted {
+            node: "n-abc".into(),
+            cli: "claude".into(),
+            session_id: "sess-1".into(),
+            after_first_prompt: true,
+            first_prompt_at_ms: 100,
+            label: Some("revisão da landing".into()),
+            persisted_at_ms: 200,
+        };
+        assert_eq!(session.kind(), "SessionPersisted");
+        let reclaim = DomainEvent::DiskReclaimProposed {
+            candidates: vec![ReclaimCandidate {
+                path: "target/".into(),
+                bytes: 30_000_000_000,
+                kind: "cargo_target".into(),
+            }],
+            reclaimable_bytes: 30_000_000_000,
+            proposed_at_ms: 0,
+        };
+        assert_eq!(reclaim.kind(), "DiskReclaimProposed");
+        for ev in [&session, &reclaim] {
+            // Round-trip serde preserva tudo (inclui o `ReclaimCandidate` aninhado).
+            let back: DomainEvent =
+                serde_json::from_value(serde_json::to_value(ev).unwrap()).unwrap();
+            assert_eq!(&back, ev, "round-trip preserva os campos");
+            // META: o apply do canvas não toca a projeção (reconstrução é por replay externo).
+            let mut state = ProjectedState::default();
+            let before = state.clone();
+            apply(&mut state, ev);
+            assert_eq!(state, before, "F3-5 é META (no-op no canvas)");
+        }
+
+        // ADITIVO — payload PARCIAL de `SessionPersisted` (só os obrigatórios) → defaults seguros.
+        let partial = serde_json::json!({"event":"SessionPersisted","node":"n-x","cli":"codex","session_id":"s9"});
+        match serde_json::from_value::<DomainEvent>(partial).expect("parcial carrega") {
+            DomainEvent::SessionPersisted {
+                after_first_prompt,
+                first_prompt_at_ms,
+                label,
+                persisted_at_ms,
+                ..
+            } => {
+                assert!(
+                    after_first_prompt,
+                    "default_true: invariante de admissão ≥1 prompt"
+                );
+                assert_eq!(first_prompt_at_ms, 0);
+                assert_eq!(label, None);
+                assert_eq!(persisted_at_ms, 0);
+            }
+            other => panic!("variante errada: {other:?}"),
+        }
+
+        // ADITIVO — um log ANTIGO (variante pré-F3-5) replaya intacto: a largada não o quebra.
+        let legacy = serde_json::json!({"event":"WorkspaceArchived"});
+        assert_eq!(
+            serde_json::from_value::<DomainEvent>(legacy).expect("evento antigo carrega"),
+            DomainEvent::WorkspaceArchived,
+            "replay F0..F3-4 intacto após a largada F3-5"
+        );
     }
 }

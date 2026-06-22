@@ -447,6 +447,45 @@ impl Mailbox {
         Ok(out)
     }
 
+    /// F3-5-7 (`BufferGauge`, spec 53 §11.A): LEITURAS de ocupação das filas — uma por nó com
+    /// outbox (`mailbox:<node>`, capacidade `MAX_DRAIN_BATCH` mensagens/tick) + a DLQ (`dlq`,
+    /// capacidade `0` = sem teto hoje, spec §11 tabela). Unidade `"messages"`. SÓ leitura crua
+    /// (conta os `*.json` do outbox/DLQ no disco, sem teto — não é um drain); o amostrador
+    /// (`buffer_registry::sample`) aplica a anti-amplificação e quem tem o `EventStore` (o
+    /// supervisor, no drain) apenda o `BufferOccupancySampled`. Não toca o event log (inv #5).
+    /// Ordem estável por `buffer_id`.
+    ///
+    /// # Errors
+    /// Falha de I/O ao listar o `outbox` por-nó ou a DLQ.
+    pub fn gauge_readings(&self) -> std::io::Result<Vec<crate::buffer_registry::GaugeReading>> {
+        use crate::buffer_registry::GaugeReading;
+        // Profundidade por nó: conta os *.json em cada subdir por-nó do outbox (cap=false → conta
+        // TUDO, é leitura, não o drain capeado).
+        let mut per_node: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for (node, _path) in collect_node_outbox(&self.outbox_dir(), false)? {
+            *per_node.entry(node).or_insert(0) += 1;
+        }
+        let mut readings: Vec<GaugeReading> = per_node
+            .into_iter()
+            .map(|(node, used)| GaugeReading {
+                buffer_id: format!("mailbox:{node}"),
+                used,
+                capacity: MAX_DRAIN_BATCH as u64,
+                unit: "messages".to_string(),
+            })
+            .collect();
+        // DLQ: capacidade 0 = sem teto hoje → visível, mas pressão sempre 0,0 (nunca alarma).
+        readings.push(GaugeReading {
+            buffer_id: "dlq".to_string(),
+            used: self.dead_letters()?.len() as u64,
+            capacity: 0,
+            unit: "messages".to_string(),
+        });
+        readings.sort_by(|a, b| a.buffer_id.cmp(&b.buffer_id));
+        Ok(readings)
+    }
+
     /// **Deposita** uma mensagem no `outbox` de forma ATÔMICA: escreve `<id>.json.tmp` e renomeia
     /// para `<id>.json` (rename é atômico no mesmo FS → o `drain` nunca vê um arquivo parcial).
     ///
@@ -1115,6 +1154,48 @@ mod tests {
         assert!(!msg.await_reply);
         assert_eq!(msg.hops, 0);
         assert!(msg.root_cause_id.is_none());
+    }
+
+    /// F3-5-7 (`BufferGauge`): a leitura conta a fila por nó (`mailbox:<node>`, cap
+    /// `MAX_DRAIN_BATCH`) + a DLQ (`dlq`, cap 0 = sem teto hoje). Profundidade refletida; a DLQ é
+    /// visível mas nunca "pressiona" (ilimitada).
+    #[test]
+    fn gauge_readings_count_outbox_per_node_and_dlq() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-mbox-gauge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mb = Mailbox::new(&dir);
+
+        // 2 mensagens no outbox do @A, 1 no do @B, 1 na DLQ.
+        mb.enqueue_as("@A", &MailMessage::new("@A", "@C", "ask", "1"))
+            .expect("enqueue @A 1");
+        mb.enqueue_as("@A", &MailMessage::new("@A", "@C", "ask", "2"))
+            .expect("enqueue @A 2");
+        mb.enqueue_as("@B", &MailMessage::new("@B", "@C", "ask", "3"))
+            .expect("enqueue @B");
+        mb.dead_letter(&MailMessage::new("@X", "@Y", "ask", "morta"))
+            .expect("dead_letter");
+
+        let readings = mb.gauge_readings().expect("gauge_readings");
+        let find = |id: &str| readings.iter().find(|r| r.buffer_id == id).cloned();
+
+        let a = find("mailbox:@A").expect("mailbox:@A presente");
+        assert_eq!(a.used, 2, "2 mensagens na fila do @A");
+        assert_eq!(a.capacity, MAX_DRAIN_BATCH as u64);
+        assert_eq!(a.unit, "messages");
+        let b = find("mailbox:@B").expect("mailbox:@B presente");
+        assert_eq!(b.used, 1);
+        let dlq = find("dlq").expect("dlq presente");
+        assert_eq!(dlq.used, 1, "1 mensagem morta na DLQ");
+        assert_eq!(
+            dlq.capacity, 0,
+            "DLQ sem teto hoje → ilimitada (pressão 0,0)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

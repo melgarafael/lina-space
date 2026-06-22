@@ -505,6 +505,27 @@ impl ScrollbackStore {
         self.cfg.cap
     }
 
+    /// F3-5-7 (`BufferGauge`, spec 53 §11.A): LEITURAS de ocupação — uma por painel
+    /// (`scrollback:<panel>`). `used` = linhas na janela viva = `min(total, cap)` (satura no cap
+    /// quando o backlog cresce — o resto pagina para o disco); `capacity` = `cap`; unidade
+    /// `"lines"`. É SÓ leitura crua: o amostrador (`buffer_registry::sample`) aplica a
+    /// anti-amplificação e quem tem o `EventStore` (o supervisor, no tick do `FlushGuard`) apenda o
+    /// `BufferOccupancySampled`. Não toca o event log (inv #5 — gauge é projeção, não 2º log).
+    /// Ordem estável por `buffer_id`.
+    #[must_use]
+    pub fn gauge_readings(&self) -> Vec<crate::buffer_registry::GaugeReading> {
+        let cap = self.cfg.cap as u64;
+        self.panels
+            .iter()
+            .map(|(panel, pb)| crate::buffer_registry::GaugeReading {
+                buffer_id: format!("scrollback:{panel}"),
+                used: pb.total.min(cap),
+                capacity: cap,
+                unit: "lines".to_string(),
+            })
+            .collect()
+    }
+
     // ───────────────────── F1-5-6: idle-drain + métricas ─────────────────────
 
     /// F1-5-6: linhas no write-behind (ainda NÃO duráveis) do painel — a janela de
@@ -1018,6 +1039,55 @@ mod tests {
         assert_eq!(s.line(p, 9).unwrap().as_deref(), Some("l9"));
         assert_eq!(s.line(p, 10).unwrap(), None, "idx além do total → None");
         assert_eq!(s.tail(p, 3).unwrap(), vec!["l7", "l8", "l9"]);
+    }
+
+    /// Gate (d) F3-5: 12.000 linhas (cap 10.000) → a leitura do gauge `scrollback:<panel>` SATURA
+    /// no cap (`used==cap`, pressão ≈ 1,0) e as linhas além do cap reidratam do disco byte-idênticas.
+    #[test]
+    fn gauge_reading_saturates_at_cap_and_rehydrates_byte_identical() {
+        use crate::buffer_registry::{self, BufferRegistry};
+        let tmp = TempDir::new("gauge");
+        let mut s = ScrollbackStore::open(
+            tmp.path(),
+            ScrollbackConfig {
+                cap: 10_000,
+                flush_batch: 2_000,
+                retention_days: 30,
+            },
+        )
+        .expect("open");
+        let p = "T";
+        let pushed: Vec<String> = (0..12_000u64).map(|i| format!("linha-{i:05}")).collect();
+        for l in &pushed {
+            s.push_line(p, l.clone()).unwrap();
+        }
+        s.flush(p).unwrap();
+
+        // A leitura crua satura no cap mesmo com 12k empurradas (RAM = janela viva de `cap`).
+        let readings = s.gauge_readings();
+        assert_eq!(readings.len(), 1, "um buffer por painel");
+        let r = &readings[0];
+        assert_eq!(r.buffer_id, "scrollback:T");
+        assert_eq!(r.capacity, 10_000);
+        assert_eq!(r.used, 10_000, "RAM satura no cap mesmo com 12k empurradas");
+        assert_eq!(r.unit, "lines");
+        assert!(
+            (buffer_registry::pressure_ratio(r.used, r.capacity) - 1.0).abs() < f32::EPSILON,
+            "pressão ≈ 1,0 no cap"
+        );
+
+        // As 12k linhas voltam byte-idênticas (disco paginado + janela viva).
+        let back = s.range(p, 0, 12_000).unwrap();
+        assert_eq!(back, pushed, "12k linhas reidratam byte-idênticas");
+
+        // A amostragem produz exatamente 1 evento; a projeção reproduz a pressão ≈ 1,0.
+        let evs = buffer_registry::sample(
+            &BufferRegistry::default(),
+            &readings,
+            buffer_registry::GAUGE_WARN_RATIO,
+            1,
+        );
+        assert_eq!(evs.len(), 1, "1ª amostra do buffer emite 1 evento");
     }
 
     /// Acima do cap, as linhas antigas são PAGINADAS e hidratadas do disco byte-idênticas;

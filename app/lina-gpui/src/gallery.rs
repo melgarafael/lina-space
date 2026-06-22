@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 use lina_core::{
     can_create_workspace, DomainEvent, EventStore, LicenseTier, StoreError, WorkspaceRegistry,
 };
+// F3-5-10: gabaritos de Espaço (dono do core: Terminal G) — a galeria os LISTA e a criação os semeia.
+use lina_core::workspace_template::{builtin_templates, WorkspaceTemplate};
 use lina_host::NodeId;
 use lina_role_discovery::RoleRegistry;
 
@@ -200,6 +202,22 @@ pub const COPY_M9_BROWSE: &str = "Procurar…";
 pub const COPY_M9_CREATE: &str = "Criar Espaço";
 /// Botão de saída sem criar (spec §4 M9 — ordem de tab termina nele).
 pub const COPY_M9_CANCEL: &str = "Cancelar";
+/// F3-5-10: título da galeria de gabaritos no M9 (doc-fonte 59). Zero jargão.
+pub const COPY_M9_TEMPLATES_LABEL: &str = "Ou comece de um modelo pronto";
+
+/// F3-5-10: descrição LEIGA de um gabarito por slug — o [`WorkspaceTemplate`] não carrega blurb
+/// (o core é dado puro), então a tradução p/ a tela mora aqui (zero jargão). Slug desconhecido cai
+/// num fallback honesto em vez de tela vazia.
+#[must_use]
+pub fn template_blurb(slug: &str) -> &'static str {
+    match slug {
+        "saas" => {
+            "Time pronto pra criar um produto digital: arquitetura, servidor, telas e qualidade."
+        }
+        "marketing" => "Time pronto pra conteúdo e divulgação: pesquisa e textos de venda.",
+        _ => "Um Espaço já montado pra você começar rápido.",
+    }
+}
 /// Vitrine 4 do gating free=1 (copy-f1-4.md §1a, congelada — citação literal).
 pub const COPY_M9_BLOCKED_FREE: &str = "Você já usa o Espaço do plano Free (1 de 1)";
 /// CTA da vitrine (copy-f1-4.md §1a).
@@ -316,6 +334,10 @@ pub struct CreateSpaceModal {
     default_cwd: Option<String>,
     /// Nomes de Espaço já tomados (registry) — aviso leve de duplicado (padrão M6).
     existing: Vec<String>,
+    /// F3-5-10: gabarito escolhido (índice em [`builtin_templates`]); `None` = criar pelo Foco
+    /// simples (gate f: "sem template = criação atual inalterada"). Mutuamente exclusivo com o
+    /// card de Foco: escolher um zera o outro (ver [`Self::select_preset`]/[`Self::select_template`]).
+    template_idx: Option<usize>,
 }
 
 impl CreateSpaceModal {
@@ -347,6 +369,7 @@ impl CreateSpaceModal {
             key_field_open: false,
             default_cwd,
             existing,
+            template_idx: None,
         };
         m.refresh_prefills();
         m
@@ -360,9 +383,59 @@ impl CreateSpaceModal {
 
     /// Seleciona um card de Foco. Enquanto o usuário não tocou o Nome, o nome
     /// acompanha o rótulo do Foco (e o Diretório acompanha o nome, mesma regra).
+    /// F3-5-10: escolher um Foco DESMARCA o gabarito (mutuamente exclusivos na tela).
     pub fn select_preset(&mut self, idx: usize) {
         self.preset_idx = idx.min(FocusPreset::all().len() - 1);
+        self.template_idx = None;
         self.refresh_prefills();
+    }
+
+    // ── F3-5-10: gabaritos de Espaço ("comece de um modelo pronto") ──
+
+    /// Os gabaritos embutidos, na ordem da galeria (SaaS, Marketing).
+    #[must_use]
+    pub fn templates() -> Vec<WorkspaceTemplate> {
+        builtin_templates()
+    }
+
+    /// O gabarito escolhido (resolvido do índice), ou `None` = criar pelo Foco simples.
+    #[must_use]
+    pub fn selected_template(&self) -> Option<WorkspaceTemplate> {
+        self.template_idx
+            .and_then(|i| builtin_templates().into_iter().nth(i))
+    }
+
+    /// `true` se o card de gabarito `idx` está selecionado (p/ o render destacar).
+    #[must_use]
+    pub fn is_template_selected(&self, idx: usize) -> bool {
+        self.template_idx == Some(idx)
+    }
+
+    /// `true` se ALGUM gabarito está escolhido (p/ o render apagar os cards de Foco).
+    #[must_use]
+    pub fn has_template(&self) -> bool {
+        self.template_idx.is_some()
+    }
+
+    /// Escolhe um gabarito. Enquanto o Nome não foi tocado, ele acompanha o nome do gabarito
+    /// (mesma regra do Foco). Índice fora de faixa é ignorado (defensivo).
+    pub fn select_template(&mut self, idx: usize) {
+        let templates = builtin_templates();
+        let Some(t) = templates.get(idx) else {
+            return;
+        };
+        self.template_idx = Some(idx);
+        if !self.name_touched {
+            self.name = t.name.clone();
+            // o Diretório acompanha o nome quando também não foi tocado (mesma regra do Foco).
+            if !self.workdir_touched {
+                self.workdir = self
+                    .default_cwd
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| workdir_template(&self.name));
+            }
+        }
     }
 
     /// Próximo card (→/↓ com foco nos cards).
@@ -623,6 +696,9 @@ impl CreateSpaceModal {
             return false;
         }
         let workdir = self.expanded_workdir();
+        // F3-5-10: gabarito escolhido → o MESMO funil gated semeia o template (gating+dedup+registry
+        // preservados); sem gabarito → criação pelo Foco, inalterada (gate f).
+        let template = self.selected_template();
         match workspace_boot::create_workspace(
             parent,
             &self.name,
@@ -631,6 +707,7 @@ impl CreateSpaceModal {
             registry,
             now_ms,
             tier,
+            template.as_ref(),
         ) {
             Ok(ws_root) => {
                 on_created(ws_root);
@@ -1131,5 +1208,48 @@ mod tests {
         );
         assert_eq!(registry.entries().len(), 1, "inscrito no registry global");
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    // ───────── F3-5-10 · galeria de gabaritos (estado do CreateSpaceModal) ─────────
+
+    /// Escolher um gabarito marca o índice e — enquanto o Nome não foi tocado — o Nome acompanha
+    /// o nome do gabarito. Índice fora de faixa é ignorado (defensivo).
+    #[test]
+    fn select_template_sets_index_and_name_follows_until_touched() {
+        let mut m = CreateSpaceModal::new(None, None, Vec::new());
+        assert!(!m.has_template(), "nasce sem gabarito (Foco simples)");
+        m.select_template(0);
+        assert!(m.has_template() && m.is_template_selected(0));
+        let t0 = CreateSpaceModal::templates()
+            .into_iter()
+            .next()
+            .expect("ao menos um gabarito");
+        assert_eq!(m.selected_template().map(|t| t.slug), Some(t0.slug.clone()));
+        assert_eq!(
+            m.name, t0.name,
+            "Nome acompanha o gabarito enquanto não tocado"
+        );
+        m.select_template(999);
+        assert!(
+            m.is_template_selected(0),
+            "índice inválido não muda a seleção"
+        );
+    }
+
+    /// Foco e gabarito são MUTUAMENTE EXCLUSIVOS: escolher um zera o outro (a tela nunca mostra
+    /// dois "começos" selecionados).
+    #[test]
+    fn focus_and_template_are_mutually_exclusive() {
+        let mut m = CreateSpaceModal::new(None, None, Vec::new());
+        m.select_template(0);
+        assert!(m.has_template());
+        m.select_preset(1);
+        assert!(!m.has_template(), "escolher um Foco zera o gabarito");
+        assert!(m.selected_template().is_none());
+        m.select_template(1);
+        assert!(
+            m.has_template() && m.is_template_selected(1),
+            "gabarito volta a vencer o Foco"
+        );
     }
 }

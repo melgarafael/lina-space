@@ -25,7 +25,7 @@ use gpui::{
 };
 use lina_bootstrap::Autonomy;
 use lina_cli_profiles::ProfileRegistry;
-use lina_core::{DiscoveredCli, Effort};
+use lina_core::{CliProfile, DiscoveredCli, Effort};
 use lina_host::NodeId;
 
 use crate::ui::{Button, Frame, Modal, Panel, Space};
@@ -211,6 +211,17 @@ pub const COPY_EDIT_ENGINE_RESTART_WARN: &str =
 pub const COPY_EDIT_APPLY_NOTE: &str = "Mudanças de nome e papel valem agora.";
 pub const COPY_WHY_PREFIX: &str = "ⓘ por quê?";
 
+// ── F3-5-3 (doc-fonte 67): seção "Continuar uma conversa" — retomar uma conversa salva (`--resume`)
+// sem digitar nada técnico. Zero jargão: o leigo pensa "continuar de onde parei", nunca "sessão"/
+// "id"/"motor cru". A copy passa pelo guardião `copy_has_no_jargon` como toda string da tela.
+pub const COPY_RESUME_HEADER_CLOSED: &str = "▸ Continuar uma conversa";
+pub const COPY_RESUME_HEADER_OPEN: &str = "▾ Continuar uma conversa";
+pub const COPY_RESUME_HINT: &str =
+    "retome de onde você parou — a conversa volta com tudo o que já foi conversado";
+pub const COPY_RESUME_EMPTY: &str =
+    "Nenhuma conversa salva ainda. Elas aparecem aqui assim que um agente começa a trabalhar.";
+pub const COPY_RESUME_UNAVAILABLE: &str = "indisponível agora";
+
 /// Linha-fantasma do co-piloto (M6-E2): nunca popup, nunca rouba foco.
 #[must_use]
 pub fn copy_ghost(label: &str) -> String {
@@ -311,6 +322,49 @@ pub fn engines_from(found: &[DiscoveredCli], profiles: &ProfileRegistry) -> Vec<
 pub enum EngineScan {
     Scanning,
     Ready(Vec<Engine>),
+}
+
+/// **F3-5-3 — uma linha da seção "Continuar uma conversa".** O que a tela MOSTRA (nome amigável +
+/// idade humanizada) + o comando de religação JÁ montado (via `lina_core::resume_session::
+/// resume_command`, com o verbo de resume do CLI + o `session_id` exato). Nenhum dado técnico
+/// (`session_id`/`cli`) aparece na tela: ele viaja só dentro de `command`, consumido pelo funil de
+/// admissão. `resumable == false` ⇒ o motor da conversa sumiu/não retoma → linha apagada e inerte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSessionRow {
+    pub display_name: String,
+    /// Idade humanizada ("ontem", "há 3 dias") — calculada na montagem (gpui-free no render).
+    pub age: String,
+    /// `[program, args…, resume_args…, session_id]`; vazio quando `resumable == false`.
+    pub command: Vec<String>,
+    pub profile_id: Option<String>,
+    pub role: Option<String>,
+    pub cwd: Option<String>,
+    pub resumable: bool,
+}
+
+/// **F3-5-3 — idade humanizada de uma conversa salva** (para o leigo reconhecer "a de ontem").
+/// PURA e em buckets (sem precisão falsa de minutos): a tela quer significado, não cronômetro.
+/// `now`/`then` em ms epoch; `now < then` (relógio não-monotônico) cai em "agora há pouco".
+#[must_use]
+pub fn humanize_age(now_ms: u64, then_ms: u64) -> String {
+    let mins = now_ms.saturating_sub(then_ms) / 60_000;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if mins < 1 {
+        "agora há pouco".to_string()
+    } else if hours < 1 {
+        format!("há {mins} min")
+    } else if days < 1 {
+        format!("há {hours}h")
+    } else if days == 1 {
+        "ontem".to_string()
+    } else if days < 7 {
+        format!("há {days} dias")
+    } else if days < 14 {
+        "há 1 semana".to_string()
+    } else {
+        format!("há {} semanas", days / 7)
+    }
 }
 
 // ═══════════════════════════ CLI Profiles em RUNTIME (critério 7) ═══════════════════════════
@@ -423,6 +477,10 @@ pub const GALLERY_VIEWPORT_MAX: f32 = 384.0;
 /// Orçamento vertical do modal SEM a lista (título + chips + nome + papel + pasta + avançado +
 /// rodapé + gaps + paddings), estimado por cima de propósito: sobrar é seguro, faltar estoura.
 pub const MODAL_BASE_RESERVED: f32 = 500.0;
+
+/// F3-5-3: teto da lista de conversas salvas (~4 linhas). Em const NOMEADA (não `px(<literal>)`)
+/// para a viewport rolar sem pesar a catraca de tokens — o corte não-inteiro sinaliza que rola.
+pub const RESUME_VIEWPORT_MAX: f32 = 232.0;
 
 /// Tamanho lógico em px — `f32` cru (gpui-free) para o teste rodar headless.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -975,6 +1033,16 @@ pub struct AgentModal {
     /// F3-0-6: nível de raciocínio selecionado na seção RACIOCÍNIO (só CRIAR — vai ao spawn via
     /// `CreatePlan.effort`). `None` = casa não-tocada → o controle exibe o default [`Effort::Medium`].
     effort: Option<Effort>,
+    /// F3-5-3: a seção "Continuar uma conversa" está aberta (só no modo CRIAR). Default fechado —
+    /// o caminho primário é criar; retomar é um atalho que o usuário expande.
+    saved_open: bool,
+    /// F3-5-3: as conversas salvas já foram carregadas (lazy: na 1ª abertura da seção). Evita
+    /// reler o log a cada toggle e distingue "ainda não carregou" de "carregou e está vazio".
+    saved_loaded: bool,
+    /// F3-5-3: as conversas salvas a listar (montadas pela view a partir da projeção + perfis).
+    saved_rows: Vec<SavedSessionRow>,
+    /// F3-5-3: scroll da lista de conversas (a viewport rola por dentro, como a galeria de papéis).
+    saved_scroll: ScrollHandle,
 }
 
 impl AgentModal {
@@ -1012,6 +1080,11 @@ impl AgentModal {
             autonomy: Autonomy::Assisted,
             // F3-0-6: casa não-tocada → o controle mostra o default neutro (Medium/equilibrado).
             effort: None,
+            // F3-5-3: seção de conversas salvas fechada e ainda não carregada (lazy on-open).
+            saved_open: false,
+            saved_loaded: false,
+            saved_rows: Vec::new(),
+            saved_scroll: ScrollHandle::new(),
         }
     }
 
@@ -1604,6 +1677,41 @@ impl AgentModal {
     pub fn set_error(&mut self, msg: impl Into<String>) {
         self.error = Some(msg.into());
     }
+
+    // ── F3-5-3: conversas salvas ("Continuar uma conversa") ──
+
+    #[must_use]
+    pub fn saved_open(&self) -> bool {
+        self.saved_open
+    }
+
+    #[must_use]
+    pub fn saved_loaded(&self) -> bool {
+        self.saved_loaded
+    }
+
+    #[must_use]
+    pub fn saved_rows(&self) -> &[SavedSessionRow] {
+        &self.saved_rows
+    }
+
+    /// Handle do scroll da lista — o render amarra na viewport via `track_scroll` (como a galeria).
+    #[must_use]
+    pub fn saved_scroll(&self) -> &ScrollHandle {
+        &self.saved_scroll
+    }
+
+    /// Abre/fecha a seção. O caller carrega as conversas na 1ª abertura (lazy) — ver
+    /// [`WorkspaceView::modal_toggle_saved_sessions`].
+    pub fn toggle_saved(&mut self) {
+        self.saved_open = !self.saved_open;
+    }
+
+    /// Injeta as conversas salvas montadas pela view (projeção + perfis) e marca como carregadas.
+    pub fn set_saved_sessions(&mut self, rows: Vec<SavedSessionRow>) {
+        self.saved_rows = rows;
+        self.saved_loaded = true;
+    }
 }
 
 /// Dedup leigo: nome já existe → sufixo " (2)"/" (3)"… (tabela de erros: avisa, não bloqueia).
@@ -1677,6 +1785,120 @@ pub fn render(
                     })),
             ),
     );
+
+    // ── F3-5-3: "Continuar uma conversa" (só no CRIAR; doc-fonte 67) ──
+    // Atalho leigo para retomar uma conversa salva sem digitar nada técnico. Colapsada por default
+    // (o caminho primário é criar do zero); expandir CARREGA as conversas (lazy, só no gesto —
+    // `modal_toggle_saved_sessions`), então o modal abre instantâneo e nada lê o log sem o clique.
+    if !is_edit {
+        let mut sec = div().flex().flex_col().gap_2();
+        sec = sec.child(
+            div()
+                .id("m6-resume-toggle")
+                .flex()
+                .flex_row()
+                .items_center()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(th.surface.panel))
+                .text_color(rgb(th.text.primary))
+                .cursor_pointer()
+                .aria_label("continuar uma conversa salva")
+                .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
+                    v.modal_toggle_saved_sessions(cx);
+                }))
+                .child(text!(if modal.saved_open() {
+                    COPY_RESUME_HEADER_OPEN
+                } else {
+                    COPY_RESUME_HEADER_CLOSED
+                })),
+        );
+        if modal.saved_open() {
+            sec = sec.child(
+                div()
+                    .px_3()
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(COPY_RESUME_HINT)),
+            );
+            let rows = modal.saved_rows();
+            if modal.saved_loaded() && rows.is_empty() {
+                // Estado vazio HONESTO: explica QUANDO conversas aparecem (após o 1º trabalho).
+                sec = sec.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_color(rgb(th.text.muted))
+                        .child(text!(COPY_RESUME_EMPTY)),
+                );
+            } else {
+                // Viewport que rola por dentro (mesma doutrina da galeria): a lista nunca estoura
+                // o modal; o teto é const NOMEADA → fora da catraca de tokens.
+                let mut list = div()
+                    .id("m6-resume-list")
+                    .aria_label(format!("conversas salvas, {} para continuar", rows.len()))
+                    .track_scroll(modal.saved_scroll())
+                    .overflow_y_scroll()
+                    .max_h(px(RESUME_VIEWPORT_MAX))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1();
+                for (i, r) in rows.iter().enumerate() {
+                    let name_color = if r.resumable {
+                        th.text.bright
+                    } else {
+                        th.text.muted
+                    };
+                    // Resumível → idade ("ontem"); indisponível → aviso honesto (motor sumiu).
+                    let meta = if r.resumable {
+                        r.age.clone()
+                    } else {
+                        COPY_RESUME_UNAVAILABLE.to_string()
+                    };
+                    let mut row = div()
+                        .id(("m6-resume-item", i))
+                        .aria_label(format!("continuar a conversa {} · {meta}", r.display_name))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(th.surface.raised));
+                    // Só linha resumível é clicável — a inerte não promete o que não cumpre.
+                    if r.resumable {
+                        row = row.cursor_pointer().on_click(cx.listener(
+                            move |v, _ev: &ClickEvent, _w, cx| {
+                                v.modal_resume_saved_session(i, cx);
+                            },
+                        ));
+                    }
+                    row = row
+                        .child(
+                            // Doutrina B3: o nome CEDE (min_w 0 + clip); a idade é flex_none.
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .overflow_hidden()
+                                .font_weight(FontWeight(f32::from(th.typography.weight.semibold)))
+                                .text_color(rgb(name_color))
+                                .child(text!(r.display_name.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(rgb(th.text.muted))
+                                .child(text!(meta)),
+                        );
+                    list = list.child(row);
+                }
+                sec = sec.child(list);
+            }
+        }
+        col = col.child(sec);
+    }
 
     // ── quick-start de motores (M6-E1) ──
     match modal.engines() {
@@ -2920,6 +3142,93 @@ impl WorkspaceView {
                 eprintln!("lina-gpui: F1-2-3p2 — salvar papel falhou: {e}");
                 if let Some(m) = self.agent_modal.as_mut() {
                     m.gallery_editor_set_error(COPY_TPL_ERR_SAVE.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// **F3-5-3 — abre/fecha "Continuar uma conversa"; CARREGA na 1ª abertura (lazy).** A leitura
+    /// (projeção do log + perfis do disco) roda só no GESTO de abrir, nunca por frame — o modal abre
+    /// instantâneo. Reabrir usa o cache (o modal é efêmero; não vale reler o log a cada toggle).
+    fn modal_toggle_saved_sessions(&mut self, cx: &mut Context<Self>) {
+        let load_now = self
+            .agent_modal
+            .as_ref()
+            .is_some_and(|m| !m.saved_open() && !m.saved_loaded());
+        if let Some(m) = self.agent_modal.as_mut() {
+            m.toggle_saved();
+        }
+        if load_now {
+            let rows = self.build_saved_session_rows();
+            if let Some(m) = self.agent_modal.as_mut() {
+                m.set_saved_sessions(rows);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Monta as linhas da seção: a projeção das conversas salvas (bridge) + os CLI Profiles do disco
+    /// (MESMA fonte do quick-start), resolvendo o comando de religação de cada uma com o verbo de
+    /// resume do motor + o `session_id` exato (`lina_core::resume_session::resume_command`). Sem
+    /// motor resumível → linha inerte (`resumable=false`), nunca um comando que abriria do zero.
+    fn build_saved_session_rows(&self) -> Vec<SavedSessionRow> {
+        let sessions = self.nodes.saved_sessions();
+        let profiles = load_profiles(&profiles_dir(self.nodes.lina_home()));
+        let now = lina_core::now_ms();
+        sessions
+            .into_iter()
+            .map(|s| {
+                let profile = profiles.get(&s.cli);
+                let resumable = profile.is_some_and(CliProfile::can_resume);
+                let command = if resumable {
+                    profile.map_or_else(Vec::new, |p| {
+                        lina_core::resume_session::resume_command(p, Some(&s.session_id))
+                    })
+                } else {
+                    Vec::new()
+                };
+                SavedSessionRow {
+                    display_name: s.display_name,
+                    age: humanize_age(now, s.persisted_at_ms),
+                    command,
+                    profile_id: Some(s.cli),
+                    role: s.role,
+                    cwd: s.cwd,
+                    resumable,
+                }
+            })
+            .collect()
+    }
+
+    /// **F3-5-3 — o clique numa conversa → retoma pelo funil único (`admit_node`, sem bypass).**
+    /// Sucesso fecha o modal (a conversa volta no canvas); falha mostra um aviso leigo inline (o
+    /// detalhe técnico já foi pro stderr no bridge). Linha inerte (`!resumable`) é no-op defensivo.
+    fn modal_resume_saved_session(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(row) = self
+            .agent_modal
+            .as_ref()
+            .and_then(|m| m.saved_rows().get(idx).cloned())
+        else {
+            return;
+        };
+        if !row.resumable {
+            return;
+        }
+        match self.nodes.resume_session(
+            row.command,
+            row.profile_id,
+            row.display_name,
+            row.role,
+            row.cwd,
+        ) {
+            Ok(_) => {
+                self.agent_modal = None;
+            }
+            Err(e) => {
+                eprintln!("lina-gpui: F3-5-3 — retomar conversa falhou: {e}");
+                if let Some(m) = self.agent_modal.as_mut() {
+                    m.set_error(e);
                 }
             }
         }
@@ -4257,6 +4566,12 @@ kind = "idle"
             COPY_EDIT_ENGINE_RESTART_WARN,
             COPY_EDIT_APPLY_NOTE,
             COPY_WHY_PREFIX,
+            // F3-5-3: seção "Continuar uma conversa" — toda string visível passa pelo guardião.
+            COPY_RESUME_HEADER_CLOSED,
+            COPY_RESUME_HEADER_OPEN,
+            COPY_RESUME_HINT,
+            COPY_RESUME_EMPTY,
+            COPY_RESUME_UNAVAILABLE,
             // FIX-3: seção AUTONOMIA — rótulo, descrições leigas e explicação do card.
             COPY_AUTONOMY_LABEL,
             COPY_CARD_AUTONOMY_EXPLAIN,
@@ -4301,5 +4616,74 @@ kind = "idle"
         // trocar o motor reseta o override.
         m.select_engine(0);
         assert_eq!(m.effective_command(), "claude --flag");
+    }
+
+    // ───────── F3-5-3 · seção "Continuar uma conversa" (estado do modal) ─────────
+
+    fn saved_row(name: &str, resumable: bool) -> SavedSessionRow {
+        SavedSessionRow {
+            display_name: name.to_string(),
+            age: "ontem".to_string(),
+            command: if resumable {
+                vec!["claude".into(), "--resume".into(), "sess".into()]
+            } else {
+                Vec::new()
+            },
+            profile_id: Some("claude-code".into()),
+            role: Some("designer".into()),
+            cwd: Some("/tmp/proj".into()),
+            resumable,
+        }
+    }
+
+    /// A seção nasce FECHADA e VAZIA (lazy): o caminho primário é criar; carregar é sob o gesto.
+    #[test]
+    fn saved_section_starts_closed_and_unloaded() {
+        let m = modal();
+        assert!(!m.saved_open(), "fechada por default");
+        assert!(!m.saved_loaded(), "nada carregado até o 1º gesto de abrir");
+        assert!(m.saved_rows().is_empty());
+    }
+
+    /// `toggle_saved` alterna; `set_saved_sessions` injeta as linhas e marca como carregado
+    /// (distingue "ainda não carregou" de "carregou e está vazio" — estados de tela distintos).
+    #[test]
+    fn toggle_and_set_saved_sessions_drive_the_section() {
+        let mut m = modal();
+        m.toggle_saved();
+        assert!(m.saved_open());
+        assert!(
+            !m.saved_loaded(),
+            "abrir não carrega sozinho — quem carrega é a view"
+        );
+        m.set_saved_sessions(vec![saved_row("Revisor", true), saved_row("Velho", false)]);
+        assert!(m.saved_loaded(), "carregou (mesmo que viesse vazio)");
+        assert_eq!(m.saved_rows().len(), 2);
+        assert!(m.saved_rows()[0].resumable);
+        assert!(!m.saved_rows()[1].resumable);
+        m.toggle_saved();
+        assert!(!m.saved_open(), "fecha de novo");
+        assert!(m.saved_loaded(), "fechar não descarta o cache");
+    }
+
+    /// `humanize_age` em buckets honestos (sem precisão falsa); `now < then` cai em "agora há pouco".
+    #[test]
+    fn humanize_age_buckets() {
+        let min = 60_000u64;
+        let hour = 60 * min;
+        let day = 24 * hour;
+        assert_eq!(humanize_age(1_000, 1_000), "agora há pouco");
+        assert_eq!(humanize_age(30 * 1_000, 0), "agora há pouco", "<1 min");
+        assert_eq!(humanize_age(5 * min, 0), "há 5 min");
+        assert_eq!(humanize_age(3 * hour, 0), "há 3h");
+        assert_eq!(humanize_age(day, 0), "ontem");
+        assert_eq!(humanize_age(3 * day, 0), "há 3 dias");
+        assert_eq!(humanize_age(10 * day, 0), "há 1 semana");
+        assert_eq!(humanize_age(21 * day, 0), "há 3 semanas");
+        assert_eq!(
+            humanize_age(0, 999_999),
+            "agora há pouco",
+            "relógio não-monotônico"
+        );
     }
 }

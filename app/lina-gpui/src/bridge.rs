@@ -39,6 +39,26 @@ use lina_core::{
 // aprendizado. Só CONSUMIDA aqui (seleção top-K + leitura de status); a política e a projeção
 // vivem em `lina-core::mentality` (dono: Terminal I).
 use lina_core::mentality::{Belief, BeliefStatus, Mentality, PromotionPolicy};
+// F3-5-3: a projeção das conversas `--resume` salvas (dono: Terminal B). O app LISTA/religa (replay)
+// e, no tick do pump, GERA o `SessionPersisted` do 1º prompt (`persist_after_first_prompt`) — fiação
+// desta fatia; a regra de admissão/poda vive no core.
+use lina_core::resume_session::{ResumeSessionStore, DEFAULT_SESSION_STORE_MAX_ENTRIES};
+// F3-5-7 (`BufferGauge`, spec 53 §11.A): amostrador de ocupação dos buffers. O app coleta as leituras
+// cruas (scrollback/mailbox) e apenda `BufferOccupancySampled` no tick, com o `prev` CACHEADO em
+// memória (delta — `replay` por tick seria O(N)/tick = freeze). Maquinaria do core: dono Terminal K.
+use lina_core::buffer_registry::{
+    self, BufferRegistry, GaugeReading, GaugeSnapshot, GAUGE_WARN_RATIO,
+};
+// F3-5-8 (frente DISCO, dono Terminal M): o app CHAMA a camada pura (probe periódico + evaluate) no
+// tick e a execução custodiada (run_disk_reclaim) no BrokerPump — fechando o critério (e) do ENOSPC #25.
+// A poda real só roda após o gesto humano; o probe é leitura (sysinfo/stat), não toca o event log.
+use lina_core::disk_budget::{
+    classify, evaluate, human_bytes, run_disk_reclaim, scan_candidate, DiskBudget, DiskPressure,
+    DiskProbe, DiskReclaimOutcome, DiskSnapshot, OsDiskProbe, DISK_PROBE_SECS,
+};
+// F3-5-1: o snapshot de sessões `--resume` observadas no disco (global da máquina) — correlacionado
+// por `cwd` ao nó do Espaço para nascer o `SessionPersisted`.
+use lina_session_watch::Session;
 // A2A UNIVERSAL: o registry de TODOS os CLI Profiles — a entrega resolve o profile do ALVO
 // por aqui (CliProfile vem re-exportado do core; ProfileRegistry é o índice por `id`).
 use lina_cli_profiles::ProfileRegistry;
@@ -749,7 +769,40 @@ pub struct MailboxPump {
     /// SEAM-1: `event_count` do último `post_process_spawns` — só re-varre o log quando há evento
     /// novo (padrão do `last_cost_ec`; evita ler o log a cada tick sem mudança).
     last_spawn_ec: u64,
+    /// F3-5-1: snapshot vivo das sessões `--resume` observadas no disco (alimentado pelo `SessionHub`,
+    /// o mesmo `Arc` do dashboard). Correlacionado por `cwd` ao nó do Espaço para nascer o
+    /// `SessionPersisted` do 1º prompt (`persist_first_prompts`).
+    sessions: Arc<Mutex<Vec<Session>>>,
+    /// F3-5-1: `session_id`s para os quais o `SessionPersisted` já nasceu — cache DELTA que dá o
+    /// short-circuit anti-freeze (todas conhecidas ⇒ zero `project`/`replay` no tick). O `plan_persist`
+    /// é idempotente no core; este cache evita até o custo de tentar.
+    persisted_sessions: std::collections::HashSet<String>,
+    /// F3-5-1: `now_ms` do último `project` de correlação sessão↔nó. O `lina-session-watch` é GLOBAL
+    /// (vê sessões da máquina inteira, muitas sem nó no Espaço); throttlar o `project` evita varrer a
+    /// projeção a cada tick por causa dessas órfãs permanentes (anti-freeze, par do `last_cost_ec`).
+    last_session_scan_ms: u64,
+    /// F3-5-7: cache do ÚLTIMO `BufferRegistry` amostrado (o `prev` de `buffer_registry::sample`). É a
+    /// projeção "último por buffer_id vence" mantida em memória por DELTA — jamais `BufferRegistry::
+    /// replay(store)` por tick (O(N)/tick foi a causa-raiz documentada do freeze).
+    buffer_gauge: BufferRegistry,
+    /// F3-5-7: `now_ms` da última amostragem de buffers. `mailbox.gauge_readings()` faz I/O (lista o
+    /// outbox) — throttlar ao [`BUFFER_SAMPLE_INTERVAL_MS`] mantém o medidor barato no tick de 120ms.
+    last_buffer_sample_ms: u64,
+    /// F3-5-8: `now_ms` do último probe de disco. O probe roda no tick de 120ms mas só vale a cada
+    /// [`DISK_PROBE_SECS`] (300s) — disco enche devagar; varrer o FS por tick seria desperdício (e a
+    /// varredura de candidatos é pesada). Par do `last_buffer_sample_ms`.
+    last_disk_probe_ms: u64,
+    /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
+    /// `buffer_gauge`): só (re)apenda `DiskPressureSignaled` quando o nível MUDA, nunca a cada probe.
+    last_disk_pressure: Option<DiskPressure>,
 }
+
+/// F3-5-1: passo do throttle do `project` de correlação sessão↔nó (anti-freeze; ver `sessions`).
+const SESSION_SCAN_INTERVAL_MS: u64 = 2_000;
+/// F3-5-7: passo do throttle da amostragem de buffers (o `gauge_readings` da mailbox faz I/O).
+const BUFFER_SAMPLE_INTERVAL_MS: u64 = 1_000;
+/// F3-5-8: passo do throttle do probe de disco — [`DISK_PROBE_SECS`] (300s) em ms (anti-freeze).
+const DISK_PROBE_INTERVAL_MS: u64 = DISK_PROBE_SECS * 1_000;
 
 /// SEAM-1: detalhes INFORJÁVEIS de um pedido de spawn (do `SpawnRequested`), usados por
 /// `post_process_spawns` p/ fiar o binding de cascata (M4) + o 1º prompt.
@@ -767,6 +820,32 @@ fn autonomy_to_level(a: lina_bootstrap::Autonomy) -> lina_core::AutonomyLevel {
         lina_bootstrap::Autonomy::Manual => lina_core::AutonomyLevel::Manual,
         lina_bootstrap::Autonomy::Assisted => lina_core::AutonomyLevel::Assisted,
         lina_bootstrap::Autonomy::Autonomous => lina_core::AutonomyLevel::Autonomous,
+    }
+}
+
+/// F3-5-7: aplica um `BufferOccupancySampled` ao cache do registry em memória (DELTA — mantém o `prev`
+/// de [`buffer_registry::sample`] sem `replay`). Espelha a projeção do core (último por `buffer_id`
+/// vence); chamado só para os eventos que o `sample` JÁ decidiu emitir.
+fn apply_gauge_event(reg: &mut BufferRegistry, ev: &DomainEvent) {
+    if let DomainEvent::BufferOccupancySampled {
+        buffer_id,
+        used,
+        capacity,
+        unit,
+        pressure_ratio,
+        sampled_at_ms,
+    } = ev
+    {
+        reg.gauges.insert(
+            buffer_id.clone(),
+            GaugeSnapshot {
+                used: *used,
+                capacity: *capacity,
+                unit: unit.clone(),
+                pressure_ratio: *pressure_ratio,
+                sampled_at_ms: *sampled_at_ms,
+            },
+        );
     }
 }
 
@@ -798,6 +877,9 @@ impl MailboxPump {
         autonomy: lina_bootstrap::Autonomy,
         // SEAM-1: o funil de admissão (ADR 0022) — `SpawnApproved` cria o terminal por aqui.
         nodes: Arc<NodeManager>,
+        // F3-5-1: snapshot vivo das sessões `--resume` (mesmo `Arc` que o dashboard recebe do hub) —
+        // a fonte do `session_id` correlacionado por `cwd` ao nó para nascer o `SessionPersisted`.
+        sessions: Arc<Mutex<Vec<Session>>>,
     ) -> Self {
         // F3-0-2 (SEAM-1'): a config dos 13 params de orquestração é PROJEÇÃO do event log (invariante
         // #4) — `resolve_from_store` reconstrói o `RouterConfig` varrendo os `SystemParamsChanged`,
@@ -831,6 +913,25 @@ impl MailboxPump {
             eprintln!("lina-gpui: falha ao restaurar o estado do freio (segue despausado): {e}");
         }
         lock(&brake).paused = router.is_paused();
+        // F3-5-1/-7: semeia os caches de longa duração a partir do log UMA vez no boot (jamais por
+        // tick — replay/tick é O(N)/tick, a causa-raiz do freeze). Falha de leitura → cache vazio + aviso
+        // (degrada: o 1º tick re-tenta, e `plan_persist`/`sample` são idempotentes/aditivos), nunca panica.
+        let persisted_sessions = match ResumeSessionStore::replay(&lock(&store)) {
+            Ok(s) => s.sessions.into_iter().map(|x| x.session_id).collect(),
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: cache de sessões salvas não semeado ({e}); o 1º tick re-tenta"
+                );
+                std::collections::HashSet::new()
+            }
+        };
+        let buffer_gauge = match BufferRegistry::replay(&lock(&store)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("lina-gpui: cache de buffers não semeado ({e}); começa vazio");
+                BufferRegistry::default()
+            }
+        };
         Self {
             router,
             sup,
@@ -846,6 +947,13 @@ impl MailboxPump {
             nodes,
             seeded_spawns: std::collections::HashSet::new(),
             last_spawn_ec: 0,
+            sessions,
+            persisted_sessions,
+            last_session_scan_ms: 0,
+            buffer_gauge,
+            last_buffer_sample_ms: 0,
+            last_disk_probe_ms: 0,
+            last_disk_pressure: None,
         }
     }
 
@@ -1155,6 +1263,190 @@ impl MailboxPump {
         // F3-1-7 (ADR 0036): aplica os gestos humanos diretos da UI (confirmar/ajustar Goal).
         self.drain_human_intents();
         self.refresh_cost_paused();
+        // F3-5-1: nasce o `SessionPersisted` do 1º prompt de cada nó (idempotente; throttle anti-freeze).
+        self.persist_first_prompts(now_ms());
+        // F3-5-7: amostra a ocupação dos buffers (anti-amplificação + cache delta do prev; throttle I/O).
+        self.sample_buffers(now_ms());
+        // F3-5-8: detecta pressão de disco (ENOSPC #25) e PROPÕE poda custodiada (throttle 300s).
+        self.probe_disk(now_ms());
+    }
+
+    /// **F3-5-1 (fiação da GERAÇÃO): nasce o `SessionPersisted` do 1º prompt de cada nó.** Correlaciona
+    /// as sessões `--resume` observadas no disco (por `cwd`) ao nó do Espaço e, na borda do 1º prompt,
+    /// chama [`ResumeSessionStore::persist_after_first_prompt`] (idempotente). Sem isto a projeção de
+    /// sessões salvas seria sempre VAZIA em produção (gate a morto — só os testes a alimentavam).
+    ///
+    /// Anti-freeze (lição do `attention_heartbeat`): short-circuit barato quando toda sessão já nasceu
+    /// (zero `project`/`replay`); e como o `lina-session-watch` é GLOBAL (vê sessões da máquina sem nó
+    /// no Espaço), o `project` de correlação é throttlado a [`SESSION_SCAN_INTERVAL_MS`].
+    fn persist_first_prompts(&mut self, now_ms: u64) {
+        let snapshot = lock(&self.sessions).clone();
+        // Short-circuit: nada novo (toda sessão já tem seu SessionPersisted) → sem project nem replay.
+        if snapshot
+            .iter()
+            .all(|s| self.persisted_sessions.contains(&s.session_id))
+        {
+            return;
+        }
+        // Há sessão nova (talvez de outro projeto, sem nó): throttla o project p/ não varrer por tick.
+        if now_ms.saturating_sub(self.last_session_scan_ms) < SESSION_SCAN_INTERVAL_MS {
+            return;
+        }
+        self.last_session_scan_ms = now_ms;
+        let project = match lock(&self.store).project() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("lina-gpui: persist_first_prompts não projetou o roster ({e})");
+                return;
+            }
+        };
+        for s in &snapshot {
+            if self.persisted_sessions.contains(&s.session_id) {
+                continue;
+            }
+            let Some(cwd) = s.cwd.as_deref() else {
+                continue; // sessão sem cwd → não correlaciona a um nó
+            };
+            // Correlação por `cwd` (o mesmo binding que o dashboard de custo usa): o nó terminal cujo
+            // cwd casa. Sessão da máquina sem nó no Espaço → ignorada (não é deste workspace).
+            let node = project.nodes.iter().find(|(_, n)| {
+                n.kind.eq_ignore_ascii_case("terminal") && n.cwd.as_deref() == Some(cwd)
+            });
+            let Some((node_id, _)) = node else {
+                continue;
+            };
+            let node_id = node_id.to_string();
+            let mut store = lock(&self.store);
+            match ResumeSessionStore::persist_after_first_prompt(
+                &mut store,
+                &node_id,
+                &s.cli,
+                &s.session_id,
+                None,
+                now_ms,
+                DEFAULT_SESSION_STORE_MAX_ENTRIES,
+            ) {
+                Ok(_) => {
+                    drop(store);
+                    self.persisted_sessions.insert(s.session_id.clone());
+                }
+                Err(e) => eprintln!("lina-gpui: persist da sessão {} falhou: {e}", s.session_id),
+            }
+        }
+    }
+
+    /// **F3-5-7 (fiação da AMOSTRAGEM): apenda `BufferOccupancySampled` da ocupação dos buffers.**
+    /// Coleta as leituras cruas (scrollback por painel + mailbox/DLQ por nó), passa por
+    /// [`buffer_registry::sample`] (anti-amplificação A4 — só emite ao cruzar bucket de 10%/warn) e
+    /// apenda o que sobra. Sem isto, `lina check --buffers` seria sempre vazio em produção (gate d morto).
+    ///
+    /// Anti-freeze: o `prev` é o cache [`Self::buffer_gauge`] (delta, NUNCA `BufferRegistry::replay`
+    /// por tick); a coleta (a da mailbox faz I/O no outbox) é throttlada a [`BUFFER_SAMPLE_INTERVAL_MS`].
+    fn sample_buffers(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_buffer_sample_ms) < BUFFER_SAMPLE_INTERVAL_MS {
+            return;
+        }
+        self.last_buffer_sample_ms = now_ms;
+        let mut readings: Vec<GaugeReading> = Vec::new();
+        if let Some(sb) = self.nodes.scrollback() {
+            readings.extend(lock(&sb).gauge_readings());
+        }
+        match self.router.mailbox().gauge_readings() {
+            Ok(r) => readings.extend(r),
+            Err(e) => eprintln!("lina-gpui: leituras de buffer da mailbox falharam ({e})"),
+        }
+        if readings.is_empty() {
+            return;
+        }
+        let events =
+            buffer_registry::sample(&self.buffer_gauge, &readings, GAUGE_WARN_RATIO, now_ms);
+        if events.is_empty() {
+            return; // anti-amplificação: nenhuma leitura cruzou bucket/warn
+        }
+        let mut store = lock(&self.store);
+        for ev in &events {
+            if let Err(e) = store.append(ev) {
+                eprintln!("lina-gpui: falha ao apendar BufferOccupancySampled ({e})");
+                continue;
+            }
+            apply_gauge_event(&mut self.buffer_gauge, ev);
+        }
+    }
+
+    /// **F3-5-8 (fiação do PROBE): detecta pressão de disco e PROPÕE poda custodiada (ENOSPC #25).**
+    /// Lê o uso do volume do workspace (leve, `sysinfo`), classifica e — só em `critical` — varre os
+    /// candidatos (`target/` do cargo, scrollback DB, DLQ) e PROPÕE a poda via [`evaluate`]
+    /// (`DiskPressureSignaled` + `DiskReclaimProposed`). NUNCA apaga: a poda é custodiada no BrokerPump
+    /// (gate humano). Sem isto a frente de disco ficaria inerte no app vivo (gate (e) morto).
+    ///
+    /// Anti-freeze (espelha `sample_buffers`): throttle a [`DISK_PROBE_INTERVAL_MS`] (300s — disco
+    /// enche devagar); a varredura PESADA do FS só em `critical`; anti-amplificação por
+    /// [`Self::last_disk_pressure`] (só sinaliza ao MUDAR de nível). O probe é LEITURA — não dispara
+    /// `permission_prompt` (achado #36); a execução destrutiva é do broker custodiado.
+    fn probe_disk(&mut self, now_ms: u64) {
+        self.probe_disk_with(&OsDiskProbe, now_ms);
+    }
+
+    /// Núcleo testável do probe — o [`DiskProbe`] é INJETADO (`OsDiskProbe` em produção; simulado no
+    /// teste, sem tocar o FS real, lição #36). Throttle + anti-amplificação vivem aqui.
+    fn probe_disk_with(&mut self, probe: &impl DiskProbe, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_disk_probe_ms) < DISK_PROBE_INTERVAL_MS {
+            return;
+        }
+        self.last_disk_probe_ms = now_ms;
+        // ws_root = pai de `<ws_root>/.lina` (a raiz da mailbox do router). Sem pai → sem probe.
+        let Some(ws_root) = self
+            .router
+            .mailbox()
+            .root()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let (used, total) = match probe.volume_usage(&ws_root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("lina-gpui: probe de disco não leu o volume ({e})");
+                return;
+            }
+        };
+        let (_pct, pressure) = classify(used, total);
+        // Anti-amplificação (espelha o cache delta do buffer_gauge): só (re)sinaliza ao MUDAR de nível.
+        if self.last_disk_pressure == Some(pressure) {
+            return;
+        }
+        // A varredura dos candidatos toca o FS (pesada) — só vale em `critical`, onde a proposta nasce.
+        let candidate_dirs = [
+            (ws_root.join("target"), "cargo_target"),
+            (
+                ws_root.join(".lina").join("scrollback.db"),
+                "old_scrollback_db",
+            ),
+            (ws_root.join(".lina").join("dead-letter"), "dlq_archive"),
+        ];
+        let candidates = if pressure == DiskPressure::Critical {
+            candidate_dirs
+                .iter()
+                .filter_map(|(path, kind)| scan_candidate(probe, path, kind))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let snapshot = DiskSnapshot {
+            path: "workspace_target".to_string(),
+            used_bytes: used,
+            total_bytes: total,
+            candidates,
+        };
+        let mut store = lock(&self.store);
+        match evaluate(&snapshot, now_ms, &mut store) {
+            Ok(_) => {
+                drop(store);
+                self.last_disk_pressure = Some(pressure);
+            }
+            Err(e) => eprintln!("lina-gpui: avaliação de disco falhou ({e})"),
+        }
     }
 
     /// **F3-1-7 (ADR 0036) — aplica os GESTOS HUMANOS DIRETOS da UI** (confirmar/ajustar uma Goal;
@@ -1358,6 +1650,15 @@ pub enum PendingGate {
         requester: String,
         display: String,
     },
+    /// `disk.reclaim` (F3-5-8, ADR 0043) — poda de disco IRREVERSÍVEL. Os `candidate_paths` vêm da
+    /// PROPOSTA pendente no log (`DiskReclaimProposed`), nunca do payload do agente — só o gesto humano
+    /// dispara a poda (zero `DiskReclaimExecuted` sem confirm).
+    DiskReclaim {
+        id: String,
+        requester: String,
+        display: String,
+        candidate_paths: Vec<String>,
+    },
 }
 
 impl PendingGate {
@@ -1365,21 +1666,25 @@ impl PendingGate {
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
-            Self::Custody { id, .. } | Self::Resume { id, .. } => id,
+            Self::Custody { id, .. } | Self::Resume { id, .. } | Self::DiskReclaim { id, .. } => id,
         }
     }
     /// Texto legível do banner.
     #[must_use]
     pub fn display(&self) -> &str {
         match self {
-            Self::Custody { display, .. } | Self::Resume { display, .. } => display,
+            Self::Custody { display, .. }
+            | Self::Resume { display, .. }
+            | Self::DiskReclaim { display, .. } => display,
         }
     }
     /// Origem AUTENTICADA (dir-dono). Exposto para teste/observabilidade do gate.
     #[must_use]
     pub fn requester(&self) -> &str {
         match self {
-            Self::Custody { requester, .. } | Self::Resume { requester, .. } => requester,
+            Self::Custody { requester, .. }
+            | Self::Resume { requester, .. }
+            | Self::DiskReclaim { requester, .. } => requester,
         }
     }
 }
@@ -1757,6 +2062,7 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         match m.intent.as_str() {
             "broker.do" => self.enqueue_custody(m),
             "resume.request" => self.enqueue_resume(m),
+            "disk.reclaim" => self.enqueue_disk_reclaim(m),
             other => eprintln!(
                 "lina-gpui: intent {other:?} desconhecido na fila de broker (msg {}) — ignorado",
                 m.id
@@ -1838,6 +2144,61 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         );
     }
 
+    /// **F3-5-8: enfileira a poda de disco no gate humano.** Os `candidate_paths` vêm da PROPOSTA
+    /// pendente no log (`DiskReclaimProposed`, projeção [`DiskBudget`]) — NUNCA do payload do agente
+    /// (um `from` forjável não escolhe o que apagar; a doutrina ADR 0021 §5/0043). `run_disk_reclaim`
+    /// com `confirmed=false` registra o gate (`ActionGated{ask}` + `BrokerDenied{unconfirmed}`) sem
+    /// apagar nada; a execução só ocorre após o gesto humano (⌘⏎) em [`Self::execute_disk_reclaim`].
+    fn enqueue_disk_reclaim(&mut self, m: &MailMessage) {
+        let candidate_paths: Vec<String> = {
+            let store = lock(&self.store);
+            let records = match store.events() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("lina-gpui: disk.reclaim nao leu o log ({e}) — ignorado");
+                    return;
+                }
+            };
+            DiskBudget::replay(&records)
+                .pending_proposal()
+                .map(|p| p.candidates.iter().map(|c| c.path.clone()).collect())
+                .unwrap_or_default()
+        };
+        if candidate_paths.is_empty() {
+            eprintln!(
+                "lina-gpui: disk.reclaim sem proposta pendente (msg {}) — ignorado",
+                m.id
+            );
+            return;
+        }
+        // Registra o gate SEM apagar (espelha `enqueue_custody`→`run_custody(false)`): ActionGated{ask}
+        // + BrokerDenied{unconfirmed}. O closure nunca roda com `confirmed=false`.
+        {
+            let mut store = lock(&self.store);
+            if let Err(e) =
+                run_disk_reclaim(&candidate_paths, &m.from, false, &mut store, |_| Ok(0))
+            {
+                eprintln!("lina-gpui: disk.reclaim nao registrou o gate ({e}) — ignorado");
+                return;
+            }
+        }
+        let pend = PendingGate::DiskReclaim {
+            id: m.id.clone(),
+            requester: m.from.clone(), // AUTENTICADA (dir-dono), nunca o `from` de conteúdo
+            display: format!(
+                "🧹 LIMPEZA de disco proposta ({} caminho(s)) — ⌘⏎ aprova · ⌘⇧⏎ recusa (apaga DE VERDADE)",
+                candidate_paths.len()
+            ),
+            candidate_paths,
+        };
+        lock(&self.desk).queue.push_back(pend);
+        lock(&self.model).touch();
+        eprintln!(
+            "lina-gpui: DISK.RECLAIM — poda proposta na fila do gate humano (⌘⏎). msg {}",
+            m.id
+        );
+    }
+
     /// O humano confirmou (`id`): tira a FRENTE da fila (se casar o id) e executa conforme o tipo —
     /// custódia (segredo do cofre + marcador) ou retomada (CostCeilingResumed se pausado).
     fn execute_confirmed(&mut self, id: &str) {
@@ -1868,6 +2229,11 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
                 ..
             } => self.execute_custody(&action, &secret_key, &requester),
             PendingGate::Resume { requester, .. } => self.execute_resume(&requester),
+            PendingGate::DiskReclaim {
+                candidate_paths,
+                requester,
+                ..
+            } => self.execute_disk_reclaim(&candidate_paths, &requester),
         };
         eprintln!("lina-gpui: GATE — {banner}");
         {
@@ -1930,6 +2296,55 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             Err(e) => format!("⛔ retomada falhou ao apendar CostCeilingResumed: {e}"),
         }
     }
+
+    /// **F3-5-8: executa a poda confirmada (a porta IRREVERSÍVEL).** `run_disk_reclaim(confirmed=true)`
+    /// → `DiskReclaimApproved` → o executor apaga os caminhos APROVADOS (medindo os bytes) →
+    /// `DiskReclaimExecuted`. Só o gate humano (⌘⏎) chega aqui; `approved_by` é exibição, a autoridade
+    /// foi o gesto (ADR 0043). O executor [`reclaim_paths`] é o ÚNICO ponto que toca o disco (achado #36).
+    fn execute_disk_reclaim(&self, candidate_paths: &[String], requester: &str) -> String {
+        let outcome = {
+            let mut store = lock(&self.store);
+            run_disk_reclaim(candidate_paths, requester, true, &mut store, reclaim_paths)
+        };
+        match outcome {
+            Ok(DiskReclaimOutcome::Executed { reclaimed_bytes }) => format!(
+                "✅ disco limpo (gate humano) a pedido de {requester} — {} liberados",
+                human_bytes(reclaimed_bytes)
+            ),
+            Ok(DiskReclaimOutcome::DeniedUnconfirmed) => {
+                "⛔ poda sem confirmacao — nada apagado".to_string()
+            }
+            Err(e) => format!("⛔ poda de disco falhou na execucao: {e}"),
+        }
+    }
+}
+
+/// F3-5-8: a poda REAL (o executor injetado em [`run_disk_reclaim`]) — o ÚNICO ponto que toca o disco.
+/// Mede os bytes de cada caminho APROVADO, apaga (diretório ou arquivo) e soma o recuperado. Caminho
+/// ausente é pulado (já liberado). Fora do core (achado #36: a operação destrutiva não mora na camada
+/// pura); só roda atrás do gesto humano (`confirmed=true` em `run_disk_reclaim`).
+fn reclaim_paths(paths: &[String]) -> Result<u64, String> {
+    let probe = OsDiskProbe;
+    let mut reclaimed = 0u64;
+    for raw in paths {
+        let path = std::path::Path::new(raw);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = if path.is_dir() {
+            probe.dir_size(path)
+        } else {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        };
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        result.map_err(|e| format!("apagar {}: {e}", path.display()))?;
+        reclaimed = reclaimed.saturating_add(bytes);
+    }
+    Ok(reclaimed)
 }
 
 // ════════════════════ F1-1-7 · fiação da FILA DE ATENÇÃO (AttentionQueue ↔ app) ════════════════════
@@ -4021,6 +4436,28 @@ fn install_post_commit_hook(base_repo: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// **F3-5-3 — uma conversa salva pronta para o modal "Continuar uma conversa".** Projeção
+/// HUMANIZADA de [`ResumeSessionStore`] (a sessão `--resume` ativa de um nó) enriquecida com o
+/// nome/papel/pasta do nó ORIGINAL (da projeção do log): o leigo reconhece a conversa pelo nome,
+/// e o restore re-entra na MESMA pasta — onde o CLI guarda o histórico daquela conversa (sem isso
+/// `claude --resume <id>` não acha o arquivo da sessão). `session_id`/`cli` são DADO transportado
+/// (ADR 0022), nunca exibidos: viajam só dentro do comando de religação.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSessionView {
+    /// Id capturado do JSONL — DADO p/ o `--resume`, jamais autoridade nem texto de tela.
+    pub session_id: String,
+    /// `id` do CLI Profile de origem — resolve o motor (e seus `resume_args`) na religação.
+    pub cli: String,
+    /// Nome amigável: o rótulo da sessão; senão o nome projetado do nó; senão um genérico.
+    pub display_name: String,
+    /// Papel canônico do nó original (p/ o nó retomado renascer no mesmo papel).
+    pub role: Option<String>,
+    /// Pasta REAL do nó original — re-entrada na religação (onde mora o histórico da conversa).
+    pub cwd: Option<String>,
+    /// Carimbo da persistência — a tela ordena por ele (mais recente primeiro) e humaniza a idade.
+    pub persisted_at_ms: u64,
+}
+
 /// **Rodada 360 (ADR 0022 §1) — o PLANO de admissão**: a intenção "quero um terminal"
 /// normalizada. Os entry points são tradutores finos de intenção → este plano; quem o
 /// executa é SEMPRE o [`NodeManager::admit_node`]. Toda porta futura (API, CLI,
@@ -5150,6 +5587,120 @@ impl NodeManager {
             .project()
             .ok()
             .and_then(|st| st.nodes.get(&node).and_then(|n| n.cli.clone()))
+    }
+
+    /// **F3-5-3 — as conversas salvas e ATIVAS, prontas para o modal "Continuar uma conversa".**
+    /// Projeta o [`ResumeSessionStore`] do log (a sessão só nasce APÓS o 1º prompt — o critério
+    /// "sem prompt → não aparece" é garantido AQUI, na projeção, não na UI) e enriquece cada uma
+    /// com o nome/papel/pasta do nó original. Ordem: mais RECENTE primeiro (a candidata natural de
+    /// "continuar de onde parei"; o store entrega ASC por `persisted_at_ms` para o LRU — a tela
+    /// quer o inverso). Replay sob demanda: chamado só ao ABRIR a seção do modal, nunca por frame.
+    /// Falha de leitura degrada para vazio (a UI mostra o estado vazio honesto), nunca crasha.
+    #[must_use]
+    pub fn saved_sessions(&self) -> Vec<SavedSessionView> {
+        let store = lock(&self.store);
+        let sessions = match ResumeSessionStore::replay(&store) {
+            Ok(s) => s.sessions,
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: F3-5-3 — leitura das conversas salvas falhou: {e}; lista vazia"
+                );
+                return Vec::new();
+            }
+        };
+        // Projeção do MESMO snapshot p/ resolver nome/papel/pasta de cada nó original; ausente
+        // (log ilegível) → degrada para os campos sem enriquecimento, nunca crasha.
+        let proj = store.project().ok();
+        drop(store);
+        let mut out: Vec<SavedSessionView> = sessions
+            .into_iter()
+            .map(|s| {
+                let info = proj.as_ref().and_then(|p| {
+                    s.node
+                        .parse::<NodeId>()
+                        .ok()
+                        .and_then(|id| p.nodes.get(&id))
+                });
+                let display_name = s
+                    .label
+                    .clone()
+                    .or_else(|| info.and_then(|n| n.name.clone()))
+                    .unwrap_or_else(|| "Conversa salva".to_string());
+                SavedSessionView {
+                    session_id: s.session_id,
+                    cli: s.cli,
+                    display_name,
+                    role: info.and_then(|n| n.role.clone()),
+                    cwd: info.and_then(|n| n.cwd.clone()),
+                    persisted_at_ms: s.persisted_at_ms,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.persisted_at_ms
+                .cmp(&a.persisted_at_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        out
+    }
+
+    /// **F3-5-3 — a admissão de uma conversa retomada (PURA, testável sem PTY).** Traduz a escolha
+    /// no modal em [`NodeAdmission`]: o `command` (`[program, args…, resume_args…, session_id]`,
+    /// montado pela view via `lina_core::resume_session::resume_command`) vira o motor; nome/papel
+    /// vêm do nó original; a pasta é re-entrada com `consent: true` (já consentida quando o nó
+    /// nasceu — espelha o restore F1-4-3, `restore_terminals`). `None` quando o comando está vazio
+    /// (motor da conversa indisponível) — a UI avisa em vez de admitir um agente mudo.
+    #[must_use]
+    fn resume_admission(
+        command: &[String],
+        profile_id: Option<String>,
+        name: String,
+        role: Option<String>,
+        cwd: Option<String>,
+    ) -> Option<NodeAdmission> {
+        let (program, args) = command.split_first()?;
+        Some(NodeAdmission {
+            name: Some(name.clone()),
+            role: role.unwrap_or_else(|| "terminal".to_string()),
+            engine: Some(AgentEngine {
+                program: program.clone(),
+                args: args.to_vec(),
+                profile_id: profile_id.clone(),
+                label: profile_id.unwrap_or(name),
+            }),
+            cwd: match cwd {
+                Some(p) => CwdPolicy::UserDir {
+                    path: PathBuf::from(p),
+                    consent: true,
+                },
+                None => CwdPolicy::Managed,
+            },
+            position: None,
+            requested_by: None, // retomar é gesto humano direto no modal (origem humana, não spawn)
+            autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
+        })
+    }
+
+    /// **F3-5-3 — retoma uma conversa salva pelo FUNIL ÚNICO (`admit_node`, sem bypass — ADR 0022).**
+    /// O novo nó nasce com o nome/papel/pasta da conversa anterior e roda o CLI com o verbo de
+    /// resume + o `session_id` EXATO → o CLI reabre AQUELA conversa (não "a última da pasta"). Não
+    /// revive o `NodeId` antigo: a identidade do nó segue `LINA_NODE_ID` (ADR 0026) — quem volta é a
+    /// CONVERSA, pelo `--resume`. Erro = comando vazio (motor indisponível) ou falha do funil.
+    pub fn resume_session(
+        &self,
+        command: Vec<String>,
+        profile_id: Option<String>,
+        name: String,
+        role: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<NodeId, String> {
+        let admission =
+            Self::resume_admission(&command, profile_id, name, role, cwd).ok_or_else(|| {
+                "Esta conversa não pode ser retomada agora (o motor dela não está disponível)."
+                    .to_string()
+            })?;
+        self.admit_node(admission)
     }
 
     /// **F1-2-3 p2 (seam p/ o modal de papéis)** — persiste um papel CUSTOM do usuário:
@@ -7214,6 +7765,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let outbox = Mailbox::new(&mailbox_root); // handle separado p/ enfileirar (mesmo `.lina/`)
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -7381,6 +7933,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -7590,6 +8143,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let bus_count = |s: &Arc<Mutex<EventStore>>| {
             lock(s)
@@ -7697,6 +8251,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()), // A2A: registry vazio ⇒ target_profile cai no fallback (= pré-fix)
             Autonomy::Assisted, // SEAM-1: testes de roteamento — autonomia default (não-spawn)
             test_nodes(Arc::clone(&store)), // SEAM-1: nodes não exercitado (sem SpawnApproved aqui)
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
         let outbox = Mailbox::new(&mailbox_root);
         let kinds = |s: &Arc<Mutex<EventStore>>| {
@@ -8087,6 +8642,7 @@ mod tests {
             Arc::new(ProfileRegistry::new()),
             Autonomy::Assisted,
             Arc::clone(&nodes),
+            Arc::new(Mutex::new(Vec::new())), // F3-5-1: sem sessões observadas neste teste
         );
 
         // O "clique para liberar" do card: a view só ENFILEIRA o gesto (by=human é a NATUREZA do
@@ -8109,6 +8665,380 @@ mod tests {
                 .iter()
                 .any(|r| r.kind == "NodeStatusChanged" && r.payload["reason"] == "breaker_reset"),
             "NodeStatusChanged{{reason:breaker_reset}} apendado pelo reset humano"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F3-5 (fiação das costuras no app): persist do 1º prompt + buffers + DISCO ────────────────
+
+    /// Sonda de disco SIMULADA — `used/total` injetados; `dir_size` > 0 só para o `target/` (mesmo
+    /// padrão do `MockProbe` do core). Prova a costura sem tocar o FS real (lição #36).
+    struct MockDiskProbe {
+        used: u64,
+        total: u64,
+    }
+    impl DiskProbe for MockDiskProbe {
+        fn volume_usage(&self, _path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+            Ok((self.used, self.total))
+        }
+        fn dir_size(&self, path: &std::path::Path) -> u64 {
+            if path.ends_with("target") {
+                30_000_000_000
+            } else {
+                0
+            }
+        }
+    }
+
+    /// **Gate (e) — probe a 96% nasce `DiskPressureSignaled{critical}` + `DiskReclaimProposed`.** O
+    /// disco simulado cruza crítico no tick → sinaliza a pressão e PROPÕE a poda (há candidato: o
+    /// `target/`); o probe NUNCA apaga (gate (e) VIVO, não só nos testes do core).
+    #[test]
+    fn probe_disk_critical_signals_and_proposes() {
+        let (mut pump, store, dir) = pump_for_test("disk-probe", Arc::new(Mutex::new(Vec::new())));
+        pump.probe_disk_with(
+            &MockDiskProbe {
+                used: 96,
+                total: 100,
+            },
+            600_000,
+        );
+        assert_eq!(
+            count_kind(&store, "DiskPressureSignaled"),
+            1,
+            "um sinal de pressão"
+        );
+        let critical = lock(&store).events().expect("ev").iter().any(|r| {
+            r.kind == "DiskPressureSignaled"
+                && r.payload.get("threshold_crossed").and_then(|v| v.as_str()) == Some("critical")
+        });
+        assert!(critical, "threshold critical a 96%");
+        assert_eq!(
+            count_kind(&store, "DiskReclaimProposed"),
+            1,
+            "propõe a poda (há candidato target)"
+        );
+        assert_eq!(
+            count_kind(&store, "DiskReclaimExecuted"),
+            0,
+            "o probe NUNCA apaga (proposta ≠ execução)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anti-freeze: re-sinalizar o MESMO nível não re-emite (anti-amplificação por `last_disk_pressure`),
+    /// e dentro do intervalo de throttle não há novo probe — o tick de 120ms não vira O(N)/tick.
+    #[test]
+    fn probe_disk_anti_amplifies_and_throttles() {
+        let (mut pump, store, dir) =
+            pump_for_test("disk-throttle", Arc::new(Mutex::new(Vec::new())));
+        let probe = MockDiskProbe {
+            used: 96,
+            total: 100,
+        };
+        pump.probe_disk_with(&probe, 600_000);
+        let after_first = count_kind(&store, "DiskPressureSignaled");
+        // Throttle: dentro do intervalo (< 300s) → sem novo probe.
+        pump.probe_disk_with(&probe, 600_000 + 1_000);
+        assert_eq!(
+            count_kind(&store, "DiskPressureSignaled"),
+            after_first,
+            "throttle barra o re-probe"
+        );
+        // Além do throttle, MESMO nível (critical) → anti-amplificação barra.
+        pump.probe_disk_with(&probe, 600_000 + DISK_PROBE_INTERVAL_MS + 1);
+        assert_eq!(
+            count_kind(&store, "DiskPressureSignaled"),
+            after_first,
+            "mesmo nível ⇒ sem novo sinal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Semeia uma `DiskReclaimProposed` no `store` apontando para `path` — via `evaluate` +
+    /// `scan_candidate` (que produz o `ReclaimCandidate` sem nomeá-lo; o tipo não é re-exportado do core).
+    fn seed_disk_proposal(store: &Arc<Mutex<EventStore>>, path: &std::path::Path) {
+        struct FixedBytesProbe;
+        impl DiskProbe for FixedBytesProbe {
+            fn volume_usage(&self, _: &std::path::Path) -> std::io::Result<(u64, u64)> {
+                Ok((96, 100))
+            }
+            fn dir_size(&self, _: &std::path::Path) -> u64 {
+                4096
+            }
+        }
+        let candidates = std::iter::once((path, "cargo_target"))
+            .filter_map(|(p, k)| scan_candidate(&FixedBytesProbe, p, k))
+            .collect();
+        let snapshot = DiskSnapshot {
+            path: "workspace_target".to_string(),
+            used_bytes: 96,
+            total_bytes: 100,
+            candidates,
+        };
+        let mut s = lock(store);
+        evaluate(&snapshot, 1, &mut s).expect("semear proposta de poda");
+    }
+
+    /// **Gate (e) — disk.reclaim no BrokerPump: custódia → `Executed` SÓ após confirm.** A proposta no
+    /// log dá os caminhos (não o payload); sem gesto humano ZERO poda; com ⌘⏎ → `DiskReclaimExecuted`
+    /// e o alvo (tmpdir isolado) é apagado. Prova a porta IRREVERSÍVEL sob gate humano (ADR 0043).
+    #[test]
+    fn disk_reclaim_custody_executes_only_after_confirm() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-diskreclaim-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("abrir store"),
+        ));
+        // Um alvo de poda REAL mas ISOLADO (tmpdir de teste) — apagá-lo é seguro (não é o target real).
+        let victim = base.join("reclaim-victim");
+        std::fs::create_dir_all(&victim).expect("mkdir victim");
+        std::fs::write(victim.join("big.bin"), vec![0u8; 4096]).expect("arquivo alvo");
+        // Proposta pendente no log: a FONTE dos caminhos que enqueue_disk_reclaim materializa.
+        seed_disk_proposal(&store, &victim);
+        let broker_mb = Mailbox::new(&broker_root);
+        broker_mb
+            .enqueue_as(
+                "@Dev",
+                &MailMessage::new("@Dev", "broker", "disk.reclaim", ""),
+            )
+            .expect("enqueue_as @Dev");
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            Arc::clone(&model),
+            sup_with_nodes(&["@Dev"]),
+        );
+        let kinds = |s: &Arc<Mutex<EventStore>>| {
+            lock(s)
+                .events()
+                .expect("ev")
+                .into_iter()
+                .map(|r| r.kind)
+                .collect::<Vec<_>>()
+        };
+
+        // (1) tick: enqueue_disk_reclaim → ActionGated{ask}+BrokerDenied, PendingGate, ZERO Executed.
+        pump.tick();
+        let pend_id = {
+            let d = lock(&desk);
+            let p = d.front().expect("pendente disk.reclaim na frente");
+            assert!(
+                matches!(p, PendingGate::DiskReclaim { .. }),
+                "pendência é DiskReclaim"
+            );
+            assert_eq!(p.requester(), "@Dev", "origem autenticada");
+            p.id().to_string()
+        };
+        assert!(kinds(&store).contains(&"ActionGated".to_string()));
+        assert!(kinds(&store).contains(&"BrokerDenied".to_string()));
+        assert!(
+            !kinds(&store).contains(&"DiskReclaimExecuted".to_string()),
+            "sem confirmação NUNCA apaga"
+        );
+        assert!(victim.exists(), "o alvo segue intacto sem o gesto humano");
+
+        // (2) gesto humano (⌘⏎) → 2º tick executa a poda real (do tmpdir isolado).
+        lock(&desk).confirm_requested = Some(pend_id);
+        pump.tick();
+        assert!(
+            kinds(&store).contains(&"DiskReclaimExecuted".to_string()),
+            "após confirmação, a poda executa"
+        );
+        let executed_bytes = lock(&store)
+            .events()
+            .expect("ev")
+            .iter()
+            .find(|r| r.kind == "DiskReclaimExecuted")
+            .and_then(|r| r.payload.get("reclaimed_bytes").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        assert!(executed_bytes > 0, "bytes recuperados > 0");
+        assert!(!victim.exists(), "o alvo foi podado (gate humano)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Um `MailboxPump` mínimo (sem PTY) para exercitar as costuras F3-5 — store/sessions injetáveis.
+    fn pump_for_test(
+        tag: &str,
+        sessions: Arc<Mutex<Vec<Session>>>,
+    ) -> (MailboxPump, Arc<Mutex<EventStore>>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-f35aw-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("abrir store"),
+        ));
+        let pump = MailboxPump::new(
+            Arc::new(Supervisor::new()),
+            Arc::clone(&store),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Mailbox::new(dir.join(".lina")),
+            new_reinject_queue(),
+            Arc::new(Mutex::new(SharedModel::default())),
+            crate::wiring::new_brake(),
+            0,
+            demo_profile(),
+            Arc::new(ProfileRegistry::new()),
+            Autonomy::Assisted,
+            test_nodes(Arc::clone(&store)),
+            sessions,
+        );
+        (pump, store, dir)
+    }
+
+    /// Uma `Session` do `lina-session-watch` com o `cwd`/`session_id`/`cli` dados (demais campos zerados).
+    fn test_session(cwd: &str, session_id: &str, cli: &str) -> Session {
+        Session {
+            cli: cli.to_string(),
+            session_id: session_id.to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            tokens_cache: 0,
+            tokens_thinking: 0,
+            cost_usd: 0.0,
+            cost_estimated: false,
+            model: None,
+            cwd: Some(cwd.to_string()),
+            last_ts: None,
+            subagents: Vec::new(),
+            tools: Vec::new(),
+            source: lina_session_watch::CostSource::Jsonl,
+        }
+    }
+
+    /// Semeia um nó terminal com `cwd` na projeção (NodeAdded + TerminalSpawned) — o alvo da correlação.
+    fn seed_terminal_cwd(store: &Arc<Mutex<EventStore>>, node: NodeId, cli: &str, cwd: &str) {
+        let mut s = lock(store);
+        s.append(&DomainEvent::NodeAdded {
+            node,
+            kind: "Terminal".into(),
+            x: 0.0,
+            y: 0.0,
+            requested_by: None,
+        })
+        .expect("NodeAdded");
+        s.append(&DomainEvent::TerminalSpawned {
+            node,
+            cli: cli.into(),
+            cwd: Some(cwd.into()),
+        })
+        .expect("TerminalSpawned");
+    }
+
+    fn count_kind(store: &Arc<Mutex<EventStore>>, kind: &str) -> usize {
+        lock(store)
+            .events()
+            .expect("eventos")
+            .iter()
+            .filter(|r| r.kind == kind)
+            .count()
+    }
+
+    /// **Gate (a) — fiação da geração: 1 prompt observado ⇒ exatamente 1 `SessionPersisted`.** A sessão
+    /// do disco (mesmo `cwd` do nó) nasce o evento; re-chamar é idempotente (cache + `plan_persist`).
+    #[test]
+    fn persist_first_prompt_births_session_persisted_idempotent() {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let (mut pump, store, dir) = pump_for_test("persist", Arc::clone(&sessions));
+        let node = NodeId::from_u128(0x7e51);
+        seed_terminal_cwd(&store, node, "claude-code", "/proj/vendas");
+        // O `lina-session-watch` materializa o 1º prompt: uma sessão no MESMO cwd do nó.
+        *lock(&sessions) = vec![test_session("/proj/vendas", "sess-1", "claude-code")];
+
+        pump.persist_first_prompts(10_000);
+        assert_eq!(
+            count_kind(&store, "SessionPersisted"),
+            1,
+            "1 prompt observado ⇒ 1 SessionPersisted (a costura está LIGADA)"
+        );
+
+        // Idempotente: re-chamar (mesma sessão) não nasce outro evento.
+        pump.persist_first_prompts(20_000);
+        assert_eq!(
+            count_kind(&store, "SessionPersisted"),
+            1,
+            "mesma sessão ⇒ sem novo evento"
+        );
+
+        // A projeção do core lista a sessão salva do nó (o que o modal "Sessões salvas" consome).
+        let saved = ResumeSessionStore::replay(&lock(&store)).expect("replay");
+        assert_eq!(
+            saved
+                .active_for(&node.to_string())
+                .expect("sessão ativa")
+                .session_id,
+            "sess-1"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uma sessão da máquina SEM nó no Espaço (outro projeto) não nasce evento — o `cwd` não casa.
+    #[test]
+    fn session_without_node_does_not_persist() {
+        let sessions = Arc::new(Mutex::new(vec![test_session(
+            "/proj/orfa",
+            "sess-x",
+            "claude-code",
+        )]));
+        let (mut pump, store, dir) = pump_for_test("orfa", Arc::clone(&sessions));
+        pump.persist_first_prompts(10_000);
+        assert_eq!(
+            count_kind(&store, "SessionPersisted"),
+            0,
+            "sessão sem nó no Espaço ⇒ nada nasce"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Gate (d) — fiação da amostragem: o tick apenda `BufferOccupancySampled`.** A 1ª amostragem
+    /// emite (a DLQ é sempre lida); amostragens repetidas de MESMA ocupação NÃO inflam o log
+    /// (anti-amplificação A4 + cache delta do `prev` + throttle) — a defesa contra o freeze por replay/tick.
+    #[test]
+    fn sample_buffers_emits_then_does_not_amplify() {
+        let (mut pump, store, dir) = pump_for_test("buffers", Arc::new(Mutex::new(Vec::new())));
+        pump.sample_buffers(5_000);
+        let after_first = count_kind(&store, "BufferOccupancySampled");
+        assert!(
+            after_first >= 1,
+            "1ª amostragem emite ≥1 BufferOccupancySampled (a costura está LIGADA)"
+        );
+        // 50 "ticks" de mesma ocupação (well além do throttle): zero eventos novos — não infla o log.
+        for i in 1..=50 {
+            pump.sample_buffers(5_000 + i * BUFFER_SAMPLE_INTERVAL_MS * 2);
+        }
+        assert_eq!(
+            count_kind(&store, "BufferOccupancySampled"),
+            after_first,
+            "ocupação estável ⇒ zero eventos novos (anti-amplificação + delta, sem freeze)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anti-freeze do throttle: duas amostragens dentro de [`BUFFER_SAMPLE_INTERVAL_MS`] não reamostram
+    /// (a 2ª nem chega a ler I/O da mailbox) — o tick de 120ms não vira O(N)/tick.
+    #[test]
+    fn sample_buffers_throttles_within_interval() {
+        let (mut pump, store, dir) = pump_for_test("throttle", Arc::new(Mutex::new(Vec::new())));
+        pump.sample_buffers(5_000);
+        let baseline = count_kind(&store, "BufferOccupancySampled");
+        pump.sample_buffers(5_000 + BUFFER_SAMPLE_INTERVAL_MS / 2); // dentro do intervalo
+        assert_eq!(
+            count_kind(&store, "BufferOccupancySampled"),
+            baseline,
+            "dentro do throttle ⇒ sem reamostragem"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12925,5 +13855,209 @@ mod tests {
         // restaura o fallback p/ não vazar estado entre testes.
         set_cell_metrics(CELL_W, CELL_H);
         assert!((cell_w() - CELL_W).abs() < f32::EPSILON);
+    }
+
+    // ───────── F3-5-3 · conversas salvas (modal "Continuar uma conversa") ─────────
+
+    /// Helper: apenda um `SessionPersisted` (o 1º prompt observado) no log de teste.
+    fn seed_session(store: &Arc<Mutex<EventStore>>, node: NodeId, session_id: &str, ts: u64) {
+        lock(store)
+            .append(&DomainEvent::SessionPersisted {
+                node: node.to_string(),
+                cli: "claude-code".into(),
+                session_id: session_id.into(),
+                after_first_prompt: true,
+                first_prompt_at_ms: ts,
+                label: None,
+                persisted_at_ms: ts,
+            })
+            .expect("SessionPersisted");
+    }
+
+    /// **Gate (a)/(k) — a seção lista as conversas salvas, mais RECENTE primeiro, ENRIQUECIDAS
+    /// com nome/papel/pasta do nó; e o nó SEM 1º prompt NÃO aparece** (a projeção é o filtro).
+    #[test]
+    fn saved_sessions_lists_persisted_recent_first_and_hides_promptless() {
+        let (nm, store, _model) = test_manager("saved-list", None);
+        let antiga = NodeId::from_u128(101);
+        let recente = NodeId::from_u128(102);
+        let sem_prompt = NodeId::from_u128(103);
+        {
+            let mut s = lock(&store);
+            seed_terminal(
+                &mut s,
+                antiga,
+                0.0,
+                0.0,
+                "Página de vendas",
+                "designer",
+                "Claude Code",
+                Some("claude-code"),
+            );
+            seed_terminal(
+                &mut s,
+                recente,
+                0.0,
+                0.0,
+                "Revisor",
+                "qa",
+                "Claude Code",
+                Some("claude-code"),
+            );
+            // sem_prompt EXISTE no log (nó projetado) mas NUNCA teve sessão salva.
+            seed_terminal(
+                &mut s,
+                sem_prompt,
+                0.0,
+                0.0,
+                "Recém-criado",
+                "terminal",
+                "Claude Code",
+                Some("claude-code"),
+            );
+        }
+        seed_session(&store, antiga, "sess-antiga", 1_000);
+        seed_session(&store, recente, "sess-recente", 5_000);
+
+        let views = nm.saved_sessions();
+        assert_eq!(views.len(), 2, "só as conversas COM 1º prompt aparecem");
+        // Mais recente primeiro.
+        assert_eq!(views[0].display_name, "Revisor");
+        assert_eq!(views[0].session_id, "sess-recente");
+        assert_eq!(views[0].role.as_deref(), Some("qa"));
+        assert_eq!(
+            views[0].cwd.as_deref(),
+            Some("/tmp/proj"),
+            "pasta enriquecida do log"
+        );
+        assert_eq!(views[1].display_name, "Página de vendas");
+        assert_eq!(views[1].session_id, "sess-antiga");
+        assert!(
+            !views.iter().any(|v| v.display_name == "Recém-criado"),
+            "nó sem 1º prompt não aparece na lista"
+        );
+    }
+
+    /// O `label` da sessão (quando o watch o forneceu) VENCE o nome projetado do nó na tela.
+    #[test]
+    fn saved_session_label_wins_over_projected_name() {
+        let (nm, store, _model) = test_manager("saved-label", None);
+        let node = NodeId::from_u128(111);
+        {
+            let mut s = lock(&store);
+            seed_terminal(
+                &mut s,
+                node,
+                0.0,
+                0.0,
+                "Terminal C",
+                "terminal",
+                "Claude Code",
+                Some("claude-code"),
+            );
+        }
+        lock(&store)
+            .append(&DomainEvent::SessionPersisted {
+                node: node.to_string(),
+                cli: "claude-code".into(),
+                session_id: "sess-1".into(),
+                after_first_prompt: true,
+                first_prompt_at_ms: 2_000,
+                label: Some("Minha conversa de ontem".into()),
+                persisted_at_ms: 2_000,
+            })
+            .expect("SessionPersisted");
+        let views = nm.saved_sessions();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].display_name, "Minha conversa de ontem");
+    }
+
+    /// **Gate (k) — a admissão de resume (PURA) carrega o comando de religação no motor**
+    /// (`[program, args…, --resume, session_id]`), nome/papel do nó, e re-entra na pasta com
+    /// consentimento (espelha o restore). Comando vazio (motor sumiu) ⇒ `None` (a UI avisa).
+    #[test]
+    fn resume_admission_builds_engine_with_resume_command() {
+        let cmd = vec![
+            "claude".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--resume".to_string(),
+            "sess-abc".to_string(),
+        ];
+        let adm = NodeManager::resume_admission(
+            &cmd,
+            Some("claude-code".to_string()),
+            "Página de vendas".to_string(),
+            Some("designer".to_string()),
+            Some("/tmp/proj".to_string()),
+        )
+        .expect("comando não-vazio ⇒ admissão");
+        assert_eq!(adm.name.as_deref(), Some("Página de vendas"));
+        assert_eq!(adm.role, "designer");
+        let engine = adm.engine.expect("motor presente");
+        assert_eq!(engine.program, "claude");
+        assert_eq!(
+            engine.args,
+            vec!["--output-format", "stream-json", "--resume", "sess-abc"],
+            "o session_id exato viaja no comando — retoma AQUELA conversa, não 'a última da pasta'"
+        );
+        assert_eq!(engine.profile_id.as_deref(), Some("claude-code"));
+        match adm.cwd {
+            CwdPolicy::UserDir { path, consent } => {
+                assert_eq!(path, PathBuf::from("/tmp/proj"));
+                assert!(
+                    consent,
+                    "re-entrar na pasta da conversa não é consentimento novo"
+                );
+            }
+            other => panic!("esperava UserDir, veio {other:?}"),
+        }
+        assert!(
+            adm.requested_by.is_none(),
+            "retomar é gesto humano, não spawn"
+        );
+        // Comando vazio (motor indisponível) ⇒ sem admissão muda.
+        assert!(
+            NodeManager::resume_admission(&[], None, "x".into(), None, None).is_none(),
+            "sem comando ⇒ None (a UI avisa em vez de criar um agente mudo)"
+        );
+    }
+
+    /// **Gate (k) — `resume_session` passa pelo FUNIL ÚNICO (`admit_node`), sem bypass:** o nó
+    /// nasce no roster com o nome/papel da conversa. Comando vazio ⇒ `Err` leigo (não admite).
+    #[test]
+    fn resume_session_admits_through_funnel() {
+        let (nm, _store, model) = test_manager("resume-funnel", None);
+        // `cat` existe no ambiente de teste (mesma fábrica leve do test_manager); os args são
+        // ignorados pelo cat — o que importa é o nó NASCER pelo funil com a identidade certa.
+        let node = nm
+            .resume_session(
+                vec![
+                    "cat".to_string(),
+                    "--resume".to_string(),
+                    "sess-x".to_string(),
+                ],
+                Some("claude-code".to_string()),
+                "Conversa retomada".to_string(),
+                Some("backend".to_string()),
+                None,
+            )
+            .expect("retoma pelo funil");
+        let name = lock(&model)
+            .nodes
+            .get(&node)
+            .map(|v| v.name.clone())
+            .expect("nó no roster");
+        assert_eq!(
+            name, "Conversa retomada",
+            "o nó retomado entra no roster com o nome"
+        );
+        assert_eq!(nm.node_role(node).as_deref(), Some("backend"));
+        // Comando vazio ⇒ recusa leiga (motor da conversa indisponível).
+        assert!(
+            nm.resume_session(vec![], None, "x".into(), None, None)
+                .is_err(),
+            "sem comando ⇒ Err (a UI mostra aviso leigo)"
+        );
     }
 }
