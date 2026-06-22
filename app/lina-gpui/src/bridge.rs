@@ -39,6 +39,9 @@ use lina_core::{
 // aprendizado. Só CONSUMIDA aqui (seleção top-K + leitura de status); a política e a projeção
 // vivem em `lina-core::mentality` (dono: Terminal I).
 use lina_core::mentality::{Belief, BeliefStatus, Mentality, PromotionPolicy};
+// F3-5-3: a projeção das conversas `--resume` salvas (dono: Terminal B). Só CONSUMIDA aqui — a
+// regra de admissão/poda e o replay vivem no core; o app lista e religa pelo funil `admit_node`.
+use lina_core::resume_session::ResumeSessionStore;
 // A2A UNIVERSAL: o registry de TODOS os CLI Profiles — a entrega resolve o profile do ALVO
 // por aqui (CliProfile vem re-exportado do core; ProfileRegistry é o índice por `id`).
 use lina_cli_profiles::ProfileRegistry;
@@ -4021,6 +4024,28 @@ fn install_post_commit_hook(base_repo: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// **F3-5-3 — uma conversa salva pronta para o modal "Continuar uma conversa".** Projeção
+/// HUMANIZADA de [`ResumeSessionStore`] (a sessão `--resume` ativa de um nó) enriquecida com o
+/// nome/papel/pasta do nó ORIGINAL (da projeção do log): o leigo reconhece a conversa pelo nome,
+/// e o restore re-entra na MESMA pasta — onde o CLI guarda o histórico daquela conversa (sem isso
+/// `claude --resume <id>` não acha o arquivo da sessão). `session_id`/`cli` são DADO transportado
+/// (ADR 0022), nunca exibidos: viajam só dentro do comando de religação.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSessionView {
+    /// Id capturado do JSONL — DADO p/ o `--resume`, jamais autoridade nem texto de tela.
+    pub session_id: String,
+    /// `id` do CLI Profile de origem — resolve o motor (e seus `resume_args`) na religação.
+    pub cli: String,
+    /// Nome amigável: o rótulo da sessão; senão o nome projetado do nó; senão um genérico.
+    pub display_name: String,
+    /// Papel canônico do nó original (p/ o nó retomado renascer no mesmo papel).
+    pub role: Option<String>,
+    /// Pasta REAL do nó original — re-entrada na religação (onde mora o histórico da conversa).
+    pub cwd: Option<String>,
+    /// Carimbo da persistência — a tela ordena por ele (mais recente primeiro) e humaniza a idade.
+    pub persisted_at_ms: u64,
+}
+
 /// **Rodada 360 (ADR 0022 §1) — o PLANO de admissão**: a intenção "quero um terminal"
 /// normalizada. Os entry points são tradutores finos de intenção → este plano; quem o
 /// executa é SEMPRE o [`NodeManager::admit_node`]. Toda porta futura (API, CLI,
@@ -5150,6 +5175,113 @@ impl NodeManager {
             .project()
             .ok()
             .and_then(|st| st.nodes.get(&node).and_then(|n| n.cli.clone()))
+    }
+
+    /// **F3-5-3 — as conversas salvas e ATIVAS, prontas para o modal "Continuar uma conversa".**
+    /// Projeta o [`ResumeSessionStore`] do log (a sessão só nasce APÓS o 1º prompt — o critério
+    /// "sem prompt → não aparece" é garantido AQUI, na projeção, não na UI) e enriquece cada uma
+    /// com o nome/papel/pasta do nó original. Ordem: mais RECENTE primeiro (a candidata natural de
+    /// "continuar de onde parei"; o store entrega ASC por `persisted_at_ms` para o LRU — a tela
+    /// quer o inverso). Replay sob demanda: chamado só ao ABRIR a seção do modal, nunca por frame.
+    /// Falha de leitura degrada para vazio (a UI mostra o estado vazio honesto), nunca crasha.
+    #[must_use]
+    pub fn saved_sessions(&self) -> Vec<SavedSessionView> {
+        let store = lock(&self.store);
+        let sessions = match ResumeSessionStore::replay(&store) {
+            Ok(s) => s.sessions,
+            Err(e) => {
+                eprintln!("lina-gpui: F3-5-3 — leitura das conversas salvas falhou: {e}; lista vazia");
+                return Vec::new();
+            }
+        };
+        // Projeção do MESMO snapshot p/ resolver nome/papel/pasta de cada nó original; ausente
+        // (log ilegível) → degrada para os campos sem enriquecimento, nunca crasha.
+        let proj = store.project().ok();
+        drop(store);
+        let mut out: Vec<SavedSessionView> = sessions
+            .into_iter()
+            .map(|s| {
+                let info = proj.as_ref().and_then(|p| {
+                    s.node.parse::<NodeId>().ok().and_then(|id| p.nodes.get(&id))
+                });
+                let display_name = s
+                    .label
+                    .clone()
+                    .or_else(|| info.and_then(|n| n.name.clone()))
+                    .unwrap_or_else(|| "Conversa salva".to_string());
+                SavedSessionView {
+                    session_id: s.session_id,
+                    cli: s.cli,
+                    display_name,
+                    role: info.and_then(|n| n.role.clone()),
+                    cwd: info.and_then(|n| n.cwd.clone()),
+                    persisted_at_ms: s.persisted_at_ms,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.persisted_at_ms
+                .cmp(&a.persisted_at_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        out
+    }
+
+    /// **F3-5-3 — a admissão de uma conversa retomada (PURA, testável sem PTY).** Traduz a escolha
+    /// no modal em [`NodeAdmission`]: o `command` (`[program, args…, resume_args…, session_id]`,
+    /// montado pela view via `lina_core::resume_session::resume_command`) vira o motor; nome/papel
+    /// vêm do nó original; a pasta é re-entrada com `consent: true` (já consentida quando o nó
+    /// nasceu — espelha o restore F1-4-3, `restore_terminals`). `None` quando o comando está vazio
+    /// (motor da conversa indisponível) — a UI avisa em vez de admitir um agente mudo.
+    #[must_use]
+    fn resume_admission(
+        command: &[String],
+        profile_id: Option<String>,
+        name: String,
+        role: Option<String>,
+        cwd: Option<String>,
+    ) -> Option<NodeAdmission> {
+        let (program, args) = command.split_first()?;
+        Some(NodeAdmission {
+            name: Some(name.clone()),
+            role: role.unwrap_or_else(|| "terminal".to_string()),
+            engine: Some(AgentEngine {
+                program: program.clone(),
+                args: args.to_vec(),
+                profile_id: profile_id.clone(),
+                label: profile_id.unwrap_or(name),
+            }),
+            cwd: match cwd {
+                Some(p) => CwdPolicy::UserDir {
+                    path: PathBuf::from(p),
+                    consent: true,
+                },
+                None => CwdPolicy::Managed,
+            },
+            position: None,
+            requested_by: None, // retomar é gesto humano direto no modal (origem humana, não spawn)
+            autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
+        })
+    }
+
+    /// **F3-5-3 — retoma uma conversa salva pelo FUNIL ÚNICO (`admit_node`, sem bypass — ADR 0022).**
+    /// O novo nó nasce com o nome/papel/pasta da conversa anterior e roda o CLI com o verbo de
+    /// resume + o `session_id` EXATO → o CLI reabre AQUELA conversa (não "a última da pasta"). Não
+    /// revive o `NodeId` antigo: a identidade do nó segue `LINA_NODE_ID` (ADR 0026) — quem volta é a
+    /// CONVERSA, pelo `--resume`. Erro = comando vazio (motor indisponível) ou falha do funil.
+    pub fn resume_session(
+        &self,
+        command: Vec<String>,
+        profile_id: Option<String>,
+        name: String,
+        role: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<NodeId, String> {
+        let admission = Self::resume_admission(&command, profile_id, name, role, cwd).ok_or_else(
+            || "Esta conversa não pode ser retomada agora (o motor dela não está disponível).".to_string(),
+        )?;
+        self.admit_node(admission)
     }
 
     /// **F1-2-3 p2 (seam p/ o modal de papéis)** — persiste um papel CUSTOM do usuário:
@@ -12925,5 +13057,166 @@ mod tests {
         // restaura o fallback p/ não vazar estado entre testes.
         set_cell_metrics(CELL_W, CELL_H);
         assert!((cell_w() - CELL_W).abs() < f32::EPSILON);
+    }
+
+    // ───────── F3-5-3 · conversas salvas (modal "Continuar uma conversa") ─────────
+
+    /// Helper: apenda um `SessionPersisted` (o 1º prompt observado) no log de teste.
+    fn seed_session(store: &Arc<Mutex<EventStore>>, node: NodeId, session_id: &str, ts: u64) {
+        lock(store)
+            .append(&DomainEvent::SessionPersisted {
+                node: node.to_string(),
+                cli: "claude-code".into(),
+                session_id: session_id.into(),
+                after_first_prompt: true,
+                first_prompt_at_ms: ts,
+                label: None,
+                persisted_at_ms: ts,
+            })
+            .expect("SessionPersisted");
+    }
+
+    /// **Gate (a)/(k) — a seção lista as conversas salvas, mais RECENTE primeiro, ENRIQUECIDAS
+    /// com nome/papel/pasta do nó; e o nó SEM 1º prompt NÃO aparece** (a projeção é o filtro).
+    #[test]
+    fn saved_sessions_lists_persisted_recent_first_and_hides_promptless() {
+        let (nm, store, _model) = test_manager("saved-list", None);
+        let antiga = NodeId::from_u128(101);
+        let recente = NodeId::from_u128(102);
+        let sem_prompt = NodeId::from_u128(103);
+        {
+            let mut s = lock(&store);
+            seed_terminal(
+                &mut s, antiga, 0.0, 0.0, "Página de vendas", "designer", "Claude Code",
+                Some("claude-code"),
+            );
+            seed_terminal(
+                &mut s, recente, 0.0, 0.0, "Revisor", "qa", "Claude Code", Some("claude-code"),
+            );
+            // sem_prompt EXISTE no log (nó projetado) mas NUNCA teve sessão salva.
+            seed_terminal(
+                &mut s, sem_prompt, 0.0, 0.0, "Recém-criado", "terminal", "Claude Code",
+                Some("claude-code"),
+            );
+        }
+        seed_session(&store, antiga, "sess-antiga", 1_000);
+        seed_session(&store, recente, "sess-recente", 5_000);
+
+        let views = nm.saved_sessions();
+        assert_eq!(views.len(), 2, "só as conversas COM 1º prompt aparecem");
+        // Mais recente primeiro.
+        assert_eq!(views[0].display_name, "Revisor");
+        assert_eq!(views[0].session_id, "sess-recente");
+        assert_eq!(views[0].role.as_deref(), Some("qa"));
+        assert_eq!(views[0].cwd.as_deref(), Some("/tmp/proj"), "pasta enriquecida do log");
+        assert_eq!(views[1].display_name, "Página de vendas");
+        assert_eq!(views[1].session_id, "sess-antiga");
+        assert!(
+            !views.iter().any(|v| v.display_name == "Recém-criado"),
+            "nó sem 1º prompt não aparece na lista"
+        );
+    }
+
+    /// O `label` da sessão (quando o watch o forneceu) VENCE o nome projetado do nó na tela.
+    #[test]
+    fn saved_session_label_wins_over_projected_name() {
+        let (nm, store, _model) = test_manager("saved-label", None);
+        let node = NodeId::from_u128(111);
+        {
+            let mut s = lock(&store);
+            seed_terminal(
+                &mut s, node, 0.0, 0.0, "Terminal C", "terminal", "Claude Code",
+                Some("claude-code"),
+            );
+        }
+        lock(&store)
+            .append(&DomainEvent::SessionPersisted {
+                node: node.to_string(),
+                cli: "claude-code".into(),
+                session_id: "sess-1".into(),
+                after_first_prompt: true,
+                first_prompt_at_ms: 2_000,
+                label: Some("Minha conversa de ontem".into()),
+                persisted_at_ms: 2_000,
+            })
+            .expect("SessionPersisted");
+        let views = nm.saved_sessions();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].display_name, "Minha conversa de ontem");
+    }
+
+    /// **Gate (k) — a admissão de resume (PURA) carrega o comando de religação no motor**
+    /// (`[program, args…, --resume, session_id]`), nome/papel do nó, e re-entra na pasta com
+    /// consentimento (espelha o restore). Comando vazio (motor sumiu) ⇒ `None` (a UI avisa).
+    #[test]
+    fn resume_admission_builds_engine_with_resume_command() {
+        let cmd = vec![
+            "claude".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--resume".to_string(),
+            "sess-abc".to_string(),
+        ];
+        let adm = NodeManager::resume_admission(
+            &cmd,
+            Some("claude-code".to_string()),
+            "Página de vendas".to_string(),
+            Some("designer".to_string()),
+            Some("/tmp/proj".to_string()),
+        )
+        .expect("comando não-vazio ⇒ admissão");
+        assert_eq!(adm.name.as_deref(), Some("Página de vendas"));
+        assert_eq!(adm.role, "designer");
+        let engine = adm.engine.expect("motor presente");
+        assert_eq!(engine.program, "claude");
+        assert_eq!(
+            engine.args,
+            vec!["--output-format", "stream-json", "--resume", "sess-abc"],
+            "o session_id exato viaja no comando — retoma AQUELA conversa, não 'a última da pasta'"
+        );
+        assert_eq!(engine.profile_id.as_deref(), Some("claude-code"));
+        match adm.cwd {
+            CwdPolicy::UserDir { path, consent } => {
+                assert_eq!(path, PathBuf::from("/tmp/proj"));
+                assert!(consent, "re-entrar na pasta da conversa não é consentimento novo");
+            }
+            other => panic!("esperava UserDir, veio {other:?}"),
+        }
+        assert!(adm.requested_by.is_none(), "retomar é gesto humano, não spawn");
+        // Comando vazio (motor indisponível) ⇒ sem admissão muda.
+        assert!(
+            NodeManager::resume_admission(&[], None, "x".into(), None, None).is_none(),
+            "sem comando ⇒ None (a UI avisa em vez de criar um agente mudo)"
+        );
+    }
+
+    /// **Gate (k) — `resume_session` passa pelo FUNIL ÚNICO (`admit_node`), sem bypass:** o nó
+    /// nasce no roster com o nome/papel da conversa. Comando vazio ⇒ `Err` leigo (não admite).
+    #[test]
+    fn resume_session_admits_through_funnel() {
+        let (nm, _store, model) = test_manager("resume-funnel", None);
+        // `cat` existe no ambiente de teste (mesma fábrica leve do test_manager); os args são
+        // ignorados pelo cat — o que importa é o nó NASCER pelo funil com a identidade certa.
+        let node = nm
+            .resume_session(
+                vec!["cat".to_string(), "--resume".to_string(), "sess-x".to_string()],
+                Some("claude-code".to_string()),
+                "Conversa retomada".to_string(),
+                Some("backend".to_string()),
+                None,
+            )
+            .expect("retoma pelo funil");
+        let name = lock(&model)
+            .nodes
+            .get(&node)
+            .map(|v| v.name.clone())
+            .expect("nó no roster");
+        assert_eq!(name, "Conversa retomada", "o nó retomado entra no roster com o nome");
+        assert_eq!(nm.node_role(node).as_deref(), Some("backend"));
+        // Comando vazio ⇒ recusa leiga (motor da conversa indisponível).
+        assert!(
+            nm.resume_session(vec![], None, "x".into(), None, None).is_err(),
+            "sem comando ⇒ Err (a UI mostra aviso leigo)"
+        );
     }
 }
