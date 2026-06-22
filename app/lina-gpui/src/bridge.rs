@@ -49,6 +49,13 @@ use lina_core::resume_session::{ResumeSessionStore, DEFAULT_SESSION_STORE_MAX_EN
 use lina_core::buffer_registry::{
     self, BufferRegistry, GaugeReading, GaugeSnapshot, GAUGE_WARN_RATIO,
 };
+// F3-5-8 (frente DISCO, dono Terminal M): o app CHAMA a camada pura (probe periódico + evaluate) no
+// tick e a execução custodiada (run_disk_reclaim) no BrokerPump — fechando o critério (e) do ENOSPC #25.
+// A poda real só roda após o gesto humano; o probe é leitura (sysinfo/stat), não toca o event log.
+use lina_core::disk_budget::{
+    classify, evaluate, human_bytes, run_disk_reclaim, scan_candidate, DiskBudget, DiskPressure,
+    DiskProbe, DiskReclaimOutcome, DiskSnapshot, OsDiskProbe, DISK_PROBE_SECS,
+};
 // F3-5-1: o snapshot de sessões `--resume` observadas no disco (global da máquina) — correlacionado
 // por `cwd` ao nó do Espaço para nascer o `SessionPersisted`.
 use lina_session_watch::Session;
@@ -781,12 +788,21 @@ pub struct MailboxPump {
     /// F3-5-7: `now_ms` da última amostragem de buffers. `mailbox.gauge_readings()` faz I/O (lista o
     /// outbox) — throttlar ao [`BUFFER_SAMPLE_INTERVAL_MS`] mantém o medidor barato no tick de 120ms.
     last_buffer_sample_ms: u64,
+    /// F3-5-8: `now_ms` do último probe de disco. O probe roda no tick de 120ms mas só vale a cada
+    /// [`DISK_PROBE_SECS`] (300s) — disco enche devagar; varrer o FS por tick seria desperdício (e a
+    /// varredura de candidatos é pesada). Par do `last_buffer_sample_ms`.
+    last_disk_probe_ms: u64,
+    /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
+    /// `buffer_gauge`): só (re)apenda `DiskPressureSignaled` quando o nível MUDA, nunca a cada probe.
+    last_disk_pressure: Option<DiskPressure>,
 }
 
 /// F3-5-1: passo do throttle do `project` de correlação sessão↔nó (anti-freeze; ver `sessions`).
 const SESSION_SCAN_INTERVAL_MS: u64 = 2_000;
 /// F3-5-7: passo do throttle da amostragem de buffers (o `gauge_readings` da mailbox faz I/O).
 const BUFFER_SAMPLE_INTERVAL_MS: u64 = 1_000;
+/// F3-5-8: passo do throttle do probe de disco — [`DISK_PROBE_SECS`] (300s) em ms (anti-freeze).
+const DISK_PROBE_INTERVAL_MS: u64 = DISK_PROBE_SECS * 1_000;
 
 /// SEAM-1: detalhes INFORJÁVEIS de um pedido de spawn (do `SpawnRequested`), usados por
 /// `post_process_spawns` p/ fiar o binding de cascata (M4) + o 1º prompt.
@@ -936,6 +952,8 @@ impl MailboxPump {
             last_session_scan_ms: 0,
             buffer_gauge,
             last_buffer_sample_ms: 0,
+            last_disk_probe_ms: 0,
+            last_disk_pressure: None,
         }
     }
 
@@ -1249,6 +1267,8 @@ impl MailboxPump {
         self.persist_first_prompts(now_ms());
         // F3-5-7: amostra a ocupação dos buffers (anti-amplificação + cache delta do prev; throttle I/O).
         self.sample_buffers(now_ms());
+        // F3-5-8: detecta pressão de disco (ENOSPC #25) e PROPÕE poda custodiada (throttle 300s).
+        self.probe_disk(now_ms());
     }
 
     /// **F3-5-1 (fiação da GERAÇÃO): nasce o `SessionPersisted` do 1º prompt de cada nó.** Correlaciona
@@ -1350,6 +1370,82 @@ impl MailboxPump {
                 continue;
             }
             apply_gauge_event(&mut self.buffer_gauge, ev);
+        }
+    }
+
+    /// **F3-5-8 (fiação do PROBE): detecta pressão de disco e PROPÕE poda custodiada (ENOSPC #25).**
+    /// Lê o uso do volume do workspace (leve, `sysinfo`), classifica e — só em `critical` — varre os
+    /// candidatos (`target/` do cargo, scrollback DB, DLQ) e PROPÕE a poda via [`evaluate`]
+    /// (`DiskPressureSignaled` + `DiskReclaimProposed`). NUNCA apaga: a poda é custodiada no BrokerPump
+    /// (gate humano). Sem isto a frente de disco ficaria inerte no app vivo (gate (e) morto).
+    ///
+    /// Anti-freeze (espelha `sample_buffers`): throttle a [`DISK_PROBE_INTERVAL_MS`] (300s — disco
+    /// enche devagar); a varredura PESADA do FS só em `critical`; anti-amplificação por
+    /// [`Self::last_disk_pressure`] (só sinaliza ao MUDAR de nível). O probe é LEITURA — não dispara
+    /// `permission_prompt` (achado #36); a execução destrutiva é do broker custodiado.
+    fn probe_disk(&mut self, now_ms: u64) {
+        self.probe_disk_with(&OsDiskProbe, now_ms);
+    }
+
+    /// Núcleo testável do probe — o [`DiskProbe`] é INJETADO (`OsDiskProbe` em produção; simulado no
+    /// teste, sem tocar o FS real, lição #36). Throttle + anti-amplificação vivem aqui.
+    fn probe_disk_with(&mut self, probe: &impl DiskProbe, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_disk_probe_ms) < DISK_PROBE_INTERVAL_MS {
+            return;
+        }
+        self.last_disk_probe_ms = now_ms;
+        // ws_root = pai de `<ws_root>/.lina` (a raiz da mailbox do router). Sem pai → sem probe.
+        let Some(ws_root) = self
+            .router
+            .mailbox()
+            .root()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return;
+        };
+        let (used, total) = match probe.volume_usage(&ws_root) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("lina-gpui: probe de disco não leu o volume ({e})");
+                return;
+            }
+        };
+        let (_pct, pressure) = classify(used, total);
+        // Anti-amplificação (espelha o cache delta do buffer_gauge): só (re)sinaliza ao MUDAR de nível.
+        if self.last_disk_pressure == Some(pressure) {
+            return;
+        }
+        // A varredura dos candidatos toca o FS (pesada) — só vale em `critical`, onde a proposta nasce.
+        let candidate_dirs = [
+            (ws_root.join("target"), "cargo_target"),
+            (
+                ws_root.join(".lina").join("scrollback.db"),
+                "old_scrollback_db",
+            ),
+            (ws_root.join(".lina").join("dead-letter"), "dlq_archive"),
+        ];
+        let candidates = if pressure == DiskPressure::Critical {
+            candidate_dirs
+                .iter()
+                .filter_map(|(path, kind)| scan_candidate(probe, path, kind))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let snapshot = DiskSnapshot {
+            path: "workspace_target".to_string(),
+            used_bytes: used,
+            total_bytes: total,
+            candidates,
+        };
+        let mut store = lock(&self.store);
+        match evaluate(&snapshot, now_ms, &mut store) {
+            Ok(_) => {
+                drop(store);
+                self.last_disk_pressure = Some(pressure);
+            }
+            Err(e) => eprintln!("lina-gpui: avaliação de disco falhou ({e})"),
         }
     }
 
@@ -1554,6 +1650,15 @@ pub enum PendingGate {
         requester: String,
         display: String,
     },
+    /// `disk.reclaim` (F3-5-8, ADR 0043) — poda de disco IRREVERSÍVEL. Os `candidate_paths` vêm da
+    /// PROPOSTA pendente no log (`DiskReclaimProposed`), nunca do payload do agente — só o gesto humano
+    /// dispara a poda (zero `DiskReclaimExecuted` sem confirm).
+    DiskReclaim {
+        id: String,
+        requester: String,
+        display: String,
+        candidate_paths: Vec<String>,
+    },
 }
 
 impl PendingGate {
@@ -1561,21 +1666,25 @@ impl PendingGate {
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
-            Self::Custody { id, .. } | Self::Resume { id, .. } => id,
+            Self::Custody { id, .. } | Self::Resume { id, .. } | Self::DiskReclaim { id, .. } => id,
         }
     }
     /// Texto legível do banner.
     #[must_use]
     pub fn display(&self) -> &str {
         match self {
-            Self::Custody { display, .. } | Self::Resume { display, .. } => display,
+            Self::Custody { display, .. }
+            | Self::Resume { display, .. }
+            | Self::DiskReclaim { display, .. } => display,
         }
     }
     /// Origem AUTENTICADA (dir-dono). Exposto para teste/observabilidade do gate.
     #[must_use]
     pub fn requester(&self) -> &str {
         match self {
-            Self::Custody { requester, .. } | Self::Resume { requester, .. } => requester,
+            Self::Custody { requester, .. }
+            | Self::Resume { requester, .. }
+            | Self::DiskReclaim { requester, .. } => requester,
         }
     }
 }
@@ -1953,6 +2062,7 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         match m.intent.as_str() {
             "broker.do" => self.enqueue_custody(m),
             "resume.request" => self.enqueue_resume(m),
+            "disk.reclaim" => self.enqueue_disk_reclaim(m),
             other => eprintln!(
                 "lina-gpui: intent {other:?} desconhecido na fila de broker (msg {}) — ignorado",
                 m.id
@@ -2034,6 +2144,61 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         );
     }
 
+    /// **F3-5-8: enfileira a poda de disco no gate humano.** Os `candidate_paths` vêm da PROPOSTA
+    /// pendente no log (`DiskReclaimProposed`, projeção [`DiskBudget`]) — NUNCA do payload do agente
+    /// (um `from` forjável não escolhe o que apagar; a doutrina ADR 0021 §5/0043). `run_disk_reclaim`
+    /// com `confirmed=false` registra o gate (`ActionGated{ask}` + `BrokerDenied{unconfirmed}`) sem
+    /// apagar nada; a execução só ocorre após o gesto humano (⌘⏎) em [`Self::execute_disk_reclaim`].
+    fn enqueue_disk_reclaim(&mut self, m: &MailMessage) {
+        let candidate_paths: Vec<String> = {
+            let store = lock(&self.store);
+            let records = match store.events() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("lina-gpui: disk.reclaim nao leu o log ({e}) — ignorado");
+                    return;
+                }
+            };
+            DiskBudget::replay(&records)
+                .pending_proposal()
+                .map(|p| p.candidates.iter().map(|c| c.path.clone()).collect())
+                .unwrap_or_default()
+        };
+        if candidate_paths.is_empty() {
+            eprintln!(
+                "lina-gpui: disk.reclaim sem proposta pendente (msg {}) — ignorado",
+                m.id
+            );
+            return;
+        }
+        // Registra o gate SEM apagar (espelha `enqueue_custody`→`run_custody(false)`): ActionGated{ask}
+        // + BrokerDenied{unconfirmed}. O closure nunca roda com `confirmed=false`.
+        {
+            let mut store = lock(&self.store);
+            if let Err(e) =
+                run_disk_reclaim(&candidate_paths, &m.from, false, &mut store, |_| Ok(0))
+            {
+                eprintln!("lina-gpui: disk.reclaim nao registrou o gate ({e}) — ignorado");
+                return;
+            }
+        }
+        let pend = PendingGate::DiskReclaim {
+            id: m.id.clone(),
+            requester: m.from.clone(), // AUTENTICADA (dir-dono), nunca o `from` de conteúdo
+            display: format!(
+                "🧹 LIMPEZA de disco proposta ({} caminho(s)) — ⌘⏎ aprova · ⌘⇧⏎ recusa (apaga DE VERDADE)",
+                candidate_paths.len()
+            ),
+            candidate_paths,
+        };
+        lock(&self.desk).queue.push_back(pend);
+        lock(&self.model).touch();
+        eprintln!(
+            "lina-gpui: DISK.RECLAIM — poda proposta na fila do gate humano (⌘⏎). msg {}",
+            m.id
+        );
+    }
+
     /// O humano confirmou (`id`): tira a FRENTE da fila (se casar o id) e executa conforme o tipo —
     /// custódia (segredo do cofre + marcador) ou retomada (CostCeilingResumed se pausado).
     fn execute_confirmed(&mut self, id: &str) {
@@ -2064,6 +2229,11 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
                 ..
             } => self.execute_custody(&action, &secret_key, &requester),
             PendingGate::Resume { requester, .. } => self.execute_resume(&requester),
+            PendingGate::DiskReclaim {
+                candidate_paths,
+                requester,
+                ..
+            } => self.execute_disk_reclaim(&candidate_paths, &requester),
         };
         eprintln!("lina-gpui: GATE — {banner}");
         {
@@ -2126,6 +2296,55 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             Err(e) => format!("⛔ retomada falhou ao apendar CostCeilingResumed: {e}"),
         }
     }
+
+    /// **F3-5-8: executa a poda confirmada (a porta IRREVERSÍVEL).** `run_disk_reclaim(confirmed=true)`
+    /// → `DiskReclaimApproved` → o executor apaga os caminhos APROVADOS (medindo os bytes) →
+    /// `DiskReclaimExecuted`. Só o gate humano (⌘⏎) chega aqui; `approved_by` é exibição, a autoridade
+    /// foi o gesto (ADR 0043). O executor [`reclaim_paths`] é o ÚNICO ponto que toca o disco (achado #36).
+    fn execute_disk_reclaim(&self, candidate_paths: &[String], requester: &str) -> String {
+        let outcome = {
+            let mut store = lock(&self.store);
+            run_disk_reclaim(candidate_paths, requester, true, &mut store, reclaim_paths)
+        };
+        match outcome {
+            Ok(DiskReclaimOutcome::Executed { reclaimed_bytes }) => format!(
+                "✅ disco limpo (gate humano) a pedido de {requester} — {} liberados",
+                human_bytes(reclaimed_bytes)
+            ),
+            Ok(DiskReclaimOutcome::DeniedUnconfirmed) => {
+                "⛔ poda sem confirmacao — nada apagado".to_string()
+            }
+            Err(e) => format!("⛔ poda de disco falhou na execucao: {e}"),
+        }
+    }
+}
+
+/// F3-5-8: a poda REAL (o executor injetado em [`run_disk_reclaim`]) — o ÚNICO ponto que toca o disco.
+/// Mede os bytes de cada caminho APROVADO, apaga (diretório ou arquivo) e soma o recuperado. Caminho
+/// ausente é pulado (já liberado). Fora do core (achado #36: a operação destrutiva não mora na camada
+/// pura); só roda atrás do gesto humano (`confirmed=true` em `run_disk_reclaim`).
+fn reclaim_paths(paths: &[String]) -> Result<u64, String> {
+    let probe = OsDiskProbe;
+    let mut reclaimed = 0u64;
+    for raw in paths {
+        let path = std::path::Path::new(raw);
+        if !path.exists() {
+            continue;
+        }
+        let bytes = if path.is_dir() {
+            probe.dir_size(path)
+        } else {
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+        };
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        result.map_err(|e| format!("apagar {}: {e}", path.display()))?;
+        reclaimed = reclaimed.saturating_add(bytes);
+    }
+    Ok(reclaimed)
 }
 
 // ════════════════════ F1-1-7 · fiação da FILA DE ATENÇÃO (AttentionQueue ↔ app) ════════════════════
@@ -8450,7 +8669,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── F3-5 (fiação das costuras no app): persist do 1º prompt + amostragem de buffers ──────────
+    // ── F3-5 (fiação das costuras no app): persist do 1º prompt + buffers + DISCO ────────────────
+
+    /// Sonda de disco SIMULADA — `used/total` injetados; `dir_size` > 0 só para o `target/` (mesmo
+    /// padrão do `MockProbe` do core). Prova a costura sem tocar o FS real (lição #36).
+    struct MockDiskProbe {
+        used: u64,
+        total: u64,
+    }
+    impl DiskProbe for MockDiskProbe {
+        fn volume_usage(&self, _path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+            Ok((self.used, self.total))
+        }
+        fn dir_size(&self, path: &std::path::Path) -> u64 {
+            if path.ends_with("target") {
+                30_000_000_000
+            } else {
+                0
+            }
+        }
+    }
+
+    /// **Gate (e) — probe a 96% nasce `DiskPressureSignaled{critical}` + `DiskReclaimProposed`.** O
+    /// disco simulado cruza crítico no tick → sinaliza a pressão e PROPÕE a poda (há candidato: o
+    /// `target/`); o probe NUNCA apaga (gate (e) VIVO, não só nos testes do core).
+    #[test]
+    fn probe_disk_critical_signals_and_proposes() {
+        let (mut pump, store, dir) = pump_for_test("disk-probe", Arc::new(Mutex::new(Vec::new())));
+        pump.probe_disk_with(
+            &MockDiskProbe {
+                used: 96,
+                total: 100,
+            },
+            600_000,
+        );
+        assert_eq!(
+            count_kind(&store, "DiskPressureSignaled"),
+            1,
+            "um sinal de pressão"
+        );
+        let critical = lock(&store).events().expect("ev").iter().any(|r| {
+            r.kind == "DiskPressureSignaled"
+                && r.payload.get("threshold_crossed").and_then(|v| v.as_str()) == Some("critical")
+        });
+        assert!(critical, "threshold critical a 96%");
+        assert_eq!(
+            count_kind(&store, "DiskReclaimProposed"),
+            1,
+            "propõe a poda (há candidato target)"
+        );
+        assert_eq!(
+            count_kind(&store, "DiskReclaimExecuted"),
+            0,
+            "o probe NUNCA apaga (proposta ≠ execução)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anti-freeze: re-sinalizar o MESMO nível não re-emite (anti-amplificação por `last_disk_pressure`),
+    /// e dentro do intervalo de throttle não há novo probe — o tick de 120ms não vira O(N)/tick.
+    #[test]
+    fn probe_disk_anti_amplifies_and_throttles() {
+        let (mut pump, store, dir) =
+            pump_for_test("disk-throttle", Arc::new(Mutex::new(Vec::new())));
+        let probe = MockDiskProbe {
+            used: 96,
+            total: 100,
+        };
+        pump.probe_disk_with(&probe, 600_000);
+        let after_first = count_kind(&store, "DiskPressureSignaled");
+        // Throttle: dentro do intervalo (< 300s) → sem novo probe.
+        pump.probe_disk_with(&probe, 600_000 + 1_000);
+        assert_eq!(
+            count_kind(&store, "DiskPressureSignaled"),
+            after_first,
+            "throttle barra o re-probe"
+        );
+        // Além do throttle, MESMO nível (critical) → anti-amplificação barra.
+        pump.probe_disk_with(&probe, 600_000 + DISK_PROBE_INTERVAL_MS + 1);
+        assert_eq!(
+            count_kind(&store, "DiskPressureSignaled"),
+            after_first,
+            "mesmo nível ⇒ sem novo sinal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Semeia uma `DiskReclaimProposed` no `store` apontando para `path` — via `evaluate` +
+    /// `scan_candidate` (que produz o `ReclaimCandidate` sem nomeá-lo; o tipo não é re-exportado do core).
+    fn seed_disk_proposal(store: &Arc<Mutex<EventStore>>, path: &std::path::Path) {
+        struct FixedBytesProbe;
+        impl DiskProbe for FixedBytesProbe {
+            fn volume_usage(&self, _: &std::path::Path) -> std::io::Result<(u64, u64)> {
+                Ok((96, 100))
+            }
+            fn dir_size(&self, _: &std::path::Path) -> u64 {
+                4096
+            }
+        }
+        let candidates = std::iter::once((path, "cargo_target"))
+            .filter_map(|(p, k)| scan_candidate(&FixedBytesProbe, p, k))
+            .collect();
+        let snapshot = DiskSnapshot {
+            path: "workspace_target".to_string(),
+            used_bytes: 96,
+            total_bytes: 100,
+            candidates,
+        };
+        let mut s = lock(store);
+        evaluate(&snapshot, 1, &mut s).expect("semear proposta de poda");
+    }
+
+    /// **Gate (e) — disk.reclaim no BrokerPump: custódia → `Executed` SÓ após confirm.** A proposta no
+    /// log dá os caminhos (não o payload); sem gesto humano ZERO poda; com ⌘⏎ → `DiskReclaimExecuted`
+    /// e o alvo (tmpdir isolado) é apagado. Prova a porta IRREVERSÍVEL sob gate humano (ADR 0043).
+    #[test]
+    fn disk_reclaim_custody_executes_only_after_confirm() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-diskreclaim-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let broker_root = base.join("broker");
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("abrir store"),
+        ));
+        // Um alvo de poda REAL mas ISOLADO (tmpdir de teste) — apagá-lo é seguro (não é o target real).
+        let victim = base.join("reclaim-victim");
+        std::fs::create_dir_all(&victim).expect("mkdir victim");
+        std::fs::write(victim.join("big.bin"), vec![0u8; 4096]).expect("arquivo alvo");
+        // Proposta pendente no log: a FONTE dos caminhos que enqueue_disk_reclaim materializa.
+        seed_disk_proposal(&store, &victim);
+        let broker_mb = Mailbox::new(&broker_root);
+        broker_mb
+            .enqueue_as(
+                "@Dev",
+                &MailMessage::new("@Dev", "broker", "disk.reclaim", ""),
+            )
+            .expect("enqueue_as @Dev");
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            Arc::clone(&model),
+            sup_with_nodes(&["@Dev"]),
+        );
+        let kinds = |s: &Arc<Mutex<EventStore>>| {
+            lock(s)
+                .events()
+                .expect("ev")
+                .into_iter()
+                .map(|r| r.kind)
+                .collect::<Vec<_>>()
+        };
+
+        // (1) tick: enqueue_disk_reclaim → ActionGated{ask}+BrokerDenied, PendingGate, ZERO Executed.
+        pump.tick();
+        let pend_id = {
+            let d = lock(&desk);
+            let p = d.front().expect("pendente disk.reclaim na frente");
+            assert!(
+                matches!(p, PendingGate::DiskReclaim { .. }),
+                "pendência é DiskReclaim"
+            );
+            assert_eq!(p.requester(), "@Dev", "origem autenticada");
+            p.id().to_string()
+        };
+        assert!(kinds(&store).contains(&"ActionGated".to_string()));
+        assert!(kinds(&store).contains(&"BrokerDenied".to_string()));
+        assert!(
+            !kinds(&store).contains(&"DiskReclaimExecuted".to_string()),
+            "sem confirmação NUNCA apaga"
+        );
+        assert!(victim.exists(), "o alvo segue intacto sem o gesto humano");
+
+        // (2) gesto humano (⌘⏎) → 2º tick executa a poda real (do tmpdir isolado).
+        lock(&desk).confirm_requested = Some(pend_id);
+        pump.tick();
+        assert!(
+            kinds(&store).contains(&"DiskReclaimExecuted".to_string()),
+            "após confirmação, a poda executa"
+        );
+        let executed_bytes = lock(&store)
+            .events()
+            .expect("ev")
+            .iter()
+            .find(|r| r.kind == "DiskReclaimExecuted")
+            .and_then(|r| r.payload.get("reclaimed_bytes").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        assert!(executed_bytes > 0, "bytes recuperados > 0");
+        assert!(!victim.exists(), "o alvo foi podado (gate humano)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Um `MailboxPump` mínimo (sem PTY) para exercitar as costuras F3-5 — store/sessions injetáveis.
     fn pump_for_test(
