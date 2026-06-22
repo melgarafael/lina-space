@@ -1373,6 +1373,24 @@ pub enum DomainEvent {
         #[serde(default)]
         label: Option<String>,
     },
+    // ───────── Rito de paradigma (spec-mestre 50, Meadows [2]; épico 39 §IV) ─────────
+    /// Registro AUDITÁVEL do rito de red-team de paradigma ao FECHAR uma fase (ADR 0044).
+    /// Aplica o invariante #4 ("o event log é a fonte") ao META-PROCESSO: a auto-crítica do
+    /// paradigma vira FATO no log, não só um `.md`. Variante nova (campos obrigatórios sem
+    /// `serde(default)`; `adr_ref` opcional). META — no-op no `apply` (auditoria por replay
+    /// externo). Emissão = verbo `lina paradigm` futuro OU gesto do Maestro ao aceitar o ADR;
+    /// `verdict`/`invariant_challenged` são DADO, jamais autoridade.
+    ParadigmReviewed {
+        /// fase revisada (ex.: `"F3"`).
+        phase: String,
+        /// o que foi desafiado (ex.: `"7-invariantes"` ou o invariante específico).
+        invariant_challenged: String,
+        /// veredito do rito (ex.: `"sem-dogma; 3 impostos nomeados"`).
+        verdict: String,
+        /// ADR que registra o rito (ex.: `"0044"`).
+        #[serde(default)]
+        adr_ref: Option<String>,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -1507,6 +1525,8 @@ impl DomainEvent {
             DomainEvent::SkillSelected { .. } => "SkillSelected",
             DomainEvent::SkillFactoryProposed { .. } => "SkillFactoryProposed",
             DomainEvent::ClueSetDefined { .. } => "ClueSetDefined",
+            // Rito de paradigma (épico 39 §IV): registro auditável do red-team de fechamento de fase.
+            DomainEvent::ParadigmReviewed { .. } => "ParadigmReviewed",
         }
     }
 
@@ -1963,7 +1983,9 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::DiskReclaimExecuted { .. }
         | DomainEvent::SkillSelected { .. }
         | DomainEvent::SkillFactoryProposed { .. }
-        | DomainEvent::ClueSetDefined { .. } => {}
+        | DomainEvent::ClueSetDefined { .. }
+        // Rito de paradigma: registro de auditoria (META) — reconstruído por replay, não toca o canvas.
+        | DomainEvent::ParadigmReviewed { .. } => {}
     }
 }
 
@@ -4244,5 +4266,33 @@ mod tests {
             DomainEvent::WorkspaceArchived,
             "replay F0..F3-4 intacto após a largada F3-5"
         );
+    }
+
+    /// Rito de paradigma (épico 39 §IV, ADR 0044): `ParadigmReviewed` é META, faz round-trip serde
+    /// e é ADITIVO — payload sem `adr_ref` carrega (`None`). O rito que audita o #4 vira fato no log.
+    #[test]
+    fn paradigm_reviewed_is_additive_meta_and_roundtrips() {
+        let ev = DomainEvent::ParadigmReviewed {
+            phase: "F3".into(),
+            invariant_challenged: "7-invariantes".into(),
+            verdict: "sem-dogma; 3 impostos nomeados".into(),
+            adr_ref: Some("0044".into()),
+        };
+        assert_eq!(ev.kind(), "ParadigmReviewed");
+        let back: DomainEvent = serde_json::from_value(serde_json::to_value(&ev).unwrap()).unwrap();
+        assert_eq!(back, ev, "round-trip preserva os campos");
+        // META: não toca o canvas (auditoria por replay externo).
+        let mut state = ProjectedState::default();
+        let before = state.clone();
+        apply(&mut state, &ev);
+        assert_eq!(state, before, "ParadigmReviewed é META");
+        // ADITIVO: payload sem `adr_ref` → None.
+        let partial = serde_json::json!({
+            "event":"ParadigmReviewed","phase":"F4","invariant_challenged":"x","verdict":"y"
+        });
+        match serde_json::from_value::<DomainEvent>(partial).expect("parcial carrega") {
+            DomainEvent::ParadigmReviewed { adr_ref, .. } => assert_eq!(adr_ref, None),
+            other => panic!("variante errada: {other:?}"),
+        }
     }
 }
