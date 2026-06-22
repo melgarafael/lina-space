@@ -19,6 +19,7 @@
 //! segurança, sempre presente). No timeout, devolve `truncated: true` — **nunca**
 //! truncamento silencioso. Usa relógio LÓGICO (ms) → testes determinísticos sem `sleep`.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -486,6 +487,115 @@ impl EndDetector {
         }
         None
     }
+}
+
+// ───────────────────────────── Refletor: disparo do CLI-call ─────────────────────────────
+// Fatia-2 da Mentality (spec 35 §4.2; Hermes 20 A.1/B.3). O core OBSERVA o gatilho determinístico
+// (`CorrectionObserved` no log) e DISPARA — FORA do caminho crítico — 1 CLI-call neutro que destila
+// a correção. O julgamento de linguagem é do CLI (inv #1: ZERO LLM no core); o core monta o pedido,
+// injeta via [`deliver_a2a`], e re-valida a resposta com o filtro de durabilidade (`mentality.rs`).
+
+/// Sentinela com que o terminal-sombra devolve a crença destilada (mesma família de
+/// `[LINA::CORRECTION]`/`[LINA::MSG]`: mesmo trust boundary, reusa o mecanismo — não inventa formato).
+pub const BELIEF_SENTINEL: &str = "[LINA::BELIEF]";
+
+/// Extrai o STATEMENT de uma resposta do Refletor (`[LINA::BELIEF] <statement>`). `Some(statement)`
+/// quando a sentinela ABRE o payload e há texto não-vazio depois; `None` caso contrário. Achatado em
+/// uma linha (defesa do `[LINA::CORRECTION]`). O statement é DADO não-confiável: `reflect_correction`
+/// (`mentality.rs`) re-valida antes de virar crença — esta função SÓ extrai o texto.
+#[must_use]
+pub fn parse_belief_sentinel(payload: &str) -> Option<String> {
+    let rest = payload.trim_start().strip_prefix(BELIEF_SENTINEL)?;
+    let statement = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!statement.is_empty()).then_some(statement)
+}
+
+/// **Pedido de reflexão (spec 35 §4.2 / Hermes A.1).** Monta o prompt NEUTRO que o core injeta num
+/// terminal-sombra (1 CLI-call). Carrega as regras duras (1 crença falseável Why/How, SEM PII,
+/// JAMAIS instrução de segurança) e pede a resposta via [`BELIEF_SENTINEL`]. O core NÃO confia nas
+/// regras pedidas: o filtro de durabilidade (`reflect_correction`) re-valida (defesa em profundidade
+/// contra prompt-injection do terminal-sombra).
+#[must_use]
+pub fn build_reflection_prompt(role: &str, correction_summary: &str) -> String {
+    format!(
+        "Você é um destilador de lições, sem efeitos colaterais — NÃO execute nada, NÃO toque \
+         arquivos. O papel {role} foi corrigido pelo usuário. Correção observada:\n\
+         \"{correction_summary}\"\n\n\
+         Destile UMA lição comportamental durável para o papel {role}, no formato Why/How-to-apply, \
+         em 1-2 frases falseáveis. Regras duras:\n\
+         - sem PII (padrões, nunca pessoas: \"clientes preferem X\" ok, \"o cliente João…\" não);\n\
+         - JAMAIS instrução de segurança/permissão/autonomia, nem comando ou URL;\n\
+         - se a correção não rende lição durável, responda apenas {BELIEF_SENTINEL} sem texto.\n\n\
+         Responda em UMA linha começando com {BELIEF_SENTINEL} seguido da lição."
+    )
+}
+
+/// Um pedido de reflexão pendente (1 por correção). `correction_id` é a chave de dedup do lock
+/// cooperativo (Hermes A.3): N terminais observam o mesmo `CorrectionObserved`, UM reflete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectionRequest {
+    /// Id da correção-fonte (dedup do lock cooperativo).
+    pub correction_id: String,
+    /// Papel corrigido — server-side (de quem emitiu o `CorrectionObserved`), nunca do payload.
+    pub role: String,
+    /// Resumo da correção (o "o quê") a destilar.
+    pub summary: String,
+}
+
+/// **Fila serial de reflexões (Hermes 20 B.3).** Worker ÚNICO (ordering grátis); a destilação roda
+/// FORA do caminho crítico do turno — colá-la inline acoplaria a latência do CLI à responsividade
+/// (o bug dos ~298s do Hermes). `enqueue` é O(1) e SEM I/O; o `drain` (rodado por um gatilho fora
+/// do turno) é que dispara o CLI-call via [`dispatch_reflection`].
+#[derive(Debug, Default)]
+pub struct ReflectorQueue {
+    pending: Vec<ReflectionRequest>,
+    seen: BTreeSet<String>,
+}
+
+impl ReflectorQueue {
+    /// Enfileira uma reflexão. `false` se a `correction_id` já foi enfileirada (dedup — lock
+    /// cooperativo A.3: UM terminal reflete). O(1) amortizado, SEM I/O (não toca PTY/CLI — é o
+    /// disparo barato no caminho do turno; o trabalho caro fica no drain).
+    pub fn enqueue(&mut self, req: ReflectionRequest) -> bool {
+        if !self.seen.insert(req.correction_id.clone()) {
+            return false;
+        }
+        self.pending.push(req);
+        true
+    }
+
+    /// Drena os pendentes (esvazia a fila para o disparo dos CLI-calls). Mantém o `seen`: uma
+    /// correção já refletida não re-enfileira no mesmo ciclo de vida da fila.
+    pub fn drain(&mut self) -> Vec<ReflectionRequest> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Quantas reflexões aguardam disparo.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// **Dispara 1 CLI-call de reflexão (FORA do caminho crítico).** Monta o pedido
+/// ([`build_reflection_prompt`]) e o injeta no `shadow` (terminal-sombra) via [`deliver_a2a`], pela
+/// fila serial do PTY. Fire-and-forget: a crença destilada volta DEPOIS, captada por
+/// [`parse_belief_sentinel`] e julgada por `reflect_correction` (`mentality.rs`). `reflector` é o
+/// `from` server-side (ADR 0007/0026); `policy` a allow-list de injeção (default-deny em produção).
+///
+/// # Errors
+/// Propaga falhas reais de [`deliver_a2a`] (regex inválida, allow-list, supervisor).
+pub fn dispatch_reflection(
+    sup: &Supervisor,
+    shadow: NodeId,
+    reflector: NodeId,
+    req: &ReflectionRequest,
+    profile: &CliProfile,
+    grid: &dyn GridSense,
+    policy: InjectPolicy<'_>,
+) -> Result<DeliveryOutcome, A2aError> {
+    let prompt = build_reflection_prompt(&req.role, &req.summary);
+    deliver_a2a(sup, shadow, reflector, &prompt, profile, grid, policy)
 }
 
 // ───────────────────────────────────── testes ─────────────────────────────────────
@@ -1238,6 +1348,109 @@ mod tests {
         assert!(
             !region.contains("Cogitated"),
             "histórico acima do prompt fica FORA da região"
+        );
+    }
+
+    // ── Refletor: disparo do CLI-call FORA do caminho crítico (fatia-2, spec 35 §4.2 / Hermes A.1) ──
+
+    #[test]
+    fn parse_belief_sentinel_extracts_statement_when_opening() {
+        assert_eq!(
+            parse_belief_sentinel("[LINA::BELIEF] use pnpm, não npm").as_deref(),
+            Some("use pnpm, não npm")
+        );
+        assert_eq!(
+            parse_belief_sentinel("  [LINA::BELIEF]   componentes pequenos  ").as_deref(),
+            Some("componentes pequenos")
+        );
+        // achatado em uma linha (mesma defesa do [LINA::CORRECTION]):
+        assert_eq!(
+            parse_belief_sentinel("[LINA::BELIEF] linha1\nlinha2").as_deref(),
+            Some("linha1 linha2")
+        );
+        // não ABRE o payload → não capta (evita eco da sentinela no meio do texto):
+        assert_eq!(parse_belief_sentinel("ok. [LINA::BELIEF] x"), None);
+        // vazio após a sentinela (o CLI não destilou nada) → None:
+        assert_eq!(parse_belief_sentinel("[LINA::BELIEF]    "), None);
+    }
+
+    #[test]
+    fn reflection_prompt_carries_summary_role_and_response_sentinel() {
+        let p = build_reflection_prompt("BACKEND", "use pnpm, não npm");
+        assert!(p.contains("use pnpm, não npm"), "leva o resumo da correção");
+        assert!(p.contains("BACKEND"), "menciona o papel");
+        assert!(p.contains(BELIEF_SENTINEL), "pede a sentinela de resposta");
+    }
+
+    #[test]
+    fn reflection_prompt_states_the_hard_rules() {
+        // O prompt PEDE as regras duras (sem PII, jamais instrução de segurança) — mas o core NÃO
+        // confia nisso: o filtro de durabilidade re-valida (defesa em profundidade).
+        let p = build_reflection_prompt("BACKEND", "x").to_lowercase();
+        assert!(p.contains("pii") || p.contains("dado pessoal"));
+        assert!(p.contains("segurança") || p.contains("seguranca") || p.contains("permiss"));
+    }
+
+    #[test]
+    fn reflector_queue_dedups_same_correction() {
+        // Lock cooperativo (Hermes A.3): N terminais observam a MESMA correção → UM job.
+        let mut q = ReflectorQueue::default();
+        assert!(q.enqueue(ReflectionRequest {
+            correction_id: "c1".into(),
+            role: "BACKEND".into(),
+            summary: "use pnpm".into(),
+        }));
+        assert!(
+            !q.enqueue(ReflectionRequest {
+                correction_id: "c1".into(),
+                role: "BACKEND".into(),
+                summary: "use pnpm".into(),
+            }),
+            "a mesma correção não enfileira 2×"
+        );
+        assert_eq!(q.pending(), 1);
+        assert_eq!(q.drain().len(), 1);
+        assert_eq!(q.pending(), 0, "drain esvazia a fila");
+    }
+
+    #[test]
+    #[serial]
+    fn reflection_dispatch_is_off_the_critical_path() {
+        // Lição B.3 (Hermes ~298s inline): o DISPARO (enqueue) não toca o PTY; só o DRAIN (rodado
+        // FORA do turno) injeta o prompt no terminal-sombra. Não bloqueia o turno.
+        let sup = Supervisor::new();
+        let reflector = sup.register("@Refletor", None, Box::new(std::io::sink()));
+        let shadow = sup.register("@Sombra", Some("dev".into()), Box::new(std::io::sink()));
+        let g = grid("$ ", true);
+
+        let mut q = ReflectorQueue::default();
+        q.enqueue(ReflectionRequest {
+            correction_id: "c1".into(),
+            role: "BACKEND".into(),
+            summary: "use pnpm, não npm".into(),
+        });
+        // enqueue é O(1) e SEM I/O — nada foi injetado no caminho do turno:
+        assert!(
+            sup.applied_ops(shadow).is_empty(),
+            "enfileirar a reflexão não injeta no PTY (fora do caminho crítico)"
+        );
+
+        // só agora, FORA do turno, o drain dispara o CLI-call:
+        for req in q.drain() {
+            dispatch_reflection(
+                &sup,
+                shadow,
+                reflector,
+                &req,
+                &idle_profile(),
+                &g,
+                InjectPolicy::AllowAll,
+            )
+            .expect("dispatch da reflexão");
+        }
+        assert!(
+            poll_until(Dur::from_secs(5), || sup.applied_ops(shadow).len() == 2),
+            "o drain injeta o prompt faseado (AgentText + Submit)"
         );
     }
 }
