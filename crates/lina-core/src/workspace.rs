@@ -171,6 +171,60 @@ pub fn resolve_spawn_cwd(
     }
 }
 
+// ───────────────────────────── worktree por agente (spec 36 §1) ─────────────────────────────
+
+/// Decisão PURA do NOME da branch de worktree de um agente (spec 36 §1): `lina/<slug>`, com
+/// `<slug>` = o nome do agente reduzido a um refname git válido (minúsculas; cada corrida de
+/// caracteres não-alfanuméricos-ASCII vira um único `-`; sem `-` nas pontas). O app EXECUTA
+/// `git worktree add -b <branch>`; o core só decide o nome (inv#7, core git-free).
+///
+/// A unicidade da branch vem da unicidade do nome do agente no Espaço — nomes distintos geram
+/// branches distintas (base do aceite F3-4-1). Nome vazio / só-símbolos cai no fallback
+/// `lina/agente` (nunca um refname inválido como `lina/` ou `lina/.`).
+#[must_use]
+pub fn worktree_branch_name(agent_name: &str) -> String {
+    let mut slug = String::with_capacity(agent_name.len());
+    let mut pending_dash = false;
+    for c in agent_name.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(c.to_ascii_lowercase());
+        } else {
+            // Qualquer corrida de não-alfanuméricos-ASCII (espaço, `/`, `.`, acento, símbolo)
+            // colapsa em UM `-` — e só é materializada quando vier outro alfanumérico, então
+            // nunca sobra `-` nas pontas (refname inválido).
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() {
+        "lina/agente".to_string()
+    } else {
+        format!("lina/{slug}")
+    }
+}
+
+/// Path PURO da worktree de um agente: `<ws_root>/wt-<safe_key>` — irmão do dir gerenciado,
+/// ÚNICO por nó (a `node_key` é única por construção). Separadores embutidos na key são
+/// sanitizados (defesa em profundidade §7: um `..`/`/` na key nunca escapa da raiz do Espaço).
+/// O app cria a árvore aqui via `git worktree add`.
+#[must_use]
+pub fn worktree_path(ws_root: &Path, node_key: &str) -> PathBuf {
+    let safe_key: String = node_key
+        .chars()
+        .map(|c| {
+            if std::path::is_separator(c) || c == '\\' {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    ws_root.join(format!("wt-{safe_key}"))
+}
+
 // ───────────────────────────── o Espaço ─────────────────────────────
 
 /// Um Espaço ABERTO: raiz do projeto + seu event store (`<root>/.lina/events`).
@@ -494,4 +548,79 @@ pub fn default_registry_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|home| PathBuf::from(home).join(".lina").join("workspaces.json"))
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::{worktree_branch_name, worktree_path};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn branch_name_slugs_and_prefixes() {
+        assert_eq!(worktree_branch_name("Terminal A"), "lina/terminal-a");
+        assert_eq!(
+            worktree_branch_name("Carga 01 (burst)"),
+            "lina/carga-01-burst"
+        );
+    }
+
+    /// Base do aceite F3-4-1: dois nós no MESMO projeto recebem branches DIFERENTES.
+    #[test]
+    fn distinct_names_yield_distinct_branches() {
+        assert_ne!(
+            worktree_branch_name("Terminal A"),
+            worktree_branch_name("Terminal B")
+        );
+    }
+
+    /// `git check-ref-format` proíbe espaço, `~ ^ : ? * [ \`, `..`, e fim em `.`/`/`. O slug
+    /// nunca pode produzir um refname que o `git worktree add -b` recusaria.
+    #[test]
+    fn branch_name_is_a_valid_git_refname() {
+        for raw in [
+            "Terminal A",
+            "Carga 01 (burst)",
+            "feat/x..y",
+            "  ~weird^stuff~  ",
+            "UPPER",
+            "dot.",
+        ] {
+            let b = worktree_branch_name(raw);
+            assert!(b.starts_with("lina/"), "{b} sem prefixo");
+            assert!(!b.contains(".."), "{b} contém ..");
+            assert!(
+                !b.ends_with('.') && !b.ends_with('/') && !b.ends_with('-'),
+                "{b} termina mal"
+            );
+            for c in [' ', '~', '^', ':', '?', '*', '[', '\\', '\t'] {
+                assert!(!b.contains(c), "{b} contém char proibido {c:?}");
+            }
+        }
+    }
+
+    /// Nome vazio / só-símbolos → fallback não-vazio e válido (nunca `lina/` cru).
+    #[test]
+    fn branch_name_falls_back_on_empty_slug() {
+        assert_eq!(worktree_branch_name("***"), "lina/agente");
+        assert_eq!(worktree_branch_name(""), "lina/agente");
+    }
+
+    #[test]
+    fn path_is_under_ws_root_unique_per_key() {
+        let root = Path::new("/tmp/ws");
+        assert_eq!(
+            worktree_path(root, "n-abc"),
+            PathBuf::from("/tmp/ws/wt-n-abc")
+        );
+        assert_ne!(worktree_path(root, "n-abc"), worktree_path(root, "n-def"));
+    }
+
+    /// Defesa em profundidade §7: separador embutido na key vira `-`, nunca um componente que
+    /// escapa da raiz do Espaço.
+    #[test]
+    fn path_sanitizes_separators_in_key() {
+        let root = Path::new("/tmp/ws");
+        let p = worktree_path(root, "../evil");
+        assert!(p.starts_with(root), "{p:?} escapou da raiz");
+    }
 }
