@@ -87,8 +87,12 @@ pub fn is_goto_only(item: &AttentionItem) -> bool {
     // terminal (injeção remota não existe nesta fase). Permissão não-Yn (Choice/Trust) idem.
     // W3 (#22): DeliveredNoProgress é OBSERVABILIDADE — nunca aprovável (alerta + foco; o Maestro age
     // re-despachando, não com y/n). Reusa o caminho não-aprovável: a ação primária é olhar o terminal.
+    // F3-4-4: CodeConflict é "humano árbitro NO TERMINAL" (spec 36 §2) — o gesto é rebase/
+    // renegociar/desconflitar no fluxo de código, NUNCA um Aprovar/Recusar remoto. Goto-only
+    // (sem botões: o core nem o resolve — vive em `code_conflicts`, não em `permissions`).
     item.kind == AttentionKind::GuardAsk
         || item.kind == AttentionKind::DeliveredNoProgress
+        || item.kind == AttentionKind::CodeConflict
         || (item.kind == AttentionKind::Permission && item.prompt_kind != PromptKind::Yn)
 }
 
@@ -799,6 +803,9 @@ pub fn render_panel(
         let selo = if item.kind == AttentionKind::DeliveredNoProgress {
             // W3 (#22): aviso de monitoramento (recebeu, não começou) — nem custódia nem permissão.
             "aviso".to_string()
+        } else if item.kind == AttentionKind::CodeConflict {
+            // F3-4-4: conflito de código (um colega tocou arquivo reservado) — não é permissão.
+            "conflito".to_string()
         } else {
             match (is_custody, item.evidence) {
                 (true, _) => "custódia".to_string(),
@@ -851,8 +858,16 @@ pub fn render_panel(
                             .child(text!(age_label(item.created_ts, now_ms))),
                     ),
             );
-        // O comando/resumo exato em monospace (transparência: segurança pede o literal).
-        if let Some(detail) = &item.detail {
+        // O comando/resumo exato em monospace (transparência: segurança pede o literal). EXCEÇÃO
+        // F3-4-4: o `detail` do CodeConflict é técnico (paths/branch/"rebase" — vocabulário da spec
+        // 36 p/ o painel rico, deferido); ao leigo vaza jargão (inv #6), e o toast já dá a mensagem
+        // legível. Suprimido aqui até o painel rico traduzi-lo. (GuardAsk segue mostrando o cmd —
+        // ali o literal É a transparência de segurança que o usuário precisa ver antes de aprovar.)
+        if let Some(detail) = item
+            .detail
+            .as_ref()
+            .filter(|_| item.kind != AttentionKind::CodeConflict)
+        {
             row = row.child(
                 div()
                     .id(("att-detail", i64id))
@@ -1160,6 +1175,29 @@ mod tests {
         let mut c = item("c", "B", AttentionKind::Custody, 1);
         c.prompt_kind = PromptKind::Choice;
         assert!(!is_goto_only(&c));
+    }
+
+    /// F3-4-4: CodeConflict é goto-only (humano árbitro NO TERMINAL, spec 36 §2) — nunca um
+    /// Aprovar/Recusar remoto (seria botão morto: o core não o resolve, vive em `code_conflicts`).
+    /// E o toast é leigo: sem jargão de git (rebase/branch/merge/HEAD) e sem prometer aprovação.
+    #[test]
+    fn code_conflict_is_goto_only_and_leiga() {
+        let it = item("cc", "Terminal B", AttentionKind::CodeConflict, 1);
+        assert!(
+            is_goto_only(&it),
+            "conflito de código resolve NO TERMINAL, nunca por botão remoto"
+        );
+        let copy = toast_copy(&it);
+        for jargao in ["rebase", "branch", "merge", "head", "git"] {
+            assert!(
+                !copy.to_lowercase().contains(jargao),
+                "toast do conflito vaza jargão '{jargao}': {copy}"
+            );
+        }
+        assert!(
+            !copy.contains("Aprovar") && !copy.contains("⌘⏎"),
+            "conflito nunca promete aprovação remota: {copy}"
+        );
     }
 
     /// FIX-2: o ASK do guard é goto-only (alerta+foco; o y/n é respondido NO terminal) e a copy
