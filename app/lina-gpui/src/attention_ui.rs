@@ -131,6 +131,14 @@ pub fn toast_copy(item: &AttentionItem) -> String {
             "{} recebeu a tarefa e ainda não começou — vale dar uma olhada",
             item.node_id
         ),
+        // F3-4-4 (spec 36 §2): conflito de código — um colega tocou um arquivo que ESTE nó
+        // reservou (claim × paths do commit). Aviso honesto que pede direção; o gesto é no
+        // terminal (alinhar/desconflitar), nunca um y/n remoto. Copy leiga — o `detail` do core
+        // carrega o técnico (paths/branch) para o painel rico (deferido). Precedência guard-ask.
+        AttentionKind::CodeConflict => format!(
+            "{} tem um conflito de código — um colega mexeu num arquivo que ele reservou; vá até o terminal alinhar",
+            item.node_id
+        ),
         AttentionKind::Permission => match item.prompt_kind {
             PromptKind::Choice => format!(
                 "{} fez uma pergunta e aguarda sua escolha — vá até o terminal",
@@ -1036,7 +1044,9 @@ mod tests {
                 AttentionKind::Custody | AttentionKind::Spawn => AttentionEvidence::Custody,
                 AttentionKind::Permission | AttentionKind::GuardAsk => AttentionEvidence::Hook,
                 // Espelha a projeção real do core (estrutural, derivado do log — não heurístico).
-                AttentionKind::DeliveredNoProgress => AttentionEvidence::Hook,
+                AttentionKind::DeliveredNoProgress | AttentionKind::CodeConflict => {
+                    AttentionEvidence::Hook
+                }
             },
             created_ts: ts,
             state: AttentionState::Pending,
