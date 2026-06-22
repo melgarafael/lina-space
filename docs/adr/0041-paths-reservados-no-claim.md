@@ -11,7 +11,7 @@
 
 A spec 36 §2 manda: ao chegar um `CodeChanged{paths}`, cada nó compara `paths` **× claims** — sem interseção ignora; com interseção PARA e pede direção. O problema: **o claim hoje reserva apenas o ID do item**, nunca QUAIS arquivos. O `PlanItem` (`plan.rs:90-112`) carrega `id`/`desc`/`owner`/`status`/`goal_id`/`parents`/`acceptance`/`budget_tokens` — sem campo de paths. O ADR 0032 adicionou `parents` mas não paths. Sem onde guardar os arquivos reservados, não há o que cruzar.
 
-**Achado favorável:** o evento `PlanClaimed { id, item, by }` (`router.rs:1973-1980`) já carrega o `item` **completo** — então, se o `PlanItem` ganhar `paths`, a projeção de claims já tem os caminhos reservados **sem mudar o evento**.
+**Correção factual (achado do Terminal I, 2026-06-22):** uma versão anterior deste ADR supôs que `PlanClaimed` carregava o `PlanItem` completo. **Errado** — `PlanClaimed { id, item: String, by }` (`events.rs:569`) carrega apenas a *ref* do item (id), não o struct; e `PlanItemAttributed { item, goal_id, parents, acceptance, budget_tokens }` (`events.rs:654`) — o veículo dos metadados ricos do item — **não tinha paths**. Consequência: se `paths` vivesse só no `PlanItem` em memória, ele nunca entraria no event log → `store.project()` reconstruiria `paths: []` → a comparação `paths`×claims ficaria **inerte por replay** e o "replay idempotente" (F3-4-4) seria improvável. Por isso `paths` precisa ser **persistido no evento** (`PlanItemAttributed`), não só no struct projetado.
 
 ## Decisão
 
@@ -24,6 +24,8 @@ Em `crates/lina-core/src/plan.rs:90`, acrescentar:
 ```
 
 `#[serde(default)]` — invariante #4: plano/log anterior reconstrói com `paths: []`, round-trip byte-a-byte exato. O parser rígido (`parse_item` :446) e o serializer (`@paths:`, ao lado de `@parents:` ~:363) ganham o campo opcional (ausência ≡ vazio).
+
+**E persistir no EVENTO** (sem isso a projeção fica inerte — ver Contexto): `PlanItemAttributed` (`events.rs:654`) ganha `#[serde(default)] paths: Vec<String>` (aditivo; replay F3-1 sem paths → `[]`), e o `apply()` (`events.rs:1603`) threada `paths` para o `PlanItem` projetado via `apply_item_attributed`. A projeção "quais paths o nó X reservou" junta `PlanClaimed` (item→`by`) com `PlanItemAttributed` (item→`paths`) por replay. **Decisão de fronteira (2026-06-22):** essa edição cirúrgica em `events.rs` é feita na branch da Trilha B (Terminal I), excepcionalmente, por estar acoplada ao `apply_item_attributed`/`PlanItem` (de I) — a Trilha A não toca `events.rs`/`PlanItemAttributed`, então não há risco de conflito entre workers; o Maestro especifica o contrato e revisa na integração.
 
 ### 2. Comparação determinística, ZERO LLM
 
@@ -45,6 +47,6 @@ A interseção `CodeChanged.paths` ∩ (paths dos itens com claim de **outro** n
 ## Alternativas rejeitadas
 
 - **Derivar pertencimento só por `owner` do item (sem paths):** grosseiro demais — não sabe QUAIS arquivos um item cobre, então não dá para dizer se um commit do colega toca o que você reservou. Perde a precisão que a spec 36 §2 exige.
-- **Campo de paths no `PlanClaimed` (não no `PlanItem`):** redundante — o evento já carrega o `item` inteiro; o lugar canônico do "o que o item cobre" é o item. Rejeitado.
+- **Campo de paths no `PlanClaimed` (em vez de `PlanItemAttributed`):** `PlanClaimed` liga apenas `item`(id)→`by` — o "o que o item cobre" é propriedade do ITEM, não do ato de claim; duplicá-lo no claim espalharia a verdade por dois eventos. O lugar canônico é `PlanItemAttributed` (junto de `parents`/`acceptance`/`budget`), e a projeção junta os dois por id. Rejeitado.
 - **`paths` não-aditivo:** quebraria replay de plano/log anterior (viola inv #4). Rejeitado de saída.
 - **Inferir paths por LLM ("este item parece mexer nesses arquivos?"):** não-determinismo num guardrail (viola inv #1 e a doutrina 0007/0019). Os paths são **declarados**, a interseção é de conjuntos. Rejeitado.
