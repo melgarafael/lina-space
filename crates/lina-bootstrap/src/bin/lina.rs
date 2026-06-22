@@ -59,6 +59,8 @@ fn main() -> ExitCode {
         Some("params") => run_params(&args[1..]),
         Some("effort") => run_effort(&args[1..]),
         Some("goal") => run_goal(&args[1..]),
+        Some("code-changed") => run_code_changed(&args[1..]),
+        Some("branch-integrated") => run_branch_integrated(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -68,7 +70,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -1562,6 +1564,208 @@ fn run_plan_intent(intent: &str, id: Option<&String>) -> ExitCode {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+// ── F3-4 (spec 36 §2/§3): verbos `lina code-changed` / `lina branch-integrated` ──
+// O hook git pós-commit (worktree) chama `code-changed`; o DevOps integrador chama
+// `branch-integrated` após um merge PROVADO. O bin SÓ enfileira os FATOS do commit/merge; o
+// supervisor carimba `author_node`/`by` SERVER-SIDE (do dir-dono autenticado, ADR 0007) e emite
+// `CodeChanged`/`BranchIntegrated`. NENHUM campo do payload decide autor/autoridade — `branch`/
+// `paths`/`commit`/`into` são dado transportado, jamais identidade (doutrina de segurança).
+
+/// Coleta o valor de uma flag repetível (`--path a --path b`) e os escalares (`--branch`,
+/// `--commit`, `--into`) de um argv simples. PURA (sem I/O) para testar o parse isolado. Keys
+/// owned: o chamador não precisa manter `args` vivo só por causa do mapa.
+fn parse_kv_flags(
+    args: &[String],
+    repeated: &str,
+) -> (std::collections::HashMap<String, String>, Vec<String>) {
+    let mut scalars = std::collections::HashMap::new();
+    let mut multi = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        if key == repeated {
+            if let Some(v) = args.get(i + 1) {
+                multi.push(v.clone());
+            }
+            i += 2;
+        } else if key.starts_with("--") {
+            if let Some(v) = args.get(i + 1) {
+                scalars.insert(key.to_string(), v.clone());
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    (scalars, multi)
+}
+
+/// Monta o envelope `code.changed` (spec 36 §2): alvo sentinela `code`, payload = os FATOS do
+/// commit (`branch`/`commit`/`paths` do `git diff-tree`). O `author_node` é OMITIDO de propósito —
+/// é carimbado server-side pelo supervisor (ADR 0007), nunca aceito do payload de um agente.
+fn build_code_changed_envelope(
+    from: &str,
+    branch: &str,
+    commit: &str,
+    paths: &[String],
+) -> MailMessage {
+    let payload = serde_json::json!({
+        "branch": branch,
+        "commit": commit,
+        "paths": paths,
+    })
+    .to_string();
+    MailMessage::new(from, "code", "code.changed", payload)
+}
+
+/// `lina code-changed --branch <b> --commit <sha> [--path <p>]...` — o hook git pós-commit da
+/// worktree o chama com os fatos do commit. O bin enfileira `code.changed`; o supervisor emite
+/// `CodeChanged{author_node}` carimbando o autor pelo binding autenticado (NUNCA do payload).
+fn run_code_changed(args: &[String]) -> ExitCode {
+    let (scalars, paths) = parse_kv_flags(args, "--path");
+    let (Some(branch), Some(commit)) = (scalars.get("--branch"), scalars.get("--commit")) else {
+        eprintln!("lina: code-changed exige --branch e --commit");
+        usage();
+        return ExitCode::from(2);
+    };
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let msg = build_code_changed_envelope(&from, branch, commit, &paths);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &from, &msg) {
+        Ok(()) => {
+            println!("ok: code.changed em {branch} enfileirado (msg {})", msg.id);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Monta o envelope `branch.integrated` (spec 36 §3): alvo sentinela `code`, payload = a PROVA do
+/// merge (`branch` integrada, `into` = linha de destino, `commit` de merge). O supervisor é quem
+/// emite `BranchIntegrated` — a ÚNICA prova de "branch fechada" no log.
+fn build_branch_integrated_envelope(
+    from: &str,
+    branch: &str,
+    into: &str,
+    commit: &str,
+) -> MailMessage {
+    let payload = serde_json::json!({
+        "branch": branch,
+        "into": into,
+        "commit": commit,
+    })
+    .to_string();
+    MailMessage::new(from, "code", "branch.integrated", payload)
+}
+
+/// `lina branch-integrated --branch <b> --into <dst> --commit <sha>` — o DevOps integrador o
+/// chama após um `git merge` PROVADO na linha de integração (skill `lina-integration`). Enfileira
+/// `branch.integrated`; o supervisor emite `BranchIntegrated`. Trabalho órfão NUNCA é descartado
+/// em silêncio: branch só é "fechada" com este evento no log.
+fn run_branch_integrated(args: &[String]) -> ExitCode {
+    let (scalars, _) = parse_kv_flags(args, "--path");
+    let (Some(branch), Some(into), Some(commit)) = (
+        scalars.get("--branch"),
+        scalars.get("--into"),
+        scalars.get("--commit"),
+    ) else {
+        eprintln!("lina: branch-integrated exige --branch, --into e --commit");
+        usage();
+        return ExitCode::from(2);
+    };
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: nao foi possivel ler {INPUT_PATH} (de onde vem o 'from'): {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let msg = build_branch_integrated_envelope(&from, branch, into, commit);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &from, &msg) {
+        Ok(()) => {
+            println!(
+                "ok: branch.integrated {branch}->{into} enfileirado (msg {})",
+                msg.id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod f3_4_code_signal_tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    /// O envelope `code.changed` carrega os FATOS do commit — e o autor é OMITIDO (server-side).
+    #[test]
+    fn code_changed_envelope_carries_facts_not_author() {
+        let msg = build_code_changed_envelope(
+            "Terminal B",
+            "lina/agente-um",
+            "abc1234",
+            &["src/a.rs".to_string(), "src/b.rs".to_string()],
+        );
+        assert_eq!(msg.intent, "code.changed");
+        assert_eq!(
+            msg.to, "code",
+            "alvo sentinela — supervisor intercepta por intent"
+        );
+        let p: serde_json::Value = serde_json::from_str(&msg.payload).expect("payload json");
+        assert_eq!(p["branch"], "lina/agente-um");
+        assert_eq!(p["commit"], "abc1234");
+        assert_eq!(p["paths"], serde_json::json!(["src/a.rs", "src/b.rs"]));
+        assert!(
+            p.get("author_node").is_none(),
+            "autor é carimbado SERVER-SIDE (ADR 0007), nunca vem do payload"
+        );
+    }
+
+    /// O envelope `branch.integrated` carrega a prova do merge (branch → into @ commit).
+    #[test]
+    fn branch_integrated_envelope_carries_merge_proof() {
+        let msg = build_branch_integrated_envelope("DevOps", "lina/f3-4-a", "develop", "deadbeef");
+        assert_eq!(msg.intent, "branch.integrated");
+        assert_eq!(msg.to, "code");
+        let p: serde_json::Value = serde_json::from_str(&msg.payload).expect("payload json");
+        assert_eq!(p["branch"], "lina/f3-4-a");
+        assert_eq!(p["into"], "develop");
+        assert_eq!(p["commit"], "deadbeef");
+    }
+
+    /// `--path` é repetível (um por arquivo do `diff-tree`); escalares (`--branch`/`--commit`) são
+    /// únicos. O parse ignora posicionais órfãos — robusto a um hook que passe args extras.
+    #[test]
+    fn parse_kv_flags_collects_repeated_and_scalars() {
+        let (scalars, paths) = parse_kv_flags(
+            &argv(&[
+                "--branch", "lina/x", "--commit", "sha1", "--path", "a.rs", "--path", "b.rs",
+            ]),
+            "--path",
+        );
+        assert_eq!(scalars.get("--branch").map(String::as_str), Some("lina/x"));
+        assert_eq!(scalars.get("--commit").map(String::as_str), Some("sha1"));
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
     }
 }
 
