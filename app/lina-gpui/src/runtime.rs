@@ -674,6 +674,9 @@ pub fn boot_ws_runtime(
         Arc::clone(&profile_registry),
         autonomy, // SEAM-1 (M2): autonomia REAL fiada no RouterConfig (manual bloqueia spawn)
         Arc::clone(&nodes), // SEAM-1: funil de admissão — SpawnApproved cria o terminal
+        // F3-5-1: o MESMO snapshot de sessões que o dashboard recebe do hub — o pump correlaciona por
+        // `cwd` e nasce o `SessionPersisted` do 1º prompt (vazio quando o CLI não grava session-file).
+        Arc::clone(&dash.sessions),
     )
     .spawn();
 
