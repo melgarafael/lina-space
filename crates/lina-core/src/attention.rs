@@ -41,7 +41,7 @@ use std::collections::HashMap;
 /// nesta rodada — costura coordenada.)
 pub use crate::events::PromptKind;
 use crate::events::{
-    ApprovalDecision, DomainEvent, EventRecord, PermissionEvidence, ResolutionVia,
+    ApprovalDecision, DomainEvent, EventRecord, PermissionEvidence, ReclaimCandidate, ResolutionVia,
 };
 use crate::lifecycle::reason;
 use crate::NodeStatus;
@@ -309,6 +309,23 @@ struct PendingCodeConflict {
     last_ts: u64,
 }
 
+/// F3-5-8 (ADR 0043): uma PROPOSTA de poda de disco aguardando o gesto humano custodiado. Vira item
+/// [`AttentionKind::Custody`] na fila — o gate IRREVERSÍVEL (apagar bytes), gate humano em TODO nível.
+/// Projeção PURA do log (event-sourced, SEM evento novo): armada por `DiskReclaimProposed`, resolvida
+/// por `DiskReclaimExecuted` (a poda ocorreu). Reconstruída por replay (sobrevive a crash/reabrir). O
+/// `approved_by` de `DiskReclaimApproved` é EXIBIÇÃO — NÃO resolve o item (a autoridade é o gesto, não
+/// o campo; ADR 0007). Dedup por `stable_id`: re-proposta dos mesmos caminhos (probe periódico) não
+/// empilha. NÃO some por TTL: disco cheio é problema vivo (inv #6, nunca perder em silêncio).
+#[derive(Debug, Clone)]
+struct PendingDiskReclaim {
+    /// Id estável derivado dos caminhos (`disk_budget::reclaim_stable_id`) — o gesto o referencia
+    /// (ADR 0021 §5: nunca texto/posição).
+    stable_id: String,
+    /// Copy leiga do que será liberado (de `reclaimable_bytes` + nº de candidatos).
+    detail: String,
+    created_ts: u64,
+}
+
 /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
 #[derive(Debug, Default)]
 pub struct AttentionQueue {
@@ -341,6 +358,9 @@ pub struct AttentionQueue {
     claims: HashMap<String, String>,
     /// F3-4-4: conflitos de código abertos (1 por `(owner, branch)`) — o "PARA" do pertencimento.
     code_conflicts: Vec<PendingCodeConflict>,
+    /// F3-5-8: propostas de poda de disco pendentes de gesto (entram como `Custody`). Armadas por
+    /// `DiskReclaimProposed`, resolvidas por `DiskReclaimExecuted`; dedup por `stable_id`.
+    disk_reclaims: Vec<PendingDiskReclaim>,
 }
 
 impl AttentionQueue {
@@ -490,6 +510,18 @@ impl AttentionQueue {
                 author_node,
                 ..
             } => self.fold_code_changed(branch, paths, author_node, ts),
+            // ───────── F3-5-8 (ADR 0043): proposta de poda → gate `Custody`; poda → resolve ─────────
+            DomainEvent::DiskReclaimProposed {
+                candidates,
+                reclaimable_bytes,
+                ..
+            } => self.fold_disk_reclaim_proposed(candidates, *reclaimable_bytes, ts),
+            // A poda OCORREU → a proposta saiu (resolvida). `DiskReclaimApproved` NÃO resolve aqui:
+            // `approved_by` é exibição, não autoridade — só a execução real (Executed) limpa o gate.
+            DomainEvent::DiskReclaimExecuted { paths, .. } => {
+                let stable_id = crate::disk_budget::reclaim_stable_id(paths);
+                self.disk_reclaims.retain(|d| d.stable_id != stable_id);
+            }
             // Pós-decisão do executor (F1-1-8): sem efeito na fila — o item já saiu
             // no `PermissionResolved`. Um abort (`screen_changed`) reapresenta via
             // RE-DETECÇÃO (novo `PermissionAsked`, novo stable_id — ADR 0021 §1).
@@ -682,6 +714,31 @@ impl AttentionQueue {
         if let Some(d) = self.dispatches.iter_mut().find(|d| d.node_id == node) {
             d.idle_ts.get_or_insert(ts);
         }
+    }
+
+    /// F3-5-8: arma uma proposta de poda como pendência `Custody` (dedup por `stable_id` derivado dos
+    /// caminhos — re-proposta do probe periódico não empilha). A copy leiga vem de `reclaimable_bytes`
+    /// (humanizado em GB/MB) + nº de candidatos; o gesto referencia o `stable_id`, nunca o texto.
+    fn fold_disk_reclaim_proposed(
+        &mut self,
+        candidates: &[ReclaimCandidate],
+        reclaimable_bytes: u64,
+        ts: u64,
+    ) {
+        let paths: Vec<String> = candidates.iter().map(|c| c.path.clone()).collect();
+        let stable_id = crate::disk_budget::reclaim_stable_id(&paths);
+        if self.disk_reclaims.iter().any(|d| d.stable_id == stable_id) {
+            return;
+        }
+        self.disk_reclaims.push(PendingDiskReclaim {
+            stable_id,
+            detail: format!(
+                "liberar {} de disco ({} alvo(s)) — precisa da sua confirmação",
+                crate::disk_budget::human_bytes(reclaimable_bytes),
+                candidates.len()
+            ),
+            created_ts: ts,
+        });
     }
 
     // ───────────────────────── espelho da custódia (pump do app) ─────────────────────────
@@ -890,7 +947,22 @@ impl AttentionQueue {
                 }
             })
         });
-        let mut out = round_robin_by_node(custody.collect());
+        // F3-5-8: as propostas de poda compartilham a precedência de `Custody` (gate humano duro). O
+        // `node_id` é o pseudo-nó de sistema "disco" — a pressão é do workspace, não de um terminal.
+        let disk = self.disk_reclaims.iter().map(|d| AttentionItem {
+            stable_id: d.stable_id.clone(),
+            node_id: "disco".to_string(),
+            kind: AttentionKind::Custody,
+            detail: Some(d.detail.clone()),
+            evidence: AttentionEvidence::Custody,
+            created_ts: d.created_ts,
+            state: state_of(d.created_ts),
+            prompt_kind: PromptKind::Yn, // gate aprovável: liberar o disco? (gesto custodiado)
+            vt_snapshot_hash: None,
+        });
+        let mut custody_items: Vec<AttentionItem> = custody.collect();
+        custody_items.extend(disk);
+        let mut out = round_robin_by_node(custody_items);
         out.extend(round_robin_by_node(perms.collect()));
         out.extend(round_robin_by_node(spawns.collect()));
         out.extend(round_robin_by_node(guard.collect()));
@@ -2353,6 +2425,106 @@ mod tests {
                 .count(),
             1,
             "o conflito sobrevive ao replay"
+        );
+    }
+
+    // ───────────────── F3-5-8 · proposta de poda como gate Custody (ADR 0043) ─────────────────
+
+    fn disk_proposed(path: &str, reclaimable: u64) -> DomainEvent {
+        DomainEvent::DiskReclaimProposed {
+            candidates: vec![ReclaimCandidate {
+                path: path.to_string(),
+                bytes: reclaimable,
+                kind: "cargo_target".to_string(),
+            }],
+            reclaimable_bytes: reclaimable,
+            proposed_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn disk_reclaim_proposed_enters_as_custody() {
+        let mut q = AttentionQueue::new();
+        q.observe(&disk_proposed("/ws/target", 30 * (1 << 30)), T0);
+        let items = q.items(T0 + 1);
+        let disk = items
+            .iter()
+            .find(|i| i.stable_id == "disk-reclaim:/ws/target")
+            .expect("a proposta de poda entra na fila");
+        assert_eq!(disk.kind, AttentionKind::Custody, "gate humano duro");
+        assert_eq!(disk.evidence, AttentionEvidence::Custody);
+        let detail = disk.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("liberar") && detail.contains("GB"), "copy leiga: {detail}");
+    }
+
+    #[test]
+    fn disk_reclaim_executed_resolves_the_gate() {
+        let mut q = AttentionQueue::new();
+        q.observe(&disk_proposed("/ws/target", 30 * (1 << 30)), T0);
+        q.observe(
+            &DomainEvent::DiskReclaimExecuted {
+                reclaimed_bytes: 30 * (1 << 30),
+                paths: vec!["/ws/target".to_string()],
+                executed_at_ms: 0,
+            },
+            T0 + 2,
+        );
+        assert!(
+            !q.items(T0 + 3)
+                .iter()
+                .any(|i| i.stable_id == "disk-reclaim:/ws/target"),
+            "a poda executada resolve o gate"
+        );
+    }
+
+    #[test]
+    fn disk_reclaim_approved_alone_does_not_resolve_gate() {
+        // `approved_by` é EXIBIÇÃO: um `DiskReclaimApproved` (mesmo forjado) NÃO limpa o gate — só a
+        // execução real (Executed) resolve. A autoridade é o gesto, não o campo (ADR 0007).
+        let mut q = AttentionQueue::new();
+        q.observe(&disk_proposed("/ws/target", 30 * (1 << 30)), T0);
+        q.observe(
+            &DomainEvent::DiskReclaimApproved {
+                candidate_paths: vec!["/ws/target".to_string()],
+                approved_by: "forjado".to_string(),
+                approved_at_ms: 0,
+            },
+            T0 + 2,
+        );
+        assert!(
+            q.items(T0 + 3)
+                .iter()
+                .any(|i| i.stable_id == "disk-reclaim:/ws/target"),
+            "approved_by não resolve o gate (só a execução custodiada o faz)"
+        );
+    }
+
+    #[test]
+    fn disk_reclaim_proposed_dedups_same_paths() {
+        let mut q = AttentionQueue::new();
+        q.observe(&disk_proposed("/ws/target", 30 * (1 << 30)), T0);
+        q.observe(&disk_proposed("/ws/target", 30 * (1 << 30)), T0 + 300_000); // re-probe
+        assert_eq!(
+            q.items(T0 + 300_001)
+                .iter()
+                .filter(|i| i.stable_id == "disk-reclaim:/ws/target")
+                .count(),
+            1,
+            "re-proposta dos mesmos caminhos não empilha"
+        );
+    }
+
+    #[test]
+    fn disk_reclaim_pending_survives_replay() {
+        // Crash com proposta pendente → reabrir reconstrói o gate do log (event-sourced).
+        let log = vec![cc_rec(disk_proposed("/ws/target", 30 * (1 << 30)), T0)];
+        let q = AttentionQueue::replay(&log);
+        assert!(
+            q.items(T0 + 1)
+                .iter()
+                .any(|i| i.kind == AttentionKind::Custody
+                    && i.stable_id == "disk-reclaim:/ws/target"),
+            "a proposta de poda sobrevive ao replay"
         );
     }
 }
