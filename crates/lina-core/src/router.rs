@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::code::{CodeIntegration, INTEGRATOR_ROLE, INTEGRATOR_SETTLE_MS};
 use crate::events::{
     AcceptanceCriterion, AwaitReason, BlockReason, CheckKind, DomainEvent, Effort, EffortOrigin,
     EventRecord, EventStore, StoreError, Verdict as GoalVerdict,
@@ -84,6 +85,24 @@ const HUMAN_GESTURE: NodeId = NodeId::from_u128(0x4855_4d41_4e00_0000_0000_0000_
 /// o `delivered_ts` (epoch da entrega) torna o re-despacho idempotente POR ENTREGA (uma re-injeção
 /// abre um epoch novo; o gap entre o pedido e a re-injeção não re-escala).
 const STALL_RESPAWN_PREFIX: &str = "stall-respawn";
+
+/// F3-4 (pendência fechada na F3-5): `NodeId` SENTINELA do gatilho de AUTO-INTEGRAÇÃO. O auto-spawn do
+/// DevOps integrador NÃO tem agente remetente — a decisão é do CORE (gatilho determinístico
+/// [`crate::code::CodeIntegration`]), não de um terminal. Bytes soletram "AUTOINT"; distinto de
+/// [`STRUCTURAL_JUDGE`] (`nil`) / [`HUMAN_GESTURE`]; como nós reais nascem `Uuid::now_v7()`, nunca
+/// colide com um nó real. `requested_by` = carimbo server-side, JAMAIS forjável por agente (ADR 0007).
+const INTEGRATOR_TRIGGER: NodeId = NodeId::from_u128(0x4155_544f_494e_5400_0000_0000_0000_0000);
+/// Prefixo determinístico do `id` do `SpawnRequested` de auto-integração — sufixado pelo `seq` do
+/// último `CodeChanged` (único por episódio; replay reconstrói idêntico). DISTINTO de `goal-respawn:`/
+/// `stall-respawn:` → as escadas de spawn nunca se misturam na contagem.
+const AUTO_INTEGRATE_PREFIX: &str = "auto-integrate";
+/// Motivo do `SpawnGated` do auto-spawn do integrador: auto-organização que SUGERE (banner), nunca
+/// aplica — o nascimento do integrador passa por aval humano (ADR 0007/0042), mesmo em `autonomo`
+/// (criar um terminal sozinho é "aplicar"). O bin degrada `reason` desconhecido graciosamente
+/// (`explain_spawn_gate` → "motivo: …"); a tradução pt-br fina do banner é costura do bin/UI.
+const AUTO_INTEGRATE_REASON: &str = "auto_integrate";
+/// Nome exibido do terminal integrador auto-spawnado (a unicidade no roster é do funil `admit_node`).
+const INTEGRATOR_NAME: &str = "Integrador";
 
 /// F3-CONF-2 (gate c): `reason` do `NodeStatusChanged{Idle}` emitido pelo RESET HUMANO do breaker.
 /// Duplo papel: (1) registra durável o desbloqueio (a tela honesta volta de "pausado por segurança"
@@ -434,6 +453,12 @@ pub struct Router {
     /// F3-CONF-2: maior `seq` já varrido por [`Router::sync_dispatch_progress`] — disarm incremental
     /// (delta only; NUNCA full-replay — o `O(N)` por tick foi a causa-raiz documentada do freeze).
     dispatch_progress_seq: u64,
+    /// F3-4 (auto-spawn do integrador): `now_ms` do último check do gatilho de auto-integração. O
+    /// gatilho ([`CodeIntegration`]) exige um `from_records` (replay) — caro por tick. Como ele só
+    /// dispara após ≥ [`INTEGRATOR_SETTLE_MS`] de silêncio da equipe, throttlar o check a esse mesmo
+    /// intervalo NÃO perde disparos (a condição persiste) e mantém o pump fora do `O(N)`/tick (a
+    /// causa-raiz do freeze). `0` = nunca checado (o 1º tick com `now_ms` real cruza o intervalo).
+    last_integrator_check_ms: u64,
 }
 
 /// **F1-0-7 — backoff exponencial com jitter DETERMINÍSTICO** por (id, attempt):
@@ -513,6 +538,7 @@ impl Router {
             breaker_open: HashSet::new(),
             dispatched_at: HashMap::new(),
             dispatch_progress_seq: 0,
+            last_integrator_check_ms: 0,
         }
     }
 
@@ -591,6 +617,37 @@ impl Router {
         Ok(())
     }
 
+    /// **F3-4 (pendência fechada na F3-5): auto-spawn do DevOps integrador.** Fia o gatilho
+    /// determinístico ÓRFÃO ([`CodeIntegration::integrator_dispatch`]) ao caminho de spawn governado.
+    /// Verificação time-based chamada no tick do [`Self::pump`]: quando a equipe ASSENTOU (todos
+    /// Idle/Dead há ≥ [`INTEGRATOR_SETTLE_MS`]) E há branch não-integrada E nenhum pedido de integrador
+    /// está EM VOO (idempotência event-sourced, [`integrator_request_in_flight`]), apenda
+    /// `SpawnRequested{role:DEVOPS}` (intent-vs-action: o pedido no log SEMPRE, antes da decisão) +
+    /// `SpawnGated{auto_integrate}`. O nascimento passa por aval humano — a fila de atenção projeta o
+    /// banner do `SpawnGated` no log (não do retorno); auto-organização SUGERE, nunca aplica.
+    ///
+    /// `Ok(Some(SpawnGated))` quando propôs; `Ok(None)` quando nada a fazer. A DECISÃO é PURA de
+    /// `now_ms` ([`plan_integrator_spawn`]) → o replay reproduz o disparo idêntico (gate f/h).
+    ///
+    /// # Errors
+    /// Falha ao ler ou apendar no event log.
+    pub fn dispatch_integrator_if_due(
+        &mut self,
+        store: &mut EventStore,
+        now_ms: u64,
+    ) -> Result<Option<RouteOutcome>, StoreError> {
+        let events = plan_integrator_spawn(&store.events()?, now_ms);
+        if events.is_empty() {
+            return Ok(None);
+        }
+        for event in &events {
+            store.append(event)?;
+        }
+        Ok(Some(RouteOutcome::SpawnGated {
+            reason: AUTO_INTEGRATE_REASON.to_string(),
+        }))
+    }
+
     /// **Drena a mailbox e roteia cada mensagem.** `deliver(target, from, text)` faz a entrega
     /// faseada de fato (em produção: [`crate::deliver_a2a`] com o perfil/grid do alvo). Devolve
     /// `(id, resultado)` por mensagem (observabilidade).
@@ -614,6 +671,21 @@ impl Router {
         }
         if let Err(e) = self.enforce_dispatch_protocol(store, now_ms) {
             eprintln!("lina-core: pump falhou no protocolo anti-engolimento (retentará): {e}");
+        }
+        // F3-4 (pendência fechada na F3-5): auto-spawn do DevOps integrador. Verificação time-based como
+        // os sweeps acima — quando a equipe assentou com branch pendente, PROPÕE o integrador (gated,
+        // aval humano; o banner vem da projeção do `SpawnGated` no log). THROTTLADA ao intervalo de
+        // assentamento: o check exige um replay (`CodeIntegration::from_records`), e rodá-lo por tick
+        // reintroduziria o `O(N)`/tick que causou o freeze — como o gatilho só dispara após ≥ SETTLE de
+        // silêncio, checar a esse passo não perde disparos. Falha de I/O é VISÍVEL (stderr), nunca
+        // silenciosa; o tick segue (um log lento não derruba a auto-organização).
+        if now_ms.saturating_sub(self.last_integrator_check_ms) >= INTEGRATOR_SETTLE_MS {
+            self.last_integrator_check_ms = now_ms;
+            if let Err(e) = self.dispatch_integrator_if_due(store, now_ms) {
+                eprintln!(
+                    "lina-core: pump não avaliou o auto-spawn do integrador (retentará): {e}"
+                );
+            }
         }
         // A6: drena de forma RECUPERÁVEL — move para `.inflight` e reprocessa órfãos de um crash.
         let msgs = self.mailbox.drain_to_inflight().unwrap_or_else(|e| {
@@ -3752,6 +3824,86 @@ fn append_spawn_gated(
     Ok(())
 }
 
+/// **A DECISÃO PURA do auto-spawn do integrador (F3-4, testável com `ts` controlado).** Dado os
+/// records e `now_ms`, devolve os eventos a apendar (`[SpawnRequested, SpawnGated]`) quando o gatilho
+/// determinístico dispara E não há pedido em voo; senão `[]`. PURO (sem I/O) — o `EventStore::append`
+/// carimba `ts` com wall-clock, então a lógica time-based mora aqui (não no wrapper), reproduzível por
+/// replay igual a [`CodeIntegration::from_records`]. O `id` leva o `seq` do último `CodeChanged`
+/// (único por episódio; determinístico).
+fn plan_integrator_spawn(records: &[EventRecord], now_ms: u64) -> Vec<DomainEvent> {
+    let Some(dispatch) =
+        CodeIntegration::from_records(records).integrator_dispatch(now_ms, INTEGRATOR_SETTLE_MS)
+    else {
+        return Vec::new();
+    };
+    if integrator_request_in_flight(records) {
+        return Vec::new();
+    }
+    // Sufixo do id = seq do último `CodeChanged` (sempre ≥1 quando o gatilho dispara — há branch
+    // pendente). Torna o `id` único por episódio: um novo lote de trabalho gera um id novo.
+    let last_code_seq = records
+        .iter()
+        .filter(|r| r.kind == "CodeChanged")
+        .map(|r| r.seq)
+        .max()
+        .unwrap_or(0);
+    let id = format!("{AUTO_INTEGRATE_PREFIX}:{last_code_seq}");
+    let prompt = format!(
+        "Junte na develop as branches ainda não integradas: {}. Carregue a skill lina-integration e \
+         valide cada merge (exit codes diretos) antes de fechar com `lina branch-integrated`.",
+        dispatch.branches.join(", ")
+    );
+    vec![
+        DomainEvent::SpawnRequested {
+            id: id.clone(),
+            requested_by: INTEGRATOR_TRIGGER,
+            name: INTEGRATOR_NAME.to_string(),
+            role: INTEGRATOR_ROLE.to_string(),
+            root_cause_id: id.clone(),
+            hops: 0,
+            prompt,
+            model: None,
+            effort: None,
+            goal_id: None,
+        },
+        DomainEvent::SpawnGated {
+            id,
+            requested_by: INTEGRATOR_TRIGGER,
+            reason: AUTO_INTEGRATE_REASON.to_string(),
+        },
+    ]
+}
+
+/// Idempotência do auto-spawn do integrador (EDGE-triggered): `true` se já há um pedido de integrador
+/// EM VOO — emitido DEPOIS do último trabalho pendente novo (`CodeChanged`). O gatilho é LEVEL (a
+/// condição "equipe assentada + branch pendente" persiste até a integração); sem esta guarda, cada
+/// tick spawnaria um integrador. Sem `CodeChanged` novo desde o último pedido ⇒ não re-disparar (o
+/// banner segue pendente até o humano decidir); um `CodeChanged` posterior ⇒ re-arma. Só conta
+/// `SpawnRequested` com `role == INTEGRATOR_ROLE` (as outras escadas de spawn não contam).
+fn integrator_request_in_flight(records: &[EventRecord]) -> bool {
+    let mut last_code_changed: Option<u64> = None;
+    let mut last_integrator_req: Option<u64> = None;
+    for rec in records {
+        match rec.kind.as_str() {
+            "CodeChanged" => last_code_changed = Some(rec.seq),
+            "SpawnRequested"
+                if rec.payload.get("role").and_then(|v| v.as_str()) == Some(INTEGRATOR_ROLE) =>
+            {
+                last_integrator_req = Some(rec.seq);
+            }
+            _ => {}
+        }
+    }
+    match (last_integrator_req, last_code_changed) {
+        // Pedi um integrador DEPOIS do último trabalho novo → ainda em voo (não re-disparar).
+        (Some(req), Some(code)) => req > code,
+        // Pedi sem nenhum `CodeChanged` registrado → conservador: em voo.
+        (Some(_), None) => true,
+        // Nunca pedi → livre para disparar.
+        (None, _) => false,
+    }
+}
+
 /// FIX #22: `true` se a mensagem é um PING DE PRESENÇA (`lina handshake`): `intent == "handshake"` E
 /// alvo broadcast (`to == "*"`). Fire-and-forget — o roster vivo é do Supervisor (events.rs:141); a msg
 /// não delega nem entrega a ninguém. Reconhecê-la cedo evita o `UnknownSender("")` + `RouteBlocked`
@@ -4294,6 +4446,191 @@ mod tests {
                 .is_branch_pending("lina/a"),
             "branch fechada após BranchIntegrated"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── F3-4 (pendência fechada na F3-5): auto-spawn do DevOps integrador ──────────────────────
+
+    /// `EventRecord` sintético a partir do `DomainEvent` REAL — payload com a tag `event`, para
+    /// `CodeIntegration::from_record` decodificar. Fixture à-mão sem a tag seria engolido em silêncio.
+    fn synth_rec(seq: u64, ts: u64, ev: &DomainEvent) -> EventRecord {
+        EventRecord {
+            seq,
+            ts,
+            kind: ev.kind().to_string(),
+            version: ev.current_version(),
+            payload: serde_json::to_value(ev).expect("serializar evento"),
+        }
+    }
+
+    /// Um nó ASSENTADO (Idle) desde `since_ts` — fixture do gatilho "equipe assentada".
+    fn node_idle(seq: u64, since_ts: u64, node: NodeId) -> EventRecord {
+        synth_rec(
+            seq,
+            since_ts,
+            &DomainEvent::NodeStatusChanged {
+                node,
+                status: NodeStatus::Idle.as_str().to_string(),
+                from: String::new(),
+                reason: String::new(),
+            },
+        )
+    }
+
+    /// Um commit que deixa `branch` pendente (sem `BranchIntegrated`).
+    fn code_changed_rec(seq: u64, ts: u64, branch: &str) -> EventRecord {
+        synth_rec(
+            seq,
+            ts,
+            &DomainEvent::CodeChanged {
+                branch: branch.to_string(),
+                paths: vec!["src/x.rs".to_string()],
+                author_node: "n-author".to_string(),
+                commit: "c1".to_string(),
+            },
+        )
+    }
+
+    const SETTLE: u64 = INTEGRATOR_SETTLE_MS;
+
+    /// **Gate (h) — o DevOps é PROPOSTO (auto-spawn) quando a equipe assenta com branch pendente.** A
+    /// decisão pura emite `SpawnRequested{DEVOPS, hops:0}` + `SpawnGated{auto_integrate}` (aval
+    /// humano); idempotente no mesmo lote (re-chamar com o pedido já no log NÃO re-propõe).
+    #[test]
+    fn auto_spawn_proposes_integrator_when_team_settled() {
+        let n1 = NodeId::from_u128(1);
+        let records = vec![
+            code_changed_rec(1, 1_000, "lina/a"),
+            node_idle(2, 1_000, n1),
+        ];
+        let now = 1_000 + SETTLE + 1;
+        let events = plan_integrator_spawn(&records, now);
+        assert_eq!(events.len(), 2, "SpawnRequested + SpawnGated");
+        assert!(
+            matches!(&events[0], DomainEvent::SpawnRequested { role, requested_by, hops, .. }
+                if role == INTEGRATOR_ROLE && *requested_by == INTEGRATOR_TRIGGER && *hops == 0),
+            "pedido do integrador, origem (hops 0), requested_by = sentinela do sistema"
+        );
+        assert!(matches!(
+            &events[1],
+            DomainEvent::SpawnGated { reason, requested_by, .. }
+                if reason == AUTO_INTEGRATE_REASON && *requested_by == INTEGRATOR_TRIGGER
+        ));
+
+        // Idempotência: com o SpawnRequested já no log, a guarda edge-triggered barra a re-proposta.
+        let mut after = records.clone();
+        after.push(synth_rec(3, now, &events[0]));
+        after.push(synth_rec(4, now, &events[1]));
+        assert!(
+            plan_integrator_spawn(&after, now + SETTLE).is_empty(),
+            "pedido em voo ⇒ não re-propõe (sem tempestade)"
+        );
+    }
+
+    /// Re-arma: um `CodeChanged` NOVO depois do último pedido solta a guarda → propõe de novo (a
+    /// equipe terminou outro lote de trabalho).
+    #[test]
+    fn auto_spawn_rearms_on_new_work() {
+        let n1 = NodeId::from_u128(1);
+        let records = vec![
+            code_changed_rec(1, 1_000, "lina/a"),
+            node_idle(2, 1_000, n1),
+            synth_rec(
+                3,
+                2_000,
+                &DomainEvent::SpawnRequested {
+                    id: "auto-integrate:1".into(),
+                    requested_by: INTEGRATOR_TRIGGER,
+                    name: INTEGRATOR_NAME.into(),
+                    role: INTEGRATOR_ROLE.into(),
+                    root_cause_id: "auto-integrate:1".into(),
+                    hops: 0,
+                    prompt: String::new(),
+                    model: None,
+                    effort: None,
+                    goal_id: None,
+                },
+            ),
+            code_changed_rec(4, 3_000, "lina/b"), // trabalho NOVO depois do pedido
+        ];
+        assert_eq!(
+            plan_integrator_spawn(&records, 1_000 + SETTLE + 1).len(),
+            2,
+            "CodeChanged posterior ao pedido ⇒ re-propõe"
+        );
+    }
+
+    /// Silencioso quando a equipe NÃO assentou (um nó ainda Busy), mesmo com branch pendente.
+    #[test]
+    fn auto_spawn_silent_when_team_busy() {
+        let n1 = NodeId::from_u128(1);
+        let n2 = NodeId::from_u128(2);
+        let records = vec![
+            code_changed_rec(1, 1_000, "lina/a"),
+            node_idle(2, 1_000, n1),
+            synth_rec(
+                3,
+                1_000,
+                &DomainEvent::NodeStatusChanged {
+                    node: n2,
+                    status: NodeStatus::Busy.as_str().to_string(),
+                    from: String::new(),
+                    reason: String::new(),
+                },
+            ),
+        ];
+        assert!(
+            plan_integrator_spawn(&records, 1_000 + SETTLE + 1).is_empty(),
+            "um nó Busy ⇒ equipe não assentada ⇒ não dispara"
+        );
+    }
+
+    /// Silencioso quando NÃO há branch pendente (equipe assentada, mas nada a juntar).
+    #[test]
+    fn auto_spawn_silent_when_nothing_pending() {
+        let n1 = NodeId::from_u128(1);
+        let records = vec![node_idle(1, 1_000, n1)];
+        assert!(plan_integrator_spawn(&records, 1_000 + SETTLE + 1).is_empty());
+    }
+
+    /// **A COSTURA LIGADA (não órfã): o `pump` dispara o auto-spawn.** End-to-end pelo tick REAL — a
+    /// branch pendente + equipe assentada faz o pump apendar `SpawnRequested{DEVOPS}` no log (prova que
+    /// a fiação existe, não só a decisão pura). Mailbox vazia: só os sweeps + auto-spawn correm.
+    #[test]
+    fn pump_wires_auto_spawn_integrator() {
+        let (mut router, sup, dir) = router_with("auto-spawn-pump");
+        let mut ts = TmpStore::new("auto-spawn-pump");
+        let (_rec, mut deliver) = recorder();
+        let n1 = NodeId::from_u128(0xA1);
+        ts.store
+            .append(&DomainEvent::CodeChanged {
+                branch: "lina/a".into(),
+                paths: vec!["src/x.rs".into()],
+                author_node: "n-a".into(),
+                commit: "c1".into(),
+            })
+            .expect("cc");
+        ts.store
+            .append(&DomainEvent::NodeStatusChanged {
+                node: n1,
+                status: NodeStatus::Idle.as_str().to_string(),
+                from: String::new(),
+                reason: String::new(),
+            })
+            .expect("idle");
+        // `append` carimba `ts` com wall-clock; o now_ms do tick fica além da janela de assentamento.
+        let base = ts.store.events().expect("ev").last().expect("last").ts;
+        router.pump(&mut ts.store, base + SETTLE + 1_000, &mut deliver);
+        assert!(
+            ts.store
+                .events()
+                .expect("ev")
+                .iter()
+                .any(|r| r.kind == "SpawnRequested"
+                    && r.payload.get("role").and_then(|v| v.as_str()) == Some(INTEGRATOR_ROLE)),
+            "o pump fiou o auto-spawn: SpawnRequested{{DEVOPS}} no log"
+        );
+        drop(sup);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
