@@ -452,10 +452,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let p = std::env::temp_dir().join(format!(
-                "lina-disk-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
+            let p = std::env::temp_dir()
+                .join(format!("lina-disk-{tag}-{}-{nanos}", std::process::id()));
             std::fs::create_dir_all(&p).expect("criar tempdir");
             Self(p)
         }
@@ -645,7 +643,11 @@ mod tests {
         let budget = DiskBudget::replay(&store.events().expect("eventos"));
         // O approved_by aparece só como EXIBIÇÃO…
         assert_eq!(
-            budget.pending_proposal().expect("proposta").approved_by.as_deref(),
+            budget
+                .pending_proposal()
+                .expect("proposta")
+                .approved_by
+                .as_deref(),
             Some("atacante-se-auto-aprovando")
         );
         // …mas NADA foi executado: zero DiskReclaimExecuted, zero bytes (a autoridade é o gesto).
@@ -721,7 +723,11 @@ mod tests {
         std::fs::write(sub.join("b.bin"), vec![0u8; 2000]).expect("b");
 
         let probe = OsDiskProbe;
-        assert_eq!(probe.dir_size(tmp.path()), 3000, "soma recursiva dos arquivos");
+        assert_eq!(
+            probe.dir_size(tmp.path()),
+            3000,
+            "soma recursiva dos arquivos"
+        );
         // scan_candidate só materializa se há bytes.
         let cand = scan_candidate(&probe, tmp.path(), "cargo_target").expect("candidato");
         assert_eq!(cand.bytes, 3000);
@@ -765,7 +771,11 @@ mod tests {
         .expect("probe");
         assert_eq!(snapshot.used_bytes, 96);
         assert_eq!(snapshot.total_bytes, 100);
-        assert_eq!(snapshot.candidates.len(), 1, "só o target não-vazio vira candidato");
+        assert_eq!(
+            snapshot.candidates.len(),
+            1,
+            "só o target não-vazio vira candidato"
+        );
         assert_eq!(snapshot.reclaimable_bytes(), 30_000_000_000);
     }
 }

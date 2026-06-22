@@ -519,7 +519,10 @@ mod tests {
         .expect("run_disk_reclaim");
 
         assert_eq!(outcome, DiskReclaimOutcome::DeniedUnconfirmed);
-        assert!(!ran.get(), "o executor (a poda) NÃO pode rodar sem o gesto humano");
+        assert!(
+            !ran.get(),
+            "o executor (a poda) NÃO pode rodar sem o gesto humano"
+        );
 
         let events = store.events().expect("eventos");
         let gated = events
@@ -562,7 +565,11 @@ mod tests {
                 reclaimed_bytes: 30_000_000_000
             }
         );
-        assert_eq!(seen.get(), Some(1), "o executor recebe os caminhos aprovados");
+        assert_eq!(
+            seen.get(),
+            Some(1),
+            "o executor recebe os caminhos aprovados"
+        );
 
         let ks = kinds(&store);
         let approved = ks.iter().position(|k| k == "DiskReclaimApproved");

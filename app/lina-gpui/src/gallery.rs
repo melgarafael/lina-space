@@ -211,7 +211,9 @@ pub const COPY_M9_TEMPLATES_LABEL: &str = "Ou comece de um modelo pronto";
 #[must_use]
 pub fn template_blurb(slug: &str) -> &'static str {
     match slug {
-        "saas" => "Time pronto pra criar um produto digital: arquitetura, servidor, telas e qualidade.",
+        "saas" => {
+            "Time pronto pra criar um produto digital: arquitetura, servidor, telas e qualidade."
+        }
         "marketing" => "Time pronto pra conteúdo e divulgação: pesquisa e textos de venda.",
         _ => "Um Espaço já montado pra você começar rápido.",
     }
@@ -399,7 +401,8 @@ impl CreateSpaceModal {
     /// O gabarito escolhido (resolvido do índice), ou `None` = criar pelo Foco simples.
     #[must_use]
     pub fn selected_template(&self) -> Option<WorkspaceTemplate> {
-        self.template_idx.and_then(|i| builtin_templates().into_iter().nth(i))
+        self.template_idx
+            .and_then(|i| builtin_templates().into_iter().nth(i))
     }
 
     /// `true` se o card de gabarito `idx` está selecionado (p/ o render destacar).
@@ -1222,9 +1225,15 @@ mod tests {
             .next()
             .expect("ao menos um gabarito");
         assert_eq!(m.selected_template().map(|t| t.slug), Some(t0.slug.clone()));
-        assert_eq!(m.name, t0.name, "Nome acompanha o gabarito enquanto não tocado");
+        assert_eq!(
+            m.name, t0.name,
+            "Nome acompanha o gabarito enquanto não tocado"
+        );
         m.select_template(999);
-        assert!(m.is_template_selected(0), "índice inválido não muda a seleção");
+        assert!(
+            m.is_template_selected(0),
+            "índice inválido não muda a seleção"
+        );
     }
 
     /// Foco e gabarito são MUTUAMENTE EXCLUSIVOS: escolher um zera o outro (a tela nunca mostra
@@ -1238,6 +1247,9 @@ mod tests {
         assert!(!m.has_template(), "escolher um Foco zera o gabarito");
         assert!(m.selected_template().is_none());
         m.select_template(1);
-        assert!(m.has_template() && m.is_template_selected(1), "gabarito volta a vencer o Foco");
+        assert!(
+            m.has_template() && m.is_template_selected(1),
+            "gabarito volta a vencer o Foco"
+        );
     }
 }

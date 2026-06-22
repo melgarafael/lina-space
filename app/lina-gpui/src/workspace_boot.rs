@@ -804,8 +804,15 @@ mod tests {
         );
 
         // Roster semeado como PEDIDOS, não nós vivos — só o gate `admit_node` materializa terminal.
-        let spawns: Vec<_> = records.iter().filter(|r| r.kind == "SpawnRequested").collect();
-        assert_eq!(spawns.len(), saas.roster.len(), "um pedido por papel do gabarito");
+        let spawns: Vec<_> = records
+            .iter()
+            .filter(|r| r.kind == "SpawnRequested")
+            .collect();
+        assert_eq!(
+            spawns.len(),
+            saas.roster.len(),
+            "um pedido por papel do gabarito"
+        );
         assert_eq!(
             records.iter().filter(|r| r.kind == "NodeAdded").count(),
             0,
@@ -823,7 +830,11 @@ mod tests {
         );
 
         // Gating + registry preservados pelo funil único (não furou o gate, não sumiu da lista).
-        assert_eq!(reg.active_count(), 1, "o Espaço do gabarito entra no registry");
+        assert_eq!(
+            reg.active_count(),
+            1,
+            "o Espaço do gabarito entra no registry"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -1858,10 +1858,7 @@ pub fn render(
                     };
                     let mut row = div()
                         .id(("m6-resume-item", i))
-                        .aria_label(format!(
-                            "continuar a conversa {} · {meta}",
-                            r.display_name
-                        ))
+                        .aria_label(format!("continuar a conversa {} · {meta}", r.display_name))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -4655,7 +4652,10 @@ kind = "idle"
         let mut m = modal();
         m.toggle_saved();
         assert!(m.saved_open());
-        assert!(!m.saved_loaded(), "abrir não carrega sozinho — quem carrega é a view");
+        assert!(
+            !m.saved_loaded(),
+            "abrir não carrega sozinho — quem carrega é a view"
+        );
         m.set_saved_sessions(vec![saved_row("Revisor", true), saved_row("Velho", false)]);
         assert!(m.saved_loaded(), "carregou (mesmo que viesse vazio)");
         assert_eq!(m.saved_rows().len(), 2);
@@ -4680,6 +4680,10 @@ kind = "idle"
         assert_eq!(humanize_age(3 * day, 0), "há 3 dias");
         assert_eq!(humanize_age(10 * day, 0), "há 1 semana");
         assert_eq!(humanize_age(21 * day, 0), "há 3 semanas");
-        assert_eq!(humanize_age(0, 999_999), "agora há pouco", "relógio não-monotônico");
+        assert_eq!(
+            humanize_age(0, 999_999),
+            "agora há pouco",
+            "relógio não-monotônico"
+        );
     }
 }

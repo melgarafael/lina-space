@@ -2454,7 +2454,10 @@ mod tests {
         assert_eq!(disk.kind, AttentionKind::Custody, "gate humano duro");
         assert_eq!(disk.evidence, AttentionEvidence::Custody);
         let detail = disk.detail.as_deref().unwrap_or_default();
-        assert!(detail.contains("liberar") && detail.contains("GB"), "copy leiga: {detail}");
+        assert!(
+            detail.contains("liberar") && detail.contains("GB"),
+            "copy leiga: {detail}"
+        );
     }
 
     #[test]

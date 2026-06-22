@@ -1574,7 +1574,10 @@ impl WorkspaceView {
             // F3-5-10: galeria de gabaritos prontos (doc-fonte 59) — escolher um SEMEIA o Espaço
             // (roster + config + pistas) pelo MESMO funil gated; mouse-clicável (teclado é follow-up).
             let mut tpl_cards = div().flex().flex_row().gap_2();
-            for (idx, t) in gallery::CreateSpaceModal::templates().into_iter().enumerate() {
+            for (idx, t) in gallery::CreateSpaceModal::templates()
+                .into_iter()
+                .enumerate()
+            {
                 let selected = m.is_template_selected(idx);
                 tpl_cards = tpl_cards.child(
                     div()

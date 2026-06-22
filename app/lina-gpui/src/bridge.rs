@@ -5383,7 +5383,9 @@ impl NodeManager {
         let sessions = match ResumeSessionStore::replay(&store) {
             Ok(s) => s.sessions,
             Err(e) => {
-                eprintln!("lina-gpui: F3-5-3 — leitura das conversas salvas falhou: {e}; lista vazia");
+                eprintln!(
+                    "lina-gpui: F3-5-3 — leitura das conversas salvas falhou: {e}; lista vazia"
+                );
                 return Vec::new();
             }
         };
@@ -5395,7 +5397,10 @@ impl NodeManager {
             .into_iter()
             .map(|s| {
                 let info = proj.as_ref().and_then(|p| {
-                    s.node.parse::<NodeId>().ok().and_then(|id| p.nodes.get(&id))
+                    s.node
+                        .parse::<NodeId>()
+                        .ok()
+                        .and_then(|id| p.nodes.get(&id))
                 });
                 let display_name = s
                     .label
@@ -5471,9 +5476,11 @@ impl NodeManager {
         role: Option<String>,
         cwd: Option<String>,
     ) -> Result<NodeId, String> {
-        let admission = Self::resume_admission(&command, profile_id, name, role, cwd).ok_or_else(
-            || "Esta conversa não pode ser retomada agora (o motor dela não está disponível).".to_string(),
-        )?;
+        let admission =
+            Self::resume_admission(&command, profile_id, name, role, cwd).ok_or_else(|| {
+                "Esta conversa não pode ser retomada agora (o motor dela não está disponível)."
+                    .to_string()
+            })?;
         self.admit_node(admission)
     }
 
@@ -13463,15 +13470,34 @@ mod tests {
         {
             let mut s = lock(&store);
             seed_terminal(
-                &mut s, antiga, 0.0, 0.0, "Página de vendas", "designer", "Claude Code",
+                &mut s,
+                antiga,
+                0.0,
+                0.0,
+                "Página de vendas",
+                "designer",
+                "Claude Code",
                 Some("claude-code"),
             );
             seed_terminal(
-                &mut s, recente, 0.0, 0.0, "Revisor", "qa", "Claude Code", Some("claude-code"),
+                &mut s,
+                recente,
+                0.0,
+                0.0,
+                "Revisor",
+                "qa",
+                "Claude Code",
+                Some("claude-code"),
             );
             // sem_prompt EXISTE no log (nó projetado) mas NUNCA teve sessão salva.
             seed_terminal(
-                &mut s, sem_prompt, 0.0, 0.0, "Recém-criado", "terminal", "Claude Code",
+                &mut s,
+                sem_prompt,
+                0.0,
+                0.0,
+                "Recém-criado",
+                "terminal",
+                "Claude Code",
                 Some("claude-code"),
             );
         }
@@ -13484,7 +13510,11 @@ mod tests {
         assert_eq!(views[0].display_name, "Revisor");
         assert_eq!(views[0].session_id, "sess-recente");
         assert_eq!(views[0].role.as_deref(), Some("qa"));
-        assert_eq!(views[0].cwd.as_deref(), Some("/tmp/proj"), "pasta enriquecida do log");
+        assert_eq!(
+            views[0].cwd.as_deref(),
+            Some("/tmp/proj"),
+            "pasta enriquecida do log"
+        );
         assert_eq!(views[1].display_name, "Página de vendas");
         assert_eq!(views[1].session_id, "sess-antiga");
         assert!(
@@ -13501,7 +13531,13 @@ mod tests {
         {
             let mut s = lock(&store);
             seed_terminal(
-                &mut s, node, 0.0, 0.0, "Terminal C", "terminal", "Claude Code",
+                &mut s,
+                node,
+                0.0,
+                0.0,
+                "Terminal C",
+                "terminal",
+                "Claude Code",
                 Some("claude-code"),
             );
         }
@@ -13554,11 +13590,17 @@ mod tests {
         match adm.cwd {
             CwdPolicy::UserDir { path, consent } => {
                 assert_eq!(path, PathBuf::from("/tmp/proj"));
-                assert!(consent, "re-entrar na pasta da conversa não é consentimento novo");
+                assert!(
+                    consent,
+                    "re-entrar na pasta da conversa não é consentimento novo"
+                );
             }
             other => panic!("esperava UserDir, veio {other:?}"),
         }
-        assert!(adm.requested_by.is_none(), "retomar é gesto humano, não spawn");
+        assert!(
+            adm.requested_by.is_none(),
+            "retomar é gesto humano, não spawn"
+        );
         // Comando vazio (motor indisponível) ⇒ sem admissão muda.
         assert!(
             NodeManager::resume_admission(&[], None, "x".into(), None, None).is_none(),
@@ -13575,7 +13617,11 @@ mod tests {
         // ignorados pelo cat — o que importa é o nó NASCER pelo funil com a identidade certa.
         let node = nm
             .resume_session(
-                vec!["cat".to_string(), "--resume".to_string(), "sess-x".to_string()],
+                vec![
+                    "cat".to_string(),
+                    "--resume".to_string(),
+                    "sess-x".to_string(),
+                ],
                 Some("claude-code".to_string()),
                 "Conversa retomada".to_string(),
                 Some("backend".to_string()),
@@ -13587,11 +13633,15 @@ mod tests {
             .get(&node)
             .map(|v| v.name.clone())
             .expect("nó no roster");
-        assert_eq!(name, "Conversa retomada", "o nó retomado entra no roster com o nome");
+        assert_eq!(
+            name, "Conversa retomada",
+            "o nó retomado entra no roster com o nome"
+        );
         assert_eq!(nm.node_role(node).as_deref(), Some("backend"));
         // Comando vazio ⇒ recusa leiga (motor da conversa indisponível).
         assert!(
-            nm.resume_session(vec![], None, "x".into(), None, None).is_err(),
+            nm.resume_session(vec![], None, "x".into(), None, None)
+                .is_err(),
             "sem comando ⇒ Err (a UI mostra aviso leigo)"
         );
     }
