@@ -148,6 +148,31 @@ fn is_settled_status(status: &str) -> bool {
     status == NodeStatus::Idle.as_str() || status == NodeStatus::Dead.as_str()
 }
 
+/// **O núcleo da comparação de pertencimento (F3-4-3, spec 36 §2):** interseção DETERMINÍSTICA de
+/// conjuntos de caminhos normalizados — `CodeChanged.paths` × paths reservados por um claim. ZERO LLM
+/// (inv #1): conjuntos de strings, sem heurística. Devolve os caminhos em comum, ordenados (estável);
+/// vazio ⇒ sem conflito (o nó ignora em silêncio). NÃO toca o filesystem — compara o que foi DECLARADO
+/// (paths do `diff-tree`/do item), nunca o disco. Usado pelo handler do router (decidir quem PARA) e
+/// pela projeção de atenção (montar o `CodeConflict`).
+#[must_use]
+pub fn intersecting_paths(changed: &[String], reserved: &[String]) -> Vec<String> {
+    let reserved_set: BTreeSet<&str> = reserved.iter().map(|p| normalize_path(p)).collect();
+    let mut hits: BTreeSet<&str> = BTreeSet::new();
+    for p in changed {
+        let norm = normalize_path(p);
+        if reserved_set.contains(norm) {
+            hits.insert(norm);
+        }
+    }
+    hits.into_iter().map(str::to_string).collect()
+}
+
+/// Normaliza um caminho do repo para a comparação: trim + remove o `./` inicial (ambos relativos ao
+/// repo). Determinístico, sem I/O — a comparação é de strings declaradas, jamais do filesystem.
+fn normalize_path(p: &str) -> &str {
+    p.trim().trim_start_matches("./")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +400,34 @@ mod tests {
         assert!(c.is_branch_pending("lina/f3-4-a"));
         assert!(!c.pending_branches().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── interseção de paths (núcleo da comparação de pertencimento, F3-4-3) ───────────────────────
+
+    #[test]
+    fn intersecting_paths_finds_common_normalized() {
+        let changed = vec![
+            "src/a.rs".to_string(),
+            "./src/b.rs".to_string(),
+            " src/c.rs ".to_string(),
+        ];
+        let reserved = vec![
+            "src/b.rs".to_string(),
+            "src/c.rs".to_string(),
+            "src/d.rs".to_string(),
+        ];
+        // `./src/b.rs` ≡ `src/b.rs` e ` src/c.rs ` ≡ `src/c.rs` (normalização); `a`/`d` não cruzam.
+        assert_eq!(
+            intersecting_paths(&changed, &reserved),
+            vec!["src/b.rs".to_string(), "src/c.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn intersecting_paths_disjoint_is_empty() {
+        // Controle −: sem caminho em comum → vazio (o nó ignora em silêncio, spec 36 §2).
+        let changed = vec!["src/x.rs".to_string()];
+        let reserved = vec!["src/y.rs".to_string()];
+        assert!(intersecting_paths(&changed, &reserved).is_empty());
     }
 }

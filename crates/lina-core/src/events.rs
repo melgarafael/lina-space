@@ -657,6 +657,12 @@ pub enum DomainEvent {
         parents: Vec<String>,
         acceptance: Vec<AcceptanceCriterion>,
         budget_tokens: u64,
+        /// F3-4-3 (spec 36 §2, ADR 0041): arquivos/globs que o item RESERVA (relativos ao repo),
+        /// event-sourcing o `PlanItem.paths`. ADITIVO via `#[serde(default)]` — replay F3-1 (shape
+        /// sem `paths`) reconstrói com `[]`, sem upcast (inv #4). Cruzado com `CodeChanged.paths` pela
+        /// projeção de pertencimento (Trilha B); DADO declarado, JAMAIS autoridade (família ADR 0007).
+        #[serde(default)]
+        paths: Vec<String>,
     },
     /// F3-1 ([8] Feedback negativo, spec 52 §3): veredito de revisão sobre a entrega de um item — o
     /// sinal de erro do laço de qualidade. Variante NOVA → sem `serde(default)` nos campos (exceto os
@@ -1606,12 +1612,14 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
             parents,
             acceptance,
             budget_tokens,
+            paths,
         } => state.plan.apply_item_attributed(
             item,
             goal_id.clone(),
             parents.clone(),
             acceptance.clone(),
             *budget_tokens,
+            paths.clone(),
         ),
         // W4-1: a indexação corrente substitui a anterior (último check-up vence).
         DomainEvent::DiscoveryIndexed { clis } => state.discovered_clis = clis.clone(),

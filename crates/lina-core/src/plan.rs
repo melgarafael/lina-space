@@ -296,12 +296,14 @@ impl Plan {
         parents: Vec<String>,
         acceptance: Vec<AcceptanceCriterion>,
         budget_tokens: u64,
+        paths: Vec<String>,
     ) {
         if let Some(it) = self.find_mut(item) {
             it.goal_id = goal_id;
             it.parents = parents;
             it.acceptance = acceptance;
             it.budget_tokens = budget_tokens;
+            it.paths = paths;
         }
     }
 
@@ -870,7 +872,7 @@ mod tests {
         let mut p = Plan::new("W");
         p.add_item("T1", "schema").unwrap();
         p.add_item("T2", "api").unwrap();
-        p.apply_item_attributed("T2", None, vec!["T1".into()], Vec::new(), 0);
+        p.apply_item_attributed("T2", None, vec!["T1".into()], Vec::new(), 0, Vec::new());
 
         // T1 ainda Todo → claim T2 recusado, sem mutar o item.
         let err = p.try_claim("T2", "@W").unwrap_err();
@@ -900,7 +902,14 @@ mod tests {
         for id in ["T1", "T2", "T3"] {
             p.add_item(id, "x").unwrap();
         }
-        p.apply_item_attributed("T3", None, vec!["T1".into(), "T2".into()], Vec::new(), 0);
+        p.apply_item_attributed(
+            "T3",
+            None,
+            vec!["T1".into(), "T2".into()],
+            Vec::new(),
+            0,
+            Vec::new(),
+        );
         p.try_claim("T1", "@A").unwrap();
         p.try_check("T1", "@A").unwrap(); // só T1 Done
 
@@ -918,7 +927,14 @@ mod tests {
     fn missing_parent_counts_as_not_done() {
         let mut p = Plan::new("W");
         p.add_item("T2", "x").unwrap();
-        p.apply_item_attributed("T2", None, vec!["NAO_EXISTE".into()], Vec::new(), 0);
+        p.apply_item_attributed(
+            "T2",
+            None,
+            vec!["NAO_EXISTE".into()],
+            Vec::new(),
+            0,
+            Vec::new(),
+        );
         assert!(matches!(
             p.try_claim("T2", "@W"),
             Err(PlanError::ParentsNotDone { .. })
@@ -945,7 +961,14 @@ mod tests {
     fn only_present_fields_are_emitted() {
         let mut p = Plan::new("W");
         p.add_item("T1", "x").unwrap();
-        p.apply_item_attributed("T1", None, vec!["P1".into(), "P2".into()], Vec::new(), 0);
+        p.apply_item_attributed(
+            "T1",
+            None,
+            vec!["P1".into(), "P2".into()],
+            Vec::new(),
+            0,
+            Vec::new(),
+        );
         let text = p.render();
         let line = text.lines().last().unwrap();
         assert_eq!(
@@ -971,6 +994,7 @@ mod tests {
                 check_arg: Some("cargo clippy".into()),
             }],
             4096,
+            Vec::new(),
         );
         let text = p.render();
         let back = Plan::parse(&text).expect("parse do proprio render");
@@ -983,6 +1007,30 @@ mod tests {
         assert_eq!(t2.budget_tokens, 4096);
         assert_eq!(t2.acceptance[0].desc, "compila sem warnings");
         assert_eq!(t2.acceptance[0].check_kind, CheckKind::Command);
+    }
+
+    /// F3-4-3 (ADR 0041): a ATRIBUIÇÃO (ponto de entrada do event-sourcing — `PlanItemAttributed`)
+    /// seta os `paths`, e eles sobrevivem ao render→parse. Prova que os paths chegam à projeção pelo
+    /// log (não só pelo parse de um plano.md à mão).
+    #[test]
+    fn apply_item_attributed_sets_paths_and_roundtrips() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "x").unwrap();
+        p.apply_item_attributed(
+            "T1",
+            None,
+            Vec::new(),
+            Vec::new(),
+            0,
+            vec!["src/a.rs".into(), "src/b.rs".into()],
+        );
+        let it = p.find("T1").expect("T1");
+        assert_eq!(
+            it.paths,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        let back = Plan::parse(&p.render()).expect("re-parse");
+        assert_eq!(back.find("T1").expect("T1").paths, it.paths);
     }
 
     /// Texto livre do `acceptance` com o PRÓPRIO separador (` :: `) e barra-invertida round-trippa —
@@ -1001,6 +1049,7 @@ mod tests {
                 check_arg: Some(r"glob\com\barra :: e separador".into()),
             }],
             0,
+            Vec::new(),
         );
         let text = p.render();
         let back = Plan::parse(&text).expect("parse");
