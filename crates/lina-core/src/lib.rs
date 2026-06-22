@@ -191,6 +191,19 @@ pub use suspend::{
     SuspendConfig, SuspendController, SuspendGuards, SuspendState, SuspendTransition,
 };
 
+// ── F3-5 (Auto-aprimoramento, Sessões & Contexto): módulos da onda ──
+// Stubs criados na LARGADA — lib.rs é dono único do Maestro (parecer de topologia do
+// Arquiteto: 7 frentes criariam `pub mod` aqui = multi-editor). Cada frente PREENCHE só o
+// seu arquivo e NÃO edita lib.rs. Re-exports (`pub use`) ficam comigo na integração; o
+// acesso provisório é via caminho completo `lina_core::<mod>::<Tipo>`.
+pub mod buffer_registry; // F3-5-7 · BUFFERS (K)
+pub mod clue; // F3-5-6 · CONTEXTO (I)
+pub mod disk_budget; // F3-5-8 · DISCO (M)
+pub mod resume_session; // F3-5-1 · SESSÕES (B)
+pub mod skill_factory; // F3-5-5 · SKILLS (J)
+pub mod skill_index; // F3-5-4 · SKILLS (J)
+pub mod workspace_template; // F3-5-10 · TEMPLATES (G)
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para
