@@ -210,6 +210,102 @@ where
     }
 }
 
+// ───────────────────────────── F3-5-8 · poda de disco custodiada (ADR 0043) ──────────────────────
+
+/// Classe do gate de uma poda de disco — ação destrutiva LOCAL (apagar bytes do usuário), família
+/// gated-hard (igual `git push`/`rm -rf`, #19). Distinta de [`CLASS_GATED_HARD_EXTERNAL`]: deploy/
+/// pay/send dependem de um SEGREDO no cofre; a poda depende do GESTO humano (não há segredo a injetar).
+pub const CLASS_GATED_HARD_DISK: &str = "gated-hard-disk";
+
+/// Desfecho de uma poda custodiada (F3-5-8, ADR 0043). Prova a salvaguarda inegociável: SEM o gesto
+/// (`confirmed=false`) → zero bytes, zero `DiskReclaimExecuted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskReclaimOutcome {
+    /// Sem o gesto humano → bloqueado. A poda NÃO roda; nada é apagado.
+    DeniedUnconfirmed,
+    /// Gesto dado + poda executada → bytes recuperados (auditado em `DiskReclaimExecuted`).
+    Executed {
+        /// Bytes recuperados pela poda (do executor).
+        reclaimed_bytes: u64,
+    },
+}
+
+/// **A execução custodiada da poda de disco (F3-5-8, ADR 0043) — a porta IRREVERSÍVEL.**
+///
+/// Salvaguarda inegociável (ADR 0043 §2): **zero `DiskReclaimExecuted` sem o gesto humano**.
+/// `approved_by` é EXIBIÇÃO (humaniza quem aprovou na tela), NUNCA autoridade — a autoridade é o
+/// `confirmed` (o gesto custodiado `AttentionKind::Custody`), jamais um campo de payload (ADR 0007).
+/// Forjar `DiskReclaimApproved` no log NÃO passa por aqui ⇒ não dispara poda alguma.
+///
+/// Fluxo (espelha a doutrina de [`run_custody`], mas a ação é LOCAL e destrutiva — sem segredo):
+/// 1. Apenda `ActionGated{class:"gated-hard-disk", decision:"ask"}` — o gate de uma poda fala SEMPRE
+///    `ask` (custódia é o piso; nunca `allow`, em nenhum nível).
+/// 2. `confirmed == false` → apenda `BrokerDenied{disk_reclaim, unconfirmed}`; o executor NÃO roda.
+/// 3. `confirmed == true` → apenda `DiskReclaimApproved` (gate passou; `approved_by` p/ exibição) →
+///    chama `execute` (a poda real `rm`/`cargo clean`, feita pelo supervisor FORA do core) →
+///    apenda `DiskReclaimExecuted{reclaimed_bytes}` (Ok) ou `BrokerDenied{exec_failed}` (Err).
+///
+/// `execute` recebe os caminhos aprovados e devolve os bytes recuperados — é o ÚNICO ponto que toca
+/// o disco; o worker NÃO o exercita com poda real (lição #36), nos testes é injetado.
+///
+/// # Errors
+/// [`BrokerError::Store`] se o append ao log falhar; [`BrokerError::Exec`] se a poda (`execute`) falhar.
+pub fn run_disk_reclaim<F>(
+    candidate_paths: &[String],
+    approved_by: &str,
+    confirmed: bool,
+    store: &mut EventStore,
+    execute: F,
+) -> Result<DiskReclaimOutcome, BrokerError>
+where
+    F: FnOnce(&[String]) -> Result<u64, String>,
+{
+    // O gate de uma poda fala SEMPRE `ask` (a custódia é o piso que a autonomia jamais afrouxa).
+    // `node:None`: a pendência já é item `Custody` (de `DiskReclaimProposed`, attention.rs); um
+    // `node:Some` aqui a duplicaria como GuardAsk (mesmo motivo do `run_custody`).
+    store.append(&DomainEvent::ActionGated {
+        cmd: format!("lina disk reclaim [{} caminho(s)]", candidate_paths.len()),
+        class: CLASS_GATED_HARD_DISK.to_string(),
+        decision: "ask".to_string(),
+        node: None,
+    })?;
+
+    // Sem o gesto humano → bloqueia. O executor NÃO roda; nada é apagado; nenhum `DiskReclaimApproved`.
+    if !confirmed {
+        store.append(&DomainEvent::BrokerDenied {
+            action: "disk_reclaim".to_string(),
+            reason: "unconfirmed".to_string(),
+        })?;
+        return Ok(DiskReclaimOutcome::DeniedUnconfirmed);
+    }
+
+    // Gesto dado: o gate PASSOU. `approved_by` é só exibição; a autoridade foi o `confirmed`.
+    store.append(&DomainEvent::DiskReclaimApproved {
+        candidate_paths: candidate_paths.to_vec(),
+        approved_by: approved_by.to_string(),
+        approved_at_ms: 0,
+    })?;
+
+    // A poda real (rm/cargo clean) — feita pelo executor injetado (supervisor), FORA do core.
+    match execute(candidate_paths) {
+        Ok(reclaimed_bytes) => {
+            store.append(&DomainEvent::DiskReclaimExecuted {
+                reclaimed_bytes,
+                paths: candidate_paths.to_vec(),
+                executed_at_ms: 0,
+            })?;
+            Ok(DiskReclaimOutcome::Executed { reclaimed_bytes })
+        }
+        Err(e) => {
+            store.append(&DomainEvent::BrokerDenied {
+                action: "disk_reclaim".to_string(),
+                reason: "exec_failed".to_string(),
+            })?;
+            Err(BrokerError::Exec(e))
+        }
+    }
+}
+
 // ───────────────────────────────────── testes (AC-6.5, headless com MockStore) ──────────────────
 
 #[cfg(test)]
@@ -400,5 +496,134 @@ mod tests {
             .expect("ActionGated");
         assert_eq!(gated.payload["class"], CLASS_GATED_HARD_EXTERNAL);
         assert_eq!(gated.payload["decision"], "ask");
+    }
+
+    // ───────────────────── F3-5-8 · poda de disco custodiada (ADR 0043) ─────────────────────
+
+    fn target_paths() -> Vec<String> {
+        vec!["/ws/target".to_string()]
+    }
+
+    /// Critério (e) — "zero bytes sem aprovação": SEM o gesto, o executor NÃO roda e nenhum
+    /// `DiskReclaimExecuted`/`DiskReclaimApproved` é apendado; só o gate (`ask`) + `BrokerDenied`.
+    #[test]
+    fn disk_reclaim_unconfirmed_deletes_nothing() {
+        let tmp = TempDir::new("disk-unconfirmed");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let ran = Cell::new(false);
+
+        let outcome = run_disk_reclaim(&target_paths(), "@Fundador", false, &mut store, |_paths| {
+            ran.set(true);
+            Ok(30_000_000_000)
+        })
+        .expect("run_disk_reclaim");
+
+        assert_eq!(outcome, DiskReclaimOutcome::DeniedUnconfirmed);
+        assert!(!ran.get(), "o executor (a poda) NÃO pode rodar sem o gesto humano");
+
+        let events = store.events().expect("eventos");
+        let gated = events
+            .iter()
+            .find(|r| r.kind == "ActionGated")
+            .expect("ActionGated");
+        assert_eq!(gated.payload["class"], CLASS_GATED_HARD_DISK);
+        assert_eq!(gated.payload["decision"], "ask");
+        assert!(events
+            .iter()
+            .any(|r| r.kind == "BrokerDenied" && r.payload["reason"] == "unconfirmed"));
+        assert!(
+            !events.iter().any(|r| r.kind == "DiskReclaimExecuted"),
+            "NUNCA pode haver DiskReclaimExecuted sem o gesto"
+        );
+        assert!(
+            !events.iter().any(|r| r.kind == "DiskReclaimApproved"),
+            "sem o gesto não há nem DiskReclaimApproved"
+        );
+    }
+
+    /// Critério (e) — "com gesto custodiado → DiskReclaimExecuted{reclaimed_bytes>0}": o gesto
+    /// produz `DiskReclaimApproved` ANTES de `DiskReclaimExecuted` (zero Executed sem Approved), e o
+    /// executor recebe os caminhos aprovados.
+    #[test]
+    fn disk_reclaim_confirmed_approves_then_executes() {
+        let tmp = TempDir::new("disk-confirmed");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let seen: Cell<Option<usize>> = Cell::new(None);
+
+        let outcome = run_disk_reclaim(&target_paths(), "@Fundador", true, &mut store, |paths| {
+            seen.set(Some(paths.len()));
+            Ok(30_000_000_000)
+        })
+        .expect("run_disk_reclaim");
+
+        assert_eq!(
+            outcome,
+            DiskReclaimOutcome::Executed {
+                reclaimed_bytes: 30_000_000_000
+            }
+        );
+        assert_eq!(seen.get(), Some(1), "o executor recebe os caminhos aprovados");
+
+        let ks = kinds(&store);
+        let approved = ks.iter().position(|k| k == "DiskReclaimApproved");
+        let executed = ks.iter().position(|k| k == "DiskReclaimExecuted");
+        assert!(approved.is_some() && executed.is_some());
+        assert!(
+            approved < executed,
+            "DiskReclaimApproved deve PRECEDER DiskReclaimExecuted (zero Executed sem Approved)"
+        );
+
+        let events = store.events().expect("eventos");
+        let exec = events
+            .iter()
+            .find(|r| r.kind == "DiskReclaimExecuted")
+            .expect("DiskReclaimExecuted");
+        assert_eq!(exec.payload["reclaimed_bytes"], 30_000_000_000_u64);
+    }
+
+    /// Poda autorizada mas a EXECUÇÃO falha: o gesto fica registrado (`Approved`), mas NÃO há
+    /// `DiskReclaimExecuted` — só `BrokerDenied{exec_failed}`. Honesto e auditável.
+    #[test]
+    fn disk_reclaim_exec_failure_leaves_no_executed() {
+        let tmp = TempDir::new("disk-execfail");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+
+        let err = run_disk_reclaim(&target_paths(), "@Fundador", true, &mut store, |_paths| {
+            Err("rm falhou: permissão negada".to_string())
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, BrokerError::Exec(_)));
+        let events = store.events().expect("eventos");
+        assert!(events.iter().any(|r| r.kind == "DiskReclaimApproved"));
+        assert!(
+            !events.iter().any(|r| r.kind == "DiskReclaimExecuted"),
+            "execução falha NÃO produz DiskReclaimExecuted"
+        );
+        assert!(events
+            .iter()
+            .any(|r| r.kind == "BrokerDenied" && r.payload["reason"] == "exec_failed"));
+    }
+
+    /// MUTAÇÃO da salvaguarda (família ADR 0007): um `DiskReclaimApproved` forjado DIRETO no log
+    /// (sem passar por `run_disk_reclaim`) é inerte — `run_disk_reclaim` é o ÚNICO produtor de
+    /// `DiskReclaimExecuted`, e ele exige `confirmed`. O campo de payload jamais executa a poda.
+    #[test]
+    fn forged_approved_by_in_log_executes_nothing() {
+        let tmp = TempDir::new("disk-forged");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        // O agente forja o gate escrevendo o campo direto no log:
+        store
+            .append(&DomainEvent::DiskReclaimApproved {
+                candidate_paths: target_paths(),
+                approved_by: "atacante".to_string(),
+                approved_at_ms: 0,
+            })
+            .expect("append forjado");
+        // Nenhuma poda nasce de um campo de payload:
+        assert!(
+            !kinds(&store).iter().any(|k| k == "DiskReclaimExecuted"),
+            "forjar approved_by NÃO dispara poda — só o gesto via run_disk_reclaim a produz"
+        );
     }
 }
