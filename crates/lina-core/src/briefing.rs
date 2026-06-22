@@ -18,6 +18,20 @@
 //!   de orquestração — receberia ruído que não usa, e o despacho crava esse gate como critério.
 //! - **K-cap (anti-muro):** as listas de contexto são limitadas a [`CONTEXT_ITEM_CAP`]; a truncação é
 //!   SEMPRE sinalizada (nunca corte silencioso — o terminal sabe que há mais e por onde puxar).
+//!
+//! ## Camadas de CONTEXTO da onda F3-5 (todas gated, todas DADO-nunca-autoridade)
+//! - **Pistas (F3-5-6, doc-fonte 65):** os `paths` que a IA enxerga no projeto deste terminal,
+//!   lidos da projeção [`crate::clue::ClueSet`] e **gated por escopo** (`paths_for(scope)`).
+//! - **Doutrinas-como-hooks (F3-5-9, doc-fonte 61):** no foco "app/sistema" (`dev_app`), injeta as
+//!   doutrinas de arquitetura/segurança/código (anti-slop) — **gated por foco**, texto acima do CLI.
+//! - **Skills (camada de skills):** as skills escolhidas para o nó, lidas da projeção
+//!   [`SelectedSkills`] de `SkillSelected` (emitido por J) — **desacoplado**: lemos a projeção, não
+//!   o código de J.
+
+use std::collections::BTreeMap;
+
+use crate::clue::ClueSet;
+use crate::events::{DomainEvent, EventRecord, EventStore, StoreError};
 
 /// Teto de itens por lista de CONTEXTO (K-cap). O briefing **informa**, não despeja: além disto, o
 /// terminal puxa sob demanda (`lina plan read`). Bounded ⇒ o briefing não cresce sem limite com o log.
@@ -42,6 +56,93 @@ pub struct BriefingInput<'a> {
     /// segundo (instabilidade/ruído sem sinal); a data dá frescor sem poluir nem desestabilizar o
     /// briefing entre dois boots do mesmo dia (replay determinístico).
     pub date: &'a str,
+
+    /// F3-5-6 — escopo/projeto deste terminal; casa com as pistas (`clues.paths_for(scope)`). O
+    /// gating por escopo garante que o terminal só enxergue as pistas do SEU projeto.
+    pub scope: &'a str,
+    /// F3-5-6 — projeção das pistas (`ClueSet`), LIDA aqui. Remover a pista (redefinir vazia) → a
+    /// projeção retrai o escopo → o `paths` some do briefing no próximo turno.
+    pub clues: &'a ClueSet,
+    /// F3-5-9 — foco do Espaço/terminal. "app/sistema" (`dev_app`) ATIVA as doutrinas-como-hooks;
+    /// qualquer outro foco → não entram (gating por foco, default-deny via [`focus_builds_software`]).
+    pub focus: &'a str,
+    /// id do nó (casa com `SkillSelected.node`) — para a camada de skills resolver as do terminal.
+    pub node: &'a str,
+    /// camada de skills — projeção de `SkillSelected` (emitido por J), LIDA aqui (gated por nó). O
+    /// briefing lê a projeção, nunca o código de J (doutrina "fronteira em camadas").
+    pub selected_skills: &'a SelectedSkills,
+}
+
+/// Uma skill escolhida para um nó, reconstruída de `SkillSelected` (F3-5-4). Os campos são DADO de
+/// adoção/contexto — `source`/`trigger` informam de onde/por que a skill entrou, nunca autoridade.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedSkill {
+    /// Nome da skill (ex.: `senior-backend`).
+    pub skill: String,
+    /// Gatilho que casou (palavra-chave/contexto), se houver.
+    pub trigger: Option<String>,
+    /// De onde a skill veio (catálogo/hub/fábrica).
+    pub source: String,
+}
+
+/// Projeção das skills selecionadas por NÓ (replay de `SkillSelected`). Acumula por nó; o último
+/// `SkillSelected` da MESMA skill no mesmo nó vence (atualiza gatilho/origem). `BTreeMap` aninhado
+/// dá ordem estável → briefing determinístico. PURA sobre o log (inv #4), como `ClueSet`/`Mentality`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectedSkills {
+    by_node: BTreeMap<String, BTreeMap<String, SelectedSkill>>,
+}
+
+impl SelectedSkills {
+    /// Reconstrói a projeção do `EventStore` por replay.
+    ///
+    /// # Errors
+    /// Falha ao ler o event log.
+    pub fn replay(store: &EventStore) -> Result<Self, StoreError> {
+        Ok(Self::from_records(&store.events()?))
+    }
+
+    /// **Coração determinístico (PURO).** Varre os registros e agrupa as skills escolhidas por nó.
+    #[must_use]
+    pub fn from_records(records: &[EventRecord]) -> Self {
+        let mut by_node: BTreeMap<String, BTreeMap<String, SelectedSkill>> = BTreeMap::new();
+        for record in records {
+            // Indecodificável → pula (projeção DERIVADA, não validadora — padrão `ClueSet`/`Mentality`).
+            let Ok(event) =
+                DomainEvent::from_record(&record.kind, record.version, record.payload.clone())
+            else {
+                continue;
+            };
+            if let DomainEvent::SkillSelected {
+                node,
+                skill,
+                trigger,
+                source,
+            } = event
+            {
+                // Último-vence por (nó, skill): re-selecionar a mesma skill atualiza gatilho/origem,
+                // sem duplicar.
+                by_node.entry(node).or_default().insert(
+                    skill.clone(),
+                    SelectedSkill {
+                        skill,
+                        trigger,
+                        source,
+                    },
+                );
+            }
+        }
+        Self { by_node }
+    }
+
+    /// As skills escolhidas para `node`, em ordem estável (vazio se nenhuma). Gating por nó.
+    #[must_use]
+    pub fn skills_for(&self, node: &str) -> Vec<&SelectedSkill> {
+        self.by_node
+            .get(node)
+            .map(|m| m.values().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Os sete invariantes inegociáveis do produto (CLAUDE.md) — a espinha ESTÁVEL do briefing. Forma
@@ -69,6 +170,21 @@ pub fn role_orchestrates(role: &str) -> bool {
         .trim()
         .to_ascii_uppercase();
     matches!(norm.as_str(), "MAESTRO" | "ORQUESTRADOR")
+}
+
+/// `true` se o FOCO do Espaço é "desenvolver app/sistema" — o gatilho das doutrinas-como-hooks
+/// (doc-fonte 61). Casa com o id de contrato `dev_app` (`FocusPreset::DevApp`, gravado em
+/// `WorkspaceCreated.focus_preset`) e com as formas humanas equivalentes. Allowlist explícita
+/// (default-deny: `research_content`/`blank`/`geral`/"" → sem doutrina), espelhando
+/// [`role_orchestrates`]. Tolerante a `@`/caixa/espaços.
+#[must_use]
+pub fn focus_builds_software(focus: &str) -> bool {
+    let norm = focus
+        .trim()
+        .trim_start_matches('@')
+        .trim()
+        .to_ascii_lowercase();
+    matches!(norm.as_str(), "dev_app" | "app/sistema" | "app" | "sistema")
 }
 
 /// Monta o briefing em camadas para `input`, **gated por papel**. Função PURA: mesma entrada → mesma
@@ -104,12 +220,60 @@ pub fn build_briefing(input: &BriefingInput) -> String {
          observada (rodou, leu o output, viu o comportamento) — nunca por suposicao.\n",
     );
 
+    // ── DOUTRINAS-COMO-HOOKS (F3-5-9, doc-fonte 61) — gated por FOCO, texto acima do CLI (inv #1) ──
+    // No foco "app/sistema" (`dev_app`), as doutrinas seniores de arquitetura/segurança/código entram
+    // automaticamente (anti-slop onde mais importa: a base de longo prazo do projeto). Fora do foco,
+    // não entram — seriam ruído. ZERO LLM: é texto fixo do produto, montado por gating determinístico.
+    if focus_builds_software(input.focus) {
+        out.push_str(&format!(
+            "\n[DOUTRINA] doutrina app/sistema — aplique como {} senior (anti-slop em arquitetura e seguranca):\n",
+            display_role(input.role)
+        ));
+        out.push_str(
+            "  arquitetura: antes de qualquer decisao, pergunte \"isto fecha uma porta acima?\" — se\n  \
+             sim, PARE e registre um ADR curto; nada de abstracao especulativa nem refactor de brinde.\n",
+        );
+        out.push_str(
+            "  seguranca: nenhum campo escrito por agente (from/payload/contrato/filename) decide\n  \
+             identidade, ordem ou autorizacao — contrato e DADO, jamais autoridade; acao irreversivel\n  \
+             exige gate humano.\n",
+        );
+        out.push_str(
+            "  codigo: causa raiz acima de fix temporario; zero erro engolido (catch vazio / unwrap em\n  \
+             producao); nomes dizem o QUE; o obvio/morno (slop) nao passa.\n",
+        );
+    }
+
     // ───────── CONTEXTO — o projeto e as decisões vivas (K-capped) ─────────
     out.push_str("\n[CONTEXTO] o projeto e as decisoes vivas\n");
     out.push_str("plano (itens):\n");
     push_capped(&mut out, input.plan_items, "lina plan read");
     out.push_str("decisoes vivas:\n");
     push_capped(&mut out, input.decisions, "lina plan read");
+
+    // Pistas (F3-5-6, doc-fonte 65) — gated por ESCOPO: só entra a pista ATIVA do projeto deste
+    // terminal. Removida (redefinida vazia) → a projeção retrai o escopo → a seção some no próximo
+    // turno. `paths` é DADO de contexto (o que a IA olha), nunca autoridade de acesso.
+    let clue_paths = input.clues.paths_for(input.scope);
+    if !clue_paths.is_empty() {
+        out.push_str("pistas (arquivos/pastas que a IA enxerga neste projeto):\n");
+        for path in clue_paths {
+            out.push_str(&format!("  - {path}\n"));
+        }
+    }
+
+    // Skills (camada de skills) — gated por NÓ: as skills escolhidas para este terminal, lidas da
+    // projeção `SelectedSkills` de `SkillSelected` (emitido por J). Desacoplado: lemos a projeção.
+    let node_skills = input.selected_skills.skills_for(input.node);
+    if !node_skills.is_empty() {
+        out.push_str("skills escolhidas para este terminal:\n");
+        for s in node_skills {
+            match &s.trigger {
+                Some(t) => out.push_str(&format!("  - {} (gatilho: {t})\n", s.skill)),
+                None => out.push_str(&format!("  - {}\n", s.skill)),
+            }
+        }
+    }
 
     // ───────── VOLÁTIL — o estado de agora (re-leia a cada boot) ─────────
     out.push_str(&format!("\n[VOLATIL] estado de agora — {}\n", input.date));
@@ -170,6 +334,8 @@ mod tests {
         let plan = lines(&["T1 :: montar a tela :: @owner:voce"]);
         let dec = lines(&["UI usa tokens semanticos, nunca cor hard-coded"]);
         let live = lines(&["@Terminal A: Busy", "@Terminal B: Idle"]);
+        let clues = ClueSet::default();
+        let selected = SelectedSkills::default();
         build_briefing(&BriefingInput {
             role,
             skills: &skills,
@@ -177,6 +343,11 @@ mod tests {
             decisions: &dec,
             live_state: &live,
             date: "2026-06-18",
+            scope: "",
+            clues: &clues,
+            focus: "", // sem foco app/sistema → sem doutrinas (isola os testes legados)
+            node: "",
+            selected_skills: &selected,
         })
     }
 
@@ -249,6 +420,8 @@ mod tests {
         let many: Vec<String> = (0..CONTEXT_ITEM_CAP + 5)
             .map(|i| format!("T{i} :: item :: @owner:?"))
             .collect();
+        let clues = ClueSet::default();
+        let selected = SelectedSkills::default();
         let b = build_briefing(&BriefingInput {
             role: "BACKEND",
             skills: &[],
@@ -256,6 +429,11 @@ mod tests {
             decisions: &[],
             live_state: &[],
             date: "2026-06-18",
+            scope: "",
+            clues: &clues,
+            focus: "",
+            node: "",
+            selected_skills: &selected,
         });
         // Exatamente CONTEXT_ITEM_CAP itens de plano renderizados + a linha de "+N".
         let rendered = b.matches("  - T").count();
@@ -286,5 +464,214 @@ mod tests {
             !b.contains("protocolo de orquestracao"),
             "sem papel = worker (default-deny)"
         );
+    }
+
+    // ───────── camadas de contexto da F3-5 (pistas · doutrinas-como-hooks · skills) ─────────
+
+    /// Monta um briefing variando só os parâmetros contextuais (escopo/pistas/foco/nó/skills).
+    fn briefing_with(
+        scope: &str,
+        clues: &ClueSet,
+        focus: &str,
+        node: &str,
+        selected: &SelectedSkills,
+    ) -> String {
+        build_briefing(&BriefingInput {
+            role: "BACKEND",
+            skills: &[],
+            plan_items: &[],
+            decisions: &[],
+            live_state: &[],
+            date: "2026-06-18",
+            scope,
+            clues,
+            focus,
+            node,
+            selected_skills: selected,
+        })
+    }
+
+    fn clue_record(seq: u64, scope: &str, paths: &[&str]) -> EventRecord {
+        let event = DomainEvent::ClueSetDefined {
+            scope: scope.to_string(),
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            label: None,
+        };
+        EventRecord {
+            seq,
+            ts: seq,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa"),
+        }
+    }
+
+    fn skill_record(
+        seq: u64,
+        node: &str,
+        skill: &str,
+        trigger: Option<&str>,
+        source: &str,
+    ) -> EventRecord {
+        let event = DomainEvent::SkillSelected {
+            node: node.to_string(),
+            skill: skill.to_string(),
+            trigger: trigger.map(str::to_string),
+            source: source.to_string(),
+        };
+        EventRecord {
+            seq,
+            ts: seq,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa"),
+        }
+    }
+
+    /// Critério (c): pista definida → o terminal daquele projeto enxerga os arquivos no briefing.
+    #[test]
+    fn clue_paths_appear_in_briefing_for_scope() {
+        let clues =
+            ClueSet::from_records(&[clue_record(1, "checkout", &["src/checkout/", "docs/x"])]);
+        let b = briefing_with("checkout", &clues, "", "", &SelectedSkills::default());
+        assert!(b.contains("src/checkout/"), "a pista entra no contexto");
+        assert!(b.contains("docs/x"));
+        assert!(b.contains("pistas"), "a camada de pistas é rotulada");
+    }
+
+    /// Critério (c): remover a pista (redefinir vazia) → some do briefing no próximo turno.
+    #[test]
+    fn clue_disappears_from_briefing_when_removed() {
+        let clues = ClueSet::from_records(&[
+            clue_record(1, "checkout", &["src/checkout/"]),
+            clue_record(2, "checkout", &[]), // remoção
+        ]);
+        let b = briefing_with("checkout", &clues, "", "", &SelectedSkills::default());
+        assert!(
+            !b.contains("src/checkout/"),
+            "pista removida não aparece mais no briefing"
+        );
+        assert!(
+            !b.contains("pistas (arquivos"),
+            "sem pista ativa → a camada de pistas nem é rotulada (some)"
+        );
+    }
+
+    /// Gating por escopo: o terminal de OUTRO escopo não enxerga a pista (zero vazamento).
+    #[test]
+    fn clue_is_scoped_in_briefing() {
+        let clues = ClueSet::from_records(&[clue_record(1, "checkout", &["src/checkout/"])]);
+        let b = briefing_with("landing", &clues, "", "", &SelectedSkills::default());
+        assert!(
+            !b.contains("src/checkout/"),
+            "o escopo 'landing' não vê a pista de 'checkout'"
+        );
+    }
+
+    /// Critério (c): doutrinas-como-hooks entram no foco "app/sistema" e NÃO entram fora dele.
+    #[test]
+    fn doctrines_gated_by_app_focus() {
+        let with_focus = briefing_with(
+            "",
+            &ClueSet::default(),
+            "dev_app",
+            "",
+            &SelectedSkills::default(),
+        );
+        assert!(
+            with_focus.contains("doutrina app/sistema"),
+            "no foco app/sistema as doutrinas entram"
+        );
+        assert!(
+            with_focus.contains("fecha uma porta"),
+            "doutrina de arquitetura presente"
+        );
+        assert!(
+            with_focus.contains("contrato e DADO, jamais autoridade"),
+            "doutrina de segurança presente (fiel ao invariante)"
+        );
+
+        let no_focus = briefing_with(
+            "",
+            &ClueSet::default(),
+            "research_content",
+            "",
+            &SelectedSkills::default(),
+        );
+        assert!(
+            !no_focus.contains("doutrina app/sistema"),
+            "fora do foco app/sistema as doutrinas NÃO entram"
+        );
+    }
+
+    /// `focus_builds_software`: allowlist (dev_app + formas humanas); default-deny no resto.
+    #[test]
+    fn focus_builds_software_is_allowlist_default_deny() {
+        for yes in ["dev_app", "app/sistema", "App", " @sistema "] {
+            assert!(focus_builds_software(yes), "{yes:?} é foco de app/sistema");
+        }
+        for no in ["research_content", "blank", "geral", "", "marketing"] {
+            assert!(!focus_builds_software(no), "{no:?} não dispara doutrinas");
+        }
+    }
+
+    /// Camada de skills: o briefing LÊ a projeção `SelectedSkills` e injeta as skills do nó.
+    #[test]
+    fn selected_skills_layer_reads_projection_gated_by_node() {
+        let selected = SelectedSkills::from_records(&[skill_record(
+            1,
+            "n1",
+            "senior-backend",
+            Some("api"),
+            "catalogo",
+        )]);
+        let b1 = briefing_with("", &ClueSet::default(), "", "n1", &selected);
+        assert!(
+            b1.contains("senior-backend"),
+            "o nó n1 vê a skill escolhida"
+        );
+        assert!(b1.contains("skills escolhidas"), "a camada é rotulada");
+
+        let b2 = briefing_with("", &ClueSet::default(), "", "n2", &selected);
+        assert!(
+            !b2.contains("senior-backend"),
+            "outro nó não vê a skill de n1 (gating por nó)"
+        );
+    }
+
+    /// Projeção `SelectedSkills`: agrupa por nó; a MESMA skill re-selecionada no nó atualiza (último
+    /// vence), não duplica.
+    #[test]
+    fn selected_skills_projection_groups_by_node_last_wins() {
+        let selected = SelectedSkills::from_records(&[
+            skill_record(1, "n1", "senior-backend", Some("api"), "catalogo"),
+            skill_record(2, "n1", "lina-agent-bus", None, "catalogo"),
+            skill_record(3, "n1", "senior-backend", Some("query"), "hub"), // mesma skill, atualiza
+            skill_record(4, "n2", "senior-frontend", None, "catalogo"),
+        ]);
+        let n1 = selected.skills_for("n1");
+        assert_eq!(n1.len(), 2, "n1 tem 2 skills distintas (sem duplicar)");
+        let backend = n1
+            .iter()
+            .find(|s| s.skill == "senior-backend")
+            .expect("achou senior-backend");
+        assert_eq!(
+            backend.trigger.as_deref(),
+            Some("query"),
+            "a re-seleção atualiza o gatilho (último vence)"
+        );
+        assert_eq!(backend.source, "hub");
+        assert_eq!(selected.skills_for("n2").len(), 1);
+        assert!(selected.skills_for("ausente").is_empty());
+    }
+
+    /// Pureza preservada com as camadas novas: mesma entrada (projeções + foco) → byte-idêntico.
+    #[test]
+    fn build_stays_pure_with_contextual_layers() {
+        let clues = ClueSet::from_records(&[clue_record(1, "s", &["p/"])]);
+        let selected = SelectedSkills::from_records(&[skill_record(1, "n", "sk", None, "src")]);
+        let a = briefing_with("s", &clues, "dev_app", "n", &selected);
+        let b = briefing_with("s", &clues, "dev_app", "n", &selected);
+        assert_eq!(a, b);
     }
 }
