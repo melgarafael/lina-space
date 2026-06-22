@@ -23,11 +23,12 @@
 //!
 //! ## Invariantes honrados
 //! - **Template é DADO, JAMAIS autoridade (regra-mãe da onda).** `requested_by` dos spawns semeados
-//!   é a ORIGEM SINTÉTICA [`TEMPLATE_ORIGIN`] (carimbo server-side de auditoria, padrão
-//!   `STRUCTURAL_JUDGE`/`HUMAN_GESTURE` do router), nunca um nó forjado: o `SpawnRequested` é só um
-//!   PEDIDO no log — o terminal físico só nasce pelo funil `admit_node`/gate (ADR 0022). Semear não
-//!   cria nó nem escala privilégio. `by` dos params é `"preset:<slug>"` (camada de origem, não
-//!   credencial). ZERO LLM: a expansão do template é determinística.
+//!   é o `NodeId` do INSTANCIADOR, **recebido como parâmetro do caller server-side** (o nó/supervisor
+//!   que instancia) — NUNCA inventado pelo template: `requested_by` é o "sender autenticado" no
+//!   contrato de `SpawnRequested`, então o template só TRANSPORTA fielmente o id do caller, sem forjá-lo.
+//!   Ainda assim semear não cria nó: o `SpawnRequested` é só um PEDIDO — o terminal físico só nasce
+//!   pelo funil `admit_node`/gate (ADR 0022), sem escalar privilégio. `by` dos params é
+//!   `"preset:<slug>"` (camada de origem, não credencial). ZERO LLM: a expansão é determinística.
 //! - **Determinismo / replay idêntico (inv #4):** [`seed_events`] é PURO (sem relógio, sem
 //!   `Uuid::now_v7`) — os ids são derivados do `slug`, então duas instanciações produzem os MESMOS
 //!   payloads e as projeções reconstroem byte-a-byte. (O `ts` que `EventStore::append` carimba é
@@ -40,13 +41,6 @@ use std::path::Path;
 use crate::events::{AcceptanceCriterion, CheckKind, DomainEvent, Effort, EventStore, StoreError};
 use crate::workspace::{Workspace, WorkspaceError};
 use crate::NodeId;
-
-/// Origem SINTÉTICA dos `SpawnRequested` semeados por um template (os bytes soletram `TMPL`).
-/// Espelha [`STRUCTURAL_JUDGE`](crate::router) (`nil`) / `HUMAN_GESTURE` do router: um `NodeId`
-/// fixo e determinístico que **não é um nó do roster** e nunca colide com um nó real (que nasce
-/// `Uuid::now_v7`). É CARIMBO DE ORIGEM para auditoria ("este pedido veio de um template"), **jamais
-/// autoridade** (regra-mãe ADR 0007): o pedido semeado só vira terminal pelo funil `admit_node`/gate.
-pub const TEMPLATE_ORIGIN: NodeId = NodeId::from_u128(0x544D_504C_0000_0000_0000_0000_0000_0000);
 
 /// Um papel pré-definido do roster de um template → um [`DomainEvent::SpawnRequested`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +134,7 @@ impl WorkspaceTemplate {
 /// NÃO inclui o `WorkspaceCreated` (foco/doutrina): esse é do `create`, encadeado ANTES por
 /// [`create_workspace_from_template`] (o template não toca a criação — só semeia depois).
 #[must_use]
-pub fn seed_events(template: &WorkspaceTemplate) -> Vec<DomainEvent> {
+pub fn seed_events(template: &WorkspaceTemplate, requested_by: NodeId) -> Vec<DomainEvent> {
     let root_cause_id = template.root_cause();
     let mut events = Vec::new();
 
@@ -148,7 +142,7 @@ pub fn seed_events(template: &WorkspaceTemplate) -> Vec<DomainEvent> {
     for (idx, r) in template.roster.iter().enumerate() {
         events.push(DomainEvent::SpawnRequested {
             id: format!("template:{}:spawn:{idx}", template.slug),
-            requested_by: TEMPLATE_ORIGIN,
+            requested_by,
             name: r.name.clone(),
             role: r.role.clone(),
             root_cause_id: root_cause_id.clone(),
@@ -209,8 +203,9 @@ pub fn seed_events(template: &WorkspaceTemplate) -> Vec<DomainEvent> {
 pub fn instanciar(
     template: &WorkspaceTemplate,
     store: &mut EventStore,
+    requested_by: NodeId,
 ) -> Result<usize, StoreError> {
-    let events = seed_events(template);
+    let events = seed_events(template, requested_by);
     for ev in &events {
         store.append(ev)?;
     }
@@ -227,10 +222,11 @@ pub fn instanciar(
 pub fn create_workspace_from_template(
     root: impl AsRef<Path>,
     template: &WorkspaceTemplate,
+    requested_by: NodeId,
     default_cwd: Option<&Path>,
 ) -> Result<Workspace, WorkspaceError> {
     let mut ws = Workspace::create(root, &template.name, &template.focus_preset, default_cwd)?;
-    instanciar(template, ws.store_mut())?;
+    instanciar(template, ws.store_mut(), requested_by)?;
     Ok(ws)
 }
 
@@ -451,6 +447,12 @@ mod tests {
         events.iter().filter(|e| e.kind == kind).count()
     }
 
+    /// Id sintético do INSTANCIADOR nos testes (o nó/supervisor server-side que instancia o
+    /// template). No produto vem do caller AUTENTICADO; aqui é fixo só para asserção.
+    fn caller() -> NodeId {
+        NodeId::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0042)
+    }
+
     /// Critério (f): instanciar SEMEIA o log com roster + params + pistas + backlog na ORDEM certa.
     #[test]
     fn instanciar_semeia_o_log_dos_quatro_tipos() {
@@ -458,7 +460,7 @@ mod tests {
         let mut store = EventStore::open(tmp.path()).expect("abrir store");
         let t = template_saas();
 
-        let n = instanciar(&t, &mut store).expect("instanciar");
+        let n = instanciar(&t, &mut store, caller()).expect("instanciar");
         let events = store.events().expect("ler log");
 
         // roster (4) + params (2) + pistas (1) + backlog (2 itens × 2 eventos = 4) = 11
@@ -484,7 +486,7 @@ mod tests {
         let tmp = TempDir::new("replay");
         let mut store = EventStore::open(tmp.path()).expect("abrir store");
         let t = template_saas();
-        instanciar(&t, &mut store).expect("instanciar");
+        instanciar(&t, &mut store, caller()).expect("instanciar");
 
         // params → ParamsLedger (camada workspace)
         let ledger = ParamsLedger::replay(&store).expect("replay params");
@@ -526,7 +528,7 @@ mod tests {
         let t = template_marketing();
         {
             let mut store = EventStore::open(tmp.path()).expect("abrir store");
-            instanciar(&t, &mut store).expect("instanciar");
+            instanciar(&t, &mut store, caller()).expect("instanciar");
         }
         // Nova abertura, do zero, do mesmo diretório.
         let reaberto = EventStore::open(tmp.path()).expect("reabrir store");
@@ -546,12 +548,12 @@ mod tests {
     fn seed_events_e_deterministico() {
         let t = template_saas();
         assert_eq!(
-            seed_events(&t),
-            seed_events(&t),
-            "duas expansões do mesmo template são byte-a-byte iguais"
+            seed_events(&t, caller()),
+            seed_events(&t, caller()),
+            "duas expansões do mesmo template (mesmo caller) são byte-a-byte iguais"
         );
-        // E os ids carregam a origem do template (auditável, não-aleatório).
-        match &seed_events(&t)[0] {
+        // Os ids carregam a origem do template (auditável, não-aleatório); o requested_by é o caller.
+        match &seed_events(&t, caller())[0] {
             DomainEvent::SpawnRequested {
                 id,
                 requested_by,
@@ -562,8 +564,9 @@ mod tests {
                 assert_eq!(id, "template:saas:spawn:0");
                 assert_eq!(root_cause_id, "template:saas");
                 assert_eq!(
-                    *requested_by, TEMPLATE_ORIGIN,
-                    "origem sintética, não nó real"
+                    *requested_by,
+                    caller(),
+                    "carimba o id do INSTANCIADOR (caller), não uma constante do template"
                 );
                 assert_eq!(*effort, Some(Effort::High), "Arquiteto roda em High");
             }
@@ -573,30 +576,33 @@ mod tests {
         }
     }
 
-    /// SEGURANÇA (regra-mãe): a origem do template NUNCA é um nó real do roster — é a sentinela
-    /// determinística, distinta de qualquer `Uuid::now_v7`. Forjá-la não confere identidade
-    /// (o nó só nasce pelo admit_node/gate; aqui só há um PEDIDO no log).
+    /// SEGURANÇA + despacho (regra-mãe): `requested_by` é RECEBIDO do caller server-side, NUNCA
+    /// inventado pelo template. Toda `SpawnRequested` semeada carrega EXATAMENTE o id passado; um
+    /// caller diferente → carimbo diferente (prova que é o parâmetro, não uma constante embutida).
+    /// O pedido segue sendo só um PEDIDO no log — o terminal só nasce pelo admit_node/gate (ADR 0022).
     #[test]
-    fn origem_de_template_e_sentinela_nao_no_real() {
-        assert_ne!(
-            TEMPLATE_ORIGIN,
-            NodeId::nil(),
-            "distinta do STRUCTURAL_JUDGE"
-        );
-        // Um nó real nasce de Uuid::now_v7 (versão 7); a sentinela do template não tem versão v7.
-        assert_ne!(
-            TEMPLATE_ORIGIN.get_version_num(),
-            7,
-            "a origem do template nunca coincide com um NodeId real (v7)"
-        );
-        for ev in seed_events(&template_marketing()) {
+    fn seed_stamps_caller_supplied_requested_by() {
+        let a = NodeId::from_u128(0x00AA);
+        let b = NodeId::from_u128(0x00BB);
+        assert_ne!(a, b, "callers distintos");
+
+        for ev in seed_events(&template_saas(), a) {
             if let DomainEvent::SpawnRequested { requested_by, .. } = ev {
                 assert_eq!(
-                    requested_by, TEMPLATE_ORIGIN,
-                    "todo spawn carimba a sentinela"
+                    requested_by, a,
+                    "todo spawn carrega o id do caller A, sem forjar"
                 );
             }
         }
+        // Caller diferente → carimbo diferente: o template TRANSPORTA o id, não o inventa.
+        let first_b = seed_events(&template_saas(), b)
+            .into_iter()
+            .find_map(|ev| match ev {
+                DomainEvent::SpawnRequested { requested_by, .. } => Some(requested_by),
+                _ => None,
+            })
+            .expect("há ao menos um spawn no roster");
+        assert_eq!(first_b, b, "o carimbo segue o caller B");
     }
 
     /// Critério (f): instanciar pela GALERIA (foco do template → doutrinas-como-hooks) — o caminho
@@ -605,8 +611,8 @@ mod tests {
     fn create_from_template_grava_o_foco_que_liga_as_doutrinas() {
         let tmp_saas = TempDir::new("create-saas");
         let saas = template_saas();
-        let mut ws =
-            create_workspace_from_template(tmp_saas.path(), &saas, None).expect("criar saas");
+        let mut ws = create_workspace_from_template(tmp_saas.path(), &saas, caller(), None)
+            .expect("criar saas");
         let proj = ws.store_mut().project().expect("project");
         assert_eq!(
             proj.focus_preset.as_deref(),
@@ -624,8 +630,8 @@ mod tests {
 
         let tmp_mkt = TempDir::new("create-mkt");
         let mkt = template_marketing();
-        let mut ws2 =
-            create_workspace_from_template(tmp_mkt.path(), &mkt, None).expect("criar mkt");
+        let mut ws2 = create_workspace_from_template(tmp_mkt.path(), &mkt, caller(), None)
+            .expect("criar mkt");
         let proj2 = ws2.store_mut().project().expect("project");
         assert!(
             !focus_builds_software(proj2.focus_preset.as_deref().unwrap_or("")),
