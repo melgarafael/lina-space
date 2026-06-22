@@ -61,6 +61,10 @@ fn main() -> ExitCode {
         Some("goal") => run_goal(&args[1..]),
         Some("code-changed") => run_code_changed(&args[1..]),
         Some("branch-integrated") => run_branch_integrated(&args[1..]),
+        Some("skill") => run_skill(&args[1..]),
+        Some("clue") => run_clue(&args[1..]),
+        Some("disk") => run_disk(&args[1..]),
+        Some("template") => run_template(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -70,7 +74,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -948,6 +952,11 @@ fn run_history(args: &[String]) -> ExitCode {
 }
 
 fn run_check(args: &[String]) -> ExitCode {
+    // F3-5-7: `lina check --buffers` — modo de OCUPAÇÃO (sem alvo), derivado do log. Detectado
+    // antes de exigir o alvo (que os demais `check @nó` pedem).
+    if args.iter().any(|a| a == "--buffers") {
+        return run_check_buffers();
+    }
     let Some(target_raw) = args.first() else {
         usage();
         return ExitCode::from(2);
@@ -1704,6 +1713,383 @@ fn run_branch_integrated(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("lina: falha ao enfileirar na mailbox: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ═══════════════════════ F3-5 FIAÇÃO CORE: verbos das 7 features ═══════════════════════
+// Os verbos read-only leem o espelho `log.jsonl` (`parse_log_records`) como os demais (sem abrir
+// o SQLite — não disputa o WAL do app). Os verbos que MUTAM enfileiram um contrato; o supervisor
+// emite o evento carimbando a origem SERVER-SIDE (o bin nunca decide identidade pelo payload).
+
+// ── F3-5-4/5: `lina skill <check|select|propose>` ──
+
+/// `lina skill <check|select|propose>` (F3-5-4/5). `check` é read-only (formato + guard de
+/// inline-shell); `select`/`propose` enfileiram o contrato (o supervisor emite `SkillSelected`/
+/// `SkillFactoryProposed` carimbando o `node` SERVER-SIDE). A lógica pura vive em `skills.rs`.
+fn run_skill(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("check") => run_skill_check(args.get(1)),
+        Some("select") => run_skill_select(&args[1..]),
+        Some("propose") => run_skill_propose(&args[1..]),
+        _ => {
+            eprintln!("lina: uso: lina skill <check <path> | select --context <txt> [--have <tool>]... | propose <nome> [--ref <url>]...>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina skill check <path>` — read-only: valida o formato (core) e o risco de carga (guard de
+/// inline-shell). Exit 3 = "precisa gate humano" (inline-shell), não erro de execução.
+fn run_skill_check(path: Option<&String>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("lina: skill check exige <path-da-SKILL.md>");
+        return ExitCode::from(2);
+    };
+    let md = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: nao foi possivel ler {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let check = lina_bootstrap::skills::skill_check(&md);
+    match &check.format {
+        Ok(()) => println!("formato: ok"),
+        Err(e) => println!("formato: INVALIDO — {e}"),
+    }
+    if check.load_class == lina_core::ActionClass::Routine {
+        println!("carga: liberada (skill e so dado, sem inline-shell)");
+        ExitCode::SUCCESS
+    } else {
+        println!("carga: GATE HUMANO — a skill tem inline-shell (codigo nao-confiavel); revise antes de habilitar");
+        ExitCode::from(3)
+    }
+}
+
+/// `lina skill select --context <txt> [--have <tool>]...` — roda o seletor PURO sobre o índice
+/// (catálogo + `.claude/skills`) filtrado pelas tools presentes; enfileira `skill.select` por skill
+/// que casou.
+fn run_skill_select(args: &[String]) -> ExitCode {
+    let (scalars, have) = parse_kv_flags(args, "--have");
+    let Some(context) = scalars.get("--context") else {
+        eprintln!("lina: skill select exige --context <txt>");
+        return ExitCode::from(2);
+    };
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let present: std::collections::BTreeSet<String> = have.into_iter().collect();
+    let index = lina_bootstrap::skills::build_skill_index(Some(Path::new(".claude/skills")));
+    let selections = lina_core::skill_index::select(&index, &present, context);
+    if selections.is_empty() {
+        println!("nenhuma skill casou o contexto (com as tools presentes)");
+        return ExitCode::SUCCESS;
+    }
+    let mailbox = Mailbox::new(mailbox_root());
+    for sel in &selections {
+        let msg = lina_bootstrap::skills::build_skill_select_envelope(
+            &from,
+            &sel.name,
+            sel.trigger.as_deref(),
+            "catalog",
+        );
+        if let Err(e) = enqueue_per_node(&mailbox, &from, &msg) {
+            eprintln!("lina: falha ao enfileirar skill.select: {e}");
+            return ExitCode::from(1);
+        }
+        println!(
+            "ok: skill '{}' selecionada (gatilho: {})",
+            sel.name,
+            sel.trigger.as_deref().unwrap_or("-")
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `lina skill propose <nome> [--ref <url>]...` — a fábrica PROPÕE (gate humano antes de criar).
+fn run_skill_propose(args: &[String]) -> ExitCode {
+    let (_, refs) = parse_kv_flags(args, "--ref");
+    let Some(name) = args.first().filter(|a| !a.starts_with('-')) else {
+        eprintln!("lina: skill propose exige <nome> [--ref <url>]...");
+        return ExitCode::from(2);
+    };
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let msg = lina_bootstrap::skills::build_skill_propose_envelope(&from, name, &refs);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &from, &msg) {
+        Ok(()) => {
+            println!(
+                "ok: skill.propose '{name}' enfileirado (gate humano antes de criar/habilitar)"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar skill.propose: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ── F3-5-6: `lina clue <list|define|clear>` ──
+
+/// `lina clue <list|define|clear>` (F3-5-6). `list` é read-only (pistas do log); `define`/`clear`
+/// enfileiram o contrato (o supervisor emite `ClueSetDefined`). Pistas = DADO de contexto.
+fn run_clue(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("list") => run_clue_list(),
+        Some("define") => run_clue_mutate("clue.define", &args[1..]),
+        Some("clear") => run_clue_mutate("clue.clear", &args[1..]),
+        _ => {
+            eprintln!("lina: uso: lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina clue list` — read-only: as pistas ativas projetadas do log.
+fn run_clue_list() -> ExitCode {
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let records = lina_bootstrap::parse_log_records(&content);
+    let clues = lina_core::clue::ClueSet::from_records(&records);
+    print!("{}", render_clues(&clues));
+    ExitCode::SUCCESS
+}
+
+/// Render de apresentação CLI das pistas (a projeção `ClueSet` é a fonte; o app tem o seu próprio).
+fn render_clues(clues: &lina_core::clue::ClueSet) -> String {
+    if clues.is_empty() {
+        return "pistas: — (nenhuma pista definida ainda)\n".to_string();
+    }
+    let mut out = String::from("pistas ativas (o que a IA enxerga por projeto):\n");
+    for scope in clues.scopes() {
+        let label = clues
+            .clue_for(scope)
+            .and_then(|c| c.label.clone())
+            .map_or_else(String::new, |l| format!(" — {l}"));
+        out.push_str(&format!("  [{scope}]{label}\n"));
+        for path in clues.paths_for(scope) {
+            out.push_str(&format!("    - {path}\n"));
+        }
+    }
+    out
+}
+
+/// `lina clue define|clear <scope> ...` — enfileira o contrato. `scope` é o 1º posicional.
+fn run_clue_mutate(intent: &str, args: &[String]) -> ExitCode {
+    let Some(scope) = args.first().filter(|s| !s.starts_with('-')) else {
+        eprintln!("lina: clue exige <scope> como 1o argumento");
+        return ExitCode::from(2);
+    };
+    let (scalars, paths) = parse_kv_flags(&args[1..], "--path");
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let payload = if intent == "clue.clear" {
+        serde_json::json!({ "scope": scope }).to_string()
+    } else {
+        serde_json::json!({ "scope": scope, "paths": paths, "label": scalars.get("--label") })
+            .to_string()
+    };
+    let msg = MailMessage::new(&from, "clue", intent, payload);
+    let mailbox = Mailbox::new(mailbox_root());
+    match enqueue_per_node(&mailbox, &from, &msg) {
+        Ok(()) => {
+            println!("ok: {intent} '{scope}' enfileirado");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar {intent}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ── F3-5-7: `lina check --buffers` (read-only) ──
+
+/// `lina check --buffers` (F3-5-7): deriva a ocupação de TODOS os buffers do event log (replay
+/// puro). SÓ-LEITURA, igual aos demais `check` (lê o espelho `log.jsonl`).
+fn run_check_buffers() -> ExitCode {
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let records = lina_bootstrap::parse_log_records(&content);
+    let registry = lina_core::buffer_registry::BufferRegistry::from_records(&records);
+    let report = lina_core::buffer_registry::buffer_report(&registry);
+    print!("{}", render_buffer_report(&report));
+    ExitCode::SUCCESS
+}
+
+/// Render de apresentação CLI da ocupação dos buffers.
+fn render_buffer_report(report: &lina_core::buffer_registry::BufferReport) -> String {
+    if report.lines.is_empty() {
+        return "buffers: — (nenhuma amostra de ocupacao ainda)\n".to_string();
+    }
+    let mut out = String::from("ocupacao dos buffers (do event log):\n");
+    for l in &report.lines {
+        let cap = if l.capacity == 0 {
+            "ilimitado".to_string()
+        } else {
+            l.capacity.to_string()
+        };
+        let pct = if l.capacity == 0 {
+            String::new()
+        } else {
+            format!(" — {:.0}%", l.pressure_ratio * 100.0)
+        };
+        let warn = if l.over_warn {
+            "  (!) acima do limite"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "  {} : {}/{} {}{}{}\n",
+            l.buffer_id, l.used, cap, l.unit, pct, warn
+        ));
+    }
+    out
+}
+
+// ── F3-5-8: `lina disk <status|reclaim>` ──
+
+/// `lina disk <status|reclaim>` (F3-5-8). `status` é read-only (pressão/proposta do log); `reclaim`
+/// é gesto CUSTODIADO (ADR 0043): o bin só ENFILEIRA o pedido na fila de broker — ZERO bytes
+/// apagados sem confirmação HUMANA. `approved_by` é exibição, nunca autoridade.
+fn run_disk(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("status") => run_disk_status(),
+        Some("reclaim") => run_disk_reclaim(),
+        _ => {
+            eprintln!("lina: uso: lina disk <status | reclaim>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina disk status` — read-only: a pressão de disco e a proposta de poda pendente, do log.
+fn run_disk_status() -> ExitCode {
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let records = lina_bootstrap::parse_log_records(&content);
+    let budget = lina_core::disk_budget::DiskBudget::replay(&records);
+    print!("{}", render_disk_status(&budget));
+    ExitCode::SUCCESS
+}
+
+/// Render de apresentação CLI do estado de disco.
+fn render_disk_status(budget: &lina_core::disk_budget::DiskBudget) -> String {
+    use lina_core::disk_budget::human_bytes;
+    let mut out = String::new();
+    match budget.pressure() {
+        Some(p) => out.push_str(&format!(
+            "disco [{}]: {:.0}% usado ({} livres) — {}\n",
+            p.path,
+            p.used_pct * 100.0,
+            human_bytes(p.free_bytes),
+            p.threshold
+        )),
+        None => out.push_str("disco: sem sinal de pressao ainda\n"),
+    }
+    if let Some(prop) = budget.pending_proposal() {
+        out.push_str(&format!(
+            "limpeza pendente: {} recuperaveis em {} candidato(s) — requer seu aval\n",
+            human_bytes(prop.reclaimable_bytes),
+            prop.candidates.len()
+        ));
+    }
+    if budget.is_reclaim_executed() {
+        out.push_str(&format!(
+            "ultima poda: {} recuperados\n",
+            human_bytes(budget.reclaimed_bytes())
+        ));
+    }
+    out
+}
+
+/// `lina disk reclaim` — gesto CUSTODIADO: enfileira `disk.reclaim` na fila de broker (mesmo canal
+/// de `lina do`/`lina resume`). O supervisor executa a poda SÓ após confirmação humana na janela;
+/// o agente, sozinho, NUNCA apaga (inv #6: irreversível pede gate em todo nível de autonomia).
+fn run_disk_reclaim() -> ExitCode {
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let msg = MailMessage::new(&from, "broker", "disk.reclaim", "").with_ref("disk:reclaim");
+    let mailbox = Mailbox::new(broker_mailbox_root());
+    match mailbox.enqueue_as(&from, &msg) {
+        Ok(()) => {
+            println!("gated: poda de disco requer confirmacao humana (a poda e irreversivel)");
+            println!("registrado para o supervisor — ZERO bytes apagados sem o seu aval");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar disk.reclaim: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ── F3-5-10: `lina template <list|create>` ──
+
+/// `lina template <list|create <slug>>` (F3-5-10). `list` é read-only (gabaritos embutidos);
+/// `create` instancia o gabarito no Espaço atual (semeia roster + params + pistas + backlog no log).
+fn run_template(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("list") => {
+            print!("{}", lina_core::workspace_template::list_templates_report());
+            ExitCode::SUCCESS
+        }
+        Some("create") => run_template_create(args.get(1)),
+        _ => {
+            eprintln!("lina: uso: lina template <list | create <slug>>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `lina template create <slug>` — semeia o gabarito no Espaço atual (gate (f): replay reconstrói o
+/// Espaço semeado). Abre o store p/ ESCRITA (semeia eventos); um slug desconhecido é rejeitado.
+fn run_template_create(slug: Option<&String>) -> ExitCode {
+    let Some(slug) = slug else {
+        eprintln!("lina: template create exige <slug> (use 'lina template list')");
+        return ExitCode::from(2);
+    };
+    let Some(template) = lina_core::workspace_template::template_by_slug(slug) else {
+        eprintln!("lina: gabarito '{slug}' desconhecido (use 'lina template list')");
+        return ExitCode::from(2);
+    };
+    let mut store = match EventStore::open(events_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: nao foi possivel abrir o event store: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match lina_core::workspace_template::instanciar(&template, &mut store) {
+        Ok(n) => {
+            println!(
+                "ok: gabarito '{}' instanciado ({n} eventos: roster + parametros + pistas + backlog)",
+                template.name
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao semear o gabarito: {e}");
             ExitCode::from(1)
         }
     }

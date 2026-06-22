@@ -1056,6 +1056,19 @@ impl Router {
             return self.handle_branch_integrated(msg, store);
         }
 
+        // ── F3-5-4/5: `lina skill select|propose` — emite `SkillSelected`/`SkillFactoryProposed`
+        //    (o `node` carimbado SERVER-SIDE = remetente autenticado, JAMAIS o payload — ADR 0007).
+        //    Registro puro (não entregue a PTY): a camada de skills do briefing consome a projeção.
+        if is_skill_intent(&msg.intent) {
+            return self.handle_skill(msg, store);
+        }
+
+        // ── F3-5-6: `lina clue define|clear` — emite `ClueSetDefined` (pistas que o terminal de um
+        //    escopo passa a enxergar). DADO de contexto, nunca autoridade. Registro puro.
+        if is_clue_intent(&msg.intent) {
+            return self.handle_clue(msg, store);
+        }
+
         // ── F3-3 (M-DETECTOR, spec 35 §4.1): sentinela `[LINA::CORRECTION]` no payload — verbo
         //    ESTRUTURADO de CAPTAÇÃO de aprendizado (molde de plan/params/goal). Detectado pela
         //    SENTINELA (não por intent canônico — qualquer mensagem cujo payload ABRE com o marcador
@@ -2246,6 +2259,103 @@ impl Router {
         // Registro puro: ninguém é notificado (a prova vive no log; a projeção de pendências a lê).
         RouteOutcome::Delivered {
             targets: Vec::new(),
+        }
+    }
+
+    /// **F3-5-4/5: handler dos verbos `lina skill select|propose`.** Emite `SkillSelected` (o
+    /// seletor casou uma skill) ou `SkillFactoryProposed` (a fábrica propõe uma skill especialista
+    /// — SUGERE, nunca aplica: só o evento, zero efeito colateral de criação). O `node` de
+    /// `SkillSelected` é o remetente AUTENTICADO (`msg.from`, server-side — JAMAIS o payload, ADR
+    /// 0007; o `sender` já foi resolvido no roster acima). `skill`/`skill_name` vazio é rejeitado.
+    /// Registro puro: a camada de skills do briefing consome a projeção (J emite, I lê).
+    fn handle_skill(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let event = if msg.intent == "skill.propose" {
+            let skill_name = payload
+                .get("skill_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if skill_name.is_empty() {
+                return RouteOutcome::ContractRejected(
+                    "skill.propose exige 'skill_name' no payload".into(),
+                );
+            }
+            let via = payload
+                .get("via")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("deep-research")
+                .to_string();
+            let references = str_array(&payload, "references");
+            DomainEvent::SkillFactoryProposed {
+                skill_name,
+                via,
+                references,
+            }
+        } else {
+            let skill = payload
+                .get("skill")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if skill.is_empty() {
+                return RouteOutcome::ContractRejected(
+                    "skill.select exige 'skill' no payload".into(),
+                );
+            }
+            DomainEvent::SkillSelected {
+                node: msg.from.clone(), // SERVER-SIDE: remetente autenticado, jamais o payload
+                skill,
+                trigger: payload
+                    .get("trigger")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+                source: payload
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        };
+        if let Err(e) = store.append(&event) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+        RouteOutcome::Delivered {
+            targets: Vec::new(),
+        }
+    }
+
+    /// **F3-5-6: handler dos verbos `lina clue define|clear`.** Emite `ClueSetDefined` via
+    /// [`crate::clue::define_clue`] (que já encapsula o append). `clue.define` lê `scope`/`paths`/
+    /// `label` do payload — DADO de contexto, nunca autoridade (não concede acesso, só informa o
+    /// que a IA olha); `clue.clear` é açúcar para `paths` vazio (retrai a pista). Registro puro.
+    fn handle_clue(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let scope = payload
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if scope.is_empty() {
+            return RouteOutcome::ContractRejected("clue exige 'scope' no payload".into());
+        }
+        let result = if msg.intent == "clue.clear" {
+            crate::clue::clear_clue(store, &scope)
+        } else {
+            let paths = str_array(&payload, "paths");
+            let label = payload
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            crate::clue::define_clue(store, &scope, &paths, label)
+        };
+        match result {
+            Ok(_) => RouteOutcome::Delivered {
+                targets: Vec::new(),
+            },
+            Err(e) => RouteOutcome::PersistFailed(e.to_string()),
         }
     }
 
@@ -3545,6 +3655,33 @@ fn is_code_changed_intent(intent: &str) -> bool {
 /// a projeção `code::branches_nao_integradas` o consome). Molde de [`is_code_changed_intent`].
 fn is_branch_integrated_intent(intent: &str) -> bool {
     intent == "branch.integrated"
+}
+
+/// F3-5-4/5: `true` se o intent é um verbo de skill (`lina skill select|propose`). Interceptado no
+/// router — emite `SkillSelected`/`SkillFactoryProposed` (node server-side). Molde de
+/// [`is_code_changed_intent`].
+fn is_skill_intent(intent: &str) -> bool {
+    intent == "skill.select" || intent == "skill.propose"
+}
+
+/// F3-5-6: `true` se o intent é um verbo de pista (`lina clue define|clear`). Interceptado no
+/// router — emite `ClueSetDefined` via [`crate::clue::define_clue`].
+fn is_clue_intent(intent: &str) -> bool {
+    intent == "clue.define" || intent == "clue.clear"
+}
+
+/// Extrai um `Vec<String>` de um array JSON de strings num campo do payload (vazio se ausente ou
+/// não-array). Açúcar compartilhado pelos handlers estruturados (`references`/`paths`).
+fn str_array(payload: &serde_json::Value, key: &str) -> Vec<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// F3-1-2 (spec 52 §1/§3): o JUIZ ESTRUTURAL — roda os critérios de aceite de um item, ZERO LLM.
