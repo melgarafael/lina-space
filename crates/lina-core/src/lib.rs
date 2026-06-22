@@ -67,7 +67,7 @@ pub use mailbox::{
 mod router;
 pub use router::{
     AutonomyLevel, CostLedger, PlanOpError, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS,
-    DELEGATION_BUDGET, FANOUT_GATE, MAX_DEPTH,
+    DELEGATION_BUDGET, FANOUT_GATE, HUMAN_GESTURE, MAX_DEPTH,
 };
 
 /// F3-0-1 ([12] Parâmetros): casa versionada dos ~15 números de orquestração — quatro camadas

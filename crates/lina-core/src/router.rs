@@ -77,7 +77,9 @@ const STRUCTURAL_JUDGE: NodeId = NodeId::nil();
 /// entra por `route_message`→`node_by_name`, o produz). Determinístico (replay reconstrói idêntico),
 /// distinto de [`STRUCTURAL_JUDGE`] (`nil`); como os nós reais nascem `Uuid::now_v7()`, este valor fixo
 /// (os bytes soletram "HUMAN") nunca colide com um nó real. `by` = carimbo server-side, jamais do cliente.
-const HUMAN_GESTURE: NodeId = NodeId::from_u128(0x4855_4d41_4e00_0000_0000_0000_0000_0000);
+// F3-5-10: `pub` p/ o caller (app/galeria de Templates) carimbar a ORIGEM HUMANA de um Espaço
+// instanciado por gesto (sem nó instanciador) — carimbo de origem auditável, JAMAIS autoridade.
+pub const HUMAN_GESTURE: NodeId = NodeId::from_u128(0x4855_4d41_4e00_0000_0000_0000_0000_0000);
 
 /// F3-CONF-2 (gate a): prefixo dos `SpawnRequested` de RE-DESPACHO anti-engolimento — DISTINTO de
 /// `goal-respawn:`/`goal-newdev:` (escalonamento por `Fail`, [`count_respawns_with_effort`]), então as
