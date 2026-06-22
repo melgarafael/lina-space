@@ -91,6 +91,19 @@
 
 ---
 
-## STATUS — F3-4 PREPARADA (2026-06-22 · Maestro: Terminal A)
+## STATUS — F3-4 FECHADA EM CÓDIGO (2026-06-22 · Maestro: Terminal A)
 
-Plano + 3 despachos especialistas escritos. Aguarda OK do fundador para: incluir pendências → criar develop → entregar fundação → criar worktrees → disparar B/I/R.
+**Gate de onda (4 lentes, read-only) PASS · gate visual (g) do fundador PENDENTE.** Executada como dogfooding: 2 codificadores em git worktrees ISOLADAS (B=Trilha A, I=Trilha B) + R=QA/integrador; o Maestro entregou a fundação (contrato de eventos), criou as worktrees e integrou na `develop`. Os merges das 2 trilhas foram **LIMPOS (zero conflito)** — a feature provou as fronteiras disjuntas na prática.
+
+**Entregue (commits na `develop`):**
+- **Fundação (A):** `0d7f039` — `CodeChanged`/`BranchIntegrated` em events.rs + ADRs 0040/0041/0042.
+- **Trilha A (B, `lina/f3-4-a` → merge `1227491`):** F3-4-1 CwdPolicy::Worktree + `git worktree add` (app executa, core git-free) + LINA_BRANCH + degrada honesto; F3-4-2 verbo `lina code-changed` + post-commit hook merge-safe; F3-4-6 salvaguardas gated-hard (reset --hard/branch -D/checkout --force; bug -D/-d corrigido na raiz); F3-4-5 skill `lina-integration` + verbo `lina branch-integrated`.
+- **Trilha B (I, `lina/f3-4-b` → merge `e211a43`):** F3-4-3 paths no PlanItem + PlanItemAttributed + handler `code.changed` (author server-side) + paths×claims + broadcast por pertencimento; F3-4-4 AttentionKind::CodeConflict; F3-4-5 `code.rs` (projeção branches-não-integradas + gatilho determinístico).
+- **Integração (A):** `8b27367` braço de render do CodeConflict no app; **`78c9152` fechou a costura ÓRFÃ `branch.integrated`→`BranchIntegrated`** (o verbo de B enfileirava, a projeção de I consumia, mas faltava o handler que emite — caiu no vão; precedente F3-3 60de9ec); `18e775a` fechou os 3 achados do gate de onda no CodeConflict (ALTA botão-morto via is_goto_only + MÉDIA detail vaza jargão + BAIXA selo).
+- **QA (R):** veredito de segurança **0 ALTA / 0 MEDIA / 0 BAIXA**; eval-first RED→GREEN (salvaguardas --ignored exit 101 → ativado GREEN); 13 tests f3_4 + suíte de segurança do router verde por mutação.
+
+**Validação de fora (Maestro):** lina-core lib 481/0; workspace test/clippy --all-targets/fmt exit 0; app clippy --all-targets + token_ratchet 2/2 intacto. Gate de saída: (a) PASS por construção, (b) PASS construção+teste, (c) PARCIAL (mecânica+prova+skill PASS; auto-nascimento do DevOps DEFERIDO por design — `code.rs:10`, dogfood manual nesta rodada), (d) PASS construção+teste.
+
+**Deferido (porta aberta):** auto-spawn do DevOps por gatilho (a projeção DECIDE; o disparo automático amadurece sob os mesmos gates); painel rico do CodeConflict (UI futura — o detail técnico fica para ele); hook pós-commit é `sh`-only (Windows bring-up). Achados de dogfooding #36-38 em `tasks/despachos/achados-dogfooding-sessao.md`.
+
+**⬜ Gate (g) VISUAL — fundador na tela:** validar o aviso de conflito de código legível (sem jargão, "vá ao terminal alinhar", sem botão de aprovação remota) + a criação de agentes em cópias isoladas. gpui não roda headless.
