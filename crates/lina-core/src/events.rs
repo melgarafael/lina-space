@@ -1196,6 +1196,43 @@ pub enum DomainEvent {
         /// Motivo da aposentadoria. String aberta (precedente `SpawnGated.reason`).
         reason: String,
     },
+    // ──────────────── F3-4 Coordenação de Código Multi-Agente (spec 36) ────────────────
+    // Sinal de mudança + prova de integração para N agentes codando em git worktrees
+    // isoladas no MESMO PC. Variantes TOTALMENTE novas (precedente `SpawnRequested`):
+    // campos OBRIGATÓRIOS sem `serde(default)` (replay antigo nunca as encontra). REGRA-MÃE
+    // (família ADR 0007/0026): `author_node` é o binding server-side do nó que commitou
+    // (do outbox autenticado), JAMAIS o texto do payload escrito por um agente — `paths`/
+    // `branch`/`commit` são DADO transportado, nunca decidem identidade, ordem ou
+    // autorização. O event log é a FONTE do sinal (nunca regex). As projeções (CodeChanged
+    // por branch; branches não-integradas — módulo `code`) reconstroem por REPLAY externo
+    // (padrão `CostLedger`/`Mentality`): estes eventos NÃO tocam `ProjectedState` (no-op).
+    /// SINAL DE MUDANÇA (spec 36 §2): um commit numa worktree de agente apendou trabalho.
+    /// Emitido pelo hook git pós-commit via verbo `lina code-changed` — o supervisor
+    /// carimba `author_node` server-side; o hook só transporta os fatos do commit
+    /// (`paths` do `diff-tree`, `branch`, `commit`). Broadcast por pertencimento (Trilha B)
+    /// compara `paths`×claims: sem interseção → ignora; com → o nó dono PARA e pede direção.
+    CodeChanged {
+        /// Branch da worktree onde o commit entrou (ex.: `lina/<nome-do-agente>`).
+        branch: String,
+        /// Caminhos tocados pelo commit (relativos ao repo) — DADO p/ a comparação ×claims.
+        paths: Vec<String>,
+        /// Nó autor — binding server-side do outbox autenticado, JAMAIS do payload (ADR 0007).
+        author_node: String,
+        /// SHA do commit que disparou o sinal (prova auditável no log).
+        commit: String,
+    },
+    /// PROVA DE INTEGRAÇÃO (spec 36 §3): uma branch foi mergeada na linha de integração.
+    /// É a ÚNICA prova de "branch fechada" — só com `BranchIntegrated` no log a projeção
+    /// de branches-não-integradas a remove do conjunto pendente. Emitido pelo DevOps
+    /// integrador por merge PROVADO; trabalho órfão nunca vira lixo (vira item de atenção).
+    BranchIntegrated {
+        /// Branch de origem que foi integrada.
+        branch: String,
+        /// Linha de integração de destino (ex.: `develop`).
+        into: String,
+        /// SHA do commit de merge resultante (prova auditável no log).
+        commit: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -1296,6 +1333,9 @@ impl DomainEvent {
             DomainEvent::BeliefChallenged { .. } => "BeliefChallenged",
             DomainEvent::BeliefEstablished { .. } => "BeliefEstablished",
             DomainEvent::BeliefRetired { .. } => "BeliefRetired",
+            // F3-4 Coordenação de código (spec 36): sinal de mudança + prova de integração.
+            DomainEvent::CodeChanged { .. } => "CodeChanged",
+            DomainEvent::BranchIntegrated { .. } => "BranchIntegrated",
         }
     }
 
@@ -1731,7 +1771,12 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::BeliefReinforced { .. }
         | DomainEvent::BeliefChallenged { .. }
         | DomainEvent::BeliefEstablished { .. }
-        | DomainEvent::BeliefRetired { .. } => {}
+        | DomainEvent::BeliefRetired { .. }
+        // F3-4 Coordenação de código (spec 36): o sinal de mudança e a prova de integração
+        // são META no apply do canvas — as projeções (`code`) reconstroem por REPLAY externo
+        // (padrão `CostLedger`/`Mentality`). Estes eventos NÃO tocam `ProjectedState`.
+        | DomainEvent::CodeChanged { .. }
+        | DomainEvent::BranchIntegrated { .. } => {}
     }
 }
 
