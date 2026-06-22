@@ -23,7 +23,7 @@ use crate::mailbox::{
     parse_correction, parse_target, render_message_block_v2, validate_envelope_v2,
     EnvelopeViolation, MailMessage, Mailbox, TargetSpec,
 };
-use crate::plan::{Plan, PlanError, PlanItem};
+use crate::plan::{ItemState, Plan, PlanError, PlanItem};
 use crate::{A2aEnvelope, DeliveryOutcome, NodeId, NodeStatus, Recipient, RolePolicy, Supervisor};
 
 /// Janela de dedupe por `id` (design §3: dedupe em 60s).
@@ -963,6 +963,16 @@ impl Router {
         //    ADR 0007). Precedem o pipeline de entrega/alvo, como os demais verbos.
         if is_goal_intent(&msg.intent) {
             return self.handle_goal(msg, sender, store);
+        }
+
+        // ── F3-4-3 (spec 36 §2): `lina code-changed` — SINAL DE MUDANÇA de um commit numa worktree de
+        //    agente. Verbo ESTRUTURADO (molde de plan/goal): apenda `CodeChanged` com `author_node`
+        //    CARIMBADO SERVER-SIDE (= `sender` autenticado, JAMAIS o payload — regra-mãe ADR 0007), e
+        //    faz o BROADCAST POR PERTENCIMENTO: compara `paths`×claims e avisa SÓ os donos afetados, que
+        //    PARAM. NÃO é delegação A2A entregue a um alvo `to`; a entrega é a notificação de
+        //    pertencimento. Precede o pipeline de entrega/alvo, como os demais verbos.
+        if is_code_changed_intent(&msg.intent) {
+            return self.handle_code_changed(msg, sender, store, deliver);
         }
 
         // ── F3-3 (M-DETECTOR, spec 35 §4.1): sentinela `[LINA::CORRECTION]` no payload — verbo
@@ -2021,6 +2031,96 @@ impl Router {
         }
     }
 
+    /// **F3-4-3 (spec 36 §2): handler do sinal de mudança `code.changed`.** Apenda `CodeChanged` com
+    /// `author_node` CARIMBADO SERVER-SIDE (= `msg.from`, o remetente JÁ autenticado por
+    /// [`Supervisor::node_by_name`] no topo de `route_message`), IGNORANDO qualquer `author_node` no
+    /// payload (regra-mãe ADR 0007: campo escrito por agente nunca decide identidade). Depois faz o
+    /// **broadcast por pertencimento**: cruza `paths`×claims ATIVOS (`crate::code::intersecting_paths`,
+    /// ZERO LLM) e entrega a notificação de PARADA SÓ aos donos afetados (≠ autor) que estão vivos — quem
+    /// não tem interseção é ignorado em silêncio. O item de atenção `CodeConflict` é reconstruído à parte
+    /// pela projeção da fila (do mesmo `CodeChanged` no log). A comparação só ALERTA, nunca concede posse.
+    fn handle_code_changed<D>(
+        &mut self,
+        msg: &MailMessage,
+        sender: NodeId,
+        store: &mut EventStore,
+        deliver: &mut D,
+    ) -> RouteOutcome
+    where
+        D: FnMut(NodeId, NodeId, &str) -> Result<DeliveryOutcome, String>,
+    {
+        let payload: serde_json::Value =
+            serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
+        let branch = payload
+            .get("branch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if branch.is_empty() {
+            return RouteOutcome::ContractRejected("code.changed exige 'branch' no payload".into());
+        }
+        let commit = payload
+            .get("commit")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let paths: Vec<String> = payload
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // `author_node` = remetente AUTENTICADO (NOME), JAMAIS o payload (ADR 0007). O `sender` (NodeId)
+        // já é o binding inforjável; o NOME (`msg.from`) é o mesmo espaço dos `owner` dos claims, então a
+        // comparação autor×dono é direta e a projeção da fila reconstrói o conflito do mesmo carimbo.
+        let author = msg.from.clone();
+        if let Err(e) = store.append(&DomainEvent::CodeChanged {
+            branch: branch.clone(),
+            paths: paths.clone(),
+            author_node: author.clone(),
+            commit,
+        }) {
+            return RouteOutcome::PersistFailed(e.to_string());
+        }
+
+        // Broadcast por PERTENCIMENTO: quem tem claim ATIVO (Doing) que intersecta os paths, e NÃO é o
+        // autor, PARA. Notifica só os vivos; sem interseção → silêncio (nó não muda de estado).
+        let plan = match store.project() {
+            Ok(state) => state.plan,
+            Err(e) => return RouteOutcome::PersistFailed(e.to_string()),
+        };
+        let mut targets: Vec<NodeId> = Vec::new();
+        for item in &plan.itens {
+            let Some(owner) = item.owner.as_deref() else {
+                continue;
+            };
+            if owner == author || item.status != ItemState::Doing {
+                continue;
+            }
+            if crate::code::intersecting_paths(&paths, &item.paths).is_empty() {
+                continue;
+            }
+            if let Some(owner_node) = self.sup.node_by_name(owner) {
+                if targets.contains(&owner_node) {
+                    continue; // um dono com vários itens afetados é avisado uma vez
+                }
+                let note = format!(
+                    "o colega ({author}) mexeu na branch {branch} em arquivo que você reservou — pare e avalie (rebase, renegociar ou desconflitar)"
+                );
+                // Entrega best-effort: a notificação é o "PARA" do pertencimento; a direção humana
+                // PERSISTE no `CodeConflict` da fila (do log), então uma falha de injeção não perde o
+                // sinal. Convenção `deliver(target, from, texto)`: alvo = o dono que PARA; from = o autor.
+                let _ = deliver(owner_node, sender, &note);
+                targets.push(owner_node);
+            }
+        }
+        RouteOutcome::Delivered { targets }
+    }
+
     /// Núcleo compartilhado de `plan.add`/`plan.seed`: semeia o item (`PlanItemAdded`) e o ATRIBUI à
     /// Goal/parents/DoD (`PlanItemAttributed`), mutando o `plan` que o caller projetou (e que ele depois
     /// reescreve no `plan.md` — o `plan.seed` emite o `GoalDecomposed` no meio). `Some(_)` = rejeição
@@ -2039,6 +2139,7 @@ impl Router {
             parents,
             acceptance,
             budget_tokens,
+            paths,
         } = attr;
         if let Err(e) = plan.add_item(item.clone(), desc.clone()) {
             return Some(RouteOutcome::PlanRejected(e.to_string()));
@@ -2055,6 +2156,7 @@ impl Router {
             parents.clone(),
             acceptance.clone(),
             budget_tokens,
+            paths.clone(),
         );
         if let Err(e) = store.append(&DomainEvent::PlanItemAttributed {
             item,
@@ -2062,6 +2164,7 @@ impl Router {
             parents,
             acceptance,
             budget_tokens,
+            paths,
         }) {
             return Some(RouteOutcome::PersistFailed(e.to_string()));
         }
@@ -2110,6 +2213,17 @@ impl Router {
             .get("budget_tokens")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
+        // F3-4-3 (ADR 0041): `paths` reservados — mesmo parse opcional de `parents` (ausente → []);
+        // assim `lina plan add` sem `--paths` segue idêntico, e com paths o item declara o que reserva.
+        let paths = payload
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut plan = match store.project() {
             Ok(state) => state.plan,
@@ -2125,6 +2239,7 @@ impl Router {
                 parents,
                 acceptance,
                 budget_tokens,
+                paths,
             },
         ) {
             return outcome;
@@ -2192,6 +2307,9 @@ impl Router {
                 parents: Vec::new(),
                 acceptance,
                 budget_tokens: 0,
+                // Item de meta decomposta não declara paths (a decomposição rica em sub-tarefas com
+                // arquivos reservados é do Maestro-agente via `plan add --paths`, porta da F3-2).
+                paths: Vec::new(),
             },
         ) {
             return outcome;
@@ -3246,6 +3364,8 @@ struct ItemAttribution {
     parents: Vec<String>,
     acceptance: Vec<AcceptanceCriterion>,
     budget_tokens: u64,
+    /// F3-4-3 (ADR 0041): arquivos que o item reserva (cruzados com `CodeChanged.paths`).
+    paths: Vec<String>,
 }
 
 /// `true` se o intent é uma operação de plano (aplicada ao `plan.md`, nunca entregue a PTY).
@@ -3283,6 +3403,13 @@ fn is_effort_intent(intent: &str) -> bool {
 /// PTY (o alvo `goal`/`@workspace` não é um nó endereçável).
 fn is_goal_intent(intent: &str) -> bool {
     matches!(intent, "goal.define" | "goal.interpret" | "goal.confirm")
+}
+
+/// F3-4-3 (spec 36 §2): `true` se o intent é o SINAL DE MUDANÇA de código (`lina code-changed`).
+/// Interceptado no router (molde de [`is_goal_intent`]) — apenda `CodeChanged` (author_node
+/// server-side) + broadcast por pertencimento, NUNCA entregue como delegação a um `to`.
+fn is_code_changed_intent(intent: &str) -> bool {
+    intent == "code.changed"
 }
 
 /// F3-1-2 (spec 52 §1/§3): o JUIZ ESTRUTURAL — roda os critérios de aceite de um item, ZERO LLM.
@@ -3992,6 +4119,131 @@ mod tests {
         assert_eq!(calls.len(), 1, "uma entrega");
         assert_eq!(calls[0].0, b, "alvo é B");
         assert!(calls[0].2.contains("[LINA::MSG]") && calls[0].2.contains("payload: oi"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────── F3-4-3 (spec 36 §2): handler do sinal de mudança `code.changed` ─────────
+
+    /// Plano sintético direto no log: item reserva `paths`, claimed por `owner` (vira Doing na projeção).
+    fn seed_claim(store: &mut EventStore, item: &str, paths: &[&str], owner: &str) {
+        store
+            .append(&DomainEvent::PlanItemAdded {
+                item: item.into(),
+                desc: "x".into(),
+            })
+            .expect("PlanItemAdded");
+        store
+            .append(&DomainEvent::PlanItemAttributed {
+                item: item.into(),
+                goal_id: None,
+                parents: vec![],
+                acceptance: vec![],
+                budget_tokens: 0,
+                paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            })
+            .expect("PlanItemAttributed");
+        store
+            .append(&DomainEvent::PlanClaimed {
+                id: format!("claim-{item}"),
+                item: item.into(),
+                by: owner.into(),
+            })
+            .expect("PlanClaimed");
+    }
+
+    /// **Regra-mãe (ADR 0007):** `code.changed` carimba `author_node` SERVER-SIDE (= remetente
+    /// AUTENTICADO), IGNORANDO um `author_node` FORJADO no payload. Mutação prova: o forjado some.
+    #[test]
+    fn code_changed_stamps_author_server_side_ignoring_payload() {
+        let (mut router, sup, dir) = router_with("cc-auth");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("cc-auth");
+        let (_rec, mut deliver) = recorder();
+        // author_node FORJADO no payload = @EVIL — deve ser ignorado.
+        let payload =
+            r#"{"branch":"lina/a","commit":"c1","paths":["src/x.rs"],"author_node":"@EVIL"}"#;
+        let msg = MailMessage::new("@A", "@workspace", "code.changed", payload);
+        let out = router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+        assert!(matches!(out, RouteOutcome::Delivered { .. }));
+        let cc = ts
+            .store
+            .events()
+            .expect("events")
+            .into_iter()
+            .find(|r| r.kind == "CodeChanged")
+            .expect("CodeChanged logado");
+        assert_eq!(
+            cc.payload.get("author_node").and_then(|v| v.as_str()),
+            Some("@A"),
+            "author = remetente autenticado, NUNCA o @EVIL forjado no payload"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Broadcast por PERTENCIMENTO: só o dono do claim que intersecta os paths (e ≠ autor) é
+    /// notificado a PARAR; um claim disjunto fica intacto. `CodeChanged` logado (author = @A).
+    #[test]
+    fn code_changed_notifies_only_intersecting_claim_owner() {
+        let (mut router, sup, dir) = router_with("cc-belong");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let _c = sup.register("@C", None, sink());
+        let mut ts = TmpStore::new("cc-belong");
+        let (rec, mut deliver) = recorder();
+        seed_claim(&mut ts.store, "T1", &["src/leads.rs"], "@B");
+        seed_claim(&mut ts.store, "T2", &["src/outro.rs"], "@C");
+        // @A commita tocando SÓ src/leads.rs (reservado por @B).
+        let payload = r#"{"branch":"lina/a","commit":"c1","paths":["src/leads.rs"]}"#;
+        let msg = MailMessage::new("@A", "@workspace", "code.changed", payload);
+        let out = router.route_message(&msg, &mut ts.store, 2000, &mut deliver);
+        assert_eq!(out, RouteOutcome::Delivered { targets: vec![b] });
+        let calls = rec.borrow();
+        assert_eq!(calls.len(), 1, "só @B (pertencimento); @C intacto");
+        assert_eq!(calls[0].0, b, "alvo é @B (o dono que PARA)");
+        assert!(calls[0].2.contains("pare"), "a notificação manda PARAR");
+        drop(calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Controle −: o autor NÃO é avisado do PRÓPRIO commit, e um commit disjunto não avisa ninguém.
+    #[test]
+    fn code_changed_skips_self_author_and_disjoint() {
+        let (mut router, sup, dir) = router_with("cc-self");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("cc-self");
+        let (rec, mut deliver) = recorder();
+        // @A reserva src/leads.rs e é o PRÓPRIO autor do commit que o toca.
+        seed_claim(&mut ts.store, "T1", &["src/leads.rs"], "@A");
+        let payload = r#"{"branch":"lina/a","commit":"c1","paths":["src/leads.rs"]}"#;
+        let msg = MailMessage::new("@A", "@workspace", "code.changed", payload);
+        let out = router.route_message(&msg, &mut ts.store, 2000, &mut deliver);
+        assert_eq!(
+            out,
+            RouteOutcome::Delivered { targets: vec![] },
+            "autor==dono → ninguém avisado"
+        );
+        assert!(rec.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Payload sem `branch` → recusa LEGÍVEL, nada logado (sinal malformado não polui o log).
+    #[test]
+    fn code_changed_without_branch_is_rejected() {
+        let (mut router, sup, dir) = router_with("cc-bad");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("cc-bad");
+        let (_rec, mut deliver) = recorder();
+        let msg = MailMessage::new("@A", "@workspace", "code.changed", r#"{"paths":["x"]}"#);
+        let out = router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+        assert!(matches!(out, RouteOutcome::ContractRejected(_)));
+        assert!(
+            ts.store
+                .events()
+                .expect("events")
+                .iter()
+                .all(|r| r.kind != "CodeChanged"),
+            "branch ausente → nenhum CodeChanged logado"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5185,6 +5437,7 @@ mod tests {
                 parents: vec![],
                 acceptance: vec![],
                 budget_tokens: 0,
+                paths: vec![],
             })
             .unwrap();
         let (_rec, mut deliver) = recorder();
@@ -8022,6 +8275,7 @@ mod tests {
                     parents: vec![],
                     acceptance: vec![crit_cmd("criterio", cmd)],
                     budget_tokens: 0,
+                    paths: vec![],
                 })
                 .unwrap();
             router.route_message(
@@ -8406,6 +8660,7 @@ mod tests {
                 parents: vec![],
                 acceptance: vec![crit_cmd("ok", "true")],
                 budget_tokens: 0,
+                paths: vec![],
             })
             .unwrap();
         ts.store

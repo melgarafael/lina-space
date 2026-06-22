@@ -119,6 +119,14 @@ pub enum AttentionKind {
     /// Precedência mais baixa (responder y/n no terminal pode esperar atrás dos gates que travam um
     /// turno), mas NUNCA invisível (direção do fundador 2026-06-07: todo bloqueante alerta).
     GuardAsk,
+    /// F3-4-4 (spec 36 §2): CONFLITO DE CÓDIGO por pertencimento — um commit do time (`CodeChanged`)
+    /// tocou um arquivo que ESTE nó reservou (`paths`×claim ≠ ∅, de OUTRO autor). O nó dono do claim
+    /// PARA e PEDE direção humana (rebase? renegociar? desconflitar?) — não-trivial por natureza, daí a
+    /// precedência da família guard-ask (entre [`AttentionKind::GuardAsk`] e
+    /// [`AttentionKind::DeliveredNoProgress`]). Alerta + foco (`Choice`), NUNCA `Yn` aprovável daqui
+    /// (`resolve`/`auto_deny_due` só olham `Yn`): a escolha resolve no fluxo de integração, não com um
+    /// y/n na fila. NUNCA auto-some por TTL (perder um conflito em silêncio violaria inv #6).
+    CodeConflict,
     /// W3 (ponto-cego do ADR 0019 §4): um handoff foi ENTREGUE (`MessageDelivered{to}`), o nó voltou
     /// a `Idle` e ficou parado ≥ [`DELIVERED_NO_PROGRESS_WINDOW_MS`] sem UM ÚNICO progresso atribuível
     /// — o "despacho engolido" (#22/#23). É OBSERVABILIDADE, não bloqueante humano: o stall detector
@@ -282,6 +290,25 @@ struct PendingDispatch {
     idle_ts: Option<u64>,
 }
 
+/// F3-4-4 (spec 36 §2): conflito de pertencimento ABERTO — um commit de OUTRO nó tocou paths que
+/// `owner` reservou. Dedup por `(owner, branch)`: commits sucessivos do mesmo colega na mesma branch
+/// renovam `last_ts` e UNEM os paths, não empilham. PURA projeção do log (sem evento novo): armada por
+/// `CodeChanged` × claims; NÃO some por TTL (conflito não-resolvido nunca evapora — inv #6). Reconstruída
+/// por replay como o resto da fila.
+#[derive(Debug, Clone)]
+struct PendingCodeConflict {
+    /// NOME do nó dono do claim que PARA (foco da fila por nome, como [`PendingGuardAsk`]).
+    owner: String,
+    /// Branch do colega cujo commit tocou o arquivo reservado (exibição leiga).
+    branch: String,
+    /// Paths em CONFLITO (a interseção) — copy leiga; unidos a cada commit novo do mesmo par.
+    paths: Vec<String>,
+    /// 1ª vez visto (idade exibida; estável no replay).
+    created_ts: u64,
+    /// Último commit conflitante deste par (renova a recência).
+    last_ts: u64,
+}
+
 /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
 #[derive(Debug, Default)]
 pub struct AttentionQueue {
@@ -306,6 +333,14 @@ pub struct AttentionQueue {
     /// Allowlist por nó (`NodeDetectionMuted`, último vence): `true` = fallback de
     /// grid DESLIGADO para o nó.
     muted: HashMap<String, bool>,
+    /// F3-4-4: paths que cada item RESERVA (de `PlanItemAttributed`, último vence) — o lado "claims"
+    /// da comparação ×`CodeChanged`. Sem evento novo: a fila já vê o log inteiro.
+    item_paths: HashMap<String, Vec<String>>,
+    /// F3-4-4: claims ATIVOS (item → NOME do dono). `PlanClaimed` ativa; `PlanChecked` libera (item
+    /// concluído não reserva mais). Só claim VIVO entra na comparação de conflito.
+    claims: HashMap<String, String>,
+    /// F3-4-4: conflitos de código abertos (1 por `(owner, branch)`) — o "PARA" do pertencimento.
+    code_conflicts: Vec<PendingCodeConflict>,
 }
 
 impl AttentionQueue {
@@ -432,6 +467,29 @@ impl AttentionQueue {
             DomainEvent::NodeRemoved { node } | DomainEvent::TerminalExited { node } => {
                 self.remove_dispatch(&node.to_string());
             }
+            // ───────── F3-4-4 (spec 36 §2): conflito de código por pertencimento ─────────
+            // Projeção PURA derivada (SEM evento novo): a fila junta os paths reservados (do item) +
+            // o claim (item→dono) + o sinal de mudança, e cruza DETERMINISTICAMENTE (ZERO LLM, inv #1).
+            // `paths`/`author_node` são DADO, jamais autoridade: a interseção só ABRE alerta (PARA e
+            // pergunta), nunca concede posse (família ADR 0007).
+            DomainEvent::PlanItemAttributed { item, paths, .. } => {
+                // Último vence (re-atribuição substitui). Vazio é legítimo (item sem reserva).
+                self.item_paths.insert(item.clone(), paths.clone());
+            }
+            DomainEvent::PlanClaimed { item, by, .. } => {
+                // Claim ATIVA a reserva do item para o dono (NOME — mesmo espaço de `author_node`).
+                self.claims.insert(item.clone(), by.clone());
+            }
+            DomainEvent::PlanChecked { item, .. } => {
+                // Item concluído → libera a reserva (não há mais o que PARAR nele).
+                self.claims.remove(item);
+            }
+            DomainEvent::CodeChanged {
+                branch,
+                paths,
+                author_node,
+                ..
+            } => self.fold_code_changed(branch, paths, author_node, ts),
             // Pós-decisão do executor (F1-1-8): sem efeito na fila — o item já saiu
             // no `PermissionResolved`. Um abort (`screen_changed`) reapresenta via
             // RE-DETECÇÃO (novo `PermissionAsked`, novo stable_id — ADR 0021 §1).
@@ -539,6 +597,58 @@ impl AttentionQueue {
         self.guard_asks.push(PendingGuardAsk {
             node: node.to_string(),
             cmd: cmd.to_string(),
+            created_ts: ts,
+            last_ts: ts,
+        });
+    }
+
+    // ───────────────────── F3-4-4 (spec 36 §2): conflito de código por pertencimento ─────────────────────
+
+    /// Cruza um `CodeChanged` com os claims ATIVOS: para cada item reservado por OUTRO nó cujos paths
+    /// intersectam os do commit, abre/renova um `CodeConflict` para o dono. DETERMINÍSTICO (ZERO LLM):
+    /// interseção de conjuntos via [`crate::code::intersecting_paths`]. Coleta antes de mutar (não dá
+    /// para iterar `self.claims` e gravar em `self.code_conflicts` ao mesmo tempo).
+    fn fold_code_changed(&mut self, branch: &str, paths: &[String], author_node: &str, ts: u64) {
+        let mut found: Vec<(String, Vec<String>)> = Vec::new();
+        for (item, owner) in &self.claims {
+            if owner == author_node {
+                continue; // o próprio autor do commit nunca é avisado do seu trabalho
+            }
+            if let Some(reserved) = self.item_paths.get(item) {
+                let hits = crate::code::intersecting_paths(paths, reserved);
+                if !hits.is_empty() {
+                    found.push((owner.clone(), hits));
+                }
+            }
+        }
+        for (owner, hits) in found {
+            self.fold_code_conflict(&owner, branch, hits, ts);
+        }
+    }
+
+    /// Funde um conflito no item do par `(owner, branch)` (dedup: renova `last_ts` e UNE os paths; o 1º
+    /// fixa `created_ts`). Commits sucessivos do mesmo colega na mesma branch nunca empilham dois itens.
+    /// Determinístico no replay (eventos em ordem de `ts`). NUNCA remove (conflito não-resolvido persiste
+    /// — inv #6; a resolução por gesto humano é seam de v2).
+    fn fold_code_conflict(&mut self, owner: &str, branch: &str, hits: Vec<String>, ts: u64) {
+        if let Some(existing) = self
+            .code_conflicts
+            .iter_mut()
+            .find(|c| c.owner == owner && c.branch == branch)
+        {
+            existing.last_ts = ts;
+            for p in hits {
+                if !existing.paths.contains(&p) {
+                    existing.paths.push(p);
+                }
+            }
+            existing.paths.sort();
+            return;
+        }
+        self.code_conflicts.push(PendingCodeConflict {
+            owner: owner.to_string(),
+            branch: branch.to_string(),
+            paths: hits, // já vem ordenado de `intersecting_paths`
             created_ts: ts,
             last_ts: ts,
         });
@@ -735,6 +845,26 @@ impl AttentionQueue {
                 prompt_kind: PromptKind::Choice,
                 vt_snapshot_hash: None,
             });
+        // F3-4-4 (spec 36 §2): conflitos de pertencimento — precedência da família guard-ask (ENTRE
+        // guard e o engolido). 1 por `(owner, branch)` (dedup no fold) ⇒ anti-amplificação. `detail` =
+        // copy leiga ("o colega mexeu em X que você reservou"); `Choice`: alerta + foco, a escolha
+        // (rebase/renegociar/desconflitar) resolve no fluxo de integração, NUNCA y/n na fila. Estrutural
+        // (projeção do log, não-heurística). PURO de `now_ms` ⇒ replay reconstrói a fila idêntica.
+        let conflicts = self.code_conflicts.iter().map(|c| AttentionItem {
+            stable_id: format!("code-conflict:{}:{}", c.owner, c.branch),
+            node_id: c.owner.clone(),
+            kind: AttentionKind::CodeConflict,
+            detail: Some(format!(
+                "o colega mexeu em {} que você reservou ({}) — rebase, renegociar ou desconflitar?",
+                c.paths.join(", "),
+                c.branch
+            )),
+            evidence: AttentionEvidence::Hook,
+            created_ts: c.created_ts,
+            state: state_of(c.created_ts),
+            prompt_kind: PromptKind::Choice,
+            vt_snapshot_hash: None,
+        });
         // W3 (ponto-cego do ADR 0019): despachos ENTREGUES que voltaram a `Idle` e ficaram parados
         // ≥ DELIVERED_NO_PROGRESS_WINDOW_MS (desde o `Idle`) sem UM ÚNICO progresso atribuível → o
         // "engolido". Precedência MAIS BAIXA (alerta de observabilidade, nunca bloqueante). 1 por nó
@@ -764,6 +894,7 @@ impl AttentionQueue {
         out.extend(round_robin_by_node(perms.collect()));
         out.extend(round_robin_by_node(spawns.collect()));
         out.extend(round_robin_by_node(guard.collect()));
+        out.extend(round_robin_by_node(conflicts.collect()));
         out.extend(round_robin_by_node(swallowed.collect()));
         out
     }
@@ -1996,6 +2127,232 @@ mod tests {
             swallowed(&rebuilt, now),
             vec![a.to_string()],
             "o engolido sobrevive ao replay"
+        );
+    }
+
+    // ───────── F3-4-4 (spec 36 §2): conflito de código por pertencimento ─────────
+
+    /// `EventRecord` sintético do PRÓPRIO `DomainEvent` (carrega a tag interna), `ts` controlado —
+    /// exercita o decode REAL (`from_record`) no replay, como em `mentality.rs`.
+    fn cc_rec(event: DomainEvent, ts: u64) -> EventRecord {
+        EventRecord {
+            seq: 0,
+            ts,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa evento"),
+        }
+    }
+
+    fn attributed(item: &str, paths: &[&str]) -> DomainEvent {
+        DomainEvent::PlanItemAttributed {
+            item: item.into(),
+            goal_id: None,
+            parents: vec![],
+            acceptance: vec![],
+            budget_tokens: 0,
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+        }
+    }
+
+    fn claimed(item: &str, by: &str) -> DomainEvent {
+        DomainEvent::PlanClaimed {
+            id: format!("claim-{item}-{by}"),
+            item: item.into(),
+            by: by.into(),
+        }
+    }
+
+    fn code_changed(branch: &str, paths: &[&str], author: &str) -> DomainEvent {
+        DomainEvent::CodeChanged {
+            branch: branch.into(),
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
+            author_node: author.into(),
+            commit: format!("commit-{branch}"),
+        }
+    }
+
+    /// Controle +: item reservado por @B; um commit de @A toca o arquivo → @B vê um `CodeConflict`
+    /// com `stable_id`, `Choice` (alerta+foco) e a copy leiga com o path em conflito.
+    #[test]
+    fn code_conflict_fires_on_intersecting_claim_of_another_node() {
+        let mut q = AttentionQueue::new();
+        q.observe(&attributed("T1", &["src/leads.rs"]), T0);
+        q.observe(&claimed("T1", "@B"), T0 + 1);
+        q.observe(
+            &code_changed("lina/a", &["src/leads.rs", "src/mod.rs"], "@A"),
+            T0 + 2,
+        );
+        let items = q.items(T0 + 3);
+        let conflict = items
+            .iter()
+            .find(|i| i.kind == AttentionKind::CodeConflict)
+            .expect("um conflito de código");
+        assert_eq!(conflict.node_id, "@B", "o DONO do claim PARA");
+        assert_eq!(conflict.stable_id, "code-conflict:@B:lina/a");
+        assert_eq!(
+            conflict.prompt_kind,
+            PromptKind::Choice,
+            "alerta+foco, NUNCA Yn aprovável"
+        );
+        assert!(conflict
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("src/leads.rs"));
+    }
+
+    /// Controle −: o commit não toca nada reservado → nenhum conflito (estado inalterado).
+    #[test]
+    fn no_conflict_when_paths_are_disjoint() {
+        let mut q = AttentionQueue::new();
+        q.observe(&attributed("T1", &["src/leads.rs"]), T0);
+        q.observe(&claimed("T1", "@B"), T0 + 1);
+        q.observe(&code_changed("lina/a", &["src/outro.rs"], "@A"), T0 + 2);
+        assert!(
+            q.items(T0 + 3)
+                .iter()
+                .all(|i| i.kind != AttentionKind::CodeConflict),
+            "sem interseção → sem conflito"
+        );
+    }
+
+    /// Controle −: o PRÓPRIO dono commitando no que reservou NÃO gera conflito (é o trabalho dele).
+    #[test]
+    fn own_commit_does_not_conflict() {
+        let mut q = AttentionQueue::new();
+        q.observe(&attributed("T1", &["src/leads.rs"]), T0);
+        q.observe(&claimed("T1", "@B"), T0 + 1);
+        q.observe(&code_changed("lina/b", &["src/leads.rs"], "@B"), T0 + 2);
+        assert!(
+            q.items(T0 + 3)
+                .iter()
+                .all(|i| i.kind != AttentionKind::CodeConflict),
+            "autor == dono → sem conflito"
+        );
+    }
+
+    /// Item concluído (`PlanChecked`) LIBERA a reserva → commit posterior não conflita.
+    #[test]
+    fn checked_item_releases_reservation() {
+        let mut q = AttentionQueue::new();
+        q.observe(&attributed("T1", &["src/leads.rs"]), T0);
+        q.observe(&claimed("T1", "@B"), T0 + 1);
+        q.observe(
+            &DomainEvent::PlanChecked {
+                id: "chk".into(),
+                item: "T1".into(),
+                by: "@B".into(),
+            },
+            T0 + 2,
+        );
+        q.observe(&code_changed("lina/a", &["src/leads.rs"], "@A"), T0 + 3);
+        assert!(
+            q.items(T0 + 4)
+                .iter()
+                .all(|i| i.kind != AttentionKind::CodeConflict),
+            "claim liberado → sem conflito"
+        );
+    }
+
+    /// Commits sucessivos do mesmo colega na mesma branch DEDUPLICAM (1 item, paths unidos).
+    #[test]
+    fn successive_commits_same_pair_dedup_and_union_paths() {
+        let mut q = AttentionQueue::new();
+        q.observe(&attributed("T1", &["src/a.rs", "src/b.rs"]), T0);
+        q.observe(&claimed("T1", "@B"), T0 + 1);
+        q.observe(&code_changed("lina/a", &["src/a.rs"], "@A"), T0 + 2);
+        q.observe(&code_changed("lina/a", &["src/b.rs"], "@A"), T0 + 3);
+        let conflicts: Vec<_> = q
+            .items(T0 + 4)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::CodeConflict)
+            .collect();
+        assert_eq!(conflicts.len(), 1, "mesmo (owner,branch) → 1 item");
+        let detail = conflicts[0].detail.clone().expect("detail");
+        assert!(
+            detail.contains("src/a.rs") && detail.contains("src/b.rs"),
+            "paths unidos"
+        );
+    }
+
+    /// Precedência da família guard-ask: o conflito sai DEPOIS do guard e ANTES do engolido.
+    #[test]
+    fn code_conflict_precedence_between_guard_and_swallowed() {
+        // (1) guard + conflito, consultados a fresco: guard antes do conflito.
+        let mut q1 = AttentionQueue::new();
+        q1.observe(&guard_ask("@G", "git push"), T0);
+        q1.observe(&attributed("T1", &["src/x.rs"]), T0 + 1);
+        q1.observe(&claimed("T1", "@B"), T0 + 2);
+        q1.observe(&code_changed("lina/a", &["src/x.rs"], "@A"), T0 + 3);
+        let kinds1: Vec<AttentionKind> = q1.items(T0 + 10).iter().map(|i| i.kind).collect();
+        let gi = kinds1
+            .iter()
+            .position(|k| *k == AttentionKind::GuardAsk)
+            .expect("guard");
+        let ci = kinds1
+            .iter()
+            .position(|k| *k == AttentionKind::CodeConflict)
+            .expect("conflito");
+        assert!(gi < ci, "guard antes do conflito");
+
+        // (2) conflito + engolido, consultados além da janela: conflito antes do engolido.
+        let mut q2 = AttentionQueue::new();
+        q2.observe(&attributed("T1", &["src/x.rs"]), T0);
+        q2.observe(&claimed("T1", "@B"), T0 + 1);
+        q2.observe(&code_changed("lina/a", &["src/x.rs"], "@A"), T0 + 2);
+        q2.observe(&delivered(nid(7)), T0 + 3);
+        q2.observe(&idle(nid(7)), T0 + 4);
+        let now = T0 + 4 + DELIVERED_NO_PROGRESS_WINDOW_MS + 1;
+        let kinds2: Vec<AttentionKind> = q2.items(now).iter().map(|i| i.kind).collect();
+        let ci2 = kinds2
+            .iter()
+            .position(|k| *k == AttentionKind::CodeConflict)
+            .expect("conflito");
+        let si = kinds2
+            .iter()
+            .position(|k| *k == AttentionKind::DeliveredNoProgress)
+            .expect("engolido");
+        assert!(ci2 < si, "conflito antes do engolido");
+    }
+
+    /// `author_node` FORJADO no payload é IGNORADO: o que importa é o que o supervisor carimba
+    /// (server-side). Aqui provamos que a projeção compara contra o `author_node` do EVENTO (o
+    /// carimbado), não contra um campo do item — o handler do router é quem garante o carimbo.
+    #[test]
+    fn conflict_uses_event_author_not_item_owner_field() {
+        // @B reservou; o commit é de @A (carimbado no evento) → conflito para @B.
+        let mut q = AttentionQueue::new();
+        q.observe(&attributed("T1", &["src/x.rs"]), T0);
+        q.observe(&claimed("T1", "@B"), T0 + 1);
+        q.observe(&code_changed("lina/a", &["src/x.rs"], "@A"), T0 + 2);
+        let c = q
+            .items(T0 + 3)
+            .into_iter()
+            .find(|i| i.kind == AttentionKind::CodeConflict)
+            .expect("conflito");
+        assert_eq!(c.node_id, "@B");
+    }
+
+    /// **replay idempotente (gate f):** reconstruir do log duas vezes dá os MESMOS itens; e o
+    /// conflito SOBREVIVE ao replay (a fila reconstrói o `CodeConflict` do log).
+    #[test]
+    fn code_conflict_replay_is_idempotent() {
+        let log = vec![
+            cc_rec(attributed("T1", &["src/leads.rs"]), T0),
+            cc_rec(claimed("T1", "@B"), T0 + 1),
+            cc_rec(code_changed("lina/a", &["src/leads.rs"], "@A"), T0 + 2),
+        ];
+        let a = AttentionQueue::replay(&log);
+        let b = AttentionQueue::replay(&log);
+        assert_eq!(a.items(T0 + 3), b.items(T0 + 3), "replay determinístico");
+        assert_eq!(
+            a.items(T0 + 3)
+                .iter()
+                .filter(|i| i.kind == AttentionKind::CodeConflict)
+                .count(),
+            1,
+            "o conflito sobrevive ao replay"
         );
     }
 }
