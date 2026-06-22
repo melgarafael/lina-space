@@ -109,6 +109,14 @@ pub struct PlanItem {
     /// F3-1 (spec 52 §2): orçamento de tokens deste item (`0` = sem teto próprio; herda a Goal).
     #[serde(default)]
     pub budget_tokens: u64,
+    /// F3-4-3 (spec 36 §2, ADR 0041): arquivos/globs que o item RESERVA, relativos ao repo. Cruzados
+    /// com `CodeChanged.paths` de um commit do time: interseção com o claim de OUTRO nó → o dono PARA
+    /// e abre um `CodeConflict` (a "trava cooperativa" do pertencimento). DADO declarado, JAMAIS
+    /// autoridade (família ADR 0007): só abre alerta, nunca concede posse nem autoriza ação.
+    /// `#[serde(default)]` → plano/log anterior reconstrói com `paths: []`, round-trip byte-a-byte
+    /// exato (inv #4).
+    #[serde(default)]
+    pub paths: Vec<String>,
 }
 
 /// O plano compartilhado — projeção do event log, serializável em `.lina/plan.md`.
@@ -273,6 +281,7 @@ impl Plan {
                 parents: Vec::new(),
                 acceptance: Vec::new(),
                 budget_tokens: 0,
+                paths: Vec::new(),
             });
         }
     }
@@ -364,6 +373,13 @@ impl Plan {
                 out.push_str(FIELD_SEP);
                 out.push_str("@parents:");
                 out.push_str(&item.parents.join(","));
+            }
+            // F3-4-3 (ADR 0041): `@paths:` ao lado de `@parents:` — emitido só quando não-vazio, então
+            // o item legado (paths default) produz a MESMA linha de antes (round-trip byte-a-byte).
+            if !item.paths.is_empty() {
+                out.push_str(FIELD_SEP);
+                out.push_str("@paths:");
+                out.push_str(&item.paths.join(","));
             }
             if !item.acceptance.is_empty() {
                 out.push_str(FIELD_SEP);
@@ -473,12 +489,20 @@ fn parse_item(line: &str) -> Result<PlanItem, PlanError> {
     let mut parents: Vec<String> = Vec::new();
     let mut acceptance: Vec<AcceptanceCriterion> = Vec::new();
     let mut budget_tokens: u64 = 0;
+    let mut paths: Vec<String> = Vec::new();
     while parts.len() > 4 {
         let last = parts[parts.len() - 1];
         if let Some(g) = last.strip_prefix("@goal:") {
             goal_id = Some(g.to_string());
         } else if let Some(ps) = last.strip_prefix("@parents:") {
             parents = if ps.is_empty() {
+                Vec::new()
+            } else {
+                ps.split(',').map(str::to_string).collect()
+            };
+        } else if let Some(ps) = last.strip_prefix("@paths:") {
+            // F3-4-3 (ADR 0041): mesma gramática de `@parents:` (lista separada por vírgula).
+            paths = if ps.is_empty() {
                 Vec::new()
             } else {
                 ps.split(',').map(str::to_string).collect()
@@ -543,6 +567,7 @@ fn parse_item(line: &str) -> Result<PlanItem, PlanError> {
         parents,
         acceptance,
         budget_tokens,
+        paths,
     })
 }
 
@@ -662,6 +687,7 @@ mod tests {
             parents: Vec::new(),
             acceptance: Vec::new(),
             budget_tokens: 0,
+            paths: Vec::new(),
         });
         p.itens.push(PlanItem {
             id: "B".into(),
@@ -672,6 +698,7 @@ mod tests {
             parents: Vec::new(),
             acceptance: Vec::new(),
             budget_tokens: 0,
+            paths: Vec::new(),
         });
         p.itens.push(PlanItem {
             id: "C".into(),
@@ -682,6 +709,7 @@ mod tests {
             parents: Vec::new(),
             acceptance: Vec::new(),
             budget_tokens: 0,
+            paths: Vec::new(),
         });
         p.itens.push(PlanItem {
             id: "D".into(),
@@ -692,9 +720,44 @@ mod tests {
             parents: Vec::new(),
             acceptance: Vec::new(),
             budget_tokens: 0,
+            paths: Vec::new(),
         });
         let back = Plan::parse(&p.render()).unwrap();
         assert_eq!(back, p);
+    }
+
+    /// F3-4-3 (ADR 0041): um item COM `@paths:` round-trippa byte-a-byte (parse → render → texto
+    /// idêntico) e a lista é lida correta. O `@paths:` é emitido ao lado de `@parents:`.
+    #[test]
+    fn item_with_paths_roundtrips_exactly() {
+        let canonical = "# Plano — W\n\
+            <!-- lina/plan@1 · escritor unico: supervisor · NAO editar a mao -->\n\
+            ## Decisoes\n\
+            ## Itens\n\
+            - [~] T1 :: tela de leads :: @owner:@Front :: status:doing :: @paths:src/ui/leads.rs,src/ui/mod.rs\n";
+        let plan = Plan::parse(canonical).expect("parse com @paths");
+        let item = plan.itens.iter().find(|i| i.id == "T1").expect("T1");
+        assert_eq!(
+            item.paths,
+            vec!["src/ui/leads.rs".to_string(), "src/ui/mod.rs".to_string()]
+        );
+        // Round-trip byte-a-byte: o render do parseado é IDÊNTICO ao texto canônico.
+        assert_eq!(plan.render(), canonical, "@paths round-trip byte-a-byte");
+        // E parse(render(plan)) == plan (identidade estrutural).
+        assert_eq!(Plan::parse(&plan.render()).expect("re-parse"), plan);
+    }
+
+    /// F3-4-3 (inv #4): item SEM paths (o legado, todos os sufixos default) NÃO emite `@paths:` — a
+    /// linha é IDÊNTICA à de antes da F3-4 (replay de plano antigo reserializa byte-a-byte igual).
+    #[test]
+    fn legacy_item_without_paths_renders_without_paths_suffix() {
+        let mut p = Plan::new("W");
+        p.add_item("T1", "x").unwrap();
+        p.try_claim("T1", "@A").unwrap();
+        let text = p.render();
+        assert!(!text.contains("@paths:"), "sem paths → sem sufixo @paths");
+        assert!(text.ends_with("- [~] T1 :: x :: @owner:@A :: status:doing\n"));
+        assert!(p.find("T1").expect("T1").paths.is_empty());
     }
 
     #[test]
