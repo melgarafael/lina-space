@@ -2080,7 +2080,10 @@ fn run_template_create(slug: Option<&String>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    match lina_core::workspace_template::instanciar(&template, &mut store) {
+    // `requested_by = HUMAN_GESTURE`: instanciar um gabarito é um GESTO DE CONFIGURAÇÃO do usuário
+    // (consistente com a galeria da UI, que também carimba HUMAN_GESTURE) — não auto-orquestração de
+    // agente. O carimbo faz os spawns do roster nascerem com origem humana (passam o gate de spawn).
+    match lina_core::workspace_template::instanciar(&template, &mut store, lina_core::HUMAN_GESTURE) {
         Ok(n) => {
             println!(
                 "ok: gabarito '{}' instanciado ({n} eventos: roster + parametros + pistas + backlog)",
