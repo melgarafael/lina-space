@@ -206,24 +206,10 @@ pub fn worktree_branch_name(agent_name: &str) -> String {
     }
 }
 
-/// Path PURO da worktree de um agente: `<ws_root>/wt-<safe_key>` — irmão do dir gerenciado,
-/// ÚNICO por nó (a `node_key` é única por construção). Separadores embutidos na key são
-/// sanitizados (defesa em profundidade §7: um `..`/`/` na key nunca escapa da raiz do Espaço).
-/// O app cria a árvore aqui via `git worktree add`.
-#[must_use]
-pub fn worktree_path(ws_root: &Path, node_key: &str) -> PathBuf {
-    let safe_key: String = node_key
-        .chars()
-        .map(|c| {
-            if std::path::is_separator(c) || c == '\\' {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect();
-    ws_root.join(format!("wt-{safe_key}"))
-}
+// (O PATH físico da worktree — `<ws_root>/wt-<key>` — é plumbing do APP: vive em
+// `bridge.rs::worktree_path`, ao lado de `effective_managed_policy` e `ensure_cwd`, que já
+// resolvem caminhos lá. O core decide o NOME da branch — semântica; o app resolve o path —
+// plumbing. Mantém o core git-free e a fronteira de re-export intocada nesta rodada.)
 
 // ───────────────────────────── o Espaço ─────────────────────────────
 
@@ -552,8 +538,7 @@ pub fn default_registry_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod worktree_tests {
-    use super::{worktree_branch_name, worktree_path};
-    use std::path::{Path, PathBuf};
+    use super::worktree_branch_name;
 
     #[test]
     fn branch_name_slugs_and_prefixes() {
@@ -603,24 +588,5 @@ mod worktree_tests {
     fn branch_name_falls_back_on_empty_slug() {
         assert_eq!(worktree_branch_name("***"), "lina/agente");
         assert_eq!(worktree_branch_name(""), "lina/agente");
-    }
-
-    #[test]
-    fn path_is_under_ws_root_unique_per_key() {
-        let root = Path::new("/tmp/ws");
-        assert_eq!(
-            worktree_path(root, "n-abc"),
-            PathBuf::from("/tmp/ws/wt-n-abc")
-        );
-        assert_ne!(worktree_path(root, "n-abc"), worktree_path(root, "n-def"));
-    }
-
-    /// Defesa em profundidade §7: separador embutido na key vira `-`, nunca um componente que
-    /// escapa da raiz do Espaço.
-    #[test]
-    fn path_sanitizes_separators_in_key() {
-        let root = Path::new("/tmp/ws");
-        let p = worktree_path(root, "../evil");
-        assert!(p.starts_with(root), "{p:?} escapou da raiz");
     }
 }

@@ -3886,6 +3886,21 @@ pub enum CwdPolicy {
     /// construído em 5 sites + na UI `kit_consent` do modal; arrancá-lo é refactor fora do escopo
     /// mínimo do ADR — DEFERIDO de propósito) e não é mais lido na decisão do kit.
     UserDir { path: PathBuf, consent: bool },
+    /// **Worktree por agente (spec 36 §1).** O nó coda numa `git worktree` ISOLADA na branch
+    /// `branch` (nome decidido por [`lina_core::worktree_branch_name`]), criada a partir de
+    /// `base_repo` (o projeto git escolhido). O app EXECUTA `git worktree add` na admissão
+    /// (write-before-spawn) — cada agente na SUA árvore/branch, sem pisar nas outras (N IAs
+    /// codando em paralelo no mesmo PC). O path físico é derivado por [`lina_core::worktree_path`]
+    /// (único por nó). Degrada honestamente para `Managed` se o git falhar (não é repo, branch já
+    /// existe, disco) — nunca um terminal num estado mentiroso (inv#6).
+    //
+    // FUNDAÇÃO (ADR 0040), por isso `allow(dead_code)`: o CONSUMO (ramo `Worktree` do `admit`) e a
+    // EXECUÇÃO (`create_worktree`/hook) estão COMPLETOS nesta trilha; o PRODUTOR é a story de UI
+    // "criar agente no projeto X" (gatilho futuro). Nesta rodada a feature é dogfoodada com
+    // worktrees MANUAIS (onda F3-4) — só os testes constroem a variante. O `allow` cai sozinho
+    // quando a porta de UI plugar.
+    #[allow(dead_code)]
+    Worktree { base_repo: PathBuf, branch: String },
 }
 
 /// FIX-1 (dogfooding 2026-06-10): o path de TRABALHO que conta para a detecção de "cwd
@@ -3896,8 +3911,114 @@ pub enum CwdPolicy {
 fn shared_cwd_path(policy: &CwdPolicy) -> Option<&Path> {
     match policy {
         CwdPolicy::UserDir { path, .. } => Some(path.as_path()),
-        CwdPolicy::Managed | CwdPolicy::UserHome { .. } => None,
+        // `Worktree` é ÚNICA por nó por construção (`wt-<key>`) — nunca é o cwd compartilhado do
+        // FIX-1 (é justamente o oposto: cada agente na sua árvore). `Managed`/`UserHome` idem.
+        CwdPolicy::Managed | CwdPolicy::UserHome { .. } | CwdPolicy::Worktree { .. } => None,
     }
+}
+
+/// **F3-4-1 (spec 36 §1) — path PURO da worktree de um agente:** `<ws_root>/wt-<safe_key>`, irmão
+/// do dir gerenciado, ÚNICO por nó (a key é única por construção). Plumbing de path do APP — ao
+/// lado de [`effective_managed_policy`]/`ensure_cwd`, que já resolvem caminhos aqui; o core decide
+/// só o NOME da branch (`workspace::worktree_branch_name`). Separadores embutidos na key são
+/// sanitizados (defesa em profundidade §7: um `..`/`/` na key nunca escapa da raiz do Espaço).
+fn worktree_path(ws_root: &Path, node_key: &str) -> PathBuf {
+    let safe_key: String = node_key
+        .chars()
+        .map(|c| {
+            if std::path::is_separator(c) || c == '\\' {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    ws_root.join(format!("wt-{safe_key}"))
+}
+
+/// **F3-4-1 (spec 36 §1) — cria a worktree git de um agente.** A EXECUÇÃO do git vive no app (o
+/// core é git-free, inv#7): `git -C <base_repo> worktree add -b <branch> <wt_path> HEAD` cria uma
+/// árvore NOVA ligada a `base_repo`, na branch `branch`, a partir do HEAD atual. É write-before-spawn
+/// (a árvore existe antes de o PTY nascer; o shell já encontra os arquivos do projeto). Erro (não é
+/// repo, branch já existe, disco, git ausente) volta como `Err(stderr)` para o chamador DEGRADAR
+/// honestamente — nunca um terminal num estado mentiroso.
+fn create_worktree(base_repo: &Path, wt_path: &Path, branch: &str) -> Result<(), String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(base_repo)
+        .args(["worktree", "add", "-b", branch])
+        .arg(wt_path)
+        .arg("HEAD")
+        .output()
+        .map_err(|e| format!("git indisponível: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// **F3-4-2 (spec 36 §2) — o script do hook git pós-commit.** PURO (uma String): cada commit numa
+/// worktree de agente coleta os FATOS do commit (`branch`/`commit`/`paths` do `diff-tree`) e chama
+/// `lina code-changed`. O autor NÃO é coletado aqui — o supervisor o carimba server-side do binding
+/// autenticado (ADR 0007). O `lina` lê a identidade do nó do env/`.lina` do cwd onde o commit rodou.
+fn post_commit_hook_script() -> String {
+    // `$args` expandido sem aspas para passar um `--path <p>` por arquivo (paths de código não têm
+    // espaço; o caso patológico degrada para um sinal a menos, nunca para um autor forjado).
+    "#!/bin/sh\n\
+     # Lina Space — sinal de mudança (spec 36 §2). NÃO editar: instalado pelo app por worktree.\n\
+     commit=$(git rev-parse HEAD)\n\
+     branch=$(git rev-parse --abbrev-ref HEAD)\n\
+     args=\"\"\n\
+     for p in $(git diff-tree --no-commit-id --name-only -r HEAD); do\n\
+     \targs=\"$args --path $p\"\n\
+     done\n\
+     lina code-changed --branch \"$branch\" --commit \"$commit\" $args\n"
+        .to_string()
+}
+
+/// **F3-4-2 — instala o hook pós-commit no repo (merge-safe).** As worktrees COMPARTILHAM o
+/// `hooks/` do `git-common-dir`, então um hook serve a todas — ele lê branch/commit em runtime.
+/// `Ok(true)` = instalado; `Ok(false)` = já havia um post-commit (do usuário) e foi PRESERVADO
+/// (nunca sobrescrevemos trabalho dele); `Err` = git/disco falhou (o chamador degrada e narra).
+fn install_post_commit_hook(base_repo: &Path) -> Result<bool, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(base_repo)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .map_err(|e| format!("git indisponível: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let common_path = {
+        let p = Path::new(&common);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base_repo.join(p)
+        }
+    };
+    let hooks_dir = common_path.join("hooks");
+    let hook = hooks_dir.join("post-commit");
+    if hook.exists() {
+        // Merge-safe: o usuário pode ter o próprio post-commit — preservá-lo é a doutrina (igual
+        // ao kit merge-safe do UserDir). Nunca clobber silencioso.
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&hooks_dir).map_err(|e| format!("mkdir hooks: {e}"))?;
+    std::fs::write(&hook, post_commit_hook_script()).map_err(|e| format!("write hook: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&hook)
+            .map_err(|e| format!("stat hook: {e}"))?
+            .permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&hook, perm).map_err(|e| format!("chmod hook: {e}"))?;
+    }
+    Ok(true)
 }
 
 /// **Rodada 360 (ADR 0022 §1) — o PLANO de admissão**: a intenção "quero um terminal"
@@ -4770,6 +4891,14 @@ impl NodeManager {
                 // rewrite por mudança de roster). Continua listado como colega no `roster`, mas
                 // o home dele fica intocado — invariante do `+ Terminal`.
                 CwdPolicy::UserHome { .. } => {}
+                // Worktree (spec 36 §1): a árvore do agente é uma pasta de trabalho real → kit
+                // merge-safe como `UserDir`. O path físico não vive na variante (que só carrega
+                // `base_repo`/`branch`); recompõe-se de forma determinística a partir da key.
+                CwdPolicy::Worktree { .. } => {
+                    let ws_root = self.lina_dir.parent().unwrap_or(&self.lina_dir);
+                    let wt = worktree_path(ws_root, key);
+                    let _ = bw.write_user_dir(&wt, name, &roster);
+                }
             }
         }
     }
@@ -5422,6 +5551,69 @@ impl NodeManager {
                     }
                 }
                 Some(path.clone())
+            }
+            CwdPolicy::Worktree { base_repo, branch } => {
+                // O core (git-free) já decidiu o NOME da branch; aqui o app DERIVA o path único
+                // da árvore e EXECUTA o git (inv#7). `ws_root` = a raiz do Espaço (pai do `.lina`).
+                let ws_root = self
+                    .lina_dir
+                    .parent()
+                    .unwrap_or(&self.lina_dir)
+                    .to_path_buf();
+                let wt = worktree_path(&ws_root, &key);
+                match create_worktree(base_repo, &wt, branch) {
+                    Ok(()) => {
+                        // O hook de sinal de mudança (spec 36 §2): instala merge-safe no repo
+                        // (compartilhado pelas worktrees). Falha NÃO aborta a admissão — só narra
+                        // que os commits desta árvore não emitirão `CodeChanged` (degradação honesta).
+                        if let Err(e) = install_post_commit_hook(base_repo) {
+                            eprintln!(
+                                "lina-gpui: não instalei o hook de sinal de mudança em '{}' ({e}) \
+                                 — commits desta worktree não emitirão CodeChanged",
+                                base_repo.display()
+                            );
+                        }
+                        // `LINA_BRANCH` carimba a branch que o nó habita (mesma postura do
+                        // `LINA_NODE_ID`/`LINA_EFFORT` no ADR 0026: env é autoridade do APP no
+                        // spawn; um agente que reexporte só afeta o próprio processo).
+                        cmd = cmd.cwd(wt.clone()).env("LINA_BRANCH", branch.clone());
+                        // A worktree é a pasta de trabalho real do agente → kit merge-safe, como
+                        // um `UserDir`: o agente precisa da doutrina/observabilidade para cooperar.
+                        match &self.bootstrap {
+                            Some(bw) => {
+                                let mut roster: Vec<String> = self
+                                    .terminals_snapshot()
+                                    .into_iter()
+                                    .map(|(_, n)| n)
+                                    .collect();
+                                roster.push(name.clone());
+                                if bw.write_user_dir(&wt, &name, &roster) != KitOutcome::Full {
+                                    kit_missing = true;
+                                }
+                            }
+                            None => {
+                                // Boot degradado (sem bootstrap): badge honesto, nunca silencioso.
+                                kit_missing = true;
+                            }
+                        }
+                        Some(wt)
+                    }
+                    Err(e) => {
+                        // Degradação honesta (inv#6): git falhou (não é repo, branch já existe,
+                        // disco) → o nó NÃO sobe num estado mentiroso. Cai para a pasta gerenciada
+                        // (badge `kit_missing`) e NARRA no log; não aborta a admissão nem mente.
+                        eprintln!(
+                            "lina-gpui: 'git worktree add' falhou para '{name}' na branch \
+                             '{branch}' ({e}) — caindo para a pasta gerenciada"
+                        );
+                        kit_missing = true;
+                        let dir = self.ensure_cwd(&key);
+                        if let Some(d) = &dir {
+                            cmd = cmd.cwd(d.clone());
+                        }
+                        dir
+                    }
+                }
             }
         };
 
@@ -7695,6 +7887,166 @@ mod tests {
         // spawn de teste LANÇARIA o CLI de verdade. `None` = fábrica `cat` (como sempre).
         nm.set_spawn_engine_factory(Arc::new(|| None));
         (nm, store, model, sup)
+    }
+
+    /// **F3-4-1 (spec 36 §1) — worktree por agente:** dois agentes admitidos "no mesmo projeto
+    /// X" recebem worktrees ISOLADAS — branches distintas e árvores físicas separadas. É o
+    /// coração da trilha: N IAs codando em paralelo no mesmo PC sem pisar uma na outra. Usa git
+    /// REAL (a execução é do app; o core já decidiu nome/path nas funções puras de `workspace`).
+    #[test]
+    fn f3_4_1_two_worktree_nodes_get_isolated_branches() {
+        use std::process::Command;
+        let proj = std::env::temp_dir().join(format!("lina-wtproj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).expect("mkdir proj");
+        let git = |dir: &Path, args: &[&str]| -> std::process::Output {
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git roda")
+        };
+        // "projeto X": repo git com 1 commit (HEAD válido p/ a worktree derivar dele).
+        assert!(git(&proj, &["init", "-q"]).status.success(), "git init");
+        git(&proj, &["config", "user.email", "wt@test"]);
+        git(&proj, &["config", "user.name", "wt"]);
+        git(&proj, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(proj.join("README.md"), "x").expect("write");
+        git(&proj, &["add", "."]);
+        assert!(
+            git(&proj, &["commit", "-q", "-m", "init"]).status.success(),
+            "git commit inicial"
+        );
+
+        let (nm, _store, _model, _sup) = test_manager_full("wt-iso", None);
+        // A `branch` viria de `workspace::worktree_branch_name` (core) no produtor real (UI futura);
+        // aqui é explícita para manter o teste do app livre da fronteira de re-export do core.
+        let mk = |name: &str, branch: &str| NodeAdmission {
+            name: Some(name.to_string()),
+            role: "developer".to_string(),
+            engine: None,
+            cwd: CwdPolicy::Worktree {
+                base_repo: proj.clone(),
+                branch: branch.to_string(),
+            },
+            position: None,
+            requested_by: None,
+            autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
+        };
+        nm.admit_node(mk("Agente Um", "lina/agente-um"))
+            .expect("admite worktree 1");
+        nm.admit_node(mk("Agente Dois", "lina/agente-dois"))
+            .expect("admite worktree 2");
+
+        // O git registrou DUAS worktrees `lina/*` além da principal, em branches distintas.
+        let porcelain = git(&proj, &["worktree", "list", "--porcelain"]);
+        let txt = String::from_utf8_lossy(&porcelain.stdout);
+        let mut wts: Vec<(String, String)> = Vec::new();
+        let mut cur = String::new();
+        for line in txt.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                cur = p.to_string();
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                if b.starts_with("lina/") {
+                    wts.push((cur.clone(), b.to_string()));
+                }
+            }
+        }
+        assert_eq!(wts.len(), 2, "duas worktrees lina/*:\n{txt}");
+        assert_ne!(wts[0].1, wts[1].1, "branches DISTINTAS");
+        assert_ne!(wts[0].0, wts[1].0, "árvores físicas DISTINTAS");
+        // Isolamento: cada worktree REALMENTE em sua branch — checkout de uma não move a outra.
+        for (path, branch) in &wts {
+            let head = git(Path::new(path), &["rev-parse", "--abbrev-ref", "HEAD"]);
+            assert_eq!(
+                String::from_utf8_lossy(&head.stdout).trim(),
+                branch,
+                "worktree {path} deveria estar em {branch}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// **F3-4-2 (spec 36 §2) — o script do hook** chama `lina code-changed` com os fatos do commit
+    /// (branch via `--abbrev-ref`, commit via `rev-parse HEAD`, paths via `diff-tree`). O autor
+    /// NUNCA é coletado pelo hook — é carimbado server-side (ADR 0007).
+    #[test]
+    fn f3_4_2_post_commit_hook_script_carries_commit_facts() {
+        let s = post_commit_hook_script();
+        assert!(s.starts_with("#!"), "shebang");
+        assert!(s.contains("lina code-changed"), "chama o verbo");
+        assert!(s.contains("git rev-parse HEAD"), "coleta o commit");
+        assert!(s.contains("--abbrev-ref HEAD"), "coleta a branch");
+        assert!(s.contains("git diff-tree"), "coleta os paths");
+        assert!(
+            s.contains("--branch") && s.contains("--commit") && s.contains("--path"),
+            "passa branch/commit/paths ao verbo"
+        );
+        assert!(
+            !s.contains("author"),
+            "o autor é server-side, nunca no hook"
+        );
+    }
+
+    /// **F3-4-2 — instalação merge-safe:** a 1ª vez cria o hook executável; a 2ª NÃO sobrescreve um
+    /// `post-commit` pré-existente do usuário (preserva o trabalho dele, como o kit merge-safe).
+    #[test]
+    fn f3_4_2_install_hook_is_merge_safe_and_executable() {
+        use std::process::Command;
+        let proj = std::env::temp_dir().join(format!("lina-hookinst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&proj);
+        std::fs::create_dir_all(&proj).expect("mkdir");
+        assert!(Command::new("git")
+            .current_dir(&proj)
+            .args(["init", "-q"])
+            .status()
+            .expect("git")
+            .success());
+        // 1ª instalação: cria o hook.
+        assert_eq!(install_post_commit_hook(&proj), Ok(true), "cria na 1ª vez");
+        let hook = proj.join(".git").join("hooks").join("post-commit");
+        assert!(hook.exists(), "hook escrito");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "hook executável (chmod +x)");
+        }
+        // 2ª instalação: o usuário já tem um post-commit → preserva, não sobrescreve.
+        std::fs::write(&hook, "#!/bin/sh\n# hook do usuário\n").expect("write user hook");
+        assert_eq!(
+            install_post_commit_hook(&proj),
+            Ok(false),
+            "não sobrescreve"
+        );
+        assert!(
+            std::fs::read_to_string(&hook)
+                .expect("read")
+                .contains("hook do usuário"),
+            "preservou o hook do usuário"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    /// **F3-4-1 — path da worktree:** único por nó sob a raiz do Espaço (`wt-<key>`).
+    #[test]
+    fn f3_4_1_worktree_path_is_unique_per_key_under_ws_root() {
+        let root = Path::new("/tmp/ws");
+        assert_eq!(
+            worktree_path(root, "n-abc"),
+            PathBuf::from("/tmp/ws/wt-n-abc")
+        );
+        assert_ne!(worktree_path(root, "n-abc"), worktree_path(root, "n-def"));
+    }
+
+    /// **F3-4-1 — defesa em profundidade §7:** separador embutido na key vira `-`, nunca um
+    /// componente que escapa da raiz do Espaço.
+    #[test]
+    fn f3_4_1_worktree_path_sanitizes_separators_in_key() {
+        let root = Path::new("/tmp/ws");
+        let p = worktree_path(root, "../evil");
+        assert!(p.starts_with(root), "{p:?} escapou da raiz");
     }
 
     /// **F3-CONF-2 (gate c) — ponta-a-ponta do "clique para liberar":** o gesto humano
