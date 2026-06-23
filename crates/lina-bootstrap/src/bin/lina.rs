@@ -18,6 +18,7 @@ use lina_bootstrap::{
     project_retro, render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk,
     RetroInvocation, AUTONOMY_ENV,
 };
+use lina_core::channel::ChannelRegistry;
 use lina_core::history::{self, ExportFormat, HistoryLimits, HistoryPage, SearchPage};
 use lina_core::mentality::{BeliefStatus, Mentality, PromotionPolicy};
 use lina_core::scrollback::ScrollbackStore;
@@ -4079,6 +4080,24 @@ fn run_do_channel(channel: &str, rest: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    // (1) Default-deny (F4-0-1): só medeia canal DECLARADO no ChannelRegistry (projeção pura do log).
+    //     Canal desconhecido → recusa ANTES de apendar/enfileirar (não há efeito a custodiar num canal
+    //     inexistente). A validação "ação ∈ scopes do manifesto" (broker::channel_action_in_manifest)
+    //     é do SUPERVISOR, que carrega o manifesto via `manifest_ref` — o agente não faz esse I/O.
+    let registry = match ChannelRegistry::replay(&store) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("lina: falha ao ler o registro de canais: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if registry.get(channel).is_none() {
+        eprintln!(
+            "lina: canal '{channel}' nao esta declarado neste Espaco (registre o canal antes de usa-lo)."
+        );
+        return ExitCode::from(2);
+    }
 
     // (2) O gate disparou: efeito externo de canal → ask em qualquer nível (piso de custódia, ADR 0004).
     let gated = DomainEvent::ActionGated {

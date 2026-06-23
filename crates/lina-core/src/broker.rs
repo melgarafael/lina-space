@@ -21,6 +21,7 @@
 use lina_secrets::{SecretError, SecretStore, SecretVault};
 use thiserror::Error;
 
+use crate::channel::ChannelManifest;
 use crate::events::{DomainEvent, EventStore, StoreError};
 
 /// Classe canônica das ações custodiadas no evento `ActionGated`. É **broker-only**: NÃO sai do
@@ -144,6 +145,19 @@ impl BrokerRequest {
             channel: Some(channel),
         }
     }
+}
+
+/// `true` se a ação de canal está DECLARADA no manifesto (F4-0-1) — em `scopes` ou
+/// `tools.default_enabled`. **Default-deny:** ação não-declarada → `false` (o supervisor recusa
+/// antes de montar o pedido). É a tradução de "a ação no manifesto (`scopes`/`tools`)" do gate (b):
+/// o manifesto é DADO (lista o que o canal expõe), jamais autoridade — quem libera o efeito é a
+/// custódia (gate humano + segredo), não este check. O SUPERVISOR a chama ao resolver `<canal> →
+/// manifesto` ([`ChannelManifest::load`] via `manifest_ref` do [`ChannelRegistry`](crate::channel)),
+/// antes de [`BrokerRequest::for_channel`] — o lado-agente não carrega o manifesto (I/O não-confiável).
+#[must_use]
+pub fn channel_action_in_manifest(manifest: &ChannelManifest, action: &str) -> bool {
+    manifest.scopes.iter().any(|s| s == action)
+        || manifest.tools.default_enabled.iter().any(|t| t == action)
 }
 
 /// Resultado do broker. Os três caminhos provam a custódia (ADR 0004 / AC-6.5).
@@ -709,6 +723,39 @@ mod tests {
         assert!(
             matches!(err, BrokerError::UnknownAction(_)),
             "sem o discriminante de canal, `post` é UnknownAction"
+        );
+    }
+
+    /// A validação "ação no manifesto (`scopes`/`tools`)" do gate (b): ação declarada em `scopes`
+    /// OU `tools.default_enabled` → permitida; qualquer outra → recusada (default-deny). É a regra
+    /// que o supervisor aplica ao resolver `<canal> → manifesto` antes de montar o pedido de canal.
+    #[test]
+    fn channel_action_validated_against_manifest_scopes_and_tools() {
+        let manifest = ChannelManifest::parse(
+            r#"
+name = "slack-stub"
+transport = "stub"
+auth = "api_key"
+scopes = ["chat:write", "send"]
+[tools]
+default_enabled = ["post_message"]
+[install]
+ref = "v0.1.0"
+"#,
+        )
+        .expect("manifesto válido");
+
+        assert!(
+            channel_action_in_manifest(&manifest, "send"),
+            "ação declarada em scopes é permitida"
+        );
+        assert!(
+            channel_action_in_manifest(&manifest, "post_message"),
+            "ação declarada em tools.default_enabled é permitida"
+        );
+        assert!(
+            !channel_action_in_manifest(&manifest, "delete_everything"),
+            "ação não-declarada → default-deny"
         );
     }
 

@@ -8,7 +8,33 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lina_core::channel::{register_channel, ChannelManifest, TrustTier};
 use lina_core::EventStore;
+
+/// Registra um canal-stub DECLARADO (emite `ChannelRegistered`) no mesmo `LINA_HOME` — pré-condição
+/// de `lina do <canal> …` (F4-0-1 default-deny: o broker só medeia canal declarado). O store é
+/// aberto e fechado aqui (drop ao fim do escopo) ANTES de o subprocesso `lina` abrir o event log.
+fn register_stub_channel(home: &TempHome, name: &str) {
+    let toml = format!(
+        "name = \"{name}\"\n\
+         transport = \"stub\"\n\
+         auth = \"api_key\"\n\
+         scopes = [\"send\", \"read\"]\n\
+         [tools]\n\
+         default_enabled = [\"send\"]\n\
+         [install]\n\
+         ref = \"v0.1.0\"\n"
+    );
+    let manifest = ChannelManifest::parse(&toml).expect("manifesto-stub válido");
+    let mut store = EventStore::open(home.events_dir()).expect("abrir store p/ registrar canal");
+    register_channel(
+        &mut store,
+        &manifest,
+        &format!("channels/{name}/manifest.toml"),
+        TrustTier::Comunidade,
+    )
+    .expect("registrar canal-stub");
+}
 
 struct TempHome(PathBuf);
 
@@ -223,6 +249,7 @@ fn lina_do_unknown_action_is_rejected() {
 #[test]
 fn lina_do_channel_action_registers_and_blocks_without_executing() {
     let home = TempHome::new("channel");
+    register_stub_channel(&home, "slack-stub"); // pré-condição: canal declarado (F4-0-1).
     let out = run_do(&home, &["slack-stub", "send", "ola-mundo"]);
     assert!(
         out.status.success(),
@@ -264,6 +291,7 @@ fn lina_do_channel_action_registers_and_blocks_without_executing() {
 #[test]
 fn lina_do_channel_enqueues_with_channel_ref() {
     let home = TempHome::new("channelq");
+    register_stub_channel(&home, "slack-stub"); // pré-condição: canal declarado (F4-0-1).
     let out = run_do(&home, &["slack-stub", "send", "oi"]);
     assert!(out.status.success(), "registro do pedido de canal");
 
@@ -312,5 +340,23 @@ fn lina_do_channel_without_action_is_rejected() {
     assert!(
         event_kinds(&home).is_empty(),
         "canal sem ação não deve apendar evento"
+    );
+}
+
+/// **Default-deny (F4-0-1):** `lina do <canal-NÃO-declarado> send` é recusado (exit != 0) e NÃO
+/// inicia o gate (nenhum `ActionGated`) — o broker só medeia canal DECLARADO no `ChannelRegistry`.
+/// Sem o canal registrado, não há efeito a custodiar.
+#[test]
+fn lina_do_undeclared_channel_is_rejected() {
+    let home = TempHome::new("undeclared");
+    let out = run_do(&home, &["fantasma", "send", "oi"]);
+    assert!(
+        !out.status.success(),
+        "canal não declarado deve falhar (exit != 0); stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !event_kinds(&home).iter().any(|(k, _)| k == "ActionGated"),
+        "canal não declarado NÃO inicia o gate (sem ActionGated)"
     );
 }
