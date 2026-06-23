@@ -44,6 +44,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Validar manifestos de canal (schema — manifesto malformado barra o merge · F4-0-6 gate e)
+        # Gate (e) da onda F4-0: reusa o parser canônico de B (ChannelManifest, F4-0-1) para validar
+        # todo channels/<nome>/manifest.toml em merge-time. Fail-fast — um manifesto malformado (campo
+        # faltando/desconhecido, install.ref flutuante) reprova ANTES da suíte inteira, barrando o merge.
+        run: cargo test -p lina-core --test f4_0_manifest_schema -- --test-threads=1
       - name: Test (workspace, serializado — o store/recovery exige --test-threads=1)
         run: cargo test --workspace -- --test-threads=1
       - name: Clippy (-D warnings)
