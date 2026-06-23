@@ -69,24 +69,36 @@ pub fn lookup_action(name: &str) -> Option<CustodyAction> {
     CUSTODY_ACTIONS.iter().copied().find(|a| a.name == name)
 }
 
-/// Pedido de uma ação custodiada, montado a partir de `lina do <action> [args]`. Carrega a
-/// **referência** do segredo (escopo+chave), **nunca** o segredo em si.
+/// Prefixo do escopo de segredo de um **canal** no [`SecretVault`] (F4-0-2): a credencial de um canal
+/// vive em `vault.get("channel:<nome>", key)`. É a MESMA convenção que `set_channel_credential`
+/// (F40-CRED) usa ao gravar — fonte única do prefixo para o broker não divergir do cofre.
+pub const CHANNEL_SECRET_SCOPE_PREFIX: &str = "channel:";
+
+/// Pedido de uma ação custodiada, montado a partir de `lina do <action> [args]` (forma legada) ou
+/// `lina do <canal> <ação> [args]` (forma de canal, F4-0-3). Carrega a **referência** do segredo
+/// (escopo+chave), **nunca** o segredo em si.
 #[derive(Debug, Clone)]
 pub struct BrokerRequest {
-    /// Nome da ação (`deploy`/`pay`/`send`).
+    /// Nome da ação. Builtin: `deploy`/`pay`/`send`. Canal: a ação declarada no manifesto (`send`/…).
     pub action: String,
-    /// Escopo do segredo no cofre (de [`CustodyAction::scope`]).
+    /// Escopo do segredo no cofre. Builtin: de [`CustodyAction::scope`]. Canal: `channel:<nome>`.
     pub secret_scope: String,
-    /// Chave do segredo dentro do escopo (ex.: o ambiente `prod` para deploy).
+    /// Chave do segredo dentro do escopo (ex.: o ambiente `prod` para deploy; o token p/ um canal).
     pub secret_key: String,
     /// Identidade auto-declarada do requisitante (A3 pendente — não-autenticada).
     pub requester: String,
     /// Resumo legível do comando (vai para `ActionGated.cmd`; SEM o segredo).
     pub display: String,
+    /// `Some(canal)` = ação de um CANAL (F4-0-3), já validada upstream contra o manifesto do
+    /// [`ChannelRegistry`](crate::channel) (canal declarado? ação no `scopes`/`tools`?). `None` =
+    /// ação builtin do registry estático [`CUSTODY_ACTIONS`]. O discriminante diz a [`run_custody`]
+    /// QUAL validação aplicar — a custódia (gate humano + segredo no cofre) é idêntica nos dois casos.
+    pub channel: Option<String>,
 }
 
 impl BrokerRequest {
-    /// Monta o pedido para uma [`CustodyAction`] resolvida, com a chave de segredo e o requisitante.
+    /// Monta o pedido para uma [`CustodyAction`] **builtin** (registry estático), com a chave de
+    /// segredo e o requisitante.
     #[must_use]
     pub fn new(
         action: CustodyAction,
@@ -102,6 +114,34 @@ impl BrokerRequest {
             secret_key,
             requester: requester.into(),
             display,
+            channel: None,
+        }
+    }
+
+    /// Monta o pedido para uma ação de **CANAL** (F4-0-3): `lina do <canal> <ação>`. O escopo do
+    /// segredo é derivado do canal (`channel:<nome>`) — **server-side**, nunca ditado pelo agente
+    /// (um agente que escolhesse o escopo apontaria para o segredo de outro canal). A validação
+    /// "canal declarado + ação no manifesto" é feita por quem chama (contra o [`ChannelRegistry`]);
+    /// aqui a ação NÃO passa pelo registry estático de builtins.
+    #[must_use]
+    pub fn for_channel(
+        channel: impl Into<String>,
+        action: impl Into<String>,
+        secret_key: impl Into<String>,
+        requester: impl Into<String>,
+    ) -> Self {
+        let channel = channel.into();
+        let action = action.into();
+        let secret_key = secret_key.into();
+        let secret_scope = format!("{CHANNEL_SECRET_SCOPE_PREFIX}{channel}");
+        let display = format!("lina do {channel} {action} [{secret_scope}/{secret_key}]");
+        Self {
+            action,
+            secret_scope,
+            secret_key,
+            requester: requester.into(),
+            display,
+            channel: Some(channel),
         }
     }
 }
@@ -157,7 +197,11 @@ where
     S: SecretStore,
     F: FnOnce(&str) -> Result<(), String>,
 {
-    if lookup_action(&req.action).is_none() {
+    // Builtin (deploy/pay/send): a ação TEM que estar no registry estático. Canal (`channel:Some`):
+    // a validação "canal declarado + ação no manifesto" já ocorreu upstream (contra o
+    // `ChannelRegistry`); o broker não re-valida contra os builtins. A custódia abaixo é idêntica:
+    // mesmo com canal/ação forjados, sem o segredo no escopo `channel:<nome>` nada executa (no_secret).
+    if req.channel.is_none() && lookup_action(&req.action).is_none() {
         return Err(BrokerError::UnknownAction(req.action.clone()));
     }
 
@@ -472,6 +516,7 @@ mod tests {
             secret_key: "prod".to_string(),
             requester: "@Dev".to_string(),
             display: "lina do rm-the-universe".to_string(),
+            channel: None,
         };
         let err = run_custody(&req, true, &vault, &mut store, |_| Ok(())).unwrap_err();
         assert!(matches!(err, BrokerError::UnknownAction(_)));
@@ -496,6 +541,175 @@ mod tests {
             .expect("ActionGated");
         assert_eq!(gated.payload["class"], CLASS_GATED_HARD_EXTERNAL);
         assert_eq!(gated.payload["decision"], "ask");
+    }
+
+    // ───────────────────── F4-0-3 · broker de canal (`lina do <canal> <ação>`, ADR 0004) ──────
+
+    /// Cofre com um token do canal-stub no escopo `channel:slack-stub` (espelha o que F40-CRED grava
+    /// via `set_channel_credential`). A chave dentro do escopo é o tipo de credencial (`token`).
+    fn vault_with_channel_token() -> SecretVault<MockStore> {
+        let v = SecretVault::with_store("lina-space/ws-teste", MockStore::new());
+        v.set("channel:slack-stub", "token", "xoxb-TOKEN-DO-CANAL-SECRETO")
+            .expect("semear token do canal");
+        v
+    }
+
+    fn channel_req() -> BrokerRequest {
+        // `send` é também um builtin — usado de propósito para provar que o caminho de canal NÃO
+        // depende do registry estático: o discriminante `channel:Some` roteia a validação, não o nome.
+        BrokerRequest::for_channel("slack-stub", "send", "token", "@Dev")
+    }
+
+    /// Gate (b) — lado supervisor: ação de canal SEM confirmação → bloqueia + ActionGated
+    /// {class:"gated-hard-external", decision:"ask"}; o executor NÃO roda, e o escopo do segredo é o
+    /// do CANAL (`channel:slack-stub`), derivado server-side — não um escopo ditado pelo agente.
+    #[test]
+    fn channel_unconfirmed_blocks_and_logs_gated_hard_external() {
+        let tmp = TempDir::new("chan-unconfirmed");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_channel_token();
+        let ran = Cell::new(false);
+
+        let req = channel_req();
+        assert_eq!(
+            req.secret_scope, "channel:slack-stub",
+            "o escopo do segredo de um canal é derivado do nome (server-side), não ditado pelo agente"
+        );
+        assert_eq!(req.channel.as_deref(), Some("slack-stub"));
+
+        let outcome = run_custody(&req, false, &vault, &mut store, |_secret| {
+            ran.set(true);
+            Ok(())
+        })
+        .expect("run_custody");
+
+        assert_eq!(outcome, BrokerOutcome::DeniedUnconfirmed);
+        assert!(!ran.get(), "o executor NÃO pode rodar sem confirmação");
+
+        let events = store.events().expect("eventos");
+        let gated = events
+            .iter()
+            .find(|r| r.kind == "ActionGated")
+            .expect("ActionGated");
+        assert_eq!(gated.payload["class"], "gated-hard-external");
+        assert_eq!(gated.payload["decision"], "ask");
+        assert!(
+            events
+                .iter()
+                .any(|r| r.kind == "BrokerDenied" && r.payload["reason"] == "unconfirmed"),
+            "ação de canal sem confirmação deve apendar BrokerDenied{{unconfirmed}}"
+        );
+        assert!(
+            !events.iter().any(|r| r.kind == "BrokerExecuted"),
+            "NUNCA pode haver BrokerExecuted sem confirmação"
+        );
+    }
+
+    /// COM confirmação, o broker obtém o segredo DO ESCOPO DO CANAL (`channel:slack-stub`) e executa;
+    /// o segredo do canal nunca vaza para o log (invariante #2). Prova que a custódia de canal reusa
+    /// o mesmo motor — só o escopo muda.
+    #[test]
+    fn channel_confirmed_fetches_secret_from_channel_scope_and_executes() {
+        let tmp = TempDir::new("chan-confirmed");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_channel_token();
+        let seen_secret: Cell<Option<String>> = Cell::new(None);
+
+        let outcome = run_custody(&channel_req(), true, &vault, &mut store, |secret| {
+            seen_secret.set(Some(secret.to_string()));
+            Ok(())
+        })
+        .expect("run_custody");
+
+        assert_eq!(outcome, BrokerOutcome::Executed);
+        assert_eq!(
+            seen_secret.take().as_deref(),
+            Some("xoxb-TOKEN-DO-CANAL-SECRETO"),
+            "o segredo passado ao executor deve vir do escopo channel:<nome> do cofre"
+        );
+
+        let events = store.events().expect("eventos");
+        assert!(events
+            .iter()
+            .any(|r| r.kind == "BrokerExecuted" && r.payload["action"] == "send"));
+        let log_dump =
+            serde_json::to_string(&events.iter().map(|r| &r.payload).collect::<Vec<_>>())
+                .expect("serializar log");
+        assert!(
+            !log_dump.contains("xoxb-TOKEN-DO-CANAL-SECRETO"),
+            "o segredo do canal NÃO pode aparecer em nenhum evento do log"
+        );
+    }
+
+    /// Prova de custódia para canal: confirmado, mas o escopo `channel:<nome>` está VAZIO no cofre →
+    /// sem caminho de execução (`BrokerDenied{no_secret}`). Sem credencial guardada (F40-CRED não
+    /// rodou para este canal), o canal não dispara efeito externo — mesmo com o "sim" humano.
+    #[test]
+    fn channel_confirmed_without_secret_cannot_execute() {
+        let tmp = TempDir::new("chan-nosecret");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        // Cofre sem o token do canal (existe um token de OUTRO escopo p/ provar que o lookup é por escopo).
+        let vault = SecretVault::with_store("lina-space/ws-teste", MockStore::new());
+        vault
+            .set("channel:outro-canal", "token", "nao-e-este")
+            .expect("semear outro escopo");
+        let ran = Cell::new(false);
+
+        let outcome = run_custody(&channel_req(), true, &vault, &mut store, |_secret| {
+            ran.set(true);
+            Ok(())
+        })
+        .expect("run_custody");
+
+        assert_eq!(outcome, BrokerOutcome::DeniedNoSecret);
+        assert!(
+            !ran.get(),
+            "sem segredo no escopo do canal, o executor NÃO roda"
+        );
+        let events = store.events().expect("eventos");
+        assert!(events
+            .iter()
+            .any(|r| r.kind == "BrokerDenied" && r.payload["reason"] == "no_secret"));
+        assert!(!events.iter().any(|r| r.kind == "BrokerExecuted"));
+    }
+
+    /// A ação de canal NÃO passa pelo registry estático de builtins: uma ação que NÃO existe em
+    /// `CUSTODY_ACTIONS` (`post`) é aceita por `run_custody` quando vem por canal (a validação dela é
+    /// o manifesto, upstream) — enquanto a MESMA ação como builtin seria `UnknownAction`.
+    #[test]
+    fn channel_action_outside_static_registry_is_accepted() {
+        let tmp = TempDir::new("chan-bypass");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = SecretVault::with_store("lina-space/ws-teste", MockStore::new());
+        vault
+            .set("channel:notion-stub", "token", "secret-ntn")
+            .expect("semear token");
+
+        assert!(
+            lookup_action("post").is_none(),
+            "pré-condição: `post` não é uma ação builtin"
+        );
+
+        // Via canal: aceita (chega ao gate, não dá UnknownAction).
+        let req = BrokerRequest::for_channel("notion-stub", "post", "token", "@Dev");
+        let outcome =
+            run_custody(&req, false, &vault, &mut store, |_| Ok(())).expect("run_custody de canal");
+        assert_eq!(outcome, BrokerOutcome::DeniedUnconfirmed);
+
+        // A MESMA ação como builtin seria recusada de cara (prova que o discriminante é quem roteia).
+        let builtin_like = BrokerRequest {
+            action: "post".to_string(),
+            secret_scope: "channel:notion-stub".to_string(),
+            secret_key: "token".to_string(),
+            requester: "@Dev".to_string(),
+            display: "lina do post".to_string(),
+            channel: None,
+        };
+        let err = run_custody(&builtin_like, false, &vault, &mut store, |_| Ok(())).unwrap_err();
+        assert!(
+            matches!(err, BrokerError::UnknownAction(_)),
+            "sem o discriminante de canal, `post` é UnknownAction"
+        );
     }
 
     // ───────────────────── F3-5-8 · poda de disco custodiada (ADR 0043) ─────────────────────

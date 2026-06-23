@@ -200,17 +200,117 @@ fn lina_resume_does_not_unpause_only_requests() {
     );
 }
 
-/// Ação não custodiada via `lina do` é recusada (exit != 0) e não apenda evento.
+/// Um único token não-builtin via `lina do` é tratado como canal SEM ação → recusado (exit != 0) e
+/// não apenda evento (o store nem é aberto antes da validação dos argumentos).
 #[test]
 fn lina_do_unknown_action_is_rejected() {
     let home = TempHome::new("unknown");
     let out = run_do(&home, &["destruir-tudo"]);
     assert!(
         !out.status.success(),
-        "ação não custodiada deve falhar (exit != 0)"
+        "ação não custodiada / canal sem ação deve falhar (exit != 0)"
     );
     assert!(
         event_kinds(&home).is_empty(),
-        "ação desconhecida não deve apendar evento"
+        "argumento inválido não deve apendar evento"
+    );
+}
+
+/// **Gate (b) F4-0-3 lado-agente:** `lina do <canal-stub> send` SEM confirmação → registra e bloqueia.
+/// ActionGated{gated-hard-external, ask} + BrokerDenied{unconfirmed}; o agente NUNCA produz
+/// BrokerExecuted (não tem o token do escopo `channel:<nome>` nem confirmação humana). O `cmd` do
+/// ActionGated identifica o canal+ação (auditoria do gate humano vê QUAL efeito de QUAL canal).
+#[test]
+fn lina_do_channel_action_registers_and_blocks_without_executing() {
+    let home = TempHome::new("channel");
+    let out = run_do(&home, &["slack-stub", "send", "ola-mundo"]);
+    assert!(
+        out.status.success(),
+        "lina do <canal> <ação> deveria registrar com sucesso; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let events = event_kinds(&home);
+    let gated = events
+        .iter()
+        .find(|(k, _)| k == "ActionGated")
+        .expect("ActionGated apendado");
+    assert_eq!(gated.1["class"], "gated-hard-external");
+    assert_eq!(gated.1["decision"], "ask");
+    assert!(
+        gated.1["cmd"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("slack-stub"),
+        "o cmd do gate deve identificar o canal: {:?}",
+        gated.1["cmd"]
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|(k, p)| k == "BrokerDenied" && p["reason"] == "unconfirmed"),
+        "efeito de canal sem confirmação deve apendar BrokerDenied{{unconfirmed}}"
+    );
+    assert!(
+        !events.iter().any(|(k, _)| k == "BrokerExecuted"),
+        "o agente NUNCA pode produzir BrokerExecuted (não tem o segredo do canal)"
+    );
+}
+
+/// O pedido de canal entra na FILA DE BROKER por-nó com ref `do:channel:<canal>:<ação>` — o
+/// supervisor o reconhece para montar `BrokerRequest::for_channel` (escopo `channel:<canal>` derivado
+/// SERVER-SIDE; o agente não dita o escopo do segredo). E NÃO vaza para o outbox A2A.
+#[test]
+fn lina_do_channel_enqueues_with_channel_ref() {
+    let home = TempHome::new("channelq");
+    let out = run_do(&home, &["slack-stub", "send", "oi"]);
+    assert!(out.status.success(), "registro do pedido de canal");
+
+    let node_dir = home
+        .path()
+        .join("broker")
+        .join("outbox")
+        .join("agente-desconhecido");
+    let jsons: Vec<PathBuf> = std::fs::read_dir(&node_dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(jsons.len(), 1, "1 pedido de canal na fila de broker por-nó");
+
+    let raw = std::fs::read_to_string(&jsons[0]).expect("ler o pedido enfileirado");
+    assert!(
+        raw.contains("do:channel:slack-stub:send"),
+        "o ref deve transportar canal+ação para o supervisor derivar o escopo: {raw}"
+    );
+
+    // Não pode ter vazado para o outbox A2A (senão o Router o trataria como entrega a um colega).
+    let a2a_outbox = home.path().join("outbox");
+    assert!(
+        !a2a_outbox.exists()
+            || std::fs::read_dir(&a2a_outbox)
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(true),
+        "o pedido de broker NAO pode aparecer no outbox A2A"
+    );
+}
+
+/// `lina do <canal>` SEM a ação é recusado (exit != 0) e não apenda evento — a forma de canal exige
+/// `<canal> <ação>`, e a validação dos argumentos precede a abertura do store.
+#[test]
+fn lina_do_channel_without_action_is_rejected() {
+    let home = TempHome::new("channel-noaction");
+    let out = run_do(&home, &["slack-stub"]);
+    assert!(
+        !out.status.success(),
+        "canal sem ação deve falhar (exit != 0)"
+    );
+    assert!(
+        event_kinds(&home).is_empty(),
+        "canal sem ação não deve apendar evento"
     );
 }

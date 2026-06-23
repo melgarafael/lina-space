@@ -76,7 +76,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina do <canal> <acao> [args]   (F4-0-3: efeito externo de um canal (verbo brokerado InsForge); o\n   segredo vive so em channel:<canal> no cofre. O agente REGISTRA + ActionGated{{ask}}; NAO executa.)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -3942,17 +3942,22 @@ fn run_resume(_args: &[String]) -> ExitCode {
 ///   4. registra o pedido na mailbox (intent `broker.do`) para o supervisor rodar o gate humano +
 ///      `run_custody` (que obtém o segredo do cofre e executa — fora deste binário).
 ///
+/// Duas formas, mesma custódia: `lina do <deploy|pay|send> [args]` (builtin do registry) e
+/// `lina do <canal> <ação> [args]` (F4-0-3 — efeito externo de canal; ver [`run_do_channel`]). A
+/// distinção é o 1º token: se for uma ação builtin, é a forma legada; senão, é um canal.
+///
 /// A ação real NÃO roda aqui (este crate nem linka `lina-secrets`: o agente não tem acesso ao cofre).
 fn run_do(args: &[String]) -> ExitCode {
-    let Some(action) = args.first() else {
-        eprintln!("lina: 'do' exige uma acao custodiada (ex.: lina do deploy --env prod)");
+    let Some(first) = args.first() else {
+        eprintln!("lina: 'do' exige uma acao custodiada (ex.: lina do deploy --env prod) ou um canal (ex.: lina do slack send \"...\")");
         usage();
         return ExitCode::from(2);
     };
-    let Some(custody) = lookup_action(action) else {
-        eprintln!("lina: acao '{action}' nao e custodiada. Acoes suportadas: deploy | pay | send");
-        return ExitCode::from(2);
+    // 1º token não-builtin → forma de CANAL (`lina do <canal> <ação>`, F4-0-3).
+    let Some(custody) = lookup_action(first) else {
+        return run_do_channel(first, &args[1..]);
     };
+    let action = first;
     let rest = &args[1..];
     let display = if rest.is_empty() {
         format!("lina do {action}")
@@ -4019,6 +4024,102 @@ fn run_do(args: &[String]) -> ExitCode {
         custody.desc
     );
     println!("registrado para o supervisor (msg {}). O agente NAO executa: o segredo vive so no cofre do Lina.", msg.id);
+    ExitCode::SUCCESS
+}
+
+/// `lina do <canal> <ação> [args]` (F4-0-3, ADR 0004) — **forma de CANAL** do verbo brokerado: o
+/// efeito externo de qualquer canal (WhatsApp/e-mail/ferramenta) é este verbo (doutrina InsForge —
+/// o verbo é o ponto de gate, nunca o agente chamando a API direto). Idêntica em custódia à forma
+/// builtin: o agente NÃO executa — ele não tem o segredo (vive só em `channel:<canal>` no cofre do
+/// Lina) nem confirmação humana. Apenda `ActionGated{ask}` + `BrokerDenied{unconfirmed}` e enfileira
+/// o pedido (intent `broker.do`, ref `do:channel:<canal>:<ação>`) para o supervisor rodar o gate
+/// humano + `run_custody` via [`BrokerRequest::for_channel`], que deriva o escopo do segredo
+/// (`channel:<canal>`) **server-side** — o agente nunca dita o escopo (senão apontaria para o
+/// segredo de outro canal).
+///
+/// A validação "canal declarado no `ChannelRegistry` + ação no manifesto (`scopes`/`tools`)" integra
+/// com F4-0-1 (a trait `Channel` ainda é stub na largada da onda). Até a integração, a custódia já
+/// é o piso inquebrável: sem credencial no escopo do canal, nada executa, e o gate humano sempre
+/// dispara (ADR 0004 §3). O agente nunca tem caminho de execução, canal declarado ou não.
+fn run_do_channel(channel: &str, rest: &[String]) -> ExitCode {
+    // Parse não-ambíguo do ref `do:channel:<canal>:<ação>` (o supervisor faz split por `:`): canal e
+    // ação não podem conter o separador. Slugs de canal/ação não têm `:` — rejeita defensivamente.
+    if channel.contains(':') {
+        eprintln!("lina: nome de canal invalido '{channel}' (sem ':'); use um slug como 'slack' ou 'whatsapp'");
+        return ExitCode::from(2);
+    }
+    let Some(action) = rest.first() else {
+        eprintln!(
+            "lina: 'do {channel}' exige uma acao do canal (ex.: lina do {channel} send \"...\")"
+        );
+        usage();
+        return ExitCode::from(2);
+    };
+    if action.contains(':') {
+        eprintln!("lina: acao de canal invalida '{action}' (sem ':')");
+        return ExitCode::from(2);
+    }
+    let action_args = &rest[1..];
+    let display = if action_args.is_empty() {
+        format!("lina do {channel} {action}")
+    } else {
+        format!("lina do {channel} {action} {}", action_args.join(" "))
+    };
+
+    // Identidade auto-declarada (A3 pendente — autoria NÃO-autenticada, ADR 0004 §4); idem `run_do`:
+    // sem ficha, degrada para "agente-desconhecido" (falha visível > identidade exportável).
+    let requester = load_identity()
+        .map(|i| i.terminal_name)
+        .unwrap_or_else(|_| "agente-desconhecido".to_string());
+
+    let mut store = match EventStore::open(events_dir()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lina: falha ao abrir o event store: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // (2) O gate disparou: efeito externo de canal → ask em qualquer nível (piso de custódia, ADR 0004).
+    let gated = DomainEvent::ActionGated {
+        cmd: display.clone(),
+        class: CLASS_GATED_HARD_EXTERNAL.to_string(),
+        decision: "ask".to_string(),
+        // Idem `run_do` builtin: a custódia já vira item `Custody` na fila — não carimba o nó.
+        node: None,
+    };
+    if let Err(e) = store.append(&gated) {
+        eprintln!("lina: falha ao apendar ActionGated: {e}");
+        return ExitCode::from(1);
+    }
+    // (3) Sem confirmação humana → a tentativa é bloqueada. `action` carimba canal+ação para a
+    //     auditoria do gate distinguir QUAL efeito de QUAL canal foi tentado.
+    let denied = DomainEvent::BrokerDenied {
+        action: format!("{channel}:{action}"),
+        reason: "unconfirmed".to_string(),
+    };
+    if let Err(e) = store.append(&denied) {
+        eprintln!("lina: falha ao apendar BrokerDenied: {e}");
+        return ExitCode::from(1);
+    }
+
+    // (4) Registra o pedido na FILA DE BROKER dedicada. O ref `do:channel:<canal>:<ação>` diz ao
+    //     supervisor para montar `BrokerRequest::for_channel` (escopo `channel:<canal>` derivado
+    //     server-side). `enqueue_as` ESTRITO: a origem (dir-dono) autentica o `requester` (hole 3).
+    let msg = MailMessage::new(&requester, "broker", "broker.do", action_args.join(" "))
+        .with_ref(format!("do:channel:{channel}:{action}"));
+    let mailbox = Mailbox::new(broker_mailbox_root());
+    if let Err(e) = mailbox.enqueue_as(&requester, &msg) {
+        eprintln!(
+            "lina: falha ao registrar o pedido custodiado na fila de broker (origem '{requester}' precisa ser um no valido): {e}"
+        );
+        return ExitCode::from(1);
+    }
+
+    println!(
+        "gated: efeito externo no canal '{channel}' (acao '{action}') requer confirmacao humana."
+    );
+    println!("registrado para o supervisor (msg {}). O agente NAO executa: o segredo do canal vive so no cofre do Lina.", msg.id);
     ExitCode::SUCCESS
 }
 
