@@ -19,6 +19,7 @@ use lina_bootstrap::{
     RetroInvocation, AUTONOMY_ENV,
 };
 use lina_core::history::{self, ExportFormat, HistoryLimits, HistoryPage, SearchPage};
+use lina_core::mentality::{BeliefStatus, Mentality, PromotionPolicy};
 use lina_core::scrollback::ScrollbackStore;
 use lina_core::{
     check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, AgentPresence,
@@ -56,6 +57,7 @@ fn main() -> ExitCode {
         Some("vault") => run_vault(&args[1..]),
         Some("spawn") => run_spawn(&args[1..]),
         Some("retro") => run_retro(&args[1..]),
+        Some("mentality") => run_mentality(&args[1..]),
         Some("params") => run_params(&args[1..]),
         Some("effort") => run_effort(&args[1..]),
         Some("goal") => run_goal(&args[1..]),
@@ -74,7 +76,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -3483,6 +3485,264 @@ fn run_retro(args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+    }
+}
+
+// ═══════════════════════════ lina mentality — histórico de aprendizados (F3-3, read-only) ═══════════════════════════
+
+/// Uma lição renderizável (sem o shape interno do core). `standing`: `"ja-vale"` (estabelecida, virou
+/// regra) ou `"ainda-testando"` (provisória, em quarentena).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct LearningRow {
+    standing: &'static str,
+    /// A lição em si ("como pensar").
+    statement: String,
+    /// De onde veio (humanizada — "aprendido quando você corrigiu X").
+    provenance: String,
+}
+
+/// Os aprendizados ATIVOS de UM papel (estabelecidos + provisórios).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct RoleLearnings {
+    /// Papel canônico (`DEVELOPER`, `BACKEND`…) — para máquinas/auditoria (`--json`).
+    role: String,
+    /// Rótulo leigo pt-br (`Desenvolvedor`…) — o que aparece na tela.
+    label: String,
+    learnings: Vec<LearningRow>,
+}
+
+/// Papel canônico → rótulo leigo pt-br (zero jargão na superfície, inv#6). Espelha o `humanize` da
+/// UI (o painel "Como o [papel] pensa") — duplicado mínimo porque vive em outro crate (a UI é gpui).
+/// Papel fora do mapa sai em Title Case do canônico, nunca SNAKE_CASE/maiúsculo cru na cara do leigo.
+fn role_label(role: &str) -> String {
+    let label = match role {
+        "DEVELOPER" => "Desenvolvedor",
+        "MAESTRO" => "Maestro",
+        "ARQUITETO" => "Arquiteto",
+        "FRONTEND" => "Especialista em telas",
+        "BACKEND" => "Especialista em bastidores",
+        "LLM_ENGINEER" => "Especialista em IA",
+        "DATA_ENGINEER" => "Especialista em dados",
+        "UIUX_DESIGNER" => "Designer",
+        "WRITER" => "Escritor",
+        "QA" => "Testador",
+        "BUG_FIXER" => "Caça-problemas",
+        "CURADOR" => "Curador",
+        "AUTOMATOR" => "Automatizador",
+        "REVIEWER" | "reviewer" => "Revisor",
+        other => {
+            let mut s = other.to_lowercase().replace('_', " ");
+            if let Some(first) = s.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            return s;
+        }
+    };
+    label.to_string()
+}
+
+/// **Histórico de aprendizados por papel (PURO).** Projeta a `Mentality` em linhas legíveis: TODOS os
+/// papéis com crença ATIVA — estabelecida ou provisória; aposentadas ficam de fora (não são mais
+/// "como o papel pensa", embora o replay as preserve). Estabelecidas primeiro. Papel só com
+/// aposentadas não entra. ZERO LLM (inv#1) — é a projeção determinística sobre o log.
+fn mentality_history(mentality: &Mentality) -> Vec<RoleLearnings> {
+    let mut rows = Vec::new();
+    for role in mentality.roles_with_beliefs() {
+        let mut learnings: Vec<LearningRow> = mentality
+            .beliefs_for_role(role)
+            .into_iter()
+            .filter_map(|b| {
+                let standing = match b.status {
+                    BeliefStatus::Established => "ja-vale",
+                    BeliefStatus::Provisional => "ainda-testando",
+                    // Aposentada não é histórico ATIVO (segue reconstruível por replay, inv#4).
+                    BeliefStatus::Retired { .. } => return None,
+                };
+                Some(LearningRow {
+                    standing,
+                    statement: b.statement.clone(),
+                    provenance: b.provenance.clone(),
+                })
+            })
+            .collect();
+        if learnings.is_empty() {
+            continue; // papel só com crenças aposentadas — fora do histórico ativo.
+        }
+        // Estabelecidas (regra) antes das provisórias (hipótese); estável dentro do tier (ordem
+        // id-asc de `beliefs_for_role` preservada pelo sort estável).
+        learnings.sort_by_key(|l| u8::from(l.standing == "ainda-testando"));
+        rows.push(RoleLearnings {
+            role: role.to_string(),
+            label: role_label(role),
+            learnings,
+        });
+    }
+    rows
+}
+
+/// Render humano do histórico (pt-br leigo, zero jargão). Vazio → mensagem HONESTA de "ainda não
+/// aprendi nada" (nunca um silêncio que parece bug).
+fn render_mentality_history(rows: &[RoleLearnings]) -> String {
+    if rows.is_empty() {
+        return "Ainda não registrei aprendizados.\n\
+                Eu começo a aprender quando você corrige um terminal — e, quando a mesma correção se \
+                repete, ela vira uma regra daquele papel.\n"
+            .to_string();
+    }
+    let mut out = String::from(
+        "O que cada papel já aprendeu com você\n\
+         (vira regra quando a mesma correção se repete; senão, fica em teste)\n",
+    );
+    for r in rows {
+        out.push_str(&format!("\n\u{25b8} {}\n", r.label));
+        for l in &r.learnings {
+            let selo = if l.standing == "ja-vale" {
+                "já vale"
+            } else {
+                "ainda testando"
+            };
+            out.push_str(&format!("   \u{2022} [{selo}] {}\n", l.statement));
+            out.push_str(&format!("       de onde veio: {}\n", l.provenance));
+        }
+    }
+    out
+}
+
+/// **F3-3 — `lina mentality [--json]`**: o HISTÓRICO de aprendizados. Lê o event log (SÓ-LEITURA via o
+/// espelho `log.jsonl`, mesma escolha de `retro`/`check` — nunca abre o SQLite do app) e projeta a
+/// `Mentality` (M-PROMO) de TODOS os papéis — não só os do roster vivo (o painel filtra por roster;
+/// aqui o leigo vê tudo o que a Lina aprendeu, por papel, com a proveniência humanizada). ZERO LLM
+/// (inv#1): contadores sobre o log. Nenhum `append` — read-only puro (sem subcomando de mutação).
+fn run_mentality(args: &[String]) -> ExitCode {
+    let json = args.iter().any(|a| a == "--json");
+    if let Some(bad) = args.iter().find(|a| a.as_str() != "--json") {
+        eprintln!("lina mentality: argumento desconhecido '{bad}'. Uso: lina mentality [--json]");
+        return ExitCode::from(2);
+    }
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let records = parse_log_records(&content);
+    let mentality = Mentality::from_records(&records, PromotionPolicy::default());
+    let rows = mentality_history(&mentality);
+    if json {
+        match serde_json::to_string_pretty(&rows) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("lina mentality: falha ao serializar: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        print!("{}", render_mentality_history(&rows));
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod mentality_verb_tests {
+    use super::*;
+    use lina_core::EventRecord;
+
+    /// Registro sintético construído do PRÓPRIO `DomainEvent` (serializado como o `append` faz —
+    /// carrega a tag interna `event`), para exercitar o decode REAL (`from_record`).
+    fn ev(event: DomainEvent) -> EventRecord {
+        EventRecord {
+            seq: 0,
+            ts: 0,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa evento de domínio"),
+        }
+    }
+
+    fn proposed(belief_id: &str, role: &str, statement: &str, provenance: &str) -> EventRecord {
+        ev(DomainEvent::BeliefProposed {
+            belief_id: belief_id.to_string(),
+            role: role.to_string(),
+            statement: statement.to_string(),
+            provenance: provenance.to_string(),
+            untrusted_origin: false,
+        })
+    }
+
+    fn reinforced(belief_id: &str, situation_hash: &str) -> EventRecord {
+        ev(DomainEvent::BeliefReinforced {
+            belief_id: belief_id.to_string(),
+            situation_hash: situation_hash.to_string(),
+            evidence: String::new(),
+        })
+    }
+
+    /// O caminho do pedido do fundador: TODOS os papéis com crença ATIVA, estabelecidas primeiro,
+    /// rótulo leigo, proveniência humanizada — e a aposentada NÃO aparece (não é "como pensa" hoje).
+    #[test]
+    fn history_groups_active_beliefs_by_role_established_first() {
+        let log = vec![
+            // DEVELOPER: 1 estabelecida (2 situações distintas) + 1 provisória.
+            proposed(
+                "e",
+                "DEVELOPER",
+                "use pnpm, não npm",
+                "você corrigiu a instalação",
+            ),
+            reinforced("e", "s1"),
+            reinforced("e", "s2"),
+            proposed("p", "DEVELOPER", "explique simples", "você pediu clareza"),
+            // QA: só uma crença, e ela foi APOSENTADA → o papel não entra no histórico ativo.
+            proposed("r", "QA", "lição velha", "x"),
+            ev(DomainEvent::BeliefRetired {
+                belief_id: "r".to_string(),
+                reason: "retired_by_human".to_string(),
+            }),
+        ];
+        let m = Mentality::from_records(&log, PromotionPolicy::default());
+        let rows = mentality_history(&m);
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "só DEVELOPER tem crença ativa (QA só tem aposentada)"
+        );
+        let dev = &rows[0];
+        assert_eq!(dev.role, "DEVELOPER");
+        assert_eq!(
+            dev.label, "Desenvolvedor",
+            "rótulo leigo na tela, nunca o código cru"
+        );
+        assert_eq!(dev.learnings.len(), 2);
+        assert_eq!(
+            dev.learnings[0].standing, "ja-vale",
+            "estabelecida primeiro (regra antes de hipótese)"
+        );
+        assert_eq!(dev.learnings[0].statement, "use pnpm, não npm");
+        assert_eq!(dev.learnings[1].standing, "ainda-testando");
+    }
+
+    /// O render é LEIGO e HONESTO: sem jargão de status/papel cru; vazio explica o porquê (não um
+    /// silêncio que parece bug).
+    #[test]
+    fn render_is_lay_and_honest() {
+        assert!(render_mentality_history(&[]).contains("Ainda não registrei aprendizados"));
+        let rows = vec![RoleLearnings {
+            role: "DEVELOPER".to_string(),
+            label: "Desenvolvedor".to_string(),
+            learnings: vec![LearningRow {
+                standing: "ja-vale",
+                statement: "use pnpm".to_string(),
+                provenance: "você corrigiu".to_string(),
+            }],
+        }];
+        let out = render_mentality_history(&rows);
+        assert!(out.contains("Desenvolvedor"), "rótulo leigo na tela");
+        assert!(out.contains("já vale"), "selo leigo do estado");
+        assert!(out.contains("de onde veio:"), "proveniência humanizada");
+        assert!(
+            !out.contains("DEVELOPER"),
+            "papel canônico cru não vaza pro leigo"
+        );
+        assert!(
+            !out.contains("Established"),
+            "status interno do core não vaza"
+        );
     }
 }
 

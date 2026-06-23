@@ -256,6 +256,19 @@ impl Mentality {
         self.beliefs.values().filter(|b| b.role == role).collect()
     }
 
+    /// Todos os PAPÉIS com ao menos uma crença (qualquer estado), em ordem estável (asc). É a entrada
+    /// para um leitor que quer o histórico COMPLETO de aprendizados — TODOS os papéis, não só os do
+    /// roster VIVO (o painel filtra por roster; o `lina mentality` lê o log inteiro). Read-only.
+    #[must_use]
+    pub fn roles_with_beliefs(&self) -> Vec<&str> {
+        self.beliefs
+            .values()
+            .map(|b| b.role.as_str())
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Quantas correções (`CorrectionObserved`) o papel acumulou (auditoria; §5 taxa de correção).
     #[must_use]
     pub fn corrections_observed(&self, role: &str) -> u32 {
@@ -1193,6 +1206,32 @@ mod tests {
             BeliefStatus::Established
         );
         assert!(m.promotable().is_empty(), "já registrado → não re-promove");
+    }
+
+    // ── enumeração de papéis com crença (entrada do `lina mentality`) ────────────────────────────
+
+    #[test]
+    fn roles_with_beliefs_lists_all_distinct_roles_sorted() {
+        // TODOS os papéis com crença (qualquer estado) — a entrada do histórico read-only; ordem
+        // estável (asc) e distintos (dois beliefs do mesmo papel não duplicam).
+        let m = Mentality::from_records(
+            &[
+                proposed("b1", "BACKEND", "x", 100),
+                proposed("b2", "BACKEND", "y", 110),
+                proposed("b3", "FRONTEND", "z", 120),
+                // aposentada ainda CONTA como papel-com-crença (o leitor decide filtrar status).
+                proposed("b4", "QA", "w", 130),
+                retired("b4", "retired_by_human", 140),
+            ],
+            d(),
+        );
+        assert_eq!(m.roles_with_beliefs(), vec!["BACKEND", "FRONTEND", "QA"]);
+        assert!(
+            Mentality::from_records(&[], d())
+                .roles_with_beliefs()
+                .is_empty(),
+            "log sem crença → nenhum papel"
+        );
     }
 
     // ── replay reconstrói projeção idêntica (gate f, §7) ─────────────────────────────────────────
