@@ -230,6 +230,91 @@ impl<S: SecretStore> SecretVault<S> {
         self.set(scope, key, &secret)?;
         Ok(secret)
     }
+
+    /// **F4-0-2 (ADR 0004 custódia · spec 53 §credencial).** Guarda (ou sobrescreve) a credencial
+    /// `key` de um `channel` no cofre, sob o escopo da casa `channel:<canal>`. O valor vive SÓ no
+    /// keyring — **nunca no env do agente nem no log** (o broker é quem injeta na execução, ADR 0004).
+    /// Retorna a [`CredentialRef`] (canal/escopo/conta) — a REFERÊNCIA que vira `CredentialStored`
+    /// no log, JAMAIS o valor.
+    ///
+    /// Backup silencioso `.bak` antes de sobrescrever (Hermes doc 40 §3): se já existe credencial
+    /// para `(channel, key)`, a anterior é preservada em `<key>.bak` antes da troca — uma credencial
+    /// trocada por engano é recuperável, nunca some sem rastro.
+    pub fn set_channel_credential(
+        &self,
+        channel: &str,
+        key: &str,
+        val: &str,
+    ) -> Result<CredentialRef, SecretError> {
+        let scope = channel_scope(channel);
+        // Preserva a anterior no `.bak` ANTES de sobrescrever (recuperável; sem isso uma troca
+        // acidental apagaria o segredo em definitivo).
+        if let Some(prev) = self.get(&scope, key)? {
+            self.set(&scope, &backup_key(key), &prev)?;
+        }
+        self.set(&scope, key, val)?;
+        Ok(CredentialRef::new(channel, scope, key))
+    }
+
+    /// Lê o VALOR da credencial `key` do `channel` (`Ok(None)` se não existe). É o que o broker
+    /// usa, no momento da execução custodiada, para injetar o segredo — o agente nunca o vê.
+    pub fn get_channel_credential(
+        &self,
+        channel: &str,
+        key: &str,
+    ) -> Result<Option<String>, SecretError> {
+        self.get(&channel_scope(channel), key)
+    }
+
+    /// Revoga (apaga) a credencial `key` do `channel` — **e o seu `.bak`**: revogar não pode deixar
+    /// o segredo (nem o backup) no cofre por um caminho esquecido. Idempotente. Retorna a
+    /// [`CredentialRef`] do que foi removido — a referência que vira `CredentialRevoked` no log.
+    pub fn revoke_channel_credential(
+        &self,
+        channel: &str,
+        key: &str,
+    ) -> Result<CredentialRef, SecretError> {
+        let scope = channel_scope(channel);
+        self.delete(&scope, key)?;
+        self.delete(&scope, &backup_key(key))?;
+        Ok(CredentialRef::new(channel, scope, key))
+    }
+}
+
+/// **Referência** a uma credencial de canal no cofre (F4-0-2) — canal, escopo e a conta (`key_ref`).
+/// É o descritor que vira `CredentialStored{channel,scope,key_ref}` / `CredentialRevoked` no event
+/// log: carrega ONDE o segredo está (para `vault.get`), **JAMAIS o valor** (que fica só no keyring,
+/// fora do log e fora do env — invariante #2 "nada em claro no disco"; ADR 0004 custódia).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRef {
+    /// Canal dono da credencial (ex.: `"whatsapp"`, `"email"`).
+    pub channel: String,
+    /// Escopo lógico no cofre — `channel:<canal>`.
+    pub scope: String,
+    /// Referência ao segredo no keyring (a conta/`key`), nunca o valor.
+    pub key_ref: String,
+}
+
+impl CredentialRef {
+    fn new(channel: &str, scope: String, key: &str) -> Self {
+        Self {
+            channel: channel.to_owned(),
+            scope,
+            key_ref: key.to_owned(),
+        }
+    }
+}
+
+/// Escopo de cofre de uma credencial de canal: `channel:<canal>` (mesmo padrão de scope da casa —
+/// `webhook`/`deploy`/`payment`/`external`). Endereço lógico estável: `vault.get("channel:<c>", key)`.
+fn channel_scope(channel: &str) -> String {
+    format!("channel:{channel}")
+}
+
+/// Conta de backup de uma credencial trocada (Hermes doc 40 §3): a mesma `key` com sufixo `.bak`.
+/// Mantida sob o MESMO escopo `channel:<canal>` para o revoke a alcançar e apagar junto.
+fn backup_key(key: &str) -> String {
+    format!("{key}.bak")
 }
 
 /// Gera um secret de webhook aleatório: 32 bytes de entropia do SO, em hex
@@ -314,6 +399,102 @@ mod tests {
             v.get("webhook", "gatilho-1").expect("get").as_deref(),
             Some(first.as_str())
         );
+    }
+
+    // ───────────────────── F4-0-2 · credencial de canal (scope `channel:<nome>`) ─────────────────────
+
+    #[test]
+    fn channel_credential_round_trip_under_channel_scope() {
+        let v = vault();
+        // Ausente no início.
+        assert!(v
+            .get_channel_credential("whatsapp", "token")
+            .expect("get")
+            .is_none());
+        // Guarda e a REFERÊNCIA volta (canal/escopo/conta) — JAMAIS o valor.
+        let r = v
+            .set_channel_credential("whatsapp", "token", "s3gr3d0-do-whats")
+            .expect("set");
+        assert_eq!(r.channel, "whatsapp");
+        assert_eq!(
+            r.scope, "channel:whatsapp",
+            "scope da casa = channel:<nome>"
+        );
+        assert_eq!(r.key_ref, "token", "key_ref é a conta, nunca o valor");
+        assert_ne!(r.key_ref, "s3gr3d0-do-whats", "referência != valor");
+        // Lê de volta o VALOR (do cofre).
+        assert_eq!(
+            v.get_channel_credential("whatsapp", "token")
+                .expect("get")
+                .as_deref(),
+            Some("s3gr3d0-do-whats")
+        );
+        // A credencial vive sob o MESMO endereço físico que `vault.get(scope,key)` (consistência).
+        assert_eq!(
+            v.get("channel:whatsapp", "token")
+                .expect("get cru")
+                .as_deref(),
+            Some("s3gr3d0-do-whats")
+        );
+    }
+
+    #[test]
+    fn overwrite_backs_up_previous_value() {
+        // Hermes doc 40 §3: trocar a credencial PRESERVA a anterior num `.bak` (recuperável, nunca
+        // some em silêncio). Primeira gravação NÃO cria backup (nada a preservar).
+        let v = vault();
+        v.set_channel_credential("email", "api_key", "antigo")
+            .expect("set 1");
+        assert!(
+            v.get("channel:email", "api_key.bak")
+                .expect("get bak")
+                .is_none(),
+            "1ª gravação não cria backup"
+        );
+        // Sobrescreve → a anterior vai para o `.bak`; a nova fica corrente.
+        v.set_channel_credential("email", "api_key", "novo")
+            .expect("set 2");
+        assert_eq!(
+            v.get_channel_credential("email", "api_key")
+                .expect("get")
+                .as_deref(),
+            Some("novo")
+        );
+        assert_eq!(
+            v.get("channel:email", "api_key.bak")
+                .expect("get bak")
+                .as_deref(),
+            Some("antigo"),
+            "a anterior foi preservada no .bak antes de sobrescrever"
+        );
+    }
+
+    #[test]
+    fn revoke_removes_credential_and_backup() {
+        // Revogar não pode deixar o segredo (nem o backup) no cofre — leak por caminho esquecido.
+        let v = vault();
+        v.set_channel_credential("sms", "token", "v1")
+            .expect("set 1");
+        v.set_channel_credential("sms", "token", "v2")
+            .expect("set 2"); // cria o .bak
+        let r = v.revoke_channel_credential("sms", "token").expect("revoke");
+        assert_eq!(r.channel, "sms");
+        assert_eq!(r.key_ref, "token", "referência do que foi removido");
+        assert!(
+            v.get_channel_credential("sms", "token")
+                .expect("get")
+                .is_none(),
+            "credencial some após revogar"
+        );
+        assert!(
+            v.get("channel:sms", "token.bak")
+                .expect("get bak")
+                .is_none(),
+            "o .bak também some — revogar não deixa rastro de segredo"
+        );
+        // Idempotente: revogar de novo não erra.
+        v.revoke_channel_credential("sms", "token")
+            .expect("revoke idempotente");
     }
 
     /// Gate W0-7: prova que **nada sensível é persistido em claro pelo app**.
