@@ -2969,7 +2969,12 @@ mod tests {
             // META: não afeta a projeção do canvas (apply é no-op para estes).
             let mut st = ProjectedState::default();
             apply(&mut st, &ev);
-            assert_eq!(st, ProjectedState::default(), "{} é META (no-op no apply)", ev.kind());
+            assert_eq!(
+                st,
+                ProjectedState::default(),
+                "{} é META (no-op no apply)",
+                ev.kind()
+            );
         }
     }
 
