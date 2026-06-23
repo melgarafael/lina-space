@@ -449,9 +449,15 @@ impl WebhookEngine {
             .map_err(|e| WebhookError::Secret(e.to_string()))?;
 
         // Event-sourcing: a config (rota + alvo) é um fato do log. O secret NÃO entra aqui (#2).
+        // F4-WA largada: campos aditivos default (fluxo legado sem instrução/target_node). F4-WA-2
+        // preenche-os via `configure_hook` estendido (instruction/autonomy_level/target_node).
         self.state.store.append(&DomainEvent::WebhookConfigured {
             hook_id: hook_id.clone(),
             target_ref: target_ref.to_string(),
+            target_node: String::new(),
+            instruction: String::new(),
+            autonomy_level: "notify_before".to_string(),
+            secret_ref: String::new(),
         })?;
 
         wlock(&self.state.hooks).insert(
@@ -576,10 +582,16 @@ async fn handle_hook(
     //    task sobrevive e completa append E publicação. Sem ela, o estado "durável-mas-não-
     //    publicado" seria alcançável por mera desconexão, não só por crash.
     let ts = now_millis();
+    // F4-WA largada: metadados aditivos default (method/payload_size/payload_sha256). F4-WA-1
+    // preenche-os com os valores reais do request (método HTTP + tamanho/hash do body) — NUNCA o
+    // conteúdo do payload (ADR 0035 §5: só metadados no log).
     let ev = DomainEvent::WebhookReceived {
         hook_id: hook_id.clone(),
         ts,
         target_ref: binding.target_ref.clone(),
+        method: String::new(),
+        payload_size: 0,
+        payload_sha256: String::new(),
     };
     let hook_for_log = hook_id.clone();
     let outcome = tokio::spawn(async move {

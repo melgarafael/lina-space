@@ -755,6 +755,23 @@ pub enum DomainEvent {
     WebhookConfigured {
         hook_id: String,
         target_ref: String,
+        /// F4-WA (ADITIVO, spec 55 §3): o terminal DONO deste webhook (por NOME — ADR 0026).
+        /// Vazio no payload antigo (replay degrada p/ o fluxo `publish()` legado — ADR 0001 §2).
+        #[serde(default)]
+        target_node: String,
+        /// F4-WA (ADITIVO): a INSTRUÇÃO do usuário = AUTORIDADE. OBRIGATÓRIA na config nova (a UI
+        /// recusa salvar vazio — é ela que decide a ação); replay antigo → "" (fluxo legado, sem ação).
+        #[serde(default)]
+        instruction: String,
+        /// F4-WA (ADITIVO): nível de ação `"autonomous"|"notify_before"`. Default CONSERVADOR
+        /// `notify_before` — replay/payload incompleto NUNCA fabrica autonomia. String, não enum
+        /// (níveis novos entram sem upcast — spec 55 §3).
+        #[serde(default = "default_notify_before")]
+        autonomy_level: String,
+        /// F4-WA (ADITIVO): REFERÊNCIA ao secret no Secret Vault (escopo `"webhook"`, key = hook_id) —
+        /// NUNCA o valor. Normalmente vazio (a chave É o hook_id); reservado p/ secret nomeado/rotacionado.
+        #[serde(default)]
+        secret_ref: String,
     },
     /// W5-4 (nó-Gatilho): um POST externo VÁLIDO (HMAC conferido) chegou em `hook_id` e foi aceito (202).
     /// `ts` = instante de RECEPÇÃO em millis, distinto do `ts` de persistência do `EventRecord` (o
@@ -766,6 +783,16 @@ pub enum DomainEvent {
         hook_id: String,
         ts: u64,
         target_ref: String,
+        /// F4-WA (ADITIVO, spec 55 §5): método HTTP (POST/GET/…) — metadado; informa o tipo de evento.
+        #[serde(default)]
+        method: String,
+        /// F4-WA (ADITIVO): tamanho do payload em bytes — metadado p/ correlação. NUNCA o conteúdo.
+        #[serde(default)]
+        payload_size: u64,
+        /// F4-WA (ADITIVO): SHA-256 do payload (hex) — hash p/ correlação; o conteúdo NÃO vai ao log
+        /// (mesma doutrina de `HistoryReadCross`: registra o TIPO/hash, jamais o conteúdo — ADR 0035 §5).
+        #[serde(default)]
+        payload_sha256: String,
     },
     SnapshotTaken {
         seq: u64,
@@ -1457,12 +1484,57 @@ pub enum DomainEvent {
         /// a ferramenta/grupo retirado.
         scope: String,
     },
+    // ───────── F4-WA · Webhook Ativo (épico 41 §III · spec 55 · ADR 0035) ─────────
+    // LARGADA da onda F4-WA (dono único: Maestro 01). Os 2 eventos abaixo + os campos aditivos em
+    // WebhookConfigured/WebhookReceived congelam o CONTRATO do fio recepção→injeção. Todos META (no-op
+    // no `apply`): o engine de webhooks + o router reconstroem por replay. **NUNCA o payload cru nem o
+    // secret no log** (só metadados — invariante #2/#4; ADR 0035 §5). Decisão na peça onda-wa.md.
+    /// F4-WA-1 (spec 55 §5 · ADR 0035 §1): o SERVIDOR DESPACHOU um input de webhook a um terminal vivo
+    /// — o fio recepção→injeção. Livro-razão do despacho server-side com origem `sistema/webhook`.
+    /// **NUNCA carrega o payload cru** (só metadados — o conteúdo vive efêmero no PTY, não no log). META.
+    WebhookDispatched {
+        #[serde(default)]
+        webhook_id: String,
+        #[serde(default)]
+        target_node: String,
+        #[serde(default)]
+        method: String,
+        /// id da entrega A2A (correlaciona com `MessageDelivered`/`MessageRetained`/`MessageDeadLettered`).
+        #[serde(default)]
+        delivery_id: String,
+        #[serde(default)]
+        payload_sha256: String,
+        #[serde(default)]
+        payload_size: u64,
+    },
+    /// F4-WA-4 (spec 55 §5 · ADR 0035 §3 · ADR 0004): uma ação irreversível DISPARADA por webhook foi
+    /// enfileirada no gate (custódia + fila de atenção) em vez de executar. Prova observável de que o
+    /// webhook NÃO furou o gate humano. A custódia em si segue emitindo `ActionGated`/`BrokerExecuted`/
+    /// `BrokerDenied` (reuso); este é o marcador específico do canal webhook. META.
+    WebhookActionGated {
+        #[serde(default)]
+        webhook_id: String,
+        #[serde(default)]
+        target_node: String,
+        /// classe da ação (espelha guard/broker: ex. `"gated-hard-external"`).
+        #[serde(default)]
+        action_class: String,
+        /// nível efetivo aplicado: `min(webhook.autonomy_level, workspace.autonomy)`.
+        #[serde(default)]
+        effective_level: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
 /// payload mínimo casar com a semântica do nome do evento.
 fn default_muted() -> bool {
     true
+}
+
+/// Default de `autonomy_level` em [`DomainEvent::WebhookConfigured`] (F4-WA, spec 55 §3): nível
+/// CONSERVADOR `notify_before` — replay de payload antigo/incompleto NUNCA fabrica autonomia.
+fn default_notify_before() -> String {
+    "notify_before".to_string()
 }
 
 /// Default de `after_first_prompt` em [`DomainEvent::SessionPersisted`] (F3-5-1, spec 53 §11.B):
@@ -1543,6 +1615,8 @@ impl DomainEvent {
             DomainEvent::OrchestrationResumed => "OrchestrationResumed",
             DomainEvent::WebhookConfigured { .. } => "WebhookConfigured",
             DomainEvent::WebhookReceived { .. } => "WebhookReceived",
+            DomainEvent::WebhookDispatched { .. } => "WebhookDispatched",
+            DomainEvent::WebhookActionGated { .. } => "WebhookActionGated",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
             DomainEvent::HistoryReadCross { .. } => "HistoryReadCross",
             DomainEvent::NodeStalled { .. } => "NodeStalled",
@@ -1973,6 +2047,10 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // reconstrói suas ligações varrendo o log — sem efeito na projeção do canvas (padrão CostLedger).
         | DomainEvent::WebhookConfigured { .. }
         | DomainEvent::WebhookReceived { .. }
+        // F4-WA: despacho server-side / gate de ação por webhook são META — o engine + o router
+        // reconstroem por replay; payload externo e secret NUNCA no log (ADR 0035 §5).
+        | DomainEvent::WebhookDispatched { .. }
+        | DomainEvent::WebhookActionGated { .. }
         // F1-1-1: detecção de CLI é META (livro-razão da descoberta); o consumidor (F1-1)
         // reconstrói o que precisar varrendo o log — sem efeito na projeção do canvas.
         | DomainEvent::CliDetected { .. }
@@ -2975,6 +3053,99 @@ mod tests {
                 "{} é META (no-op no apply)",
                 ev.kind()
             );
+        }
+    }
+
+    /// LARGADA F4-WA: os eventos do webhook ativo (2 estendidos + 2 novos) (a) serializam com a tag
+    /// serde `event` IGUAL ao `kind()`, (b) round-trippam idêntico, (c) são META (no-op no apply). É o
+    /// contrato congelado que as 6 frentes consomem sem re-editar `events.rs`.
+    #[test]
+    fn f4_wa_events_roundtrip_and_kind_matches_serde_tag() {
+        let evs = vec![
+            DomainEvent::WebhookConfigured {
+                hook_id: "h7x".into(),
+                target_ref: "@Vendas".into(),
+                target_node: "@Vendas".into(),
+                instruction: "registre o pedido na planilha e me avise".into(),
+                autonomy_level: "notify_before".into(),
+                secret_ref: String::new(),
+            },
+            DomainEvent::WebhookReceived {
+                hook_id: "h7x".into(),
+                ts: 1_718_600_000_000,
+                target_ref: "@Vendas".into(),
+                method: "POST".into(),
+                payload_size: 482,
+                payload_sha256: "9f86d0818884".into(),
+            },
+            DomainEvent::WebhookDispatched {
+                webhook_id: "h7x".into(),
+                target_node: "@Vendas".into(),
+                method: "POST".into(),
+                delivery_id: "msg_abc".into(),
+                payload_sha256: "9f86d0818884".into(),
+                payload_size: 482,
+            },
+            DomainEvent::WebhookActionGated {
+                webhook_id: "h7x".into(),
+                target_node: "@Vendas".into(),
+                action_class: "gated-hard-external".into(),
+                effective_level: "notify_before".into(),
+            },
+        ];
+        for ev in evs {
+            let val = serde_json::to_value(&ev).expect("serialize");
+            assert_eq!(
+                val.get("event").and_then(|v| v.as_str()),
+                Some(ev.kind()),
+                "a tag serde `event` deve casar `kind()` para {}",
+                ev.kind()
+            );
+            let back: DomainEvent = serde_json::from_value(val).expect("deserialize");
+            assert_eq!(back, ev, "round-trip idêntico para {}", ev.kind());
+            let mut st = ProjectedState::default();
+            apply(&mut st, &ev);
+            assert_eq!(
+                st,
+                ProjectedState::default(),
+                "{} é META (no-op no apply)",
+                ev.kind()
+            );
+        }
+    }
+
+    /// ADITIVIDADE F4-WA (ADR 0001 §2): um `WebhookConfigured` no payload ANTIGO `{hook_id,target_ref}`
+    /// (sem os campos da F4-WA) deserializa sem erro e os defaults entram — `autonomy_level` degrada para
+    /// o nível CONSERVADOR `notify_before` (replay NUNCA fabrica autonomia); os demais para vazio. Prova
+    /// que replay de log pré-F4-WA não quebra e não escala privilégio.
+    #[test]
+    fn f4_wa_webhook_configured_old_payload_degrades_conservative() {
+        let old = serde_json::json!({
+            "event": "WebhookConfigured",
+            "hook_id": "legacy",
+            "target_ref": "@Time"
+        });
+        let ev: DomainEvent = serde_json::from_value(old).expect("deserialize payload antigo");
+        match ev {
+            DomainEvent::WebhookConfigured {
+                hook_id,
+                target_ref,
+                target_node,
+                instruction,
+                autonomy_level,
+                secret_ref,
+            } => {
+                assert_eq!(hook_id, "legacy");
+                assert_eq!(target_ref, "@Time");
+                assert_eq!(target_node, "", "campo aditivo ausente → vazio");
+                assert_eq!(instruction, "", "sem instrução no legado → sem autoridade de ação");
+                assert_eq!(
+                    autonomy_level, "notify_before",
+                    "default CONSERVADOR — replay antigo nunca fabrica autonomia"
+                );
+                assert_eq!(secret_ref, "");
+            }
+            other => panic!("esperava WebhookConfigured, veio {}", other.kind()),
         }
     }
 

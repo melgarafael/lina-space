@@ -212,6 +212,28 @@ pub mod channel; // F4-0-1 · CANAIS — trait Channel + ChannelRegistry + manif
 pub mod credential; // F4-0-2 · CREDENCIAIS — binding cofre↔event-log (I; emerg. mid-onda)
 pub mod tool_scope; // F4-0-4 · CONTEXTO — pré-config de ferramentas/grupos por projeto (M)
 
+/// Origem de uma entrega A2A — QUEM a disparou, derivada server-side (inforjável). ADR 0007/0035.
+///
+/// O Router conhece **humano** (`hops == 0`, sender sem binding) e **colega** (cascata, `hops >= 1`
+/// via `delivered_root[sender]`) — ambos derivados de binding interno, JAMAIS de campo de agente. A
+/// F4-WA (webhook ativo) adiciona a TERCEIRA origem, `System`, carimbada pela engine `lina-webhooks`
+/// no ato do despacho autenticado por HMAC — **nunca lida de `msg.from`/payload** (um agente que
+/// escreva `from:"system:<id>"` cai em `node_by_name`/`UnknownSender`, jamais herda `System`).
+///
+/// ADITIVA: variante nova não quebra replay; `Default` = `Peer` (conservador) para envelope antigo.
+/// Desenhada para ganhar novas origens-servidor (e-mail/fila/MQTT) sem reescrever o Router.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum MsgOrigin {
+    /// Agente a mando do usuário (`hops == 0`, sender sem binding) — ADR 0007.
+    Human,
+    /// Cascata A2A (`hops >= 1`, binding `delivered_root[sender]`) — ADR 0007.
+    #[default]
+    Peer,
+    /// O SERVIDOR que recebeu um webhook autenticado por HMAC. Carimbada pela engine `lina-webhooks`
+    /// no ato do despacho — NUNCA de `msg.from`/payload (inforjável; herda binding do ADR 0007/0035).
+    System { webhook_id: String },
+}
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para
@@ -230,6 +252,9 @@ pub struct A2aEnvelope {
     pub trace: Vec<NodeId>,
     /// Hop-count restante (anti-loop). Ao chegar a 0, a mensagem é dropada.
     pub ttl: u8,
+    /// F4-WA (ADITIVO, ADR 0035): origem da entrega, carimbada server-side. `Default` = `Peer`; só a
+    /// engine de webhook chama `.with_origin(System{..})`. Os 3 call-sites via `::new` não quebram.
+    pub origin: MsgOrigin,
 }
 
 /// TTL default de um envelope (hop-count máximo antes de dropar por loop).
@@ -250,6 +275,7 @@ impl A2aEnvelope {
             await_reply: false,
             trace: vec![from],
             ttl: DEFAULT_TTL,
+            origin: MsgOrigin::Peer,
         }
     }
 
@@ -257,6 +283,15 @@ impl A2aEnvelope {
     #[must_use]
     pub fn awaiting(mut self) -> Self {
         self.await_reply = true;
+        self
+    }
+
+    /// F4-WA (ADR 0035): carimba a origem da entrega. SÓ a engine de webhook a usa para setar
+    /// `System{webhook_id}` — server-side, no despacho autenticado por HMAC. O caminho A2A normal
+    /// (humano/colega) deixa o default `Peer` (a origem real é derivada por `derive_root_hops`).
+    #[must_use]
+    pub fn with_origin(mut self, origin: MsgOrigin) -> Self {
+        self.origin = origin;
         self
     }
 }
