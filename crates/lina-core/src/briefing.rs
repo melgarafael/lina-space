@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 
 use crate::clue::ClueSet;
 use crate::events::{DomainEvent, EventRecord, EventStore, StoreError};
+use crate::tool_scope::ToolScopeSet;
 
 /// Teto de itens por lista de CONTEXTO (K-cap). O briefing **informa**, não despeja: além disto, o
 /// terminal puxa sob demanda (`lina plan read`). Bounded ⇒ o briefing não cresce sem limite com o log.
@@ -63,6 +64,10 @@ pub struct BriefingInput<'a> {
     /// F3-5-6 — projeção das pistas (`ClueSet`), LIDA aqui. Remover a pista (redefinir vazia) → a
     /// projeção retrai o escopo → o `paths` some do briefing no próximo turno.
     pub clues: &'a ClueSet,
+    /// F4-0-4 — projeção das ferramentas/grupos declarados (`ToolScopeSet`), LIDA aqui. Gated por
+    /// projeto (`input.scope`): revogar uma declaração → a projeção retrai → some do briefing no
+    /// próximo turno. **Declarar ≠ autorizar** — fluxo de contexto; a ação externa segue pelo gate.
+    pub tool_scopes: &'a ToolScopeSet,
     /// F3-5-9 — foco do Espaço/terminal. "app/sistema" (`dev_app`) ATIVA as doutrinas-como-hooks;
     /// qualquer outro foco → não entram (gating por foco, default-deny via [`focus_builds_software`]).
     pub focus: &'a str,
@@ -262,6 +267,19 @@ pub fn build_briefing(input: &BriefingInput) -> String {
         }
     }
 
+    // Ferramentas/grupos declarados (F4-0-4, doc-fonte 63) — gated por PROJETO (`input.scope`). O leigo
+    // DECLAROU o que a IA enxerga; revogar → a projeção retrai → some no próximo turno. Declarar ≠
+    // autorizar: é fluxo de contexto, a ação externa continua passando pelo broker + gate.
+    let declared_tools = input.tool_scopes.tools_for(input.scope);
+    if !declared_tools.is_empty() {
+        out.push_str(
+            "ferramentas declaradas neste projeto (voce me deu acesso a — declarar != autorizar):\n",
+        );
+        for tool in declared_tools {
+            out.push_str(&format!("  - [{}] {}\n", tool.channel, tool.scope));
+        }
+    }
+
     // Skills (camada de skills) — gated por NÓ: as skills escolhidas para este terminal, lidas da
     // projeção `SelectedSkills` de `SkillSelected` (emitido por J). Desacoplado: lemos a projeção.
     let node_skills = input.selected_skills.skills_for(input.node);
@@ -335,6 +353,7 @@ mod tests {
         let dec = lines(&["UI usa tokens semanticos, nunca cor hard-coded"]);
         let live = lines(&["@Terminal A: Busy", "@Terminal B: Idle"]);
         let clues = ClueSet::default();
+        let tool_scopes = ToolScopeSet::default();
         let selected = SelectedSkills::default();
         build_briefing(&BriefingInput {
             role,
@@ -345,6 +364,7 @@ mod tests {
             date: "2026-06-18",
             scope: "",
             clues: &clues,
+            tool_scopes: &tool_scopes,
             focus: "", // sem foco app/sistema → sem doutrinas (isola os testes legados)
             node: "",
             selected_skills: &selected,
@@ -421,6 +441,7 @@ mod tests {
             .map(|i| format!("T{i} :: item :: @owner:?"))
             .collect();
         let clues = ClueSet::default();
+        let tool_scopes = ToolScopeSet::default();
         let selected = SelectedSkills::default();
         let b = build_briefing(&BriefingInput {
             role: "BACKEND",
@@ -431,6 +452,7 @@ mod tests {
             date: "2026-06-18",
             scope: "",
             clues: &clues,
+            tool_scopes: &tool_scopes,
             focus: "",
             node: "",
             selected_skills: &selected,
@@ -485,6 +507,7 @@ mod tests {
             date: "2026-06-18",
             scope,
             clues,
+            tool_scopes: &ToolScopeSet::default(),
             focus,
             node,
             selected_skills: selected,
@@ -537,6 +560,77 @@ mod tests {
         assert!(b.contains("src/checkout/"), "a pista entra no contexto");
         assert!(b.contains("docs/x"));
         assert!(b.contains("pistas"), "a camada de pistas é rotulada");
+    }
+
+    /// Critério F4-0-4 (c): ferramenta declarada entra no briefing do projeto; revogá-la → some.
+    /// **Declarar ≠ autorizar** é explicitado ao agente no próprio texto.
+    #[test]
+    fn declared_tool_appears_in_briefing_and_revoke_removes_it() {
+        fn ts_record(seq: u64, declared: bool) -> EventRecord {
+            let event = if declared {
+                DomainEvent::ToolScopeDeclared {
+                    project: "loja".into(),
+                    channel: "whatsapp".into(),
+                    scope: "grupo:Vendas".into(),
+                }
+            } else {
+                DomainEvent::ToolScopeRevoked {
+                    project: "loja".into(),
+                    channel: "whatsapp".into(),
+                    scope: "grupo:Vendas".into(),
+                }
+            };
+            EventRecord {
+                seq,
+                ts: seq,
+                kind: event.kind().to_string(),
+                version: event.current_version(),
+                payload: serde_json::to_value(&event).expect("serializa"),
+            }
+        }
+        let declared = ToolScopeSet::from_records(&[ts_record(1, true)]);
+        let with_tool = build_briefing(&BriefingInput {
+            role: "BACKEND",
+            skills: &[],
+            plan_items: &[],
+            decisions: &[],
+            live_state: &[],
+            date: "2026-06-23",
+            scope: "loja",
+            clues: &ClueSet::default(),
+            tool_scopes: &declared,
+            focus: "",
+            node: "",
+            selected_skills: &SelectedSkills::default(),
+        });
+        assert!(
+            with_tool.contains("grupo:Vendas"),
+            "a ferramenta declarada entra no briefing"
+        );
+        assert!(
+            with_tool.contains("declarar != autorizar"),
+            "a fronteira é explicitada ao agente"
+        );
+
+        let revoked = ToolScopeSet::from_records(&[ts_record(1, true), ts_record(2, false)]);
+        let without_tool = build_briefing(&BriefingInput {
+            role: "BACKEND",
+            skills: &[],
+            plan_items: &[],
+            decisions: &[],
+            live_state: &[],
+            date: "2026-06-23",
+            scope: "loja",
+            clues: &ClueSet::default(),
+            tool_scopes: &revoked,
+            focus: "",
+            node: "",
+            selected_skills: &SelectedSkills::default(),
+        });
+        assert!(
+            !without_tool.contains("grupo:Vendas"),
+            "revogada → some do briefing"
+        );
     }
 
     /// Critério (c): remover a pista (redefinir vazia) → some do briefing no próximo turno.
