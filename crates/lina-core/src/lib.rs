@@ -209,6 +209,7 @@ pub mod workspace_template; // F3-5-10 · TEMPLATES (G)
 // arquivo. Eventos do contrato já congelados em `events.rs` (largada). `broker.rs` (custódia) e
 // `lina-secrets` (cofre) JÁ existem — F4-0-3/F4-0-2 os ESTENDEM, não criam módulo.
 pub mod channel; // F4-0-1 · CANAIS — trait Channel + ChannelRegistry + manifesto (B)
+pub mod credential; // F4-0-2 · CREDENCIAIS — binding cofre↔event-log (I; emerg. mid-onda)
 pub mod tool_scope; // F4-0-4 · CONTEXTO — pré-config de ferramentas/grupos por projeto (M)
 
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
