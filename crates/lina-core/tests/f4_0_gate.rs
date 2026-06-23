@@ -2,16 +2,17 @@
 //!
 //! Este arquivo é o gate que **re-deriva** o critério de saída F4-0 por fora das frentes — provando
 //! o invariante pelo caminho real (`run_custody`, `SecretVault`, PTY de verdade, eventos congelados),
-//! nunca montando o desfecho à mão. O que depende de impl ainda-não-pronta (broker de canal `lina do
-//! <canal>`, monitor de rede, projeção de tool scope) vive em `f4_0_gate_pending.rs` como teste-alvo
-//! `#[ignore]` que prova RED hoje e vira GREEN na integração.
+//! nunca montando o desfecho à mão. Os critérios que dependiam de impl das frentes (broker de canal
+//! `lina do <canal>`, monitor de rede, projeção de tool scope) foram PROVADOS na integração, GREEN
+//! nos arquivos das frentes (`broker_cli.rs`, `network_monitor.rs`, `tool_scope.rs`/`briefing.rs`);
+//! este arquivo cobre o MOTOR (`run_custody`/dump de env) + o RED-TEAM transversal.
 //!
 //! Mapa do gate de saída (peça `tasks/epico-f4/onda-0.md` §GATE DE SAÍDA F4-0):
 //! - **(a)** credencial no cofre → dump de env de PTY de agente spawnado **não a contém** (+ mutação
 //!   que prova que a sonda morde um vazamento real). AQUI, verde.
 //! - **(b)** ação externa custodiada → `ActionGated{gated-hard-external, ask}` + **zero** execução sem
-//!   confirmação. O MOTOR (`run_custody`) está aqui, verde; a ligação canal (`lina do <canal>`) é o
-//!   alvo `#[ignore]` em `f4_0_gate_pending.rs`.
+//!   confirmação. O MOTOR (`run_custody`) está aqui, verde; a ligação canal (`lina do <canal>`) está
+//!   verde em `broker_cli.rs` (`lina_do_*_channel` / `lina_do_undeclared_channel_is_rejected`).
 //! - **RED-TEAM** (o coração): manifesto/registro de canal é DADO, não autoridade; declarar (tool
 //!   scope) ≠ autorizar; a credencial nunca entra no log (só `key_ref`).
 //!
