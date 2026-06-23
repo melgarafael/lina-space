@@ -204,6 +204,13 @@ pub mod skill_factory; // F3-5-5 · SKILLS (J)
 pub mod skill_index; // F3-5-4 · SKILLS (J)
 pub mod workspace_template; // F3-5-10 · TEMPLATES (G)
 
+// ── F4-0 (Substrato de canais & credenciais): módulos da onda ──
+// Mesmo padrão da largada F3-5 — lib.rs é dono único do Maestro; cada frente preenche só o seu
+// arquivo. Eventos do contrato já congelados em `events.rs` (largada). `broker.rs` (custódia) e
+// `lina-secrets` (cofre) JÁ existem — F4-0-3/F4-0-2 os ESTENDEM, não criam módulo.
+pub mod channel; // F4-0-1 · CANAIS — trait Channel + ChannelRegistry + manifesto (B)
+pub mod tool_scope; // F4-0-4 · CONTEXTO — pré-config de ferramentas/grupos por projeto (M)
+
 /// Envelope canônico de mensagem A2A (versionado — âncora de continuidade).
 ///
 /// Campos definidos desde já (opcionais até o supervisor preenchê-los), para

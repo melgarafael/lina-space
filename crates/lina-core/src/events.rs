@@ -1391,6 +1391,72 @@ pub enum DomainEvent {
         #[serde(default)]
         adr_ref: Option<String>,
     },
+    // ───────── F4-0 · Substrato de canais & credenciais (épico 41 §III/§IV) ─────────
+    // LARGADA da onda F4-0 (dono único: Maestro). Os 5 eventos abaixo congelam o CONTRATO que as
+    // frentes consomem (channel.rs/tool_scope.rs/broker.rs/credenciais) — cada uma só EMITE/projeta,
+    // ninguém re-edita events.rs (elimina a costura nº1; espelha a largada F3-5, lib.rs §196-205).
+    // Todos META (no-op no `apply`): reconstruídos por projeções dedicadas via replay (padrão
+    // CostLedger/ClueSet). O instante de cada fato vive no `ts` do `EventRecord` — NÃO duplicado no
+    // payload (convenção events.rs; espelha `ClueSetDefined`/`SkillSelected`). Decisão registrada na
+    // peça `tasks/epico-f4/onda-0.md` §Decisões (diverge do §IV do épico, que listava `*_at`).
+    /// F4-0-2 (ADR 0004 custódia · spec 53 §credencial): uma credencial de canal foi GUARDADA no
+    /// keyring (`lina-secrets`), indexada por canal/escopo. **`key_ref` é REFERÊNCIA ao keyring,
+    /// JAMAIS o valor** — o segredo vive no cofre, fora do log e fora do env do agente (invariante
+    /// #2 "nada em claro no disco"). O backup silencioso antes de sobrescrever (Hermes doc 40 §3) é
+    /// fato do cofre, não evento. META.
+    CredentialStored {
+        /// canal dono da credencial (ex.: `"whatsapp"`, `"email"`).
+        channel: String,
+        /// escopo lógico do segredo no cofre (`vault.set(scope, key, …)`).
+        scope: String,
+        /// REFERÊNCIA ao segredo no keyring (a chave/conta), nunca o valor.
+        key_ref: String,
+    },
+    /// F4-0-2: revogação de uma credencial de canal — o broker para de injetar o segredo (o cofre
+    /// apaga a entrada). `key_ref` é referência, jamais o valor. META.
+    CredentialRevoked {
+        /// canal dono da credencial revogada.
+        channel: String,
+        /// REFERÊNCIA ao segredo removido (a chave/conta), nunca o valor.
+        key_ref: String,
+    },
+    /// F4-0-1 (TAG [10] Estrutura · doc 40 §4/§6): um canal foi REGISTRADO no `ChannelRegistry` a
+    /// partir do seu manifesto declarativo (`channels/<nome>/manifest.toml`). **Manifesto é DADO (o
+    /// gate é o broker, F4-0-3), JAMAIS autoridade.** `trust_tier ∈ {core,curado,comunidade}`;
+    /// `install_ref` é pinado em SHA/tag (nunca flutua HEAD). Registrar ≠ conectar (default-deny por
+    /// pertencimento, ADR 0006): o canal nasce "declarado, não conectado". META.
+    ChannelRegistered {
+        /// nome do canal (chave no registry).
+        channel: String,
+        /// referência ao manifesto lido (caminho relativo ao repo/dir de canais).
+        manifest_ref: String,
+        /// tier de confiança: `"core"` | `"curado"` | `"comunidade"`.
+        trust_tier: String,
+        /// ref de instalação pinada (SHA/tag), nunca HEAD flutuante.
+        install_ref: String,
+    },
+    /// F4-0-4 (TAG [6] Fluxo · doc-fonte 63): o leigo DECLAROU, por projeto, uma ferramenta/grupo que
+    /// a IA passa a enxergar. **Declarar ≠ autorizar** — é fluxo de contexto, não autoridade; a ação
+    /// externa continua passando pelo broker+gate (F4-0-3). A projeção (`tool_scope.rs`) reconstrói o
+    /// conjunto por replay (padrão `ClueSet`: último vence). META.
+    ToolScopeDeclared {
+        /// projeto/escopo dono da declaração.
+        project: String,
+        /// canal a que a ferramenta/grupo pertence.
+        channel: String,
+        /// a ferramenta/grupo declarado (ex.: `"grupo:Vendas"`).
+        scope: String,
+    },
+    /// F4-0-4: a declaração foi RETIRADA — o acesso some no próximo turno (push, sem restart). Par de
+    /// `ToolScopeDeclared`; o fold determinístico faz o escopo sumir no replay seguinte. META.
+    ToolScopeRevoked {
+        /// projeto/escopo dono da declaração retirada.
+        project: String,
+        /// canal a que a ferramenta/grupo pertencia.
+        channel: String,
+        /// a ferramenta/grupo retirado.
+        scope: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -1527,6 +1593,11 @@ impl DomainEvent {
             DomainEvent::ClueSetDefined { .. } => "ClueSetDefined",
             // Rito de paradigma (épico 39 §IV): registro auditável do red-team de fechamento de fase.
             DomainEvent::ParadigmReviewed { .. } => "ParadigmReviewed",
+            DomainEvent::CredentialStored { .. } => "CredentialStored",
+            DomainEvent::CredentialRevoked { .. } => "CredentialRevoked",
+            DomainEvent::ChannelRegistered { .. } => "ChannelRegistered",
+            DomainEvent::ToolScopeDeclared { .. } => "ToolScopeDeclared",
+            DomainEvent::ToolScopeRevoked { .. } => "ToolScopeRevoked",
         }
     }
 
@@ -1985,7 +2056,14 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::SkillFactoryProposed { .. }
         | DomainEvent::ClueSetDefined { .. }
         // Rito de paradigma: registro de auditoria (META) — reconstruído por replay, não toca o canvas.
-        | DomainEvent::ParadigmReviewed { .. } => {}
+        | DomainEvent::ParadigmReviewed { .. }
+        // F4-0: credenciais/canais/tool-scope são META — projeções dedicadas (channel.rs/tool_scope.rs)
+        // e o cofre (lina-secrets) reconstroem o estado por replay; sem efeito na projeção do canvas.
+        | DomainEvent::CredentialStored { .. }
+        | DomainEvent::CredentialRevoked { .. }
+        | DomainEvent::ChannelRegistered { .. }
+        | DomainEvent::ToolScopeDeclared { .. }
+        | DomainEvent::ToolScopeRevoked { .. } => {}
     }
 }
 
@@ -2843,6 +2921,56 @@ mod tests {
         let n = state.nodes.get(&legacy_node).expect("nó legado projetado");
         assert_eq!(n.kind, "Terminal", "upcaster deve injetar kind=Terminal");
         assert_eq!((n.x, n.y), (1.0, 2.0));
+    }
+
+    /// LARGADA F4-0: os 5 eventos novos do substrato de canais/credenciais (a) serializam com a
+    /// tag serde `event` IGUAL ao `kind()` (contrato `from_record`/projeções) e (b) round-trippam
+    /// idêntico (replay reconstrói byte-a-byte). É o gate da largada — o contrato congelado que as
+    /// 7 frentes consomem sem re-editar `events.rs`.
+    #[test]
+    fn f4_0_substrate_events_roundtrip_and_kind_matches_serde_tag() {
+        let evs = vec![
+            DomainEvent::CredentialStored {
+                channel: "whatsapp".into(),
+                scope: "channel:whatsapp".into(),
+                key_ref: "session".into(),
+            },
+            DomainEvent::CredentialRevoked {
+                channel: "whatsapp".into(),
+                key_ref: "session".into(),
+            },
+            DomainEvent::ChannelRegistered {
+                channel: "whatsapp".into(),
+                manifest_ref: "channels/whatsapp/manifest.toml".into(),
+                trust_tier: "core".into(),
+                install_ref: "v1.2.3".into(),
+            },
+            DomainEvent::ToolScopeDeclared {
+                project: "loja".into(),
+                channel: "whatsapp".into(),
+                scope: "grupo:Vendas".into(),
+            },
+            DomainEvent::ToolScopeRevoked {
+                project: "loja".into(),
+                channel: "whatsapp".into(),
+                scope: "grupo:Vendas".into(),
+            },
+        ];
+        for ev in evs {
+            let val = serde_json::to_value(&ev).expect("serialize");
+            assert_eq!(
+                val.get("event").and_then(|v| v.as_str()),
+                Some(ev.kind()),
+                "a tag serde `event` deve casar `kind()` para {}",
+                ev.kind()
+            );
+            let back: DomainEvent = serde_json::from_value(val).expect("deserialize");
+            assert_eq!(back, ev, "round-trip idêntico para {}", ev.kind());
+            // META: não afeta a projeção do canvas (apply é no-op para estes).
+            let mut st = ProjectedState::default();
+            apply(&mut st, &ev);
+            assert_eq!(st, ProjectedState::default(), "{} é META (no-op no apply)", ev.kind());
+        }
     }
 
     /// W0-6: corrompe o `.db` (lixo no meio), reabre via `open_or_recover` e prova:
