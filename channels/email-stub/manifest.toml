@@ -1,0 +1,15 @@
+# Manifesto declarativo de canal — F4-0-1 (exemplo/stub).
+# Segundo exemplo: pino por SHA (a alternativa à tag) e auth OAuth2. Mesmas invariantes do
+# whatsapp-stub — o segredo vive no cofre (ADR 0004), nunca neste arquivo.
+
+name = "email"
+transport = "smtp"
+auth = "oauth2"
+scopes = ["mail:send"]
+
+[tools]
+default_enabled = ["send_email"]
+
+[install]
+ref = "9f1c2ae" # PINADO por SHA curto — alternativa ao pino por tag
+source = "https://example.invalid/lina-channels/email"

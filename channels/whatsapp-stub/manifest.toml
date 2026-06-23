@@ -1,0 +1,18 @@
+# Manifesto declarativo de canal — F4-0-1 (exemplo/stub).
+#
+# DADO, jamais autoridade: este arquivo DESCREVE o canal; quem libera efeito externo é o broker
+# (`lina do <canal> …`, F4-0-3) + a custódia do segredo no keyring (ADR 0004). Registrar ≠ conectar.
+# Note que NÃO há campo `trust_tier` aqui: a confiança é decidida pela curadoria (F4-0-6), não
+# auto-declarável pelo manifesto (um `trust_tier` aqui faria o parse falhar — deny_unknown_fields).
+
+name = "whatsapp"
+transport = "whatsapp_cloud_api"
+auth = "api_key"
+scopes = ["messages:send", "messages:read"]
+
+[tools]
+default_enabled = ["send_message"]
+
+[install]
+ref = "v0.1.0" # PINADO por tag — nunca HEAD/branch/latest (doc 40 §6)
+source = "https://example.invalid/lina-channels/whatsapp"

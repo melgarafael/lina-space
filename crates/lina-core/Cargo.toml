@@ -22,6 +22,9 @@ tokio = { version = "1", features = ["sync"] }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# F4-0-1: parse+validação por schema do manifesto declarativo de canal (channel.rs). Mesma versão
+# já vendorizada (lina-cli-profiles) — zero churn de lockfile.
+toml = "0.9"
 # F1-0-3 (ADR 0019 §1): tail_hash do heartbeat = SHA-256 dos últimos ~80 chars do tail do PTY.
 # Mesma versão já vendorizada na árvore (lina-webhooks) — zero churn de lockfile.
 sha2 = "0.10"
