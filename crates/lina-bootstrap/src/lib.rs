@@ -27,7 +27,7 @@ pub use pretooluse::{
 pub mod global_install;
 pub use global_install::{ensure_lina_globally_available, GlobalInstallReport};
 
-/// **F1-3 (ACHADO-1) — a safra COMPLETA de skills embutida** (`assets/lina-skills/*`, 12 skills
+/// **F1-3 (ACHADO-1) — a safra COMPLETA de skills embutida** (`assets/lina-skills/*`, 13 skills
 /// + `references/`). Instalada no kit por-nó ([`Bootstrapper::write_terminal_files_with_hooks`])
 /// E no global por-CLI ([`ensure_lina_globally_available`]).
 pub mod skills;
@@ -1286,7 +1286,7 @@ mod tests {
     }
 
     /// **F1-3 (ACHADO-1):** o kit por-nó instala a safra COMPLETA — todo terminal nasce com
-    /// as 12 skills em `.claude/skills/` (+`references/` da rubrica transversal), não só a
+    /// as 13 skills em `.claude/skills/` (+`references/` da rubrica transversal), não só a
     /// `lina-agent-bus`. Idempotente: o re-render por mudança de roster não quebra/duplica.
     #[test]
     fn write_terminal_files_installs_full_skill_kit() {
@@ -1296,7 +1296,7 @@ mod tests {
         bs.write_terminal_files(&dir, &sample("@Dev Backend"), "/abs/lina")
             .expect("escreve");
         let skills_root = dir.join(".claude").join("skills");
-        assert_eq!(LINA_SKILLS.len(), 12, "a safra embutida tem 12 skills");
+        assert_eq!(LINA_SKILLS.len(), 13, "a safra embutida tem 13 skills");
         for skill in LINA_SKILLS {
             assert!(
                 skills_root.join(skill.name).join("SKILL.md").is_file(),

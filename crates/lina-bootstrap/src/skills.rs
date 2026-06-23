@@ -1,6 +1,6 @@
 //! **F1-3 (ACHADO-1 do gate) — a safra COMPLETA de skills da Lina, embutida.**
 //!
-//! O instalador antigo levava SÓ `lina-agent-bus`: as 12 skills (11 da F1-3 + lina-translator da F3-2: orquestração,
+//! O instalador antigo levava SÓ `lina-agent-bus`: as 13 skills (11 da F1-3 + lina-translator da F3-2 + lina-webhook-handler da F4-WA: orquestração,
 //! cold-review, dispatch, spawn, retro, verification + as 4 doutrinas transversais) NÃO
 //! chegavam ao terminal — o cenário do gate só funcionou porque o Maestro copiou na mão.
 //! Princípio-base (Lina universal): TODAS as capacidades acessíveis em tudo; o ENFORCEMENT
@@ -63,6 +63,8 @@ pub const LINA_SKILLS: &[EmbeddedSkill] = &[
     // F3-2-1: a doutrina da porta de entrada (Tradutor). Ordem alfabética.
     embed!("lina-translator", ["SKILL.md"]),
     embed!("lina-verification", ["SKILL.md"]),
+    // F4-WA-3: o protocolo do webhook ativo (evento externo vira input no terminal vivo).
+    embed!("lina-webhook-handler", ["SKILL.md"]),
 ];
 
 /// Instala TODAS as skills embutidas sob `skills_root` (ex.: `<cwd>/.claude/skills` no kit
@@ -282,7 +284,7 @@ mod tests {
         }
     }
 
-    /// O instalador cria as 12 skills (+`references/`) sob o root dado.
+    /// O instalador cria as 13 skills (+`references/`) sob o root dado.
     #[test]
     fn installs_all_skills_with_references() {
         let root = std::env::temp_dir().join(format!("lina-skills-all-{}", std::process::id()));
@@ -290,8 +292,8 @@ mod tests {
         let dirs = install_skills_into(&root).expect("instala");
         assert_eq!(
             dirs.len(),
-            12,
-            "as 12 skills (11 da F1-3 + lina-translator da F3-2)"
+            13,
+            "as 13 skills (11 da F1-3 + lina-translator da F3-2 + lina-webhook-handler da F4-WA)"
         );
         for skill in LINA_SKILLS {
             assert!(
