@@ -4525,6 +4525,29 @@ impl NodeAdmission {
         }
     }
 
+    /// Porta seed/demo COM PAPEL EXPLÍCITO (F3-3 gate h, `LINA_DEMO_ROLE`): igual ao
+    /// [`Self::seeded_terminal`], mas o papel é dado em vez de fixo em `"terminal"` — o demo de
+    /// MENTALIDADE precisa de um terminal VIVO cujo papel case as crenças semeadas (ex.: `DEVELOPER`),
+    /// senão o painel "Como o [papel] pensa" não acha papel vivo que bata e some.
+    #[must_use]
+    pub fn seeded_role_terminal(
+        name: impl Into<String>,
+        role: impl Into<String>,
+        x: f64,
+        y: f64,
+    ) -> Self {
+        Self {
+            name: Some(name.into()),
+            role: role.into(),
+            engine: None,
+            cwd: CwdPolicy::Managed,
+            position: Some((x, y)),
+            requested_by: None,
+            autonomy: Autonomy::Assisted,
+            effort: Effort::Medium,
+        }
+    }
+
     /// **SEAM-1: porta de SPAWN agente-pede** (`lina spawn` aprovado, origem OU banner-aprovado). O
     /// terminal nasce gerenciado (cwd `Managed` → kit/doutrina do papel), com `requested_by` =
     /// spawner (carimba `NodeAdded.requested_by` p/ auditoria + anti-fork-bomb). O `engine` default
@@ -11358,6 +11381,30 @@ mod tests {
             "as 3 portas de AGENTE nascem em cwds gerenciados DISTINTOS (slot não-reciclável)"
         );
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// **F3-3 gate h (fix do demo de Mentality):** a porta seed/demo COM PAPEL EXPLÍCITO
+    /// ([`NodeAdmission::seeded_role_terminal`]) admite um nó VIVO cujo papel PROJETADO é o pedido —
+    /// não o `"terminal"` fixo de [`NodeAdmission::seeded_terminal`]. É exatamente o que o painel
+    /// "Como o [papel] pensa" lê (`node_role`, projeção do log) para casar com as crenças semeadas:
+    /// sem um papel VIVO == ao das crenças (`DEVELOPER`), o painel não acha papel e some (o gate h
+    /// nunca rodava). Controle: o seed SEM papel projeta `"terminal"` (provado no teste de paridade).
+    #[test]
+    fn seeded_role_terminal_projects_the_requested_role() {
+        let (nm, _store, _model) = test_manager("seed-role", None);
+        let node = nm
+            .admit_node(NodeAdmission::seeded_role_terminal(
+                "Desenvolvedor",
+                "DEVELOPER",
+                30.0,
+                96.0,
+            ))
+            .expect("admite o terminal de papel");
+        assert_eq!(
+            nm.node_role(node).as_deref(),
+            Some("DEVELOPER"),
+            "o nó VIVO projeta o papel pedido — o que o painel de mentalidade cruza com as crenças"
+        );
     }
 
     /// **COMPENSAÇÃO (ADR 0022 §5):** o NodeId nasce no `register` (antes do append), então

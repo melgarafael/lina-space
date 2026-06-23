@@ -5493,6 +5493,19 @@ fn lina_demo_enabled() -> bool {
     )
 }
 
+/// DEMO DE PAPEL (`LINA_DEMO_ROLE`): quando setado a um papel CANÔNICO (ex.: `DEVELOPER`), o modo
+/// demo semeia UM terminal vivo COM ESSE PAPEL no lugar do par A/B — é o roster coerente que o
+/// painel "Como o [papel] pensa" (F3-3 gate h) precisa: um papel VIVO que case as crenças semeadas
+/// pelo `mentality_demo_seed`. Vazio/ausente → demo padrão (A→B). **Verbatim** (sem uppercase): o
+/// papel canônico tem caixa própria (`DEVELOPER` mas `reviewer`) e precisa bater EXATO com a `role`
+/// das crenças; quem chama (o `demo-mentality.sh`) passa o token exato.
+fn demo_role() -> Option<String> {
+    std::env::var("LINA_DEMO_ROLE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Base PERSISTENTE por-usuário (macOS: `~/Library/Application Support`). Sem `$HOME` (raríssimo): cai
 /// no `temp` como degradação VISÍVEL — a alternativa (panic) violaria inv#6 ("app NUNCA quebrar").
 fn app_support_dir() -> PathBuf {
@@ -6019,42 +6032,65 @@ fn main() {
             // W4-5: o walking-skeleton não passa pela galeria de Foco → preset não-setado (`""`).
             focus_preset: String::new(),
         });
-        // Porta seed/demo (tradutor fino — ADR 0022 §1): admissão pelo funil canônico, em
-        // posição FIXA do roteiro. Um spawn que falhe DEGRADA (loga e segue) — nunca panica
-        // (inv#6): o `Err` do funil vira aviso e o demo segue sem o nó.
-        let seed_one = |name: &str, x: f64, y: f64| -> Option<NodeId> {
-            match nodes.admit_node(NodeAdmission::seeded_terminal(name, x, y)) {
+        // DEMO DE PAPEL (`LINA_DEMO_ROLE`, F3-3 gate h): o painel "Como o [papel] pensa" precisa de
+        // um papel VIVO que case as crenças semeadas (`mentality_demo_seed`). Quando o env nomeia um
+        // papel, semeia UM terminal vivo COM ESSE PAPEL — sem o par A/B nem o ⚡ A2A (o teatro aqui é
+        // a MENTALIDADE, não o A→B). Sem o env → demo padrão A→B (caminho inalterado, abaixo).
+        if let Some(role) = demo_role() {
+            // Nome leigo do papel na tela (nunca o código cru, inv#6) — "DEVELOPER" → "Desenvolvedor".
+            let label = role_suggester::humanize(&role).0;
+            let node = match nodes.admit_node(NodeAdmission::seeded_role_terminal(
+                &label, &role, 30.0, 96.0,
+            )) {
                 Ok(node) => Some(node),
                 Err(e) => {
-                    eprintln!("lina-gpui: DEMO — spawn de '{name}' falhou ({e}); seguindo sem ele");
+                    eprintln!(
+                        "lina-gpui: DEMO — terminal '{label}' ({role}) falhou ({e}); seguindo sem ele"
+                    );
                     None
                 }
-            }
-        };
-        let a = seed_one("Terminal A", 30.0, 96.0);
-        let b = seed_one("Terminal B", 740.0, 96.0);
-        // O ⚡ A2A A→B só faz sentido com AMBOS vivos; senão fica `None` (o botão some via
-        // `ready()`). O grid de B vem do mapa vivo — o funil o registrou na admissão.
-        let a2a = match (&a, &b) {
-            (Some(na), Some(nb)) => lock(&grids).get(nb).cloned().map(|grid_b| {
-                Arc::new(A2aTrigger::new(
-                    Arc::clone(&sup),
-                    *na,
-                    *nb,
-                    grid_b,
-                    // F1-0-2: o ⚡ demo usa o MESMO perfil real carregado no boot (sem demo hardcoded).
-                    // A2A UNIVERSAL: este é o FALLBACK; o ⚡ resolve o profile do ALVO pelo registry.
-                    injection_profile.clone(),
-                    Arc::clone(&profile_registry),
-                    Arc::clone(&store),
-                    Arc::clone(&model),
-                ))
-            }),
-            _ => None,
-        };
-        // O foco arranca no 1º terminal vivo (A, ou B se A falhou); o render reaponta sozinho depois.
-        let focused = a.or(b).unwrap_or_default();
-        (focused, a2a)
+            };
+            (node.unwrap_or_default(), None)
+        } else {
+            // Porta seed/demo (tradutor fino — ADR 0022 §1): admissão pelo funil canônico, em
+            // posição FIXA do roteiro. Um spawn que falhe DEGRADA (loga e segue) — nunca panica
+            // (inv#6): o `Err` do funil vira aviso e o demo segue sem o nó.
+            let seed_one = |name: &str, x: f64, y: f64| -> Option<NodeId> {
+                match nodes.admit_node(NodeAdmission::seeded_terminal(name, x, y)) {
+                    Ok(node) => Some(node),
+                    Err(e) => {
+                        eprintln!(
+                            "lina-gpui: DEMO — spawn de '{name}' falhou ({e}); seguindo sem ele"
+                        );
+                        None
+                    }
+                }
+            };
+            let a = seed_one("Terminal A", 30.0, 96.0);
+            let b = seed_one("Terminal B", 740.0, 96.0);
+            // O ⚡ A2A A→B só faz sentido com AMBOS vivos; senão fica `None` (o botão some via
+            // `ready()`). O grid de B vem do mapa vivo — o funil o registrou na admissão.
+            let a2a = match (&a, &b) {
+                (Some(na), Some(nb)) => lock(&grids).get(nb).cloned().map(|grid_b| {
+                    Arc::new(A2aTrigger::new(
+                        Arc::clone(&sup),
+                        *na,
+                        *nb,
+                        grid_b,
+                        // F1-0-2: o ⚡ demo usa o MESMO perfil real carregado no boot (sem demo hardcoded).
+                        // A2A UNIVERSAL: este é o FALLBACK; o ⚡ resolve o profile do ALVO pelo registry.
+                        injection_profile.clone(),
+                        Arc::clone(&profile_registry),
+                        Arc::clone(&store),
+                        Arc::clone(&model),
+                    ))
+                }),
+                _ => None,
+            };
+            // O foco arranca no 1º terminal vivo (A, ou B se A falhou); o render reaponta sozinho depois.
+            let focused = a.or(b).unwrap_or_default();
+            (focused, a2a)
+        }
     } else {
         // PRODUÇÃO: sem nós. `focused` é a sentinela nil (`NodeId::default()`); o render reaponta ao 1º
         // card assim que o aluno cria um com ⌘T. `a2a = None` → o botão ⚡ nem aparece (gate `ready()`).

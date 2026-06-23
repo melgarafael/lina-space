@@ -10,6 +10,9 @@ cargo run -q -p lina-core --bin mentality_demo_seed -- /tmp/lina-mentality-demo/
 
 echo
 echo "2/2 · Abrindo o Lina de TESTE (janela nova, isolada — feche quando terminar)."
-echo "      Procure o painel \"Como o Desenvolvedor pensa\"."
+echo "      Procure o terminal \"Desenvolvedor\" e o painel \"Como o Desenvolvedor pensa\"."
 echo
-LINA_WS_ROOT=/tmp/lina-mentality-demo LINA_DEMO=1 exec app/lina-gpui/target/debug/lina-gpui
+# LINA_DEMO_ROLE=DEVELOPER: o app sobe UM terminal vivo de papel Desenvolvedor (em vez do par A/B),
+# para o painel achar um papel VIVO que case as crenças semeadas acima. As crenças e o papel do
+# terminal vivo são o MESMO ("DEVELOPER") — sem isso o painel some (gate h nunca rodava).
+LINA_WS_ROOT=/tmp/lina-mentality-demo LINA_DEMO=1 LINA_DEMO_ROLE=DEVELOPER exec app/lina-gpui/target/debug/lina-gpui

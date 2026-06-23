@@ -1,13 +1,21 @@
 //! **Seed de DEMO do painel "Como o [papel] pensa" (F3-3 gate h visual).** Popula um workspace de
-//! TESTE ISOLADO com 1 nó (papel DEVELOPER) + 2 crenças (1 estabelecida, 1 provisória) para o fundador
+//! TESTE ISOLADO com 2 crenças do papel DEVELOPER (1 estabelecida, 1 provisória) para o fundador
 //! validar o painel a olho. NÃO é produção — aponta para um dir de teste (arg, ou `/tmp/lina-mentality-demo`).
+//!
+//! Este bin semeia SÓ os APRENDIZADOS (as crenças). O ROSTER VIVO coerente — um terminal de papel
+//! `DEVELOPER` — é semeado pelo PRÓPRIO app no boot via `LINA_DEMO_ROLE=DEVELOPER` (ver
+//! `demo-mentality.sh`): o painel enumera papéis pelo roster VIVO (`cards`→`node_role`, projeção do
+//! log), então o papel das crenças e o papel de um terminal VIVO TÊM que ser o mesmo. Semear aqui um
+//! `NodeAdded`/`NodeRoleAssigned` seria um nó-FANTASMA (escrito por outro processo, nunca admitido ao
+//! `NodeManager` vivo) — o painel não o veria e o boot ainda o aposentaria póstumo. Por isso: só crenças.
+//!
 //! Após popular, PROJETA a `Mentality` e imprime as crenças: o app renderiza essa MESMA projeção, então
 //! a saída aqui confirma o que o painel deve mostrar (sem depender de screenshot — TCC).
 
 use std::path::PathBuf;
 
 use lina_core::mentality::{BeliefStatus, Mentality, PromotionPolicy};
-use lina_core::{DomainEvent, EventStore, NodeId};
+use lina_core::{DomainEvent, EventStore};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::args()
@@ -18,25 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&events)?;
     let mut store = EventStore::open(&events)?;
 
-    let node = NodeId::from_u128(1);
     let role = "DEVELOPER";
 
     let seed = [
-        DomainEvent::WorkspaceCreated {
-            name: "Mentality — demo do painel".to_string(),
-            focus_preset: String::new(),
-        },
-        DomainEvent::NodeAdded {
-            node,
-            kind: "Terminal".to_string(),
-            x: 80.0,
-            y: 80.0,
-            requested_by: None,
-        },
-        DomainEvent::NodeRoleAssigned {
-            node,
-            role: role.to_string(),
-        },
         // Crença ESTABELECIDA — 2 situações distintas (s1/s2) → vira REGRA do papel ("já vale").
         DomainEvent::BeliefProposed {
             belief_id: "b-pnpm".to_string(),
