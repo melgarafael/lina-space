@@ -34,6 +34,8 @@ pub enum PaletteAction {
     NewAgent,
     /// F4-0-2 (UI): abre o modal "Conectar um canal" — upload de credencial p/ o cofre.
     ConnectChannel,
+    /// F4-WA-2c (UI): abre o modal "Receber um aviso de fora" — liga um webhook a um terminal vivo.
+    ConfigureWebhook,
     /// F1-2-2 (M6-E): abre o modal em modo EDITAR para um nó vivo.
     EditAgent(NodeId),
     /// Foca (e revela) um nó do canvas.
@@ -74,6 +76,22 @@ pub fn base_commands() -> Vec<Command> {
             "email",
             "conectar",
             "integração",
+        ]),
+        // F4-WA-2c: o leigo digita "webhook"/"aviso"/"gatilho" e acha esta tela (alias = keyword
+        // invisível). "Receber um aviso de fora" = ligar um evento externo a um terminal vivo.
+        Command::new(
+            "📩 Receber um aviso de fora",
+            PaletteAction::ConfigureWebhook,
+        )
+        .with_aliases(&[
+            "webhook",
+            "aviso",
+            "gatilho",
+            "trigger",
+            "evento",
+            "notificação",
+            "automação",
+            "receber",
         ]),
         Command::new(
             "🎨 Aparência: tema e cores (claro/escuro) — Ajustes",
@@ -226,6 +244,7 @@ fn action_key(action: &PaletteAction) -> String {
     match action {
         A::NewAgent => "new_agent".to_owned(),
         A::ConnectChannel => "connect_channel".to_owned(),
+        A::ConfigureWebhook => "configure_webhook".to_owned(),
         A::EditAgent(id) => format!("edit_agent:{id}"),
         A::FocusNode(id) => format!("focus_node:{id}"),
         A::GotoAtencao(id) => format!("goto_atencao:{id}"),

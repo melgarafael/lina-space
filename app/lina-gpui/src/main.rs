@@ -78,6 +78,9 @@ mod ui;
 // F4-0-2 (UI): modal de upload de credencial de canal — modelo gpui-free + render fina (padrão M6).
 // O valor é coletado, enviado ao cofre via o contrato core (F4-0-2/credential.rs) e some da tela.
 mod credential_modal;
+// F4-WA-2c (UI): modal "Receber um aviso de fora" (webhook) — modelo gpui-free + render fina (padrão
+// credential_modal). Coleta terminal+instrução+nível → gesto `webhook.configure` → `WebhookConfigured`.
+mod webhook_modal;
 // F4-0-5: badge "este Espaço está falando com o mundo" — projeção PURA do log (canal com credencial
 // viva), sem relógio nem I/O. 0 canais → 0 badge; ≥1 → diz QUAL canal (doc 40 §10).
 mod exposure;
@@ -543,6 +546,9 @@ struct WorkspaceView {
     /// F4-0-2 (UI): o modal de upload de credencial de canal. `Some` = aberto (teclado vai pro modal;
     /// o segredo só sai no Guardar, rumo ao cofre; some da tela ao fechar).
     credential_modal: Option<credential_modal::CredentialModal>,
+    /// F4-WA-2c (UI): o modal "Receber um aviso de fora". `Some` = aberto (teclado vai pro modal). O
+    /// endereço/senha gerados pelo servidor chegam por `webhook_present_outcome` e somem ao fechar.
+    webhook_modal: Option<webhook_modal::WebhookModal>,
     /// F4-0-5: cache da projeção de exposição (`(event_count, ExposureState)`) — reprojetada SÓ
     /// quando o log muda (disciplina `projection_cache_is_stale`, igual ao cache de goals).
     exposure_cache: Option<(u64, exposure::ExposureState)>,
@@ -747,6 +753,7 @@ impl WorkspaceView {
             agent_modal: None,
             modal_scan: None,
             credential_modal: None,
+            webhook_modal: None,
             exposure_cache: None,
             ws_autonomy: workspace_autonomy(),
             brake,
@@ -2149,6 +2156,7 @@ impl WorkspaceView {
         match action {
             A::NewAgent => self.open_agent_modal_create(cx),
             A::ConnectChannel => self.open_credential_modal(cx),
+            A::ConfigureWebhook => self.open_webhook_modal(cx),
             A::EditAgent(node) => self.open_agent_modal_edit(node, cx),
             A::FocusNode(node) => {
                 self.focus(node);
@@ -3131,6 +3139,124 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    // ── F4-WA-2c (UI) · modal "Receber um aviso de fora" (webhook) ──
+    /// Nomes dos terminais VIVOS com CLI (alvos possíveis do aviso) — exclui notas/pastas e mortos.
+    fn live_terminal_names(&self) -> Vec<String> {
+        self.nodes
+            .cards()
+            .into_iter()
+            .filter(|(_, v)| {
+                matches!(v.kind, NodeKind::Terminal) && !matches!(v.status, NodeStatus::Dead)
+            })
+            .map(|(_, v)| v.name)
+            .collect()
+    }
+
+    /// Abre o modal de webhook (paleta "Receber um aviso de fora"), já com a lista de terminais vivos.
+    fn open_webhook_modal(&mut self, cx: &mut Context<Self>) {
+        self.webhook_modal = Some(webhook_modal::WebhookModal::new(self.live_terminal_names()));
+        cx.notify();
+    }
+
+    /// Move o foco entre terminal e instrução (clique/Tab).
+    fn webhook_focus(&mut self, f: webhook_modal::WebhookField, cx: &mut Context<Self>) {
+        if let Some(m) = self.webhook_modal.as_mut() {
+            m.set_focus(f);
+            cx.notify();
+        }
+    }
+
+    /// Escolhe o terminal que recebe o aviso (clique numa linha).
+    fn webhook_select_node(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if let Some(m) = self.webhook_modal.as_mut() {
+            m.select_node(idx);
+            cx.notify();
+        }
+    }
+
+    /// Fixa o nível "Me avisa antes" / "Pode agir" (clique num segmento).
+    fn webhook_set_autonomy(
+        &mut self,
+        level: webhook_modal::WebhookAutonomy,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(m) = self.webhook_modal.as_mut() {
+            m.set_autonomy(level);
+            cx.notify();
+        }
+    }
+
+    /// Fecha o modal de webhook (Cancelar / Pronto / ✕) — o estado é RAM, some na hora.
+    fn webhook_cancel(&mut self, cx: &mut Context<Self>) {
+        self.webhook_modal = None;
+        cx.notify();
+    }
+
+    /// Cria o aviso: emite o gesto `webhook.configure` pelo canal view→core
+    /// ([`push_human_intent`](bridge) → `MailboxPump` carimba `by="human"` → o handler do core monta a
+    /// engine `lina-webhooks`, gera `hook_id`+secret e emite `WebhookConfigured{target_node,instruction,
+    /// autonomy_level}`). O modal NÃO fecha: entra em "aguardando" até o servidor devolver o
+    /// endereço/senha por [`Self::webhook_present_outcome`]. Modal incompleto registra erro leve e segue
+    /// aberto. **O payload NÃO carrega secret** (o servidor o gera — nada sensível trafega aqui).
+    fn webhook_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.webhook_modal.as_mut() else {
+            return;
+        };
+        let Some(plan) = m.commit() else {
+            cx.notify(); // incompleto: o modal já registrou o erro leve.
+            return;
+        };
+        let payload = serde_json::json!({
+            "target_node": plan.target_node,
+            "instruction": plan.instruction,
+            "autonomy_level": plan.autonomy_level,
+        })
+        .to_string();
+        self.nodes.push_human_intent("webhook.configure", payload);
+        cx.notify();
+    }
+
+    /// **Porta de integração (F4-WA-1, Terminal B).** O servidor gerou o endereço + a senha e os
+    /// devolve à tela — o modal passa ao estágio de resultado (exibe 1×). Chamado pela costura de boot
+    /// quando a engine responde; no-op se o modal já foi fechado. `allow(dead_code)` até a ponta de
+    /// retorno de B existir (a fiação que invoca isto é território dele — runtime/bridge).
+    #[allow(dead_code)]
+    pub(crate) fn webhook_present_outcome(
+        &mut self,
+        url: String,
+        secret: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(m) = self.webhook_modal.as_mut() {
+            m.present_outcome(webhook_modal::WebhookOutcome { url, secret });
+            cx.notify();
+        }
+    }
+
+    /// Copia o endereço do aviso para a área de transferência (botão "Copiar endereço").
+    fn webhook_copy_url(&mut self, cx: &mut Context<Self>) {
+        if let Some(url) = self
+            .webhook_modal
+            .as_ref()
+            .and_then(webhook_modal::WebhookModal::outcome)
+            .map(|o| o.url.clone())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(url));
+        }
+    }
+
+    /// Copia a senha de segurança (botão "Copiar senha") — a única forma de levá-la antes de sumir.
+    fn webhook_copy_secret(&mut self, cx: &mut Context<Self>) {
+        if let Some(secret) = self
+            .webhook_modal
+            .as_ref()
+            .and_then(webhook_modal::WebhookModal::outcome)
+            .map(|o| o.secret.clone())
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(secret));
+        }
+    }
+
     /// "+ Instalar outro motor…"/estado vazio: REUSA o fluxo W4-1 (T1) — abre a janela do
     /// onboarding com o instalador humano. (Instalação EMBUTIDA no modal é aprofundamento da
     /// story — ver DONE; o caminho do leigo nunca tem beco.)
@@ -3674,6 +3800,64 @@ impl WorkspaceView {
                             .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
                         {
                             if let Some(m) = self.credential_modal.as_mut() {
+                                m.type_char(kc);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // F4-WA-2c (UI) — MODAL "RECEBER UM AVISO DE FORA": enquanto aberto, o teclado o dirige (digitar
+        // monta a instrução; Tab cicla terminal↔instrução; ↑/↓ escolhem o terminal quando a lista está
+        // focada; Enter cria — ou fecha no resultado; Esc arma/descarta; Backspace apaga). Mesma
+        // precedência/`stop_propagation` do modal de credencial.
+        if self.webhook_modal.is_some() {
+            let stage = self
+                .webhook_modal
+                .as_ref()
+                .map(webhook_modal::WebhookModal::stage);
+            match ks.key.as_str() {
+                "escape" => {
+                    if self.webhook_modal.as_mut().is_some_and(|m| m.escape()) {
+                        self.webhook_modal = None;
+                    }
+                }
+                "tab" => {
+                    let dir = if ks.modifiers.shift { -1 } else { 1 };
+                    if let Some(m) = self.webhook_modal.as_mut() {
+                        m.cycle_focus(dir);
+                    }
+                }
+                "up" | "down" => {
+                    if let Some(m) = self.webhook_modal.as_mut() {
+                        if m.focus_field() == webhook_modal::WebhookField::Terminal {
+                            m.cycle_node(if ks.key == "up" { -1 } else { 1 });
+                        }
+                    }
+                }
+                "enter" | "return" => {
+                    if stage == Some(webhook_modal::WebhookStage::Outcome) {
+                        self.webhook_cancel(cx);
+                    } else {
+                        self.webhook_commit(cx);
+                    }
+                }
+                "backspace" => {
+                    if let Some(m) = self.webhook_modal.as_mut() {
+                        m.backspace();
+                    }
+                }
+                _ => {
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(kc) = ks
+                            .key_char
+                            .as_ref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                        {
+                            if let Some(m) = self.webhook_modal.as_mut() {
                                 m.type_char(kc);
                             }
                         }
@@ -5624,6 +5808,11 @@ impl Render for WorkspaceView {
         // F4-0-2 (UI): o modal de credencial de canal — mesmo nível de overlay do modal de Agente.
         let root = match &self.credential_modal {
             Some(m) => root.child(credential_modal::render(m, window.viewport_size(), cx)),
+            None => root,
+        };
+        // F4-WA-2c (UI): o modal "Receber um aviso de fora" — mesmo nível de overlay.
+        let root = match &self.webhook_modal {
+            Some(m) => root.child(webhook_modal::render(m, window.viewport_size(), cx)),
             None => root,
         };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
