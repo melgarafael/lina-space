@@ -32,6 +32,8 @@ use lina_host::{NodeId, NodeKind, NodeStatus};
 pub enum PaletteAction {
     /// F1-2-2 (M6): abre o modal "Novo Agente" (evoluiu o modo-nomeação do M2).
     NewAgent,
+    /// F4-0-2 (UI): abre o modal "Conectar um canal" — upload de credencial p/ o cofre.
+    ConnectChannel,
     /// F1-2-2 (M6-E): abre o modal em modo EDITAR para um nó vivo.
     EditAgent(NodeId),
     /// Foca (e revela) um nó do canvas.
@@ -63,6 +65,16 @@ pub fn base_commands() -> Vec<Command> {
     vec![
         Command::new("✦ Novo agente", PaletteAction::NewAgent)
             .with_aliases(&["terminal", "criar", "novo", "time", "colega", "ia"]),
+        Command::new("🔌 Conectar um canal", PaletteAction::ConnectChannel).with_aliases(&[
+            "canal",
+            "credencial",
+            "chave",
+            "senha",
+            "whatsapp",
+            "email",
+            "conectar",
+            "integração",
+        ]),
         Command::new(
             "🎨 Aparência: tema e cores (claro/escuro) — Ajustes",
             PaletteAction::OpenSettings,
@@ -213,6 +225,7 @@ fn action_key(action: &PaletteAction) -> String {
     use PaletteAction as A;
     match action {
         A::NewAgent => "new_agent".to_owned(),
+        A::ConnectChannel => "connect_channel".to_owned(),
         A::EditAgent(id) => format!("edit_agent:{id}"),
         A::FocusNode(id) => format!("focus_node:{id}"),
         A::GotoAtencao(id) => format!("goto_atencao:{id}"),

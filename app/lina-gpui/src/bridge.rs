@@ -795,6 +795,12 @@ pub struct MailboxPump {
     /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
     /// `buffer_gauge`): só (re)apenda `DiskPressureSignaled` quando o nível MUDA, nunca a cada probe.
     last_disk_pressure: Option<DiskPressure>,
+    /// F4-0-2 (gate de tela): cofre das credenciais de CANAL que o gesto `credential.store` da UI
+    /// guarda. Criado AQUI (sem novo param no `new`, que já tem 15+) — DEMO `MockStore` (não toca o
+    /// keyring do SO no teatro do fundador, igual ao `custody_vault` do `runtime`). **O VALOR vive SÓ
+    /// aqui; o log recebe só `CredentialStored{key_ref}`** (ADR 0004 / invariante #2). Produção trocaria
+    /// por `SecretVault::new(...)` (KeyringStore) — porta aberta, fora do escopo F4-0.
+    credential_vault: SecretVault<lina_secrets::MockStore>,
 }
 
 /// F3-5-1: passo do throttle do `project` de correlação sessão↔nó (anti-freeze; ver `sessions`).
@@ -954,6 +960,12 @@ impl MailboxPump {
             last_buffer_sample_ms: 0,
             last_disk_probe_ms: 0,
             last_disk_pressure: None,
+            // F4-0-2: cofre de credenciais de canal (demo MockStore; ver field). Namespaceado por
+            // workspace, igual ao `custody_vault` do runtime.
+            credential_vault: SecretVault::with_store(
+                "lina-space/walking-skeleton",
+                lina_secrets::MockStore::new(),
+            ),
         }
     }
 
@@ -1511,6 +1523,45 @@ impl MailboxPump {
                         None => eprintln!(
                             "lina-gpui: gesto 'belief.retire' com payload invalido: {}",
                             item.payload
+                        ),
+                    }
+                    continue;
+                }
+                // F4-0-2 (gate de tela): "Conectar um canal" → guardar a credencial no cofre.
+                // `human_intent` (Goal) NÃO conhece este verbo — roteamos LOCAL ANTES dele, igual a
+                // `breaker.reset`/`belief.retire`. A AUTORIDADE é a NATUREZA in-process do canal (humano);
+                // `channel`/`key` são DADO. **O payload carrega o VALOR do segredo: NUNCA logá-lo, nem em
+                // erro** (≠ breaker.reset/belief.retire, cujos payloads são inócuos). O binding grava no
+                // cofre e apenda só `CredentialStored{channel,scope,key_ref}` — a REFERÊNCIA, jamais o valor.
+                if item.intent == "credential.store" {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&item.payload).ok();
+                    let field = |k: &str| {
+                        parsed
+                            .as_ref()
+                            .and_then(|v| v.get(k))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    };
+                    match (field("channel"), field("key"), field("value")) {
+                        (Some(channel), Some(key), value) if !channel.is_empty() && !key.is_empty() => {
+                            let secret = value.unwrap_or_default();
+                            match lina_core::credential::store_channel_credential(
+                                &self.credential_vault,
+                                &mut store,
+                                &channel,
+                                &key,
+                                &secret,
+                            ) {
+                                // `CredentialBindingError` (Vault/Store) NÃO contém o valor — seguro logar.
+                                Ok(()) => applied = true,
+                                Err(e) => eprintln!(
+                                    "lina-gpui: guardar credencial do canal '{channel}' falhou: {e}"
+                                ),
+                            }
+                        }
+                        // Payload incompleto: NUNCA logar `item.payload` (contém o segredo).
+                        _ => eprintln!(
+                            "lina-gpui: gesto 'credential.store' com payload incompleto (valor omitido do log)"
                         ),
                     }
                     continue;
@@ -8688,6 +8739,67 @@ mod tests {
                 .iter()
                 .any(|r| r.kind == "NodeStatusChanged" && r.payload["reason"] == "breaker_reset"),
             "NodeStatusChanged{{reason:breaker_reset}} apendado pelo reset humano"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4-0-2 (gate de tela, fiação real): o gesto `credential.store` da UI ("Conectar um canal")
+    /// roteia pelo `drain_human_intents` → `store_channel_credential` → guarda o VALOR no cofre e
+    /// apenda `CredentialStored{key_ref}` no log. **Critério inforjável: o VALOR do segredo NUNCA
+    /// aparece no log** (varrido por inteiro). Vai pelo handler REAL (push_human_intent + tick),
+    /// nunca montando o evento à mão (a costura intent→handler é justamente o que se prova).
+    #[test]
+    fn credential_store_gesture_persists_reference_in_log_never_the_value() {
+        let dir = std::env::temp_dir().join(format!("lina-credstore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+        let sup = Arc::new(Supervisor::new());
+        let nodes = test_nodes(Arc::clone(&store));
+        let mut pump = MailboxPump::new(
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Mailbox::new(dir.join(".lina")),
+            new_reinject_queue(),
+            Arc::new(Mutex::new(SharedModel::default())),
+            crate::wiring::new_brake(),
+            0,
+            demo_profile(),
+            Arc::new(ProfileRegistry::new()),
+            Autonomy::Assisted,
+            Arc::clone(&nodes),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        // Gesto da UI: o leigo preencheu o modal e clicou guardar. O VALOR transita no payload do
+        // gesto IN-PROCESSO (jamais pelo PTY ou pelo log).
+        let secret = "s3gr3do-de-canal-whatsapp-64hex-inforjavel";
+        nodes.push_human_intent(
+            "credential.store",
+            format!(
+                r#"{{"channel":"whatsapp","scope":"channel:whatsapp","key":"sessao","value":"{secret}"}}"#
+            ),
+        );
+        pump.tick();
+
+        let recs = lock(&store).events().expect("eventos");
+        // (1) CredentialStored REGISTRADO — a REFERÊNCIA (o badge de exposição acende a partir daqui).
+        let cred = recs
+            .iter()
+            .find(|r| r.kind == "CredentialStored")
+            .expect("CredentialStored apendado pelo gesto credential.store");
+        let cred_payload = serde_json::to_string(&cred.payload).expect("serializa");
+        assert!(cred_payload.contains("whatsapp"), "channel/key_ref no log");
+        // (2) CRÍTICO (gate a, ADR 0004): o VALOR do segredo NUNCA entra no log — varre TUDO.
+        let whole_log: String = recs
+            .iter()
+            .map(|r| serde_json::to_string(&r.payload).unwrap_or_default())
+            .collect();
+        assert!(
+            !whole_log.contains(secret),
+            "o VALOR do segredo VAZOU no event log"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

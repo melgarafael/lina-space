@@ -75,6 +75,12 @@ mod license_ui;
 // F2-2-1 · catálogo de componentes núcleo (botão/painel/input/modal) da fusão T1+T3. Registro de
 // módulo apenas — a costura de boot/wiring do main.rs segue do Maestro (despacho r4).
 mod ui;
+// F4-0-2 (UI): modal de upload de credencial de canal — modelo gpui-free + render fina (padrão M6).
+// O valor é coletado, enviado ao cofre via o contrato core (F4-0-2/credential.rs) e some da tela.
+mod credential_modal;
+// F4-0-5: badge "este Espaço está falando com o mundo" — projeção PURA do log (canal com credencial
+// viva), sem relógio nem I/O. 0 canais → 0 badge; ≥1 → diz QUAL canal (doc 40 §10).
+mod exposure;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -534,6 +540,12 @@ struct WorkspaceView {
     /// F1-2-2: resultado da varredura de motores (descoberta W4-1 roda FORA da thread de UI e
     /// deposita aqui; o loop do modal o consome — lição: discovery off-thread + injetável).
     modal_scan: Option<Arc<Mutex<Option<Vec<agent_modal::Engine>>>>>,
+    /// F4-0-2 (UI): o modal de upload de credencial de canal. `Some` = aberto (teclado vai pro modal;
+    /// o segredo só sai no Guardar, rumo ao cofre; some da tela ao fechar).
+    credential_modal: Option<credential_modal::CredentialModal>,
+    /// F4-0-5: cache da projeção de exposição (`(event_count, ExposureState)`) — reprojetada SÓ
+    /// quando o log muda (disciplina `projection_cache_is_stale`, igual ao cache de goals).
+    exposure_cache: Option<(u64, exposure::ExposureState)>,
     /// FIX-3: nível de autonomia EFETIVO do Espaço ([`workspace_autonomy`] — a mesma fonte do
     /// wiring/guard). Alimenta o badge do card e o prefill da seção AUTONOMIA do modal; vira
     /// por-Agente quando a costura do funil (bridge) carimbar `LINA_AUTONOMY` por nó.
@@ -734,6 +746,8 @@ impl WorkspaceView {
             desk,
             agent_modal: None,
             modal_scan: None,
+            credential_modal: None,
+            exposure_cache: None,
             ws_autonomy: workspace_autonomy(),
             brake,
             // W4-6 gap3: este campo é o OVERRIDE do usuário (rodapé); o SO/env entra via
@@ -2134,6 +2148,7 @@ impl WorkspaceView {
         use palette::PaletteAction as A;
         match action {
             A::NewAgent => self.open_agent_modal_create(cx),
+            A::ConnectChannel => self.open_credential_modal(cx),
             A::EditAgent(node) => self.open_agent_modal_edit(node, cx),
             A::FocusNode(node) => {
                 self.focus(node);
@@ -2201,6 +2216,92 @@ impl WorkspaceView {
         if let Some(v) = fresh {
             self.goals_cache = Some(v);
         }
+    }
+
+    /// F4-0-5: reprojeta a exposição (canais com credencial viva) SÓ quando o log muda — mesma
+    /// disciplina `projection_cache_is_stale` (NUNCA por frame) e `try_with_store` não-bloqueante
+    /// do cache de goals (o badge é META, derivado do event log; inv #4).
+    fn refresh_exposure_cache(&mut self) {
+        let cached = self.exposure_cache.as_ref().map(|(c, _)| *c);
+        let fresh = self.nodes.try_with_store(|store| {
+            let count = store.event_count().ok()?;
+            if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                return None;
+            }
+            let recs = store.events().ok()?;
+            Some((count, exposure::ExposureState::from_records(&recs)))
+        });
+        if let Some(v) = fresh {
+            self.exposure_cache = Some(v);
+        }
+    }
+
+    /// F4-0-5: o badge persistente "este Espaço está falando com o mundo" — `None` quando 0 canais
+    /// expostos (0 → 0 badge). Cor de alerta SÓBRIA (`state.warning`, doc 40 §10: feedback
+    /// subconsciente, não decoração) e diz QUAL(is) canal(is), nunca um genérico.
+    fn render_exposure_badge(&mut self) -> Option<gpui::AnyElement> {
+        self.refresh_exposure_cache();
+        // Extrai os nomes (chips) + a frase completa (aria) e libera o empréstimo antes de pintar.
+        let (chips, aria): (Vec<gpui::SharedString>, String) = {
+            let (_, st) = self.exposure_cache.as_ref()?;
+            if st.is_empty() {
+                return None; // 0 canais → 0 badge.
+            }
+            let chips = st
+                .channels()
+                .iter()
+                .map(|c| gpui::SharedString::from(c.display.clone()))
+                .collect();
+            let aria = st.headline().unwrap_or_default();
+            (chips, aria)
+        };
+        let t = theme::active();
+        let mut row = div()
+            .id("exposure-badge")
+            .absolute()
+            .top(px(f32::from(t.spacing.md)))
+            .right(px(f32::from(t.spacing.md)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(f32::from(t.spacing.sm)))
+            .px(px(f32::from(t.spacing.md)))
+            .py(px(f32::from(t.spacing.xs)))
+            .rounded_full()
+            .bg(rgb(t.surface.card))
+            .border_1()
+            .border_color(rgb(t.state.warning))
+            .aria_label(gpui::SharedString::from(aria))
+            .child(
+                // Ponto de status (token de alerta) — o sinal de cor que o doc 40 §10 pede.
+                div()
+                    .w(px(f32::from(t.spacing.sm)))
+                    .h(px(f32::from(t.spacing.sm)))
+                    .rounded_full()
+                    .bg(rgb(t.state.warning)),
+            )
+            .child(
+                div()
+                    .text_size(px(f32::from(t.typography.size.small)))
+                    .font_family(t.typography.family.ui)
+                    .text_color(rgb(t.text.bright))
+                    .child(exposure::BADGE_HEADLINE),
+            );
+        // Um chip por canal exposto — "diz QUAL canal" (doc 40 §10), nunca um genérico.
+        for name in chips {
+            row = row.child(
+                div()
+                    .px(px(f32::from(t.spacing.sm)))
+                    .py(px(f32::from(t.spacing.xs)))
+                    .rounded_md()
+                    .bg(rgb(t.surface.raised))
+                    .text_size(px(f32::from(t.typography.size.small)))
+                    .font_family(t.typography.family.ui)
+                    .text_color(rgb(t.text.primary))
+                    .child(name),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     /// F3-1-7: o painel das Goals VIVAS sobre o canvas — um card por meta que merece rosto
@@ -2983,6 +3084,53 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    // ── F4-0-2 (UI) · modal de credencial de canal ──
+    /// Abre o modal de upload de credencial (paleta "Conectar um canal").
+    fn open_credential_modal(&mut self, cx: &mut Context<Self>) {
+        self.credential_modal = Some(credential_modal::CredentialModal::new());
+        cx.notify();
+    }
+
+    /// Move o foco entre os campos do modal de credencial (clique na tela).
+    fn credential_focus(&mut self, f: credential_modal::CredField, cx: &mut Context<Self>) {
+        if let Some(m) = self.credential_modal.as_mut() {
+            m.set_focus(f);
+            cx.notify();
+        }
+    }
+
+    /// Fecha o modal de credencial sem guardar — o que foi digitado some (estado é RAM).
+    fn credential_cancel(&mut self, cx: &mut Context<Self>) {
+        self.credential_modal = None;
+        cx.notify();
+    }
+
+    /// Guarda a credencial: leva o segredo UMA vez ao cofre pelo canal view→core
+    /// ([`push_human_intent`](bridge) → `MailboxPump` carimba `by="human"` → o handler do core chama
+    /// `credential::store_channel_credential`, que grava no `SecretVault` e emite
+    /// `CredentialStored{channel,scope,key_ref}` — **o VALOR nunca entra no log nem no env**). Modal
+    /// incompleto registra um erro leve e segue aberto; completo fecha (o segredo não persiste na
+    /// view). `serde_json` escapa o texto livre do usuário com segurança.
+    fn credential_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.credential_modal.as_mut() else {
+            return;
+        };
+        let Some(plan) = m.commit() else {
+            cx.notify(); // incompleto: o modal já registrou o erro leve.
+            return;
+        };
+        let payload = serde_json::json!({
+            "channel": plan.channel,
+            "scope": plan.scope,
+            "key": plan.key,
+            "value": plan.value,
+        })
+        .to_string();
+        self.nodes.push_human_intent("credential.store", payload);
+        self.credential_modal = None;
+        cx.notify();
+    }
+
     /// "+ Instalar outro motor…"/estado vazio: REUSA o fluxo W4-1 (T1) — abre a janela do
     /// onboarding com o instalador humano. (Instalação EMBUTIDA no modal é aprofundamento da
     /// story — ver DONE; o caminho do leigo nunca tem beco.)
@@ -3495,6 +3643,46 @@ impl WorkspaceView {
                 cx.notify();
                 return;
             }
+        }
+        // F4-0-2 (UI) — MODAL DE CREDENCIAL: enquanto aberto, o teclado o dirige (digitar monta o
+        // campo focado; Tab cicla; Enter guarda; Esc arma/descarta; Backspace apaga). Mesma
+        // precedência/`stop_propagation` do modo criação — a letra do segredo NUNCA vaza ao PTY.
+        if self.credential_modal.is_some() {
+            match ks.key.as_str() {
+                "escape" => {
+                    if self.credential_modal.as_mut().is_some_and(|m| m.escape()) {
+                        self.credential_modal = None;
+                    }
+                }
+                "tab" => {
+                    let dir = if ks.modifiers.shift { -1 } else { 1 };
+                    if let Some(m) = self.credential_modal.as_mut() {
+                        m.cycle_focus(dir);
+                    }
+                }
+                "enter" | "return" => self.credential_commit(cx),
+                "backspace" => {
+                    if let Some(m) = self.credential_modal.as_mut() {
+                        m.backspace();
+                    }
+                }
+                _ => {
+                    if !ks.modifiers.platform && !ks.modifiers.control {
+                        if let Some(kc) = ks
+                            .key_char
+                            .as_ref()
+                            .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                        {
+                            if let Some(m) = self.credential_modal.as_mut() {
+                                m.type_char(kc);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
         // F3-1-7 — EDITOR DO ENTENDIMENTO da Goal ("Quero ajustar"): digita a correção; Enter re-envia
         // `goal.interpret` pelo canal humano (ADR 0036); Esc cancela; Backspace apaga. Modal leve, mesma
@@ -5416,6 +5604,12 @@ impl Render for WorkspaceView {
         // F1-4-4 · M8: o RAIL de Espaços no flanco esquerdo (52px colapsado ↔ 280px expandido;
         // o componente se dimensiona — T4). Por cima do canvas, por baixo dos modais.
         let root = root.child(self.sidebar.render(&th, cx));
+        // F4-0-5: badge de exposição "este Espaço está falando com o mundo" — overlay persistente
+        // sobre o canvas, sob os modais. `None` = 0 canais expostos (0 → 0 badge).
+        let root = match self.render_exposure_badge() {
+            Some(badge) => root.child(badge),
+            None => root,
+        };
         // F1-4-4 · M9: modal Criar Espaço (galeria de Focos + Diretório de Trabalho — T5).
         let root = match &self.create_space_modal {
             Some(m) => root.child(self.render_create_space(m, &th, window.viewport_size(), cx)),
@@ -5425,6 +5619,11 @@ impl Render for WorkspaceView {
         // resolvido por um modal de verdade). A paleta, quando aberta, continua mais ao topo.
         let root = match &self.agent_modal {
             Some(m) => root.child(agent_modal::render(m, window.viewport_size(), cx)),
+            None => root,
+        };
+        // F4-0-2 (UI): o modal de credencial de canal — mesmo nível de overlay do modal de Agente.
+        let root = match &self.credential_modal {
+            Some(m) => root.child(credential_modal::render(m, window.viewport_size(), cx)),
             None => root,
         };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
