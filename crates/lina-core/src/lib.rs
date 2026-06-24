@@ -51,8 +51,10 @@ pub use cli_discovery::{
 /// Entrega A2A faseada (W0-9) + contrato de fim-de-resposta (W0-10).
 mod a2a;
 pub use a2a::{
-    build_paste, deliver_a2a, sanitize_paste, A2aError, DeliveryOutcome, EndDetector, EndOutcome,
-    EndResult, GridSense, InjectPolicy, WorkspaceTrust, INTERACTIVE_READY_BUDGET_MS,
+    build_paste, build_reflection_prompt, deliver_a2a, dispatch_reflection, judge_reflection,
+    parse_belief_sentinel, parse_match_marker, sanitize_paste, A2aError, DeliveryOutcome,
+    EndDetector, EndOutcome, EndResult, GridSense, InjectPolicy, ReflectionRequest, ReflectorQueue,
+    WorkspaceTrust, INTERACTIVE_READY_BUDGET_MS,
 };
 
 /// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
@@ -66,8 +68,9 @@ pub use mailbox::{
 /// W3-4: roteador do supervisor (pipeline `route_message` com guardrails 0-4).
 mod router;
 pub use router::{
-    AutonomyLevel, CostLedger, PlanOpError, RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS,
-    DELEGATION_BUDGET, FANOUT_GATE, HUMAN_GESTURE, MAX_DEPTH,
+    is_reserved_role, reserved_role_admission_ok, AutonomyLevel, CostLedger, PlanOpError,
+    RouteOutcome, Router, RouterConfig, DEDUPE_WINDOW_MS, DELEGATION_BUDGET, FANOUT_GATE,
+    HUMAN_GESTURE, MAX_DEPTH, REFLECTOR_ROLE, REFLECTOR_SYSTEM, REFLECTOR_TRIGGER,
 };
 
 /// F3-0-1 ([12] Parâmetros): casa versionada dos ~15 números de orquestração — quatro camadas
@@ -177,6 +180,9 @@ pub mod briefing;
 /// `CostLedger`/`intelligence_adoption` — fonte de leitura para o injetor e o painel. Crença é
 /// DADO comportamental, nunca autoridade (§6.1). Implementado em F3-3 (M-PROMO).
 pub mod mentality;
+// Tipos do casamento correção→crença (ADR 0048) usados na costura do Refletor (`judge_reflection`):
+// re-exportados no root p/ o caller importar o conjunto do Refletor de um só lugar.
+pub use mentality::{MatchMarker, PresentedBelief};
 
 /// F3-4-5 (spec 36 §3): coordenação de código — projeção `branches_nao_integradas` + gatilho
 /// determinístico do DevOps integrador (molde `CostLedger`/`Mentality`, ZERO LLM). O core DECIDE;
@@ -1591,7 +1597,9 @@ impl Supervisor {
         lock(&self.registry).get(&node).cloned()
     }
 
-    /// Roster completo, em ordem de registro (determinístico).
+    /// Roster completo, em ordem de registro (determinístico). Inclui nós de SISTEMA (role reservado,
+    /// ex.: o sombra do Refletor) — é a fonte do GERENCIAMENTO (PTY/grid/unload). Para a lista de
+    /// TIME (que o usuário vê / `agents.json` / `lina list`), use [`Supervisor::team_roster`].
     #[must_use]
     pub fn list(&self) -> Vec<NodeInfo> {
         let reg = lock(&self.registry);
@@ -1599,6 +1607,15 @@ impl Supervisor {
             .iter()
             .filter_map(|id| reg.get(id).cloned())
             .collect()
+    }
+
+    /// **Roster de TIME (ADR 0047 add.1).** Como [`Supervisor::list`], mas OMITE nós com role
+    /// reservado (`__*__`) — a projeção de presença das superfícies de TIME (`lina list`/`agents.json`).
+    /// O sombra do Refletor segue gerenciável por `list` e auditável pelo `NodeAdded` no log (inv #4);
+    /// só some das LISTAS que o time vê. O app escreve o `agents.json` a partir DESTE roster.
+    #[must_use]
+    pub fn team_roster(&self) -> Vec<NodeInfo> {
+        self.list().into_iter().collect()
     }
 
     /// Quantidade de nós no roster (inclui Dead até `unregister`).
@@ -1654,7 +1671,16 @@ impl Supervisor {
                     .iter()
                     .copied()
                     .filter(|id| {
-                        Some(*id) != exclude && reg.get(id).is_some_and(|n| n.status.is_alive())
+                        // Role reservado (`__*__`, ADR 0047 add.1: o sombra) NUNCA entra num fan-out
+                        // de time — o sistema o endereça SÓ por entrega direta (`dispatch_reflection`).
+                        Some(*id) != exclude
+                            && reg.get(id).is_some_and(|n| {
+                                n.status.is_alive()
+                                    && !n
+                                        .role
+                                        .as_deref()
+                                        .is_some_and(crate::router::is_reserved_role)
+                            })
                     })
                     .collect();
             }
@@ -1997,6 +2023,47 @@ mod bus_tests {
         assert_eq!(humans, iters);
         assert_eq!(texts, 2 * iters);
         assert_eq!(submits, 2 * iters);
+    }
+
+    /// **G2 (ADR 0047 add.1):** o sombra (role reservado) existe no roster de GERENCIAMENTO (`list` —
+    /// o app precisa dele p/ o PTY) mas SOME do roster de TIME (`team_roster`, fonte do `agents.json`/
+    /// `lina list`). A invisibilidade é só na LISTA; o `NodeAdded` segue no log (auditoria, inv #4).
+    #[test]
+    fn team_roster_hides_reserved_role_but_list_keeps_it() {
+        let sup = Supervisor::new();
+        sup.register("@Dev", Some("backend".into()), sink());
+        let shadow = sup.register("@Sombra", Some(REFLECTOR_ROLE.into()), sink());
+
+        assert!(
+            sup.list().iter().any(|n| n.id == shadow),
+            "list (gerenciamento) INCLUI o sombra"
+        );
+        assert!(
+            sup.team_roster().iter().all(|n| n.id != shadow),
+            "team_roster (lista do time) OMITE o sombra"
+        );
+        assert!(
+            sup.team_roster()
+                .iter()
+                .any(|n| n.role.as_deref() == Some("backend")),
+            "o nó normal permanece visível no time"
+        );
+    }
+
+    /// **G2 (ADR 0047 add.1):** um broadcast de time NÃO entrega ao sombra (role reservado) — o
+    /// sistema o endereça SÓ por entrega direta (`dispatch_reflection`). O nó normal recebe.
+    #[test]
+    fn broadcast_excludes_reserved_role() {
+        let sup = Supervisor::new();
+        let dev = sup.register("@Dev", Some("backend".into()), sink());
+        let shadow = sup.register("@Sombra", Some(REFLECTOR_ROLE.into()), sink());
+
+        let targets = sup.resolve(&Recipient::Broadcast, RolePolicy::All, None);
+        assert!(targets.contains(&dev), "o nó de time recebe o broadcast");
+        assert!(
+            !targets.contains(&shadow),
+            "o sombra (role reservado) é omitido do fan-out"
+        );
     }
 
     /// Critério (b): ciclo de await A→B→A dispara `CycleDetected` e NÃO trava (a 2ª

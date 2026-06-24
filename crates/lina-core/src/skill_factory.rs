@@ -109,6 +109,7 @@ mod tests {
     fn entry(name: &str, triggers: &[&str]) -> SkillIndexEntry {
         SkillIndexEntry {
             name: name.to_string(),
+            description: String::new(),
             triggers: triggers.iter().map(|s| (*s).to_string()).collect(),
             requires: Vec::new(),
         }

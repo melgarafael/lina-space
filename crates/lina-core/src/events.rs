@@ -257,6 +257,21 @@ pub enum FlushState {
     Saved,
 }
 
+/// Sinal de RESULTADO de uma seleção de skill (ADR 0045 C2, spec 0045 §3) — inferido
+/// PASSIVAMENTE, a Lina NUNCA pergunta. `Reworked`/`HumanOverride` são variantes distintas de
+/// falha para o painel distinguir "devolveram" de "trocaram"; no ranking ambas pesam negativo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkillSignal {
+    /// Skill usada, sem troca e sem re-trabalho na janela seguinte (reforço barato: gate/cold-review PASS).
+    Success,
+    /// Falha genérica (negativo no ranking).
+    Failure,
+    /// Entrega devolvida / re-trabalho — conta como falha.
+    Reworked,
+    /// Humano/Maestro trocou a skill escolhida — conta como falha.
+    HumanOverride,
+}
+
 /// Catálogo canônico de eventos do domínio (subconjunto da [[20 - Arquitetura Tecnica]]
 /// §4.2 suficiente para a Onda 0). Internamente *tagged* por `event` → o nome da
 /// variante é o `kind` persistido.
@@ -1377,6 +1392,26 @@ pub enum DomainEvent {
         trigger: Option<String>,
         /// de onde a skill veio (catálogo/hub/fábrica).
         source: String,
+        // ── ADR 0045 C2 (spec 0045 §2): campos ADITIVOS de roteamento por retrieval+outcome.
+        // Todos `#[serde(default)]` → um `SkillSelected` antigo (4 campos) reidrata trivialmente.
+        // `skill` acima É o `chosen` do ADR — NÃO há campo `chosen` (duplicação é dívida).
+        /// tipo de tarefa (`canon(role):top_terms(query)`, spec §4) — unidade de agregação do
+        /// ranking; MESMA do `situation_hash` do ADR 0048 (um conceito, dois usos).
+        #[serde(default)]
+        task_kind: String,
+        /// os skill_ids do top-k de C1 (retrieval) — o conjunto entre os quais esta venceu.
+        #[serde(default)]
+        candidates: Vec<String>,
+        /// papel do nó (agregação cross-instância/multi-workspace, ADR 0010) — `node` é a
+        /// instância (auditoria local), `by_role` agrega o aprendizado entre projetos.
+        #[serde(default)]
+        by_role: String,
+        /// por que esta venceu (retrieval-only no MVP; ganha o termo de outcome quando C2 amadurece).
+        #[serde(default)]
+        rank_reason: String,
+        /// id DETERMINÍSTICO da seleção (spec §3.1) — chave que o `SkillOutcome` referencia.
+        #[serde(default)]
+        selection_id: String,
     },
     /// F3-5-5 (Hermes C.4): faltou skill especialista → a fábrica PROPÕE uma via deep-research.
     /// SUGERE, nunca aplica (gate humano antes de carregar; `inline-shell` passa pelo guard,
@@ -1388,6 +1423,19 @@ pub enum DomainEvent {
         /// fontes/referências que a pesquisa reuniu.
         #[serde(default)]
         references: Vec<String>,
+    },
+    /// ADR 0045 C2 (spec 0045 §3): RESULTADO de uma seleção de skill, ligado por `selection_ref`
+    /// ao `SkillSelected.selection_id`. Sinal INFERIDO PASSIVAMENTE (a Lina nunca pergunta). META
+    /// — no-op no `apply`; o score por replay é projeção dedicada (padrão `CostLedger`/`Mentality`).
+    /// Skill é DADO, jamais autoridade: o outcome RANQUEIA, nunca dispensa gate (ADR 0045 §Segurança).
+    SkillOutcome {
+        /// = `selection_id` do `SkillSelected` casado (ligação determinística, replay reconstrói).
+        selection_ref: String,
+        /// Success | Failure | Reworked | HumanOverride.
+        signal: SkillSignal,
+        /// observabilidade/painel (ex.: "trocou para X"); opcional.
+        #[serde(default)]
+        evidence: String,
     },
     /// F3-5-6 (doc-fonte 65): pistas — pastas/arquivos que o terminal de um escopo passa a
     /// enxergar no briefing. `paths` é DADO de contexto, nunca autoridade (não concede acesso
@@ -1664,6 +1712,7 @@ impl DomainEvent {
             DomainEvent::DiskReclaimExecuted { .. } => "DiskReclaimExecuted",
             DomainEvent::SkillSelected { .. } => "SkillSelected",
             DomainEvent::SkillFactoryProposed { .. } => "SkillFactoryProposed",
+            DomainEvent::SkillOutcome { .. } => "SkillOutcome",
             DomainEvent::ClueSetDefined { .. } => "ClueSetDefined",
             // Rito de paradigma (épico 39 §IV): registro auditável do red-team de fechamento de fase.
             DomainEvent::ParadigmReviewed { .. } => "ParadigmReviewed",
@@ -2132,6 +2181,7 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::DiskReclaimExecuted { .. }
         | DomainEvent::SkillSelected { .. }
         | DomainEvent::SkillFactoryProposed { .. }
+        | DomainEvent::SkillOutcome { .. }
         | DomainEvent::ClueSetDefined { .. }
         // Rito de paradigma: registro de auditoria (META) — reconstruído por replay, não toca o canvas.
         | DomainEvent::ParadigmReviewed { .. }

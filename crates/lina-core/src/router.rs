@@ -104,6 +104,47 @@ const INTEGRATOR_TRIGGER: NodeId = NodeId::from_u128(0x4155_544f_494e_5400_0000_
 /// JAMAIS herda a autoridade-servidor. A `MsgOrigin::System` é carimbada por construção no despacho.
 pub const WEBHOOK_SYSTEM: NodeId = NodeId::from_u128(0x5745_4248_4f4f_4b00_0000_0000_0000_0000);
 
+/// **ADR 0047: `NodeId` SENTINELA do REFLETOR (terminal-sombra neutro).** O `from` server-side de uma
+/// reflexão que o CORE dispara num terminal-sombra (1 CLI-call FORA do caminho crítico — fatia-2
+/// Mentality): a decisão é do core (gatilho determinístico sobre `CorrectionObserved`), nenhum agente
+/// a produz (agentes entram por `route_message`→`node_by_name`). Os bytes soletram "REFLECTOR"; como
+/// nós reais nascem `Uuid::now_v7()` (JAMAIS este valor fixo), nunca colide com um nó real → um agente
+/// escrevendo este `from` no outbox cai em `UnknownSender`, JAMAIS herda a autoridade-servidor (à la
+/// [`HUMAN_GESTURE`]/[`WEBHOOK_SYSTEM`]). Determinístico (replay reconstrói idêntico). `pub` p/ o caller
+/// (app/`dispatch_reflection`) carimbar o `from` da injeção no sombra — carimbo de origem, não autoridade.
+pub const REFLECTOR_SYSTEM: NodeId = NodeId::from_u128(0x5245_464c_4543_544f_5200_0000_0000_0000);
+
+/// **ADR 0047 addendum 1: `NodeId` SENTINELA do GATILHO de admissão do sombra.** O `requested_by`
+/// com que o funil admite o terminal-sombra com o role reservado [`REFLECTOR_ROLE`]. SÓ esta origem
+/// (E `hops == 0`) autoriza emitir um role reservado ([`reserved_role_admission_ok`]) — um agente
+/// nunca a possui. Bytes soletram "REFLTRIG"; distinta de [`REFLECTOR_SYSTEM`] e dos nós reais
+/// (`Uuid::now_v7`). Molde [`INTEGRATOR_TRIGGER`]; carimbo server-side, jamais forjável (ADR 0007).
+pub const REFLECTOR_TRIGGER: NodeId = NodeId::from_u128(0x5245_464c_5452_4947_0000_0000_0000_0000);
+
+/// Role RESERVADO do terminal-sombra do Refletor (ADR 0047 addendum 1): admitido SÓ pelo funil
+/// (via [`REFLECTOR_TRIGGER`]), invisível nas superfícies de TIME (`lina list`/`proposed_team`/
+/// fan-out), mas com `NodeAdded` no log (auditoria, inv #4). Pertence ao namespace `__*__`.
+pub const REFLECTOR_ROLE: &str = "__reflector__";
+
+/// Namespace de role RESERVADO (`__nome__`): papéis que SÓ o sistema cria pelo funil — nunca um
+/// agente (via payload de spawn/`proposed_team`). Estrutural (a forma denuncia): `__` nas duas pontas
+/// e algo no meio (`__` puro / `____` não contam). Um agente que tente declarar um `__*__` é recusado.
+#[must_use]
+pub fn is_reserved_role(role: &str) -> bool {
+    let r = role.trim();
+    r.len() > 4 && r.starts_with("__") && r.ends_with("__")
+}
+
+/// **Guarda de admissão de role reservado (ADR 0047 addendum 1).** Um role `__*__` só pode ser
+/// admitido pelo SISTEMA: `requested_by == REFLECTOR_TRIGGER` E `hops == 0` (origem, não cascata).
+/// Qualquer outra origem (agente forjando `requested_by`, ou cascata `hops > 0`) → recusado. Role
+/// NÃO-reservado → sempre `true` (esta guarda não governa papéis normais). PURA — o caller (funil)
+/// consulta antes de emitir o `NodeAdded`/`SpawnRequested` do sombra.
+#[must_use]
+pub fn reserved_role_admission_ok(role: &str, requested_by: NodeId, hops: u8) -> bool {
+    !is_reserved_role(role) || (requested_by == REFLECTOR_TRIGGER && hops == 0)
+}
+
 /// Prefixo determinístico do `id` do `SpawnRequested` de auto-integração — sufixado pelo `seq` do
 /// último `CodeChanged` (único por episódio; replay reconstrói idêntico). DISTINTO de `goal-respawn:`/
 /// `stall-respawn:` → as escadas de spawn nunca se misturam na contagem.
@@ -2484,6 +2525,15 @@ impl Router {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                // ponytail: seleção DIRETA (verbo skill.select sem retrieval) → campos do ranking
+                // vazios. A guarda `!selection_id.is_empty()` em `outcome_scores` exclui esta seleção
+                // do aprendizado por outcome (ADR 0045 C2). O enriquecimento real — caminho COM
+                // retrieval que preenche task_kind/candidates/by_role/selection_id — é o R45-EMIT.
+                task_kind: String::new(),
+                candidates: Vec::new(),
+                by_role: String::new(),
+                rank_reason: String::new(),
+                selection_id: String::new(),
             }
         };
         if let Err(e) = store.append(&event) {
@@ -3605,7 +3655,10 @@ impl Router {
             .map(|r| r.strip_prefix("role:").unwrap_or(r).trim())
             .unwrap_or("")
             .to_string();
-        if name.is_empty() || name == "@" || role.is_empty() {
+        // Role RESERVADO (`__*__`, ADR 0047 add.1) NUNCA nasce de um agente: o namespace é do funil
+        // de sistema (via REFLECTOR_TRIGGER). Um agente que o declare no payload é recusado aqui —
+        // este caminho carimba `requested_by = sender` (um agente), que nunca é o gatilho de sistema.
+        if name.is_empty() || name == "@" || role.is_empty() || is_reserved_role(&role) {
             return RouteOutcome::SpawnBlocked;
         }
         let prompt = msg.payload.clone();
@@ -4037,9 +4090,13 @@ fn proposed_team_of(store: &EventStore, goal_id: &str) -> Result<Vec<String>, St
             continue;
         }
         if let Some(arr) = rec.payload.get("proposed_team").and_then(|v| v.as_array()) {
+            // Filtra role RESERVADO (`__*__`, ADR 0047 add.1): o `proposed_team` é DADO de um agente
+            // (no payload da `goal.interpret`) — não pode colar o sombra na montagem de time. A
+            // montagem (`assemble_team`) lê SÓ daqui, então o filtro na fonte cobre todo consumidor.
             team = arr
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
+                .filter(|r| !is_reserved_role(r))
                 .collect();
         }
     }
@@ -4834,6 +4891,104 @@ mod tests {
             "from forjado 'system:<id>' não resolve por node_by_name → UnknownSender (RT-1), obteve {out:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **ADR 0047: a sentinela do Refletor é distinta e não-forjável por construção.** Como
+    /// `WEBHOOK_SYSTEM`/`HUMAN_GESTURE`: const fixa (nunca um `Uuid::now_v7` de agente), distinta de
+    /// `nil` e de toda outra sentinela → não colide com nó real nem herda a autoridade de outra origem.
+    #[test]
+    fn reflector_system_is_a_distinct_non_forgeable_sentinel() {
+        assert_ne!(REFLECTOR_SYSTEM, NodeId::nil());
+        assert_ne!(REFLECTOR_SYSTEM, HUMAN_GESTURE);
+        assert_ne!(REFLECTOR_SYSTEM, WEBHOOK_SYSTEM);
+        assert_ne!(REFLECTOR_SYSTEM, INTEGRATOR_TRIGGER);
+        assert_ne!(REFLECTOR_SYSTEM, STRUCTURAL_JUDGE);
+    }
+
+    // ───────── G2 (ADR 0047 add.1): role reservado `__reflector__` — guarda/validação/filtro ─────────
+
+    #[test]
+    fn reflector_trigger_is_distinct_from_reflector_system() {
+        // duas sentinelas DISTINTAS: SYSTEM = `from` da injeção; TRIGGER = `requested_by` do funil.
+        assert_ne!(REFLECTOR_TRIGGER, REFLECTOR_SYSTEM);
+        assert_ne!(REFLECTOR_TRIGGER, NodeId::nil());
+        assert_ne!(REFLECTOR_TRIGGER, INTEGRATOR_TRIGGER);
+    }
+
+    #[test]
+    fn is_reserved_role_matches_only_double_underscore_namespace() {
+        assert!(is_reserved_role("__reflector__"));
+        assert!(is_reserved_role(REFLECTOR_ROLE));
+        assert!(!is_reserved_role("BACKEND"));
+        assert!(!is_reserved_role("backend"));
+        assert!(!is_reserved_role("__"), "só pontas, sem miolo → não reservado");
+        assert!(!is_reserved_role("____"), "4 chars (sem miolo) → não reservado");
+        assert!(!is_reserved_role("_reflector_"), "uma barra só → não reservado");
+    }
+
+    #[test]
+    fn reserved_role_admission_only_with_trigger_at_origin() {
+        let agent = NodeId::from_u128(0xABCD);
+        // role NORMAL: a guarda não governa — sempre ok (qualquer origem).
+        assert!(reserved_role_admission_ok("backend", agent, 0));
+        assert!(reserved_role_admission_ok("backend", agent, 3));
+        // role RESERVADO: SÓ com o gatilho de sistema NA ORIGEM (hops 0).
+        assert!(reserved_role_admission_ok(REFLECTOR_ROLE, REFLECTOR_TRIGGER, 0));
+        // requested_by FORJADO (um agente) → recusado, mesmo na origem.
+        assert!(!reserved_role_admission_ok(REFLECTOR_ROLE, agent, 0));
+        // gatilho certo mas em CASCATA (hops > 0) → recusado.
+        assert!(!reserved_role_admission_ok(REFLECTOR_ROLE, REFLECTOR_TRIGGER, 1));
+    }
+
+    #[test]
+    fn agent_cannot_self_declare_reserved_role_via_spawn() {
+        // VALIDAÇÃO (caminho real route_message): um agente pedindo spawn de role `__reflector__` é
+        // recusado (SpawnBlocked) — o namespace reservado é do funil de sistema, jamais de um agente.
+        let (mut router, sup, dir) = router_with("reserved-spawn");
+        let _a = sup.register("@A", None, sink());
+        let mut ts = TmpStore::new("reserved-spawn");
+        let (_rec, mut deliver) = recorder();
+
+        let m = MailMessage::new("@A", "@Sombra", "spawn", "reflita").with_ref("role:__reflector__");
+        let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
+        assert!(
+            matches!(out, RouteOutcome::SpawnBlocked),
+            "role reservado via agente → SpawnBlocked, veio {out:?}"
+        );
+        // e NÃO poluiu o livro-razão com um SpawnRequested do role reservado:
+        assert!(
+            spawn_payloads(&ts.store, "SpawnRequested")
+                .iter()
+                .all(|p| p["role"].as_str() != Some(REFLECTOR_ROLE)),
+            "nenhum SpawnRequested de role reservado foi logado"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proposed_team_drops_reserved_roles() {
+        // FILTRO na fonte: um `proposed_team` (DADO de agente) com `__reflector__` não cola o sombra
+        // na montagem de time — `proposed_team_of` o omite (o NodeAdded, se houvesse, ficaria no log).
+        let mut ts = TmpStore::new("reserved-team");
+        ts.store
+            .append(&DomainEvent::GoalInterpreted {
+                goal_id: "g1".to_string(),
+                interpretation: "montar".to_string(),
+                strategy: String::new(),
+                proposed_team: vec![
+                    "backend".to_string(),
+                    REFLECTOR_ROLE.to_string(),
+                    "qa".to_string(),
+                ],
+                acceptance_criteria: vec![],
+            })
+            .expect("GoalInterpreted");
+        let team = proposed_team_of(&ts.store, "g1").expect("proposed_team_of");
+        assert_eq!(
+            team,
+            vec!["backend".to_string(), "qa".to_string()],
+            "role reservado filtrado do time proposto"
+        );
     }
 
     // ───────── F3-4-3 (spec 36 §2): handler do sinal de mudança `code.changed` ─────────

@@ -19,20 +19,26 @@ use lina_core::skill_factory::{
 use lina_core::skill_index::{parse_frontmatter, SkillIndexEntry};
 use lina_core::{ActionClass, MailMessage};
 
-/// Uma skill embutida: nome da pasta + arquivos `(caminho relativo, conteúdo)`.
+/// Uma skill embutida: nome da pasta + papéis-alvo + arquivos `(caminho relativo, conteúdo)`.
 /// `files` é relativo à pasta da skill (ex.: `SKILL.md`, `references/rubrica.md`).
 pub struct EmbeddedSkill {
     /// Nome da pasta da skill (`<skills_root>/<name>/`).
     pub name: &'static str,
+    /// Papéis canônicos a que a skill PERTENCE (ADR 0045 C0; nomes de `default-roles.yaml`).
+    /// **Vazio = universal** (instalada para TODO papel). Senão, só os papéis listados a recebem
+    /// na fatia — `papel X não vê skill exclusiva de Y` (estende a porta aberta do ADR 0038).
+    pub roles: &'static [&'static str],
     /// Arquivos da skill: `(caminho relativo, conteúdo embutido)`.
     pub files: &'static [(&'static str, &'static str)],
 }
 
-/// Embute uma skill de `assets/lina-skills/<name>/` com os arquivos listados.
+/// Embute uma skill de `assets/lina-skills/<name>/`: `embed!(nome, [papéis], [arquivos])`.
+/// Papéis vazios (`[]`) = universal.
 macro_rules! embed {
-    ($name:literal, [$($rel:literal),+ $(,)?]) => {
+    ($name:literal, [$($role:literal),* $(,)?], [$($rel:literal),+ $(,)?]) => {
         EmbeddedSkill {
             name: $name,
+            roles: &[$($role),*],
             files: &[$(
                 (
                     $rel,
@@ -46,37 +52,82 @@ macro_rules! embed {
 /// **A 1ª safra completa** — espelho de `assets/lina-skills/` (ordem alfabética; o teste de
 /// paridade denuncia drift). `lina-cold-review` e `lina-orchestration` carregam `references/`
 /// (a rubrica do cold-review é transversal ao épico — precisa chegar junto).
+// ADR 0045 C0 — papel de cada skill (vazio = universal). Matriz CONSERVADORA: na dúvida,
+// universal (inv #6: nunca esconder capacidade por engano). Só os exclusivos genuínos são
+// tagueados — orquestração→MAESTRO (ex. literal do ADR 0038: "FRONTEND sem orquestração"),
+// copy→WRITER (ex. literal do ADR 0045: "DEVELOPER não vê copy"), etc. Afinamento fino é da
+// Curadoria (R45-CUR), nunca uma porta fechada.
 pub const LINA_SKILLS: &[EmbeddedSkill] = &[
-    embed!("lina-agent-bus", ["SKILL.md"]),
-    embed!("lina-architecture-doctrine", ["SKILL.md"]),
-    embed!("lina-code-doctrine", ["SKILL.md"]),
-    embed!("lina-cold-review", ["SKILL.md", "references/rubrica.md"]),
-    embed!("lina-copy-doctrine", ["SKILL.md"]),
-    embed!("lina-design-doctrine", ["SKILL.md"]),
-    embed!("lina-dispatch", ["SKILL.md"]),
+    // Universais (todo terminal): comunicar, verificar antes de "pronto", revisar entrega, codar.
+    embed!("lina-agent-bus", [], ["SKILL.md"]),
+    embed!("lina-architecture-doctrine", ["ARQUITETO"], ["SKILL.md"]),
+    embed!("lina-code-doctrine", [], ["SKILL.md"]),
+    embed!(
+        "lina-cold-review",
+        [],
+        ["SKILL.md", "references/rubrica.md"]
+    ),
+    embed!("lina-copy-doctrine", ["WRITER"], ["SKILL.md"]),
+    embed!(
+        "lina-design-doctrine",
+        ["FRONTEND", "UIUX_DESIGNER"],
+        ["SKILL.md"]
+    ),
+    embed!("lina-dispatch", ["MAESTRO"], ["SKILL.md"]),
     embed!(
         "lina-orchestration",
+        ["MAESTRO", "TRADUTOR"],
         ["SKILL.md", "references/monitoramento.md"]
     ),
-    embed!("lina-retro", ["SKILL.md"]),
-    embed!("lina-spawn-terminal", ["SKILL.md"]),
+    embed!("lina-retro", ["MAESTRO"], ["SKILL.md"]),
+    embed!("lina-spawn-terminal", ["MAESTRO"], ["SKILL.md"]),
     // F3-2-1: a doutrina da porta de entrada (Tradutor). Ordem alfabética.
-    embed!("lina-translator", ["SKILL.md"]),
-    embed!("lina-verification", ["SKILL.md"]),
+    embed!("lina-translator", ["TRADUTOR"], ["SKILL.md"]),
+    embed!("lina-verification", [], ["SKILL.md"]),
     // F4-WA-3: o protocolo do webhook ativo (evento externo vira input no terminal vivo).
-    embed!("lina-webhook-handler", ["SKILL.md"]),
+    embed!("lina-webhook-handler", ["AUTOMATOR"], ["SKILL.md"]),
 ];
 
-/// Instala TODAS as skills embutidas sob `skills_root` (ex.: `<cwd>/.claude/skills` no kit
-/// por-nó; `~/.claude/skills` no global por-CLI). Aditivo + idempotente: cada skill mora em
-/// pasta própria (nunca colide com skills do usuário); arquivo idêntico não é reescrito
-/// (sem churn de mtime). Devolve os dirs das skills (para o report/log honesto do app).
+/// A fatia do kit embutido para `role` (ADR 0045 C0): **universais** (sem papel) + as exclusivas
+/// do papel. `role = None` → kit COMPLETO (instalação global/role-agnóstica — preserva o ADR 0038
+/// para o uso pessoal do CLI fora do app). Match de papel case-insensitive (nome canônico de
+/// `default-roles.yaml`).
+#[must_use]
+pub fn kit_for_role(role: Option<&str>) -> Vec<&'static EmbeddedSkill> {
+    LINA_SKILLS
+        .iter()
+        .filter(|s| match role {
+            None => true,
+            Some(r) => s.roles.is_empty() || s.roles.iter().any(|own| own.eq_ignore_ascii_case(r)),
+        })
+        .collect()
+}
+
+/// Instala o kit COMPLETO (role-agnóstico) sob `skills_root` — preserva o contrato do ADR 0038
+/// (todo terminal recebe a safra inteira) para os callers atuais (install global por-CLI,
+/// `write_user_dir`). A fatia por papel (ADR 0045 C0) é [`install_skills_into_for_role`].
 ///
 /// # Errors
 /// Propaga o primeiro erro de I/O (criar dirs / escrever arquivo).
 pub fn install_skills_into(skills_root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut dirs = Vec::with_capacity(LINA_SKILLS.len());
-    for skill in LINA_SKILLS {
+    install_skills_into_for_role(skills_root, None)
+}
+
+/// Instala a fatia do kit do papel `role` sob `skills_root` (ADR 0045 C0): **universais + as
+/// exclusivas do papel** (`role = None` → kit completo). Aditivo + idempotente: cada skill mora
+/// em pasta própria (nunca colide com skills do usuário); arquivo idêntico não é reescrito (sem
+/// churn de mtime). Devolve os dirs instalados (report/log honesto do app). NÃO mexe na política
+/// de cwd — só na seleção da safra (porta aberta do ADR 0038).
+///
+/// # Errors
+/// Propaga o primeiro erro de I/O (criar dirs / escrever arquivo).
+pub fn install_skills_into_for_role(
+    skills_root: &Path,
+    role: Option<&str>,
+) -> std::io::Result<Vec<PathBuf>> {
+    let kit = kit_for_role(role);
+    let mut dirs = Vec::with_capacity(kit.len());
+    for skill in kit {
         let dir = skills_root.join(skill.name);
         for (rel, content) in skill.files {
             let dest = dir.join(rel);
@@ -131,14 +182,53 @@ pub fn build_skill_index(disk_skills_root: Option<&Path>) -> Vec<SkillIndexEntry
     index
 }
 
-/// Uma entrada do índice: `name` autoritativo (da pasta) + triggers/requires do frontmatter.
+/// Uma entrada do índice: `name` autoritativo (da pasta) + descrição/triggers/requires do
+/// frontmatter. A `description` é o "documento" do retrieval BM25 (ADR 0045 C1).
 fn index_entry(name: &str, skill_md: &str) -> SkillIndexEntry {
     let fm = parse_frontmatter(skill_md);
     SkillIndexEntry {
         name: name.to_string(),
+        description: fm.description,
         triggers: fm.triggers,
         requires: fm.requires,
     }
+}
+
+/// Persiste o índice (projeção reconstruível, ADR 0045 C1) em JSON sob `path`. Escrita atômica
+/// (tmp+rename). O retrieval (`skill_index::rank`) opera sobre o índice lido daqui — "índice no
+/// disco, não no contexto".
+///
+/// # Errors
+/// Propaga erro de serialização (improvável p/ `Vec<SkillIndexEntry>`) ou de I/O na escrita.
+pub fn write_skill_index(path: &Path, index: &[SkillIndexEntry]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(index)?;
+    write_atomic(path, &json)
+}
+
+/// Lê o índice persistido de `path`. `None` em ausência OU JSON inválido — DEGRADAÇÃO intencional,
+/// não erro engolido: o índice é reconstruível, então o caller responde com [`reindex_skill_index`]
+/// (apaga-e-reconstrói é sempre válido, inv #4).
+#[must_use]
+pub fn read_skill_index(path: &Path) -> Option<Vec<SkillIndexEntry>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Reindexa: reconstrói o índice a partir do disco ([`build_skill_index`]) e o PERSISTE em `path`.
+/// É a operação "apagá-lo e reindexar" do ADR 0045 C1 — idempotente (mesmo disco → mesmo índice).
+///
+/// # Errors
+/// Propaga o erro de I/O da persistência ([`write_skill_index`]).
+pub fn reindex_skill_index(
+    path: &Path,
+    disk_skills_root: Option<&Path>,
+) -> std::io::Result<Vec<SkillIndexEntry>> {
+    let index = build_skill_index(disk_skills_root);
+    write_skill_index(path, &index)?;
+    Ok(index)
 }
 
 /// As skills do usuário em `<root>/<nome>/SKILL.md`. Ausência de `root`/`SKILL.md` é DEGRADAÇÃO
@@ -434,6 +524,192 @@ mod tests {
     fn index_tolerates_missing_disk_root() {
         let index = build_skill_index(Some(Path::new("/caminho/inexistente/lina-xyz-999")));
         assert_eq!(index.len(), LINA_SKILLS.len());
+    }
+
+    /// CRITÉRIO DE ACEITE C1: a descrição (escalar dobrado da safra) chega ao índice — sem ela o
+    /// BM25 não teria documento. Antes do fix do parser, viria o literal ">-".
+    #[test]
+    fn index_carries_skill_description() {
+        let index = build_skill_index(None);
+        let code = index
+            .iter()
+            .find(|e| e.name == "lina-code-doctrine")
+            .expect("lina-code-doctrine no índice");
+        assert!(
+            code.description.to_lowercase().contains("anti-slop"),
+            "descrição real indexada (não o marcador de fold): {:?}",
+            code.description
+        );
+    }
+
+    // ════════════ ADR 0045 C0: partição do kit por papel ════════════
+
+    /// CRITÉRIO DE ACEITE C0 (estende o teste do ADR 0038): um papel NÃO recebe na fatia uma skill
+    /// exclusiva de outro papel — FRONTEND não vê orquestração (MAESTRO) nem copy (WRITER).
+    #[test]
+    fn role_kit_excludes_other_roles_exclusive_skills() {
+        let frontend: Vec<&str> = kit_for_role(Some("FRONTEND"))
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            !frontend.contains(&"lina-orchestration"),
+            "FRONTEND não recebe orquestração (exclusiva do MAESTRO)"
+        );
+        assert!(
+            !frontend.contains(&"lina-copy-doctrine"),
+            "FRONTEND não recebe copy (exclusiva do WRITER)"
+        );
+        // ...mas recebe a sua (design) e as universais (agent-bus).
+        assert!(
+            frontend.contains(&"lina-design-doctrine"),
+            "recebe a do papel"
+        );
+        assert!(frontend.contains(&"lina-agent-bus"), "recebe a universal");
+    }
+
+    /// O papel-dono RECEBE a sua skill exclusiva (a partição corta o ruído, não a capacidade).
+    #[test]
+    fn role_kit_includes_own_exclusive_skill() {
+        let maestro: Vec<&str> = kit_for_role(Some("MAESTRO"))
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(maestro.contains(&"lina-orchestration"));
+        assert!(maestro.contains(&"lina-dispatch"));
+    }
+
+    /// `role = None` (install global/role-agnóstico) preserva o ADR 0038: kit COMPLETO.
+    #[test]
+    fn no_role_yields_full_kit() {
+        assert_eq!(kit_for_role(None).len(), LINA_SKILLS.len());
+    }
+
+    /// Match de papel é case-insensitive (o nome canônico pode chegar em qualquer caixa).
+    #[test]
+    fn role_match_is_case_insensitive() {
+        let lower = kit_for_role(Some("maestro")).len();
+        let upper = kit_for_role(Some("MAESTRO")).len();
+        assert_eq!(lower, upper);
+        assert!(lower < LINA_SKILLS.len(), "MAESTRO é uma fatia, não o todo");
+    }
+
+    /// `install_skills_into_for_role` materializa SÓ a fatia no disco: FRONTEND instala a sua e as
+    /// universais, e NÃO a pasta de uma skill exclusiva de outro papel.
+    #[test]
+    fn install_for_role_writes_only_the_slice() {
+        let root = std::env::temp_dir().join(format!("lina-role-kit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        install_skills_into_for_role(&root, Some("FRONTEND")).expect("instala fatia");
+        assert!(
+            root.join("lina-design-doctrine").join("SKILL.md").is_file(),
+            "a skill do papel é instalada"
+        );
+        assert!(
+            root.join("lina-agent-bus").join("SKILL.md").is_file(),
+            "a universal é instalada"
+        );
+        assert!(
+            !root.join("lina-orchestration").exists(),
+            "skill exclusiva do MAESTRO NÃO aterrissa no disco do FRONTEND"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ════════════ ADR 0045 C1: índice no disco reconstruível ════════════
+
+    /// CRITÉRIO DE ACEITE C1 (ADR 0045 §Verificação): o índice é uma PROJEÇÃO reconstruível —
+    /// apagá-lo e reindexar a partir do disco produz o MESMO índice (idempotente).
+    #[test]
+    fn reindex_reconstructs_from_disk() {
+        let root = std::env::temp_dir().join(format!("lina-reindex-{}", std::process::id()));
+        let skills_dir = root.join("skills");
+        let deploy = skills_dir.join("deploy-helper");
+        std::fs::create_dir_all(&deploy).expect("dir da skill");
+        std::fs::write(
+            deploy.join("SKILL.md"),
+            "---\nname: deploy-helper\ndescription: faz o deploy\ntrigger: publica\n---\ncorpo\n",
+        )
+        .expect("SKILL.md");
+        let index_path = root.join("skill-index.json");
+
+        // 1ª indexação → persiste no disco.
+        let first = reindex_skill_index(&index_path, Some(&skills_dir)).expect("reindex 1");
+        assert!(index_path.is_file(), "índice materializado no disco");
+        assert_eq!(
+            read_skill_index(&index_path).as_deref(),
+            Some(first.as_slice())
+        );
+
+        // Apaga o índice e reindexa a partir do disco → MESMO resultado (reconstruível).
+        std::fs::remove_file(&index_path).expect("apaga índice");
+        assert!(
+            read_skill_index(&index_path).is_none(),
+            "ausente → None (reconstruível)"
+        );
+        let second = reindex_skill_index(&index_path, Some(&skills_dir)).expect("reindex 2");
+        assert_eq!(first, second, "reindexar do disco reconstrói idêntico");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ponta-a-ponta C0+C1: a fatia do papel vira índice no disco e o BM25 recupera a skill certa.
+    #[test]
+    fn role_slice_indexed_then_bm25_recovers() {
+        use lina_core::skill_index::rank;
+        let index = build_skill_index(None);
+        let got = rank(
+            &index,
+            &std::collections::BTreeSet::new(),
+            "preciso coordenar vários terminais nessa entrega",
+            5,
+        );
+        assert!(
+            got.iter().any(|r| r.name == "lina-orchestration"),
+            "a query de orquestração recupera lina-orchestration no top-k: {got:?}"
+        );
+    }
+
+    /// CRITÉRIO DE ACEITE (ADR 0045 §Segurança, prova por MUTAÇÃO): subir o score de outcome ao
+    /// MÁXIMO torna a skill a escolhida (é DADO), mas NÃO dispensa o gate de carga — `skill_check`
+    /// decide por CONTEÚDO (inline-shell), sem nenhum caminho para o score. Skill é DADO, jamais
+    /// autoridade: o ranking muda QUAL skill, nunca a autorização.
+    #[test]
+    fn outcome_score_max_does_not_bypass_load_gate() {
+        use lina_core::skill_index::{rank_with_outcome, task_kind, SkillIndexEntry};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // Skill com inline-shell → o guard SEMPRE exige gate (nunca Routine), em qualquer nível.
+        let gated_md =
+            "---\nname: deploy-helper\ndescription: faz o deploy publicando a app\n---\nrodar !`date`\n";
+        let index = [SkillIndexEntry {
+            name: "deploy-helper".to_string(),
+            description: "faz o deploy publicando a app".to_string(),
+            triggers: Vec::new(),
+            requires: Vec::new(),
+        }];
+        let role = "AUTOMATOR";
+        let query = "faz o deploy";
+
+        // MUTAÇÃO: outcome no MÁXIMO → a skill é escolhida.
+        let mut scores = BTreeMap::new();
+        scores.insert(
+            (task_kind(role, query), "deploy-helper".to_string()),
+            f64::MAX,
+        );
+        let ranked = rank_with_outcome(&index, &BTreeSet::new(), query, role, 5, &scores);
+        assert_eq!(
+            ranked[0].name, "deploy-helper",
+            "score máximo a escolhe (DADO)"
+        );
+
+        // ...e MESMO ASSIM o gate dispara: o score não tem caminho para a autoridade.
+        let check = skill_check(gated_md);
+        assert_ne!(
+            check.load_class,
+            ActionClass::Routine,
+            "outcome máximo NÃO promove skill perigosa a 'liberada' — gate intacto"
+        );
     }
 
     /// CRITÉRIO DE ACEITE: o envelope de seleção carrega skill/trigger/source e OMITE o `node`

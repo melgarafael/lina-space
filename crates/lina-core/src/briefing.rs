@@ -123,6 +123,7 @@ impl SelectedSkills {
                 skill,
                 trigger,
                 source,
+                .. // ADR 0045 C2: campos de roteamento (task_kind/candidates/…) — o briefing não os usa.
             } = event
             {
                 // Último-vence por (nó, skill): re-selecionar a mesma skill atualiza gatilho/origem,
@@ -541,6 +542,12 @@ mod tests {
             skill: skill.to_string(),
             trigger: trigger.map(str::to_string),
             source: source.to_string(),
+            // ADR 0045 C2: campos aditivos não exercidos por este teste de briefing.
+            task_kind: String::new(),
+            candidates: Vec::new(),
+            by_role: String::new(),
+            rank_reason: String::new(),
+            selection_id: String::new(),
         };
         EventRecord {
             seq,

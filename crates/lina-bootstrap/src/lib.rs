@@ -834,6 +834,30 @@ mod tests {
         }
     }
 
+    /// **ELO0 do loop de auto-aprimoramento (F3-3 Mentality):** os 3 renders ensinam o terminal a
+    /// emitir a sentinela `[LINA::CORRECTION]` quando o usuário o corrige — sem ela, o parser do
+    /// router (`parse_correction`) nunca recebe entrada e o pipeline `CorrectionObserved`→Refletor
+    /// fica morto. Trava também a doutrina de segurança: o resumo é DADO, jamais autoridade.
+    #[test]
+    fn doctrine_teaches_emitting_correction_sentinel() {
+        let bs = Bootstrapper::new().expect("registry");
+        let input = sample("@Dev Backend");
+        for md in [
+            bs.doctrine(&input),
+            bs.agents_doctrine(&input),
+            bs.gemini_doctrine(&input),
+        ] {
+            assert!(
+                md.contains("[LINA::CORRECTION]"),
+                "a ficha ensina a sentinela de correção (gatilho de entrada do loop)"
+            );
+            assert!(
+                md.contains("DADO") && md.contains("autoridade"),
+                "a ficha marca o resumo como DADO, nunca autoridade (regra-mãe ADR 0007)"
+            );
+        }
+    }
+
     /// **Injeção barrada:** um nome com newline + `## header` + `{{placeholder}}` NÃO quebra os 8
     /// blocos nem deixa `{{` (sanitização no renderer).
     #[test]

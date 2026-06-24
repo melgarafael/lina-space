@@ -190,3 +190,17 @@ Teste de aceitação ao vivo do ciclo da Goal (define→interpret→confirm→se
 - **Destravado por mim (Terminal R):** braços `DeadLetter` mínimos e honestos em `attention_ui.rs` — `toast_copy` (copy leiga "um aviso de fora não pôde chegar… será entregue quando voltar"), `is_goto_only` (observabilidade, não-aprovável, como `DeliveredNoProgress`) e o helper de teste (`evidence = Hook`, projeção estrutural). Marcados PROVISÓRIOS — a frente F4-WA refina o fraseado. **NÃO commitado.**
 - **Severidade:** ALTA (build quebrado na main; invisível ao gate por design). **Recomendação de processo:** o gate de toda onda que toca `lina-core` deve incluir `cargo build --manifest-path app/lina-gpui/Cargo.toml` (e idealmente `cargo test`), já que adicionar variante de enum ao core quebra os `match` exaustivos do shell.
 - **Status:** sinalizado ao Maestro 01 (condutor F4-WA).
+
+## REGRESSÃO · `router::retention_backstop` vermelho no HEAD após perf(a2a)/ADR 0046 (2026-06-24, Maestro Loop + Terminal B)
+- **Sintoma:** `router::tests::retention_backstop_counts_total_time_across_restart` (`router.rs:9080`) FALHA determinístico na suíte lib de `lina-core` no HEAD.
+- **Causa raiz (hipótese de B):** regrediu após `9787765 perf(a2a): entrega viva não congela mais a UI` (pump 2 fases, ADR 0046) — o backstop de retenção parece reiniciar o relógio no restart (mede tempo total cross-restart e perde a contagem).
+- **Impacto:** envenena o gate por-pacote de QUALQUER fatia que rode `cargo test -p lina-core --lib` (incl. a missão LOOP/0045). NÃO é da missão Mentality/0045 — é costura router/a2a (dono da Fase 4 / ADR 0046).
+- **Severidade:** MEDIA-ALTA (gate mascarável; vermelho REAL de retenção sob restart).
+- **Status:** confirmado por Terminal B (caminho exato); pende confirmação rigorosa minha (worktree do HEAD) na validação final + escalação ao dono de router/a2a. Workers da missão NÃO tocam (fora de fronteira).
+
+## OBSERVABILIDADE · `lina history @colega` (regressão do #15) nega "leitura cross-Espaço" para colega do MESMO workspace (2026-06-24, Maestro Loop)
+- **Sintoma:** `lina history "@Arquiteto"` (Maestro lendo a tela de um colega do PRÓPRIO time) retorna "leitura cross negada: <id> não pertence ao mesmo Espaço que o dono de <id>". O verbo foi fiado (fechava o #15), mas agora BARRA indevidamente — tive de cair no `git diff`/disco para validar progresso.
+- **Causa raiz (hipótese):** a fronteira de pertencimento (ADR 0006) compara IDs de Espaço/sessão e barra, mas Arquiteto e Maestro Loop aparecem no MESMO `lina list` — provável mismatch de resolução de ID (sessão vs workspace) ou ID estale.
+- **Impacto:** o #15 foi fiado mas a observabilidade do Maestro segue quebrada para o caso comum (colega do mesmo Espaço). `lina check` (estado) funciona; o scrollback não.
+- **Severidade:** MEDIA (degrada monitoramento; contornável pelo disco).
+- **Status:** aberto — sinalizado. Reproduzível: `lina history "@Arquiteto"` durante esta sessão.
