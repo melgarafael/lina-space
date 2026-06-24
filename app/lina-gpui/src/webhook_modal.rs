@@ -377,11 +377,9 @@ impl WebhookModal {
     /// O servidor devolveu endereço + senha → vai para o estágio de resultado (exibe 1×). Idempotente
     /// no sentido de que sobrescreve um outcome anterior (o último vence).
     ///
-    /// **Porta de integração F4-WA-1 (Terminal B):** dirigida pela costura de retorno do servidor
-    /// (a engine `lina-webhooks` gera `hook_id`+secret e devolve à view, que chama isto). Sem caller
-    /// de PRODUÇÃO até a fiação de B — provada pelos testes deste módulo (estágio Outcome). O
-    /// `allow(dead_code)` cai assim que a ponta de retorno de B existir.
-    #[allow(dead_code)]
+    /// Dirigida pela costura de retorno do servidor (F4-WA-1): a engine `lina-webhooks` gera
+    /// `hook_id`+secret e o `take_webhook_outcome` do `NodeManager` entrega à view, que chama isto pelo
+    /// loop de poll `drain_webhook_outcome`.
     pub fn present_outcome(&mut self, outcome: WebhookOutcome) {
         self.pending = false;
         self.error = None;

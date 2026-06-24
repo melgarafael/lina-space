@@ -726,6 +726,22 @@ impl WorkspaceView {
                 .await;
         })
         .detach();
+        // F4-WA-2c (UI) — POLL do RETORNO do webhook: o `(url,secret)` nasce na thread do servidor
+        // (handler gpui-free de `lina-webhooks`, F4-WA-1), que NÃO acorda o event loop do gpui nem
+        // alcança o `Context` da View (main-thread). Este loop drena o retorno na main-thread (via o
+        // acessor `take_webhook_outcome` do `NodeManager`) e o injeta no modal aberto. **Take-once:** o
+        // `(url,secret)` é efêmero (consumido 1×, NUNCA logado/`{:?}` — o secret tem `Debug` redigido).
+        // Cadência adaptativa: rápida enquanto o modal aguarda (Pending), ociosa de resto (um
+        // lock+Option é barato no ocioso, padrão dos heartbeats acima).
+        cx.spawn(async move |this, cx| loop {
+            let Ok(pending) = this.update(cx, |view, cx| view.drain_webhook_outcome(cx)) else {
+                break;
+            };
+            cx.background_executor()
+                .timer(Duration::from_millis(if pending { 50 } else { 400 }))
+                .await;
+        })
+        .detach();
         let mut view = Self {
             nodes,
             input,
@@ -3216,11 +3232,25 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// **Porta de integração (F4-WA-1, Terminal B).** O servidor gerou o endereço + a senha e os
-    /// devolve à tela — o modal passa ao estágio de resultado (exibe 1×). Chamado pela costura de boot
-    /// quando a engine responde; no-op se o modal já foi fechado. `allow(dead_code)` até a ponta de
-    /// retorno de B existir (a fiação que invoca isto é território dele — runtime/bridge).
-    #[allow(dead_code)]
+    /// **Fio de retorno do webhook (F4-WA-1 ↔ 2c).** Drena o `(url,secret)` que o handler do servidor
+    /// depositou (`NodeManager::take_webhook_outcome`) e o injeta no modal aberto via
+    /// [`Self::webhook_present_outcome`]. **Take-once:** consumido 1× (o secret não fica residente na
+    /// fila nem é logado). Devolve `true` enquanto o modal aguarda o retorno (Pending) — o loop de poll
+    /// usa isso para acelerar a cadência só quando há algo a esperar. Drenar com o modal fechado
+    /// (usuário cancelou) **descarta** o retorno: o `webhook_present_outcome` é no-op e o `(url,secret)`
+    /// é dropado (efêmero — nunca persiste).
+    fn drain_webhook_outcome(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some((url, secret)) = self.nodes.take_webhook_outcome() {
+            self.webhook_present_outcome(url, secret, cx);
+        }
+        self.webhook_modal
+            .as_ref()
+            .is_some_and(|m| m.stage() == webhook_modal::WebhookStage::Pending)
+    }
+
+    /// O servidor gerou o endereço + a senha e os devolve à tela — o modal passa ao estágio de
+    /// resultado (exibe 1×). Chamado pelo [`Self::drain_webhook_outcome`] (loop de poll); no-op se o
+    /// modal já foi fechado.
     pub(crate) fn webhook_present_outcome(
         &mut self,
         url: String,
