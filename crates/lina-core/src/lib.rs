@@ -1615,7 +1615,14 @@ impl Supervisor {
     /// só some das LISTAS que o time vê. O app escreve o `agents.json` a partir DESTE roster.
     #[must_use]
     pub fn team_roster(&self) -> Vec<NodeInfo> {
-        self.list().into_iter().collect()
+        self.list()
+            .into_iter()
+            .filter(|n| {
+                !n.role
+                    .as_deref()
+                    .is_some_and(crate::router::is_reserved_role)
+            })
+            .collect()
     }
 
     /// Quantidade de nós no roster (inclui Dead até `unregister`).
