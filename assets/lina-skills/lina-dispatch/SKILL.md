@@ -1,16 +1,16 @@
 ---
 name: lina-dispatch
 description: >-
-  O template RICO de despacho: como o orquestrador monta o prompt de uma tarefa para um worker
-  executar SOZINHO, sem perguntas de esclarecimento. Use SEMPRE que for despachar, delegar ou
-  transferir trabalho de verdade a outro terminal — gatilhos: "monta o despacho", "manda o
-  Fulano implementar/revisar/pesquisar X", "o que escrevo no handoff?", "delega essa story",
-  "distribui o épico", "re-despacha o que falhou". Cobre os 5 campos canônicos (CONTEXTO ·
-  FUNÇÃO · DIRECIONAMENTO · OBJETIVO · RESULTADO ESPERADO), o marcador PRONTO:/BLOCKED:, o
-  padrão pull-then-context (a mensagem leva o ponteiro + o essencial; o worker puxa o pesado) e
-  o re-despacho informado ("tentativas anteriores"). É o CONTEÚDO do payload — o verbo lina e a
-  proteção do leigo são da lina-agent-bus. Agnóstica de CLI.
+  Como ESCREVER o briefing de UMA tarefa para um worker executá-la sozinho, sem voltar
+  perguntando. Use ao montar o texto de um repasse: 'monta o despacho', 'o que escrevo pro Fulano
+  fazer X?', 'redige a tarefa pra delegar', 're-despacha o que falhou'. Cobre os 5 campos
+  canônicos (CONTEXTO, FUNÇÃO, DIRECIONAMENTO, OBJETIVO, RESULTADO ESPERADO), o marcador
+  PRONTO:/BLOCKED:, o padrão pull-then-context (a mensagem leva o ponteiro + o essencial; o
+  worker puxa o resto) e o re-despacho com 'tentativas anteriores'. É o CONTEÚDO de um repasse —
+  um worker, uma tarefa; não a regência do time todo nem o canal de mensagens.
 ---
+
+> **Skills irmãs:** coordenar o time todo → `lina-orchestration`; transporte da mensagem e proteção do leigo → `lina-agent-bus`.
 
 # Lina Dispatch — o template RICO de despacho (worker autossuficiente)
 

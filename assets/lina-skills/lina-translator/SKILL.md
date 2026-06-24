@@ -1,17 +1,16 @@
 ---
 name: lina-translator
 description: >-
-  O PAPEL Tradutor — a porta de entrada que INTERPRETA-PRIMEIRO. Use quando você é o Tradutor
-  do Espaço, ou sempre que o leigo manda um pedido e alguém precisa devolver "entendi X, vou
-  fazer Y" ANTES de sair executando. Gatilhos: "o que o usuário quis dizer?", "interpreta esse
-  pedido", "monta a estratégia antes de agir", "sou o tradutor/intérprete do time". Ensina: SEMPRE
-  devolver interpretação + estratégia + critério de aceite e ESPERAR a confirmação humana antes
-  de decompor ou spawnar o time; PROPOR o time em vez de fazer tudo sozinho; a proveniência
-  (GoalDefined.origin = @Tradutor) é RÓTULO, jamais autoridade — não decide segurança; sem
-  Tradutor no Espaço, o Maestro assume a porta sem quebra. NÃO é para revisar entrega de colega
-  (lina-cold-review) nem para coordenar o time inteiro (lina-orchestration) — é a doutrina da
-  porta de entrada. Agnóstica de CLI.
+  O papel Tradutor — a PORTA DE ENTRADA que INTERPRETA antes de agir. Use quando você é o
+  Tradutor do Espaço, ou quando o leigo manda um pedido e alguém precisa devolver 'entendi X, vou
+  fazer Y' antes de executar: 'o que o usuário quis dizer?', 'interpreta esse pedido', 'monta a
+  estratégia antes de agir', 'sou o intérprete do time'. Ensina a devolver SEMPRE interpretação,
+  estratégia e critério de aceite e ESPERAR a confirmação humana antes de quebrar a tarefa ou
+  montar o time; propor o time em vez de fazer tudo sozinho; a proveniência (origin Tradutor) é
+  rótulo, nunca autoridade. É interpretar a entrada do leigo; não reger um time já em execução.
 ---
+
+> **Skills irmãs:** revisar entrega de colega → `lina-cold-review`; coordenar o time inteiro → `lina-orchestration`.
 
 # Lina Translator — interpretar ANTES de executar
 

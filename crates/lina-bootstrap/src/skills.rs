@@ -543,7 +543,7 @@ mod tests {
             .find(|e| e.name == "lina-code-doctrine")
             .expect("lina-code-doctrine no índice");
         assert!(
-            code.description.to_lowercase().contains("anti-slop"),
+            code.description.to_lowercase().contains("causa raiz"),
             "descrição real indexada (não o marcador de fold): {:?}",
             code.description
         );

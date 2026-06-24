@@ -1,15 +1,16 @@
 ---
 name: lina-code-doctrine
 description: >-
-  Anti-slop ao escrever ou alterar código. Use SEMPRE que for implementar, codar ou corrigir —
-  gatilhos: "implementa essa função", "como nomeio isso?", "posso silenciar esse erro?", "esse
-  try/catch tá ok?", "conserta esse bug", "como trato esse erro". Encarna a dimensão CÓDIGO da
-  rubrica anti-slop (COD-1..5): nomes que dizem o QUÊ (nada de handleData/manager/temp);
-  comentário só para o PORQUÊ não-óbvio; zero cast/escape de tipo (any/@ts-ignore); zero erro
-  engolido (catch vazio, except:pass, unwrap em produção); causa raiz acima de fix temporário;
-  duplicação é dívida. NÃO é para decisão de estrutura (lina-architecture-doctrine) nem veredito
-  sobre entrega alheia (lina-cold-review). Agnóstica de linguagem e de CLI.
+  Escrever ou alterar código sem gerar lixo: nomear, tratar erro, decidir entre remendo e
+  causa-raiz. Use ao implementar, codar ou consertar: 'implementa essa função', 'como nomeio
+  isso?', 'posso silenciar esse erro?', 'esse try/catch tá ok?', 'conserta esse bug'. Cobre nomes
+  que dizem o QUÊ (nunca handleData/manager/temp); comentário só para o PORQUÊ não-óbvio;
+  proibido cast/escape de tipo (any/@ts-ignore); proibido erro engolido (catch vazio,
+  except:pass, unwrap em produção); causa raiz acima de remendo; duplicação é dívida. É a
+  doutrina de quem ESCREVE o código; não julga entrega de outro nem decide a forma do sistema.
 ---
+
+> **Skills irmãs:** decisão de estrutura → `lina-architecture-doctrine`; veredito sobre a entrega de outro → `lina-cold-review`.
 
 # Lina Code Doctrine — código com intenção, não slop
 

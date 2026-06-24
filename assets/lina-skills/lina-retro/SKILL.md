@@ -1,16 +1,16 @@
 ---
 name: lina-retro
 description: >-
-  Auto-aprimoramento do Espaço: ler o relatório do comando lina retro e PROPOR melhorias com
-  evidência apontável. Use SEMPRE que a tarefa for olhar para trás e melhorar o time/setup —
-  gatilhos: "roda o retro", "retrospectiva", "o que dá pra melhorar no Espaço?", "que skills
-  criar ou arquivar?", "que papéis faltam?", "analisa custos/histórico", "onde o time trava?".
-  Ensina a ler as 5 seções do relatório (skills/coordenação/custos/pedidos/lacunas) e a propor
-  nos TRÊS tipos (skills, papéis, presets), cada proposta citando o número/evento que a
-  justifica. Tudo passa por GATE HUMANO: você sugere em pt-br simples; o humano decide; você
-  NUNCA aplica (não existe lina retro apply). Para coordenar o trabalho de agora, use
-  lina-orchestration. Agnóstica de CLI.
+  Retrospectiva do Espaço: ler o relatório do comando 'lina retro' e PROPOR melhorias com
+  evidência apontável. Use para olhar para trás e melhorar o time/setup: 'roda o retro',
+  'retrospectiva', 'o que dá pra melhorar no Espaço?', 'que skills criar ou arquivar?', 'que
+  papéis faltam?', 'analisa custos/histórico', 'onde o time trava?'. Lê as 5 seções do relatório
+  (skills, coordenação, custos, pedidos, lacunas) e propõe em três tipos — skills, papéis,
+  presets — cada proposta citando o número ou evento que a justifica. Tudo passa por gate humano:
+  sugere, o humano decide, nunca aplica. É olhar para trás, não a regência de agora.
 ---
+
+> **Skill irmã:** coordenar o trabalho de AGORA → `lina-orchestration` (aqui é olhar para trás).
 
 # Lina Retro — observar o trabalho do Espaço e SUGERIR (o humano decide)
 

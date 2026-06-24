@@ -1,17 +1,16 @@
 ---
 name: lina-orchestration
 description: >-
-  O PAPEL de orquestrador — o método Maestro internalizado. Use SEMPRE que a tarefa exigir
-  coordenar vários terminais (não um único handoff) — gatilhos: "constrói X usando 3 terminais",
-  "coordena o time", "distribui esse épico", "lidera essa entrega", "alguém travou?", "como está
-  o andamento?". Ensina o LOOP: liderar → decompor (plan.md com parents:) → definir funções
-  (falta papel → spawn) → despachar (lina-dispatch via lina-agent-bus, fire-and-forget) →
-  intermediar → monitorar (projeções do event log; defs do ADR 0019) → corrigir trajeto
-  (re-despacho informado; breaker sticky após 2 falhas do mesmo item → escala ao humano) →
-  garantir objetivo (cold-review PASS antes de narrar "pronto"). NÃO é o conteúdo de UM despacho
-  (lina-dispatch) nem o transporte (lina-agent-bus) — é o papel que usa os dois. Agnóstica de
-  CLI.
+  COORDENAR um time inteiro de terminais numa entrega — o método Maestro. Use quando a tarefa
+  precisa de VÁRIOS terminais juntos, não um repasse único: 'constrói X com 3 terminais',
+  'coordena o time', 'distribui esse épico', 'lidera a entrega', 'alguém travou?', 'como está o
+  andamento?'. Ensina o ciclo: liderar, decompor em plano, atribuir funções (falta papel, criar
+  terminal), repassar trabalho, acompanhar, corrigir rota (após 2 falhas do mesmo item, escala ao
+  humano), fechar só com revisão aprovada. É o PAPEL de quem rege o conjunto; distinto de redigir
+  um repasse e de operar o canal de mensagens.
 ---
+
+> **Skills irmãs:** o conteúdo de UM despacho → `lina-dispatch`; o transporte das mensagens → `lina-agent-bus`.
 
 # Lina Orchestration — o método Maestro internalizado
 

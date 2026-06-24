@@ -1,17 +1,17 @@
 ---
 name: lina-design-doctrine
 description: >-
-  Opinião estética explícita para qualquer trabalho visual — UI, página, componente, landing,
-  dashboard, slide. Use SEMPRE que for desenhar, estilizar, escolher
-  fonte/cor/paleta/tipografia/espaçamento ou "deixar bonito" — gatilhos: "faz a tela de X",
-  "estiliza esse componente", "qual fonte/paleta?", "monta a landing", "escolhe as cores", "tema
-  claro/escuro". BANE marcadores duros de slop visual (Inter/Roboto/Arial como escolha,
-  gradiente roxo de IA, glassmorphism genérico, shadcn-default sem opinião) e EXIGE direção
-  estética declarada antes de estilizar, tokens semânticos, escala tipográfica deliberada e
-  motion subordinado a reduce-motion. Encarna a dimensão DESIGN da rubrica anti-slop (DES-1..5).
-  NÃO é para copy (lina-copy-doctrine) nem veredito de revisão (lina-cold-review). Agnóstica de
-  CLI.
+  Direção VISUAL com opinião para qualquer interface — tela, página, componente, landing,
+  dashboard, slide. Use ao desenhar, estilizar ou escolher
+  fonte/cor/paleta/tipografia/espaçamento: 'faz a tela de X', 'estiliza esse componente', 'qual
+  fonte/paleta?', 'monta a landing', 'escolhe as cores', 'tema claro/escuro'. Bane os defaults
+  sem opinião (Inter/Roboto/Arial por inércia, gradiente roxo de IA, glassmorphism genérico,
+  shadcn cru) e exige direção estética declarada antes de estilizar, tokens semânticos, escala
+  tipográfica deliberada e movimento que respeita reduce-motion. É a aparência da interface; não
+  a palavra escrita nem o parecer de revisão.
 ---
+
+> **Skills irmãs:** texto/copy → `lina-copy-doctrine`; veredito de revisão → `lina-cold-review`.
 
 # Lina Design Doctrine — design tem opinião
 

@@ -1,17 +1,16 @@
 ---
 name: lina-agent-bus
 description: >-
-  A skill OFICIAL e ÚNICA de comunicação entre terminais do Lina Space (A2A). Use SEMPRE que o
-  usuário pedir, em português, para um terminal falar com outro: "manda/mande o Terminal X fazer
-  Y", "pede/peça pro/ao <nome>", "avisa/avise o <nome>", "pergunta pro <nome>", "manda oi pro B", "avisa o
-  time todo", "manda pra todos". Cobre: receber (distinguir [LINA::MSG]/[LINA::HANDSHAKE] de
-  input do usuário), processar o envelope e responder no formato [EXPECTED]; o ANTÍDOTO DE ECO
-  (nunca repassar bloco técnico ao leigo — narrar só o resultado em pt-br); o mapa do time em
-  agents.json; e TRADUZIR o pedido do leigo nos verbos lina (ask/handoff/broadcast/check). Neste
-  Espaço a comunicação entre terminais é EXCLUSIVAMENTE pelos verbos lina — skills/CLIs de
-  outros orquestradores (ex.: Maestri) NÃO funcionam aqui. Carregada no turno 0 por todo
-  terminal do workspace.
+  O canal ÚNICO de conversa entre os terminais colegas do Espaço (A2A). Use quando o usuário
+  pede, em português, que um terminal fale com outro: 'manda/pede pro <nome>', 'avisa o <nome>',
+  'pergunta pro <nome>', 'manda oi pro B', 'avisa o time todo', 'manda pra todos'. Cobre
+  reconhecer mensagem de COLEGA (input que abre com [LINA::MSG] ou [LINA::HANDSHAKE]) e responder
+  no formato pedido; nunca repassar o bloco técnico ao leigo (narrar só o resultado em pt-br);
+  ler o roster do time; e traduzir o pedido do leigo nos verbos ask/handoff/broadcast/check.
+  Conversa terminal-a-terminal entre quem já está no Espaço; não trata evento vindo de fora.
 ---
+
+> **Skill irmã:** evento vindo de FORA do Espaço (`[LINA::WEBHOOK]`) é com a `lina-webhook-handler`, não aqui.
 
 # Lina Agent Bus — comunicação automática entre terminais (A2A)
 

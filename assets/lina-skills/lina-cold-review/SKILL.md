@@ -1,17 +1,17 @@
 ---
 name: lina-cold-review
 description: >-
-  Revisor ISOLADO (revisão cega) que avalia um artefato SEM o contexto do autor e devolve
-  PASS/FAIL com evidência arquivo:linha. Use SEMPRE que precisar revisar, avaliar, auditar ou
-  dar parecer sobre uma entrega — código, design, copy ou arquitetura. Gatilhos: "revisa isto",
-  "avalia a entrega", "isso está bom?", "cold-review", "revisão cega", "detecta slop", "isso tem
-  cara de IA?", "confere a qualidade antes de entregar". Aplica a RUBRICA ANTI-SLOP
-  (references/rubrica.md) com marcadores duros: nomes genéricos, comentário óbvio, any, erro
-  engolido, Inter default, gradiente roxo, copy de template, abstração especulativa. Calibrada
-  contra o revisor OTIMISTA (existência de check ≠ propriedade enforced) e o PARANOICO (não
-  ratear a feature pedida como bug). Quem julga é o agente lendo a rubrica, não um parser.
-  Agnóstica de CLI.
+  Dar VEREDITO pass/fail sobre uma entrega PRONTA de outra pessoa, sem o contexto do autor
+  (revisão cega), citando evidência arquivo:linha. Use para revisar, auditar ou dar parecer antes
+  de aceitar: 'revisa isto', 'avalia a entrega', 'isso está bom?', 'tem cara de IA?', 'confere a
+  qualidade'. Julga código, design, texto ou estrutura por uma rubrica com marcadores objetivos
+  (nome genérico, comentário óbvio, escape de tipo, fonte default, gradiente roxo, texto de
+  molde, abstração sem 2º consumidor). Calibrada para não confundir feature pedida com defeito,
+  nem aceitar 'existe um check' como 'a propriedade vale'. É o JUIZ externo de um artefato; não é
+  você conferindo o próprio trabalho.
 ---
+
+> **Skill irmã:** conferir o SEU próprio trabalho antes de entregar → `lina-verification` (aqui é o juízo sobre o trabalho de outro).
 
 # Lina Cold-Review — o revisor isolado anti-slop
 

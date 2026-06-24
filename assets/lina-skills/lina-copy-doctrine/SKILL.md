@@ -1,16 +1,16 @@
 ---
 name: lina-copy-doctrine
 description: >-
-  Anti-slop ao escrever texto que uma pessoa vai ler — copy, manchete, CTA, e-mail, post,
-  anúncio, microcopy. Use SEMPRE que for redigir ou melhorar texto voltado ao usuário/cliente —
-  gatilhos: "escreve a headline", "faz a copy da landing", "melhora esse texto", "qual CTA
-  uso?", "escreve o e-mail/post", "como falo isso pro cliente". Encarna a dimensão COPY da
-  rubrica anti-slop (COP-1..4): zero filler/preâmbulo vazio ("In today's fast-paced world");
-  zero genericidade de template (trocou o nome do produto e segue "verdadeiro" = genérico); CTA
-  que diz o que acontece; a VOZ do usuário lida do vault quando existir; UMA recomendação
-  decisiva em vez de menu. NÃO é para layout visual (lina-design-doctrine) nem comentários de
-  código (lina-code-doctrine). Agnóstica de CLI.
+  Escrever TEXTO que uma pessoa vai ler — headline, CTA, e-mail, post, anúncio, microcopy — sem
+  soar genérico. Use ao redigir ou melhorar texto voltado ao cliente: 'escreve a headline', 'faz
+  a copy da landing', 'melhora esse texto', 'qual CTA uso?', 'escreve o e-mail/post', 'como falo
+  isso pro cliente'. Regras: zero filler ou preâmbulo vazio; zero molde de template (trocar o
+  nome do produto e ainda fazer sentido = genérico, refazer); chamada que diz o que vai
+  acontecer; a voz do usuário lida do vault quando existir; uma recomendação decisiva em vez de
+  menu. É a palavra escrita pro público; não a aparência nem o comentário de código.
 ---
+
+> **Skills irmãs:** layout visual → `lina-design-doctrine`; comentário de código → `lina-code-doctrine`.
 
 # Lina Copy Doctrine — texto com voz, não enchimento
 
