@@ -467,7 +467,10 @@ pub struct Router {
     /// janela, sem await pendente) deixa de congelar a vítima no 1º root e passa a seguir a cadeia
     /// ATIVA (anti-loop não fragmenta por sessão longa), SEM reabrir a forja (um binding fresco de
     /// root diferente NUNCA é sobrescrito — defesa P1).
-    delivered_root: HashMap<NodeId, (String, u8, u64)>,
+    /// ADR 0049: `(root_cause_id, hops, last_ms, query)` — o 4º campo é o TEXTO da tarefa entregue,
+    /// gravado na MESMA entrega que carimba o root (correlacionado → anti-race, sem buffer frágil no
+    /// app). O braço `Delivered` lê `delivered_root_id` + `delivered_query` juntos (ambos server-side).
+    delivered_root: HashMap<NodeId, (String, u8, u64, String)>,
     /// W3-7b (ADR 0002): `id` da pergunta → ticket do `await` aberto. Fechado pelo `reply_to` casado
     /// (`Replied`) ou pelo sweep de timeout (`Timeout`) — em ambos, `end_await` libera o wait-for-graph.
     pending: HashMap<String, AwaitTicket>,
@@ -1507,11 +1510,13 @@ impl Router {
                     //    hops/last_ms (mantém vivo). (Decisão ANTES do insert p/ não segurar o `get`.)
                     let keep_existing = matches!(
                         self.delivered_root.get(&target),
-                        Some((existing, _, _)) if *existing != root
+                        Some((existing, _, _, _)) if *existing != root
                     );
                     if !keep_existing {
+                        // ADR 0049: o 4º campo é a QUERY (texto da tarefa) — correlacionada ao root na
+                        // MESMA entrega; o braço Delivered a lê via `delivered_query` (server-side).
                         self.delivered_root
-                            .insert(target, (root.clone(), hops, now_ms));
+                            .insert(target, (root.clone(), hops, now_ms, msg.payload.clone()));
                     }
                     match store.append(&DomainEvent::MessageDelivered {
                         id: msg.id.clone(),
@@ -2054,10 +2059,13 @@ impl Router {
                     // Mesmos efeitos da entrega original: binding A2 + busy-mark.
                     let keep_existing = matches!(
                         self.delivered_root.get(&target),
-                        Some((existing, _, _)) if *existing != root
+                        Some((existing, _, _, _)) if *existing != root
                     );
                     if !keep_existing {
-                        self.delivered_root.insert(target, (root, hops, now_ms));
+                        // ADR 0049: query = o bloco re-entregue (o payload cru não é retido no
+                        // RetryState; o bloco contém a tarefa — basta p/ o retrieval do mesmo turno).
+                        self.delivered_root
+                            .insert(target, (root, hops, now_ms, block.clone()));
                     }
                     self.mark_busy_after_delivery(store, target);
                     if let Err(e) = self.mailbox.ack_inflight(&id) {
@@ -2144,7 +2152,7 @@ impl Router {
             .values()
             .flat_map(|t| [t.waiter, t.target])
             .collect();
-        self.delivered_root.retain(|node, (_, _, last)| {
+        self.delivered_root.retain(|node, (_, _, last, _)| {
             now_ms.saturating_sub(*last) < window || awaiting.contains(node)
         });
     }
@@ -2158,7 +2166,7 @@ impl Router {
     /// bloco renderizado segue informativo p/ o agente; o ENFORCEMENT não o usa.)
     fn derive_root_hops(&self, msg: &MailMessage, sender: NodeId) -> (String, u8) {
         match self.delivered_root.get(&sender) {
-            Some((root, h, _)) => (root.clone(), h.saturating_add(1)),
+            Some((root, h, _, _)) => (root.clone(), h.saturating_add(1)),
             None => (msg.id.clone(), 0),
         }
     }
@@ -2177,10 +2185,12 @@ impl Router {
     pub fn seed_delivered_root(&mut self, node: NodeId, root: String, hops: u8, now_ms: u64) {
         let keep_existing = matches!(
             self.delivered_root.get(&node),
-            Some((existing, _, _)) if *existing != root
+            Some((existing, _, _, _)) if *existing != root
         );
         if !keep_existing {
-            self.delivered_root.insert(node, (root, hops, now_ms));
+            // ADR 0049: seed sintético (admissão de filho) não tem tarefa entregue → query vazia.
+            self.delivered_root
+                .insert(node, (root, hops, now_ms, String::new()));
         }
     }
 
@@ -2623,7 +2633,19 @@ impl Router {
     pub fn delivered_root_id(&self, node: NodeId) -> Option<String> {
         self.delivered_root
             .get(&node)
-            .map(|(root, _, _)| root.clone())
+            .map(|(root, _, _, _)| root.clone())
+    }
+
+    /// **ADR 0049: a QUERY (texto da tarefa) inforjável de `node`** — o 4º campo do binding
+    /// `delivered_root`, gravado na MESMA entrega que o `root_cause_id` (correlacionado → anti-race,
+    /// sem buffer frágil no app). O braço `Delivered` lê `delivered_root_id` + `delivered_query`
+    /// juntos na detecção e os faz VIAJAR no `SkillSelectionRequest`. `None`/`""` = sem tarefa ativa
+    /// (ex.: nó só-semeado). É o input do `rank_with_outcome` (a query do retrieval).
+    #[must_use]
+    pub fn delivered_query(&self, node: NodeId) -> Option<String> {
+        self.delivered_root
+            .get(&node)
+            .map(|(_, _, _, query)| query.clone())
     }
 
     /// **F3-5-6: handler dos verbos `lina clue define|clear`.** Emite `ClueSetDefined` via
@@ -4778,6 +4800,39 @@ mod tests {
         assert_eq!(calls.len(), 1, "uma entrega");
         assert_eq!(calls[0].0, b, "alvo é B");
         assert!(calls[0].2.contains("[LINA::MSG]") && calls[0].2.contains("payload: oi"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0049: na entrega, a QUERY (texto da tarefa) e o `root_cause_id` são gravados JUNTOS no
+    /// `delivered_root` → `delivered_query`/`delivered_root_id` ficam CORRELACIONADOS na mesma
+    /// gravação (server-side, inforjável) — a base anti-race que o braço Delivered snapshota no
+    /// request (sem buffer frágil por target/tick).
+    #[test]
+    fn delivered_query_and_root_correlated_on_delivery() {
+        let (mut router, sup, dir) = router_with("deliv-q");
+        let _a = sup.register("@A", None, sink());
+        let b = sup.register("@B", None, sink());
+        let mut ts = TmpStore::new("deliv-q");
+        let (_rec, mut deliver) = recorder();
+        // Antes da entrega: o nó não tem turno ativo.
+        assert_eq!(router.delivered_query(b), None);
+        assert_eq!(router.delivered_root_id(b), None);
+
+        let msg = MailMessage::new("@A", "@B", "ask", "montar a api de leads");
+        router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+
+        // Depois: query = o texto entregue; root = o id do turno (1ª entrega → próprio `msg.id`).
+        // Ambos do MESMO binding (correlacionados) → a seleção automática casa query↔turno certo.
+        assert_eq!(
+            router.delivered_query(b).as_deref(),
+            Some("montar a api de leads"),
+            "query = texto da tarefa entregue (server-side)"
+        );
+        assert_eq!(
+            router.delivered_root_id(b).as_deref(),
+            Some(msg.id.as_str()),
+            "root_cause = id do turno, correlacionado à query na mesma entrega"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
