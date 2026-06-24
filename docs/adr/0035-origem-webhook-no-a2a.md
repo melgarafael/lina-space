@@ -1,6 +1,6 @@
 # ADR 0035 — origem `sistema/webhook` no envelope A2A: a INSTRUÇÃO do usuário é autoridade, os DADOS do payload são input não-confiável
 
-- **Status:** Proposto (gate). Será aceito quando uma story da onda F4 (webhook ativo) implementar o despacho server-side carimbando a origem `sistema/webhook` no envelope, com a suíte de segurança do Router verde.
+- **Status:** **ACEITO (2026-06-24).** A onda F4-WA implementou o despacho server-side carimbando `MsgOrigin::System{webhook_id}` no envelope (WA1, `6718c4a`) — origem inforjável por construção (`WEBHOOK_SYSTEM` não resolve por `node_by_name`; `WorkspaceTrust` de direção única) — com a suíte de segurança do Router verde e o red-team consolidado (WA6, `feda27d`, 0 ALTA). **Cold-review isolado do gate** (Maestro 00, revisor que não construiu a onda): **PASS, score 98, 0 ALTA / 0 MEDIA / 1 BAIXA**, com RT-1..RT-6 re-derivados no fonte (RT-3/4/5 re-provados por mutação RED→GREEN). Instrução=autoridade / dados=não-confiável e gate-duro-inquebrável (custódia) provados. (A BAIXA — fiação app-level do marcador `WebhookActionGated` no fluxo real — é porta F4-1 declarada; o backstop `run_custody` já garante 0-exec.)
 - **Onda/Story:** Onda F4 · webhook ativo (entrega de evento externo ao terminal vivo) — webhooks re-fasados F2→F3 pelo addendum do ADR 0010 (2026-06-12); o 2º salto F3→F4 é decisão do épico 41 (o webhook ativo é mecanismo de ENTRADA, afim de Canais/F4) — registrada aqui, sem ADR próprio para o movimento de fase
 - **Data:** 2026-06-17
 
