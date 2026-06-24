@@ -364,7 +364,7 @@ fn onda2_exit_gate_end_to_end() {
     assert!(poll_until(T, || sup.applied_ops(node_b).len() == 2));
     let ops = sup.applied_ops(node_b);
     match (&ops[0], &ops[1]) {
-        (WriteOp::AgentText { from, bytes }, WriteOp::Submit { from: Some(s) }) => {
+        (WriteOp::AgentText { from, bytes }, WriteOp::Submit { from: Some(s), .. }) => {
             assert_eq!((from, s), (&node_a, &node_a));
             assert!(
                 bytes.starts_with(PASTE_BEGIN) && bytes.ends_with(PASTE_END),

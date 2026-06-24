@@ -304,7 +304,7 @@ fn onda0_exit_gate_end_to_end() {
         == 2));
     let ops = sup.applied_ops(node_b);
     match (&ops[0], &ops[1]) {
-        (WriteOp::AgentText { from, bytes }, WriteOp::Submit { from: Some(s) }) => {
+        (WriteOp::AgentText { from, bytes }, WriteOp::Submit { from: Some(s), .. }) => {
             assert_eq!((from, s), (&node_a, &node_a));
             assert!(
                 bytes.starts_with(b"\x1b[200~") && bytes.ends_with(b"\x1b[201~"),

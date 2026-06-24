@@ -49,6 +49,14 @@ const READY_POLL: Duration = Duration::from_millis(10);
 /// sempre, então a entrega legítima NÃO regride (só ganha 1 `READY_POLL` de latência). `2` é o
 /// mínimo que filtra o flicker — calibrável na tela do fundador (gate g) sem mexer no `ready_now`.
 const READY_CONFIRMATIONS: u32 = 2;
+/// **ADR 0046 (Fase 1 pragmática) — orçamento de prontidão da entrega VIVA.** A entrega A2A
+/// roda sob o lock do `EventStore` (`MailboxPump::pump`): `wait_ready` bloqueando até
+/// `ready_timeout` (~2s, alvo ocupado) segurava o mutex e CONGELAVA a UI. O caminho vivo capa o
+/// orçamento NESTE teto (≈ `READY_CONFIRMATIONS` leituras + folga anti-flicker) — alvo pronto
+/// injeta na hora; alvo ainda-ocupado vira RETENÇÃO e re-tentativa rápida (`NOT_READY_BACKOFF_MS`,
+/// router) em vez de um bloqueio longo sob o lock. Headless/bench/teste seguem com o `ready_timeout`
+/// cheio do perfil (sem contenção de UI lá; `deliver_a2a` e o teste de settle ficam intactos).
+pub const INTERACTIVE_READY_BUDGET_MS: u64 = 40;
 /// Timeout para adquirir o lock lógico do PTY do alvo.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -394,9 +402,19 @@ pub fn deliver_a2a(
     //    AgentText → submit_delay → Submit (Enter separado).
     let _guard = sup.lock_pty(target, Writer::Agent(from), LOCK_TIMEOUT)?;
     sup.enqueue_write(target, WriteOp::AgentText { from, bytes: paste })?;
-    std::thread::sleep(profile.submit_delay());
-    sup.enqueue_write(target, WriteOp::Submit { from: Some(from) })?;
-    // _guard solto aqui → libera o terminal.
+    // O `submit_delay` (espaçamento p/ a TUI processar a colagem antes do Enter) é CARREGADO no
+    // `Submit` e aplicado pelo `serial_writer` (thread por-terminal) — NÃO bloqueia aqui. Esta
+    // função roda sob o lock do `EventStore` (`MailboxPump::pump` envolve o pump inteiro em
+    // `lock(&store)`); um `sleep` aqui segurava o mutex ~0,3s/entrega e congelava a UI. Os DOIS
+    // ops são enfileirados sob o `_guard` (FIFO serial) → par contíguo, sem interleave humano.
+    sup.enqueue_write(
+        target,
+        WriteOp::Submit {
+            from: Some(from),
+            delay_ms: profile.submit_delay().as_millis() as u64,
+        },
+    )?;
+    // _guard solto aqui → libera o terminal (ambos os ops já estão na fila serial).
 
     Ok(DeliveryOutcome::Injected { ready, bracketed })
 }
@@ -758,7 +776,7 @@ mod tests {
             == 2));
         let ops = sup.applied_ops(target);
         match (&ops[0], &ops[1]) {
-            (WriteOp::AgentText { from: f, bytes }, WriteOp::Submit { from: Some(s) }) => {
+            (WriteOp::AgentText { from: f, bytes }, WriteOp::Submit { from: Some(s), .. }) => {
                 assert_eq!(f, &from);
                 assert_eq!(s, &from);
                 assert!(bytes.starts_with(PASTE_BEGIN) && bytes.ends_with(PASTE_END));
@@ -857,7 +875,7 @@ mod tests {
         for (i, op) in ops.iter().enumerate() {
             if let WriteOp::AgentText { from, .. } = op {
                 assert!(
-                    matches!(ops.get(i + 1), Some(WriteOp::Submit { from: Some(s) }) if s == from),
+                    matches!(ops.get(i + 1), Some(WriteOp::Submit { from: Some(s), .. }) if s == from),
                     "AgentText deve ser imediatamente seguido pelo seu Submit (sem interleave)"
                 );
             }
@@ -1372,6 +1390,79 @@ mod tests {
             .len()
             == 2));
         flipper.join().expect("join flipper");
+    }
+
+    /// **Fix do freeze (RE-DIAG 2026-06-24):** `deliver_a2a` NÃO pode BLOQUEAR a thread
+    /// chamadora pelo `submit_delay`. Esse `sleep` rodava sob o lock do `EventStore` (a
+    /// `MailboxPump::tick` envolve o `pump` inteiro em `lock(&store)`), congelando a UI por
+    /// ~0,3s/entrega. O atraso AgentText→Enter é responsabilidade do `serial_writer` (thread
+    /// por-terminal), não de quem segura o store. Invariantes preservados: o Enter chega
+    /// DEPOIS do atraso (temporização) e o par AgentText→Submit segue contíguo na fila FIFO
+    /// (no-interleave — o `_guard` enfileira os DOIS ops antes de soltar).
+    #[test]
+    #[serial]
+    fn deliver_does_not_block_caller_on_submit_delay() {
+        let sup = Supervisor::new();
+        let from = sup.register("@A", None, Box::new(std::io::sink()));
+        let target = sup.register("@B", None, Box::new(std::io::sink()));
+        let ready = FixedGrid {
+            region: REAL_IDLE_REGION.to_string(),
+            bracketed: true,
+        };
+        // submit_delay GRANDE (200ms) p/ tornar o bloqueio observável; prontidão imediata.
+        let src = r#"
+            id = "slow-submit"
+            program = "claude"
+            delivery = "pty_inject"
+            submit_delay_ms = 200
+            prompt_ready_regex = '(?m)^\s*[>❯]\s'
+            ready_timeout_ms = 500
+            busy_markers = ["esc to interrupt"]
+            idle_ms = 100
+            ask_timeout_ms = 100000
+            [end_signal]
+            kind = "stream_json"
+            event_type = "result"
+        "#;
+        let prof = CliProfile::from_toml_str(src, "<test>").expect("perfil parseia");
+
+        let t0 = std::time::Instant::now();
+        let res = deliver_a2a(
+            &sup,
+            target,
+            from,
+            "oi",
+            &prof,
+            &ready,
+            InjectPolicy::AllowAll,
+        )
+        .expect("alvo pronto → entrega");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            res,
+            DeliveryOutcome::Injected {
+                ready: true,
+                bracketed: true
+            }
+        );
+        // O FIX: a chamada RETORNA muito antes do submit_delay — não segura o store 200ms.
+        assert!(
+            elapsed < Dur::from_millis(80),
+            "deliver_a2a não pode bloquear o submit_delay na thread chamadora \
+             (ela segura o lock do EventStore → freeze); levou {elapsed:?}"
+        );
+        // Temporização preservada: o Enter (Submit) chega DEPOIS do atraso, pela thread do
+        // serial_writer — par AgentText→Submit contíguo (no-interleave preservado pela FIFO).
+        assert!(
+            poll_until(Dur::from_secs(2), || sup.applied_ops(target).len() == 2),
+            "AgentText + Submit deveriam ter sido aplicados (o Enter chega após o atraso)"
+        );
+        let ops = sup.applied_ops(target);
+        assert!(
+            matches!(ops[0], WriteOp::AgentText { .. }) && matches!(ops[1], WriteOp::Submit { .. }),
+            "ordem deve ser AgentText então Submit, obteve {ops:?}"
+        );
     }
 
     /// A região de input REAL extraída de um `VtBackend` de verdade: alimenta o backend

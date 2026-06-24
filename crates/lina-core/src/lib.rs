@@ -52,7 +52,7 @@ pub use cli_discovery::{
 mod a2a;
 pub use a2a::{
     build_paste, deliver_a2a, sanitize_paste, A2aError, DeliveryOutcome, EndDetector, EndOutcome,
-    EndResult, GridSense, InjectPolicy, WorkspaceTrust,
+    EndResult, GridSense, InjectPolicy, WorkspaceTrust, INTERACTIVE_READY_BUDGET_MS,
 };
 
 /// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
@@ -1129,8 +1129,12 @@ pub enum WriteOp {
     HumanKeys(Vec<u8>),
     /// Texto injetado por um agente (em produção já em bracketed-paste sanitizado — W0-9).
     AgentText { from: NodeId, bytes: Vec<u8> },
-    /// Enter como keystroke separado (`0x0D`) — o que de fato submete (W0-9).
-    Submit { from: Option<NodeId> },
+    /// Enter como keystroke separado (`0x0D`) — o que de fato submete (W0-9). `delay_ms` é o
+    /// espaçamento AgentText→Enter (do CLI Profile, `submit_delay`): o `serial_writer` (thread
+    /// por-terminal) dorme ANTES de escrever o `0x0D`. Antes, esse `sleep` rodava na thread que
+    /// ENFILEIRA — que segura o lock do `EventStore` (`MailboxPump::pump`) — e congelava a UI por
+    /// entrega. Movê-lo para cá tira o long-hold sem perder a temporização. `0` = imediato.
+    Submit { from: Option<NodeId>, delay_ms: u64 },
 }
 
 impl WriteOp {
@@ -1368,6 +1372,15 @@ fn serial_writer(
     cap: usize,
 ) {
     while let Ok(op) = rx.recv() {
+        // O espaçamento AgentText→Enter (`submit_delay` do CLI Profile) mora AQUI, na thread de
+        // escrita — NUNCA na thread que enfileira (`deliver_a2a` roda sob o lock do `EventStore`;
+        // bloquear lá congela a UI). A FIFO garante o par AgentText→Submit contíguo; o atraso só
+        // adia o `0x0D` DESTE terminal, sem segurar lock algum compartilhado.
+        if let WriteOp::Submit { delay_ms, .. } = &op {
+            if *delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(*delay_ms));
+            }
+        }
         let bytes = op.bytes();
         {
             let mut w = lock(&writer);
@@ -1738,7 +1751,15 @@ impl Supervisor {
                 bytes: text.to_vec(),
             },
         )?;
-        self.enqueue_write(target, WriteOp::Submit { from: Some(from) })
+        // Caminho SIMPLES (sem espaçamento): Enter imediato. A entrega A2A faseada
+        // (`deliver_a2a`) é quem carrega o `submit_delay` no `Submit`.
+        self.enqueue_write(
+            target,
+            WriteOp::Submit {
+                from: Some(from),
+                delay_ms: 0,
+            },
+        )
     }
 
     /// F1-1-8 / ADR 0024 — a **porta atômica de aprovação** do app (porta única, Captura 2).
@@ -1951,7 +1972,7 @@ mod bus_tests {
         for (i, op) in ops.iter().enumerate() {
             if let WriteOp::AgentText { from, .. } = op {
                 match ops.get(i + 1) {
-                    Some(WriteOp::Submit { from: Some(s) }) => {
+                    Some(WriteOp::Submit { from: Some(s), .. }) => {
                         assert_eq!(s, from, "o Submit deve ser do mesmo agente que o texto")
                     }
                     other => {

@@ -97,7 +97,13 @@ fn wait_claude_ready(
         if DIALOG_MARKERS.iter().any(|m| joined.contains(m))
             && last_enter.elapsed() > Duration::from_secs(2)
         {
-            let _ = sup.enqueue_write(node, WriteOp::Submit { from: None });
+            let _ = sup.enqueue_write(
+                node,
+                WriteOp::Submit {
+                    from: None,
+                    delay_ms: 0,
+                },
+            );
             last_enter = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(400));
@@ -113,8 +119,14 @@ fn type_line(sup: &Arc<Supervisor>, node: NodeId, text: &str) {
     sup.enqueue_write(node, WriteOp::HumanKeys(text.as_bytes().to_vec()))
         .expect("HumanKeys");
     std::thread::sleep(Duration::from_millis(250));
-    sup.enqueue_write(node, WriteOp::Submit { from: None })
-        .expect("Submit");
+    sup.enqueue_write(
+        node,
+        WriteOp::Submit {
+            from: None,
+            delay_ms: 0,
+        },
+    )
+    .expect("Submit");
 }
 
 #[test]

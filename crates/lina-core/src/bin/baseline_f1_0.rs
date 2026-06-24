@@ -1023,7 +1023,13 @@ fn wait_claude_ready(
         first_match = None;
         let dialog = DIALOG_MARKERS.iter().any(|m| joined.contains(m));
         if dialog && last_enter.elapsed() > Duration::from_secs(2) {
-            let _ = sup.enqueue_write(node, WriteOp::Submit { from: None });
+            let _ = sup.enqueue_write(
+                node,
+                WriteOp::Submit {
+                    from: None,
+                    delay_ms: 0,
+                },
+            );
             last_enter = Instant::now();
         }
         thread::sleep(Duration::from_millis(400));
@@ -1040,8 +1046,14 @@ fn type_line(sup: &Arc<Supervisor>, node: NodeId, text: &str) -> Result<()> {
     sup.enqueue_write(node, WriteOp::HumanKeys(text.as_bytes().to_vec()))
         .map_err(|e| anyhow!("HumanKeys: {e}"))?;
     thread::sleep(Duration::from_millis(250));
-    sup.enqueue_write(node, WriteOp::Submit { from: None })
-        .map_err(|e| anyhow!("Submit: {e}"))?;
+    sup.enqueue_write(
+        node,
+        WriteOp::Submit {
+            from: None,
+            delay_ms: 0,
+        },
+    )
+    .map_err(|e| anyhow!("Submit: {e}"))?;
     Ok(())
 }
 

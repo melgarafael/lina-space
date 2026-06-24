@@ -210,11 +210,16 @@ pub const DELIVERY_BACKOFF_BASE_MS: u64 = 1_000;
 /// F1-0-7: default do limiar do circuit breaker (falhas consecutivas por nó).
 pub const BREAKER_THRESHOLD: u32 = 5;
 /// **ACHADO-2:** backoff entre re-tentativas de uma entrega RETIDA por prompt-não-pronto (alvo
-/// ocupado). Throttla o re-`wait_ready` (cada re-tentativa custa ~`ready_timeout`): sem ele, o
-/// re-drain re-rodaria `wait_ready` a cada tick (busy-loop + head-of-line blocking). 2 s ≈ um
-/// orçamento de prontidão — re-checa com folga, sem martelar. Backstop final: `retention_timeout`
-/// (600 s) → DLQ (o alvo nunca ficou pronto = mensagem morta de verdade).
-pub const NOT_READY_BACKOFF_MS: u64 = 2_000;
+/// ocupado). Throttla o re-`wait_ready`: sem ele, o re-drain re-rodaria `wait_ready` a cada tick.
+///
+/// **ADR 0046 (Fase 1 pragmática):** o motivo do throttle longo era "cada re-tentativa custa
+/// ~`ready_timeout` (até 2 s de poll bloqueante)". A entrega VIVA agora **capa esse orçamento em
+/// `INTERACTIVE_READY_BUDGET_MS` (~40 ms)** — segurar o lock do `EventStore` durante uma espera
+/// longa era a causa do freeze (o pump roda sob `lock(&store)`). Com a espera barata, o re-check
+/// não martela mais, então o backoff pode ser CURTO: um alvo momentaneamente ocupado é re-tentado
+/// em ~150 ms (assentamento impercebível na conversa) em vez de esperar 2 s. Backstop final
+/// inalterado: `retention_timeout` (600 s) → DLQ (o alvo nunca ficou pronto = mensagem morta).
+pub const NOT_READY_BACKOFF_MS: u64 = 150;
 
 impl Default for RouterConfig {
     fn default() -> Self {
@@ -9026,7 +9031,7 @@ mod tests {
         let b = sup.register("@B", None, sink());
         turn_done(&sup, b);
         let mk_cfg = || RouterConfig {
-            retention_timeout_ms: 5_000, // > NOT_READY_BACKOFF_MS (2s) para a re-checagem ficar devida
+            retention_timeout_ms: 5_000, // > NOT_READY_BACKOFF_MS (150ms) para a re-checagem ficar devida
             ..RouterConfig::default()
         };
         let mut router =

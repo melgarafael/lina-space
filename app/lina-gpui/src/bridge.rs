@@ -1148,12 +1148,24 @@ impl MailboxPump {
             // A2A UNIVERSAL: o profile do ALVO (o `prompt_ready_regex`/`busy_markers` DELE), não
             // mais o global — destrava a entrega ao Codex/Gemini/Antigravity sem timeout. A
             // autorização (QUEM→QUEM) segue na `WorkspaceTrust` acima; o profile só decide o COMO.
-            let profile = target_profile(
+            let base = target_profile(
                 cli_by_node.get(&target).map(String::as_str),
                 &registry,
                 &fallback,
             );
-            let out = deliver_a2a(&sup, target, from, text, profile, &g, trust.policy())
+            // ADR 0046 (Fase 1): a entrega VIVA roda sob o lock do `EventStore` (`pump`) — um
+            // `wait_ready` longo (alvo ocupado, até ~2s) segurava o mutex e CONGELAVA a UI. Capa o
+            // orçamento de prontidão em `INTERACTIVE_READY_BUDGET_MS` (~40ms): alvo pronto injeta na
+            // hora; alvo ocupado vira RETENÇÃO + re-tentativa rápida (`NOT_READY_BACKOFF_MS`), nunca
+            // um bloqueio longo sob o lock. Headless/bench usam o perfil cheio (sem contenção de UI).
+            let mut profile = base.clone();
+            profile.ready_timeout_ms = Some(
+                profile
+                    .ready_timeout_ms
+                    .unwrap_or(2_000)
+                    .min(lina_core::INTERACTIVE_READY_BUDGET_MS),
+            );
+            let out = deliver_a2a(&sup, target, from, text, &profile, &g, trust.policy())
                 .map_err(|e| e.to_string())?;
             // Pulso efêmero da entrega real (some sozinho via `Pulse::progress`).
             {
