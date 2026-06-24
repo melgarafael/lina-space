@@ -4892,16 +4892,19 @@ impl BootstrapWriter {
                 dir.display()
             );
         }
-        // ADR 0038: a safra COMPLETA de skills (embutida via `include_str!` — funciona no app
-        // DISTRIBUÍDO, sem depender de `LINA_ASSETS`/dir de assets no disco) no namespace
-        // `.claude/skills/`. Aditivo + idempotente: cada skill mora em pasta própria, nunca
-        // colide com skill do usuário. Substitui a cópia-de-disco de SÓ a `lina-agent-bus` (o
-        // Gap B do ADR 0038) — todo terminal de PROJETO nasce com a Inteligência inteira
-        // (orquestração/gates/cold-review/verification…), não só o A2A. Idêntico ao caminho
-        // gerenciado (`write_terminal_files_with_hooks`), agora uniforme por política de cwd.
-        if let Err(e) = lina_bootstrap::install_skills_into(&dir.join(".claude").join("skills")) {
+        // ADR 0045 C0 (estende 0038): a FATIA de skills do PAPEL — universais (kit Lina:
+        // A2A/gates/cold-review/verification/código…) + as exclusivas do papel — embutida via
+        // `include_str!` (funciona no app DISTRIBUÍDO, sem `LINA_ASSETS`) no namespace
+        // `.claude/skills/`. Aditivo + idempotente: cada skill mora em pasta própria, nunca colide
+        // com skill do usuário. O `role` vem do nome (MESMA fonte da seção de Mentalidade acima); o
+        // sombra `__reflector__` (cwd Managed) NÃO passa aqui — vai por `write_one` com kit próprio.
+        let role = self.role_of(name);
+        if let Err(e) = lina_bootstrap::skills::install_skills_into_for_role(
+            &dir.join(".claude").join("skills"),
+            Some(&role),
+        ) {
             eprintln!(
-                "lina-gpui: instalar a safra de skills em {} falhou: {e}",
+                "lina-gpui: instalar a fatia de skills ({role}) em {} falhou: {e}",
                 dir.display()
             );
         }
@@ -12288,13 +12291,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **ADR 0038 — UserDir app-spawned recebe o kit COMPLETO (consent não é mais gate):** um
-    /// agente numa pasta própria escolhida por humano nasce com a doutrina + a safra inteira de
-    /// skills, MESMO com `kit_consent=false` no modal (o consentimento deixou de ser pré-requisito
-    /// — a proteção é a escrita merge-safe). Pasta LIMPA → nada recusado → `kit_missing=false`. E
-    /// SEM o dir-fantasma `<ws_root>/n-<uuid>` órfão (nem na admissão, nem no rewrite de roster).
+    /// **ADR 0038+0045 C0 — UserDir app-spawned recebe a FATIA do papel (consent não é mais gate):**
+    /// um agente numa pasta própria escolhida por humano nasce com a doutrina + a fatia de skills do
+    /// seu papel (universais + exclusivas do papel), MESMO com `kit_consent=false` (o consentimento
+    /// deixou de ser pré-requisito — a proteção é a escrita merge-safe). Pasta LIMPA → nada recusado
+    /// → `kit_missing=false`. E SEM o dir-fantasma `<ws_root>/n-<uuid>` (admissão nem rewrite).
     #[test]
-    fn userdir_app_spawn_recebe_kit_completo_sem_dir_fantasma() {
+    fn userdir_app_spawn_recebe_fatia_do_papel_sem_dir_fantasma() {
         let ws = std::env::temp_dir().join(format!("lina-noconsent-{}", std::process::id()));
         // Dir SUFIXADO pelo teste: o mesmo PID roda a suíte inteira — compartilhar
         // `lina-userdir-{pid}` com outro teste cria corrida de remove_dir_all (flake real).
@@ -12320,9 +12323,8 @@ mod tests {
             "ADR 0038: a doutrina é escrita na pasta do projeto (consent não é mais gate)"
         );
         assert!(
-            user.join(".claude/skills/lina-orchestration/SKILL.md")
-                .is_file(),
-            "ADR 0038: a safra COMPLETA chega ao UserDir (não só a lina-agent-bus)"
+            user.join(".claude/skills/lina-agent-bus/SKILL.md").is_file(),
+            "ADR 0045 C0: a fatia do papel — universais inclusas (lina-agent-bus) — chega ao UserDir"
         );
         assert!(
             !lock(&model).nodes.get(&id).is_some_and(|v| v.kit_missing),
@@ -13244,6 +13246,67 @@ mod tests {
             1,
             "a nota não duplica no re-render (idempotente)"
         );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// **ADR 0045 C0 (R45-APP) — o spawn vivo instala SÓ a fatia de skills do PAPEL, não o kit
+    /// inteiro.** `write_user_dir` (caminho UserDir do terminal de trabalho) passa o `role` REAL
+    /// (`role_of(name)`) p/ `install_skills_into_for_role` — então um papel não recebe as skills
+    /// exclusivas de OUTRO papel (ADR 0045: "DEVELOPER não vê copy; FRONTEND não vê orquestração").
+    /// NÃO-VACUOSO: usa um papel cuja fatia é MENOR que o kit completo.
+    #[test]
+    fn write_user_dir_installs_only_role_slice_not_full_kit() {
+        use lina_bootstrap::skills::kit_for_role;
+        let ws = std::env::temp_dir().join(format!(
+            "lina-r45app-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        let bw = BootstrapWriter::new(
+            ws.clone(),
+            "/v/vault".to_string(),
+            Autonomy::Assisted,
+            "lina".to_string(),
+        )
+        .expect("bootstrap writer");
+
+        // Acha um nome cujo papel INFERIDO tem fatia < kit completo (robusto à tabela de inferência).
+        let (name, role) = [
+            "Arquiteto",
+            "Maestro",
+            "Dev Frontend",
+            "Curador",
+            "Especialista em Telas",
+        ]
+        .into_iter()
+        .map(|n| (n, bw.role_of(n)))
+        .find(|(_, r)| kit_for_role(Some(r)).len() < lina_bootstrap::LINA_SKILLS.len())
+        .expect("ao menos um nome infere um papel com fatia < kit completo");
+
+        let dir = ws.join("proj");
+        std::fs::create_dir_all(&dir).expect("dir do projeto");
+        bw.write_user_dir(&dir, name, &[name.to_string()]);
+
+        let installed: std::collections::BTreeSet<String> =
+            std::fs::read_dir(dir.join(".claude").join("skills"))
+                .expect("dir de skills")
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+        let expected: std::collections::BTreeSet<String> = kit_for_role(Some(&role))
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
+
+        assert_eq!(
+            installed, expected,
+            "papel {role}: instala SÓ a fatia (universais + exclusivas do papel), não o kit completo"
+        );
+        assert!(
+            installed.len() < lina_bootstrap::LINA_SKILLS.len(),
+            "a fatia do papel {role} é MENOR que o kit completo (não-vacuoso)"
+        );
+
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -14827,13 +14890,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&user_dir);
     }
 
-    /// **ADR 0038 — kit COMPLETO em qualquer pasta de projeto:** `write_user_dir` numa pasta
-    /// LIMPA (fora do namespace gerenciado = `UserDir` real) instala a safra INTEIRA de skills
-    /// (as 12 de `LINA_SKILLS`), não só a `lina-agent-bus`. Antes do ADR 0038 só a agent-bus
-    /// chegava ao `UserDir` → o terminal nascia sem a inteligência (orquestração/gates/cold-review).
-    /// Amarrado ao catálogo do crate (anti-drift): skill nova na safra precisa chegar aqui também.
+    /// **ADR 0045 C0 — FATIA do papel em qualquer pasta de projeto:** `write_user_dir` numa pasta
+    /// LIMPA (fora do namespace gerenciado = `UserDir` real) instala a fatia de skills do PAPEL
+    /// (universais + exclusivas do papel via `kit_for_role`), não a safra inteira nem só a
+    /// `lina-agent-bus`. Amarrado ao catálogo (anti-drift): skill nova da fatia chega aqui; e o C0
+    /// CORTA as exclusivas de outro papel (controle −).
     #[test]
-    fn write_user_dir_installs_full_skill_crop_in_clean_project_dir() {
+    fn write_user_dir_installs_role_slice_in_clean_project_dir() {
         let ws = std::env::temp_dir().join(format!("lina-fullcrop-ws-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         let bw = BootstrapWriter::new(
@@ -14857,20 +14920,28 @@ mod tests {
             "pasta limpa → nada a recusar → kit Full"
         );
 
+        // ADR 0045 C0: a FATIA do papel (universais + exclusivas do papel), não a safra inteira.
         let skills_root = proj.join(".claude/skills");
-        for skill in lina_bootstrap::LINA_SKILLS {
+        let role = bw.role_of("Maestro");
+        for skill in lina_bootstrap::skills::kit_for_role(Some(&role)) {
             assert!(
                 skills_root.join(skill.name).join("SKILL.md").is_file(),
-                "ADR 0038: a skill {} tem que chegar ao UserDir (kit completo), não só a lina-agent-bus",
+                "ADR 0045 C0: a skill {} da fatia do papel {role} tem que chegar ao UserDir",
                 skill.name
             );
         }
-        // A rubrica transversal do cold-review viaja junto (references/).
+        // CONTROLE − (o C0 corta): uma skill EXCLUSIVA de outro papel NÃO aterrissa. `lina-copy-doctrine`
+        // é só do WRITER → um MAESTRO não a recebe (ADR 0045: "DEVELOPER não vê copy").
+        assert!(
+            !skills_root.join("lina-copy-doctrine").exists(),
+            "ADR 0045 C0: skill exclusiva de OUTRO papel (WRITER) não chega ao {role}"
+        );
+        // A rubrica transversal do cold-review (universal) viaja junto (references/).
         assert!(
             skills_root
                 .join("lina-cold-review/references/rubrica.md")
                 .is_file(),
-            "ADR 0038: as references/ da safra também chegam ao UserDir"
+            "as references/ das skills universais também chegam ao UserDir"
         );
 
         let _ = std::fs::remove_dir_all(&ws);
