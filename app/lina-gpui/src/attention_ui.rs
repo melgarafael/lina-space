@@ -93,6 +93,9 @@ pub fn is_goto_only(item: &AttentionItem) -> bool {
     item.kind == AttentionKind::GuardAsk
         || item.kind == AttentionKind::DeliveredNoProgress
         || item.kind == AttentionKind::CodeConflict
+        // F4-WA-5: mensagem na dead-letter queue (alvo morto) é observabilidade — re-entregue só
+        // quando o alvo volta; nunca aprovável por y/n remoto. Goto-only, como DeliveredNoProgress.
+        || item.kind == AttentionKind::DeadLetter
         || (item.kind == AttentionKind::Permission && item.prompt_kind != PromptKind::Yn)
 }
 
@@ -141,6 +144,14 @@ pub fn toast_copy(item: &AttentionItem) -> String {
         // carrega o técnico (paths/branch) para o painel rico (deferido). Precedência guard-ask.
         AttentionKind::CodeConflict => format!(
             "{} tem um conflito de código — um colega mexeu num arquivo que ele reservou; vá até o terminal alinhar",
+            item.node_id
+        ),
+        // F4-WA-5: uma entrega (tipicamente um aviso de fora/webhook) caiu na dead-letter queue porque
+        // o alvo estava morto; fica guardada e re-entregue quando ele voltar (`MessageDelivered`).
+        // Observabilidade — não aprovável daqui (goto-only). Copy PROVISÓRIA para destravar o build (o
+        // app estava sem compilar na main por falta deste braço); a frente F4-WA refina o fraseado.
+        AttentionKind::DeadLetter => format!(
+            "Um aviso de fora não pôde chegar em {} (estava fora do ar) — está guardado e será entregue quando ele voltar",
             item.node_id
         ),
         AttentionKind::Permission => match item.prompt_kind {
@@ -1059,9 +1070,9 @@ mod tests {
                 AttentionKind::Custody | AttentionKind::Spawn => AttentionEvidence::Custody,
                 AttentionKind::Permission | AttentionKind::GuardAsk => AttentionEvidence::Hook,
                 // Espelha a projeção real do core (estrutural, derivado do log — não heurístico).
-                AttentionKind::DeliveredNoProgress | AttentionKind::CodeConflict => {
-                    AttentionEvidence::Hook
-                }
+                AttentionKind::DeliveredNoProgress
+                | AttentionKind::CodeConflict
+                | AttentionKind::DeadLetter => AttentionEvidence::Hook,
             },
             created_ts: ts,
             state: AttentionState::Pending,
