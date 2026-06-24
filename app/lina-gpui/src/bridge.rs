@@ -349,6 +349,92 @@ fn extract_shadow_reply(screen: &str, expect_match: bool) -> Option<String> {
     Some(line.to_string())
 }
 
+/// ADR 0049 (R45-EMIT): passo do throttle do drain de seleção de skills (fora do hot-path) — o
+/// `build_skill_index` + `outcome_scores` lê catálogo/log; throttlar mantém o tick de 120ms leve.
+const SKILL_SELECTION_DRAIN_INTERVAL_MS: u64 = 1_000;
+/// ADR 0049: cap top-K dos candidatos que viajam no `SkillSelected` (o escolhido + os rivais).
+const SKILL_SELECTION_TOP_K: usize = 6;
+
+/// ADR 0049 (R45-EMIT, braço `Delivered`) — uma tarefa entregue aguardando seleção automática de
+/// skill. `query`/`root_cause_id` são capturados SERVER-SIDE na detecção (`delivered_query`/
+/// `delivered_root_id`, correlacionados na entrega) e VIAJAM até o drain (anti-race, ADR 0048).
+struct SkillSelectionRequest {
+    node: NodeId,
+    query: String,
+    root_cause_id: String,
+}
+
+/// Fila serial de seleções pendentes (molde da `ReflectorQueue`): dedup por `(root_cause, node)` —
+/// a mesma tarefa no mesmo nó não re-seleciona dentro do ciclo de vida da fila.
+#[derive(Default)]
+struct SkillSelectionQueue {
+    pending: std::collections::VecDeque<SkillSelectionRequest>,
+    seen: std::collections::BTreeSet<(String, NodeId)>,
+}
+
+impl SkillSelectionQueue {
+    /// Enfileira; `false` se `(root_cause, node)` já foi visto (dedup). O(log n), SEM I/O.
+    fn enqueue(&mut self, req: SkillSelectionRequest) -> bool {
+        if !self.seen.insert((req.root_cause_id.clone(), req.node)) {
+            return false;
+        }
+        self.pending.push_back(req);
+        true
+    }
+
+    /// Esvazia os pendentes (mantém `seen` — não re-seleciona no mesmo ciclo).
+    fn drain(&mut self) -> Vec<SkillSelectionRequest> {
+        self.pending.drain(..).collect()
+    }
+}
+
+/// **ADR 0049 (R45-EMIT) — seleção automática para UMA tarefa (FORA do hot-path; ZERO decisão de
+/// autoridade aqui).** Roda o retrieval+outcome do core (`rank_with_outcome`) sobre o `index`/
+/// `scores` recebidos e, se há candidato, EMITE `SkillSelected` via `Router::system_skill_select`
+/// (que carimba `by_role`/`selection_id` server-side). O `role` é da projeção (server-side); a
+/// query/root vêm do snapshot que viajou. O briefing injeta a fatia por-nó de graça.
+fn run_skill_selection(
+    router: &mut Router,
+    store: &mut EventStore,
+    sup: &Supervisor,
+    index: &[lina_core::skill_index::SkillIndexEntry],
+    scores: &std::collections::BTreeMap<(String, String), f64>,
+    req: &SkillSelectionRequest,
+) {
+    let role = store
+        .project()
+        .ok()
+        .and_then(|p| p.nodes.get(&req.node).and_then(|n| n.role.clone()))
+        .unwrap_or_default();
+    let Some(name) = sup.get(req.node).map(|n| n.name) else {
+        return;
+    };
+    // ponytail: as skills do kit Lina não declaram `requires` → present_tools vazio não filtra nada
+    // hoje; passar as tools reais do nó é o upgrade quando skills com requisito entrarem.
+    let present_tools = std::collections::BTreeSet::new();
+    let ranked = lina_core::skill_index::rank_with_outcome(
+        index,
+        &present_tools,
+        &req.query,
+        &role,
+        SKILL_SELECTION_TOP_K,
+        scores,
+    );
+    let Some(top) = ranked.first() else {
+        return; // nenhuma skill casou a query — não força seleção (degradação limpa)
+    };
+    let candidates: Vec<String> = ranked.iter().map(|r| r.name.clone()).collect();
+    let task_kind = lina_core::skill_index::task_kind(&role, &req.query);
+    router.system_skill_select(
+        store,
+        &name,
+        &top.name,
+        &task_kind,
+        &candidates,
+        &req.root_cause_id,
+    );
+}
+
 /// Empurra uma re-injeção na fila EM-PROCESSO. `target` é o `NodeId` AUTENTICADO (já resolvido no
 /// `assign_role`); `role` regenera o texto no consumidor. SEM I/O e SEM filesystem — nenhum agente
 /// alcança esta fila (FIX-A3). Infalível (push em memória).
@@ -920,6 +1006,11 @@ pub struct MailboxPump {
     /// F3-3 (ELO2): a reflexão EM VOO (disparada ao sombra, aguardando resposta) + o `ts` do disparo
     /// (base do timeout). `None` = sombra livre para a próxima. Serial → no máximo uma em voo.
     reflector_inflight: Option<(ReflectionRequest, u64)>,
+    /// ADR 0049 (R45-EMIT): fila serial de seleções automáticas de skill (tarefa entregue →
+    /// `SkillSelected`). Dedup por `(root_cause, node)`. Drenada FORA do hot-path (throttle).
+    skill_selection: SkillSelectionQueue,
+    /// ADR 0049: último tick do drain de seleção — throttle a [`SKILL_SELECTION_DRAIN_INTERVAL_MS`].
+    last_skill_selection_drain_ms: u64,
     /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
     /// `buffer_gauge`): só (re)apenda `DiskPressureSignaled` quando o nível MUDA, nunca a cada probe.
     last_disk_pressure: Option<DiskPressure>,
@@ -1111,6 +1202,8 @@ impl MailboxPump {
             last_reflection_drain_ms: 0,
             reflector_backlog: std::collections::VecDeque::new(),
             reflector_inflight: None,
+            skill_selection: SkillSelectionQueue::default(),
+            last_skill_selection_drain_ms: 0,
             last_disk_pressure: None,
             // F4-0-2: cofre de credenciais de canal (demo MockStore; ver field). Namespaceado por
             // workspace, igual ao `custody_vault` do runtime.
@@ -1412,7 +1505,16 @@ impl MailboxPump {
         let mut routed = false;
         for (id, outcome) in &results {
             match outcome {
-                RouteOutcome::Delivered { .. } | RouteOutcome::Duplicate => routed = true,
+                RouteOutcome::Duplicate => routed = true,
+                // ADR 0049 (R45-EMIT, braço Delivered): a tarefa chegou → capta {query, root_cause}
+                // server-side (correlacionados na entrega) e enfileira a seleção automática de skill
+                // (drenada FORA do hot-path; o hot-path aqui é só O(1) por target).
+                RouteOutcome::Delivered { targets } => {
+                    routed = true;
+                    for &node in targets {
+                        self.enqueue_skill_selection(node);
+                    }
+                }
                 RouteOutcome::Queued => {} // freio ativo: enfileirada de propósito, sem ruído
                 RouteOutcome::Presence => {} // ping de presença (handshake/broadcast): absorvido, sem ruído
                 // F1-0-4/ACHADO-2: alvo ocupado/retry é ESPERADO (não-erro) — sem ruído de "não roteada".
@@ -1480,6 +1582,58 @@ impl MailboxPump {
         // F3-3 (ELO2): destila as correções captadas (1 CLI-call ao sombra, fora do hot-path) e
         // grava as crenças que o core julgar (`judge_reflection` → `store.append`).
         self.drain_reflections(now_ms());
+        // ADR 0049 (R45-EMIT): seleciona automaticamente a skill da tarefa que chegou (retrieval+
+        // outcome) FORA do hot-path; emite `SkillSelected` → o briefing injeta a fatia por-nó.
+        self.drain_skill_selections(now_ms());
+    }
+
+    /// **ADR 0049 (R45-EMIT, braço `Delivered`) — capta a tarefa entregue e enfileira a seleção.**
+    /// O(1) no hot-path: lê `delivered_query`/`delivered_root_id` (server-side, correlacionados na
+    /// entrega) e enfileira; a seleção cara (retrieval+outcome) roda no drain. Sem query/turno ativo
+    /// (ex.: nó só-semeado) → não enfileira.
+    fn enqueue_skill_selection(&mut self, node: NodeId) {
+        let (Some(root_cause_id), Some(query)) = (
+            self.router.delivered_root_id(node),
+            self.router.delivered_query(node),
+        ) else {
+            return;
+        };
+        if query.trim().is_empty() {
+            return;
+        }
+        self.skill_selection.enqueue(SkillSelectionRequest {
+            node,
+            query,
+            root_cause_id,
+        });
+    }
+
+    /// **ADR 0049 (R45-EMIT) — drena as seleções FORA do hot-path (throttle).** Constrói o índice
+    /// (catálogo embutido) + os scores de outcome 1×, e seleciona para cada tarefa enfileirada
+    /// (`run_skill_selection` → `SkillSelected`). Best-effort (a seleção é informativa, nunca gate).
+    fn drain_skill_selections(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_skill_selection_drain_ms)
+            < SKILL_SELECTION_DRAIN_INTERVAL_MS
+        {
+            return;
+        }
+        let reqs = self.skill_selection.drain();
+        if reqs.is_empty() {
+            return;
+        }
+        self.last_skill_selection_drain_ms = now_ms;
+        let index = lina_bootstrap::skills::build_skill_index(None);
+        let mut store = lock(&self.store);
+        let scores = match store.events() {
+            Ok(events) => lina_core::skill_index::outcome_scores(&events),
+            Err(e) => {
+                eprintln!("lina-gpui: seleção de skill — replay p/ outcome falhou: {e}");
+                std::collections::BTreeMap::new()
+            }
+        };
+        for req in &reqs {
+            run_skill_selection(&mut self.router, &mut store, &self.sup, &index, &scores, req);
+        }
     }
 
     /// **F4-WA-1: drena as entregas-de-sistema (webhook) que a `WebhookEngine` depositou na fila** e
@@ -11151,8 +11305,8 @@ mod tests {
         // estrangeira por matching de descrição) E o alerta anti-Maestri; o `alias
         // maestri` (reforço do bug) sumiu.
         assert!(
-            body.contains("mande") && body.contains("peça") && body.contains("avise"),
-            "descrição casa com a fala pt-br do fundador (mande/peça/avise)"
+            body.contains("manda") && body.contains("avisa") && body.contains("pergunta"),
+            "descrição casa com a fala pt-br do fundador (manda/avisa/pergunta) — curadoria R45-CUR (gatilhos disjuntos) adotou a forma natural do fundador"
         );
         assert!(
             body.contains("Maestri") && body.contains("MAESTRI_CLI"),
@@ -13524,6 +13678,88 @@ mod tests {
             BeliefStatus::Provisional,
             "proposta nasce provisória"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **ADR 0049 (R45-EMIT) — a fila de seleção dedup por (root_cause, node).** A mesma tarefa
+    /// (mesmo turno) no mesmo nó não re-seleciona; turnos OU nós distintos entram.
+    #[test]
+    fn skill_selection_queue_dedups_by_root_and_node() {
+        let n1 = NodeId::from_u128(1);
+        let n2 = NodeId::from_u128(2);
+        let mut q = SkillSelectionQueue::default();
+        let req = |node, root: &str| SkillSelectionRequest {
+            node,
+            query: "montar api".into(),
+            root_cause_id: root.into(),
+        };
+        assert!(q.enqueue(req(n1, "t1")));
+        assert!(!q.enqueue(req(n1, "t1")), "mesma (turno,nó) não re-enfileira");
+        assert!(q.enqueue(req(n2, "t1")), "nó distinto entra");
+        assert!(q.enqueue(req(n1, "t2")), "turno distinto entra");
+        assert_eq!(q.drain().len(), 3);
+    }
+
+    /// **ADR 0049 (R45-EMIT e2e) — uma tarefa entregue vira `SkillSelected` automático.** Monta um
+    /// nó @J (papel BACKEND server-side via projeção) + um índice SINTÉTICO (não depende das
+    /// descrições reais, que a Curadoria reescreve) e roda o drain (`run_skill_selection`): emite
+    /// `SkillSelected` com `selection_id` real + `by_role` server-side + `source=auto` + a skill
+    /// rankeada. Prova a costura app↔core (retrieval+outcome → emissão), zero-mock no core.
+    #[test]
+    fn delivered_task_emits_auto_skill_selected_e2e() {
+        use lina_core::skill_index::SkillIndexEntry;
+        let dir = std::env::temp_dir().join(format!(
+            "lina-r45emit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sup = std::sync::Arc::new(Supervisor::new());
+        let mut store = EventStore::open(&dir).expect("store");
+        let mut router = Router::new(std::sync::Arc::clone(&sup), lina_core::Mailbox::new(dir.clone()));
+
+        // Nó @J com papel BACKEND (sup + projeção do log) — molde do seed_node_with_role do core.
+        let j = sup.register("@J", None, Box::new(std::io::sink()));
+        store
+            .append(&DomainEvent::NodeAdded {
+                node: j,
+                kind: "terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .expect("NodeAdded");
+        store
+            .append(&DomainEvent::NodeRoleAssigned {
+                node: j,
+                role: "BACKEND".into(),
+            })
+            .expect("NodeRoleAssigned");
+
+        // Índice SINTÉTICO: uma skill cuja descrição casa a query (independe das descrições reais).
+        let index = vec![SkillIndexEntry {
+            name: "skill-alvo".into(),
+            description: "montar api de leads no backend".into(),
+            triggers: Vec::new(),
+            requires: Vec::new(),
+        }];
+        let scores = std::collections::BTreeMap::new();
+        let req = SkillSelectionRequest {
+            node: j,
+            query: "montar a api de leads no backend".into(),
+            root_cause_id: "turn-r45".into(),
+        };
+        run_skill_selection(&mut router, &mut store, &sup, &index, &scores, &req);
+
+        let events = store.events().expect("events");
+        let sel: Vec<_> = events.iter().filter(|r| r.kind == "SkillSelected").collect();
+        assert_eq!(sel.len(), 1, "uma seleção automática emitida");
+        let s = sel[0].payload.to_string();
+        assert!(s.contains("\"source\":\"auto\""), "via de sistema: source=auto — {s}");
+        assert!(s.contains("BACKEND"), "by_role server-side — {s}");
+        assert!(s.contains("sel-"), "selection_id real (root_cause supre) — {s}");
+        assert!(s.contains("skill-alvo"), "a skill rankeada foi a escolhida — {s}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
