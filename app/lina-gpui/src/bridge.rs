@@ -242,6 +242,33 @@ fn render_mentality_section(role: &str, beliefs: &[&Belief]) -> Option<String> {
     Some(out)
 }
 
+/// **F3-3 (ELO4) — fiação do housekeeping de crenças.** Roda a política DETERMINÍSTICA do core
+/// (`Mentality::housekeeping_tick`, ZERO LLM) sobre o log e PERSISTE os marcos que ela aponta:
+/// promoções por contagem (`BeliefEstablished`) e provisórias estagnadas além do TTL
+/// (`BeliefRetired{expired}`). Idempotente sob replay: `promotable()`/`expired_provisional()` só
+/// listam o que ainda NÃO tem o evento, então re-rodar não duplica o marco. Best-effort — loga e
+/// segue (jamais panica a thread do pump). Devolve quantos eventos foram apendados.
+fn run_belief_housekeeping(store: &mut EventStore, now_ms: u64) -> usize {
+    let mentality = match Mentality::replay(store, PromotionPolicy::default()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("lina-gpui: housekeeping de crenças — replay falhou: {e}");
+            return 0;
+        }
+    };
+    let mut applied = 0;
+    for ev in mentality.housekeeping_tick(now_ms) {
+        match store.append(&ev) {
+            Ok(_) => applied += 1,
+            Err(e) => eprintln!(
+                "lina-gpui: housekeeping de crenças — falha ao apendar {}: {e}",
+                ev.kind()
+            ),
+        }
+    }
+    applied
+}
+
 /// Empurra uma re-injeção na fila EM-PROCESSO. `target` é o `NodeId` AUTENTICADO (já resolvido no
 /// `assign_role`); `role` regenera o texto no consumidor. SEM I/O e SEM filesystem — nenhum agente
 /// alcança esta fila (FIX-A3). Infalível (push em memória).
@@ -792,6 +819,10 @@ pub struct MailboxPump {
     /// [`DISK_PROBE_SECS`] (300s) — disco enche devagar; varrer o FS por tick seria desperdício (e a
     /// varredura de candidatos é pesada). Par do `last_buffer_sample_ms`.
     last_disk_probe_ms: u64,
+
+    /// F3-3 (ELO4): último tick em que o housekeeping de crenças rodou — throttle a
+    /// [`BELIEF_HOUSEKEEPING_INTERVAL_MS`] (replay O(N); par do `last_disk_probe_ms`).
+    last_belief_housekeeping_ms: u64,
     /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
     /// `buffer_gauge`): só (re)apenda `DiskPressureSignaled` quando o nível MUDA, nunca a cada probe.
     last_disk_pressure: Option<DiskPressure>,
@@ -817,6 +848,10 @@ const SESSION_SCAN_INTERVAL_MS: u64 = 2_000;
 const BUFFER_SAMPLE_INTERVAL_MS: u64 = 1_000;
 /// F3-5-8: passo do throttle do probe de disco — [`DISK_PROBE_SECS`] (300s) em ms (anti-freeze).
 const DISK_PROBE_INTERVAL_MS: u64 = DISK_PROBE_SECS * 1_000;
+/// F3-3 (ELO4): passo do throttle do housekeeping de crenças. `Mentality::replay` é O(N) no log —
+/// promoção/expiração não urgem a sub-minuto, então 30s mantém o tick de 120ms barato (mesma
+/// disciplina anti-freeze de `sample_buffers`/`probe_disk`; lição do freeze do attention_heartbeat).
+const BELIEF_HOUSEKEEPING_INTERVAL_MS: u64 = 30_000;
 
 /// SEAM-1: detalhes INFORJÁVEIS de um pedido de spawn (do `SpawnRequested`), usados por
 /// `post_process_spawns` p/ fiar o binding de cascata (M4) + o 1º prompt.
@@ -967,6 +1002,7 @@ impl MailboxPump {
             buffer_gauge,
             last_buffer_sample_ms: 0,
             last_disk_probe_ms: 0,
+            last_belief_housekeeping_ms: 0,
             last_disk_pressure: None,
             // F4-0-2: cofre de credenciais de canal (demo MockStore; ver field). Namespaceado por
             // workspace, igual ao `custody_vault` do runtime.
@@ -1321,6 +1357,8 @@ impl MailboxPump {
         self.sample_buffers(now_ms());
         // F3-5-8: detecta pressão de disco (ENOSPC #25) e PROPÕE poda custodiada (throttle 300s).
         self.probe_disk(now_ms());
+        // F3-3 (ELO4): promove/expira crenças pela política do core (throttle 30s, replay O(N)).
+        self.housekeeping_beliefs(now_ms());
     }
 
     /// **F4-WA-1: drena as entregas-de-sistema (webhook) que a `WebhookEngine` depositou na fila** e
@@ -1489,6 +1527,20 @@ impl MailboxPump {
     /// `permission_prompt` (achado #36); a execução destrutiva é do broker custodiado.
     fn probe_disk(&mut self, now_ms: u64) {
         self.probe_disk_with(&OsDiskProbe, now_ms);
+    }
+
+    /// **F3-3 (ELO4) — housekeeping de crenças throttled no tick.** Promove (por contagem) e expira
+    /// (TTL) crenças pela política DETERMINÍSTICA do core, via [`run_belief_housekeeping`]. Throttle a
+    /// [`BELIEF_HOUSEKEEPING_INTERVAL_MS`]: `Mentality::replay` é O(N) no log — varrer por tick
+    /// (120ms) repetiria o freeze do attention_heartbeat. Best-effort (a fn loga; nunca panica).
+    fn housekeeping_beliefs(&mut self, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_belief_housekeeping_ms) < BELIEF_HOUSEKEEPING_INTERVAL_MS
+        {
+            return;
+        }
+        self.last_belief_housekeeping_ms = now_ms;
+        let mut store = lock(&self.store);
+        run_belief_housekeeping(&mut store, now_ms);
     }
 
     /// Núcleo testável do probe — o [`DiskProbe`] é INJETADO (`OsDiskProbe` em produção; simulado no
@@ -5154,6 +5206,22 @@ pub fn plan_restore(
     registry: &ProfileRegistry,
     scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
 ) -> Vec<RestoredTerminal> {
+    // Compat (testes de layout/resgate que não exercitam retomada): restore SEM sessões salvas →
+    // todo terminal começa limpo. Produção usa [`plan_restore_resuming`], que religa a conversa
+    // exata pela `session_id` (sem ela, `--resume` cairia no SELETOR — tela do fundador 2026-06-24).
+    plan_restore_resuming(proj, registry, scrollback, &ResumeSessionStore::default())
+}
+
+/// Como [`plan_restore`], mas COM as sessões `--resume` salvas (F3-5-2): cada terminal religa pela
+/// `session_id` EXATA do seu nó (via [`lina_core::resume_session::resume_command`]) ou começa limpo
+/// se não houver id salvo — NUNCA `claude --resume` pelado (que abre o seletor interativo e, ao dar
+/// ESC + nova sessão, prendia o terminal). É o caminho de produção (boot e re-foco).
+pub fn plan_restore_resuming(
+    proj: &ProjectedState,
+    registry: &ProfileRegistry,
+    scrollback: Option<&Arc<Mutex<ScrollbackStore>>>,
+    sessions: &ResumeSessionStore,
+) -> Vec<RestoredTerminal> {
     let mut out = Vec::new();
     let is_dead_terminal = |info: &lina_core::ProjectedNode| {
         info.kind.eq_ignore_ascii_case("terminal")
@@ -5253,9 +5321,18 @@ pub fn plan_restore(
         let profile = resolved_id.as_deref().and_then(|id| registry.get(id));
         let profile_id = resolved_id;
 
-        // Badge CONDICIONADO AO OBSERVADO (copy-f1-4 §4): declarar resume é NECESSÁRIO, nunca
-        // SUFICIENTE — só «Sessão retomada» se há sessão anterior de fato (scrollback no disco).
-        let resumes = profile.is_some_and(CliProfile::can_resume) && has_prior_session;
+        // Badge + comando CONDICIONADOS AO session_id REAL (copy-f1-4 §4: declarar resume é
+        // NECESSÁRIO, nunca SUFICIENTE). Tela do fundador 2026-06-24: o restore anexava `--resume`
+        // SEM o session_id → `claude --resume` caía no SELETOR interativo e, ao dar ESC + abrir nova
+        // sessão, o terminal ficava preso (só recriar resolvia). Agora só «retoma» quando há a sessão
+        // salva DAQUELE nó E há conversa na tela (scrollback): aí `resume_command` anexa `--resume
+        // <id>` e religa a conversa CERTA. Sem id → começa LIMPO (badge honesto), NUNCA o seletor.
+        let session_id = if profile.is_some_and(CliProfile::can_resume) && has_prior_session {
+            sessions.active_for(&panel).map(|s| s.session_id.clone())
+        } else {
+            None
+        };
+        let resumes = session_id.is_some();
         let badge = if resumes {
             RestoreBadge::Resumed
         } else {
@@ -5263,14 +5340,7 @@ pub fn plan_restore(
         };
 
         let command = match profile {
-            Some(p) => {
-                let mut c = vec![p.program.clone()];
-                c.extend(p.args.iter().cloned());
-                if resumes {
-                    c.extend(p.resume_args.iter().cloned());
-                }
-                c
-            }
+            Some(p) => lina_core::resume_session::resume_command(p, session_id.as_deref()),
             None => Vec::new(),
         };
 
@@ -12968,6 +13038,44 @@ mod tests {
         }
     }
 
+    /// **F3-3 (ELO4) — housekeeping promove o promovível e é idempotente.** Uma crença estabelecida
+    /// POR CONTAGEM (2 situações distintas, sem `BeliefEstablished` explícito) é o que `promotable()`
+    /// lista; o housekeeping carimba o marco no log. Re-rodar NÃO duplica (idempotência sob replay).
+    /// NÃO-VACUOSO: sem a fiação, `promotable()` continuaria não-vazio e `applied` seria 0.
+    #[test]
+    fn belief_housekeeping_emits_established_for_promotable_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-hk-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("store")));
+        append_established_belief(&store, "BACKEND", 0);
+
+        // Antes: estabelecida por contagem, mas o marco não está no log → promotable não-vazio.
+        let before =
+            Mentality::replay(&lock(&store), PromotionPolicy::default()).expect("replay before");
+        assert_eq!(before.promotable().len(), 1, "promovível antes do housekeeping");
+
+        // 1ª passada: carimba o `BeliefEstablished`.
+        let applied = run_belief_housekeeping(&mut lock(&store), now_ms());
+        assert_eq!(applied, 1, "1 marco de promoção apendado");
+        let after =
+            Mentality::replay(&lock(&store), PromotionPolicy::default()).expect("replay after");
+        assert!(after.promotable().is_empty(), "nada mais a promover");
+        assert_eq!(
+            after.belief("b0").expect("crença existe").status,
+            BeliefStatus::Established
+        );
+
+        // 2ª passada: idempotente — nada novo a apendar.
+        let again = run_belief_housekeeping(&mut lock(&store), now_ms());
+        assert_eq!(again, 0, "re-rodar não duplica o marco");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **Estabelecida vira REGRA; provisória vem MARCADA como hipótese (com a sentinela de
     /// confirmação/contestação — §4.1).** Controle + (ambas presentes nos blocos certos) e − (a
     /// provisória NÃO aparece como regra firme). Função PURA — independe de store/relógio.
@@ -13433,7 +13541,18 @@ mod tests {
         }
 
         let proj = store.project().expect("project");
-        let plan = plan_restore(&proj, &reg, Some(&sb));
+        // Produção religa pela session_id salva (F3-5-2): só o nó com motor que retoma E sessão
+        // salva ganha `--resume <id>`. Sem id, começa limpo — NUNCA `--resume` pelado (seletor).
+        let sessions = lina_core::resume_session::ResumeSessionStore {
+            sessions: vec![lina_core::resume_session::SavedSession {
+                node: n_resume.to_string(),
+                cli: "claude-code".into(),
+                session_id: "sess-claude-1".into(),
+                label: None,
+                persisted_at_ms: 1,
+            }],
+        };
+        let plan = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions);
         assert_eq!(plan.len(), 3, "3 terminais re-erguem");
         let by = |n: NodeId| plan.iter().find(|r| r.node == n).expect("nó no plano");
 
@@ -13452,8 +13571,14 @@ mod tests {
         );
         assert_eq!(
             r.command,
-            vec!["claude", "--output-format", "stream-json", "--resume"],
-            "comando do restore carrega o verbo de resume do TOML"
+            vec![
+                "claude",
+                "--output-format",
+                "stream-json",
+                "--resume",
+                "sess-claude-1"
+            ],
+            "comando do restore carrega o verbo de resume do TOML + o session_id salvo"
         );
 
         let sh = by(n_shell);
@@ -13492,7 +13617,7 @@ mod tests {
         // Critério 4: derivável do log — re-projetar do MESMO store dá o MESMO plano.
         let proj2 = store.project().expect("re-project");
         assert_eq!(
-            plan_restore(&proj2, &reg, Some(&sb)),
+            plan_restore_resuming(&proj2, &reg, Some(&sb), &sessions),
             plan,
             "limpar projeções → replay → mesmo restore"
         );
@@ -13551,22 +13676,54 @@ mod tests {
             "painel vazio → novo começo"
         );
 
-        // Agora COM sessão anterior → «Sessão retomada» + o verbo de resume entra.
+        // Scrollback presente (conversa na tela)…
         {
             let mut s = lock(&sb);
             s.push_line(&node.to_string(), "oi de ontem".to_string())
                 .expect("push");
         }
-        let plan3 = plan_restore(&proj, &reg, Some(&sb));
+        // …mas SEM session_id salvo → começa LIMPO. Tela do fundador 2026-06-24: antes o restore
+        // anexava `--resume` SEM id → `claude --resume` caía no SELETOR interativo e o terminal
+        // travava ao dar ESC. Agora o comando NUNCA tem `--resume` pelado.
+        let plan_sem_id = plan_restore(&proj, &reg, Some(&sb));
+        assert_eq!(
+            plan_sem_id[0].badge,
+            RestoreBadge::FreshStart,
+            "scrollback sem session_id salvo → novo começo honesto (nunca o seletor)"
+        );
+        assert_eq!(
+            plan_sem_id[0].command,
+            vec!["claude", "--output-format", "stream-json"],
+            "sem id → comando SEM --resume (jamais cai no seletor interativo)"
+        );
+
+        // COM a sessão salva DAQUELE nó (1º prompt observado) → «Sessão retomada» + `--resume <id>`
+        // exato, religando a conversa CERTA (não "a última da pasta", que é o que `--resume` sem id faria).
+        let sessions = lina_core::resume_session::ResumeSessionStore {
+            sessions: vec![lina_core::resume_session::SavedSession {
+                node: node.to_string(),
+                cli: "claude-code".into(),
+                session_id: "sess-abc123".into(),
+                label: None,
+                persisted_at_ms: 1,
+            }],
+        };
+        let plan3 = plan_restore_resuming(&proj, &reg, Some(&sb), &sessions);
         assert_eq!(
             plan3[0].badge,
             RestoreBadge::Resumed,
-            "sessão anterior observada → retomada de verdade"
+            "sessão salva + scrollback → retomada de verdade"
         );
         assert_eq!(
             plan3[0].command,
-            vec!["claude", "--output-format", "stream-json", "--resume"],
-            "agora o verbo de resume entra"
+            vec![
+                "claude",
+                "--output-format",
+                "stream-json",
+                "--resume",
+                "sess-abc123"
+            ],
+            "o verbo de resume entra COM o session_id (religa a conversa exata)"
         );
 
         // Strings CONGELADAS do badge + hover (copy-f1-4 §4 — fonte autoritativa).
