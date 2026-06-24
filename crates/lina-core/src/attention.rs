@@ -532,7 +532,13 @@ impl AttentionQueue {
             }
             // Nó removido/terminal encerrado → sem alarme (sem terminal para o Maestro re-despachar).
             DomainEvent::NodeRemoved { node } | DomainEvent::TerminalExited { node } => {
-                self.remove_dispatch(&node.to_string());
+                let dead = node.to_string();
+                self.remove_dispatch(&dead);
+                // Tela do fundador (2026-06-24): pedidos de permissão de sessões JÁ encerradas
+                // acumulavam para sempre — com o grid morto, `PermissionPromptCleared` nunca chega
+                // e ninguém aprova/recusa um nó que não existe mais. Encerrar limpa as permissões
+                // órfãs DAQUELE nó (replay idempotente: o `NodeRemoved`/`TerminalExited` está no log).
+                self.permissions.retain(|p| p.node_id != dead);
             }
             // ───────── F3-4-4 (spec 36 §2): conflito de código por pertencimento ─────────
             // Projeção PURA derivada (SEM evento novo): a fila junta os paths reservados (do item) +
@@ -1314,6 +1320,29 @@ mod tests {
         assert_eq!(q.pending_count(), 2);
         q.custody_resolved("msg_c1");
         assert_eq!(q.items(T0 + 8_000).len(), 1);
+    }
+
+    /// Tela do fundador (2026-06-24): pedidos de permissão de sessões JÁ encerradas acumulavam
+    /// para sempre — com o terminal morto, o grid não é mais escaneado, `PermissionPromptCleared`
+    /// nunca chega e ninguém aprova/recusa um nó que não existe mais. Encerrar (`NodeRemoved`/
+    /// `TerminalExited`) limpa as permissões órfãs DAQUELE nó (e só dele); replay idempotente.
+    #[test]
+    fn terminal_encerrado_limpa_permissoes_orfas() {
+        let morto = NodeId::from_u128(1);
+        let vivo = NodeId::from_u128(2);
+        let mut q = AttentionQueue::new();
+        q.observe(&ask(&morto.to_string(), PermissionEvidence::Hook, "p1"), T0);
+        q.observe(&ask(&vivo.to_string(), PermissionEvidence::Hook, "p2"), T0);
+        assert_eq!(q.items(T0 + 1_000).len(), 2, "duas permissões pendentes");
+
+        q.observe(&DomainEvent::NodeRemoved { node: morto }, T0 + 2_000);
+        let items = q.items(T0 + 3_000);
+        assert_eq!(items.len(), 1, "a permissão órfã do nó morto saiu da fila");
+        assert_eq!(items[0].node_id, vivo.to_string(), "a do nó vivo permanece");
+
+        // Idempotente: `TerminalExited` do mesmo nó (replay/dupla via) não quebra nada.
+        q.observe(&DomainEvent::TerminalExited { node: morto }, T0 + 4_000);
+        assert_eq!(q.items(T0 + 5_000).len(), 1);
     }
 
     /// Dedup entre camadas (decisão do Maestro): item nasce do GRID (~1,3s), hook
