@@ -75,6 +75,10 @@ pub struct WsRuntime {
     /// `None` = perfil sem capability `hooks` ou bind falhou (degradação limpa, como antes).
     #[allow(dead_code)] // handle de POSSE (mantém o listener vivo) — como os `_pump`s.
     pub hooks: Option<Arc<HooksShared>>,
+    /// F4-WA-1: a engine de webhook ativo do Espaço (handle de POSSE — mantém o runtime tokio +
+    /// listener vivos). `None` = perfil sem webhook ou bind falhou. Como `hooks`, vive pelo runtime.
+    #[allow(dead_code)]
+    pub webhook: Option<Arc<bridge::WebhookShared>>,
     /// `Arc` (fatia ii): a view re-aponta para o dash do runtime ATIVO no switch — o wiring
     /// continua sendo alimentado pelas threads do runtime mesmo com o Espaço de fundo.
     pub dash: Arc<dashboard::DashWiring>,
@@ -563,6 +567,11 @@ pub fn boot_ws_runtime(
         mailbox_dir.clone(), // W4-2 M3/M4: `.lina/` onde notas/pastas persistem
     ));
 
+    // F4-WA-1: engine de webhook ativo (POST externo → input no terminal vivo). Runtime tokio próprio
+    // (molde HooksShared): bind loopback + serve; deposita a entrega-de-sistema na fila que o pump drena.
+    let webhook =
+        bridge::WebhookShared::start(Arc::clone(&store), Arc::clone(&sup), nodes.system_deliveries());
+
     // F1-4-3 · RESTORE do quit limpo: reabrir o app = o Espaço volta vivo (posições/nomes/
     // papéis do log + scrollback re-hidratado + resume do CLI quando o TOML declara + badge
     // honesto). Opt-out por Espaço (`restore_on_open` no settings.json — «Abrir este Espaço
@@ -678,6 +687,7 @@ pub fn boot_ws_runtime(
         // `cwd` e nasce o `SessionPersisted` do 1º prompt (vazio quando o CLI não grava session-file).
         Arc::clone(&dash.sessions),
     )
+    .with_webhook(webhook.as_deref())
     .spawn();
 
     // W3-6c (ADR 0004): a BROKER PUMP observa a FILA DE BROKER (`<ws_root>/.lina/broker/`, irmã do
@@ -709,6 +719,7 @@ pub fn boot_ws_runtime(
         injection_profile,
         profile_registry,
         hooks,
+        webhook,
         dash,
         _pump: pump,
         _mailbox_pump,

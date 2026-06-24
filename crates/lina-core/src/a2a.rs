@@ -321,6 +321,25 @@ impl WorkspaceTrust {
     pub fn policy(&self) -> InjectPolicy<'_> {
         InjectPolicy::AllowOnly(&self.pairs)
     }
+
+    /// Como [`from_members`], mais a PORTA da entrega de SISTEMA (webhook ativo — F4-WA-1/ADR 0035):
+    /// o sentinela [`crate::router::WEBHOOK_SYSTEM`] (um `NodeId` reservado, FORA do roster) ganha
+    /// autorização para injetar em CADA membro vivo, e nada mais. Direção única: `system → membro` é
+    /// confiado; `membro → system` jamais (o sistema não é um terminal que recebe). RT-1: o sentinela
+    /// não está em `members` nem resolve por `node_by_name`, então um agente nunca o produz — só o
+    /// despacho interno server-side o usa como `from`; o default-deny segue valendo para o resto.
+    /// O sentinela é resolvido internamente (não é parâmetro): o app não precisa conhecê-lo.
+    #[must_use]
+    pub fn from_members_with_system(members: &[NodeId]) -> Self {
+        let system = crate::router::WEBHOOK_SYSTEM;
+        let mut trust = Self::from_members(members);
+        for &target in members {
+            if target != system {
+                trust.pairs.push((system, target));
+            }
+        }
+        trust
+    }
 }
 
 /// **W0-9.** Entrega `text` de `from` ao terminal vivo `target`, faseado, pela fila
@@ -938,6 +957,40 @@ mod tests {
         assert!(
             sup.applied_ops(a).is_empty(),
             "par negado não pode produzir nenhum write no master do alvo"
+        );
+    }
+
+    /// **F4-WA-1 (RT-1, autorização de origem System).** A entrega de SISTEMA (webhook) usa um
+    /// `from` sentinela que NÃO pertence ao roster; a confiança do Espaço ganha uma porta especial
+    /// só para ele → injeta em qualquer membro vivo, mas nenhum agente injeta NELE, e o
+    /// default-deny segue para todo o resto.
+    #[test]
+    #[serial]
+    fn workspace_trust_authorizes_system_origin_outward_only() {
+        let sup = Supervisor::new();
+        let a = sup.register("@A", None, Box::new(std::io::sink()));
+        let b = sup.register("@B", None, Box::new(std::io::sink()));
+        let outsider = sup.register("@Outsider", None, Box::new(std::io::sink()));
+        let system = crate::router::WEBHOOK_SYSTEM; // sentinela reservado, fora do roster
+
+        let trust = WorkspaceTrust::from_members_with_system(&[a, b]);
+        let pol = trust.policy();
+
+        assert!(
+            pol.allows(system, a) && pol.allows(system, b),
+            "o sistema injeta em qualquer membro vivo (porta server-side)"
+        );
+        assert!(
+            !pol.allows(a, system) && !pol.allows(b, system),
+            "ninguém injeta NO sistema — direção única (o sistema não é terminal)"
+        );
+        assert!(
+            pol.allows(a, b) && pol.allows(b, a),
+            "o diálogo A<->B do mesmo Espaço não regride"
+        );
+        assert!(
+            !pol.allows(outsider, a) && !pol.allows(a, outsider),
+            "default-deny preservado para um forasteiro"
         );
     }
 

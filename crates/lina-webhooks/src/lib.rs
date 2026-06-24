@@ -40,7 +40,7 @@
 //! **capability** base32 não-enumerável (160 bits); o HMAC prova posse do secret compartilhado;
 //! a divergência → **401 sem publicar**. `verify_slice` compara em tempo constante (`subtle`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -48,12 +48,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, DefaultBodyLimit, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     routing::post,
     Router,
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use lina_core::{
@@ -198,6 +198,40 @@ pub struct HookConfig {
     pub secret: String,
 }
 
+/// **F4-WA-1 — entrega-de-sistema enfileirada (o "cabo" tokio→pump).** A engine (thread tokio)
+/// resolve o terminal alvo e DEPOSITA isto na fila in-process; o drain do app (pump-thread) chama
+/// `Router::dispatch_webhook` com estes campos. Carrega DADOS CRUS (o bloco `[LINA::WEBHOOK]` é
+/// montado no core, sem expor `render_webhook_block`): `method`/`content_type`/`payload` são input
+/// externo NÃO-confiável; `instruction` é a autoridade do dono. Efêmero — nunca persiste (só
+/// metadados vão ao log, ADR 0035 §5).
+#[derive(Debug, Clone)]
+pub struct SystemDelivery {
+    /// `NodeId` do terminal dono (resolvido server-side por `node_by_name`, nunca de campo).
+    pub target: NodeId,
+    /// Nome do terminal alvo (para o cabeçalho/log; o `target` é a autoridade da entrega).
+    pub target_name: String,
+    /// `hook_id` opaco do webhook que disparou.
+    pub webhook_id: String,
+    /// Método HTTP do request (dado externo).
+    pub method: String,
+    /// `content-type` reportado pelo emissor (dado externo NÃO verificado).
+    pub content_type: String,
+    /// Corpo do webhook (dado externo NÃO-confiável; vira o bloco DADOS, sanitizado no core).
+    pub payload: String,
+    /// Instrução do dono do Espaço (AUTORIDADE — define a ação).
+    pub instruction: String,
+    /// Hash SHA-256 do corpo (correlação; o conteúdo NÃO vai ao log).
+    pub payload_sha256: String,
+    /// Tamanho do corpo em bytes.
+    pub payload_size: u64,
+    /// Instante de recepção (epoch ms).
+    pub received_ts: u64,
+}
+
+/// Fila in-process da entrega-de-sistema (produtor: engine tokio; consumidor: pump-thread do app).
+/// Mesmo padrão de `human_intents`/`ReinjectQueue` — sem superfície de filesystem (ADR 0035 §1).
+pub type SystemDeliveryQueue = Arc<Mutex<VecDeque<SystemDelivery>>>;
+
 /// Resumo do replay de boot ([`WebhookEngine::replay_configured`]): quantos hooks foram religados
 /// e quantos foram pulados por secret ausente no vault (perda sinalizada, nunca silenciosa).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +253,9 @@ struct HookBinding {
     secret: String,
     from: NodeId,
     target_ref: String,
+    /// F4-WA-1: instrução do dono (AUTORIDADE) que viaja no input `[LINA::WEBHOOK]`. Vazia no fluxo
+    /// legado (`configure_hook`); preenchida por `configure_hook_active`.
+    instruction: String,
 }
 
 /// Janela de rate-limit (janela fixa).
@@ -233,6 +270,7 @@ struct RateWindow {
 struct ConfiguredHook {
     hook_id: String,
     target_ref: String,
+    instruction: String,
 }
 
 /// Fronteira do log de eventos: o que o engine precisa de um log durável — apendar fatos
@@ -277,10 +315,17 @@ impl DurableLog for EventStoreLog {
             // sem upcast definido, então os caminhos são equivalentes).
             let hook_id = r.payload.get("hook_id").and_then(|v| v.as_str());
             let target_ref = r.payload.get("target_ref").and_then(|v| v.as_str());
+            // F4-WA: campo aditivo; ausente na config legada → "" (sem instrução, fluxo do bus).
+            let instruction = r
+                .payload
+                .get("instruction")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             match (hook_id, target_ref) {
                 (Some(h), Some(t)) => out.push(ConfiguredHook {
                     hook_id: h.to_string(),
                     target_ref: t.to_string(),
+                    instruction: instruction.to_string(),
                 }),
                 _ => tracing::warn!(
                     seq = r.seq,
@@ -298,6 +343,9 @@ struct AppState {
     hooks: Arc<RwLock<HashMap<String, HookBinding>>>,
     store: Arc<dyn DurableLog>,
     supervisor: Arc<Supervisor>,
+    /// F4-WA-1: fila in-process onde o despacho server-side deposita as entregas-de-sistema (o
+    /// drain do app as consome no pump). `None` no fluxo legado (só `publish`→bus).
+    delivery_queue: Option<SystemDeliveryQueue>,
     /// Camada 1a (anti-starvation, F1-6-4): balde pré-auth por CHAVE-DE-ROTA (exista ou não),
     /// com cap de entradas ([`MAX_ROUTE_BUCKETS`]) e varredura com throttle — memória O(cap),
     /// custo por-request O(1), sem oráculo de existência.
@@ -311,6 +359,9 @@ struct AppState {
 }
 
 /// Engine de Webhooks: dono das ligações de hook + referências ao event store e ao supervisor.
+/// `Clone` (tudo `Arc`) — um clone roda `serve` na thread tokio; outro fica acessível para
+/// `configure_hook_active` no handler de gesto (o mesmo `AppState` compartilhado).
+#[derive(Clone)]
 pub struct WebhookEngine {
     state: AppState,
 }
@@ -345,6 +396,7 @@ impl WebhookEngine {
                 hooks: Arc::new(RwLock::new(HashMap::new())),
                 store,
                 supervisor,
+                delivery_queue: None,
                 rate_route: Arc::new(Mutex::new(RouteBuckets::new())),
                 rate_global: Arc::new(Mutex::new(RateWindow {
                     start: Instant::now(),
@@ -388,16 +440,16 @@ impl WebhookEngine {
         let configured = self.state.store.configured_hooks()?;
 
         // Fold last-wins por hook_id (ordem de seq do log).
-        let mut latest: HashMap<String, String> = HashMap::new();
+        let mut latest: HashMap<String, (String, String)> = HashMap::new();
         for c in configured {
-            latest.insert(c.hook_id, c.target_ref);
+            latest.insert(c.hook_id, (c.target_ref, c.instruction));
         }
 
         // Resolve os secrets ANTES de tocar o lock de hooks: o vault de produção é keyring
         // (IPC com o SO, potencialmente lento) — nunca segurar write-lock através de IPC.
         let mut summary = ReplaySummary::default();
         let mut rebound = Vec::new();
-        for (hook_id, target_ref) in latest {
+        for (hook_id, (target_ref, instruction)) in latest {
             match vault.get(SECRET_SCOPE, &hook_id) {
                 Ok(Some(secret)) => rebound.push((
                     hook_id,
@@ -405,6 +457,7 @@ impl WebhookEngine {
                         secret,
                         from,
                         target_ref,
+                        instruction,
                     },
                 )),
                 Ok(None) => {
@@ -466,10 +519,62 @@ impl WebhookEngine {
                 secret: secret.clone(),
                 from,
                 target_ref: target_ref.to_string(),
+                instruction: String::new(),
             },
         );
 
         Ok(HookConfig { hook_id, secret })
+    }
+
+    /// **F4-WA-1 — configura um hook ATIVO (webhook → input no terminal vivo).** Como
+    /// [`configure_hook`], mas grava a `instruction` (AUTORIDADE) e o `autonomy_level` no
+    /// `WebhookConfigured` (campos aditivos) e os instala no binding — é o que distingue o webhook
+    /// ativo do gatilho-de-bus legado. **GUARDA DE SEGREDO (ADR 0035 §5):** o secret HMAC NÃO entra
+    /// no log — só a `secret_ref` (= `hook_id`, ponteiro para o Vault); o valor volta apenas no
+    /// [`HookConfig`] efêmero (mostrado 1× pela UI). `target_node`/`target_ref` recebem o nome do
+    /// terminal alvo.
+    pub fn configure_hook_active<S: SecretStore>(
+        &self,
+        vault: &SecretVault<S>,
+        from: NodeId,
+        target_node: &str,
+        instruction: &str,
+        autonomy_level: &str,
+    ) -> Result<HookConfig, WebhookError> {
+        let hook_id = gen_hook_id()?;
+        let secret = vault
+            .ensure_webhook_secret(SECRET_SCOPE, &hook_id)
+            .map_err(|e| WebhookError::Secret(e.to_string()))?;
+
+        // O secret NUNCA vai ao log — só a referência (`secret_ref` = hook_id no Vault).
+        self.state.store.append(&DomainEvent::WebhookConfigured {
+            hook_id: hook_id.clone(),
+            target_ref: target_node.to_string(),
+            target_node: target_node.to_string(),
+            instruction: instruction.to_string(),
+            autonomy_level: autonomy_level.to_string(),
+            secret_ref: hook_id.clone(),
+        })?;
+
+        wlock(&self.state.hooks).insert(
+            hook_id.clone(),
+            HookBinding {
+                secret: secret.clone(),
+                from,
+                target_ref: target_node.to_string(),
+                instruction: instruction.to_string(),
+            },
+        );
+
+        Ok(HookConfig { hook_id, secret })
+    }
+
+    /// F4-WA-1: liga a fila in-process de entrega-de-sistema (builder). Sem ela, o engine cai no
+    /// fluxo legado (`publish`→bus); com ela, o despacho deposita `SystemDelivery` para o pump.
+    #[must_use]
+    pub fn with_delivery_queue(mut self, queue: SystemDeliveryQueue) -> Self {
+        self.state.delivery_queue = Some(queue);
+        self
     }
 
     /// Router axum do engine (rota `POST /hook/:hook_id` + teto de corpo defensivo de 64 KiB).
@@ -531,6 +636,7 @@ async fn handle_hook(
     State(state): State<AppState>,
     Path(hook_id): Path<String>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
@@ -582,18 +688,28 @@ async fn handle_hook(
     //    task sobrevive e completa append E publicação. Sem ela, o estado "durável-mas-não-
     //    publicado" seria alcançável por mera desconexão, não só por crash.
     let ts = now_millis();
-    // F4-WA largada: metadados aditivos default (method/payload_size/payload_sha256). F4-WA-1
-    // preenche-os com os valores reais do request (método HTTP + tamanho/hash do body) — NUNCA o
-    // conteúdo do payload (ADR 0035 §5: só metadados no log).
+    // F4-WA-1: metadados REAIS do request — método HTTP + tamanho/hash do body. NUNCA o conteúdo do
+    // payload no log (ADR 0035 §5: só metadados). O corpo (efêmero) segue para o despacho server-side.
+    let method_str = method.as_str().to_string();
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let payload_sha256 = to_hex(&Sha256::digest(&body));
+    let payload_size = body.len() as u64;
+    let payload_str = String::from_utf8_lossy(&body).into_owned();
+
     let ev = DomainEvent::WebhookReceived {
         hook_id: hook_id.clone(),
         ts,
         target_ref: binding.target_ref.clone(),
-        method: String::new(),
-        payload_size: 0,
-        payload_sha256: String::new(),
+        method: method_str.clone(),
+        payload_size,
+        payload_sha256: payload_sha256.clone(),
     };
     let hook_for_log = hook_id.clone();
+    let webhook_id = hook_id.clone();
     let outcome = tokio::spawn(async move {
         let store = Arc::clone(&state.store);
         let appended = match tokio::task::spawn_blocking(move || store.append(&ev)).await {
@@ -606,13 +722,21 @@ async fn handle_hook(
         };
         match appended {
             Ok(()) => {
-                // 6. Só o efeito NÃO-durável (publicar no bus) corre fora do caminho da resposta —
-                //    a durabilidade já foi garantida no passo 5: o FATO está no log. Se este efeito
-                //    se perder num crash, o log durável é a PROVA do disparo e permite
-                //    reconstrução; a re-entrega automática (retries/dead-letter) é Fase 2 (W5-4) —
-                //    hoje ninguém re-publica sozinho.
+                // 6. Efeito NÃO-durável fora do caminho da resposta: o DESPACHO server-side. Com a
+                //    fila ligada (produção F4-WA), DEPOSITA a entrega-de-sistema (origem System
+                //    carimbada no core, no pump); sem ela (legado), publica no bus. O FATO durável já
+                //    está no log (passo 5); o conteúdo do payload viaja efêmero, nunca persiste.
                 tokio::spawn(async move {
-                    state.publish(&binding);
+                    state.dispatch_or_publish(
+                        &binding,
+                        &webhook_id,
+                        &method_str,
+                        &content_type,
+                        &payload_str,
+                        &payload_sha256,
+                        payload_size,
+                        ts,
+                    );
                 });
                 Ok(())
             }
@@ -651,6 +775,48 @@ impl AppState {
             }
             None => {
                 tracing::warn!(target = %binding.target_ref, "webhook registrado; target_ref não resolveu");
+            }
+        }
+    }
+
+    /// **F4-WA-1 — despacho server-side.** Com a fila ligada, resolve o nó alvo (`node_by_name`,
+    /// server-side — nunca de campo) e DEPOSITA a [`SystemDelivery`] (dados crus + instrução do dono)
+    /// para o pump entregar com origem `System`; sem a fila, cai no [`Self::publish`] legado (bus). O
+    /// secret nunca é tocado aqui; o conteúdo do payload só TRANSITA (efêmero) — apenas metadados
+    /// foram ao log (ADR 0035 §5). Alvo sem nó vivo → warn (a fila de atenção/DLQ é F4-WA-5).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_or_publish(
+        &self,
+        binding: &HookBinding,
+        webhook_id: &str,
+        method: &str,
+        content_type: &str,
+        payload: &str,
+        payload_sha256: &str,
+        payload_size: u64,
+        received_ts: u64,
+    ) {
+        let Some(queue) = &self.delivery_queue else {
+            self.publish(binding);
+            return;
+        };
+        match self.supervisor.node_by_name(&binding.target_ref) {
+            Some(target) => {
+                lock(queue).push_back(SystemDelivery {
+                    target,
+                    target_name: binding.target_ref.clone(),
+                    webhook_id: webhook_id.to_string(),
+                    method: method.to_string(),
+                    content_type: content_type.to_string(),
+                    payload: payload.to_string(),
+                    instruction: binding.instruction.clone(),
+                    payload_sha256: payload_sha256.to_string(),
+                    payload_size,
+                    received_ts,
+                });
+            }
+            None => {
+                tracing::warn!(target = %binding.target_ref, "webhook ativo: alvo sem nó vivo p/ entrega");
             }
         }
     }
@@ -1005,6 +1171,7 @@ mod tests {
                 secret: secret.to_string(),
                 from,
                 target_ref: "@Dev".to_string(),
+                instruction: String::new(),
             },
         );
 
@@ -1012,6 +1179,7 @@ mod tests {
             hooks: Arc::new(RwLock::new(hooks)),
             store: Arc::new(FailingLog),
             supervisor: sup.clone(),
+            delivery_queue: None,
             rate_route: Arc::new(Mutex::new(RouteBuckets::new())),
             rate_global: Arc::new(Mutex::new(RateWindow {
                 start: Instant::now(),
@@ -1030,6 +1198,7 @@ mod tests {
             State(state),
             Path(hook_id),
             ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 40000))),
+            Method::POST,
             headers,
             body,
         )
@@ -1129,6 +1298,7 @@ mod tests {
                     secret: secret.to_string(),
                     from,
                     target_ref: "@Dev".to_string(),
+                    instruction: String::new(),
                 },
             );
         }
@@ -1247,6 +1417,7 @@ mod tests {
                 secret: "secret-drop".to_string(),
                 from,
                 target_ref: "@Dev".to_string(),
+                instruction: String::new(),
             },
         );
 

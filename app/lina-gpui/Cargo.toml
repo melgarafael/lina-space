@@ -33,6 +33,10 @@ lina-hooks = { path = "../../crates/lina-hooks" }
 # F1-4-6 (UX de ativação): gate REAL free=1/PRO=N + ativação por chave colada (ed25519
 # local, zero rede) — mata o stub `LicenseTier::Pro` que era bloqueante de release (§6-B1).
 lina-license = { path = "../../crates/lina-license" }
+# F4-WA-1: engine de webhook ativo — recepção HTTP loopback + HMAC; o boot a monta num runtime
+# tokio dedicado e deposita a entrega-de-sistema na fila in-process que o pump drena. Mesma
+# instância path do core → EventStore/Supervisor/NodeId/SecretVault unificam (sem conflito de tipos).
+lina-webhooks = { path = "../../crates/lina-webhooks" }
 # W3-6c Round 5: desserializar `MailMessage` no drain AUTENTICADO por-nó da fila de broker (o app lê
 # só os subdirs por-nó, carimbando a origem; rejeita flat) — precisa nomear `serde_json` direto.
 serde_json = "1"
@@ -42,7 +46,7 @@ serde = { version = "1", features = ["derive"] }
 # (antes só dev-dep). Mesma instância do core → o NodeId unifica. Sem mudança no grafo de deps.
 uuid = { version = "1", features = ["v7"] }
 # Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "net"] }
 # gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal
 # Toolchain offline; ver spikes/spike-gpui/RESULTADO.md §1).
 gpui = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea93604231eaf30ca4c25f1cd6" }

@@ -3382,6 +3382,7 @@ dependencies = [
  "lina-secrets",
  "lina-session-watch",
  "lina-vt",
+ "lina-webhooks",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
@@ -3465,6 +3466,21 @@ version = "0.0.1"
 dependencies = [
  "alacritty_terminal",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lina-webhooks"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "getrandom 0.2.17",
+ "hmac",
+ "lina-core",
+ "lina-secrets",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

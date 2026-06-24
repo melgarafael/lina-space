@@ -801,6 +801,14 @@ pub struct MailboxPump {
     /// aqui; o log recebe só `CredentialStored{key_ref}`** (ADR 0004 / invariante #2). Produção trocaria
     /// por `SecretVault::new(...)` (KeyringStore) — porta aberta, fora do escopo F4-0.
     credential_vault: SecretVault<lina_secrets::MockStore>,
+    /// F4-WA-1: a engine de webhook (clone — `AppState` é `Arc`) para o handler de `webhook.configure`
+    /// registrar um hook ativo; o cofre namespaceado do webhook (o MESMO do replay de boot, p/ o
+    /// secret casar pós-restart); a porta do listener (compõe a URL); o nó-Gatilho `@Trigger`. `None`/0
+    /// = boot sem webhook (perfil sem capability OU bind falhou) — o handler degrada com aviso.
+    webhook_engine: Option<lina_webhooks::WebhookEngine>,
+    webhook_vault: Option<Arc<SecretVault<lina_secrets::MockStore>>>,
+    webhook_port: u16,
+    webhook_trigger: Option<NodeId>,
 }
 
 /// F3-5-1: passo do throttle do `project` de correlação sessão↔nó (anti-freeze; ver `sessions`).
@@ -966,7 +974,25 @@ impl MailboxPump {
                 "lina-space/walking-skeleton",
                 lina_secrets::MockStore::new(),
             ),
+            webhook_engine: None,
+            webhook_vault: None,
+            webhook_port: 0,
+            webhook_trigger: None,
         }
+    }
+
+    /// F4-WA-1: liga o contexto da engine de webhook (engine clone + cofre + porta + `@Trigger`) ao
+    /// pump, para o handler de `webhook.configure`. Builder consumindo `self` (como o boot fia o pump).
+    /// `None` (boot sem webhook) → o pump segue sem o handler (degrada com aviso no gesto).
+    #[must_use]
+    pub fn with_webhook(mut self, shared: Option<&WebhookShared>) -> Self {
+        if let Some(s) = shared {
+            self.webhook_engine = Some(s.engine());
+            self.webhook_vault = Some(s.vault());
+            self.webhook_port = s.port();
+            self.webhook_trigger = Some(s.trigger());
+        }
+        self
     }
 
     /// **SEAM-1 — fia o binding de cascata (M4) + entrega o 1º prompt de spawns recém-admitidos.**
@@ -1274,6 +1300,8 @@ impl MailboxPump {
         self.drain_reinject();
         // F3-1-7 (ADR 0036): aplica os gestos humanos diretos da UI (confirmar/ajustar Goal).
         self.drain_human_intents();
+        // F4-WA-1: entrega os webhooks que a engine depositou (POST externo → input no terminal vivo).
+        self.drain_system_deliveries();
         self.refresh_cost_paused();
         // F3-5-1: nasce o `SessionPersisted` do 1º prompt de cada nó (idempotente; throttle anti-freeze).
         self.persist_first_prompts(now_ms());
@@ -1281,6 +1309,58 @@ impl MailboxPump {
         self.sample_buffers(now_ms());
         // F3-5-8: detecta pressão de disco (ENOSPC #25) e PROPÕE poda custodiada (throttle 300s).
         self.probe_disk(now_ms());
+    }
+
+    /// **F4-WA-1: drena as entregas-de-sistema (webhook) que a `WebhookEngine` depositou na fila** e
+    /// as roteia pelo `Router::dispatch_webhook` — monta o `[LINA::WEBHOOK]` (origem `System`
+    /// inforjável) e injeta pelo MESMO pipeline faseado do pump (retém em Busy, DLQ em falha). Mesma
+    /// disciplina de lock do `pump`: o `deliver`/`project_cli_by_node` ANTES de travar o `store`
+    /// (`std::sync::Mutex` não reentrante). Só projeta quando há webhook pendente.
+    fn drain_system_deliveries(&mut self) {
+        let items = self.nodes.drain_system_deliveries();
+        if items.is_empty() {
+            return;
+        }
+        let cli_by_node = self.project_cli_by_node();
+        let mut deliver = self.deliver_fn(&cli_by_node);
+        let mut routed = false;
+        {
+            let mut store = lock(&self.store);
+            for d in items {
+                let outcome = self.router.dispatch_webhook(
+                    d.target,
+                    &d.target_name,
+                    &d.webhook_id,
+                    &d.method,
+                    &d.content_type,
+                    &d.payload,
+                    &d.instruction,
+                    &d.payload_sha256,
+                    d.payload_size,
+                    d.received_ts,
+                    &mut store,
+                    now_ms(),
+                    &mut deliver,
+                );
+                match outcome {
+                    RouteOutcome::Delivered { .. }
+                    | RouteOutcome::Retained { .. }
+                    | RouteOutcome::RetryBackoff { .. }
+                    | RouteOutcome::DeadLettered { .. } => routed = true,
+                    other => {
+                        eprintln!("lina-gpui: webhook {} não entregue: {other:?}", d.webhook_id)
+                    }
+                }
+            }
+        }
+        if routed {
+            let count = lock(&self.store).event_count().ok();
+            let mut m = lock(&self.model);
+            if let Some(c) = count {
+                m.event_count = c;
+            }
+            m.touch();
+        }
     }
 
     /// **F3-5-1 (fiação da GERAÇÃO): nasce o `SessionPersisted` do 1º prompt de cada nó.** Correlaciona
@@ -1474,6 +1554,7 @@ impl MailboxPump {
             return;
         }
         let mut applied = false;
+        let mut webhook_configs: Vec<String> = Vec::new();
         {
             let mut store = lock(&self.store);
             for item in items {
@@ -1566,6 +1647,14 @@ impl MailboxPump {
                     }
                     continue;
                 }
+                // F4-WA-1: "Receber um aviso de fora" → registrar um webhook ativo. Coletado AQUI e
+                // processado FORA do lock do store (o `configure_hook_active` apende no MESMO store —
+                // chamá-lo sob o lock re-travaria o Mutex não-reentrante: deadlock). O payload do gesto
+                // NÃO tem segredo (o secret é GERADO server-side); o retorno (url+secret) vai à View.
+                if item.intent == "webhook.configure" {
+                    webhook_configs.push(item.payload);
+                    continue;
+                }
                 match self
                     .router
                     .human_intent(&item.intent, &item.payload, &mut store)
@@ -1578,6 +1667,14 @@ impl MailboxPump {
                 }
             }
         }
+        // F4-WA-1: processa os `webhook.configure` FORA do lock do store (o append de
+        // `WebhookConfigured` re-travaria o Mutex não-reentrante). Guarda de segredo: o secret só vai
+        // ao retorno efêmero (`push_webhook_outcome`), NUNCA ao log/stderr.
+        for payload in webhook_configs {
+            if self.handle_webhook_configure(&payload) {
+                applied = true;
+            }
+        }
         if applied {
             let count = lock(&self.store).event_count().ok();
             let mut m = lock(&self.model);
@@ -1585,6 +1682,58 @@ impl MailboxPump {
                 m.event_count = c;
             }
             m.touch();
+        }
+    }
+
+    /// **F4-WA-1 — handler do gesto `webhook.configure`** (espelha o braço `credential.store`, mas é
+    /// dono de uma engine ativa). Registra um webhook por terminal (`configure_hook_active` → gera
+    /// `hook_id`+secret, apenda `WebhookConfigured` SEM o segredo), monta a URL local e deposita o
+    /// retorno (url+secret) no slot efêmero da View. **Guarda de segredo (ADR 0035 §5):** o secret
+    /// NUNCA é logado — só vive no Vault + no retorno mostrado 1×. `None` na engine = boot sem webhook
+    /// (degrada com aviso). Devolve `true` se registrou (atualiza o `event_count` da UI).
+    fn handle_webhook_configure(&self, payload: &str) -> bool {
+        let (Some(engine), Some(vault), Some(trigger)) = (
+            self.webhook_engine.as_ref(),
+            self.webhook_vault.as_ref(),
+            self.webhook_trigger,
+        ) else {
+            eprintln!("lina-gpui: gesto 'webhook.configure' sem engine (boot degradado)");
+            return false;
+        };
+        let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+        let field = |k: &str| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(k))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let target_node = field("target_node").unwrap_or_default();
+        let instruction = field("instruction").unwrap_or_default();
+        // Default conservador (a UI escolhe; o gate de ação irreversível é F4-WA-4).
+        let autonomy_level = field("autonomy_level").unwrap_or_else(|| "notify_before".to_string());
+        if target_node.is_empty() || instruction.is_empty() {
+            eprintln!("lina-gpui: gesto 'webhook.configure' incompleto (target_node/instruction)");
+            return false;
+        }
+        match engine.configure_hook_active(
+            vault.as_ref(),
+            trigger,
+            &target_node,
+            &instruction,
+            &autonomy_level,
+        ) {
+            Ok(cfg) => {
+                let url = format!("http://127.0.0.1:{}/hook/{}", self.webhook_port, cfg.hook_id);
+                // O secret vai ao retorno EFÊMERO (mostrado 1× na View) — NUNCA ao log/stderr.
+                self.nodes.push_webhook_outcome(url, cfg.secret);
+                true
+            }
+            // `WebhookError` não contém o secret — seguro logar.
+            Err(e) => {
+                eprintln!("lina-gpui: registrar webhook falhou: {e}");
+                false
+            }
         }
     }
 
@@ -3887,6 +4036,90 @@ pub struct BootstrapWriter {
     role_registry: RoleRegistry,
 }
 
+/// **F4-WA-1 — a engine de webhook ativo do app, ÚNICA por Espaço.** Molde do [`HooksShared`]:
+/// runtime tokio dedicado (1 worker) mantido VIVO (dropá-lo mata o `serve`), bind loopback (inv#2)
+/// com `axum::serve` rodando nele. Registra o nó-Gatilho `@Trigger`, religa hooks do log
+/// (`replay_configured`) e deposita a entrega-de-sistema na fila que o pump drena. Guarda um clone da
+/// engine + o cofre + a porta para o handler de `webhook.configure` registrar hooks em runtime.
+pub struct WebhookShared {
+    /// Mantém o serve vivo — dropar o runtime mataria o listener.
+    _rt: tokio::runtime::Runtime,
+    engine: lina_webhooks::WebhookEngine,
+    vault: Arc<SecretVault<lina_secrets::MockStore>>,
+    port: u16,
+    trigger: NodeId,
+}
+
+impl WebhookShared {
+    /// Sobe runtime + engine + listener. Falha NUNCA derruba o app: `None` + stderr (degradação
+    /// VISÍVEL — sem webhook o app funciona como antes). `queue` é a fila compartilhada com o pump.
+    #[must_use]
+    pub fn start(
+        store: Arc<Mutex<EventStore>>,
+        sup: Arc<Supervisor>,
+        queue: lina_webhooks::SystemDeliveryQueue,
+    ) -> Option<Arc<Self>> {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("lina-gpui: [WEBHOOK] runtime indisponível ({e}) — seguindo sem webhook");
+                return None;
+            }
+        };
+        // Nó-Gatilho desta geração (o `from` reservado; o `NodeId` muda a cada processo).
+        let trigger = sup.register("@Trigger", Some("trigger".into()), Box::new(std::io::sink()));
+        // Cofre namespaceado do webhook (demo MockStore; o MESMO é compartilhado com o handler de
+        // configure via `vault()`, p/ o secret casar entre replay e registro em runtime).
+        let vault = Arc::new(SecretVault::with_store(
+            "lina-space/webhook",
+            lina_secrets::MockStore::new(),
+        ));
+        let engine = lina_webhooks::WebhookEngine::new(store, sup).with_delivery_queue(queue);
+        if let Err(e) = engine.replay_configured(&vault, trigger) {
+            eprintln!("lina-gpui: [WEBHOOK] replay falhou ({e}); hooks pré-existentes não religados");
+        }
+        let listener = match rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("lina-gpui: [WEBHOOK] bind loopback falhou ({e}) — seguindo sem webhook");
+                return None;
+            }
+        };
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let serve_engine = engine.clone();
+        rt.spawn(async move {
+            if let Err(e) = serve_engine.serve(listener).await {
+                eprintln!("lina-gpui: [WEBHOOK] serve encerrou: {e}");
+            }
+        });
+        eprintln!("lina-gpui: [WEBHOOK] engine viva em http://127.0.0.1:{port}/hook/<id>");
+        Some(Arc::new(Self {
+            _rt: rt,
+            engine,
+            vault,
+            port,
+            trigger,
+        }))
+    }
+
+    fn engine(&self) -> lina_webhooks::WebhookEngine {
+        self.engine.clone()
+    }
+    fn vault(&self) -> Arc<SecretVault<lina_secrets::MockStore>> {
+        Arc::clone(&self.vault)
+    }
+    fn port(&self) -> u16 {
+        self.port
+    }
+    fn trigger(&self) -> NodeId {
+        self.trigger
+    }
+}
+
 /// **F1-1-3 (wiring) — o listener de hooks do app, ÚNICO por processo.** Faz o
 /// `HookListener::bind()` 1x no boot (porta efêmera em loopback — inv#2) e mantém o
 /// runtime tokio dedicado VIVO (1 worker; o `serve` do axum roda nele). Cada spawn
@@ -5166,6 +5399,14 @@ pub struct NodeManager {
     /// gpui enfileira pelo `Arc<NodeManager>` compartilhado; a `MailboxPump` (escritor único do log)
     /// drena e carimba `by="human"`. Mesmo padrão do `reinject_queue`, sem superfície de filesystem.
     human_intents: Mutex<VecDeque<HumanIntentItem>>,
+    /// F4-WA-1: fila EM-PROCESSO da entrega-de-sistema (webhook). Produtor: `WebhookEngine` (thread
+    /// tokio); consumidor: `MailboxPump` (drena no tick → `Router::dispatch_webhook`). Compartilhada
+    /// por `Arc` clone com a engine via [`NodeManager::system_deliveries`]; sem superfície de FS.
+    system_deliveries: lina_webhooks::SystemDeliveryQueue,
+    /// F4-WA-1: slot EFÊMERO do retorno do gesto `webhook.configure` (url + secret) para a View
+    /// mostrar 1×. O handler deposita; o loop de poll da View consome via [`take_webhook_outcome`].
+    /// NUNCA logado (guarda de segredo, ADR 0035 §5).
+    webhook_outcome: Arc<Mutex<Option<(String, String)>>>,
     /// #7 dogfooding r2: o MOTOR de spawns agente-pede. Default de produção = discovery
     /// ([`default_spawn_engine`]); os testes injetam fixa via [`Self::set_spawn_engine_factory`].
     spawn_engine: SpawnEngineFactory,
@@ -5257,6 +5498,8 @@ impl NodeManager {
             lina_dir,
             reinject_queue: new_reinject_queue(),
             human_intents: Mutex::new(VecDeque::new()),
+            system_deliveries: Arc::new(Mutex::new(VecDeque::new())),
+            webhook_outcome: Arc::new(Mutex::new(None)),
             // #7: produção resolve o motor do spawn por DISCOVERY no momento do spawn (sem
             // mudança de assinatura — o main não precisa de fiação para o default correto).
             spawn_engine: Arc::new(|| default_spawn_engine(&discover_clis())),
@@ -5297,6 +5540,32 @@ impl NodeManager {
     /// pelo core. Privado (não pub) para não expor `HumanIntentItem` na superfície do crate.
     fn drain_human_intents(&self) -> Vec<HumanIntentItem> {
         lock(&self.human_intents).drain(..).collect()
+    }
+
+    /// F4-WA-1: a fila de entrega-de-sistema, compartilhada (clone de `Arc`) com a `WebhookEngine`
+    /// (produtor). O boot a passa à engine via `with_delivery_queue`; o pump a drena no tick.
+    #[must_use]
+    pub(crate) fn system_deliveries(&self) -> lina_webhooks::SystemDeliveryQueue {
+        Arc::clone(&self.system_deliveries)
+    }
+
+    /// F4-WA-1: a `MailboxPump` drena as entregas-de-sistema pendentes (FIFO) para roteá-las pelo
+    /// `Router::dispatch_webhook`. Privado (mesmo módulo) — não expõe `SystemDelivery` na superfície.
+    fn drain_system_deliveries(&self) -> Vec<lina_webhooks::SystemDelivery> {
+        lock(&self.system_deliveries).drain(..).collect()
+    }
+
+    /// F4-WA-1: o handler de `webhook.configure` deposita o retorno (url + secret) para a View mostrar
+    /// 1×. EFÊMERO — o último vence (a config é pontual). NUNCA logado (guarda de segredo, ADR 0035 §5).
+    pub(crate) fn push_webhook_outcome(&self, url: String, secret: String) {
+        *lock(&self.webhook_outcome) = Some((url, secret));
+    }
+
+    /// F4-WA-1: o loop de poll da View (território do Especialista) consome o retorno UMA vez (toma e
+    /// limpa o slot) e o exibe via `webhook_present_outcome`. `None` quando não há retorno novo.
+    #[allow(dead_code)] // o caller (loop de poll na View) é fiado em paralelo pelo Especialista.
+    pub(crate) fn take_webhook_outcome(&self) -> Option<(String, String)> {
+        lock(&self.webhook_outcome).take()
     }
 
     /// **W4-2 · M3/M4 — cria uma NOTA ou PASTA** pelo nome e a torna VIVA no canvas (não só na
