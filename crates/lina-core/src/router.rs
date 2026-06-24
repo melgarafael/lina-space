@@ -9216,8 +9216,9 @@ mod tests {
         let _a = sup.register("@A", None, sink());
         let b = sup.register("@B", None, sink());
         turn_done(&sup, b);
+        let retention_ms = 5_000; // teto de retenção; o backstop mede o tempo TOTAL contra ELE.
         let mk_cfg = || RouterConfig {
-            retention_timeout_ms: 5_000, // > NOT_READY_BACKOFF_MS (150ms) para a re-checagem ficar devida
+            retention_timeout_ms: retention_ms,
             ..RouterConfig::default()
         };
         let mut router =
@@ -9251,14 +9252,13 @@ mod tests {
             "re-retida no restart (relógio de retenção restaurado do log)"
         );
 
-        // Re-checagem fica devida (next_ms = rt+4000+backoff); o backstop mede do `rt` ORIGINAL:
-        // total = (rt+6001) - rt = 6001 ms >= 5000 → DLQ. Se o relógio tivesse RESETADO no restart,
-        // o total seria 6001-4000 = 2001 ms < 5000 → SEM DLQ (o que provaria a regressão).
-        router2.process_due_retries(
-            &mut ts.store,
-            rt + 4_000 + NOT_READY_BACKOFF_MS + 1,
-            &mut not_ready,
-        );
+        // Re-checagem num instante em que a retry está devida (next_ms = rt+4000+backoff, backoff
+        // curto) E o total cross-restart já passou do teto. O backstop mede do `rt` ORIGINAL: total =
+        // (rt+retention_ms+1) - rt = 5001 ms >= 5000 → DLQ. Se o relógio tivesse RESETADO no restart,
+        // o total seria 5001-4000 = 1001 ms < 5000 → SEM DLQ (o que provaria a regressão). O instante
+        // ancora no TETO de retenção, não em NOT_READY_BACKOFF_MS: é o teto que dispara o backstop, e
+        // acoplar ao backoff quebrava quando ele encolheu (2000→150, ADR 0046).
+        router2.process_due_retries(&mut ts.store, rt + retention_ms + 1, &mut not_ready);
         let dlq = records_of_kind(&ts.store, "MessageDeadLettered")
             .into_iter()
             .filter(|r| r.payload["id"].as_str() == Some(m.id.as_str()))
