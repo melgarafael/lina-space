@@ -25,10 +25,20 @@ Lacuna fechada: **RT-2 não tinha prova dedicada** → criada (`tests/f4_wa_redt
 - **RT-2 (re-provado AGORA por mim):** inverter as seções DADOS↔INSTRUÇÃO em `render_webhook_block` →
   `rt2_…` falha exatamente no assert da separação de autoridade (`crates/lina-core/tests/f4_wa_redteam.rs:122`);
   revertido → GREEN. Confirma que o teste enforça a fronteira, não a assume.
-- **RT-1/3/4/5/6:** cada um tem teste-alvo dedicado (acima) **verde no baseline** e a linha que barra
-  re-derivada no fonte; foram provados por mutação pelas frentes WA1/3/4/5 nos respectivos `@accept`
-  ("RT-X verde por mutação"). Esta passada de auditoria os re-confirma por re-derivação + baseline, não
-  re-executou as 5 mutações (honestidade: só o RT-2, a lacuna nova, foi re-mutado por mim).
+- **RT-3 (re-provado por mim):** `if !confirmed` → `if false` em `run_custody` (broker.rs:245) →
+  `webhook_irreversible_in_notify_before_gates_and_does_not_execute` (+ `unconfirmed_blocks_…`) caem;
+  revertido → GREEN. Confirma o gate humano da custódia (ADR 0004).
+- **RT-4 (re-provado por mim):** `webhook_effective_level` retornando `webhook` em vez de `min(., workspace)`
+  → `webhook_autonomous_in_assisted_workspace_proposes` (+ `…_is_min_of_both_scales`) caem; revertido → GREEN.
+- **RT-5 (re-provado por mim):** `neutralize_sentinels` → identidade →
+  `webhook_block_neutralizes_forged_sentinel_in_payload` cai; revertido → GREEN.
+- **RT-1 e RT-6 (guarda ESTRUTURAL — não mutada cirurgicamente):** não há "linha de guarda" para desligar —
+  a origem `System` nasce **por construção** no despacho server-side (RT-1) e o evento carrega **só
+  metadados por design** (RT-6). Desligá-las exigiria alterar enum/struct/resolução de sender (quebraria a
+  compilação ou dezenas de testes), não inverter uma condição. Evidência: linha-que-barra re-derivada no
+  fonte + teste-alvo verde + prova por mutação das frentes nos `@accept`.
+
+**Placar: 4/6 re-mutados nesta auditoria (RT-2/3/4/5, RED→GREEN, tree limpo após revert); RT-1/6 por re-derivação estrutural.**
 
 ## Baseline verde (re-confirmado nesta passada)
 
