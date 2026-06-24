@@ -23,6 +23,7 @@ use thiserror::Error;
 
 use crate::channel::ChannelManifest;
 use crate::events::{DomainEvent, EventStore, StoreError};
+use crate::router::AutonomyLevel;
 
 /// Classe canônica das ações custodiadas no evento `ActionGated`. É **broker-only**: NÃO sai do
 /// `classify` de uma string de comando (o agente nunca a produz por pattern-match) — por isso vive
@@ -68,6 +69,16 @@ pub const CUSTODY_ACTIONS: &[CustodyAction] = &[
 #[must_use]
 pub fn lookup_action(name: &str) -> Option<CustodyAction> {
     CUSTODY_ACTIONS.iter().copied().find(|a| a.name == name)
+}
+
+/// `true` se o pedido é uma ação custodiada conhecida — ação de **CANAL** (`channel:Some`, validada
+/// upstream contra o manifesto) **OU** builtin do registry estático ([`CUSTODY_ACTIONS`]). A negação
+/// é [`BrokerError::UnknownAction`]: o broker só medeia ações que dependem de um segredo do cofre.
+/// **Fonte única** da regra, compartilhada por [`run_custody`] e [`run_webhook_custody`] — não
+/// duplicar a condição nos dois pontos de entrada.
+#[must_use]
+pub fn is_custody_action(req: &BrokerRequest) -> bool {
+    req.channel.is_some() || lookup_action(&req.action).is_some()
 }
 
 /// Prefixo do escopo de segredo de um **canal** no [`SecretVault`] (F4-0-2): a credencial de um canal
@@ -215,7 +226,7 @@ where
     // a validação "canal declarado + ação no manifesto" já ocorreu upstream (contra o
     // `ChannelRegistry`); o broker não re-valida contra os builtins. A custódia abaixo é idêntica:
     // mesmo com canal/ação forjados, sem o segredo no escopo `channel:<nome>` nada executa (no_secret).
-    if req.channel.is_none() && lookup_action(&req.action).is_none() {
+    if !is_custody_action(req) {
         return Err(BrokerError::UnknownAction(req.action.clone()));
     }
 
@@ -266,6 +277,133 @@ where
             Err(BrokerError::Exec(e))
         }
     }
+}
+
+// ───────────────────── F4-WA-4 · gate de ação irreversível por webhook (ADR 0035 §3 · 0004) ──────
+
+/// Contexto do canal **webhook** para o gate de uma ação irreversível disparada por um disparo
+/// externo. Agrupa o que distingue o gate-de-webhook do gate normal de custódia — sem inflar a
+/// assinatura de [`run_webhook_custody`]. Todos os campos são metadados de prova; **nenhum** é
+/// autoridade (a autoridade é o gate humano da custódia, ADR 0004).
+#[derive(Debug, Clone, Copy)]
+pub struct WebhookGateContext<'a> {
+    /// `hook_id` opaco do webhook que disparou (carimbado server-side; vai ao log como prova).
+    pub webhook_id: &'a str,
+    /// Terminal dono que recebeu o input (`target_node` por NOME — ADR 0026).
+    pub target_node: &'a str,
+    /// Nível de AÇÃO declarado na config do webhook: `"autonomous"` | `"notify_before"`
+    /// (`WebhookConfigured.autonomy_level`). Vocabulário do canal — distinto da escala do workspace.
+    pub webhook_level: &'a str,
+    /// Autonomia VIGENTE do workspace (`RouterConfig::autonomy`). O `min` com o nível do webhook é o
+    /// `effective_level` — o webhook nunca afrouxa o que a autonomia do Espaço já fecha (ADR 0035 §3).
+    pub workspace: AutonomyLevel,
+}
+
+/// Rank da escala de autonomia, do mais RESTRITIVO ao mais LIVRE: `Manual(0) < Assisted(1) <
+/// Autonomous(2)`. Base do `min` de [`webhook_effective_level`]. Local ao broker (não em `router`,
+/// território de WA1) — `AutonomyLevel` é importado, jamais alterado.
+fn autonomy_rank(level: AutonomyLevel) -> u8 {
+    match level {
+        AutonomyLevel::Manual => 0,
+        AutonomyLevel::Assisted => 1,
+        AutonomyLevel::Autonomous => 2,
+    }
+}
+
+/// Mapeia o nível de AÇÃO do webhook (vocabulário do canal) para a escala [`AutonomyLevel`].
+/// `"autonomous"` → `Autonomous` ("pode agir"); QUALQUER outro valor — `"notify_before"`, vazio ou
+/// desconhecido — → `Assisted` ("me avisa antes"/propõe). O default conservador é deliberado: um
+/// nível não-reconhecido NUNCA fabrica autonomia (espelha `default_notify_before` da config).
+/// `parse_autonomy` (guard.rs) NÃO serve aqui — ela fala `manual|assistido|autonomo`, não o
+/// vocabulário do canal webhook.
+fn webhook_level_rank(level: &str) -> AutonomyLevel {
+    match level.trim().to_lowercase().as_str() {
+        "autonomous" => AutonomyLevel::Autonomous,
+        _ => AutonomyLevel::Assisted,
+    }
+}
+
+/// Serializa o nível efetivo de volta ao vocabulário de AÇÃO do canal webhook (o que a config/UI e a
+/// skill consomem): `Autonomous` → `"autonomous"` ("age"); `Manual`/`Assisted` → `"notify_before"`
+/// ("propõe/avisa antes"). Manual e Assisted colapsam porque, para a ação do webhook, ambos
+/// significam "não age sozinho" — a distinção deles é de DELEGAÇÃO (`blocks_delegation`), não da
+/// ação custodiada (que é gated de qualquer forma).
+fn webhook_level_label(level: AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::Autonomous => "autonomous",
+        AutonomyLevel::Manual | AutonomyLevel::Assisted => "notify_before",
+    }
+}
+
+/// **O nível EFETIVO de um webhook = `min(webhook.autonomy_level, workspace.autonomy)`** (ADR 0035
+/// §3) — função pura, sem efeito no log. O webhook **nunca afrouxa** o que a autonomia do Espaço já
+/// fecha: um webhook `autonomous` num Espaço `assistido` resulta `Assisted` (propõe, não age — RT-4);
+/// um webhook `notify_before` num Espaço `autonomo` resulta `Assisted` (o lado conservador vence). A
+/// string canônica do resultado (vocabulário do canal) sai por [`webhook_level_label`].
+#[must_use]
+pub fn webhook_effective_level(webhook_level: &str, workspace: AutonomyLevel) -> AutonomyLevel {
+    let webhook = webhook_level_rank(webhook_level);
+    if autonomy_rank(webhook) <= autonomy_rank(workspace) {
+        webhook
+    } else {
+        workspace
+    }
+}
+
+/// **Gate de uma ação irreversível DISPARADA por webhook (F4-WA-4, ADR 0035 §3 · ADR 0004).**
+///
+/// Webhook é um disparo externo e automático — a classe que MAIS precisa do gate. Esta função é o
+/// marcador do canal por cima da custódia: ela calcula o `effective_level`, emite
+/// [`DomainEvent::WebhookActionGated`] (prova auditável de que o webhook **não furou** o gate) e
+/// **delega a custódia INTEIRA a [`run_custody`]** — `ActionGated{ask}` + `BrokerDenied`/
+/// `BrokerExecuted`, sem reinventá-los.
+///
+/// **O `effective_level` NÃO afrouxa esta ação.** Para `gated-hard-external`, o gate é fixo `ask` em
+/// QUALQUER nível (piso ADR 0004 — a autonomia afrouxa `gated-soft`, jamais o externo irreversível);
+/// o `effective_level` é registrado como prova/contexto e é o mesmo valor que um caminho `gated-soft`
+/// consultaria. Por isso ele entra no `WebhookActionGated`, mas não desvia o fluxo de `run_custody`.
+///
+/// Fluxo:
+/// 1. Ação não-custodiada ([`is_custody_action`] falso) → `UnknownAction` SEM tocar o log (não há
+///    caminho de execução externo, logo nada que o webhook "não furou" — não emite o marcador).
+/// 2. Apenda `WebhookActionGated{webhook_id, target_node, action_class:"gated-hard-external",
+///    effective_level}` — só metadados; NUNCA o payload externo nem o segredo (ADR 0035 §5).
+/// 3. Delega a [`run_custody`]: `confirmed == false` → `DeniedUnconfirmed` (0 execução sem "sim");
+///    `confirmed == true` + segredo no cofre → `Executed` (a custódia mediou, com o gate humano).
+///
+/// # Errors
+/// [`BrokerError::UnknownAction`] se a ação não for custodiada; demais erros propagam de [`run_custody`].
+pub fn run_webhook_custody<S, F>(
+    ctx: &WebhookGateContext,
+    req: &BrokerRequest,
+    confirmed: bool,
+    vault: &SecretVault<S>,
+    store: &mut EventStore,
+    execute: F,
+) -> Result<BrokerOutcome, BrokerError>
+where
+    S: SecretStore,
+    F: FnOnce(&str) -> Result<(), String>,
+{
+    // Espelha a recusa de `run_custody`: sem ação custodiada não há efeito externo (sem segredo),
+    // logo não há gate que o webhook "não furou" — não emite o marcador, não toca o log.
+    if !is_custody_action(req) {
+        return Err(BrokerError::UnknownAction(req.action.clone()));
+    }
+
+    let effective = webhook_effective_level(ctx.webhook_level, ctx.workspace);
+
+    // Marca, ANTES da custódia, que esta ação custodiada nasceu de um webhook (prova de que o canal
+    // externo não furou o gate). `action_class` é fixa `gated-hard-external`: a custódia é o piso.
+    store.append(&DomainEvent::WebhookActionGated {
+        webhook_id: ctx.webhook_id.to_string(),
+        target_node: ctx.target_node.to_string(),
+        action_class: CLASS_GATED_HARD_EXTERNAL.to_string(),
+        effective_level: webhook_level_label(effective).to_string(),
+    })?;
+
+    // A custódia inquebrável segue idêntica a qualquer outro caminho — o webhook não cria atalho.
+    run_custody(req, confirmed, vault, store, execute)
 }
 
 // ───────────────────────────── F3-5-8 · poda de disco custodiada (ADR 0043) ──────────────────────
@@ -893,5 +1031,217 @@ ref = "v0.1.0"
             !kinds(&store).iter().any(|k| k == "DiskReclaimExecuted"),
             "forjar approved_by NÃO dispara poda — só o gesto via run_disk_reclaim a produz"
         );
+    }
+
+    // ───────────────── F4-WA-4 · gate de ação irreversível por webhook (ADR 0035 §3 · 0004) ──────
+
+    fn webhook_ctx(webhook_level: &str, workspace: AutonomyLevel) -> WebhookGateContext<'_> {
+        WebhookGateContext {
+            webhook_id: "wh-abc123",
+            target_node: "@Dev",
+            webhook_level,
+            workspace,
+        }
+    }
+
+    /// O `effective_level` é o `min(webhook, workspace)` na escala `Manual<Assisted<Autonomous` — o
+    /// webhook NUNCA afrouxa o que a autonomia do Espaço já fecha (ADR 0035 §3). Função pura.
+    #[test]
+    fn webhook_effective_level_is_min_of_both_scales() {
+        use AutonomyLevel::{Assisted, Autonomous, Manual};
+        // webhook `autonomous` num Espaço `assistido` → propõe (RT-4): o min é Assisted.
+        assert_eq!(webhook_effective_level("autonomous", Assisted), Assisted);
+        // ambos no topo → age.
+        assert_eq!(
+            webhook_effective_level("autonomous", Autonomous),
+            Autonomous
+        );
+        // webhook `notify_before` num Espaço `autonomo` → o lado conservador (webhook) vence.
+        assert_eq!(
+            webhook_effective_level("notify_before", Autonomous),
+            Assisted
+        );
+        // workspace `Manual` é o piso — o webhook não o ultrapassa.
+        assert_eq!(webhook_effective_level("autonomous", Manual), Manual);
+        // nível vazio/desconhecido NUNCA fabrica autonomia (default conservador).
+        assert_eq!(webhook_effective_level("", Autonomous), Assisted);
+        assert_eq!(webhook_effective_level("banana", Autonomous), Assisted);
+    }
+
+    /// Gate (c)/RT-3: instrução→irreversível em `notify_before` → `WebhookActionGated` (prova) +
+    /// `ActionGated{gated-hard-external, ask}` (custódia reusada) + `BrokerDenied{unconfirmed}`, e
+    /// **0 execução** sem o "sim". O webhook não fura o gate humano.
+    #[test]
+    fn webhook_irreversible_in_notify_before_gates_and_does_not_execute() {
+        let tmp = TempDir::new("wh-notify");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_deploy_token();
+        let ran = Cell::new(false);
+        let ctx = webhook_ctx("notify_before", AutonomyLevel::Assisted);
+
+        let outcome = run_webhook_custody(&ctx, &deploy_req(), false, &vault, &mut store, |_| {
+            ran.set(true);
+            Ok(())
+        })
+        .expect("run_webhook_custody");
+
+        assert_eq!(outcome, BrokerOutcome::DeniedUnconfirmed);
+        assert!(
+            !ran.get(),
+            "ação irreversível por webhook NÃO executa sem confirmação"
+        );
+
+        let events = store.events().expect("eventos");
+        // Marcador do canal: prova de que o webhook chegou ao gate (com o nível efetivo).
+        let wag = events
+            .iter()
+            .find(|r| r.kind == "WebhookActionGated")
+            .expect("WebhookActionGated");
+        assert_eq!(wag.payload["action_class"], "gated-hard-external");
+        assert_eq!(wag.payload["effective_level"], "notify_before");
+        assert_eq!(wag.payload["webhook_id"], "wh-abc123");
+        assert_eq!(wag.payload["target_node"], "@Dev");
+        // Custódia REUSADA (run_custody): ActionGated{ask} + BrokerDenied{unconfirmed}, 0 Executed.
+        let gated = events
+            .iter()
+            .find(|r| r.kind == "ActionGated")
+            .expect("ActionGated");
+        assert_eq!(gated.payload["class"], "gated-hard-external");
+        assert_eq!(gated.payload["decision"], "ask");
+        assert!(events
+            .iter()
+            .any(|r| r.kind == "BrokerDenied" && r.payload["reason"] == "unconfirmed"));
+        assert!(
+            !events.iter().any(|r| r.kind == "BrokerExecuted"),
+            "0 execução sem confirmação, mesmo originada por webhook"
+        );
+    }
+
+    /// Gate (c)/RT-4: webhook `autonomous` num Espaço `assistido` → o nível efetivo é `notify_before`
+    /// (PROPÕE, não age) — o min das autonomias manda. Prova no `effective_level` do marcador.
+    #[test]
+    fn webhook_autonomous_in_assisted_workspace_proposes() {
+        let tmp = TempDir::new("wh-autonomous-assisted");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_deploy_token();
+        let ctx = webhook_ctx("autonomous", AutonomyLevel::Assisted);
+
+        let outcome =
+            run_webhook_custody(&ctx, &deploy_req(), false, &vault, &mut store, |_| Ok(()))
+                .expect("run_webhook_custody");
+        assert_eq!(outcome, BrokerOutcome::DeniedUnconfirmed);
+
+        let events = store.events().expect("eventos");
+        let wag = events
+            .iter()
+            .find(|r| r.kind == "WebhookActionGated")
+            .expect("WebhookActionGated");
+        assert_eq!(
+            wag.payload["effective_level"], "notify_before",
+            "webhook autonomous num Espaço assistido PROPÕE (min das autonomias)"
+        );
+    }
+
+    /// Piso ADR 0004: mesmo com o nível efetivo MAIS ALTO (`autonomous` em Espaço `autonomo`), a ação
+    /// irreversível AINDA passa pelo gate `ask` — a autonomia jamais afrouxa `gated-hard` externo.
+    /// Executa só porque houve o "sim", com o segredo vindo do COFRE (nunca do payload/log).
+    #[test]
+    fn webhook_autonomous_in_autonomous_workspace_still_gates_hard_external() {
+        let tmp = TempDir::new("wh-autonomous-autonomous");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_deploy_token();
+        let seen: Cell<Option<String>> = Cell::new(None);
+        let ctx = webhook_ctx("autonomous", AutonomyLevel::Autonomous);
+
+        let outcome =
+            run_webhook_custody(&ctx, &deploy_req(), true, &vault, &mut store, |secret| {
+                seen.set(Some(secret.to_string()));
+                Ok(())
+            })
+            .expect("run_webhook_custody");
+
+        assert_eq!(outcome, BrokerOutcome::Executed);
+        assert_eq!(
+            seen.take().as_deref(),
+            Some("DEPLOY-KEY-SUPER-SECRETA"),
+            "o segredo veio do cofre (custódia), nunca do payload do webhook"
+        );
+
+        let events = store.events().expect("eventos");
+        let wag = events
+            .iter()
+            .find(|r| r.kind == "WebhookActionGated")
+            .expect("WebhookActionGated");
+        assert_eq!(wag.payload["effective_level"], "autonomous");
+        let gated = events
+            .iter()
+            .find(|r| r.kind == "ActionGated")
+            .expect("ActionGated");
+        assert_eq!(
+            gated.payload["decision"], "ask",
+            "gated-hard externo é SEMPRE ask, mesmo no nível efetivo autônomo"
+        );
+        assert!(events.iter().any(|r| r.kind == "BrokerExecuted"));
+
+        // Gate (f)/RT-6: nenhum secret aparece no log do canal webhook (só metadados).
+        let log_dump =
+            serde_json::to_string(&events.iter().map(|r| &r.payload).collect::<Vec<_>>())
+                .expect("dump");
+        assert!(
+            !log_dump.contains("DEPLOY-KEY-SUPER-SECRETA"),
+            "o segredo NÃO pode vazar em nenhum evento do canal webhook"
+        );
+    }
+
+    /// Ação não-custodiada disparada por webhook → `UnknownAction` SEM emitir `WebhookActionGated`
+    /// (não há caminho de execução externo → nada que o webhook "não furou"; o log fica intocado).
+    #[test]
+    fn webhook_unknown_action_rejected_without_marker() {
+        let tmp = TempDir::new("wh-unknown");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_deploy_token();
+        let ctx = webhook_ctx("autonomous", AutonomyLevel::Autonomous);
+        let req = BrokerRequest {
+            action: "rm-the-universe".to_string(),
+            secret_scope: "deploy".to_string(),
+            secret_key: "prod".to_string(),
+            requester: "@Dev".to_string(),
+            display: "lina do rm-the-universe".to_string(),
+            channel: None,
+        };
+
+        let err =
+            run_webhook_custody(&ctx, &req, true, &vault, &mut store, |_| Ok(())).unwrap_err();
+        assert!(matches!(err, BrokerError::UnknownAction(_)));
+        assert!(
+            kinds(&store).is_empty(),
+            "ação não-custodiada não emite WebhookActionGated nem toca o log"
+        );
+    }
+
+    /// Uma ação irreversível por webhook via CANAL (F4-0-3) reusa o mesmo gate: `WebhookActionGated`
+    /// junto da custódia de canal (segredo no escopo `channel:<nome>`). Prova que o marcador é
+    /// ortogonal ao tipo de custódia (builtin vs canal).
+    #[test]
+    fn webhook_channel_action_gates_and_marks() {
+        let tmp = TempDir::new("wh-channel");
+        let mut store = EventStore::open(tmp.path()).expect("open store");
+        let vault = vault_with_channel_token();
+        let ctx = webhook_ctx("notify_before", AutonomyLevel::Assisted);
+
+        let outcome =
+            run_webhook_custody(&ctx, &channel_req(), false, &vault, &mut store, |_| Ok(()))
+                .expect("run_webhook_custody");
+        assert_eq!(outcome, BrokerOutcome::DeniedUnconfirmed);
+
+        let events = store.events().expect("eventos");
+        assert!(
+            events.iter().any(|r| r.kind == "WebhookActionGated"),
+            "ação de canal por webhook também emite o marcador"
+        );
+        assert!(events
+            .iter()
+            .any(|r| r.kind == "ActionGated" && r.payload["decision"] == "ask"));
+        assert!(!events.iter().any(|r| r.kind == "BrokerExecuted"));
     }
 }
