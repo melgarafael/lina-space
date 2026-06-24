@@ -276,6 +276,10 @@ pub struct NoteEntry {
     /// Alvo de `[[wikilink]]` (limpo: sem alias/âncora) → nº de ocorrências — peso das arestas no
     /// sidecar JSON (preserva a multiplicidade que `links` perde ao deduplicar).
     pub link_counts: Vec<(String, usize)>,
+    /// `true` se a nota é um **placeholder de nuvem** (iCloud/OneDrive evicted): existe no vault mas o
+    /// conteúdo não foi baixado, então NÃO foi lida (headings/links/tags ficam vazios). Pular o read
+    /// evita disparar um download por arquivo — a causa de travar ao indexar vaults grandes na nuvem.
+    pub dataless: bool,
 }
 
 /// O índice de um vault: pastas + notas (ambos ordenados — determinístico).
@@ -569,7 +573,52 @@ fn parse_note(rel_path: String, content: &str) -> NoteEntry {
         embeds: extract_embeds(&body),
         tags,
         link_counts: link_count_pairs(&body),
+        dataless: false,
     }
+}
+
+/// PURO: `true` se o `stat` descreve um placeholder de nuvem evicted (iCloud/OneDrive) — tem tamanho
+/// LÓGICO (`len > 0`) mas ZERO blocos alocados no disco. Ler um desses dispara um download de rede;
+/// pulá-los é o que evita baixar (e travar ao indexar) o vault inteiro. `len == 0` = arquivo vazio real.
+#[must_use]
+fn is_dataless_stat(blocks: u64, len: u64) -> bool {
+    blocks == 0 && len > 0
+}
+
+/// `true` se o arquivo não tem dados locais (placeholder de nuvem). Unix: lê `st_blocks`/`st_size` por
+/// `lstat` (local/barato — NÃO baixa o arquivo). Outros SOs: conservador (assume materializado); a
+/// detecção on-demand do Windows/OneDrive fica como follow-up (ver achados de dogfooding).
+fn file_is_dataless(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false; // não deu pra ler o stat → trata como local (não pula nada por engano)
+    };
+    #[cfg(unix)]
+    let blocks = {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks()
+    };
+    // Sem `st_blocks` fora do Unix: finge "materializado" (não dispara o skip). A detecção on-demand
+    // do Windows/OneDrive fica como follow-up (ver achados de dogfooding).
+    #[cfg(not(unix))]
+    let blocks: u64 = 1;
+    is_dataless_stat(blocks, meta.len())
+}
+
+/// Lê+parseia UM `.md`, mas PULA o read (sem download) se `is_dataless` indicar placeholder de nuvem,
+/// devolvendo uma nota marcada `dataless` (registrada no mapa, mas sem conteúdo indexado). O predicado
+/// é injetado para provar o skip sem depender de um vault iCloud real.
+fn parse_note_or_skip(rel: &str, path: &Path, is_dataless: impl Fn(&Path) -> bool) -> NoteEntry {
+    if is_dataless(path) {
+        return NoteEntry {
+            rel_path: rel.to_string(),
+            dataless: true,
+            ..Default::default()
+        };
+    }
+    parse_note(
+        rel.to_string(),
+        &std::fs::read_to_string(path).unwrap_or_default(),
+    )
 }
 
 /// Varre o vault (recursivo, READ-ONLY, sem rede, sem LLM): coleta pastas e notas `*.md`, ignorando
@@ -653,8 +702,10 @@ fn parse_notes_parallel(md: Vec<(String, PathBuf)>) -> Vec<NoteEntry> {
                 let Some((rel, path)) = md.get(i) else {
                     break; // cursor passou do fim → este worker terminou
                 };
-                let content = std::fs::read_to_string(path).unwrap_or_default();
-                let note = parse_note(rel.clone(), &content);
+                // Placeholder de nuvem (iCloud/OneDrive evicted) → registra a nota SEM ler (não dispara
+                // download). Só os arquivos materializados pagam o read+parse. É o que destrava vaults
+                // grandes na nuvem: indexamos o que está local, sem baixar o vault inteiro de uma vez.
+                let note = parse_note_or_skip(rel, path, file_is_dataless);
                 if let Ok(mut g) = out.lock() {
                     g.push(note); // lock breve; o read+parse caro ficou fora dele
                 }
@@ -927,11 +978,20 @@ fn render_vault_index_with(
     let hubs = graph.metrics.iter().filter(|m| m.is_hub).count();
     let mocs = graph.metrics.iter().filter(|m| m.is_moc).count();
     let orphans = graph.metrics.iter().filter(|m| m.is_orphan).count();
+    let cloud = data.notes.iter().filter(|n| n.dataless).count();
+    let indexed = data.notes.len() - cloud;
     out.push_str(&format!(
-        "> {} notas · {} conexões · {hubs} hubs · {mocs} MOCs · {orphans} órfãos\n\n",
+        "> {} notas · {} conexões · {hubs} hubs · {mocs} MOCs · {orphans} órfãos\n",
         data.notes.len(),
         graph.edges.len()
     ));
+    if cloud > 0 {
+        out.push_str(&format!(
+            "> ⚠ {indexed} indexadas · {cloud} ainda na nuvem (não baixadas) — abra-as no Obsidian \
+             (ou baixe o vault) para incluí-las no mapa.\n"
+        ));
+    }
+    out.push('\n');
 
     out.push_str("## Pastas\n");
     if data.folders.is_empty() {
@@ -2979,6 +3039,83 @@ mod tests {
         let md2 =
             render_vault_index_with("Meu Vault", vault.path(), &data2, &analyze_graph(&data2));
         assert_eq!(md, md2);
+    }
+
+    /// `is_dataless_stat`: um placeholder de nuvem (iCloud/OneDrive evicted) tem tamanho LÓGICO mas
+    /// ZERO blocos no disco → ler dispararia um download de rede. Materializado = blocos > 0. Arquivo
+    /// vazio de verdade (0 bytes) NÃO é placeholder. É a heurística que evita baixar o vault inteiro.
+    #[test]
+    fn dataless_stat_flags_only_cloud_placeholders() {
+        assert!(
+            is_dataless_stat(0, 1234),
+            "tamanho>0 com zero blocos = placeholder evicted (conteúdo só na nuvem)"
+        );
+        assert!(
+            !is_dataless_stat(8, 1234),
+            "tem blocos alocados = materializado no disco"
+        );
+        assert!(
+            !is_dataless_stat(0, 0),
+            "arquivo realmente vazio (0 bytes) não é placeholder de nuvem"
+        );
+    }
+
+    /// `parse_note_or_skip`: quando o predicado diz "está na nuvem", NÃO lê o arquivo (não dispara
+    /// download) — devolve uma nota marcada `dataless`, com conteúdo vazio MESMO que o arquivo tenha
+    /// headings/links no disco. Prova: o arquivo tem conteúdo, mas a nota volta vazia (não foi lida).
+    #[test]
+    fn parse_note_or_skip_does_not_read_cloud_files() {
+        let vault = TempDir::new("dataless");
+        write(vault.path(), "n.md", "# Tem Conteudo\nlink [[x]]\n");
+        let path = vault.path().join("n.md");
+        let note = parse_note_or_skip("n.md", &path, |_| true); // simula "na nuvem (evicted)"
+        assert!(note.dataless, "marcada como na nuvem");
+        assert!(
+            note.headings.is_empty() && note.links.is_empty(),
+            "NÃO leu o arquivo: zero download. headings={:?} links={:?}",
+            note.headings,
+            note.links
+        );
+    }
+
+    /// `parse_note_or_skip`: arquivo local (materializado) → lê e parseia normalmente, `dataless=false`.
+    /// Não-regressão: o caminho comum (vault local) continua extraindo headings/links como antes.
+    #[test]
+    fn parse_note_or_skip_reads_local_files() {
+        let vault = TempDir::new("local");
+        write(vault.path(), "n.md", "# Titulo\nlink [[x]]\n");
+        let path = vault.path().join("n.md");
+        let note = parse_note_or_skip("n.md", &path, |_| false); // local/materializado
+        assert!(!note.dataless);
+        assert_eq!(note.headings, vec!["# Titulo"]);
+        assert_eq!(note.links, vec!["x"]);
+    }
+
+    /// `render_vault_index_with`: notas na nuvem (não baixadas) são contadas com HONESTIDADE no
+    /// cabeçalho — o mapa não finge que indexou o que não leu (espelha a "parada honesta" do
+    /// `vault search`). Com zero notas na nuvem, o cabeçalho NÃO ganha a linha extra (determinismo).
+    #[test]
+    fn render_reports_cloud_notes_honestly() {
+        let cloud = NoteEntry {
+            rel_path: "nuvem.md".into(),
+            dataless: true,
+            ..Default::default()
+        };
+        let data = VaultIndexData {
+            folders: vec![],
+            notes: vec![note("local.md", &["x"]), cloud],
+        };
+        let md = render_vault_index_with(
+            "V",
+            std::path::Path::new("/v"),
+            &data,
+            &analyze_graph(&data),
+        );
+        let low = md.to_lowercase();
+        assert!(
+            low.contains("nuvem") || low.contains("icloud") || low.contains("não baixad"),
+            "o índice precisa avisar que há nota(s) não baixada(s). saída:\n{md}"
+        );
     }
 
     /// `write_vault_index` grava FORA do vault, em `<lina_dir>/vault-index/` (leitura-por-padrão).
