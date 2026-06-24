@@ -1118,7 +1118,10 @@ impl Router {
         //    (o `node` carimbado SERVER-SIDE = remetente autenticado, JAMAIS o payload — ADR 0007).
         //    Registro puro (não entregue a PTY): a camada de skills do briefing consome a projeção.
         if is_skill_intent(&msg.intent) {
-            return self.handle_skill(msg, store);
+            // Caminho de AGENTE (`lina skill select` manual): root_cause = None → selection_id vazio
+            // (fora do aprendizado). A seleção AUTOMÁTICA com root_cause real entra por
+            // `system_skill_select` (ADR 0049), não por aqui.
+            return self.handle_skill(msg, store, None);
         }
 
         // ── F3-5-6: `lina clue define|clear` — emite `ClueSetDefined` (pistas que o terminal de um
@@ -2477,7 +2480,18 @@ impl Router {
     /// `SkillSelected` é o remetente AUTENTICADO (`msg.from`, server-side — JAMAIS o payload, ADR
     /// 0007; o `sender` já foi resolvido no roster acima). `skill`/`skill_name` vazio é rejeitado.
     /// Registro puro: a camada de skills do briefing consome a projeção (J emite, I lê).
-    fn handle_skill(&mut self, msg: &MailMessage, store: &mut EventStore) -> RouteOutcome {
+    ///
+    /// `root_cause` (ADR 0049): id do turno, inforjável, suprido SÓ pela via de SISTEMA
+    /// ([`Router::system_skill_select`], lido de `delivered_root`). O caminho de AGENTE
+    /// (`route_message`) passa `None` → `selection_id` vazio → a seleção manual fica fora do
+    /// aprendizado (teto do escopo a, agora intencional). `msg.root_cause_id` NÃO é fonte: um agente
+    /// o forjaria no outbox; só o binding server-side é confiável.
+    fn handle_skill(
+        &mut self,
+        msg: &MailMessage,
+        store: &mut EventStore,
+        root_cause: Option<&str>,
+    ) -> RouteOutcome {
         let payload: serde_json::Value =
             serde_json::from_str(&msg.payload).unwrap_or(serde_json::Value::Null);
         let event = if msg.intent == "skill.propose" {
@@ -2534,19 +2548,16 @@ impl Router {
                         .and_then(|p| p.nodes.get(&id).and_then(|n| n.role.clone()))
                 })
                 .unwrap_or_default();
-            // `selection_id`: derivado SERVER-SIDE da identidade autenticada + `root_cause_id` do
-            // envelope (não do payload) → ligação de outcome INFORJÁVEL. SÓ no caminho COM retrieval
-            // (task_kind presente); seleção direta fica com id vazio → excluída do aprendizado por
-            // outcome (a guarda `!selection_id.is_empty()` em `outcome_scores`).
-            let selection_id = if task_kind.is_empty() {
-                String::new()
-            } else {
-                crate::skill_index::selection_id(
-                    &msg.from,
-                    &skill,
-                    &task_kind,
-                    msg.root_cause_id.as_deref().unwrap_or_default(),
-                )
+            // `selection_id`: derivado SERVER-SIDE da identidade autenticada + `root_cause` do canal
+            // de SISTEMA (ADR 0049 — `delivered_root`, inforjável; JAMAIS do payload). SÓ quando há
+            // retrieval (task_kind) E root_cause de sistema; o caminho de agente (root_cause=None)
+            // fica com id vazio → excluído do aprendizado por outcome (guarda `!is_empty` em
+            // `outcome_scores`). Ligação de outcome inforjável → desambiguação por-turno.
+            let selection_id = match root_cause {
+                Some(rc) if !task_kind.is_empty() => {
+                    crate::skill_index::selection_id(&msg.from, &skill, &task_kind, rc)
+                }
+                _ => String::new(),
             };
             DomainEvent::SkillSelected {
                 node: msg.from.clone(), // SERVER-SIDE: remetente autenticado, jamais o payload
@@ -2573,6 +2584,46 @@ impl Router {
         RouteOutcome::Delivered {
             targets: Vec::new(),
         }
+    }
+
+    /// **ADR 0049: seleção AUTOMÁTICA de skill (via de SISTEMA).** O caller (app, braço `Delivered`
+    /// do pump, FORA do hot-path) já rodou o retrieval (`rank_with_outcome` — o índice vive no
+    /// bootstrap, anti-ciclo) e passa o resultado + o `root_cause_id` REAL do turno (capturado de
+    /// [`Router::delivered_root_id`] na detecção, inforjável). Diferente do verbo manual de agente,
+    /// ESTA via supre o `root_cause` → `selection_id` ≠ vazio → a seleção entra no aprendizado por
+    /// outcome (C2). Reusa [`Router::handle_skill`] para o carimbo server-side de `by_role`/
+    /// `selection_id`; `target` é o terminal que recebeu a tarefa (o `node` do `SkillSelected`).
+    pub fn system_skill_select(
+        &mut self,
+        store: &mut EventStore,
+        target: &str,
+        chosen: &str,
+        task_kind: &str,
+        candidates: &[String],
+        root_cause_id: &str,
+    ) -> RouteOutcome {
+        let payload = serde_json::json!({
+            "skill": chosen,
+            "task_kind": task_kind,
+            "candidates": candidates,
+            "source": "auto",
+        })
+        .to_string();
+        // `from = target`: o `node` do `SkillSelected` é o terminal que selecionou (server-side via
+        // `handle_skill`). A AUTORIDADE da via de sistema é o `root_cause` confiável, não o `from`.
+        let msg = MailMessage::new(target, "skill", "skill.select", payload);
+        self.handle_skill(&msg, store, Some(root_cause_id))
+    }
+
+    /// **ADR 0049: `root_cause_id` inforjável de `node`** — o id do turno do binding `delivered_root`
+    /// (a MESMA fonte de `derive_root_hops`, atualizada na entrega). O app o LÊ na detecção (braço
+    /// `Delivered`) e o faz VIAJAR com o `SkillSelectionRequest` (snapshot anti-race, ADR 0048):
+    /// re-lê-lo no drain casaria a seleção no turno errado. `None` se o nó não tem turno ativo.
+    #[must_use]
+    pub fn delivered_root_id(&self, node: NodeId) -> Option<String> {
+        self.delivered_root
+            .get(&node)
+            .map(|(root, _, _)| root.clone())
     }
 
     /// **F3-5-6: handler dos verbos `lina clue define|clear`.** Emite `ClueSetDefined` via
@@ -9660,31 +9711,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ADR 0045 R45-EMIT (ENFORCEMENT/MUTAÇÃO): no `skill.select` COM retrieval, `by_role` e
-    /// `selection_id` são carimbados SERVER-SIDE — um payload que FORJA esses campos NÃO os injeta
-    /// (o servidor vence). `task_kind`/`candidates` são DADO descritivo (preservados). Skill=DADO,
-    /// JAMAIS autoridade: a ligação de outcome é inforjável.
-    #[test]
-    fn skill_select_stamps_authority_server_side_ignoring_payload_forgery() {
-        let (mut router, sup, dir) = router_with("skill-emit");
-        let j = sup.register("@J", None, sink());
-        let mut ts = TmpStore::new("skill-emit");
-        // O remetente tem papel BACKEND projetado no log (estado pré-existente do Espaço).
-        ts.store
+    /// Helper: nó com papel projetado no log (estado pré-existente do Espaço) — `register` (roster
+    /// vivo p/ `node_by_name`) + `NodeAdded`/`NodeRoleAssigned` (projeção p/ `by_role`).
+    fn seed_node_with_role(
+        sup: &Supervisor,
+        store: &mut EventStore,
+        name: &str,
+        role: &str,
+    ) -> NodeId {
+        let id = sup.register(name, None, sink());
+        store
             .append(&DomainEvent::NodeAdded {
-                node: j,
+                node: id,
                 kind: "terminal".into(),
                 x: 0.0,
                 y: 0.0,
                 requested_by: None,
             })
             .unwrap();
-        ts.store
+        store
             .append(&DomainEvent::NodeRoleAssigned {
-                node: j,
-                role: "BACKEND".into(),
+                node: id,
+                role: role.into(),
             })
             .unwrap();
+        id
+    }
+
+    /// ADR 0045/0049 (ENFORCEMENT/MUTAÇÃO): no `skill.select` de AGENTE (`route_message`), `by_role`
+    /// é carimbado SERVER-SIDE e `selection_id` fica VAZIO (sem root_cause de sistema → fora do
+    /// aprendizado). Um payload que FORJA by_role/selection_id/node NÃO os injeta (servidor vence).
+    #[test]
+    fn skill_select_agent_path_stamps_by_role_and_has_no_learning_link() {
+        let (mut router, sup, dir) = router_with("skill-emit");
+        let mut ts = TmpStore::new("skill-emit");
+        seed_node_with_role(&sup, &mut ts.store, "@J", "BACKEND");
         let (_rec, mut deliver) = recorder();
         // O payload FORJA by_role + selection_id + node — o servidor DEVE ignorá-los.
         let payload = r#"{"skill":"senior-backend","task_kind":"backend:api-leads","candidates":["senior-backend","tomik-db-doctrine"],"by_role":"ADMIN-FORJADO","selection_id":"sel-FORJADO","node":"@Atacante"}"#;
@@ -9694,22 +9755,97 @@ mod tests {
         let events = ts.store.events().unwrap();
         let sel = recs_of(&events, "SkillSelected");
         assert_eq!(sel.len(), 1, "uma seleção emitida");
-        // node = remetente AUTENTICADO (não o forjado no payload).
         assert_eq!(field(sel[0], "node"), Some("@J"), "node server-side");
-        // by_role = papel PROJETADO server-side (não "ADMIN-FORJADO").
         assert_eq!(
             field(sel[0], "by_role"),
             Some("BACKEND"),
             "by_role server-side vence a forja do payload"
         );
-        // selection_id = DERIVADO server-side (prefixo sel-, != forjado).
+        // Caminho de AGENTE: selection_id VAZIO (sem root_cause de sistema) → o forjado é descartado
+        // e nenhum real é derivado (a seleção manual fica fora do aprendizado, ADR 0049).
+        assert_eq!(
+            field(sel[0], "selection_id"),
+            Some(""),
+            "agente não carrega root_cause → selection_id vazio (forja rejeitada)"
+        );
+        assert_eq!(field(sel[0], "task_kind"), Some("backend:api-leads"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0049: a via de SISTEMA ([`system_skill_select`]) supre o `root_cause` REAL → `SkillSelected`
+    /// com `selection_id` ≠ vazio (entra no aprendizado) e `by_role` server-side. Resolve o teto do
+    /// escopo (a).
+    #[test]
+    fn system_skill_select_stamps_real_selection_id_with_root_cause() {
+        let (mut router, sup, dir) = router_with("skill-auto");
+        let mut ts = TmpStore::new("skill-auto");
+        seed_node_with_role(&sup, &mut ts.store, "@J", "BACKEND");
+        let cands = vec![
+            "senior-backend".to_string(),
+            "tomik-db-doctrine".to_string(),
+        ];
+        let out = router.system_skill_select(
+            &mut ts.store,
+            "@J",
+            "senior-backend",
+            "backend:api",
+            &cands,
+            "turn-1",
+        );
+        assert!(matches!(out, RouteOutcome::Delivered { .. }));
+
+        let events = ts.store.events().unwrap();
+        let sel = recs_of(&events, "SkillSelected");
+        assert_eq!(sel.len(), 1);
+        assert_eq!(field(sel[0], "node"), Some("@J"));
+        assert_eq!(
+            field(sel[0], "by_role"),
+            Some("BACKEND"),
+            "by_role server-side"
+        );
         let sid = field(sel[0], "selection_id").unwrap_or_default();
         assert!(
-            sid.starts_with("sel-") && sid != "sel-FORJADO",
-            "selection_id derivado server-side, não o forjado: {sid}"
+            sid.starts_with("sel-") && !sid.is_empty(),
+            "via de sistema deriva selection_id real (root_cause do turno): {sid}"
         );
-        // task_kind = DADO descritivo do payload (caminho COM retrieval) — preservado.
-        assert_eq!(field(sel[0], "task_kind"), Some("backend:api-leads"));
+        assert_eq!(field(sel[0], "source"), Some("auto"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0049 (desambiguação por-turno): dois turnos distintos (root_cause diferentes) ao mesmo nó
+    /// geram `selection_id` distintos — o `SkillOutcome` de cada um casa com a seleção certa.
+    #[test]
+    fn system_skill_select_disambiguates_by_turn() {
+        let (mut router, sup, dir) = router_with("skill-turns");
+        let mut ts = TmpStore::new("skill-turns");
+        seed_node_with_role(&sup, &mut ts.store, "@J", "BACKEND");
+        let cands = vec!["senior-backend".to_string()];
+        router.system_skill_select(
+            &mut ts.store,
+            "@J",
+            "senior-backend",
+            "backend:api",
+            &cands,
+            "turn-1",
+        );
+        router.system_skill_select(
+            &mut ts.store,
+            "@J",
+            "senior-backend",
+            "backend:api",
+            &cands,
+            "turn-2",
+        );
+
+        let events = ts.store.events().unwrap();
+        let sel = recs_of(&events, "SkillSelected");
+        assert_eq!(sel.len(), 2);
+        let id1 = field(sel[0], "selection_id").unwrap_or_default();
+        let id2 = field(sel[1], "selection_id").unwrap_or_default();
+        assert_ne!(
+            id1, id2,
+            "mesmo nó/skill/task_kind em turnos distintos → selection_id distintos"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
