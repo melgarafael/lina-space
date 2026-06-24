@@ -134,6 +134,16 @@ pub enum AttentionKind {
     /// ao humano "o terminal recebeu?" (#15). Precedência MAIS BAIXA (alerta de monitoramento, nunca
     /// trava um turno); NUNCA aprovável (alerta + foco — o Maestro age re-despachando, não com y/n).
     DeliveredNoProgress,
+    /// F4-WA-5 (ADR 0035 §4 · ADR 0020): uma entrega A2A esgotou retry/retenção e foi para a
+    /// **dead-letter queue** durável (`MessageDeadLettered`) — caso típico: um webhook chegou e o
+    /// terminal-alvo está MORTO/fechado (nunca ficou pronto). É a materialização de "nada some em
+    /// silêncio" (ADR 0020) na superfície do usuário: o evento + o arquivo da DLQ já são duráveis, mas
+    /// sem item na fila o dono do Espaço nunca saberia que um aviso de fora ficou sem casa. OBSERVABILIDADE
+    /// acionável (o retry é MANUAL — ADR 0020 — ou pelo `--resume`, porta aberta não-implementada), NUNCA
+    /// aprovável daqui (não há y/n: re-enfileirar é um gesto fora da fila). Precedência acima do engolido
+    /// (perder a entrega é mais grave que recebê-la-e-não-começar). NUNCA some por TTL (some só quando a
+    /// MESMA `id` for re-entregue — `MessageDelivered` pós-reenfileiramento).
+    DeadLetter,
 }
 
 /// Camada de origem da evidência — confiabilidade NÃO-uniforme por design: `Hook` é
@@ -326,6 +336,20 @@ struct PendingDiskReclaim {
     created_ts: u64,
 }
 
+/// F4-WA-5: uma entrega que aterrissou na dead-letter queue (`MessageDeadLettered`) e aguarda um
+/// gesto humano (re-enfileiramento manual / `--resume`). Indexada por `id` (= `delivery_id` do
+/// webhook ou `msg_` do A2A) — a chave de resolução: `MessageDelivered{id}` pós-reenfileiramento.
+/// NÃO guarda o `reason`: o motivo técnico já é durável no `MessageDeadLettered` do log (a fila é
+/// projeção de exibição LEIGA — zero jargão na superfície, inv #6; quem quer o motivo lê do log).
+#[derive(Debug, Clone)]
+struct PendingDeadLetter {
+    /// `id` da entrega dead-letterada — chave de dedup (replay) E de resolução (re-entrega).
+    id: String,
+    /// Alvo (`to` do evento) — NOME ou `NodeId` serializado; a UI humaniza (UUID→@Nome).
+    to: String,
+    created_ts: u64,
+}
+
 /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
 #[derive(Debug, Default)]
 pub struct AttentionQueue {
@@ -361,6 +385,10 @@ pub struct AttentionQueue {
     /// F3-5-8: propostas de poda de disco pendentes de gesto (entram como `Custody`). Armadas por
     /// `DiskReclaimProposed`, resolvidas por `DiskReclaimExecuted`; dedup por `stable_id`.
     disk_reclaims: Vec<PendingDiskReclaim>,
+    /// F4-WA-5: entregas na DLQ aguardando gesto humano (1 por `id`, dedup no fold). Armadas por
+    /// `MessageDeadLettered`, resolvidas por `MessageDelivered{id}` (re-enfileiramento). NUNCA somem
+    /// por TTL — perder um aviso de fora em silêncio violaria "nada some" (ADR 0020) / inv #6.
+    dead_letters: Vec<PendingDeadLetter>,
 }
 
 impl AttentionQueue {
@@ -459,7 +487,26 @@ impl AttentionQueue {
             // ───────── W3 (ponto-cego do ADR 0019 §4): o alarme do "despacho engolido" ─────────
             // Projeção PURA derivada (SEM evento novo). 3 facetas: ARMAR (entrega), DESARMAR
             // (progresso atribuível — virou trabalho) e ABRIR o ponto-cego (retorno a `Idle`).
-            DomainEvent::MessageDelivered { to, .. } => self.arm_dispatch(&to.to_string(), ts),
+            DomainEvent::MessageDelivered { id, to } => {
+                // F4-WA-5: a MESMA id voltou a ser entregue (re-enfileiramento manual da DLQ, ADR
+                // 0020) → a notificação de dead-letter resolve (some). No-op se id não estava na DLQ.
+                self.dead_letters.retain(|d| d.id != *id);
+                self.arm_dispatch(&to.to_string(), ts);
+            }
+            // ───────── F4-WA-5 (ADR 0035 §4 · ADR 0020): a DLQ NOTIFICA o usuário ─────────
+            // Webhook a um alvo morto (ou A2A que esgotou retry/retenção) → a entrega já é durável na
+            // DLQ (arquivo + evento); a fila de atenção é onde "nada some em silêncio" aparece ao dono
+            // do Espaço. Dedup por `id` (replay defensivo: o mesmo evento reaplicado não duplica).
+            DomainEvent::MessageDeadLettered { id, to, .. } => {
+                if self.dead_letters.iter().any(|d| d.id == *id) {
+                    return; // já registrada (replay/re-apresentação) — idempotente
+                }
+                self.dead_letters.push(PendingDeadLetter {
+                    id: id.clone(),
+                    to: to.clone(),
+                    created_ts: ts,
+                });
+            }
             // `TokenUsageReported` é o sinal POR-TURNO (todo turno real consome tokens; o engolido
             // não roda turno → zero tokens → nunca chega aqui). `node` já é o NodeId serializado.
             DomainEvent::TokenUsageReported { node, .. } => self.remove_dispatch(node),
@@ -947,6 +994,28 @@ impl AttentionQueue {
                 }
             })
         });
+        // F4-WA-5 (ADR 0035 §4 · ADR 0020): entregas na DLQ — tipicamente um aviso de fora (webhook)
+        // que não pôde ser entregue porque o terminal-alvo está morto/fechado. OBSERVABILIDADE
+        // acionável (precede o engolido: perder a entrega é mais grave que recebê-la-e-não-começar),
+        // NUNCA aprovável daqui (`Choice` — o retry é manual/`--resume`, não y/n; defesa em
+        // profundidade: `resolve`/`auto_deny_due` só olham `Yn`). `detail` é copy LEIGA pura — o motivo
+        // técnico fica no log, nunca na superfície (zero jargão, inv #6). PURO de `now_ms` (estado só
+        // muda por `state_of`) ⇒ replay reconstrói a fila idêntica.
+        let dead = self.dead_letters.iter().map(|d| AttentionItem {
+            stable_id: format!("dead-letter:{}", d.id),
+            node_id: d.to.clone(),
+            kind: AttentionKind::DeadLetter,
+            // Copy correta para AMBOS os casos do evento (webhook OU A2A) — `MessageDeadLettered` é
+            // genérico; "mensagem" não mente quando a DLQ não veio de webhook.
+            detail: Some(
+                "não consegui entregar uma mensagem — guardei e dá pra reenviar".to_string(),
+            ),
+            evidence: AttentionEvidence::Hook, // projeção estrutural do log (não-heurística)
+            created_ts: d.created_ts,
+            state: state_of(d.created_ts),
+            prompt_kind: PromptKind::Choice,
+            vt_snapshot_hash: None,
+        });
         // F3-5-8: as propostas de poda compartilham a precedência de `Custody` (gate humano duro). O
         // `node_id` é o pseudo-nó de sistema "disco" — a pressão é do workspace, não de um terminal.
         let disk = self.disk_reclaims.iter().map(|d| AttentionItem {
@@ -967,6 +1036,7 @@ impl AttentionQueue {
         out.extend(round_robin_by_node(spawns.collect()));
         out.extend(round_robin_by_node(guard.collect()));
         out.extend(round_robin_by_node(conflicts.collect()));
+        out.extend(round_robin_by_node(dead.collect()));
         out.extend(round_robin_by_node(swallowed.collect()));
         out
     }
@@ -1099,6 +1169,108 @@ mod tests {
             vt_snapshot_hash: vt_snapshot_hash.map(str::to_string),
             prompt_kind,
         }
+    }
+
+    fn dead_lettered(id: &str, to: &str, reason: &str) -> DomainEvent {
+        DomainEvent::MessageDeadLettered {
+            id: id.into(),
+            to: to.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// F4-WA-5 (gate e): uma mensagem na DLQ (`MessageDeadLettered`) — webhook a um alvo morto —
+    /// vira EXATAMENTE 1 item na fila de atenção (nada some em silêncio), carregando o alvo e
+    /// NUNCA aprovável daqui (retry é manual/`--resume`, não y/n).
+    #[test]
+    fn dead_letter_event_enqueues_one_attention_item() {
+        let mut q = AttentionQueue::new();
+        q.observe(
+            &dead_lettered("wh_1", "@Dev", "alvo morto — tentativas esgotadas"),
+            T0,
+        );
+        let dl: Vec<_> = q
+            .items(T0 + 1_000)
+            .into_iter()
+            .filter(|i| i.kind == AttentionKind::DeadLetter)
+            .collect();
+        assert_eq!(dl.len(), 1, "DLQ → 1 item de atenção (0 perda)");
+        assert_eq!(dl[0].node_id, "@Dev", "o item carrega o alvo (UI humaniza)");
+        assert_ne!(
+            dl[0].prompt_kind,
+            PromptKind::Yn,
+            "DLQ não é aprovável na fila (retry manual/--resume, nunca y/n)"
+        );
+    }
+
+    /// Re-enfileiramento manual (ADR 0020): movido de volta ao outbox e ENTREGUE → a notificação
+    /// resolve (some quando a MESMA `id` recebe `MessageDelivered`). Sem isso o item ficaria preso.
+    #[test]
+    fn dead_letter_resolved_when_same_id_redelivered() {
+        let mut q = AttentionQueue::new();
+        q.observe(&dead_lettered("wh_7", "@Dev", "morto"), T0);
+        assert_eq!(
+            q.items(T0 + 1)
+                .iter()
+                .filter(|i| i.kind == AttentionKind::DeadLetter)
+                .count(),
+            1
+        );
+        // Humano re-enfileira; a entrega ocorre para a MESMA id → notificação resolve.
+        q.observe(
+            &DomainEvent::MessageDelivered {
+                id: "wh_7".into(),
+                to: NodeId::now_v7(),
+            },
+            T0 + 5_000,
+        );
+        assert_eq!(
+            q.items(T0 + 6_000)
+                .iter()
+                .filter(|i| i.kind == AttentionKind::DeadLetter)
+                .count(),
+            0,
+            "re-entregue → a notificação de DLQ some (0 lixo preso)"
+        );
+    }
+
+    /// A resolução é POR `id`: uma entrega de OUTRA mensagem não apaga uma DLQ pendente.
+    #[test]
+    fn dead_letter_not_resolved_by_unrelated_delivery() {
+        let mut q = AttentionQueue::new();
+        q.observe(&dead_lettered("wh_a", "@Dev", "morto"), T0);
+        q.observe(
+            &DomainEvent::MessageDelivered {
+                id: "wh_b".into(), // id DIFERENTE
+                to: NodeId::now_v7(),
+            },
+            T0 + 1_000,
+        );
+        assert_eq!(
+            q.items(T0 + 2_000)
+                .iter()
+                .filter(|i| i.kind == AttentionKind::DeadLetter)
+                .count(),
+            1,
+            "entrega de outra msg não resolve esta DLQ"
+        );
+    }
+
+    /// Replay defensivo / idempotência: o MESMO `MessageDeadLettered` reaplicado (e a fila
+    /// reconstruída do log) não duplica o item — `AttentionQueue::replay ≡ observe ao vivo`.
+    #[test]
+    fn dead_letter_dedup_on_replay() {
+        let mut q = AttentionQueue::new();
+        q.observe(&dead_lettered("wh_x", "@Dev", "morto"), T0);
+        q.observe(&dead_lettered("wh_x", "@Dev", "morto"), T0 + 10); // re-aplicação (replay)
+        assert_eq!(
+            q.items(T0 + 1_000)
+                .iter()
+                .filter(|i| i.kind == AttentionKind::DeadLetter)
+                .count(),
+            1,
+            "DLQ deduplicada por id (replay idempotente)"
+        );
     }
 
     /// Critério da story (teste headless do round-robin): nó A flooda 3 pedidos; o

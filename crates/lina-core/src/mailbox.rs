@@ -56,12 +56,15 @@ pub const MAX_MSG_BYTES: u64 = 256 * 1024;
 /// O excedente, já ordenado, fica para o próximo `drain`.
 pub const MAX_DRAIN_BATCH: usize = 256;
 
-/// `true` se `s` é um id de mensagem SEGURO: prefixo `msg_` + só `[A-Za-z0-9_-]` (não-vazio). Barra
-/// de uma vez (A1) a forja de linhas do bloco (`\n`, `:`, espaço, `[`) e (B1) o path-traversal no
-/// nome do arquivo (`/`, `..`, `\`). Aceita o hífen do UUID v7 (`msg_<uuid>`) — a forma literal
-/// `[A-Za-z0-9]+` rejeitaria os hifens do UUID e barraria toda mensagem legítima.
+/// `true` se `s` é um id de mensagem SEGURO: prefixo `msg_` (A2A) OU `wh_` (entrega de webhook,
+/// F4-WA `dispatch_webhook`) + só `[A-Za-z0-9_-]` (não-vazio). Barra de uma vez (A1) a forja de
+/// linhas do bloco (`\n`, `:`, espaço, `[`) e (B1) o path-traversal no nome do arquivo (`/`, `..`,
+/// `\`). Aceita o hífen do UUID v7 — a forma literal `[A-Za-z0-9]+` rejeitaria os hifens e barraria
+/// toda mensagem legítima. **F4-WA-5:** sem aceitar `wh_`, o DLQ de um webhook a alvo morto era
+/// recusado e a mensagem sumia em silêncio (violava 0-perda, gate (e)); o charset do resto é
+/// IDÊNTICO ao de `msg_` — a guarda de forja/path-traversal continua intacta.
 fn valid_msg_id(s: &str) -> bool {
-    match s.strip_prefix("msg_") {
+    match s.strip_prefix("msg_").or_else(|| s.strip_prefix("wh_")) {
         Some(rest) => {
             !rest.is_empty()
                 && rest
