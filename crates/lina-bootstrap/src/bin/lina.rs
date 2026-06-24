@@ -1790,9 +1790,10 @@ fn run_skill_check(path: Option<&String>) -> ExitCode {
     }
 }
 
-/// `lina skill select --context <txt> [--have <tool>]...` — roda o seletor PURO sobre o índice
-/// (catálogo + `.claude/skills`) filtrado pelas tools presentes; enfileira `skill.select` por skill
-/// que casou.
+/// `lina skill select --context <txt> [--have <tool>]...` — caminho de seleção COM RETRIEVAL
+/// (ADR 0045 R45-EMIT): ranqueia o índice por relevância léxica (C1) + histórico de outcome do log
+/// (C2), escolhe a top-1 e enfileira UM `skill.select` enriquecido com {query, task_kind,
+/// candidates}. node/by_role/selection_id são carimbados SERVER-SIDE pelo router.
 fn run_skill_select(args: &[String]) -> ExitCode {
     let (scalars, have) = parse_kv_flags(args, "--have");
     let Some(context) = scalars.get("--context") else {
@@ -1806,31 +1807,47 @@ fn run_skill_select(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // Papel do próprio terminal: roster (agents.json) com fallback à descoberta determinística.
+    // É o `role` que ancora o `task_kind` (canon(role):top-termos) e o ranking por outcome.
+    let role = roster_roles()
+        .into_iter()
+        .find(|(name, _)| *name == from)
+        .map(|(_, r)| r)
+        .unwrap_or_else(|| canonical_role(&from));
     let present: std::collections::BTreeSet<String> = have.into_iter().collect();
     let index = lina_bootstrap::skills::build_skill_index(Some(Path::new(".claude/skills")));
-    let selections = lina_core::skill_index::select(&index, &present, context);
-    if selections.is_empty() {
+    // Histórico de outcome (C2): projeção SÓ-LEITURA do event log — mesma leitura de `lina mentality`.
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let scores = lina_core::skill_index::outcome_scores(&parse_log_records(&content));
+    // top-k candidatos por relevância+outcome; a top-1 é a escolha viva.
+    const TOP_K: usize = 8;
+    let ranked =
+        lina_core::skill_index::rank_with_outcome(&index, &present, context, &role, TOP_K, &scores);
+    let Some(chosen) = ranked.first() else {
         println!("nenhuma skill casou o contexto (com as tools presentes)");
         return ExitCode::SUCCESS;
-    }
+    };
+    let task_kind = lina_core::skill_index::task_kind(&role, context);
+    let candidates: Vec<String> = ranked.iter().map(|r| r.name.clone()).collect();
+    let msg = lina_bootstrap::skills::build_skill_select_envelope(
+        &from,
+        &chosen.name,
+        None, // o retrieval pontua a descrição inteira — não casa um gatilho específico
+        "catalog",
+        context,
+        &task_kind,
+        &candidates,
+    );
     let mailbox = Mailbox::new(mailbox_root());
-    for sel in &selections {
-        let msg = lina_bootstrap::skills::build_skill_select_envelope(
-            &from,
-            &sel.name,
-            sel.trigger.as_deref(),
-            "catalog",
-        );
-        if let Err(e) = enqueue_per_node(&mailbox, &from, &msg) {
-            eprintln!("lina: falha ao enfileirar skill.select: {e}");
-            return ExitCode::from(1);
-        }
-        println!(
-            "ok: skill '{}' selecionada (gatilho: {})",
-            sel.name,
-            sel.trigger.as_deref().unwrap_or("-")
-        );
+    if let Err(e) = enqueue_per_node(&mailbox, &from, &msg) {
+        eprintln!("lina: falha ao enfileirar skill.select: {e}");
+        return ExitCode::from(1);
     }
+    println!(
+        "ok: skill '{}' selecionada (relevância+histórico; {} candidatos)",
+        chosen.name,
+        candidates.len()
+    );
     ExitCode::SUCCESS
 }
 

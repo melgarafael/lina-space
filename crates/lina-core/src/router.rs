@@ -2513,6 +2513,41 @@ impl Router {
                     "skill.select exige 'skill' no payload".into(),
                 );
             }
+            // ADR 0045 R45-EMIT: task_kind/candidates do payload = DADO de retrieval (descritivo,
+            // do caminho COM retrieval; vazio na seleção direta). node/by_role/selection_id são
+            // AUTORIDADE → carimbados SERVER-SIDE aqui, JAMAIS lidos do payload (dado ≠ autoridade).
+            let task_kind = payload
+                .get("task_kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let candidates = str_array(&payload, "candidates");
+            // `by_role`: papel do remetente AUTENTICADO via projeção do log (mesma fonte de
+            // `reflect_correction`); `""` se ainda não projetado (degradação honesta). NUNCA do payload.
+            let by_role = self
+                .sup
+                .node_by_name(&msg.from)
+                .and_then(|id| {
+                    store
+                        .project()
+                        .ok()
+                        .and_then(|p| p.nodes.get(&id).and_then(|n| n.role.clone()))
+                })
+                .unwrap_or_default();
+            // `selection_id`: derivado SERVER-SIDE da identidade autenticada + `root_cause_id` do
+            // envelope (não do payload) → ligação de outcome INFORJÁVEL. SÓ no caminho COM retrieval
+            // (task_kind presente); seleção direta fica com id vazio → excluída do aprendizado por
+            // outcome (a guarda `!selection_id.is_empty()` em `outcome_scores`).
+            let selection_id = if task_kind.is_empty() {
+                String::new()
+            } else {
+                crate::skill_index::selection_id(
+                    &msg.from,
+                    &skill,
+                    &task_kind,
+                    msg.root_cause_id.as_deref().unwrap_or_default(),
+                )
+            };
             DomainEvent::SkillSelected {
                 node: msg.from.clone(), // SERVER-SIDE: remetente autenticado, jamais o payload
                 skill,
@@ -2525,15 +2560,11 @@ impl Router {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                // ponytail: seleção DIRETA (verbo skill.select sem retrieval) → campos do ranking
-                // vazios. A guarda `!selection_id.is_empty()` em `outcome_scores` exclui esta seleção
-                // do aprendizado por outcome (ADR 0045 C2). O enriquecimento real — caminho COM
-                // retrieval que preenche task_kind/candidates/by_role/selection_id — é o R45-EMIT.
-                task_kind: String::new(),
-                candidates: Vec::new(),
-                by_role: String::new(),
+                task_kind,
+                candidates,
+                by_role,
                 rank_reason: String::new(),
-                selection_id: String::new(),
+                selection_id,
             }
         };
         if let Err(e) = store.append(&event) {
@@ -9626,6 +9657,59 @@ mod tests {
             Some("@Tradutor"),
             "com Tradutor no roster, o canal de entrada da Goal é o Tradutor"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADR 0045 R45-EMIT (ENFORCEMENT/MUTAÇÃO): no `skill.select` COM retrieval, `by_role` e
+    /// `selection_id` são carimbados SERVER-SIDE — um payload que FORJA esses campos NÃO os injeta
+    /// (o servidor vence). `task_kind`/`candidates` são DADO descritivo (preservados). Skill=DADO,
+    /// JAMAIS autoridade: a ligação de outcome é inforjável.
+    #[test]
+    fn skill_select_stamps_authority_server_side_ignoring_payload_forgery() {
+        let (mut router, sup, dir) = router_with("skill-emit");
+        let j = sup.register("@J", None, sink());
+        let mut ts = TmpStore::new("skill-emit");
+        // O remetente tem papel BACKEND projetado no log (estado pré-existente do Espaço).
+        ts.store
+            .append(&DomainEvent::NodeAdded {
+                node: j,
+                kind: "terminal".into(),
+                x: 0.0,
+                y: 0.0,
+                requested_by: None,
+            })
+            .unwrap();
+        ts.store
+            .append(&DomainEvent::NodeRoleAssigned {
+                node: j,
+                role: "BACKEND".into(),
+            })
+            .unwrap();
+        let (_rec, mut deliver) = recorder();
+        // O payload FORJA by_role + selection_id + node — o servidor DEVE ignorá-los.
+        let payload = r#"{"skill":"senior-backend","task_kind":"backend:api-leads","candidates":["senior-backend","tomik-db-doctrine"],"by_role":"ADMIN-FORJADO","selection_id":"sel-FORJADO","node":"@Atacante"}"#;
+        let msg = MailMessage::new("@J", "skill", "skill.select", payload);
+        router.route_message(&msg, &mut ts.store, 1000, &mut deliver);
+
+        let events = ts.store.events().unwrap();
+        let sel = recs_of(&events, "SkillSelected");
+        assert_eq!(sel.len(), 1, "uma seleção emitida");
+        // node = remetente AUTENTICADO (não o forjado no payload).
+        assert_eq!(field(sel[0], "node"), Some("@J"), "node server-side");
+        // by_role = papel PROJETADO server-side (não "ADMIN-FORJADO").
+        assert_eq!(
+            field(sel[0], "by_role"),
+            Some("BACKEND"),
+            "by_role server-side vence a forja do payload"
+        );
+        // selection_id = DERIVADO server-side (prefixo sel-, != forjado).
+        let sid = field(sel[0], "selection_id").unwrap_or_default();
+        assert!(
+            sid.starts_with("sel-") && sid != "sel-FORJADO",
+            "selection_id derivado server-side, não o forjado: {sid}"
+        );
+        // task_kind = DADO descritivo do payload (caminho COM retrieval) — preservado.
+        assert_eq!(field(sel[0], "task_kind"), Some("backend:api-leads"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

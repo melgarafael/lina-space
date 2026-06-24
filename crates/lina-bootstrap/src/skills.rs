@@ -249,21 +249,28 @@ fn read_disk_skills(root: &Path) -> Vec<SkillIndexEntry> {
         .collect()
 }
 
-/// Monta o envelope `skill.select` (F3-5-4): o supervisor emite `SkillSelected{node,...}`
-/// carimbando o `node` SERVER-SIDE (identidade autenticada) — o payload NUNCA carrega `node`
-/// (dado forjável ≠ autoridade, igual `code.changed` omite `author_node`). `source` = de onde a
-/// skill veio (catálogo/hub/fábrica).
+/// Monta o envelope `skill.select` (F3-5-4 + ADR 0045 R45-EMIT): o supervisor emite
+/// `SkillSelected{node,...}` carimbando `node`/`by_role`/`selection_id` SERVER-SIDE (identidade
+/// autenticada) — o payload NUNCA carrega esses (dado forjável ≠ autoridade, igual `code.changed`
+/// omite `author_node`). `query`/`task_kind`/`candidates` são DADO de retrieval (descritivo, do
+/// caminho COM retrieval): alimentam a projeção de outcome (C2), nunca a autoridade.
 #[must_use]
 pub fn build_skill_select_envelope(
     from: &str,
     skill: &str,
     trigger: Option<&str>,
     source: &str,
+    query: &str,
+    task_kind: &str,
+    candidates: &[String],
 ) -> MailMessage {
     let payload = serde_json::json!({
         "skill": skill,
         "trigger": trigger,
         "source": source,
+        "query": query,
+        "task_kind": task_kind,
+        "candidates": candidates,
     })
     .to_string();
     MailMessage::new(from, SKILL_TARGET, "skill.select", payload)
@@ -712,15 +719,21 @@ mod tests {
         );
     }
 
-    /// CRITÉRIO DE ACEITE: o envelope de seleção carrega skill/trigger/source e OMITE o `node`
-    /// (carimbado server-side, igual `code.changed` omite o autor).
+    /// CRITÉRIO DE ACEITE: o envelope de seleção carrega skill/trigger/source + o DADO de retrieval
+    /// (query/task_kind/candidates) e OMITE node/by_role/selection_id (carimbados server-side).
     #[test]
-    fn select_envelope_omits_node_and_carries_selection() {
+    fn select_envelope_omits_authority_and_carries_retrieval_data() {
         let msg = build_skill_select_envelope(
             "Terminal J",
             "lina-code-doctrine",
             Some("conserta esse bug"),
             "catalog",
+            "conserta esse bug no login",
+            "developer:bug-conserta-login",
+            &[
+                "lina-code-doctrine".to_string(),
+                "lina-cold-review".to_string(),
+            ],
         );
         assert_eq!(msg.intent, "skill.select");
         assert_eq!(
@@ -731,9 +744,15 @@ mod tests {
         assert_eq!(p["skill"], "lina-code-doctrine");
         assert_eq!(p["trigger"], "conserta esse bug");
         assert_eq!(p["source"], "catalog");
+        assert_eq!(p["query"], "conserta esse bug no login");
+        assert_eq!(p["task_kind"], "developer:bug-conserta-login");
+        assert_eq!(p["candidates"][0], "lina-code-doctrine");
+        // node/by_role/selection_id são AUTORIDADE → carimbados server-side, nunca do payload.
+        assert!(p.get("node").is_none(), "node é SERVER-SIDE");
+        assert!(p.get("by_role").is_none(), "by_role é SERVER-SIDE");
         assert!(
-            p.get("node").is_none(),
-            "node é carimbado SERVER-SIDE, nunca vem do payload"
+            p.get("selection_id").is_none(),
+            "selection_id é SERVER-SIDE"
         );
     }
 
