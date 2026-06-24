@@ -233,8 +233,10 @@ pub fn check_action(cmd: &str, autonomy: AutonomyLevel) -> GateDecision {
 // Rodar shell de uma SKILL.md (`!`cmd``, expandido na carga) é EXECUTAR CÓDIGO NÃO-CONFIÁVEL —
 // para usuário leigo, skill instalada de hub é vetor de ataque. O conteúdo da skill é DADO; o
 // inline-shell é o ÚNICO ponto que vira código. Tratamos sua CARGA com a MESMA régua das ações
-// de shell (`classify`/`decide`): inline-shell = piso `gated-hard` → gate humano antes de
-// carregável, em TODO nível (autônomo NUNCA afrouxa). Sem inline-shell, a skill é só texto → allow.
+// de shell (`classify`/`decide`): inline-shell = piso `gated-soft` (libera no autônomo, confirma
+// em manual/assistido) E o comando embutido perigoso ELEVA para `gated-hard` (gate em todo nível).
+// Sem inline-shell, a skill é só texto → allow. (Piso afrouxado hard→soft: decisão do fundador
+// 2026-06-24 — carregar habilidade que roda comando travava demais; o conteúdo perigoso segue hard.)
 
 /// Os comandos de cada snippet inline-shell `!`...`` numa SKILL.md (Hermes C.2): o `!` seguido
 /// de um comando entre crases, expandido na carga. Devolve os comandos na ordem; vazio = a skill
@@ -255,22 +257,58 @@ pub fn inline_shell_commands(skill_md: &str) -> Vec<String> {
 }
 
 /// A classe de RISCO de CARREGAR uma skill (Hermes C.2). Sem inline-shell → `Routine` (a skill é
-/// DADO). COM inline-shell → PISO `GatedHard`: código não-confiável de origem externa precisa de
-/// gate humano antes de carregável, e o autônomo NUNCA afrouxa. O comando embutido mais severo
-/// (via [`classify`]) só CONFIRMA o piso — mesmo um snippet benigno (`!`date``) exige revisão.
+/// DADO). COM inline-shell → PISO `GatedSoft` (o autônomo carrega sozinho; manual/assistido
+/// confirmam), MAS dois vetores ELEVAM para `GatedHard` (gate em TODO nível, inclusive autônomo):
+/// (a) comando intrinsecamente perigoso embutido (`rm -rf`, `deploy`, `curl` externo… via
+/// [`classify`]); (b) ACESSO A SEGREDO/CREDENCIAL ([`command_touches_secret`]) — `cat ~/.aws/...`
+/// é exfiltração, que o `classify` de shell não enxerga como hard (o verbo `cat` é benigno).
+///
+/// Decisão do fundador (2026-06-24): carregar habilidade que roda comando interrompia demais no
+/// uso normal. O piso virou `GatedSoft` (libera no autônomo) SEM abrir o caso perigoso — comando
+/// perigoso e leitura de segredo seguem `GatedHard`. Antes o piso era `GatedHard` para TUDO.
 #[must_use]
 pub fn classify_skill_load(skill_md: &str) -> ActionClass {
     let cmds = inline_shell_commands(skill_md);
     if cmds.is_empty() {
         return ActionClass::Routine;
     }
-    // Inline-shell presente: piso `GatedHard` (`.max(GatedHard)`) ainda que o comando seja
-    // benigno — a origem não-confiável é o que pesa. O mais severo só confirma o teto.
+    // Exfiltração na carga (ler chave/credencial) é o vetor que o `classify` de shell NÃO captura
+    // (o verbo `cat`/`echo` é benigno) — barra ANTES do piso: skill de hub que toca segredo nunca
+    // carrega sem gate humano, em nível algum.
+    if cmds.iter().any(|c| command_touches_secret(c)) {
+        return ActionClass::GatedHard;
+    }
+    // Demais: piso `GatedSoft` (libera no autônomo) e o comando perigoso eleva para `GatedHard`.
     cmds.iter()
         .map(|c| classify(c))
         .max()
-        .unwrap_or(ActionClass::GatedHard)
-        .max(ActionClass::GatedHard)
+        .unwrap_or(ActionClass::GatedSoft)
+        .max(ActionClass::GatedSoft)
+}
+
+/// Heurística de exfiltração para a CARGA de skill: o comando embutido toca um caminho/arquivo de
+/// SEGREDO (chaves SSH/GPG, credenciais de nuvem, `.env`, tokens). Skill de hub que LÊ segredo na
+/// carga é vetor de exfiltração — eleva a `GatedHard` mesmo que o verbo (`cat`/`echo`) seja benigno
+/// para o [`classify`] de shell. Conservador: um falso-positivo só PEDE confirmação (lado seguro).
+fn command_touches_secret(cmd: &str) -> bool {
+    const SECRET_MARKERS: &[&str] = &[
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".netrc",
+        "id_rsa",
+        "id_ed25519",
+        "credentials",
+        "secret",
+        "/.env",
+        ".pem",
+        "keychain",
+        "private_key",
+        "api_key",
+        "apikey",
+    ];
+    let lower = cmd.to_ascii_lowercase();
+    SECRET_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// O veredito de CARREGAR uma skill sob um nível de autonomia (Hermes C.2): [`classify_skill_load`]
@@ -1126,18 +1164,51 @@ mod tests {
         assert!(inline_shell_commands("trecho !`comando sem fechar\n").is_empty());
     }
 
-    /// CRITÉRIO DE ACEITE: skill com inline-shell é barrada pelo guard ANTES de carregar — mesmo
-    /// um snippet BENIGNO (`date`) exige gate humano, porque a ORIGEM (skill de hub) é não-confiável.
+    /// Decisão do fundador (2026-06-24): skill com inline-shell BENIGNO (`date`) é `GatedSoft` — o
+    /// autônomo carrega sozinho (menos travas no uso normal), mas manual/assistido ainda confirmam
+    /// (origem de hub é não-confiável). É o conteúdo perigoso que eleva para `GatedHard` (testes abaixo).
     #[test]
-    fn skill_with_benign_inline_shell_is_gated_hard() {
+    fn skill_with_benign_inline_shell_is_gated_soft() {
         let md = "Contexto fresco: !`date +%s`\n";
-        assert_eq!(classify_skill_load(md), ActionClass::GatedHard);
+        assert_eq!(classify_skill_load(md), ActionClass::GatedSoft);
+        // No autônomo, libera; em manual/assistido, ainda pede.
+        assert_eq!(
+            skill_load_decision(md, AutonomyLevel::Autonomous),
+            Decision::Allow
+        );
+        assert_eq!(
+            skill_load_decision(md, AutonomyLevel::Assisted),
+            Decision::Ask
+        );
     }
 
     #[test]
     fn skill_with_destructive_inline_shell_is_gated_hard() {
         let md = "Limpeza: !`rm -rf $HOME`\n";
         assert_eq!(classify_skill_load(md), ActionClass::GatedHard);
+    }
+
+    /// SEGURANÇA — a decisão do fundador (2026-06-24, piso soft) NÃO abre exfiltração: skill cujo
+    /// inline-shell LÊ segredo (`cat ~/.aws/credentials`) é `GatedHard` mesmo com verbo benigno
+    /// (`cat`), e o autônomo NÃO afrouxa. É o vetor que o classify de shell não pega sozinho.
+    #[test]
+    fn skill_reading_secret_is_gated_hard_even_for_benign_verb() {
+        for md in [
+            "Contexto: !`cat ~/.aws/credentials`\n",
+            "Chave: !`cat ~/.ssh/id_rsa`\n",
+            "Env: !`cat /app/.env`\n",
+        ] {
+            assert_eq!(
+                classify_skill_load(md),
+                ActionClass::GatedHard,
+                "ler segredo na carga é gated-hard: {md:?}"
+            );
+            assert_eq!(
+                skill_load_decision(md, AutonomyLevel::Autonomous),
+                Decision::Ask,
+                "ler credencial na carga NUNCA carrega sozinho, nem no autônomo: {md:?}"
+            );
+        }
     }
 
     /// CRITÉRIO DE ACEITE: o autônomo NUNCA afrouxa o gate de carga de skill com inline-shell.

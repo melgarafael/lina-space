@@ -1769,12 +1769,24 @@ fn run_skill_check(path: Option<&String>) -> ExitCode {
         Ok(()) => println!("formato: ok"),
         Err(e) => println!("formato: INVALIDO — {e}"),
     }
-    if check.load_class == lina_core::ActionClass::Routine {
-        println!("carga: liberada (skill e so dado, sem inline-shell)");
-        ExitCode::SUCCESS
-    } else {
-        println!("carga: GATE HUMANO — a skill tem inline-shell (codigo nao-confiavel); revise antes de habilitar");
-        ExitCode::from(3)
+    // Decisão do fundador (2026-06-24): a carga segue a RÉGUA DE AUTONOMIA (`decide`), não mais
+    // "qualquer inline-shell = gate". Skill só-dado ou inline-shell benigno (piso gated-soft) carrega
+    // sozinha no autônomo; manual/assistido confirmam; conteúdo perigoso ou leitura de segredo
+    // (gated-hard) pede gate em TODO nível. A autonomia vem do env do PTY (`LINA_AUTONOMY`).
+    let autonomy = parse_autonomy(&autonomy_from_env()).unwrap_or(lina_core::AutonomyLevel::Assisted);
+    match lina_core::decide(check.load_class, autonomy) {
+        lina_core::Decision::Allow if check.load_class == lina_core::ActionClass::Routine => {
+            println!("carga: liberada (skill e so dado, sem inline-shell)");
+            ExitCode::SUCCESS
+        }
+        lina_core::Decision::Allow => {
+            println!("carga: liberada (inline-shell benigno + autonomia autonoma)");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            println!("carga: GATE HUMANO — a skill tem inline-shell de risco (codigo nao-confiavel/segredo); revise antes de habilitar");
+            ExitCode::from(3)
+        }
     }
 }
 
