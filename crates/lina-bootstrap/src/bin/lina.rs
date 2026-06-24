@@ -24,8 +24,8 @@ use lina_core::mentality::{BeliefStatus, Mentality, PromotionPolicy};
 use lina_core::scrollback::ScrollbackStore;
 use lina_core::{
     check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, AgentPresence,
-    CheckKind, DomainEvent, EventStore, Goal, GoalPhase, HandoffContract, MailMessage, Mailbox,
-    NodeId, ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
+    CheckKind, DomainEvent, EventRecord, EventStore, Goal, GoalPhase, HandoffContract, MailMessage,
+    Mailbox, NodeId, ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -68,6 +68,7 @@ fn main() -> ExitCode {
         Some("clue") => run_clue(&args[1..]),
         Some("disk") => run_disk(&args[1..]),
         Some("template") => run_template(&args[1..]),
+        Some("webhook") => run_webhook(&args[1..]),
         _ => {
             usage();
             ExitCode::from(2)
@@ -77,7 +78,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina do <canal> <acao> [args]   (F4-0-3: efeito externo de um canal (verbo brokerado InsForge); o\n   segredo vive so em channel:<canal> no cofre. O agente REGISTRA + ActionGated{{ask}}; NAO executa.)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
+        "uso:\n  lina whoami [--bootstrap]\n  lina ask @<alvo> \"<msg>\" [--await] [--intent ask|handoff|broadcast|...] [--role PAPEL] [--reply-to <id>]\n  lina handoff @<alvo> \"<tarefa>\" [--context <arquivo>] [--ref plan:<id>] [--timeout-sec N] [--await]\n   (F1-0-6: delega COM contrato estruturado lina/msg@2 — schema de entrada/saida, timeout, retry;\n    --context ANEXA o conteudo do arquivo ao payload. Fire-and-forget por padrao; acompanhe com\n    `lina check`. Em autonomia manual o proprio comando recusa — delegacao bloqueada localmente.)\n  lina check @<alvo>   (F1-0-6: estado VIVO do colega — Ready/Busy/Idle/Blocked/Dead + motivo da\n   ultima transicao + travamento (ADR 0019) + ultima atividade A2A. LEITURA PURA de agents.json +\n   log.jsonl: nao injeta NADA no terminal do colega.)\n  lina history @<colega> [--tail N] [--offset K] [--search \"<regex>\" [--limit N] [--cursor I]]\n   [--export json|txt --from A --to B] [--json]   (#15: o Maestro VE a tela do colega — leitura PURA\n   do scrollback pela fronteira de pertencimento (ADR 0006): membro do mesmo Espaco le, fora dela e\n   barrado + auditado. Default imprime as ultimas linhas; --json devolve o formato do contrato F1.\n   NAO injeta nada — espiar != cutucar, igual `lina check`.)\n  lina broadcast \"*\" \"<msg>\"   (avisa TODOS os terminais vivos; --role PAPEL p/ um papel. ADR0007:\n   o fan-out INICIAL pedido pelo humano entrega a todos SEM gate; a CASCATA (re-espalhar) pede ok.)\n  lina handshake\n  lina plan read | claim <id> | check <id> | add <id> \"<desc>\" [--goal G] [--parents T1,T2] [--accept \"<>\"] [--budget N] | seed <goal_id>\n  lina guard --check-action --cmd \"<comando>\" --autonomy <manual|assistido|autonomo>\n  lina guard --pretooluse   (hook PreToolUse do Claude Code: le JSON no stdin, emite a decisao em JSON no stdout)\n  lina resume   (W3-7c: PEDE retomada do teto de custo; o agente NAO des-pausa — gate humano na janela)\n  lina do <deploy|pay|send> [args]   (W3-6c: acao custodiada; o agente REGISTRA, NAO executa)\n  lina do <canal> <acao> [args]   (F4-0-3: efeito externo de um canal (verbo brokerado InsForge); o\n   segredo vive so em channel:<canal> no cofre. O agente REGISTRA + ActionGated{{ask}}; NAO executa.)\n  lina list [--json]   (W4-2: lista os agentes do workspace — nome/papel/status do agents.json)\n  lina vault path | index | read <nota> | search <termo>   (segundo cerebro: le os vault(s) Obsidian\n   linkados no onboarding em .lina/vault.json; `index` mostra o mapa estrutural PageIndex; `read`/`search`\n   acessam as notas. Comece por `index` para NAVEGAR antes de abrir notas.)\n  lina spawn @<Nome> --role <papel> [--prompt \"<1o prompt>\"]   (F1-3-6: PEDE criar um terminal novo\n   quando falta um papel. Gate inforjavel: ORIGEM ok; CASCATA/cap/custo pedem aval humano; manual\n   recusa. A criacao fisica e do Espaco — voce NAO cunha o terminal.)\n  lina retro [--json] [--now-ms <ms>]   (F1-3-7: auto-aprimoramento v0. Le o event log (SO-LEITURA) e\n   emite um RELATORIO deterministico de projecoes: skills (uso/stale>30d/archive>90d), coordenacao\n   (bloqueios/spawns gated/re-delegacoes/breaker), custos por terminal+outliers, pedidos de origem e\n   lacunas de papel. ZERO LLM: quem PROPOE melhorias e o agente (skill lina-retro), com gate humano.\n   So OBSERVA e SUGERE — nao existe `lina retro apply`; arquivar/fixar/mudar passa pelo humano.)\n  lina mentality [--json]   (F3-3: o HISTORICO de aprendizados — o que cada PAPEL ja aprendeu com voce\n   (estabelecidas='ja vale' + provisorias='ainda testando'), de TODOS os papeis (nao so os do roster\n   vivo, que o painel mostra), com a proveniencia humanizada. Le o log (SO-LEITURA), ZERO LLM, sem append.)\n  lina params show | set <chave> <valor> --scope <escopo> [--target <alvo>] | reset <chave> --scope <escopo>\n   (F3-0-5: parametros de orquestracao versionados. show projeta o log (SO-LEITURA); set/reset enfileiram\n    p/ o supervisor validar a faixa, carimbar a origem e aplicar. escopos: global|workspace|preset|terminal;\n    em autonomia manual o proprio comando recusa.)\n  lina effort @<Nome> <low|medium|high>   (F3-0-5: define o nivel de raciocinio (cognicao) de um terminal;\n   enfileira p/ o supervisor resolver o alvo, validar e aplicar. manual recusa; auto-atribuicao e barrada server-side.)\n  lina goal define \"<meta>\" [--budget N] [--accept \"<criterio>\"]... | interpret <goal_id> --understanding \"<>\" --strategy \"<>\" [--team A,B] [--accept ...] | confirm <goal_id> | status <goal_id> [--json]\n   (F3-1: a Meta como primitiva. define/interpret/confirm ENFILEIRAM o intent (o supervisor cunha o goal_id,\n    valida o ciclo e emite os eventos); status le a projecao da Goal (SO-LEITURA). manual recusa as mutacoes.)\n  lina code-changed --branch <b> --commit <sha> [--path <p>]...   (F3-4-2: o hook git pos-commit da\n   worktree chama este verbo com os fatos do commit (diff-tree); o bin enfileira code.changed e o\n   supervisor carimba o author_node SERVER-SIDE e emite CodeChanged. O autor NUNCA vem do payload.)\n  lina branch-integrated --branch <b> --into <dst> --commit <sha>   (F3-4-5: o DevOps integrador chama\n   apos um merge PROVADO; enfileira branch.integrated -> BranchIntegrated (unica prova de branch fechada).)\n  lina skill <check <path> | select --context \"<txt>\" [--have <tool>]... | propose <nome> [--ref <url>]...>\n   (F3-5-4/5: check valida formato+inline-shell (SO-LEITURA); select casa a skill e enfileira skill.select\n    -> SkillSelected (node SERVER-SIDE); propose enfileira skill.propose -> SkillFactoryProposed (sugere, gate humano).)\n  lina clue <list | define <scope> [--path <p>]... [--label <l>] | clear <scope>>   (F3-5-6: pistas que a\n   IA enxerga por projeto. list le o log (SO-LEITURA); define/clear enfileiram -> ClueSetDefined. Pista=DADO.)\n  lina check --buffers   (F3-5-7: ocupacao de TODOS os buffers, derivada do log (SO-LEITURA).)\n  lina disk <status | reclaim>   (F3-5-8: status le pressao/proposta do log (SO-LEITURA); reclaim e gesto\n   CUSTODIADO -> fila de broker (ZERO bytes apagados sem confirmacao HUMANA; approved_by nao e autoridade).)\n  lina template <list | create <slug>>   (F3-5-10: list mostra os gabaritos embutidos; create instancia o\n   gabarito no Espaco atual (semeia roster+params+pistas+backlog no log).)\n  lina webhook <list [--json] | show <id>>   (F4-WA-2b: avisos de fora (webhooks) deste Espaco. list/show\n   projetam o event log (SO-LEITURA) -- nome do alvo, instrucao, nivel, recebimentos; NUNCA a senha.)\n\n  (--reply-to <id>: responde a uma pergunta --await; fecha o await do colega)\n  (resume: registra resume.request na fila de broker por-no; o supervisor apenda CostCeilingResumed SO\n   apos confirmacao HUMANA na janela (Cmd+Enter). O agente, sozinho, NUNCA tira do estado Paused.)\n  (guard --check-action: imprime allow|ask|deny; apenda ActionGated ao log quando NAO for allow)\n  (guard --pretooluse: autonomia via LINA_AUTONOMY (default assistido); fail-safe ask em erro)\n  (do: gated-hard-external; o segredo vive so no SecretVault do Lina. O agente nao tem o token nem\n   confirmacao -> registra o pedido + apenda ActionGated{{ask}}+BrokerDenied{{unconfirmed}}; quem executa\n   COM o segredo, apos gate humano, e o supervisor/broker. Custodia = camada inquebravel, ADR 0004.)"
     );
 }
 
@@ -3930,6 +3931,346 @@ fn run_resume(_args: &[String]) -> ExitCode {
             );
             ExitCode::from(1)
         }
+    }
+}
+
+// ───────────────────────────── F4-WA-2b · lina webhook (avisos de fora) ─────────────────────────────
+//
+// Verbos de leitura do CLI sobre os webhooks ativos do Espaço. `list`/`show` são projeção PURA do
+// event log compartilhado (`<LINA_HOME>/events/log.jsonl`) — o MESMO que o app escreve — via
+// `lina-core` (já linkado). O **secret HMAC NUNCA toca o log** (invariante #2): a projeção lê só os
+// campos conhecidos da config, então não há por onde vazá-lo (`show` é seguro por construção).
+//
+// `add`/`test`/`rm` NÃO entram aqui: exigem capacidades que este binário deliberadamente NÃO tem
+// (cliente HTTP + HMAC + acesso ao cofre — o agente nunca segura segredo, ADR 0004) + a porta viva
+// do listener (efêmera, na memória do app, não publicada em disco) + o evento `WebhookRemoved`
+// (contrato congelado). Costura sinalizada ao Maestro 01 (FASE B).
+
+/// Projeção de UM webhook ("aviso de fora") derivada do event log — **sem o secret** (ele só vive no
+/// cofre + no retorno mostrado 1× na criação; nunca no disco). É o que `lina webhook list`/`show`
+/// exibem. `target_node` por NOME (ADR 0026); `autonomy_level` em string ("notify_before"/"autonomous").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct WebhookView {
+    hook_id: String,
+    target_node: String,
+    instruction: String,
+    autonomy_level: String,
+    /// Nº de POSTs VÁLIDOS recebidos (contagem de `WebhookReceived` — HMAC já conferido na recepção).
+    received_count: u64,
+    /// Instante (epoch ms) do último recebimento, se houve.
+    last_received_ts: Option<u64>,
+    /// Método HTTP do último recebimento (metadado; nunca o conteúdo do payload).
+    last_method: Option<String>,
+}
+
+/// Lê um campo string do payload cru de um `EventRecord` (vazio se ausente) — leitura tolerante por
+/// chave (o upcast tipado do core, `from_record`, é `pub(crate)`; o bin lê o JSON do log direto).
+fn webhook_field(record: &EventRecord, key: &str) -> String {
+    record
+        .payload
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// **PURO** — projeta os webhooks configurados a partir do event log. Fold *last-wins* por `hook_id`
+/// da config (`WebhookConfigured`: reconfigurar atualiza alvo/instrução/nível) agregando os sinais de
+/// recepção (`WebhookReceived`: contagem + último ts/método). Hooks com recepção mas sem config NÃO
+/// aparecem (sem dono conhecido). Ordem estável por `hook_id` (BTreeMap) — saída determinística.
+fn project_webhooks(records: &[EventRecord]) -> Vec<WebhookView> {
+    use std::collections::BTreeMap;
+    let mut configs: BTreeMap<String, WebhookView> = BTreeMap::new();
+    let mut receipts: BTreeMap<String, (u64, Option<u64>, Option<String>)> = BTreeMap::new();
+    for record in records {
+        match record.kind.as_str() {
+            "WebhookConfigured" => {
+                let hook_id = webhook_field(record, "hook_id");
+                if hook_id.is_empty() {
+                    continue;
+                }
+                // `target_node` é aditivo (F4-WA); no payload legado cai p/ `target_ref` (alvo antigo).
+                let node = webhook_field(record, "target_node");
+                let target_node = if node.is_empty() {
+                    webhook_field(record, "target_ref")
+                } else {
+                    node
+                };
+                // Default conservador: payload sem nível NUNCA fabrica autonomia (espelha events.rs).
+                let level = webhook_field(record, "autonomy_level");
+                let autonomy_level = if level.is_empty() {
+                    "notify_before".to_string()
+                } else {
+                    level
+                };
+                configs.insert(
+                    hook_id.clone(),
+                    WebhookView {
+                        hook_id,
+                        target_node,
+                        instruction: webhook_field(record, "instruction"),
+                        autonomy_level,
+                        received_count: 0,
+                        last_received_ts: None,
+                        last_method: None,
+                    },
+                );
+            }
+            "WebhookReceived" => {
+                let hook_id = webhook_field(record, "hook_id");
+                if hook_id.is_empty() {
+                    continue;
+                }
+                let ts = record.payload.get("ts").and_then(serde_json::Value::as_u64);
+                let method = webhook_field(record, "method");
+                let entry = receipts.entry(hook_id).or_insert((0, None, None));
+                entry.0 += 1;
+                if ts.is_some() {
+                    entry.1 = ts; // log em ordem de seq → o último recebimento vence
+                }
+                if !method.is_empty() {
+                    entry.2 = Some(method);
+                }
+            }
+            _ => {}
+        }
+    }
+    configs
+        .into_values()
+        .map(|mut view| {
+            if let Some((count, last_ts, last_method)) = receipts.remove(&view.hook_id) {
+                view.received_count = count;
+                view.last_received_ts = last_ts;
+                view.last_method = last_method;
+            }
+            view
+        })
+        .collect()
+}
+
+/// Rótulo leigo do nível de autonomia do webhook (zero jargão na fala).
+fn webhook_level_label(level: &str) -> &'static str {
+    match level {
+        "autonomous" => "pode agir sozinho",
+        _ => "me avisa antes de agir",
+    }
+}
+
+/// Resumo leigo dos recebimentos de um webhook ("nenhum recebido ainda" ou "N× (último: MÉTODO)").
+fn webhook_receipts_summary(view: &WebhookView) -> String {
+    if view.received_count == 0 {
+        "nenhum recebido ainda".to_string()
+    } else {
+        let metodo = view.last_method.as_deref().unwrap_or("?");
+        format!("{}x (ultimo: {metodo})", view.received_count)
+    }
+}
+
+/// `lina webhook list` — render leigo da lista de avisos de fora (SEM secret).
+fn render_webhook_list(views: &[WebhookView]) -> String {
+    if views.is_empty() {
+        return "Nenhum aviso de fora configurado ainda. Crie um na tela \"Receber um aviso de fora\".\n"
+            .to_string();
+    }
+    let mut out = format!("Avisos de fora configurados ({}):\n", views.len());
+    for view in views {
+        out.push_str(&format!(
+            "  - {} -> {}   [{}]   ({})\n",
+            view.hook_id,
+            view.target_node,
+            webhook_level_label(&view.autonomy_level),
+            webhook_receipts_summary(view),
+        ));
+    }
+    out
+}
+
+/// `lina webhook show <id>` — detalhe de UM webhook, **sem o secret** (a senha só aparece 1× na
+/// criação). Lê só os campos conhecidos da projeção; nunca ecoa o payload cru — não há por onde vazar.
+fn render_webhook_show(view: &WebhookView) -> String {
+    let mut out = format!("Aviso de fora {}\n", view.hook_id);
+    out.push_str(&format!("  Endereco:        /hook/{}\n", view.hook_id));
+    out.push_str(&format!("  Quem recebe:     {}\n", view.target_node));
+    out.push_str(&format!("  O que eu faco:   {}\n", view.instruction));
+    out.push_str(&format!(
+        "  Autonomia:       {}\n",
+        webhook_level_label(&view.autonomy_level)
+    ));
+    out.push_str(&format!(
+        "  Recebimentos:    {}\n",
+        webhook_receipts_summary(view)
+    ));
+    out.push_str(
+        "  A senha de seguranca nao e mostrada aqui -- ela so aparece uma vez, quando voce cria o aviso.\n",
+    );
+    out
+}
+
+/// `lina webhook <list|show>` — leitura dos avisos de fora deste Espaço. `add`/`test`/`rm` ainda não
+/// existem neste binário (costura de FASE B sinalizada ao Maestro): mensagem honesta, nunca um falso-ok.
+fn run_webhook(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("list") => run_webhook_list(args.iter().any(|a| a == "--json")),
+        Some("show") => run_webhook_show_cmd(&args[1..]),
+        Some(other) => {
+            eprintln!(
+                "lina webhook: subcomando '{other}' ainda nao disponivel neste binario (disponiveis: list, show). \
+                 Para criar um aviso de fora, use a tela \"Receber um aviso de fora\"."
+            );
+            ExitCode::from(2)
+        }
+        None => {
+            eprintln!("uso: lina webhook <list [--json] | show <id>>");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_webhook_list(json: bool) -> ExitCode {
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let views = project_webhooks(&parse_log_records(&content));
+    if json {
+        match serde_json::to_string_pretty(&views) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("lina webhook list: falha ao serializar: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        print!("{}", render_webhook_list(&views));
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_webhook_show_cmd(args: &[String]) -> ExitCode {
+    let Some(hook_id) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("uso: lina webhook show <id>");
+        return ExitCode::from(2);
+    };
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let views = project_webhooks(&parse_log_records(&content));
+    match views.iter().find(|v| &v.hook_id == hook_id) {
+        Some(view) => {
+            print!("{}", render_webhook_show(view));
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!(
+                "lina webhook show: nenhum aviso de fora com id '{hook_id}'. Rode `lina webhook list` para ver os ids."
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod webhook_verb_tests {
+    use super::*;
+    use lina_core::EventRecord;
+
+    /// Registro a partir do PRÓPRIO `DomainEvent` (serializado como o `append` faz — carrega a tag
+    /// interna `event`), para a projeção exercitar o decode REAL do payload do log.
+    fn ev(event: DomainEvent) -> EventRecord {
+        EventRecord {
+            seq: 0,
+            ts: 0,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa evento de dominio"),
+        }
+    }
+
+    fn configured(hook_id: &str, node: &str, instruction: &str, level: &str) -> EventRecord {
+        ev(DomainEvent::WebhookConfigured {
+            hook_id: hook_id.to_string(),
+            target_ref: node.to_string(),
+            target_node: node.to_string(),
+            instruction: instruction.to_string(),
+            autonomy_level: level.to_string(),
+            secret_ref: hook_id.to_string(),
+        })
+    }
+
+    fn received(hook_id: &str, ts: u64, method: &str) -> EventRecord {
+        ev(DomainEvent::WebhookReceived {
+            hook_id: hook_id.to_string(),
+            ts,
+            target_ref: "@X".to_string(),
+            method: method.to_string(),
+            payload_size: 12,
+            payload_sha256: "abc".to_string(),
+        })
+    }
+
+    /// Reconfigurar um hook = *last-wins* (alvo/instrução/nível do ÚLTIMO `WebhookConfigured`); os
+    /// recebimentos do hook são CONTADOS e o último ts/método vence. Hook sem recepção = contagem 0.
+    #[test]
+    fn list_folds_config_last_wins_and_counts_receipts() {
+        let log = vec![
+            configured("AAA", "@X", "avise o time", "notify_before"),
+            configured("AAA", "@Y", "pode publicar", "autonomous"), // reconfig: last-wins
+            received("AAA", 100, "POST"),
+            received("AAA", 200, "POST"),
+            configured("BBB", "@Z", "registre", "notify_before"),
+        ];
+        let views = project_webhooks(&log);
+
+        assert_eq!(views.len(), 2, "dois hooks distintos (AAA reconfig + BBB)");
+        let a = views.iter().find(|v| v.hook_id == "AAA").expect("AAA");
+        assert_eq!(a.target_node, "@Y", "last-wins do alvo");
+        assert_eq!(a.instruction, "pode publicar", "last-wins da instrucao");
+        assert_eq!(a.autonomy_level, "autonomous", "last-wins do nivel");
+        assert_eq!(a.received_count, 2, "dois POSTs validos contados");
+        assert_eq!(a.last_received_ts, Some(200), "ultimo ts vence");
+        assert_eq!(a.last_method.as_deref(), Some("POST"));
+
+        let b = views.iter().find(|v| v.hook_id == "BBB").expect("BBB");
+        assert_eq!(b.received_count, 0, "BBB nunca recebeu");
+        assert_eq!(b.last_received_ts, None);
+    }
+
+    /// `show` NUNCA vaza o secret: mesmo que um valor de segredo apareça no payload do log (cenário
+    /// hostil hipotético), o render só lê os campos conhecidos da projeção — nunca ecoa o payload cru.
+    #[test]
+    fn show_never_leaks_a_secret_in_the_payload() {
+        // Payload com um campo "secret" plantado (o append real NUNCA grava isto — invariante #2).
+        let mut record = configured("CCC", "@X", "faca algo", "notify_before");
+        record
+            .payload
+            .as_object_mut()
+            .expect("payload objeto")
+            .insert(
+                "secret".to_string(),
+                serde_json::Value::String("SUPERSECRETO-NAO-VAZA".to_string()),
+            );
+        let views = project_webhooks(&[record]);
+        let view = views.first().expect("um webhook projetado");
+
+        let out = render_webhook_show(view);
+        assert!(out.contains("CCC"), "mostra o id");
+        assert!(out.contains("@X"), "mostra o alvo");
+        assert!(out.contains("faca algo"), "mostra a instrucao");
+        assert!(
+            !out.contains("SUPERSECRETO-NAO-VAZA"),
+            "o render NUNCA ecoa um segredo do payload"
+        );
+        // E a projeção sequer carrega um campo de segredo (seguro por construção).
+        let serialized = serde_json::to_string(view).expect("serializa view");
+        assert!(
+            !serialized.contains("SUPERSECRETO-NAO-VAZA"),
+            "a projecao nao carrega segredo"
+        );
+    }
+
+    /// Lista vazia é HONESTA, não um silêncio que parece bug, e aponta o caminho de criação.
+    #[test]
+    fn empty_list_is_honest_not_silent() {
+        let out = render_webhook_list(&[]);
+        assert!(
+            out.contains("Nenhum aviso de fora"),
+            "vazio explica o porque"
+        );
     }
 }
 
