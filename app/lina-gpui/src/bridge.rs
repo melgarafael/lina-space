@@ -39,6 +39,12 @@ use lina_core::{
 // aprendizado. Só CONSUMIDA aqui (seleção top-K + leitura de status); a política e a projeção
 // vivem em `lina-core::mentality` (dono: Terminal I).
 use lina_core::mentality::{Belief, BeliefStatus, Mentality, PromotionPolicy};
+// F3-3 (ELO1/ELO2): o contrato do Refletor (request, fila, julgamento) vive em `lina-core` (dono:
+// Terminal B), re-exportado no top-level; o app só CHAMA — enfileira (ELO1), drena/julga (ELO2).
+use lina_core::{
+    dispatch_reflection, judge_reflection, PresentedBelief, ReflectionRequest, ReflectorQueue,
+    REFLECTOR_ROLE, REFLECTOR_SYSTEM, REFLECTOR_TRIGGER,
+};
 // F3-5-3: a projeção das conversas `--resume` salvas (dono: Terminal B). O app LISTA/religa (replay)
 // e, no tick do pump, GERA o `SessionPersisted` do 1º prompt (`persist_after_first_prompt`) — fiação
 // desta fatia; a regra de admissão/poda vive no core.
@@ -267,6 +273,80 @@ fn run_belief_housekeeping(store: &mut EventStore, now_ms: u64) -> usize {
         }
     }
     applied
+}
+
+/// **F3-3 (ELO1) — monta a `ReflectionRequest` de um `CorrectionObserved` observado.** O
+/// `RouteOutcome::CorrectionObserved` só carrega o `role` (server-side); o `summary` é lido do log
+/// por `refs == correction_id` (via serde público — `from_record` é `pub(crate)` no core, mas o
+/// evento é `pub` + `#[serde(tag="event")]`). O `presented` é o SNAPSHOT capturado AGORA (T1) por
+/// `top_k_for_role` — VIAJA com a request e é re-validado no T2 (race A2.b, ADR 0048). `task_kind`
+/// vem da fórmula CANÔNICA compartilhada com o ADR 0045 (`skill_index::task_kind`), nunca duplicada.
+/// `None` se o `CorrectionObserved` não está no log (degradação: sem o "o quê", não se reflete).
+fn build_reflection_request(
+    store: &EventStore,
+    correction_id: &str,
+    role: &str,
+    now_ms: u64,
+) -> Option<ReflectionRequest> {
+    let summary = correction_summary(store, correction_id)?;
+    let presented: Vec<PresentedBelief> = Mentality::replay(store, PromotionPolicy::default())
+        .ok()?
+        .top_k_for_role(role, MENTALITY_INJECT_TOP_K, now_ms)
+        .into_iter()
+        .map(|b| PresentedBelief {
+            belief_id: b.belief_id.clone(),
+            role: b.role.clone(),
+            statement: b.statement.clone(),
+        })
+        .collect();
+    Some(ReflectionRequest {
+        correction_id: correction_id.to_string(),
+        role: role.to_string(),
+        task_kind: lina_core::skill_index::task_kind(role, &summary),
+        summary,
+        presented,
+        // §6.3: a origem externa-não-confiável é carimbada server-side quando a sessão processou
+        // conteúdo externo; a correção direta do usuário é confiável (default do contrato do core).
+        untrusted_origin: false,
+    })
+}
+
+/// Lê o `summary` do `CorrectionObserved` cujo `refs` aponta para `correction_id` (o id da mensagem
+/// que carregou `[LINA::CORRECTION]`). Varre o log do fim p/ o início (a correção é recente) e
+/// desserializa via serde público (o evento é `pub` + `#[serde(tag="event")]`; `from_record` é
+/// `pub(crate)`). O(N) só na detecção de uma correção (raro), nunca no caminho-quente de toda msg.
+fn correction_summary(store: &EventStore, correction_id: &str) -> Option<String> {
+    store.events().ok()?.iter().rev().find_map(|r| {
+        if r.kind != "CorrectionObserved" {
+            return None;
+        }
+        match serde_json::from_value::<DomainEvent>(r.payload.clone()).ok()? {
+            DomainEvent::CorrectionObserved { summary, refs, .. }
+                if refs.iter().any(|x| x.as_str() == correction_id) =>
+            {
+                Some(summary)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// **F3-3 (ELO2) — extrai a RESPOSTA do sombra da tela.** O sombra responde numa linha que ABRE com
+/// `[LINA::BELIEF] <statement> [LINA::MATCH] <marcador>`. O prompt MENCIONA as sentinelas, mas só no
+/// MEIO de frases — apenas a resposta as tem no INÍCIO de uma linha, o que descarta o eco do prompt.
+/// `expect_match` (há crenças apresentadas): exige o marcador `[LINA::MATCH]` — senão a resposta
+/// ainda está sendo escrita (não capto parcial: `judge_reflection` é idempotente só na completa).
+/// (Literal das sentinelas: a const `a2a::BELIEF_SENTINEL` não é re-exportada; é protocolo de ADR.)
+fn extract_shadow_reply(screen: &str, expect_match: bool) -> Option<String> {
+    let line = screen
+        .lines()
+        .map(str::trim_start)
+        .rev()
+        .find(|l| l.starts_with("[LINA::BELIEF]"))?;
+    if expect_match && !line.contains("[LINA::MATCH]") {
+        return None;
+    }
+    Some(line.to_string())
 }
 
 /// Empurra uma re-injeção na fila EM-PROCESSO. `target` é o `NodeId` AUTENTICADO (já resolvido no
@@ -823,6 +903,23 @@ pub struct MailboxPump {
     /// F3-3 (ELO4): último tick em que o housekeeping de crenças rodou — throttle a
     /// [`BELIEF_HOUSEKEEPING_INTERVAL_MS`] (replay O(N); par do `last_disk_probe_ms`).
     last_belief_housekeeping_ms: u64,
+
+    /// F3-3 (ELO1): fila serial de reflexões pendentes — `CorrectionObserved` enfileira (ELO1), o
+    /// drain dispara o sombra FORA do hot-path (ELO2). Dedup por `correction_id` (lock cooperativo
+    /// A.3: N terminais observam, UM reflete). `enqueue` é O(1), SEM I/O.
+    reflector_queue: ReflectorQueue,
+    /// F3-3 (ELO2): o terminal-sombra NEUTRO (ADR 0047), spawnado LAZY na 1ª reflexão e reusado por
+    /// workspace. `None` até a 1ª correção destilável. Fora do roster (role `__reflector__`).
+    reflector_shadow: Option<NodeId>,
+    /// F3-3 (ELO2): último tick em que o drain de reflexões rodou — throttle (a destilação é 1
+    /// CLI-call; não dispara por tick de 120ms). Par do `last_belief_housekeeping_ms`.
+    last_reflection_drain_ms: u64,
+    /// F3-3 (ELO2): reflexões DRENADAS da fila aguardando disparo (FIFO). Processadas UMA por vez —
+    /// um sombra, fila serial: a próxima só dispara quando a resposta da anterior é captada.
+    reflector_backlog: std::collections::VecDeque<ReflectionRequest>,
+    /// F3-3 (ELO2): a reflexão EM VOO (disparada ao sombra, aguardando resposta) + o `ts` do disparo
+    /// (base do timeout). `None` = sombra livre para a próxima. Serial → no máximo uma em voo.
+    reflector_inflight: Option<(ReflectionRequest, u64)>,
     /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
     /// `buffer_gauge`): só (re)apenda `DiskPressureSignaled` quando o nível MUDA, nunca a cada probe.
     last_disk_pressure: Option<DiskPressure>,
@@ -852,6 +949,12 @@ const DISK_PROBE_INTERVAL_MS: u64 = DISK_PROBE_SECS * 1_000;
 /// promoção/expiração não urgem a sub-minuto, então 30s mantém o tick de 120ms barato (mesma
 /// disciplina anti-freeze de `sample_buffers`/`probe_disk`; lição do freeze do attention_heartbeat).
 const BELIEF_HOUSEKEEPING_INTERVAL_MS: u64 = 30_000;
+/// F3-3 (ELO2): passo do throttle do DISPARO de reflexões — a destilação é 1 CLI-call ao sombra,
+/// nunca por tick de 120ms. A captação da resposta roda a cada tick (barata: só lê o grid).
+const REFLECTION_DRAIN_INTERVAL_MS: u64 = 2_000;
+/// F3-3 (ELO2): teto de espera por uma resposta do sombra antes de desistir (a destilação é rápida,
+/// mas o CLI pode travar; sem teto, a reflexão em voo bloquearia a fila serial para sempre).
+const REFLECTION_TIMEOUT_MS: u64 = 120_000;
 
 /// SEAM-1: detalhes INFORJÁVEIS de um pedido de spawn (do `SpawnRequested`), usados por
 /// `post_process_spawns` p/ fiar o binding de cascata (M4) + o 1º prompt.
@@ -1003,6 +1106,11 @@ impl MailboxPump {
             last_buffer_sample_ms: 0,
             last_disk_probe_ms: 0,
             last_belief_housekeeping_ms: 0,
+            reflector_queue: ReflectorQueue::default(),
+            reflector_shadow: None,
+            last_reflection_drain_ms: 0,
+            reflector_backlog: std::collections::VecDeque::new(),
+            reflector_inflight: None,
             last_disk_pressure: None,
             // F4-0-2: cofre de credenciais de canal (demo MockStore; ver field). Namespaceado por
             // workspace, igual ao `custody_vault` do runtime.
@@ -1237,9 +1345,12 @@ impl MailboxPump {
     /// Reescreve `agents.json` (o mapa do time que a skill `lina-agent-bus` lê) quando o roster
     /// mudar — o supervisor é o ESCRITOR ÚNICO de `.lina/`.
     fn refresh_agents(&mut self) {
+        // G2/ADR0047: o `agents.json` (lina list / a skill `lina-agent-bus`) é o roster do TIME —
+        // usa `team_roster()` (filtra o sombra `__reflector__`), nunca `list()` (que mantém o sombra
+        // para gestão de PTY). O sombra existe no log + gerenciamento, mas fica fora da tela.
         let roster: Vec<AgentPresence> = self
             .sup
-            .list()
+            .team_roster()
             .into_iter()
             .map(|n| AgentPresence {
                 name: n.name,
@@ -1330,6 +1441,13 @@ impl MailboxPump {
                 // SEAM-1: CASCATA já está no log (`SpawnGated{cascade}`) → a fila de atenção projeta o
                 // banner (gate humano). Bloqueado (manual) é recusa terminal. Sem ruído de "não roteada".
                 RouteOutcome::SpawnGated { .. } | RouteOutcome::SpawnBlocked => {}
+                // F3-3 (ELO1, M-DETECTOR→Refletor): correção captada → enfileira a reflexão; a
+                // destilação (1 CLI-call ao sombra) roda no drain, FORA do hot-path (ELO2). `id` é o
+                // `correction_id` (estável → belief_id determinístico); `role` é server-side.
+                RouteOutcome::CorrectionObserved { role } => {
+                    self.enqueue_reflection(id, role);
+                    routed = true;
+                }
                 other => eprintln!("lina-gpui: mensagem {id} não roteada: {other:?}"),
             }
         }
@@ -1359,6 +1477,9 @@ impl MailboxPump {
         self.probe_disk(now_ms());
         // F3-3 (ELO4): promove/expira crenças pela política do core (throttle 30s, replay O(N)).
         self.housekeeping_beliefs(now_ms());
+        // F3-3 (ELO2): destila as correções captadas (1 CLI-call ao sombra, fora do hot-path) e
+        // grava as crenças que o core julgar (`judge_reflection` → `store.append`).
+        self.drain_reflections(now_ms());
     }
 
     /// **F4-WA-1: drena as entregas-de-sistema (webhook) que a `WebhookEngine` depositou na fila** e
@@ -1541,6 +1662,134 @@ impl MailboxPump {
         self.last_belief_housekeeping_ms = now_ms;
         let mut store = lock(&self.store);
         run_belief_housekeeping(&mut store, now_ms);
+    }
+
+    /// **F3-3 (ELO1) — capta um `CorrectionObserved` e enfileira a reflexão.** O `enqueue` é O(1)
+    /// (sem I/O); a destilação cara (1 CLI-call ao sombra) roda no drain FORA do hot-path (ELO2).
+    /// `correction_id` é o id da mensagem que carregou `[LINA::CORRECTION]` (estável → `belief_id`
+    /// determinístico, ADR 0048); `role` é server-side (do binding, jamais do payload do agente).
+    fn enqueue_reflection(&mut self, correction_id: &str, role: &str) {
+        let req = {
+            let store = lock(&self.store);
+            build_reflection_request(&store, correction_id, role, now_ms())
+        };
+        if let Some(req) = req {
+            self.reflector_queue.enqueue(req);
+        }
+    }
+
+    /// **F3-3 (ELO2) — drena a fila de reflexões e fecha o loop, FORA do hot-path.** Serial (um
+    /// sombra): capta a resposta da reflexão EM VOO antes de disparar a próxima. (1) se há uma em
+    /// voo, lê a saída do sombra → `judge_reflection` (o CORE decide a autoria; ZERO decisão aqui) →
+    /// `store.append`, ou desiste no timeout; (2) senão, reabastece o backlog da fila e dispara a
+    /// próxima (spawn LAZY do sombra neutro). Throttle no disparo; a captação é barata (lê o grid).
+    fn drain_reflections(&mut self, now_ms: u64) {
+        // (1) reflexão em voo? tenta captar a resposta (só a COMPLETA — idempotência do judge).
+        if let Some((req, dispatch_ms)) = self.reflector_inflight.take() {
+            let expect_match = !req.presented.is_empty();
+            match self.read_shadow_reply(expect_match) {
+                Some(reply) => {
+                    let events = judge_reflection(&req, &reply);
+                    let mut store = lock(&self.store);
+                    for ev in &events {
+                        if let Err(e) = store.append(ev) {
+                            eprintln!("lina-gpui: refletor — falha ao apendar {}: {e}", ev.kind());
+                        }
+                    }
+                }
+                None if now_ms.saturating_sub(dispatch_ms) <= REFLECTION_TIMEOUT_MS => {
+                    // ainda destilando — recoloca em voo e espera o próximo tick.
+                    self.reflector_inflight = Some((req, dispatch_ms));
+                }
+                None => eprintln!(
+                    "lina-gpui: refletor — reflexão {} expirou sem resposta do sombra",
+                    req.correction_id
+                ),
+            }
+            return;
+        }
+        // (2) sombra livre: reabastece o backlog e dispara a próxima (com throttle).
+        if self.reflector_backlog.is_empty() {
+            self.reflector_backlog.extend(self.reflector_queue.drain());
+        }
+        if self.reflector_backlog.is_empty()
+            || now_ms.saturating_sub(self.last_reflection_drain_ms) < REFLECTION_DRAIN_INTERVAL_MS
+        {
+            return;
+        }
+        if let Some(req) = self.reflector_backlog.pop_front() {
+            self.last_reflection_drain_ms = now_ms;
+            match self.dispatch_to_shadow(&req) {
+                Ok(()) => self.reflector_inflight = Some((req, now_ms)),
+                Err(e) => eprintln!("lina-gpui: refletor — dispatch ao sombra falhou: {e}"),
+            }
+        }
+    }
+
+    /// Garante o terminal-sombra NEUTRO (ADR 0047): spawnado LAZY na 1ª reflexão e reusado por
+    /// workspace. Fora do roster — role [`REFLECTOR_ROLE`], `requested_by` [`REFLECTOR_TRIGGER`] (a
+    /// projeção de presença o filtra). Devolve o `NodeId` (cria se ainda não existe).
+    fn ensure_shadow(&mut self) -> Result<NodeId, String> {
+        if let Some(shadow) = self.reflector_shadow {
+            return Ok(shadow);
+        }
+        let plan =
+            NodeAdmission::spawned_agent("Reflector", REFLECTOR_ROLE, REFLECTOR_TRIGGER, None);
+        let shadow = self.nodes.admit_node(plan)?;
+        self.reflector_shadow = Some(shadow);
+        Ok(shadow)
+    }
+
+    /// Injeta o prompt de reflexão no sombra (1 CLI-call) pela MESMA política do pump (profile do
+    /// alvo, default-deny por roster vivo). `from` = [`REFLECTOR_SYSTEM`] (identidade de sistema
+    /// inforjável, ADR 0047); a saída do sombra é re-validada por `judge_reflection` (DADO).
+    fn dispatch_to_shadow(&mut self, req: &ReflectionRequest) -> Result<(), String> {
+        let shadow = self.ensure_shadow()?;
+        let cli_by_node = self.project_cli_by_node();
+        let grid = lock(&self.grids)
+            .get(&shadow)
+            .cloned()
+            .ok_or_else(|| format!("sem grid para o sombra {shadow}"))?;
+        let trust = WorkspaceTrust::from_members(&live_member_ids(&self.sup));
+        let mut profile = target_profile(
+            cli_by_node.get(&shadow).map(String::as_str),
+            &self.registry,
+            &self.profile,
+        )
+        .clone();
+        profile.ready_timeout_ms = Some(
+            profile
+                .ready_timeout_ms
+                .unwrap_or(2_000)
+                .min(lina_core::INTERACTIVE_READY_BUDGET_MS),
+        );
+        dispatch_reflection(
+            &self.sup,
+            shadow,
+            REFLECTOR_SYSTEM,
+            req,
+            &profile,
+            &grid,
+            trust.policy(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    /// Lê a tela do sombra e extrai a linha-resposta (ELO2). `None` se o sombra ainda não existe ou
+    /// não respondeu (ou a resposta está incompleta). Não bloqueia (lê o grid vivo).
+    fn read_shadow_reply(&self, expect_match: bool) -> Option<String> {
+        let shadow = self.reflector_shadow?;
+        let grid = lock(&self.grids).get(&shadow).cloned()?;
+        let screen = {
+            let g = lock(&grid);
+            let (_, rows) = g.dims();
+            (0..rows)
+                .map(|i| g.row_text(i))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        extract_shadow_reply(&screen, expect_match)
     }
 
     /// Núcleo testável do probe — o [`DiskProbe`] é INJETADO (`OsDiskProbe` em produção; simulado no
@@ -13072,6 +13321,146 @@ mod tests {
         // 2ª passada: idempotente — nada novo a apendar.
         let again = run_belief_housekeeping(&mut lock(&store), now_ms());
         assert_eq!(again, 0, "re-rodar não duplica o marco");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F3-3 (ELO1) — monta a `ReflectionRequest` a partir de um `CorrectionObserved` no log.** O
+    /// `summary` vem do evento (`refs == correction_id`, lido via serde público); o `presented` é o
+    /// SNAPSHOT top-K do papel capturado AGORA (T1, race A2.b); o `task_kind` é a fórmula CANÔNICA
+    /// compartilhada com o 0045 (`skill_index::task_kind`). CONTROLE −: id ausente → `None`.
+    #[test]
+    fn build_reflection_request_assembles_from_correction_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-elo1-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("store")));
+        {
+            let mut s = lock(&store);
+            s.append(&DomainEvent::CorrectionObserved {
+                role: "BACKEND".to_string(),
+                summary: "use pnpm, não npm".to_string(),
+                refs: vec!["cid-1".to_string()],
+            })
+            .expect("append correção");
+        }
+        append_established_belief(&store, "BACKEND", 0);
+        append_established_belief(&store, "BACKEND", 1);
+
+        let req = {
+            let s = lock(&store);
+            build_reflection_request(&s, "cid-1", "BACKEND", now_ms())
+        }
+        .expect("correção no log → request montada");
+        assert_eq!(req.correction_id, "cid-1");
+        assert_eq!(req.role, "BACKEND");
+        assert_eq!(req.summary, "use pnpm, não npm");
+        assert!(
+            req.task_kind.starts_with("backend:"),
+            "task_kind canônico do 0045: {}",
+            req.task_kind
+        );
+        assert_eq!(
+            req.presented.len(),
+            2,
+            "snapshot top-K do papel viaja na request (T1)"
+        );
+        assert!(!req.untrusted_origin, "correção direta do usuário é confiável");
+
+        // CONTROLE −: sem CorrectionObserved para o id → None.
+        let none = {
+            let s = lock(&store);
+            build_reflection_request(&s, "cid-inexistente", "BACKEND", now_ms())
+        };
+        assert!(none.is_none(), "id ausente → sem request");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **F3-3 (ELO2) — capta a linha-resposta do sombra, NÃO o eco do prompt.** O prompt menciona as
+    /// sentinelas no meio de frases; só a resposta as abre numa linha. Completude exige o marcador.
+    #[test]
+    fn extract_shadow_reply_picks_response_line_not_prompt_echo() {
+        let screen = "Você é um destilador... Responda começando com [LINA::BELIEF] seguido da lição.\n\
+                      Ao final, ACRESCENTE [LINA::MATCH] seguido de: reforça #i | nova.\n\
+                      $ \n\
+                      [LINA::BELIEF] use pnpm, não npm [LINA::MATCH] nova\n\
+                      $ ";
+        let reply = extract_shadow_reply(screen, true).expect("linha-resposta extraída");
+        assert!(reply.starts_with("[LINA::BELIEF]"));
+        assert!(reply.contains("use pnpm"));
+        assert!(reply.contains("[LINA::MATCH] nova"));
+
+        // Só o prompt ecoado (nenhuma linha ABRE com a sentinela) → None.
+        let only_prompt = "Responda começando com [LINA::BELIEF] seguido da lição.\n$ ";
+        assert!(extract_shadow_reply(only_prompt, true).is_none());
+
+        // Resposta sem marcador: incompleta quando esperado, completa quando não.
+        let no_marker = "[LINA::BELIEF] use pnpm, não npm";
+        assert!(extract_shadow_reply(no_marker, true).is_none());
+        assert!(extract_shadow_reply(no_marker, false).is_some());
+    }
+
+    /// **F3-3 (ELO1+ELO2 e2e da costura app↔core) — uma correção observada vira `BeliefProposed`.**
+    /// Sem CLI real: o caminho determinístico (ELO1 monta a request do log → ELO2 capta a resposta
+    /// do sombra → `judge_reflection` decide → `store.append`) é exercitado com a resposta do sombra
+    /// SIMULADA. Prova que a crença destilada aparece na projeção `Mentality` do papel.
+    #[test]
+    fn correction_to_belief_proposed_seam_e2e() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-e2e-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("store")));
+
+        // M-DETECTOR: a correção foi captada (refs aponta para a mensagem-fonte).
+        {
+            let mut s = lock(&store);
+            s.append(&DomainEvent::CorrectionObserved {
+                role: "BACKEND".to_string(),
+                summary: "use pnpm, não npm".to_string(),
+                refs: vec!["cid-e2e".to_string()],
+            })
+            .expect("append correção");
+        }
+
+        // ELO1: monta a request (papel sem crença prévia → presented vazio → não espera marcador).
+        let req = {
+            let s = lock(&store);
+            build_reflection_request(&s, "cid-e2e", "BACKEND", now_ms())
+        }
+        .expect("request montada");
+        assert!(req.presented.is_empty(), "papel sem crença → snapshot vazio");
+
+        // ELO2: o sombra destila (resposta SIMULADA) → captação → judge → append.
+        let shadow_reply = "[LINA::BELIEF] use pnpm, não npm — é o gerenciador padrão do projeto";
+        let reply = extract_shadow_reply(shadow_reply, !req.presented.is_empty())
+            .expect("resposta do sombra captada");
+        let events = judge_reflection(&req, &reply);
+        {
+            let mut s = lock(&store);
+            for ev in &events {
+                s.append(ev).expect("append do evento de crença");
+            }
+        }
+
+        // A crença destilada está na projeção do papel (nasce Provisional — proposta).
+        let m = Mentality::replay(&lock(&store), PromotionPolicy::default()).expect("replay");
+        let belief = m
+            .beliefs_for_role("BACKEND")
+            .into_iter()
+            .find(|b| b.statement.contains("pnpm"))
+            .expect("a correção virou crença do papel BACKEND");
+        assert_eq!(
+            belief.status,
+            BeliefStatus::Provisional,
+            "proposta nasce provisória"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
