@@ -3941,10 +3941,11 @@ fn run_resume(_args: &[String]) -> ExitCode {
 // `lina-core` (já linkado). O **secret HMAC NUNCA toca o log** (invariante #2): a projeção lê só os
 // campos conhecidos da config, então não há por onde vazá-lo (`show` é seguro por construção).
 //
-// `add`/`test`/`rm` NÃO entram aqui: exigem capacidades que este binário deliberadamente NÃO tem
-// (cliente HTTP + HMAC + acesso ao cofre — o agente nunca segura segredo, ADR 0004) + a porta viva
-// do listener (efêmera, na memória do app, não publicada em disco) + o evento `WebhookRemoved`
-// (contrato congelado). Costura sinalizada ao Maestro 01 (FASE B).
+// `test` NÃO posta nada nem toca segredo: ENFILEIRA um gesto `webhook.test` na fila de BROKER (mesmo
+// caminho do `lina do`) — `to=broker`, `intent=webhook.test`, `ref=webhook:<hook_id>`, payload=sample.
+// O APP drena, faz o POST interno em loopback com o secret do cofre e entrega ao PTY (ADR 0035/0004 —
+// o agente nunca segura segredo; contrato fechado com F4-WA-1). `add` (cria + mostra o secret 1×, a UI
+// já faz) e `rm` (exige `WebhookRemoved`, fora do contrato congelado de `events.rs`) ficam como WA2B-2.
 
 /// Projeção de UM webhook ("aviso de fora") derivada do event log — **sem o secret** (ele só vive no
 /// cofre + no retorno mostrado 1× na criação; nunca no disco). É o que `lina webhook list`/`show`
@@ -4112,15 +4113,18 @@ fn run_webhook(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("list") => run_webhook_list(args.iter().any(|a| a == "--json")),
         Some("show") => run_webhook_show_cmd(&args[1..]),
+        Some("test") => run_webhook_test(&args[1..]),
         Some(other) => {
             eprintln!(
-                "lina webhook: subcomando '{other}' ainda nao disponivel neste binario (disponiveis: list, show). \
-                 Para criar um aviso de fora, use a tela \"Receber um aviso de fora\"."
+                "lina webhook: subcomando '{other}' ainda nao disponivel neste binario (disponiveis: list, show, test). \
+                 Criar (add) e remover (rm) chegam na WA2B-2; por ora crie um aviso pela tela \"Receber um aviso de fora\"."
             );
             ExitCode::from(2)
         }
         None => {
-            eprintln!("uso: lina webhook <list [--json] | show <id>>");
+            eprintln!(
+                "uso: lina webhook <list [--json] | show <id> | test <id> [--payload <json>]>"
+            );
             ExitCode::from(2)
         }
     }
@@ -4159,6 +4163,100 @@ fn run_webhook_show_cmd(args: &[String]) -> ExitCode {
             eprintln!(
                 "lina webhook show: nenhum aviso de fora com id '{hook_id}'. Rode `lina webhook list` para ver os ids."
             );
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Payload de exemplo do `lina webhook test` quando o usuário não passa `--payload` — JSON pequeno e
+/// inofensivo (é DADO de teste, jamais instrução): só prova o fio recepção→PTY chegando ao alvo.
+fn default_webhook_test_payload() -> String {
+    r#"{"event":"teste","mensagem":"disparo de teste do aviso de fora"}"#.to_string()
+}
+
+/// **PURO** — parseia `<id> [--payload <json>]` em `(hook_id, payload)`. `Err` (com mensagem de uso)
+/// para id ausente, posicional extra ou `--payload` sem valor. Default de payload aplicado aqui.
+fn parse_webhook_test_args(args: &[String]) -> Result<(String, String), String> {
+    const USO: &str = "uso: lina webhook test <id> [--payload <json>]";
+    let mut hook_id: Option<String> = None;
+    let mut payload: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--payload" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!("lina webhook test: --payload exige um valor JSON\n{USO}")
+                })?;
+                payload = Some(value.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                return Err(format!(
+                    "lina webhook test: opcao desconhecida '{other}'\n{USO}"
+                ));
+            }
+            other if hook_id.is_none() => {
+                hook_id = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "lina webhook test: argumento extra '{other}'\n{USO}"
+                ))
+            }
+        }
+    }
+    let hook_id = hook_id.ok_or_else(|| format!("lina webhook test: falta o <id>\n{USO}"))?;
+    Ok((
+        hook_id,
+        payload.unwrap_or_else(default_webhook_test_payload),
+    ))
+}
+
+/// **PURO** — monta o envelope do gesto `webhook.test` no contrato FECHADO com o app (F4-WA-1): vai
+/// pela fila de BROKER (`to=broker`), `intent=webhook.test`, o `hook_id` viaja no `ref` (`webhook:<id>`)
+/// e o `sample` é o payload. O app drena e dispara o POST com o secret do cofre (o CLI nunca assina).
+fn build_webhook_test_msg(from: &str, hook_id: &str, payload: &str) -> MailMessage {
+    MailMessage::new(from, "broker", "webhook.test", payload).with_ref(format!("webhook:{hook_id}"))
+}
+
+/// `lina webhook test <id> [--payload <json>]` — ENFILEIRA o gesto `webhook.test` na fila de broker; o
+/// app faz o POST interno (com o secret do cofre) e entrega ao PTY do alvo (ADR 0004 — o agente não
+/// assina nem posta). Recusa um `id` desconhecido (valida contra a config do log, como `show`).
+fn run_webhook_test(args: &[String]) -> ExitCode {
+    let (hook_id, payload) = match parse_webhook_test_args(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+    let content = std::fs::read_to_string(event_log_path()).unwrap_or_default();
+    let views = project_webhooks(&parse_log_records(&content));
+    if !views.iter().any(|v| v.hook_id == hook_id) {
+        eprintln!(
+            "lina webhook test: nenhum aviso de fora com id '{hook_id}'. Rode `lina webhook list` para ver os ids."
+        );
+        return ExitCode::from(1);
+    }
+    let from = match load_identity() {
+        Ok(i) => i.terminal_name,
+        Err(e) => {
+            eprintln!("lina: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let msg = build_webhook_test_msg(&from, &hook_id, &payload);
+    let mailbox = Mailbox::new(broker_mailbox_root());
+    match mailbox.enqueue_as(&from, &msg) {
+        Ok(()) => {
+            println!(
+                "ok: teste do aviso de fora '{hook_id}' enfileirado. O app dispara com a senha do cofre e entrega no terminal alvo (o [LINA::WEBHOOK] vai aparecer la)."
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("lina: falha ao enfileirar webhook.test: {e}");
             ExitCode::from(1)
         }
     }
@@ -4271,6 +4369,66 @@ mod webhook_verb_tests {
             out.contains("Nenhum aviso de fora"),
             "vazio explica o porque"
         );
+    }
+
+    /// O envelope do `test` casa EXATO o contrato fechado com o app (Maestro 01 + F4-WA-1): vai pela
+    /// fila de broker, `intent=webhook.test`, o `hook_id` no `ref`, o sample no payload. SEM secret.
+    #[test]
+    fn webhook_test_envelope_matches_broker_contract() {
+        let msg = build_webhook_test_msg("@Maestro", "HOOK123", r#"{"x":1}"#);
+        assert_eq!(
+            msg.to, "broker",
+            "fila de broker (mesmo caminho do lina do)"
+        );
+        assert_eq!(msg.intent, "webhook.test");
+        assert_eq!(
+            msg.ref_id.as_deref(),
+            Some("webhook:HOOK123"),
+            "o hook_id viaja no ref"
+        );
+        assert_eq!(msg.payload, r#"{"x":1}"#, "o sample e o payload");
+    }
+
+    /// Parse de `<id> [--payload <json>]`: id obrigatório; payload opcional (default quando ausente).
+    #[test]
+    fn webhook_test_args_parse_id_and_optional_payload() {
+        assert_eq!(
+            parse_webhook_test_args(&["AAA".to_string()]),
+            Ok(("AAA".to_string(), default_webhook_test_payload()))
+        );
+        assert_eq!(
+            parse_webhook_test_args(&[
+                "AAA".to_string(),
+                "--payload".to_string(),
+                "{\"k\":1}".to_string()
+            ]),
+            Ok(("AAA".to_string(), "{\"k\":1}".to_string()))
+        );
+    }
+
+    /// Parse recusa entradas ambíguas/incompletas (mensagem de uso, exit 2 no chamador).
+    #[test]
+    fn webhook_test_args_reject_missing_id_extra_and_dangling_flag() {
+        assert!(
+            parse_webhook_test_args(&["--payload".to_string(), "{}".to_string()]).is_err(),
+            "sem id posicional"
+        );
+        assert!(
+            parse_webhook_test_args(&["AAA".to_string(), "BBB".to_string()]).is_err(),
+            "dois posicionais"
+        );
+        assert!(
+            parse_webhook_test_args(&["AAA".to_string(), "--payload".to_string()]).is_err(),
+            "--payload sem valor"
+        );
+    }
+
+    /// O payload de exemplo default é JSON válido (é DADO de teste, nunca instrução/comando).
+    #[test]
+    fn webhook_test_default_payload_is_valid_json() {
+        let payload = default_webhook_test_payload();
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&payload);
+        assert!(parsed.is_ok(), "o payload de exemplo deve ser JSON valido");
     }
 }
 

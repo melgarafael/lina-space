@@ -701,6 +701,7 @@ pub fn boot_ws_runtime(
         Arc::clone(&model),
         Arc::clone(&sup), // roster vivo: valida que a origem do pedido é um nó REAL (hole 3)
     )
+    .with_webhook(webhook.as_deref()) // F4-WA-2b: cofre+porta p/ o gesto webhook.test (dogfooding)
     .spawn();
 
     Ok(WsRuntime {

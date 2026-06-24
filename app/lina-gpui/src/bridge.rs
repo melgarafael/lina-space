@@ -2005,6 +2005,40 @@ fn sanitize_for_banner(s: &str) -> String {
     out
 }
 
+/// **F4-WA-2b — POST HTTP/1.1 SÍNCRONO mínimo ao listener loopback de webhook** (dogfooding do gate
+/// a). Bloqueante (`std::net`, sem tokio nem cliente HTTP externo) — roda na thread do broker com
+/// timeouts curtos p/ não travar o tick. Devolve o status HTTP (ex.: 202) ou um erro. NÃO é um
+/// cliente HTTP geral: só o suficiente p/ o self-test local de um hook do PRÓPRIO app.
+fn post_local_hook(port: u16, hook_id: &str, sig: &str, body: &str) -> Result<u16, String> {
+    use std::io::{Read, Write};
+    let addr = format!("127.0.0.1:{port}");
+    let mut stream =
+        std::net::TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let req = format!(
+        "POST /hook/{hook_id} HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         X-Signature: {sig}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    let mut resp = String::new();
+    stream
+        .read_to_string(&mut resp)
+        .map_err(|e| format!("read: {e}"))?;
+    resp.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| format!("resposta sem status HTTP: {:?}", resp.lines().next()))
+}
+
 /// **Observador da FILA DE BROKER (`<LINA_HOME>/broker/`).** Numa thread própria, drena os pedidos
 /// privilegiados (`broker.do` = custódia; `resume.request` = retomada do teto), enfileira-os no gate
 /// humano e — só após confirmação na janela — executa: custódia chama [`run_custody`] (segredo do
@@ -2023,6 +2057,11 @@ pub struct BrokerPump<S: SecretStore> {
     model: Model,
     /// Roster vivo — para validar que a origem autenticada (dir-dono) é um NÓ REAL (hole 3).
     sup: Arc<Supervisor>,
+    /// F4-WA-2b: cofre do webhook (secret por `hook_id`) + porta do listener vivo, para o gesto
+    /// `webhook.test` (dogfooding do gate a) disparar um POST HMAC-válido ao próprio `/hook/<id>`.
+    /// `None`/0 = boot sem webhook. O secret é lido AQUI e nunca sai do app (ADR 0004).
+    webhook_vault: Option<Arc<SecretVault<lina_secrets::MockStore>>>,
+    webhook_port: u16,
 }
 
 impl<S: SecretStore + Send + 'static> BrokerPump<S> {
@@ -2043,7 +2082,21 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             desk,
             model,
             sup,
+            webhook_vault: None,
+            webhook_port: 0,
         }
+    }
+
+    /// F4-WA-2b: liga o cofre+porta do webhook ao broker, para o gesto `webhook.test`. Builder
+    /// consumindo `self` (como o boot fia a pump). `None` (boot sem webhook) → o broker segue sem o
+    /// handler de teste (degrada com aviso no gesto).
+    #[must_use]
+    pub fn with_webhook(mut self, shared: Option<&WebhookShared>) -> Self {
+        if let Some(s) = shared {
+            self.webhook_vault = Some(s.vault());
+            self.webhook_port = s.port();
+        }
+        self
     }
 
     /// Sobe a thread que observa a fila de broker (gate humano + execução) a cada ~150 ms.
@@ -2263,10 +2316,75 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             "broker.do" => self.enqueue_custody(m),
             "resume.request" => self.enqueue_resume(m),
             "disk.reclaim" => self.enqueue_disk_reclaim(m),
+            // F4-WA-2b: dogfooding do gate (a). POST LOCAL inócuo de teste → executa DIRETO (sem gate
+            // humano). A AÇÃO que o webhook PROVOCAR, se irreversível, ainda passa pela custódia.
+            "webhook.test" => self.handle_webhook_test(m),
             other => eprintln!(
                 "lina-gpui: intent {other:?} desconhecido na fila de broker (msg {}) — ignorado",
                 m.id
             ),
+        }
+    }
+
+    /// **F4-WA-2b — dogfooding do gate (a): dispara um POST HMAC-válido ao PRÓPRIO listener.** O gesto
+    /// `webhook.test` (broker) NÃO passa por gate humano (POST LOCAL inócuo de teste; a AÇÃO que o
+    /// webhook PROVOCAR, se irreversível, ainda passa pela custódia). Resolve o `hook_id` do `ref`
+    /// (`webhook:<id>`), lê o secret do cofre, assina o `sample` (HMAC) e POSTa a `/hook/<id>` em
+    /// `127.0.0.1:<porta>` — o fluxo normal (handle_hook → dispatch → pump) entrega o input
+    /// `[LINA::WEBHOOK]` ao terminal alvo. O secret NUNCA sai do app (ADR 0004: o agente só pediu).
+    fn handle_webhook_test(&self, m: &MailMessage) {
+        let Some(hook_id) = m.ref_id.as_deref().and_then(|r| r.strip_prefix("webhook:")) else {
+            eprintln!(
+                "lina-gpui: webhook.test sem ref 'webhook:<id>' (msg {}) — ignorado",
+                m.id
+            );
+            return;
+        };
+        // Defesa: o `hook_id` (base32) entra na request-line HTTP e na key do cofre → barra CRLF/path
+        // injection de um ref forjado. Um id não-alfanumérico nunca é um hook real (gen_hook_id=base32).
+        if hook_id.is_empty() || !hook_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            eprintln!(
+                "lina-gpui: webhook.test com hook_id invalido (msg {}) — ignorado",
+                m.id
+            );
+            return;
+        }
+        let (Some(vault), port) = (self.webhook_vault.as_ref(), self.webhook_port) else {
+            eprintln!("lina-gpui: webhook.test sem webhook montado (boot degradado) — ignorado");
+            return;
+        };
+        if port == 0 {
+            eprintln!("lina-gpui: webhook.test sem porta de listener viva — ignorado");
+            return;
+        }
+        let secret = match vault.get("webhook", hook_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                eprintln!(
+                    "lina-gpui: webhook.test: hook {hook_id} sem secret no cofre (foi configurado?) — ignorado"
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("lina-gpui: webhook.test: erro ao ler o cofre: {e}");
+                return;
+            }
+        };
+        // Payload de exemplo: o do gesto, ou um default. É DADO (input não-confiável no terminal).
+        let body = if m.payload.trim().is_empty() {
+            "{\"sample\":true,\"source\":\"lina webhook test\"}".to_string()
+        } else {
+            m.payload.clone()
+        };
+        let sig = lina_webhooks::sign_hex(&secret, body.as_bytes());
+        match post_local_hook(port, hook_id, &sig, &body) {
+            Ok(202) => eprintln!(
+                "lina-gpui: webhook.test {hook_id} → 202: o input [LINA::WEBHOOK] flui ao terminal alvo"
+            ),
+            Ok(status) => {
+                eprintln!("lina-gpui: webhook.test {hook_id} → POST respondeu {status} (esperado 202)")
+            }
+            Err(e) => eprintln!("lina-gpui: webhook.test {hook_id} → POST local falhou: {e}"),
         }
     }
 
@@ -14487,5 +14605,37 @@ mod tests {
                 .is_err(),
             "sem comando ⇒ Err (a UI mostra aviso leigo)"
         );
+    }
+
+    /// **F4-WA-2b — `post_local_hook` monta um POST HTTP/1.1 bem-formado e parseia o status.** Um
+    /// listener fake aceita 1 conexão, lê a request e responde 202: prova a request-line (`POST
+    /// /hook/<id>`), o header `X-Signature`, o body, e o parse do código de status (o circuito real
+    /// POST→PTV é o e2e conjunto com o produtor do CLI).
+    #[test]
+    fn post_local_hook_sends_well_formed_request_and_parses_status() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).expect("read req");
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .expect("write resp");
+            req
+        });
+        let status =
+            post_local_hook(port, "HOOKID123", "deadbeef", "{\"x\":1}").expect("post local");
+        assert_eq!(status, 202, "parse do status HTTP");
+        let req = server.join().expect("join server");
+        assert!(
+            req.starts_with("POST /hook/HOOKID123 HTTP/1.1"),
+            "request-line do POST: {req:?}"
+        );
+        assert!(req.contains("X-Signature: deadbeef"), "header de assinatura");
+        assert!(req.contains("{\"x\":1}"), "body no corpo");
     }
 }
