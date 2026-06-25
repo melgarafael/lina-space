@@ -663,6 +663,9 @@ struct WorkspaceView {
     powers_inventory: Option<lina_core::PowerInventory>,
     /// F2-4: o painel "Seus Poderes" está aberto? (toggle pela topbar + atalho).
     powers_panel_open: bool,
+    /// F2-4 (r2): aba ATIVA da Área de Poderes — `None` = "Todos"; `Some(kind)` = só esse tipo.
+    /// Semente do filtro dos cards e do `selected` de cada aba. Estado de sessão (ao re-abrir, "Todos").
+    powers_tab: Option<lina_core::PowerKind>,
     /// F2-4-5: estado do picker de Direções Visuais (seleção 1-clique, puro/headless; `Copy`).
     design_gallery: design_directions::DesignGallery,
     /// F2-4-5: a galeria de Direções Visuais está aberta? (toggle pela topbar).
@@ -886,6 +889,7 @@ impl WorkspaceView {
             mentality_cache: None,
             powers_inventory: None,
             powers_panel_open: false,
+            powers_tab: None,
             design_gallery: design_directions::DesignGallery::new(),
             design_gallery_open: false,
         };
@@ -2776,10 +2780,14 @@ impl WorkspaceView {
             return None;
         }
         let inventory = self.powers_inventory.as_ref()?;
+        let active_tab = self.powers_tab;
+        // r2: filtro pela aba ativa (None = "Todos" = sem filtro). `should_render` segue cuidando do
+        // `Disabled` (mostrar ≠ autorizar).
         let cards: Vec<powers_panel::PowerCard> = inventory
             .powers
             .iter()
             .filter(|p| powers_panel::should_render(p, powers_panel::CAN_REENABLE))
+            .filter(|p| active_tab.is_none_or(|k| p.kind == k))
             .cloned()
             .map(|power| {
                 let name = power.name.clone();
@@ -2791,13 +2799,42 @@ impl WorkspaceView {
                 ))
             })
             .collect();
-        let panel = powers_panel::PowersPanel::new(inventory).powers(cards);
-        let col = div()
+        // r2: abas com contador, só dos tipos PRESENTES + "Todos" (de `tab_models`). Cada aba leva o
+        // handler que troca `powers_tab` e re-renderiza — a view só dispara, sem autoridade.
+        let tabs: Vec<powers_panel::PowerTab> =
+            powers_panel::tab_models(&inventory.counts, active_tab)
+                .into_iter()
+                .map(|model| {
+                    let id = model.id;
+                    powers_panel::PowerTab::new(model).on_select(cx.listener(
+                        move |view, _ev, _w, cx| {
+                            view.select_powers_tab(id, cx);
+                        },
+                    ))
+                })
+                .collect();
+        let panel = powers_panel::PowersPanel::new(inventory)
+            .tabs(tabs)
+            .powers(cards);
+        // r2: área CENTRAL dedicada (~0.72×0.82 da janela), centrada — não mais o flanco direito
+        // espremido. O pai com altura constrita engata o `overflow_y_scroll` no body do panel.
+        let overlay = div()
             .absolute()
-            .top_16()
+            .top_0()
+            .left_0()
             .right_0()
-            .child(div().w(gpui::relative(0.42)).child(panel));
-        Some(col.into_any_element())
+            .bottom_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(gpui::relative(0.72))
+                    .h(gpui::relative(0.82))
+                    .child(panel),
+            );
+        Some(overlay.into_any_element())
     }
 
     /// F2-4 (mostrar ≠ autorizar): o leigo clicou a ação de 1 clique de um Poder. A view só DISPARA o
@@ -2860,6 +2897,13 @@ impl WorkspaceView {
             scanned_at_ms: lina_core::now_ms(),
         });
         self.powers_inventory = Some(inv);
+    }
+
+    /// F2-4 (r2): troca a aba ATIVA da Área de Poderes. Não toca o inventário (a projeção de disco não
+    /// muda); só re-renderiza com o filtro. `None` = aba "Todos".
+    fn select_powers_tab(&mut self, id: Option<lina_core::PowerKind>, cx: &mut Context<Self>) {
+        self.powers_tab = id;
+        cx.notify();
     }
 
     /// F2-4-5: a galeria de Direções Visuais (onboarding estético). `None` quando fechada. A galeria

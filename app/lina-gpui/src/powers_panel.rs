@@ -15,19 +15,25 @@
 //!   como `BeliefCard::on_retire`); quem autoriza é o supervisor. Nenhum campo lido do disco
 //!   (`name`/`origin`) decide autorização — é DADO de exibição.
 //!
-//! **Identidade = design system F2** (épico 38 §VIII, "Instrumento de Estúdio com a temperatura do
-//! Ateliê"). Não invento visual: ESPELHO `mentality_panel`/`goal_card` — Fraunces ([`family.display`])
-//! só no título (o "momento" do fundador vendo o seu arsenal), IBM Plex ([`family.ui`]) no corpo, cor
-//! semântica fixa (verde/azul/âmbar/neutro) dos tokens, **zero literal** (a catraca `token_ratchet`
-//! nasce verde para este arquivo). WCAG 1.4.1: cada estado é **texto + ícone + cor** via [`Badge`].
+//! **Estrutura (correção r2 — pedido do fundador na tela):** área central dedicada (não mais flanco
+//! direito espremido), cabeçalho FIXO (título Fraunces + resumo contado + abas por TIPO com contador)
+//! e corpo ROLÁVEL com a lista da aba ativa. Listas volumosas (skills/plugins) usam 2 colunas via
+//! split intercalado — alturas equilibradas, sem a monotonia de 60 cards iguais empilhados. A
+//! filtragem da aba é responsabilidade do call-site (o painel só conta o que recebe).
 //!
-//! **Padrão da casa:** a DECISÃO (estado→rótulo/tom, ação, origem, resumo) mora em **funções puras
-//! testáveis** — gpui não roda headless, então o [`RenderOnce`] é casca fina sobre elas. O painel
-//! consome o contrato do core direto (ADR 0052 §3: `Power`/`PowerInventory` JÁ são o view-model — sem
-//! duplicar tipo). A ponte `bridge.rs`→inventário é costura do Maestro; aqui renderizo contra um mock.
+//! **Identidade = design system F2** (épico 38 §VIII, "Instrumento de Estúdio com a temperatura do
+//! Ateliê"). Fraunces ([`family.display`]) só no título (o "momento" do fundador vendo o seu arsenal),
+//! IBM Plex ([`family.ui`]) no corpo, cor semântica fixa (verde/azul/âmbar/neutro) dos tokens, **zero
+//! literal** (a catraca `token_ratchet` nasce verde para este arquivo). WCAG 1.4.1: cada estado é
+//! **texto + ícone + cor** via [`Badge`].
+//!
+//! **Padrão da casa:** a DECISÃO (estado→rótulo/tom, ação, origem, resumo, modelo das abas, densidade)
+//! mora em **funções puras testáveis** — gpui não roda headless, então o [`RenderOnce`] é casca fina
+//! sobre elas. O painel consome o contrato do core direto (ADR 0052 §3: `Power`/`PowerInventory` JÁ
+//! são o view-model — sem duplicar tipo).
 //!
 //! `allow(dead_code)`: itens `pub` sem chamador no bin disparam dead-code no `clippy -D` — caem quando
-//! o Maestro fiar `render_powers_panel` + a ponte `bridge.rs` (Camada 2). Mesmo padrão do catálogo `ui`.
+//! o Maestro fiar `render_powers_panel` final (Camada 2). Mesmo padrão do catálogo `ui`.
 //!
 //! [`family.display`]: crate::theme::FontFamilyTokens::display
 //! [`family.ui`]: crate::theme::FontFamilyTokens::ui
@@ -36,7 +42,8 @@
 use std::collections::BTreeMap;
 
 use gpui::{
-    div, prelude::*, px, rgb, App, ClickEvent, FontWeight, IntoElement, SharedString, Window,
+    div, prelude::*, px, rgb, App, ClickEvent, ElementId, FontWeight, IntoElement, SharedString,
+    Window,
 };
 
 use lina_core::{Power, PowerInventory, PowerKind, PowerOrigin, PowerScope, PowerState};
@@ -62,6 +69,9 @@ pub const EMPTY_STATE: &str =
 
 /// Rótulo da seção de origem de cada card (de onde o Poder vem). Discreto, em pt-br.
 pub const ORIGIN_LABEL: &str = "De onde vem";
+
+/// Rótulo da aba que junta todos os tipos. Não se pluraliza ("Todos · 109") — é coletivo.
+pub const TAB_ALL: &str = "Todos";
 
 // Os 5 rótulos de estado (fonte: entrega-d4 §III.b — a PALAVRA que o leigo lê).
 const READY_LABEL: &str = "Pronto pra usar";
@@ -119,6 +129,21 @@ fn kind_anchor(kind: PowerKind) -> &'static str {
         PowerKind::Command => "command",
         PowerKind::Hook => "hook",
         PowerKind::Mcp => "MCP",
+    }
+}
+
+/// Slug estável (kebab) p/ o `ElementId` da aba — `None` = "all". Pura; estável entre frames porque
+/// se baseia no enum, não no rótulo (que muda com pluralização).
+#[must_use]
+fn tab_slug(id: Option<PowerKind>) -> &'static str {
+    match id {
+        None => "all",
+        Some(PowerKind::Skill) => "skill",
+        Some(PowerKind::Plugin) => "plugin",
+        Some(PowerKind::Agent) => "agent",
+        Some(PowerKind::Command) => "command",
+        Some(PowerKind::Hook) => "hook",
+        Some(PowerKind::Mcp) => "mcp",
     }
 }
 
@@ -197,6 +222,73 @@ pub const CAN_REENABLE: bool = false;
 #[must_use]
 pub fn should_render(power: &Power, can_reenable: bool) -> bool {
     power.state != PowerState::Disabled || can_reenable
+}
+
+// ───────────────────────────── Abas por tipo (modelo + densidade) ─────────────────────────────
+
+/// O modelo PURO de uma aba — o que ela é (id), quanto conta, e se está ativa. Sem render, sem
+/// handler — é o produto de [`tab_models`] e a entrada de [`PowerTab::new`] no call-site (que pluga
+/// o handler de troca de aba via `cx.listener(...)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabModel {
+    /// `None` = a aba "Todos" (junção); `Some(kind)` = a aba daquele tipo.
+    pub id: Option<PowerKind>,
+    pub count: u32,
+    pub active: bool,
+}
+
+/// Constrói a fila canônica de abas para um inventário e uma aba ativa: **"Todos"** primeiro (count =
+/// total), depois UMA aba por tipo PRESENTE (`count > 0`), na ordem canônica do `BTreeMap` (a mesma
+/// do resumo do cabeçalho). Inventário vazio = `Vec::new()` (sem abas — o painel cai no estado vazio
+/// acolhedor). `active = None` ⇒ a "Todos" fica ativa (default natural ao abrir o painel).
+///
+/// Pura (testada). É o `tabs_for` da API: o call-site mapeia os modelos em [`PowerTab`] com o handler.
+#[must_use]
+pub fn tab_models(
+    counts: &BTreeMap<PowerKind, u32>,
+    active: Option<PowerKind>,
+) -> Vec<TabModel> {
+    let total: u32 = counts.values().sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    let mut tabs = Vec::with_capacity(counts.len() + 1);
+    tabs.push(TabModel {
+        id: None,
+        count: total,
+        active: active.is_none(),
+    });
+    for (&kind, &count) in counts.iter().filter(|(_, &n)| n > 0) {
+        tabs.push(TabModel {
+            id: Some(kind),
+            count,
+            active: active == Some(kind),
+        });
+    }
+    tabs
+}
+
+/// O rótulo da aba, conforme o leigo lê: `"Skills · 75"`, `"Plugin · 1"`, `"Todos · 109"`. Pluraliza
+/// o nome do tipo pela contagem; "Todos" é coletivo (não pluraliza). Separador `·` casa a identidade
+/// do resumo do cabeçalho.
+#[must_use]
+pub fn tab_label(model: TabModel) -> String {
+    let word = match model.id {
+        None => TAB_ALL,
+        Some(kind) => kind_label(kind, model.count),
+    };
+    format!("{word} · {}", model.count)
+}
+
+/// Limite de cards de UMA aba a partir do qual a lista vira 2 colunas (split intercalado) — abaixo
+/// disso, fica em coluna única (cards mais "respiráveis"). 12 = ~uma tela cheia sem precisar rolar;
+/// acima disso a 2-col deixa o panorama legível sem rolar infinito. Pura.
+pub const GRID_THRESHOLD: usize = 12;
+
+/// `true` ⇒ a aba ativa renderiza em 2 colunas. Pura (testada).
+#[must_use]
+pub fn use_grid(card_count: usize) -> bool {
+    card_count > GRID_THRESHOLD
 }
 
 // ───────────────────────────── Origem rotulada (de onde o Poder vem) ─────────────────────────────
@@ -306,6 +398,53 @@ fn muted_text(t: &Theme, text: SharedString) -> impl IntoElement {
         .text_size(px(f32::from(t.typography.size.small)))
         .text_color(rgb(t.text.muted))
         .child(gpui::text!(text))
+}
+
+// ───────────────────────────── Aba (RenderOnce) ─────────────────────────────
+
+/// **Uma aba.** Pílula clicável (`Button` do catálogo, `Secondary`/`Sm`, com anel de seleção quando
+/// ativa — token-puro). O modelo é o produto de [`tab_models`]; o `on_select` vem do call-site via
+/// `cx.listener(...)`, como o resto do catálogo `ui/`. Construa com [`PowerTab::new`].
+#[derive(IntoElement)]
+pub struct PowerTab {
+    model: TabModel,
+    on_select: Option<ClickHandler>,
+}
+
+impl PowerTab {
+    /// Nova aba a partir do modelo puro.
+    #[must_use]
+    pub fn new(model: TabModel) -> Self {
+        Self {
+            model,
+            on_select: None,
+        }
+    }
+
+    /// Handler de clique. Passe `cx.listener(|view, _ev, _w, cx| view.select_powers_tab(id, cx))`.
+    #[must_use]
+    pub fn on_select(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_select = Some(Box::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for PowerTab {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let id: ElementId = SharedString::from(format!("powers-tab-{}", tab_slug(self.model.id)))
+            .into();
+        let label = tab_label(self.model);
+        let mut btn = Button::new(id, label)
+            .size(ButtonSize::Sm)
+            .selected(self.model.active);
+        if let Some(handler) = self.on_select {
+            btn = btn.on_click(handler);
+        }
+        btn
+    }
 }
 
 // ───────────────────────────── O card de UM Poder (RenderOnce) ─────────────────────────────
@@ -428,29 +567,45 @@ impl RenderOnce for PowerCard {
 
 // ───────────────────────────── O painel da Área de Poderes (RenderOnce) ─────────────────────────────
 
-/// **A "Área de Poderes".** Nível 1 = título (Fraunces), resumo contado ("75 Poderes · 33 Plugins") e
-/// subtítulo; nível 2 = a lista de cards (origem, estado e ação), ou o estado vazio acolhedor.
-/// builder + [`RenderOnce`]; os cards já vêm com seus handlers do call-site (a view é dona do gesto).
-/// Construa com [`PowersPanel::new`] (resumo do inventário) e alimente [`PowersPanel::powers`].
+/// **A "Área de Poderes".** Cabeçalho FIXO com título Fraunces, resumo contado ("75 Poderes · 33
+/// Plugins"), intro e ABAS por tipo (com contador). CORPO ROLÁVEL com a lista da aba ativa, em área
+/// central dedicada (não flanco direito), com respiro. Listas volumosas (`use_grid` ⇒ split
+/// intercalado em 2 colunas) ganham hierarquia legível sem rolar infinito; modestas, 1 coluna.
+///
+/// builder + [`RenderOnce`]; os cards já vêm filtrados pela aba ativa (o call-site monta) e com seus
+/// handlers (a view é dona do gesto). Construa com [`PowersPanel::new`] e alimente:
+///
+/// - [`PowersPanel::tabs`] (`Vec<PowerTab>` produzido de [`tab_models`] + `cx.listener`),
+/// - [`PowersPanel::powers`] (`Vec<PowerCard>` da aba ativa).
 #[derive(IntoElement)]
 pub struct PowersPanel {
     summary: String,
+    tabs: Vec<PowerTab>,
     cards: Vec<PowerCard>,
 }
 
 impl PowersPanel {
-    /// Novo painel a partir do inventário (alimenta o resumo do nível 1 com `inventory.counts`). Os
-    /// cards (filtrados + com handlers) vêm depois via [`PowersPanel::powers`].
+    /// Novo painel a partir do inventário (alimenta o resumo do nível 1 com `inventory.counts`).
+    /// As abas e os cards vêm depois via [`PowersPanel::tabs`]/[`PowersPanel::powers`].
     #[must_use]
     pub fn new(inventory: &PowerInventory) -> Self {
         Self {
             summary: summary_line(&inventory.counts),
+            tabs: Vec::new(),
             cards: Vec::new(),
         }
     }
 
-    /// Os cards a exibir — já construídos com seus handlers e JÁ filtrados por [`should_render`]
-    /// (o call-site não passa `Disabled` enquanto o app não religar). Sem cards = estado vazio.
+    /// As abas a renderizar — vindas de [`tab_models`] e mapeadas com o handler de troca pelo
+    /// call-site. Sem abas = sem fila no cabeçalho (inventário vazio cai no estado vazio).
+    #[must_use]
+    pub fn tabs(mut self, tabs: Vec<PowerTab>) -> Self {
+        self.tabs = tabs;
+        self
+    }
+
+    /// Os cards a exibir — já JÁ filtrados pela ABA ATIVA (call-site) e por [`should_render`]
+    /// (`Disabled` escondido enquanto o app não religar). Sem cards = estado vazio acolhedor.
     #[must_use]
     pub fn powers(mut self, cards: Vec<PowerCard>) -> Self {
         self.cards = cards;
@@ -462,32 +617,117 @@ impl RenderOnce for PowersPanel {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let t = theme::active();
 
+        // ── Cabeçalho fixo ───────────────────────────────────────────────────────────
         let title = title_text(&t, SharedString::from(PANEL_TITLE));
-        // Resumo do nível 1 — só quando há algo contado (vazio cai no estado vazio abaixo).
         let summary = (!self.summary.is_empty())
             .then(|| summary_text(&t, SharedString::from(self.summary.clone())));
         let intro = muted_text(&t, SharedString::from(PANEL_INTRO));
 
-        // Nível 2: a lista de cards, ou o estado vazio acolhedor (nunca tela em branco).
-        let body: gpui::AnyElement = if self.cards.is_empty() {
-            muted_text(&t, SharedString::from(EMPTY_STATE)).into_any_element()
-        } else {
+        let tab_row = (!self.tabs.is_empty()).then(|| {
+            // flex_wrap p/ janelas estreitas: as abas quebram pra próxima linha em vez de cortar.
             div()
                 .flex()
-                .flex_col()
-                .gap(px(Space::Md.px(&t)))
-                .children(self.cards)
-                .into_any_element()
-            // ponytail: lista direta (mock ~6 itens). Virtualização de 75+ cards é polimento de
-            // layout do Maestro na posição final do painel, não desta fatia.
-        };
+                .flex_row()
+                .flex_wrap()
+                .gap(px(Space::Sm.px(&t)))
+                .children(self.tabs)
+        });
 
-        Panel::surface()
-            .gap(Space::Lg)
-            .pad(Space::Lg, Space::Lg)
+        let header = div()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(Space::Md.px(&t)))
             .child(title)
             .children(summary)
             .child(intro)
+            .children(tab_row);
+
+        // ── Body rolável (idioma do app — ver `onboarding.rs:1152-1157`/`attention_ui.rs:1058-1060`):
+        //    `flex_1 + min_h(px(0.)) + overflow_y_scroll` num filho do flex_col raiz. `px(0.)` é
+        //    reset estrutural (catraca ignora, ver test em `tests/token_ratchet.rs:262`).
+        let body: gpui::AnyElement = if self.cards.is_empty() {
+            // Estado vazio: acolhedor, centralizado vertical. NUNCA tela em branco (inv #6).
+            div()
+                .flex_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .child(muted_text(&t, SharedString::from(EMPTY_STATE)))
+                .into_any_element()
+        } else if use_grid(self.cards.len()) {
+            // Lista volumosa (skills/plugins): SPLIT intercalado em 2 colunas — alturas equilibradas,
+            // sem a monotonia de pilha única de 60+ cards.
+            let mut col_a: Vec<PowerCard> = Vec::with_capacity(self.cards.len() / 2 + 1);
+            let mut col_b: Vec<PowerCard> = Vec::with_capacity(self.cards.len() / 2 + 1);
+            for (i, card) in self.cards.into_iter().enumerate() {
+                if i % 2 == 0 {
+                    col_a.push(card);
+                } else {
+                    col_b.push(card);
+                }
+            }
+            let gap = px(Space::Md.px(&t));
+            div()
+                .id("powers-body")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(gap)
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(gap)
+                                .children(col_a),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(gap)
+                                .children(col_b),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            // Lista modesta: 1 coluna, cards "respiráveis".
+            div()
+                .id("powers-body")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(Space::Md.px(&t)))
+                        .children(self.cards),
+                )
+                .into_any_element()
+        };
+
+        // ── Container raiz: identidade da casa via tokens (Card + borda 1px), `size_full` p/ casar
+        //    com o pai de altura constrita do call-site (modal-like, ~0.72×0.82 da janela).
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(Space::Lg.px(&t)))
+            .px(px(Space::Lg.px(&t)))
+            .py(px(Space::Lg.px(&t)))
+            .bg(rgb(t.surface.card))
+            .border_1()
+            .border_color(rgb(t.surface.border))
+            .rounded_md()
+            .child(header)
             .child(body)
     }
 }
@@ -729,6 +969,122 @@ mod tests {
         assert_eq!(kind_anchor(PowerKind::Hook), "hook");
     }
 
+    /// **Abas: "Todos" primeiro com a soma; depois UMA por tipo PRESENTE na ordem canônica do
+    /// `BTreeMap`. Tipo zerado NÃO emite aba (não polui o cabeçalho).** Default ativo = "Todos".
+    #[test]
+    fn tab_models_emit_all_first_then_present_kinds() {
+        let mut counts: BTreeMap<PowerKind, u32> = BTreeMap::new();
+        counts.insert(PowerKind::Skill, 75);
+        counts.insert(PowerKind::Plugin, 33);
+        counts.insert(PowerKind::Hook, 1);
+        counts.insert(PowerKind::Agent, 0); // zerado: não aparece
+
+        let tabs = tab_models(&counts, None);
+        let ids: Vec<_> = tabs.iter().map(|t| t.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                None,
+                Some(PowerKind::Skill),
+                Some(PowerKind::Plugin),
+                Some(PowerKind::Hook),
+            ],
+            "Todos primeiro; ordem canônica; Agent (count=0) NÃO entra"
+        );
+        assert_eq!(tabs[0].count, 75 + 33 + 1, "Todos = soma das presentes");
+        assert!(tabs[0].active, "active=None ⇒ Todos ativa por padrão");
+        assert!(
+            tabs.iter().skip(1).all(|t| !t.active),
+            "nenhuma outra fica ativa com active=None"
+        );
+    }
+
+    /// Aba ativa específica: o `active=Some(kind)` desliga a "Todos" e liga só o tipo escolhido.
+    #[test]
+    fn tab_models_active_marks_only_the_chosen_one() {
+        let mut counts: BTreeMap<PowerKind, u32> = BTreeMap::new();
+        counts.insert(PowerKind::Skill, 5);
+        counts.insert(PowerKind::Plugin, 9);
+        let tabs = tab_models(&counts, Some(PowerKind::Plugin));
+        let active: Vec<_> = tabs.iter().filter(|t| t.active).map(|t| t.id).collect();
+        assert_eq!(
+            active,
+            vec![Some(PowerKind::Plugin)],
+            "só Plugin marcada ativa"
+        );
+    }
+
+    /// Inventário vazio: zero abas (o painel cai no estado vazio acolhedor, sem fila no cabeçalho).
+    #[test]
+    fn tab_models_empty_inventory_emits_no_tabs() {
+        assert!(tab_models(&BTreeMap::new(), None).is_empty());
+        let mut zeroed: BTreeMap<PowerKind, u32> = BTreeMap::new();
+        zeroed.insert(PowerKind::Skill, 0);
+        zeroed.insert(PowerKind::Plugin, 0);
+        assert!(
+            tab_models(&zeroed, None).is_empty(),
+            "total=0 ⇒ sem abas (não emite 'Todos · 0')"
+        );
+    }
+
+    /// Rótulo da aba: pluraliza o nome do tipo pela contagem; "Todos" é coletivo. Separador `·`.
+    #[test]
+    fn tab_label_pluralizes_per_count() {
+        assert_eq!(
+            tab_label(TabModel {
+                id: None,
+                count: 109,
+                active: true
+            }),
+            "Todos · 109",
+            "Todos é coletivo, não pluraliza"
+        );
+        assert_eq!(
+            tab_label(TabModel {
+                id: Some(PowerKind::Plugin),
+                count: 44,
+                active: false
+            }),
+            "Plugins · 44"
+        );
+        assert_eq!(
+            tab_label(TabModel {
+                id: Some(PowerKind::Hook),
+                count: 1,
+                active: false
+            }),
+            "Gatilho · 1",
+            "singular pela contagem"
+        );
+    }
+
+    /// Densidade: ≤ `GRID_THRESHOLD` ⇒ coluna única; acima ⇒ 2 colunas. Fronteira testada.
+    #[test]
+    fn use_grid_kicks_in_above_threshold() {
+        assert!(!use_grid(0), "vazio fica em col simples (cai no estado vazio)");
+        assert!(!use_grid(GRID_THRESHOLD), "fronteira inclusiva: ≤ ⇒ col simples");
+        assert!(use_grid(GRID_THRESHOLD + 1), "acima do limite ⇒ 2 col");
+        assert!(use_grid(75), "skills volumosos ⇒ 2 col");
+    }
+
+    /// Slug da aba é estável e único por id (não depende do rótulo, que pluraliza).
+    #[test]
+    fn tab_slug_is_stable_and_unique() {
+        let ids = [
+            None,
+            Some(PowerKind::Skill),
+            Some(PowerKind::Plugin),
+            Some(PowerKind::Agent),
+            Some(PowerKind::Command),
+            Some(PowerKind::Hook),
+            Some(PowerKind::Mcp),
+        ];
+        let slugs: Vec<&'static str> = ids.iter().copied().map(tab_slug).collect();
+        let unique: std::collections::HashSet<_> = slugs.iter().collect();
+        assert_eq!(unique.len(), slugs.len(), "cada aba tem um slug distinto");
+        assert_eq!(tab_slug(None), "all", "aba 'Todos' = slug 'all'");
+    }
+
     /// Toda a copy LEIGA do painel é pt-br sem jargão técnico de implementação/orquestração — a âncora
     /// "(skill)" é a ÚNICA exceção deliberada (testada à parte), e não entra aqui.
     #[test]
@@ -738,12 +1094,23 @@ mod tests {
             summary_line(&inv.counts),
             origin_label(&inv.powers[3].origin),
             inert_reason(&inv.powers[3].origin),
+            tab_label(TabModel {
+                id: None,
+                count: 109,
+                active: true,
+            }),
+            tab_label(TabModel {
+                id: Some(PowerKind::Plugin),
+                count: 44,
+                active: false,
+            }),
         ];
         let surfaces: Vec<&str> = [
             PANEL_TITLE,
             PANEL_INTRO,
             EMPTY_STATE,
             ORIGIN_LABEL,
+            TAB_ALL,
             READY_LABEL,
             UPDATE_LABEL,
             REPAIR_LABEL,
