@@ -912,10 +912,44 @@ impl AttentionQueue {
     /// externo — nunca auto-inferido, #28174).
     #[must_use]
     pub fn dismiss(&self, stable_id: &str) -> Option<DomainEvent> {
-        let item = self.permissions.iter().find(|p| p.matches(stable_id))?;
-        Some(DomainEvent::PermissionDismissed {
-            stable_id: item.stable_id.clone(),
-        })
+        // Permission: emite o canônico (o gesto pode ter vindo por alias do merge entre camadas).
+        if let Some(p) = self.permissions.iter().find(|p| p.matches(stable_id)) {
+            return Some(DomainEvent::PermissionDismissed {
+                stable_id: p.stable_id.clone(),
+            });
+        }
+        // Tela do fundador (2026-06-25): «dispensar» é GENÉRICO (botão "Limpar fila"). Reconhece
+        // QUALQUER item da fila pelo `stable_id` EXIBIDO — sem isto o evento nunca era emitido para
+        // dead-letter/guard/etc., o fold genérico nunca rodava e o botão "não fazia nada". O
+        // `stable_id` desses tipos já É o canônico (vem direto de `items()`).
+        self.has_item_with_stable_id(stable_id)
+            .then(|| DomainEvent::PermissionDismissed {
+                stable_id: stable_id.to_string(),
+            })
+    }
+
+    /// `true` se ALGUM item da fila (qualquer tipo, não só permissão) tem o `stable_id` EXIBIDO —
+    /// espelha os formatos de [`Self::items`]. Usado por [`Self::dismiss`] para reconhecer
+    /// não-permissões no "Limpar fila"; evita emitir `PermissionDismissed` de lixo (id inexistente).
+    fn has_item_with_stable_id(&self, stable_id: &str) -> bool {
+        self.dead_letters
+            .iter()
+            .any(|d| format!("dead-letter:{}", d.id) == stable_id)
+            || self
+                .guard_asks
+                .iter()
+                .any(|g| format!("guard:{}", g.node) == stable_id)
+            || self.custody.iter().any(|c| c.id == stable_id)
+            || self.disk_reclaims.iter().any(|d| d.stable_id == stable_id)
+            || self.spawns.iter().any(|s| s.id == stable_id)
+            || self
+                .code_conflicts
+                .iter()
+                .any(|c| format!("code-conflict:{}:{}", c.owner, c.branch) == stable_id)
+            || self
+                .dispatches
+                .iter()
+                .any(|d| format!("delivered-no-progress:{}", d.node_id) == stable_id)
     }
 
     /// Comando da allowlist por nó: liga/desliga o fallback de GRID para `node_id`.
@@ -1458,6 +1492,51 @@ mod tests {
             "permission + guard-ask + dead-letter do nó morto saíram juntos"
         );
         assert_eq!(items[0].node_id, vivo.to_string(), "só o do nó vivo permanece");
+    }
+
+    /// Tela do fundador (2026-06-25, REGRESSÃO do botão "Limpar"): o botão chamava `dismiss(id)`, mas
+    /// o PRODUTOR `dismiss` só reconhecia PERMISSÕES — para um dead-letter retornava `None`, então o
+    /// evento `PermissionDismissed` NUNCA era emitido e o fold (já genérico) nunca rodava. "Clico e
+    /// nada ocorre". Testa o CAMINHO REAL (produtor → evento → fold), não o fold direto.
+    #[test]
+    fn dismiss_reconhece_qualquer_tipo_caminho_real() {
+        let mut q = AttentionQueue::new();
+        q.observe(
+            &DomainEvent::MessageDeadLettered {
+                id: "m1".into(),
+                to: "@Especialista em IA".into(),
+                reason: "alvo inexistente".into(),
+            },
+            T0,
+        );
+        q.observe(
+            &DomainEvent::ActionGated {
+                cmd: "x".into(),
+                class: "gated-hard".into(),
+                decision: "ask".into(),
+                node: Some("Maestro 01".into()),
+            },
+            T0,
+        );
+        assert_eq!(q.items(T0 + 1_000).len(), 2);
+
+        // O PRODUTOR reconhece dead-letter e guard-ask (não só permissão) e emite o evento.
+        let ev_dl = q.dismiss("dead-letter:m1").expect("dismiss reconhece dead-letter");
+        assert!(
+            matches!(&ev_dl, DomainEvent::PermissionDismissed { stable_id } if stable_id == "dead-letter:m1")
+        );
+        let ev_g = q.dismiss("guard:Maestro 01").expect("dismiss reconhece guard-ask");
+
+        // Caminho REAL: observar os eventos produzidos LIMPA de verdade (não o fold à mão).
+        q.observe(&ev_dl, T0 + 2_000);
+        q.observe(&ev_g, T0 + 2_000);
+        assert!(
+            q.items(T0 + 3_000).is_empty(),
+            "dismiss + observe zera a fila — o botão Limpar funciona de ponta a ponta"
+        );
+
+        // stable_id que não casa item algum → None (não emite evento de lixo).
+        assert!(q.dismiss("dead-letter:inexistente").is_none());
     }
 
     /// Tela do fundador (2026-06-25): o botão "Limpar fila" precisa dispensar QUALQUER tipo, não só
