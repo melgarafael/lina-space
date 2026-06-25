@@ -14,11 +14,10 @@
 //! - **heurística nunca decide estado:** o estado vem do disco (frontmatter válido? arquivo presente?
 //!   na pasta do CLI focado?), determinístico — adivinhar pelo output do terminal é banido.
 //!
-//! ## Largada (Maestro 01) × implementação (F24CORE / Terminal B)
-//! Os TIPOS abaixo são o contrato selado do ADR 0052 §3 — UI (`powers_panel.rs`) e QA renderizam/
-//! testam contra eles JÁ. As funções `scan_powers`/`watch_targets` estão como **stub** (corpo vazio
-//! que compila): o **Terminal B (F24CORE)** preenche a varredura real (manifest-first, 5 estados) e
-//! pode ESTENDER `PowerRoots` se precisar — sem tocar `events.rs`/`lib.rs` (a costura já existe).
+//! ## Contrato (ADR 0052 §3) — tipos + scanner
+//! Os TIPOS são o contrato selado do ADR 0052 §3, consumidos direto pela UI (`powers_panel.rs`) e
+//! pelo QA. `scan_powers`/`watch_targets` implementam a varredura real (manifest-first, 5 estados);
+//! os caminhos por CLI vêm do `CliProfile` (`skills_dir`/`mcp_config_path`), sem hardcode (inv#3).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

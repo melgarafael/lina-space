@@ -5924,7 +5924,7 @@ impl Render for WorkspaceView {
         }
 
         // F2-4-3+4: porta VISÍVEL da Área de Poderes (fio condutor #3 — nada só atrás de atalho).
-        // [SEAM: scan-ao-abrir] o scan real liga aqui quando a ponte `bridge.rs` montar `PowerRoots`.
+        // Ao ABRIR, `refresh_powers_inventory` faz o scan-ao-abrir (PowerRoots real) e preenche o painel.
         topbar = topbar.child(
             div()
                 .id("powers-btn")
