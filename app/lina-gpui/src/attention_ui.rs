@@ -1034,6 +1034,15 @@ pub fn render_panel(
                         .text_color(rgb(th.text.bright))
                         .child(text!(format!("Fila de Atenção ({})", items.len()))),
                 )
+                // Tela do fundador (2026-06-25): «Limpar» zera a fila — o controle manual que faltava
+                // para pendências velhas (mensagens não entregues a alvos que já não existem).
+                .child(btn(
+                    cx,
+                    "att-panel-clear",
+                    "Limpar",
+                    (th.surface.raised, th.text.primary),
+                    |v, _w, cx| v.attention_clear_all(cx),
+                ))
                 .child(btn(
                     cx,
                     "att-panel-close",

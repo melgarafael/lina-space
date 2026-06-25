@@ -2054,6 +2054,25 @@ impl WorkspaceView {
         }
     }
 
+    /// Tela do fundador (2026-06-25): «Limpar fila» — dispensa TODOS os itens visíveis de uma vez.
+    /// Cada um vira `PermissionDismissed{stable_id}` (o fold genérico remove de qualquer fila), dando
+    /// ao usuário o controle de zerar pendências velhas que nenhum encerramento automático alcança
+    /// (ex.: avisos de mensagens não entregues a alvos que nunca existiram). Gesto humano, durável.
+    fn attention_clear_all(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .attention_items
+            .iter()
+            .map(|i| i.stable_id.clone())
+            .collect();
+        let mut changed = false;
+        for id in &ids {
+            changed |= self.attention.dismiss(id);
+        }
+        if changed {
+            self.attention_refresh_now(cx);
+        }
+    }
+
     /// «Silenciar/Reativar detecção deste terminal» (allowlist por nó — reversível).
     fn attention_toggle_mute(&mut self, node_id: &str, cx: &mut Context<Self>) {
         let muted = self.attention.is_node_muted(node_id);

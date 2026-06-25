@@ -428,9 +428,29 @@ impl AttentionQueue {
             // prompt respondido DIRETO no terminal (PromptCleared, R2b item 5 — sem
             // decisão fabricada; `matches` cobre canônico E aliases do merge).
             DomainEvent::PermissionResolved { stable_id, .. }
-            | DomainEvent::PermissionDismissed { stable_id }
             | DomainEvent::PermissionPromptCleared { stable_id, .. } => {
                 self.permissions.retain(|p| !p.matches(stable_id));
+            }
+            // Tela do fundador (2026-06-25): «dispensar» é GENÉRICO. O botão "Limpar fila" e o "Não
+            // era um pedido" emitem `PermissionDismissed{stable_id}` para QUALQUER item da fila (não
+            // só permissões) — remove o item de qualquer fila pelo `stable_id` EXIBIDO (a identidade
+            // do item na UI, ADR 0021 §6). É o que dá ao usuário o controle de zerar pendências que
+            // nenhum encerramento automático alcança (dead-letters a alvos que nunca existiram). Para
+            // um stable_id de permissão real, os retains dos demais tipos são no-op (os formatos
+            // `dead-letter:`/`guard:`/… não casam) — não regride o "Não era um pedido".
+            DomainEvent::PermissionDismissed { stable_id } => {
+                self.permissions.retain(|p| !p.matches(stable_id));
+                self.custody.retain(|c| c.id != *stable_id);
+                self.disk_reclaims.retain(|d| d.stable_id != *stable_id);
+                self.spawns.retain(|s| s.id != *stable_id);
+                self.guard_asks
+                    .retain(|g| format!("guard:{}", g.node) != *stable_id);
+                self.code_conflicts
+                    .retain(|c| format!("code-conflict:{}:{}", c.owner, c.branch) != *stable_id);
+                self.dead_letters
+                    .retain(|d| format!("dead-letter:{}", d.id) != *stable_id);
+                self.dispatches
+                    .retain(|d| format!("delivered-no-progress:{}", d.node_id) != *stable_id);
             }
             DomainEvent::NodeDetectionMuted { node_id, muted } => {
                 self.muted.insert(node_id.clone(), *muted);
@@ -1438,6 +1458,53 @@ mod tests {
             "permission + guard-ask + dead-letter do nó morto saíram juntos"
         );
         assert_eq!(items[0].node_id, vivo.to_string(), "só o do nó vivo permanece");
+    }
+
+    /// Tela do fundador (2026-06-25): o botão "Limpar fila" precisa dispensar QUALQUER tipo, não só
+    /// permissão. `PermissionDismissed{stable_id}` agora remove o item pelo `stable_id` exibido de
+    /// qualquer fila — é como o usuário zera dead-letters de alvos que nunca existiram (sem morte
+    /// para o purge pegar). Um stable_id de permissão real NÃO afeta as outras filas (no-op).
+    #[test]
+    fn dismiss_generico_remove_qualquer_item_por_stable_id() {
+        let mut q = AttentionQueue::new();
+        q.observe(
+            &DomainEvent::MessageDeadLettered {
+                id: "m1".into(),
+                to: "@Especialista em IA".into(),
+                reason: "alvo inexistente".into(),
+            },
+            T0,
+        );
+        q.observe(
+            &DomainEvent::ActionGated {
+                cmd: "cd /repo && lina plan read".into(),
+                class: "gated-hard".into(),
+                decision: "ask".into(),
+                node: Some("Maestro 01".into()),
+            },
+            T0,
+        );
+        q.observe(&ask("Z", PermissionEvidence::Hook, "perm1"), T0);
+        assert_eq!(q.items(T0 + 1_000).len(), 3, "dead-letter + guard-ask + permissão");
+
+        // "Limpar" dispensa o dead-letter pelo stable_id exibido (`dead-letter:<id>`).
+        q.observe(
+            &DomainEvent::PermissionDismissed {
+                stable_id: "dead-letter:m1".into(),
+            },
+            T0 + 2_000,
+        );
+        assert_eq!(q.items(T0 + 3_000).len(), 2, "dead-letter dispensado");
+        // E o guard-ask (`guard:<nome>`).
+        q.observe(
+            &DomainEvent::PermissionDismissed {
+                stable_id: "guard:Maestro 01".into(),
+            },
+            T0 + 3_000,
+        );
+        let rest = q.items(T0 + 4_000);
+        assert_eq!(rest.len(), 1, "guard-ask dispensado; só a permissão fica");
+        assert_eq!(rest[0].stable_id, "perm1");
     }
 
     /// Dedup entre camadas (decisão do Maestro): item nasce do GRID (~1,3s), hook
