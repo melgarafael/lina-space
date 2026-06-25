@@ -1641,6 +1641,23 @@ pub enum DomainEvent {
         #[serde(default)]
         approved_by: String,
     },
+    // ───────── F2-4 · Área de Poderes (épico 38 §III F2-4 · ADR 0052) ─────────
+    // LARGADA da onda F2-4 (dono único: Maestro 01). Evento de AUDITORIA anti-manipulação do scan
+    // de Poderes — METADADOS apenas. META: no-op no `apply`; o painel NÃO depende dele (lê o scan
+    // de disco direto via `powers::scan_powers`). ADITIVO (`#[serde(default)]`): replay de log antigo
+    // nunca quebra. Limite duro (ADR 0052 §2): ZERO nome/descrição/conteúdo de poder; NENHUM campo
+    // decide autorização (mostrar ≠ autorizar).
+    /// F2-4: um scan da Área de Poderes ocorreu — só CONTADORES + timestamp, para auditoria.
+    PowerScanned {
+        /// total de poderes vistos (soma de todos os kinds).
+        total: u32,
+        /// contagem por kind — chave = `PowerKind` em minúsculo ("skill","plugin",…). String, não
+        /// enum, para o evento sobreviver a um `PowerKind` novo (replay-safe).
+        #[serde(default)]
+        counts: BTreeMap<String, u32>,
+        #[serde(default)]
+        scanned_at_ms: u64,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -1739,6 +1756,8 @@ impl DomainEvent {
             DomainEvent::ChannelDisconnected { .. } => "ChannelDisconnected",
             DomainEvent::ChannelMessageRead { .. } => "ChannelMessageRead",
             DomainEvent::ChannelMessageSent { .. } => "ChannelMessageSent",
+            // F2-4 Área de Poderes (épico 38 · ADR 0052): auditoria do scan (só metadados).
+            DomainEvent::PowerScanned { .. } => "PowerScanned",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
             DomainEvent::HistoryReadCross { .. } => "HistoryReadCross",
             DomainEvent::NodeStalled { .. } => "NodeStalled",
@@ -2272,7 +2291,9 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         | DomainEvent::CredentialRevoked { .. }
         | DomainEvent::ChannelRegistered { .. }
         | DomainEvent::ToolScopeDeclared { .. }
-        | DomainEvent::ToolScopeRevoked { .. } => {}
+        | DomainEvent::ToolScopeRevoked { .. }
+        // F2-4: auditoria do scan de Poderes — META (ADR 0052); o painel lê o scan de disco direto.
+        | DomainEvent::PowerScanned { .. } => {}
     }
 }
 

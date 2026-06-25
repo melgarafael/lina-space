@@ -58,6 +58,11 @@ ask_timeout_ms = 120000
 # OBSERVADO: `~/.codex/sessions/AAAA/MM/DD/rollout-*.jsonl` nesta máquina.
 session_dir_pattern = "~/.codex/sessions/*/*/*/rollout-*.jsonl"
 
+# F2-4 (ADR 0052 §5): caminhos da Área de Poderes do Codex. mcp_config_path é TOML (`[mcp_servers.*]`)
+# — o scanner decide o parser pela extensão `.toml` (distinto do JSON do Claude). skills em `~/.codex/skills`.
+skills_dir = "~/.codex/skills"
+mcp_config_path = "~/.codex/config.toml"
+
 # Assinatura no grid (telemetria camada 4 — NUNCA decisória): o banner do composer do Codex.
 output_markers = ["OpenAI Codex"]
 

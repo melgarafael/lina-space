@@ -48,6 +48,10 @@ ask_timeout_ms = 120000
 # conservador; watch degrada gracioso se não casar. Calibrar contra ~/.gemini real.
 session_dir_pattern = "~/.gemini/*/*.jsonl"
 
+# F2-4 (ADR 0052 §5): pasta de skills do Gemini para a Área de Poderes. mcp_config_path ausente:
+# o formato de config de MCP do `gemini` não está caracterizado aqui (entra por TOML quando for).
+skills_dir = "~/.gemini/skills"
+
 # ⚠️ Vazio: banner/markers reais do `gemini` não caracterizados aqui.
 output_markers = []
 

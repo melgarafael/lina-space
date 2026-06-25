@@ -48,6 +48,14 @@ pub use cli_discovery::{
     discover_clis, discover_clis_in, find_in_path, query_version, DiscoveredCli, KNOWN_CLIS,
 };
 
+/// F2-4: Área de Poderes — scanner determinístico de disco (skills/plugins/agents/commands/hooks/
+/// MCPs), projeção efêmera manifest-first (ADR 0052). Largada do Maestro; F24CORE preenche o scan.
+mod powers;
+pub use powers::{
+    scan_powers, watch_targets, Power, PowerInventory, PowerKind, PowerOrigin, PowerRoots,
+    PowerScope, PowerState, POWERS_DEBOUNCE_MS,
+};
+
 /// Entrega A2A faseada (W0-9) + contrato de fim-de-resposta (W0-10).
 mod a2a;
 pub use a2a::{

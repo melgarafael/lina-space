@@ -198,6 +198,16 @@ pub struct CliProfile {
     /// (F1-1-2). `None` = CLI sem session-files (ex.: shell puro).
     #[serde(default)]
     pub session_dir_pattern: Option<String>,
+    /// F2-4 (ADR 0052 §5): pasta de skills deste CLI (glob, suporta `~`), ex. `"~/.claude/skills"`,
+    /// `"~/.gemini/skills"`. `None` = CLI sem pasta de skills. Consumido por `powers.rs::scan_powers`
+    /// para a Área de Poderes (e por `InertHere`: skill na pasta deste CLI ≠ do terminal focado).
+    #[serde(default)]
+    pub skills_dir: Option<String>,
+    /// F2-4 (ADR 0052 §5): arquivo de config de MCP deste CLI, formato por-CLI decidido pela extensão,
+    /// ex. `"~/.claude.json"` (Claude, JSON) ou `"~/.codex/config.toml"` (Codex, TOML). `None` = CLI
+    /// sem MCP. Suporta `~`. Consumido por `powers.rs::scan_powers`.
+    #[serde(default)]
+    pub mcp_config_path: Option<String>,
     /// Assinaturas deste CLI observáveis no output do grid — telemetria da
     /// camada 4 do ADR de detecção (13.9): **nunca decisória**, só validação
     /// cruzada de confiança. Vazio = sem marcadores conhecidos.
@@ -667,6 +677,18 @@ mod tests {
             profile.capabilities.has("handoff_support"),
             "claude-code suporta handoff A2A completo (13.9 item 5)"
         );
+
+        // F2-4 (ADR 0052 §5): caminhos da Área de Poderes (consumidos por powers.rs::scan_powers).
+        assert_eq!(
+            profile.skills_dir.as_deref(),
+            Some("~/.claude/skills"),
+            "skills_dir do claude-code (scan da Área de Poderes)"
+        );
+        assert_eq!(
+            profile.mcp_config_path.as_deref(),
+            Some("~/.claude.json"),
+            "mcp_config_path do claude-code (manifesto JSON de MCP)"
+        );
     }
 
     // ── A2A UNIVERSAL: o profile do Codex parseia e expõe a calibração da TUI real ──
@@ -713,6 +735,14 @@ mod tests {
         assert_eq!(
             profile.session_dir_pattern.as_deref(),
             Some("~/.codex/sessions/*/*/*/rollout-*.jsonl"),
+        );
+
+        // F2-4 (ADR 0052 §5): MCP do Codex é TOML (`[mcp_servers.*]`) — o scanner decide o parser
+        // pela extensão `.toml`, distinta do JSON do Claude. skills em `~/.codex/skills`.
+        assert_eq!(profile.skills_dir.as_deref(), Some("~/.codex/skills"));
+        assert_eq!(
+            profile.mcp_config_path.as_deref(),
+            Some("~/.codex/config.toml")
         );
     }
 
