@@ -111,9 +111,11 @@ Decidir: **(1)** HTTP client de saída (`ureq` síncrono leve vs `reqwest` async
 
 ---
 
-## FECHAMENTO desta rodada (2026-06-25, Maestro 01) — NÚCLEO completo; APP deferido p/ sessão dedicada
+## FECHAMENTO desta rodada (2026-06-25, Maestro 01) — ✅ NÚCLEO + APP completos e commitados
 
-**Decisão do fundador:** fechar esta rodada com o **núcleo pronto, provado e commitado** (`0a4cb60`); a tela (`F41-APP`) vira a **1ª tarefa da próxima sessão dedicada**, feita com calma e testada com o Waha real na VPS.
+> ⚡ **ATUALIZAÇÃO (mesmo dia, mais tarde):** o app NÃO ficou deferido — o Especialista destravou (a fila A2A drenou) e **FECHOU a feature inteira**; commit **`7de2d6c`** (`feat(f4-1): app WhatsApp/Waha`). A "fronteira do app" mapeada mais abaixo foi **REALIZADA**, não adiada — fica como registro de como foi feito (o cuidado de freeze, o call-site anti-órfã, etc. foram todos seguidos). Gate verde: clippy `--all-targets -D warnings` + 667 testes. **Pendem só os gates de TELA do fundador** (Waha na VPS + credenciais + push). *Lição registrada: concluí "deferido" 3× cedo demais validando estado defasado da fila; a verdade é o disco no instante da decisão — `[[maestro-sob-fila-congestionada-decide-por-disco-nao-redespacha]]`.*
+
+**Histórico da decisão (revertida pelo avanço do trabalho):** a 1ª leitura foi fechar a rodada com o **núcleo commitado** (`0a4cb60`) e deferir a tela; o app então fechou no mesmo dia.
 
 **✅ Entregue, verde e COMMITADO (`0a4cb60`):** transporte Waha (B) · projeção Connected/session_ref (J) · leitura auditada + scope (K) · 4 eventos (largada) · **18 testes de segurança** (R) · manifesto · ADR 0050. Suíte completa do core **0 regressão**. Validado de fora pelo Maestro (cargo test + leitura). *Cold-review isolado do Maestro 00 ficou preso na fila A2A congestionada — não bloqueou; minha validação cobre o gate técnico.*
 
