@@ -1,0 +1,25 @@
+# Manifesto declarativo do canal WhatsApp via Waha — F4-1-1 (ADR 0050).
+#
+# DADO, jamais autoridade: este arquivo DESCREVE o canal; quem libera o efeito externo (envio) é o
+# broker (`lina do whatsapp send …`, F4-0-3) + a custódia do `X-Api-Key` no cofre (escopo
+# `channel:whatsapp`, ADR 0004). Registrar ≠ conectar. NÃO há `trust_tier` aqui — a confiança é
+# decidida pela curadoria (F4-0-6), não auto-declarável (declará-lo faria o parse falhar:
+# `deny_unknown_fields`).
+
+name = "whatsapp"
+transport = "waha_http"
+auth = "api_key"
+scopes = ["messages:read", "messages:send"]
+
+# As AÇÕES brokeradas que o canal expõe — slugs EXATOS (sem `:`), porque `channel_action_in_manifest`
+# (broker.rs) e `run_do_channel` fazem MATCH EXATO contra a ação de `do:channel:whatsapp:<ação>`.
+# `send`/`read` (não `messages:send`) é o que casa: sem isto, o envio seria negado por default-deny
+# ANTES da custódia (achado do Arquiteto, ADR 0050 §(5); correção de costura aplicada pelo Maestro).
+[tools]
+default_enabled = ["send", "read"]
+
+[install]
+# PINADO pela tag da imagem Waha em produção (ref/waha/04 §image) — nunca HEAD/branch/latest, que
+# deixaria o que se instala mudar sob os pés (doc 40 §6).
+ref = "noweb-2026.4.2"
+source = "https://hub.docker.com/r/devlikeapro/waha-plus"

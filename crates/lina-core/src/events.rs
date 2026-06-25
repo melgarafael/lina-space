@@ -1571,6 +1571,76 @@ pub enum DomainEvent {
         #[serde(default)]
         effective_level: String,
     },
+    // ───────── F4-1 · Canal WhatsApp/Waha (épico 41 §III · Onda F4-1) ─────────
+    // LARGADA da onda F4-1 (dono único: Maestro 01). Os 4 eventos abaixo congelam o CONTRATO da vida
+    // do canal: conectar (QR) → ler (fluido, auditado) → enviar (gated humano) → desconectar (zera o
+    // cano). Todos META (no-op no `apply`): a projeção `ChannelRegistry`/`channel_read` reconstrói por
+    // replay. **Doutrina dura (épico §IV):** `session_ref` é REFERÊNCIA custodiada (jamais o token);
+    // conteúdo de mensagem NUNCA vai cru ao log (só `count`/refs — espelha `HistoryReadCross`);
+    // `approved_by` é rótulo de PROVENIÊNCIA, jamais autoridade. Convenção D2: o instante vive no `ts`
+    // do `EventRecord` (sem `*_at` no payload). Decisão na peça onda-1.md.
+    /// F4-1-2 (TAG [10] Estrutura): uma conta de canal foi CONECTADA por ação humana de tela (o leigo
+    /// escaneou o QR). Opt-in sinalizado + gesto explícito (nunca silencioso). A projeção passa a
+    /// derivar `ChannelStatus::Connected`. `session_ref` é REFERÊNCIA à sessão custodiada (keyring),
+    /// jamais o token — o agente nunca o vê (ADR 0004). META.
+    ChannelConnected {
+        /// nome do canal (ex.: `"whatsapp"`).
+        #[serde(default)]
+        channel: String,
+        /// REFERÊNCIA à sessão custodiada no cofre (a chave/conta), nunca o token de sessão.
+        #[serde(default)]
+        session_ref: String,
+        /// escopo da conexão (ex.: provedor/instância Waha) — DADO declarativo, nunca autoridade.
+        #[serde(default)]
+        scope: String,
+    },
+    /// F4-1-2 (TAG [10] Estrutura): a conexão foi DESFEITA — o cano zera; o próximo `lina do <canal>`
+    /// falha "não conectado". Par de `ChannelConnected`; o fold determinístico derruba o estado para
+    /// `Declared` no replay seguinte. META.
+    ChannelDisconnected {
+        /// nome do canal desconectado.
+        #[serde(default)]
+        channel: String,
+        /// REFERÊNCIA à sessão encerrada (correlaciona com o `ChannelConnected`), nunca o token.
+        #[serde(default)]
+        session_ref: String,
+    },
+    /// F4-1-3 (TAG [6] Fluxo): a IA LEU uma conversa/grupo DECLARADO como contexto de entrada. Leitura
+    /// é fluida (sem efeito externo → sem gate) mas AUDITADA. **Conteúdo NUNCA vai cru ao log** — só
+    /// metadados (`count`/refs), espelhando `HistoryReadCross`. Só grupos no `tool_scope` (default-deny
+    /// F4-1-5): ler um não-declarado é recusado e auditado, não emite este evento de sucesso. META.
+    ChannelMessageRead {
+        /// nome do canal (ex.: `"whatsapp"`).
+        #[serde(default)]
+        channel: String,
+        /// REFERÊNCIA à conversa/grupo lido (ex.: `"grupo:Vendas"`), nunca o conteúdo.
+        #[serde(default)]
+        conversation_ref: String,
+        /// quantidade de mensagens lidas (metadado, nunca o texto).
+        #[serde(default)]
+        count: u32,
+        /// nó que leu (proveniência da leitura), para a trilha de auditoria.
+        #[serde(default)]
+        read_by_node: String,
+    },
+    /// F4-1-4 (TAG [10] Estrutura · ADR 0004): uma mensagem FOI ENVIADA — só APÓS o gate humano. Encadeia
+    /// a `ActionGated`+`BrokerExecuted` (reusados via `broker_exec_ref`). **Texto da mensagem fora do log
+    /// cru** (só refs). `approved_by` é rótulo de PROVENIÊNCIA do gesto humano (lição
+    /// `human-gesture-sentinela`), JAMAIS autoridade — quem libera é a custódia, não este campo. META.
+    ChannelMessageSent {
+        /// nome do canal (ex.: `"whatsapp"`).
+        #[serde(default)]
+        channel: String,
+        /// REFERÊNCIA à conversa/grupo destino, nunca o conteúdo.
+        #[serde(default)]
+        conversation_ref: String,
+        /// correlação com o `BrokerExecuted` da custódia (prova de que passou pelo gate).
+        #[serde(default)]
+        broker_exec_ref: String,
+        /// rótulo de proveniência de quem aprovou (humano) — auditoria, JAMAIS autoridade.
+        #[serde(default)]
+        approved_by: String,
+    },
 }
 
 /// Default do campo `muted` de [`DomainEvent::NodeDetectionMuted`] — `true` para o
@@ -1665,6 +1735,10 @@ impl DomainEvent {
             DomainEvent::WebhookReceived { .. } => "WebhookReceived",
             DomainEvent::WebhookDispatched { .. } => "WebhookDispatched",
             DomainEvent::WebhookActionGated { .. } => "WebhookActionGated",
+            DomainEvent::ChannelConnected { .. } => "ChannelConnected",
+            DomainEvent::ChannelDisconnected { .. } => "ChannelDisconnected",
+            DomainEvent::ChannelMessageRead { .. } => "ChannelMessageRead",
+            DomainEvent::ChannelMessageSent { .. } => "ChannelMessageSent",
             DomainEvent::SnapshotTaken { .. } => "SnapshotTaken",
             DomainEvent::HistoryReadCross { .. } => "HistoryReadCross",
             DomainEvent::NodeStalled { .. } => "NodeStalled",
@@ -2100,6 +2174,13 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
         // reconstroem por replay; payload externo e secret NUNCA no log (ADR 0035 §5).
         | DomainEvent::WebhookDispatched { .. }
         | DomainEvent::WebhookActionGated { .. }
+        // F4-1: vida do canal WhatsApp/Waha (conectar/ler/enviar/desconectar) é META — a projeção
+        // `ChannelRegistry`/`channel_read` reconstrói por replay; conteúdo de mensagem e token de
+        // sessão NUNCA no log (só refs/metadados — épico 41 §IV).
+        | DomainEvent::ChannelConnected { .. }
+        | DomainEvent::ChannelDisconnected { .. }
+        | DomainEvent::ChannelMessageRead { .. }
+        | DomainEvent::ChannelMessageSent { .. }
         // F1-1-1: detecção de CLI é META (livro-razão da descoberta); o consumidor (F1-1)
         // reconstrói o que precisar varrendo o log — sem efeito na projeção do canvas.
         | DomainEvent::CliDetected { .. }
@@ -3159,6 +3240,99 @@ mod tests {
                 st,
                 ProjectedState::default(),
                 "{} é META (no-op no apply)",
+                ev.kind()
+            );
+        }
+    }
+
+    /// LARGADA F4-1: os 4 eventos da vida do canal WhatsApp/Waha (conectar/ler/enviar/desconectar)
+    /// (a) serializam com a tag serde `event` IGUAL ao `kind()`, (b) round-trippam idêntico,
+    /// (c) são META (no-op no apply). É o contrato congelado que as frentes da onda F4-1 consomem
+    /// sem re-editar `events.rs`.
+    #[test]
+    fn f4_1_channel_events_roundtrip_and_kind_matches_serde_tag() {
+        let evs = vec![
+            DomainEvent::ChannelConnected {
+                channel: "whatsapp".into(),
+                session_ref: "session".into(),
+                scope: "waha:default".into(),
+            },
+            DomainEvent::ChannelDisconnected {
+                channel: "whatsapp".into(),
+                session_ref: "session".into(),
+            },
+            DomainEvent::ChannelMessageRead {
+                channel: "whatsapp".into(),
+                conversation_ref: "grupo:Vendas".into(),
+                count: 12,
+                read_by_node: "@Dev".into(),
+            },
+            DomainEvent::ChannelMessageSent {
+                channel: "whatsapp".into(),
+                conversation_ref: "grupo:Vendas".into(),
+                broker_exec_ref: "exec_abc".into(),
+                approved_by: "@Fundador".into(),
+            },
+        ];
+        for ev in evs {
+            let val = serde_json::to_value(&ev).expect("serialize");
+            assert_eq!(
+                val.get("event").and_then(|v| v.as_str()),
+                Some(ev.kind()),
+                "a tag serde `event` deve casar `kind()` para {}",
+                ev.kind()
+            );
+            let back: DomainEvent = serde_json::from_value(val).expect("deserialize");
+            assert_eq!(back, ev, "round-trip idêntico para {}", ev.kind());
+            // META: a vida do canal não afeta a projeção do canvas (apply é no-op).
+            let mut st = ProjectedState::default();
+            apply(&mut st, &ev);
+            assert_eq!(
+                st,
+                ProjectedState::default(),
+                "{} é META (no-op no apply)",
+                ev.kind()
+            );
+        }
+    }
+
+    /// SEGURANÇA F4-1 (épico 41 §IV): conteúdo de mensagem e token de sessão NUNCA aparecem no
+    /// payload serializado dos eventos de canal — só refs/metadados. Prova por varredura do JSON:
+    /// nenhum texto de conversa, nenhum segredo. (O texto/segredo entram via `execute(&secret)` do
+    /// broker e do transporte, jamais no log.)
+    #[test]
+    fn f4_1_channel_events_carry_no_content_or_secret() {
+        let segredo = "wa-session-token-SUPERSECRETO";
+        let texto = "oi, qual o preço do bolo de cenoura?";
+        let evs = vec![
+            DomainEvent::ChannelConnected {
+                channel: "whatsapp".into(),
+                session_ref: "session".into(),
+                scope: "waha:default".into(),
+            },
+            DomainEvent::ChannelMessageRead {
+                channel: "whatsapp".into(),
+                conversation_ref: "grupo:Vendas".into(),
+                count: 3,
+                read_by_node: "@Dev".into(),
+            },
+            DomainEvent::ChannelMessageSent {
+                channel: "whatsapp".into(),
+                conversation_ref: "grupo:Vendas".into(),
+                broker_exec_ref: "exec_abc".into(),
+                approved_by: "@Fundador".into(),
+            },
+        ];
+        for ev in evs {
+            let s = serde_json::to_string(&ev).expect("serialize");
+            assert!(
+                !s.contains(segredo),
+                "evento {} jamais carrega o token de sessão",
+                ev.kind()
+            );
+            assert!(
+                !s.contains(texto),
+                "evento {} jamais carrega o conteúdo da mensagem",
                 ev.kind()
             );
         }

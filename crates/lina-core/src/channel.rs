@@ -240,17 +240,20 @@ impl TrustTier {
     }
 }
 
-/// Estado de conexão derivado de um canal registrado.
+/// Estado de conexão derivado de um canal registrado (puro do log — nenhum campo de agente decide
+/// conexão, inv #4).
 ///
-/// Nesta frente (F4-0) a projeção só consome `ChannelRegistered` → todo canal nasce
-/// [`ChannelStatus::Declared`] (default-deny do ADR 0006: registrar não conecta). F4-1 introduzirá
-/// `ChannelConnected`; quando existir, a projeção passará a consumi-lo e a derivar um estado
-/// `Connected` — a porta fica aberta sem inventar evento agora (inv #4: nenhuma variante fora das
-/// 5 da largada F4-0).
+/// `Declared` é o estado de nascimento (default-deny do ADR 0006: registrar não conecta).
+/// `Connected` é derivado de `ChannelConnected` (gesto humano de tela, F4-1) e carrega a
+/// [`RegisteredChannel::session_ref`] custodiada; `ChannelDisconnected` zera o cano e volta a
+/// `Declared`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelStatus {
-    /// Registrado mas sem conexão estabelecida — o estado de TODO canal em F4-0.
+    /// Registrado mas sem conexão estabelecida — o estado de nascimento de todo canal.
     Declared,
+    /// Conexão estabelecida por gesto humano de tela (`ChannelConnected`) — há uma sessão custodiada
+    /// ativa, referenciada por [`RegisteredChannel::session_ref`].
+    Connected,
 }
 
 impl ChannelStatus {
@@ -259,6 +262,7 @@ impl ChannelStatus {
     pub fn label(self) -> &'static str {
         match self {
             ChannelStatus::Declared => "declarado, não conectado",
+            ChannelStatus::Connected => "conectado",
         }
     }
 }
@@ -280,8 +284,11 @@ pub struct RegisteredChannel {
     pub trust_tier: TrustTier,
     /// Ref de instalação pinada registrada (SHA/tag).
     pub install_ref: String,
-    /// Estado derivado — `Declared` em F4-0 (registrar ≠ conectar).
+    /// Estado derivado — `Declared` ao registrar; `Connected` após `ChannelConnected`.
     pub status: ChannelStatus,
+    /// REFERÊNCIA à sessão custodiada (cofre): `Some` enquanto `Connected`; `None` ao registrar ou
+    /// desconectar. JAMAIS o token — só o ponteiro para o cofre (ADR 0004).
+    pub session_ref: Option<String>,
 }
 
 /// Projeção dos canais registrados por NOME (padrão `ClueSet`/`CostLedger`: o último
@@ -314,25 +321,48 @@ impl ChannelRegistry {
             else {
                 continue;
             };
-            if let DomainEvent::ChannelRegistered {
-                channel,
-                manifest_ref,
-                trust_tier,
-                install_ref,
-            } = event
-            {
-                // Último-vence (padrão `ClueSet`): a re-registração substitui o estado anterior.
-                by_channel.insert(
-                    channel.clone(),
-                    RegisteredChannel {
-                        channel,
-                        manifest_ref,
-                        // Default-deny ao reidratar: tier desconhecido NUNCA vira `core`.
-                        trust_tier: TrustTier::parse(&trust_tier),
-                        install_ref,
-                        status: ChannelStatus::Declared,
-                    },
-                );
+            match event {
+                DomainEvent::ChannelRegistered {
+                    channel,
+                    manifest_ref,
+                    trust_tier,
+                    install_ref,
+                } => {
+                    // Último-vence (padrão `ClueSet`): a re-registração substitui o estado anterior
+                    // — nova declaração volta a `Declared`, sem sessão.
+                    by_channel.insert(
+                        channel.clone(),
+                        RegisteredChannel {
+                            channel,
+                            manifest_ref,
+                            // Default-deny ao reidratar: tier desconhecido NUNCA vira `core`.
+                            trust_tier: TrustTier::parse(&trust_tier),
+                            install_ref,
+                            status: ChannelStatus::Declared,
+                            session_ref: None,
+                        },
+                    );
+                }
+                // Conectar/desconectar atualiza um canal JÁ registrado (registrar ≠ conectar): um
+                // evento de conexão órfão NÃO materializa canal — falta manifesto/tier/install para
+                // construí-lo, e o log é DADO, jamais autoridade que fabrica estado.
+                DomainEvent::ChannelConnected {
+                    channel,
+                    session_ref,
+                    ..
+                } => {
+                    if let Some(ch) = by_channel.get_mut(&channel) {
+                        ch.status = ChannelStatus::Connected;
+                        ch.session_ref = Some(session_ref);
+                    }
+                }
+                DomainEvent::ChannelDisconnected { channel, .. } => {
+                    if let Some(ch) = by_channel.get_mut(&channel) {
+                        ch.status = ChannelStatus::Declared;
+                        ch.session_ref = None;
+                    }
+                }
+                _ => {}
             }
         }
         Self { by_channel }
@@ -385,6 +415,46 @@ pub fn register_channel(
         manifest_ref: manifest_ref.trim().to_string(),
         trust_tier: trust_tier.as_str().to_string(),
         install_ref: manifest.install.pinned_ref.clone(),
+    })?;
+    Ok(seq)
+}
+
+/// Marca um canal já registrado como CONECTADO: emite `ChannelConnected`. A projeção passa a derivar
+/// [`ChannelStatus::Connected`] + a `session_ref`. O `session_ref` é a REFERÊNCIA à sessão custodiada
+/// no cofre (o agente nunca vê o token, ADR 0004); `scope` é DADO declarativo (ex.: instância Waha),
+/// jamais autoridade. Conectar pressupõe registrar — conectar um canal não registrado é no-op na
+/// projeção (espelha `register_channel`: o helper só apenda o fato; o broker é quem gate o efeito).
+///
+/// # Errors
+/// [`ChannelError::Store`] se a persistência do evento falha.
+pub fn connect_channel(
+    store: &mut EventStore,
+    channel: &str,
+    session_ref: &str,
+    scope: &str,
+) -> Result<u64, ChannelError> {
+    let seq = store.append(&DomainEvent::ChannelConnected {
+        channel: channel.to_string(),
+        session_ref: session_ref.to_string(),
+        scope: scope.to_string(),
+    })?;
+    Ok(seq)
+}
+
+/// Desfaz a conexão de um canal: emite `ChannelDisconnected`. A projeção volta o canal a
+/// [`ChannelStatus::Declared`] e zera a `session_ref` (o cano fecha). `session_ref` correlaciona com
+/// o `ChannelConnected` que se encerra.
+///
+/// # Errors
+/// [`ChannelError::Store`] se a persistência do evento falha.
+pub fn disconnect_channel(
+    store: &mut EventStore,
+    channel: &str,
+    session_ref: &str,
+) -> Result<u64, ChannelError> {
+    let seq = store.append(&DomainEvent::ChannelDisconnected {
+        channel: channel.to_string(),
+        session_ref: session_ref.to_string(),
     })?;
     Ok(seq)
 }
@@ -477,6 +547,38 @@ mod tests {
             manifest_ref: manifest_ref.to_string(),
             trust_tier: trust_tier.to_string(),
             install_ref: install_ref.to_string(),
+        };
+        EventRecord {
+            seq,
+            ts: seq,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa o evento"),
+        }
+    }
+
+    /// `EventRecord` de `ChannelConnected` serializado COMO no log (mesma disciplina de tag de
+    /// `channel_record`).
+    fn connected_record(seq: u64, channel: &str, session_ref: &str, scope: &str) -> EventRecord {
+        let event = DomainEvent::ChannelConnected {
+            channel: channel.to_string(),
+            session_ref: session_ref.to_string(),
+            scope: scope.to_string(),
+        };
+        EventRecord {
+            seq,
+            ts: seq,
+            kind: event.kind().to_string(),
+            version: event.current_version(),
+            payload: serde_json::to_value(&event).expect("serializa o evento"),
+        }
+    }
+
+    /// `EventRecord` de `ChannelDisconnected` serializado COMO no log.
+    fn disconnected_record(seq: u64, channel: &str, session_ref: &str) -> EventRecord {
+        let event = DomainEvent::ChannelDisconnected {
+            channel: channel.to_string(),
+            session_ref: session_ref.to_string(),
         };
         EventRecord {
             seq,
@@ -582,7 +684,79 @@ mod tests {
         assert_eq!(ch.trust_tier, TrustTier::Curado);
         assert_eq!(ch.status, ChannelStatus::Declared);
         assert_eq!(ch.status.label(), "declarado, não conectado");
+        assert_eq!(ch.session_ref, None);
         assert_eq!(registry.len(), 1);
+    }
+
+    /// Critério F4-1-2: ciclo de vida real pelo log — registrar (`Declared`, sem sessão) → conectar
+    /// (`Connected` + `session_ref`) → desconectar (volta a `Declared`, zera `session_ref`). Provado
+    /// por append→replay (caminho real, sem montar projeção à mão).
+    #[test]
+    fn connect_then_disconnect_drives_status_and_session_ref() {
+        let tmp = TempDir::new("connect-lifecycle");
+        let mut store = EventStore::open(tmp.path()).expect("abrir store");
+        let manifest = ChannelManifest::parse(WELL_FORMED).expect("parse");
+        register_channel(&mut store, &manifest, "channels/whatsapp/manifest.toml", TrustTier::Curado)
+            .expect("registra");
+
+        // Registrado, ainda não conectado.
+        let registry = ChannelRegistry::replay(&store).expect("replay");
+        let ch = registry.get("whatsapp").expect("registrado");
+        assert_eq!(ch.status, ChannelStatus::Declared);
+        assert_eq!(ch.session_ref, None);
+
+        // Conectar → Connected + session_ref + rótulo pt-br "conectado".
+        connect_channel(&mut store, "whatsapp", "keyring:channel:whatsapp", "waha@127.0.0.1:3000")
+            .expect("conecta");
+        let registry = ChannelRegistry::replay(&store).expect("replay");
+        let ch = registry.get("whatsapp").expect("registrado");
+        assert_eq!(ch.status, ChannelStatus::Connected);
+        assert_eq!(ch.status.label(), "conectado");
+        assert_eq!(ch.session_ref.as_deref(), Some("keyring:channel:whatsapp"));
+
+        // Desconectar → o cano zera: volta a Declared, session_ref some.
+        disconnect_channel(&mut store, "whatsapp", "keyring:channel:whatsapp").expect("desconecta");
+        let registry = ChannelRegistry::replay(&store).expect("replay");
+        let ch = registry.get("whatsapp").expect("registrado");
+        assert_eq!(ch.status, ChannelStatus::Declared);
+        assert_eq!(ch.session_ref, None);
+    }
+
+    /// Último-vence (padrão `ClueSet`) sobre conexão + replay determinístico: a sequência
+    /// connect→disconnect→connect converge no último estado, idêntica em duas execuções.
+    #[test]
+    fn connect_disconnect_last_wins_and_replay_deterministic() {
+        let log = [
+            channel_record(1, "wa", "m.toml", "core", "v1"),
+            connected_record(2, "wa", "sref-1", "waha"),
+            disconnected_record(3, "wa", "sref-1"),
+            connected_record(4, "wa", "sref-2", "waha"),
+        ];
+        let registry = ChannelRegistry::from_records(&log);
+        let ch = registry.get("wa").expect("registrado");
+        assert_eq!(ch.status, ChannelStatus::Connected);
+        assert_eq!(ch.session_ref.as_deref(), Some("sref-2"), "último connect vence");
+        assert_eq!(
+            ChannelRegistry::from_records(&log),
+            ChannelRegistry::from_records(&log),
+            "replay determinístico (inv #4)"
+        );
+    }
+
+    /// Segurança/invariante "registrar ≠ conectar": um `ChannelConnected` sem `ChannelRegistered`
+    /// prévio NÃO materializa canal — o log é DADO, jamais autoridade que fabrica estado/sessão.
+    #[test]
+    fn connect_without_prior_registration_is_noop() {
+        let log = [
+            connected_record(1, "ghost", "sref", "waha"),
+            disconnected_record(2, "ghost", "sref"),
+        ];
+        let registry = ChannelRegistry::from_records(&log);
+        assert!(
+            registry.get("ghost").is_none(),
+            "conectar sem registrar não cria canal"
+        );
+        assert!(registry.is_empty());
     }
 
     /// Default-deny: na ausência de curadoria, registra-se com [`TrustTier::default`] (`Comunidade`).

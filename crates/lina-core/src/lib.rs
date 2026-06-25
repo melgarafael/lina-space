@@ -218,6 +218,14 @@ pub mod channel; // F4-0-1 · CANAIS — trait Channel + ChannelRegistry + manif
 pub mod credential; // F4-0-2 · CREDENCIAIS — binding cofre↔event-log (I; emerg. mid-onda)
 pub mod tool_scope; // F4-0-4 · CONTEXTO — pré-config de ferramentas/grupos por projeto (M)
 
+// ── F4-1 (WhatsApp/Waha): módulos da onda ──
+// LARGADA F4-1 (Maestro 01 dono único de lib.rs). Contrato de eventos (ChannelConnected/Disconnected/
+// MessageRead/MessageSent) já congelado em `events.rs`. A projeção de status vive em `channel.rs`
+// (estendido por I, não módulo novo). `broker.rs` (custódia `for_channel`/`run_custody`) já existe — o
+// envio gated o REUSA. Cada frente preenche só o seu arquivo; ninguém toca lib.rs nesta rodada.
+pub mod channel_read; // F4-1-3/5 · LEITURA — conversa declarada como contexto, auditada + scope de grupos (K)
+pub mod channel_waha; // F4-1-1 · TRANSPORTE — cliente HTTP Waha (sessão por QR, custódia) (B)
+
 /// Origem de uma entrega A2A — QUEM a disparou, derivada server-side (inforjável). ADR 0007/0035.
 ///
 /// O Router conhece **humano** (`hops == 0`, sender sem binding) e **colega** (cascata, `hops >= 1`
