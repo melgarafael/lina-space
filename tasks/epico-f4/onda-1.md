@@ -108,3 +108,22 @@ Decidir: **(1)** HTTP client de saída (`ureq` síncrono leve vs `reqwest` async
 - **Waha mudar API** → ref pinado + manifesto versionado + escopo mínimo.
 - **A IA "achar" que pode enviar sem gate** → custódia: sem segredo, sem caminho (não confia em doutrina-texto).
 - **Feature-creep** (importar a complexidade do guia TomikCRM) → escopo MÍNIMO travado: conectar/ler/enviar/desconectar.
+
+---
+
+## FECHAMENTO desta rodada (2026-06-25, Maestro 01) — NÚCLEO completo; APP deferido p/ sessão dedicada
+
+**Decisão do fundador:** fechar esta rodada com o **núcleo pronto, provado e commitado** (`0a4cb60`); a tela (`F41-APP`) vira a **1ª tarefa da próxima sessão dedicada**, feita com calma e testada com o Waha real na VPS.
+
+**✅ Entregue, verde e COMMITADO (`0a4cb60`):** transporte Waha (B) · projeção Connected/session_ref (J) · leitura auditada + scope (K) · 4 eventos (largada) · **18 testes de segurança** (R) · manifesto · ADR 0050. Suíte completa do core **0 regressão**. Validado de fora pelo Maestro (cargo test + leitura). *Cold-review isolado do Maestro 00 ficou preso na fila A2A congestionada — não bloqueou; minha validação cobre o gate técnico.*
+
+### ⬜ PENDENTE — `F41-APP` (app/lina-gpui, próxima sessão) — MAPA PRONTO p/ o executor
+> O dono do app (Especialista em Telas) **travou 3× num `permission_prompt`** (atrito do Lina, ver dogfooding) + a fila A2A congestionou. NÃO foi improvisado para não arriscar freeze. Abaixo, a fronteira já mapeada pelo Maestro:
+
+**3 entregas no app/lina-gpui (dono único):**
+1. **Elo `do:channel:whatsapp:send` (porta `F41-BROKER-APP`)** — em `bridge.rs`: hoje `enqueue_custody` (`:2859`) faz `lookup_action("channel:whatsapp:send")` → falha ("ação não custodiada"). Adicionar: se `action` começa com `channel:`, parsear `channel:<canal>:<ação>` → `ChannelManifest::load` (via `RegisteredChannel.manifest_ref` da projeção `ChannelRegistry`) → `channel_action_in_manifest` → `BrokerRequest::for_channel`. **Carregar `chat_id`/`text`/`canal` no `PendingGate::Custody`** (hoje só guarda `action`/`secret_key`/`requester`) p/ o `execute` ter os args.
+2. **🚨 CUIDADO DE FREEZE (mapeado — não ignorar):** `execute_custody` (`:3033`) roda o `execute` de `run_custody` **DENTRO de `lock(&self.store)`** (`:3040-3053`). O `WahaClient::send` é **I/O de rede** — chamá-lo ali SEGURA o mutex do `EventStore` durante a rede = **FREEZE** (lições `[[lina-freeze-attention-heartbeat-replay]]`/`[[lina-freeze-a2a-deliver-store-lock]]`, ADR 0046). Para o canal: gate+segredo (lock curto) → **soltar o lock** → `thread::spawn` faz o `send` HTTP (padrão de `bridge.rs:750` `fire()`/`deliver_a2a`: Arcs clonados, I/O na thread, lock só p/ appends rápidos) → re-lock só p/ apendar `ChannelMessageSent{broker_exec_ref,approved_by}`+`BrokerExecuted`. **NÃO** rodar `run_custody` inteiro com I/O no execute sob o lock.
+3. **Modal "Conectar WhatsApp" + badge** (padrão `webhook_modal.rs`/`credential_modal.rs`): `connect`+`qr` OFF-CRITICAL-PATH → render do QR → poll `status` até `Working` → `connect_channel`. `base_url` **configurável** (Waha REMOTO na VPS Hetzner/Tailscale — `100.104.223.26:porta` http na mesh, OU domínio https → liga feature `tls` do `ureq`; **não** loopback). Badge "WhatsApp conectado" + trilha pt-br de `ChannelMessageRead`/`Sent`.
+
+**Liga o e2e deferido do R:** `tests/f4_1_send_custody.rs` header §"happy-path e2e deferido ao integrador" — quando o elo existir, trocar o `execute` mock por `channel_waha::send` contra mock HTTP e afirmar 1 POST + header.
+**Gate de tela do fundador (BLOQUEANTE, só ele):** Waha rodando na VPS + credenciais (`X-Api-Key`+endpoint) → ver QR → escanear → ler grupo real → propor envio → aprovar → mensagem no celular.
