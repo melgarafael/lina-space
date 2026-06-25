@@ -389,6 +389,11 @@ pub struct AttentionQueue {
     /// `MessageDeadLettered`, resolvidas por `MessageDelivered{id}` (re-enfileiramento). NUNCA somem
     /// por TTL — perder um aviso de fora em silêncio violaria "nada some" (ADR 0020) / inv #6.
     dead_letters: Vec<PendingDeadLetter>,
+    /// Tela do fundador (2026-06-25): `NodeId serializado → NOME` (de `NodeRenamed`). A morte de um
+    /// terminal chega por `NodeId`, mas guard-asks/dead-letters/conflitos são chaveados por NOME —
+    /// sem este mapa, encerrar um nó não limpava esses tipos e a fila acumulava pedidos de sessões
+    /// já finalizadas (153 terminais que nem existem mais na tela do fundador).
+    node_names: HashMap<String, String>,
 }
 
 impl AttentionQueue {
@@ -527,18 +532,22 @@ impl AttentionQueue {
                     // Voltou a `Idle`: abre o ponto-cego (o relógio de stall não corre fora de `Busy`).
                     self.mark_dispatch_idle(&node, ts);
                 } else if status == NodeStatus::Dead.as_str() {
-                    self.remove_dispatch(&node); // nó morto: sem alarme (nada a re-despachar)
+                    // Tela do fundador (2026-06-25): nó morto — INCLUI a morte póstuma do boot
+                    // (`close_previous_generation` emite `Dead` para a geração anterior). Limpa TODAS
+                    // as pendências dele, não só o alarme: é o que faz a fila NÃO acumular pedidos de
+                    // sessões já finalizadas (via replay, a morte das gerações antigas limpa os órfãos).
+                    self.purge_node_pendings(&node);
                 }
             }
-            // Nó removido/terminal encerrado → sem alarme (sem terminal para o Maestro re-despachar).
+            // FIX-2/tela do fundador: mapeia `NodeId → NOME` para casar a morte (que vem por NodeId)
+            // com as pendências chaveadas por nome (guard-ask/dead-letter/conflito) ao limpar.
+            DomainEvent::NodeRenamed { node, name } => {
+                self.node_names.insert(node.to_string(), name.clone());
+            }
+            // Nó removido/terminal encerrado → limpa TODAS as suas pendências (sem terminal vivo, nada
+            // a aprovar/re-despachar/re-entregar). Mesma rotina da morte por `Dead`.
             DomainEvent::NodeRemoved { node } | DomainEvent::TerminalExited { node } => {
-                let dead = node.to_string();
-                self.remove_dispatch(&dead);
-                // Tela do fundador (2026-06-24): pedidos de permissão de sessões JÁ encerradas
-                // acumulavam para sempre — com o grid morto, `PermissionPromptCleared` nunca chega
-                // e ninguém aprova/recusa um nó que não existe mais. Encerrar limpa as permissões
-                // órfãs DAQUELE nó (replay idempotente: o `NodeRemoved`/`TerminalExited` está no log).
-                self.permissions.retain(|p| p.node_id != dead);
+                self.purge_node_pendings(&node.to_string());
             }
             // ───────── F3-4-4 (spec 36 §2): conflito de código por pertencimento ─────────
             // Projeção PURA derivada (SEM evento novo): a fila junta os paths reservados (do item) +
@@ -758,6 +767,28 @@ impl AttentionQueue {
     /// idempotente: sem vigia = sem alarme.
     fn remove_dispatch(&mut self, node: &str) {
         self.dispatches.retain(|d| d.node_id != node);
+    }
+
+    /// Tela do fundador (2026-06-25): limpa TODAS as pendências de um nó encerrado/morto — não só o
+    /// alarme de despacho. As filas usam chaves heterogêneas (permissões/custódia/despacho por NodeId;
+    /// guard-ask/dead-letter/conflito por NOME), então casa o `NodeId` morto, o NOME mapeado
+    /// (`node_names`, de `NodeRenamed`) e a forma `@Nome`. Sem isto, encerrar um terminal deixava seus
+    /// pedidos órfãos e a fila acumulava o lixo de sessões já finalizadas. Idempotente no replay.
+    /// `spawns` (chave `requested_by`) fica de fora: o solicitante de um spawn pode estar vivo.
+    fn purge_node_pendings(&mut self, node_id: &str) {
+        self.remove_dispatch(node_id);
+        let name = self.node_names.get(node_id).cloned();
+        let matches = |key: &str| -> bool {
+            key == node_id
+                || name
+                    .as_deref()
+                    .is_some_and(|n| key == n || key.trim_start_matches('@') == n)
+        };
+        self.permissions.retain(|p| !matches(&p.node_id));
+        self.guard_asks.retain(|g| !matches(&g.node));
+        self.dead_letters.retain(|d| !matches(&d.to));
+        self.custody.retain(|c| !matches(&c.node_id));
+        self.code_conflicts.retain(|c| !matches(&c.owner));
     }
 
     /// O nó voltou a `Idle` após a entrega → registra o instante (abre o ponto-cego: o relógio de
@@ -1343,6 +1374,70 @@ mod tests {
         // Idempotente: `TerminalExited` do mesmo nó (replay/dupla via) não quebra nada.
         q.observe(&DomainEvent::TerminalExited { node: morto }, T0 + 4_000);
         assert_eq!(q.items(T0 + 5_000).len(), 1);
+    }
+
+    /// Tela do fundador (2026-06-25): a fila acumulava 153 pedidos de sessões JÁ finalizadas —
+    /// guard-asks e dead-letters de terminais que nem existem mais (não só permissões). Encerrar/matar
+    /// um nó — INCLUSIVE a morte póstuma do boot (`NodeStatusChanged{Dead}` de
+    /// `close_previous_generation`) — limpa TODAS as pendências dele, casando as chaves heterogêneas
+    /// (NodeId × NOME × @Nome). Via replay, a morte das gerações antigas zera os órfãos.
+    #[test]
+    fn terminal_morto_limpa_pendencias_de_todos_os_tipos() {
+        let a = NodeId::from_u128(1);
+        let vivo = NodeId::from_u128(2);
+        let mut q = AttentionQueue::new();
+        // A morte chega por NodeId; guard-ask/dead-letter são por NOME → o mapa vem de `NodeRenamed`.
+        q.observe(
+            &DomainEvent::NodeRenamed {
+                node: a,
+                name: "Terminal A".into(),
+            },
+            T0,
+        );
+        // 3 pendências do MESMO nó, com CHAVES diferentes:
+        q.observe(&ask(&a.to_string(), PermissionEvidence::Hook, "p1"), T0); // permission: NodeId
+        q.observe(
+            &DomainEvent::ActionGated {
+                cmd: "cd /repo && lina plan read".into(),
+                class: "gated-hard".into(),
+                decision: "ask".into(),
+                node: Some("Terminal A".into()), // guard-ask: NOME
+            },
+            T0,
+        );
+        q.observe(
+            &DomainEvent::MessageDeadLettered {
+                id: "m1".into(),
+                to: "@Terminal A".into(), // dead-letter: @Nome
+                reason: "node_dead".into(),
+            },
+            T0,
+        );
+        // Controle: pendência de um nó VIVO não pode sumir.
+        q.observe(&ask(&vivo.to_string(), PermissionEvidence::Hook, "p2"), T0);
+        assert_eq!(
+            q.items(T0 + 1_000).len(),
+            4,
+            "3 do nó A (permission+guard-ask+dead-letter) + 1 do vivo"
+        );
+
+        // Morte póstuma do boot — exatamente o que `close_previous_generation` emite ao reabrir.
+        q.observe(
+            &DomainEvent::NodeStatusChanged {
+                node: a,
+                status: NodeStatus::Dead.as_str().to_string(),
+                from: NodeStatus::Idle.as_str().to_string(),
+                reason: "app_reopened".into(),
+            },
+            T0 + 2_000,
+        );
+        let items = q.items(T0 + 3_000);
+        assert_eq!(
+            items.len(),
+            1,
+            "permission + guard-ask + dead-letter do nó morto saíram juntos"
+        );
+        assert_eq!(items[0].node_id, vivo.to_string(), "só o do nó vivo permanece");
     }
 
     /// Dedup entre camadas (decisão do Maestro): item nasce do GRID (~1,3s), hook
