@@ -17,6 +17,10 @@ mod goal_card;
 // + tokens F2; lógica de tela em funções puras. A projeção viva (`lina_core::mentality`, M-PROMO) é
 // mapeada para o view-model por um adaptador fino em `mentality_views` (costura alinhada com o dono).
 mod mentality_panel;
+// F2-4 (épico 38 · ADR 0052): Área de Poderes (painel) + galeria de Direções Visuais. LARGADA do
+// Maestro 01 (mod declarado; F24UI/F24DESIGN preenchem o módulo e entregam a fiação como diff).
+mod design_directions;
+mod powers_panel;
 // W4-2 · M1: paleta de comandos (Cmd-K) sobre o canvas — modelo puro testável + render gpui.
 mod palette;
 // W4-1: onboarding turno-0 (T0→T3 + "Instalar para mim"). Módulo isolado; disjunto do canvas.
@@ -653,6 +657,16 @@ struct WorkspaceView {
     /// SÓ com evento novo (`projection_cache_is_stale`), NUNCA por frame — mesma disciplina do
     /// custo/effort/goals (fix do freeze do `lina ask`: store ocupado mantém o cache).
     mentality_cache: Option<(u64, Vec<mentality_panel::RoleMentality>)>,
+    /// F2-4-3+4: inventário de Poderes (projeção efêmera de disco — ADR 0052). `None` = ainda não
+    /// escaneado; o scan-ao-abrir o preenche. O painel renderiza a partir daqui — DADO de exibição,
+    /// nenhum campo decide autorização (mostrar ≠ autorizar).
+    powers_inventory: Option<lina_core::PowerInventory>,
+    /// F2-4: o painel "Seus Poderes" está aberto? (toggle pela topbar + atalho).
+    powers_panel_open: bool,
+    /// F2-4-5: estado do picker de Direções Visuais (seleção 1-clique, puro/headless; `Copy`).
+    design_gallery: design_directions::DesignGallery,
+    /// F2-4-5: a galeria de Direções Visuais está aberta? (toggle pela topbar).
+    design_gallery_open: bool,
 }
 
 impl WorkspaceView {
@@ -870,6 +884,10 @@ impl WorkspaceView {
             prof: prof::Probe::from_env(),
             goals_cache: None,
             mentality_cache: None,
+            powers_inventory: None,
+            powers_panel_open: false,
+            design_gallery: design_directions::DesignGallery::new(),
+            design_gallery_open: false,
         };
         // r5 · plug do Descarregar (contrato combinado C↔Core A2A): botão do rail →
         // executor `runtime::unload_workspace` (Busy preservado por re-checagem no seam);
@@ -2746,6 +2764,150 @@ impl WorkspaceView {
     fn retire_belief(&mut self, belief_id: &str, cx: &mut Context<Self>) {
         self.nodes
             .push_human_intent("belief.retire", format!(r#"{{"belief_id":"{belief_id}"}}"#));
+        cx.notify();
+    }
+
+    /// F2-4-3+4: a "Área de Poderes" — o que o leigo tem instalado e o que precisa de ajuste, em pt-br
+    /// sem jargão. `None` quando fechado ou sem inventário (sem tela vazia forçada). Os cards já vêm
+    /// filtrados por `should_render` (`Disabled` escondido até existir religar real — a tela nunca
+    /// mente) e disparam o gesto `power.action` — a EXECUÇÃO passa pelo gate (mostrar ≠ autorizar).
+    fn render_powers_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.powers_panel_open {
+            return None;
+        }
+        let inventory = self.powers_inventory.as_ref()?;
+        let cards: Vec<powers_panel::PowerCard> = inventory
+            .powers
+            .iter()
+            .filter(|p| powers_panel::should_render(p, powers_panel::CAN_REENABLE))
+            .cloned()
+            .map(|power| {
+                let name = power.name.clone();
+                let state = power.state;
+                powers_panel::PowerCard::new(power).on_action(cx.listener(
+                    move |view, _ev, _w, cx| {
+                        view.act_on_power(&name, state, cx);
+                    },
+                ))
+            })
+            .collect();
+        let panel = powers_panel::PowersPanel::new(inventory).powers(cards);
+        let col = div()
+            .absolute()
+            .top_16()
+            .right_0()
+            .child(div().w(gpui::relative(0.42)).child(panel));
+        Some(col.into_any_element())
+    }
+
+    /// F2-4 (mostrar ≠ autorizar): o leigo clicou a ação de 1 clique de um Poder. A view só DISPARA o
+    /// gesto pelo canal in-process (como `belief.retire`); o roteamento gesto→efeito gated (custódia) é
+    /// porta aberta — o efeito real (atualizar/consertar/instalar) é fatia posterior. `name`/`state` são
+    /// DADO de exibição, JAMAIS autoridade; `name` vem do disco, então o payload é serializado com escape.
+    /// [SEAM: roteamento `power.action` → efeito custodiado].
+    fn act_on_power(&mut self, name: &str, state: lina_core::PowerState, cx: &mut Context<Self>) {
+        let verb = match state {
+            lina_core::PowerState::UpdateAvailable => "update",
+            lina_core::PowerState::NeedsRepair => "repair",
+            lina_core::PowerState::InertHere => "install",
+            lina_core::PowerState::Disabled => "reenable",
+            lina_core::PowerState::Ready => return,
+        };
+        let payload = serde_json::json!({ "power": name, "verb": verb }).to_string();
+        self.nodes.push_human_intent("power.action", payload);
+        cx.notify();
+    }
+
+    /// F2-4: re-deriva o inventário de Poderes do DISCO (projeção efêmera, ~0ms — ADR 0052 §1) ao
+    /// ABRIR o painel (scan-ao-abrir) e emite `PowerScanned` (só CONTADORES — §2; auditoria best-effort,
+    /// nunca bloqueia a UI). manifest-first é garantido no core (`scan_powers` lê o manifesto, nunca a
+    /// árvore de 1,9GB). Nenhum campo lido do disco decide autorização (mostrar ≠ autorizar).
+    fn refresh_powers_inventory(&mut self) {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        // Espaço aberto + TODOS os CliProfile do runtime ativo (os campos `skills_dir`/`mcp_config_path`
+        // dizem ao scanner onde cada CLI guarda seus poderes — inv#3, sem caminho hardcoded).
+        let (project_dir, profiles) = {
+            let r = lock(&self.runtimes);
+            let project_dir = Some(r.active.clone());
+            let profiles: Vec<lina_core::CliProfile> = r
+                .map
+                .get(&r.active)
+                .map(|rt| {
+                    rt.profile_registry
+                        .ids()
+                        .filter_map(|id| rt.profile_registry.get(id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            (project_dir, profiles)
+        };
+        let roots = lina_core::PowerRoots {
+            home,
+            project_dir,
+            profiles,
+        };
+        // CLI do terminal focado → decide `InertHere` (skill na pasta do CLI X, terminal roda CLI Y).
+        let focused_cli = self.nodes.node_cli(self.focused);
+        let inv = lina_core::scan_powers(&roots, focused_cli.as_deref());
+        // Auditoria anti-manipulação (só contadores + timestamp; ZERO conteúdo de poder). Best-effort.
+        let (total, counts) = inv.audit_counts();
+        let _ = lock(&self.nodes.store_handle()).append(&lina_core::DomainEvent::PowerScanned {
+            total,
+            counts,
+            scanned_at_ms: lina_core::now_ms(),
+        });
+        self.powers_inventory = Some(inv);
+    }
+
+    /// F2-4-5: a galeria de Direções Visuais (onboarding estético). `None` quando fechada. A galeria
+    /// SELECIONA/destaca (efeito visível imediato); aplicar/persistir o tema é porta aberta. O link
+    /// externo (`open-design.ai`) é opt-in: só abre no clique do usuário (local-first, inv #2).
+    /// [SEAM: persistir/aplicar a direção escolhida como preferência do Espaço].
+    fn render_design_directions(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.design_gallery_open {
+            return None;
+        }
+        use design_directions::{DirectionCard, DirectionsGallery, OPEN_DESIGN_URL};
+        let g = self.design_gallery;
+        let lina_n = design_directions::lina_directions().len();
+        let lina: Vec<DirectionCard> = design_directions::lina_directions()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, d)| {
+                DirectionCard::new(d, g.is_selected(i))
+                    .on_choose(cx.listener(move |v, _e, _w, cx| v.choose_design_direction(i, cx)))
+            })
+            .collect();
+        let curated: Vec<DirectionCard> = design_directions::curated_directions()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, d)| {
+                let idx = lina_n + i;
+                DirectionCard::new(d, g.is_selected(idx))
+                    .on_choose(cx.listener(move |v, _e, _w, cx| v.choose_design_direction(idx, cx)))
+            })
+            .collect();
+        let gallery = DirectionsGallery::new()
+            .lina(lina)
+            .curated(curated)
+            .on_open_external(cx.listener(|_v, _e, _w, cx| cx.open_url(OPEN_DESIGN_URL)));
+        let col = div()
+            .absolute()
+            .top_16()
+            .right_0()
+            .child(div().w(gpui::relative(0.46)).child(gallery));
+        Some(col.into_any_element())
+    }
+
+    /// F2-4-5: o leigo escolheu uma direção visual (1 clique) — destaca a escolha (efeito visível). A
+    /// aplicação/persistência do tema é porta aberta (ver `render_design_directions`).
+    fn choose_design_direction(&mut self, idx: usize, cx: &mut Context<Self>) {
+        self.design_gallery.select(idx);
         cx.notify();
     }
 
@@ -5761,6 +5923,43 @@ impl Render for WorkspaceView {
             );
         }
 
+        // F2-4-3+4: porta VISÍVEL da Área de Poderes (fio condutor #3 — nada só atrás de atalho).
+        // [SEAM: scan-ao-abrir] o scan real liga aqui quando a ponte `bridge.rs` montar `PowerRoots`.
+        topbar = topbar.child(
+            div()
+                .id("powers-btn")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(th.surface.raised))
+                .text_color(rgb(th.text.primary))
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                    view.powers_panel_open = !view.powers_panel_open;
+                    if view.powers_panel_open {
+                        view.refresh_powers_inventory();
+                    }
+                    cx.notify();
+                }))
+                .child(text!("Poderes")),
+        );
+        // F2-4-5: porta VISÍVEL da galeria de Direções Visuais (onboarding estético).
+        topbar = topbar.child(
+            div()
+                .id("visual-btn")
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(th.surface.raised))
+                .text_color(rgb(th.text.primary))
+                .cursor_pointer()
+                .on_click(cx.listener(|view, _ev: &ClickEvent, _w, cx| {
+                    view.design_gallery_open = !view.design_gallery_open;
+                    cx.notify();
+                }))
+                .child(text!("Visual")),
+        );
+
         topbar = topbar.child(
             div()
                 .id("add-terminal-btn")
@@ -6133,6 +6332,15 @@ impl Render for WorkspaceView {
         // "já vale", provisórias "ainda testando", aposentar-1-clique). Ausente até a projeção viva
         // alimentar a tela (Camada 2); sem tela vazia forçada.
         if let Some(panel) = self.render_mentality_panel(cx) {
+            root = root.child(panel);
+        }
+        // F2-4-3+4: a "Área de Poderes" — vitrine do que o leigo tem instalado e do que precisa de
+        // ajuste (skills/plugins/agents/hooks/MCPs). Sob os modais/paleta; ausente até o scan-ao-abrir.
+        if let Some(panel) = self.render_powers_panel(cx) {
+            root = root.child(panel);
+        }
+        // F2-4-5: galeria de Direções Visuais (onboarding estético, opt-in a open-design.ai). Sob os modais.
+        if let Some(panel) = self.render_design_directions(cx) {
             root = root.child(panel);
         }
         // F1-1-5 (P6/fluxo c): painel "Atividade e custos" — zona lateral direita, sob os modais.
