@@ -250,6 +250,11 @@ impl RenderOnce for Modal {
 
         let mut panel = div()
             .id(panel_id)
+            // O painel BLOQUEIA o mouse. Sem isto, o clique no painel atravessa para o véu
+            // occludente atrás (que carrega o on_click de dismiss) e QUALQUER clique fecha o
+            // modal — hitbox Normal não oclui o irmão de trás (gpui). Conserta todo modal com
+            // .dismiss_on_backdrop (webhook, credential, …): o clique fora fecha, o clique dentro não.
+            .occlude()
             .w(px(self.frame.w))
             .max_h(px(self.frame.max_h))
             .flex()

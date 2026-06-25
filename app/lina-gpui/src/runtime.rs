@@ -516,6 +516,13 @@ pub fn boot_ws_runtime(
     // Semente OPCIONAL via `LINA_DEPLOY_TOKEN`: com ela, a custódia EXECUTA (segredo do cofre); sem
     // ela, o cofre fica vazio e a custódia BLOQUEIA (DeniedNoSecret) — ambos provam a blindagem.
     let custody_vault = SecretVault::with_store("lina-space/walking-skeleton", MockStore::new());
+    // F4-1-4: cofre de CANAIS, COMPARTILHADO (Arc) entre a `MailboxPump` (a tela de conectar grava a
+    // chave aqui via `credential.store`) e a `BrokerPump` (o envio gated a lê do MESMO cofre). Um único
+    // cofre; sem isso, a chave gravada por uma pump seria invisível à outra (MockStore é por-instância).
+    let channel_vault = Arc::new(SecretVault::with_store(
+        "lina-space/channels",
+        MockStore::new(),
+    ));
     if let Ok(token) = std::env::var("LINA_DEPLOY_TOKEN") {
         match custody_vault.set("deploy", "prod", &token) {
             Ok(()) => {
@@ -573,8 +580,11 @@ pub fn boot_ws_runtime(
 
     // F4-WA-1: engine de webhook ativo (POST externo → input no terminal vivo). Runtime tokio próprio
     // (molde HooksShared): bind loopback + serve; deposita a entrega-de-sistema na fila que o pump drena.
-    let webhook =
-        bridge::WebhookShared::start(Arc::clone(&store), Arc::clone(&sup), nodes.system_deliveries());
+    let webhook = bridge::WebhookShared::start(
+        Arc::clone(&store),
+        Arc::clone(&sup),
+        nodes.system_deliveries(),
+    );
 
     // F1-4-3 · RESTORE do quit limpo: reabrir o app = o Espaço volta vivo (posições/nomes/
     // papéis do log + scrollback re-hidratado + resume do CLI quando o TOML declara + badge
@@ -697,6 +707,8 @@ pub fn boot_ws_runtime(
         Arc::clone(&dash.sessions),
     )
     .with_webhook(webhook.as_deref())
+    // F4-1-4: a tela "Conectar WhatsApp" grava a chave (`credential.store`) NESTE cofre compartilhado.
+    .with_channel_vault(Arc::clone(&channel_vault))
     .spawn();
 
     // W3-6c (ADR 0004): a BROKER PUMP observa a FILA DE BROKER (`<ws_root>/.lina/broker/`, irmã do
@@ -711,6 +723,8 @@ pub fn boot_ws_runtime(
         Arc::clone(&sup), // roster vivo: valida que a origem do pedido é um nó REAL (hole 3)
     )
     .with_webhook(webhook.as_deref()) // F4-WA-2b: cofre+porta p/ o gesto webhook.test (dogfooding)
+    // F4-1-4: o envio gated de canal lê a chave do MESMO cofre que a tela gravou.
+    .with_channel_vault(Some(Arc::clone(&channel_vault)))
     .spawn();
 
     Ok(WsRuntime {

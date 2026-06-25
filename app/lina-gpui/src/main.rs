@@ -81,6 +81,10 @@ mod credential_modal;
 // F4-WA-2c (UI): modal "Receber um aviso de fora" (webhook) — modelo gpui-free + render fina (padrão
 // credential_modal). Coleta terminal+instrução+nível → gesto `webhook.configure` → `WebhookConfigured`.
 mod webhook_modal;
+// F4-1-2-UI: o modal "Conectar seu WhatsApp" — QR + status, com a conexão rodando off-critical-path.
+mod whatsapp_modal;
+// F4-1-6: projeção do WhatsApp para a tela — badge "conectado" + trilha de auditoria narrada (pt-br).
+mod channel_audit;
 // F4-0-5: badge "este Espaço está falando com o mundo" — projeção PURA do log (canal com credencial
 // viva), sem relógio nem I/O. 0 canais → 0 badge; ≥1 → diz QUAL canal (doc 40 §10).
 mod exposure;
@@ -549,6 +553,12 @@ struct WorkspaceView {
     /// F4-WA-2c (UI): o modal "Receber um aviso de fora". `Some` = aberto (teclado vai pro modal). O
     /// endereço/senha gerados pelo servidor chegam por `webhook_present_outcome` e somem ao fechar.
     webhook_modal: Option<webhook_modal::WebhookModal>,
+    /// F4-1-2-UI: o modal "Conectar seu WhatsApp". `Some` = aberto (teclado vai pro modal). A conexão
+    /// (QR + poll) roda numa thread off-critical-path; o progresso chega pelo slot do `NodeManager`.
+    whatsapp_modal: Option<whatsapp_modal::WhatsAppModal>,
+    /// F4-1-6: cache da projeção do WhatsApp (`(event_count, WhatsAppStatus)`) — badge "conectado" +
+    /// trilha de auditoria. Reprojetada SÓ quando o `event_count` muda (anti-freeze, padrão exposição).
+    whatsapp_cache: Option<(u64, channel_audit::WhatsAppStatus)>,
     /// F4-0-5: cache da projeção de exposição (`(event_count, ExposureState)`) — reprojetada SÓ
     /// quando o log muda (disciplina `projection_cache_is_stale`, igual ao cache de goals).
     exposure_cache: Option<(u64, exposure::ExposureState)>,
@@ -693,6 +703,24 @@ impl WorkspaceView {
                 .await;
         })
         .detach();
+        // F4-1-2-UI: HEARTBEAT do modal "Conectar seu WhatsApp" — o progresso (QR/status) é depositado
+        // pela thread off-critical-path (gpui-free, NÃO acorda o event loop). Enquanto o modal está
+        // aberto, ~3 ticks/s marcam dirty para o QR/estado aparecerem; barato quando fechado.
+        cx.spawn(async move |this, cx| loop {
+            let Ok(open) = this.update(cx, |view, cx| {
+                let open = view.whatsapp_modal.is_some();
+                if open {
+                    cx.notify();
+                }
+                open
+            }) else {
+                break;
+            };
+            cx.background_executor()
+                .timer(Duration::from_millis(if open { 300 } else { 500 }))
+                .await;
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 let Ok(alive) = this.update(cx, |view, cx| {
@@ -770,6 +798,8 @@ impl WorkspaceView {
             modal_scan: None,
             credential_modal: None,
             webhook_modal: None,
+            whatsapp_modal: None,
+            whatsapp_cache: None,
             exposure_cache: None,
             ws_autonomy: workspace_autonomy(),
             brake,
@@ -2073,6 +2103,42 @@ impl WorkspaceView {
         }
     }
 
+    /// Tela do fundador (2026-06-25): «⌘⏎ no item de disco». A proposta de poda do PROBE chega pela
+    /// fila de atenção (`DiskReclaimProposed`), NÃO pelo gate do desk — por isso o ⌘⏎ não fazia nada.
+    /// Aqui (desk VAZIO, garantido pelo branch `None` do ⌘⏎) enfileira a poda no desk com os caminhos
+    /// da PROPOSTA no log (nunca de campo forjável — ADR 0043) e confirma; a `BrokerPump` apaga só
+    /// após este gesto humano (custódia intacta: o agente nunca apaga sozinho). `stable_id` é o id
+    /// estável da proposta (`reclaim_stable_id` dos caminhos), então o item da fila some no
+    /// `DiskReclaimExecuted` que a execução apenda.
+    fn attention_confirm_disk(&mut self, stable_id: &str, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .nodes
+            .try_with_store(|store| {
+                let recs = store.events().ok()?;
+                lina_core::disk_budget::DiskBudget::replay(&recs)
+                    .pending_proposal()
+                    .map(|p| p.candidates.iter().map(|c| c.path.clone()).collect())
+            })
+            .unwrap_or_default();
+        if paths.is_empty() {
+            eprintln!("lina-gpui: ⌘⏎ no disco sem proposta pendente no log — ignorado");
+            return;
+        }
+        {
+            let mut d = lock(&self.desk);
+            if !d.queue.iter().any(|g| g.id() == stable_id) {
+                d.queue.push_back(crate::bridge::PendingGate::DiskReclaim {
+                    id: stable_id.to_string(),
+                    requester: "disco".to_string(),
+                    display: format!("🧹 LIMPEZA de disco — apaga {} caminho(s)", paths.len()),
+                    candidate_paths: paths,
+                });
+            }
+            d.confirm_requested = Some(stable_id.to_string());
+        }
+        self.attention_refresh_now(cx);
+    }
+
     /// «Silenciar/Reativar detecção deste terminal» (allowlist por nó — reversível).
     fn attention_toggle_mute(&mut self, node_id: &str, cx: &mut Context<Self>) {
         let muted = self.attention.is_node_muted(node_id);
@@ -2190,6 +2256,7 @@ impl WorkspaceView {
         use palette::PaletteAction as A;
         match action {
             A::NewAgent => self.open_agent_modal_create(cx),
+            A::ConnectWhatsApp => self.open_whatsapp_modal(cx),
             A::ConnectChannel => self.open_credential_modal(cx),
             A::ConfigureWebhook => self.open_webhook_modal(cx),
             A::EditAgent(node) => self.open_agent_modal_edit(node, cx),
@@ -2345,6 +2412,126 @@ impl WorkspaceView {
             );
         }
         Some(row.into_any_element())
+    }
+
+    /// F4-1-6: reprojeta o estado do WhatsApp (conexão + trilha) SÓ quando o `event_count` muda — o
+    /// `whatsapp_status` é O(N) no log; reprojetar por frame seria freeze (lição #1). Espelha
+    /// `refresh_exposure_cache`.
+    fn refresh_whatsapp_cache(&mut self) {
+        let cached = self.whatsapp_cache.as_ref().map(|(c, _)| *c);
+        let fresh = self.nodes.try_with_store(|store| {
+            let count = store.event_count().ok()?;
+            if !dashboard::projection_cache_is_stale(cached, Some(count)) {
+                return None;
+            }
+            let recs = store.events().ok()?;
+            Some((count, channel_audit::whatsapp_status(&recs)))
+        });
+        if let Some(v) = fresh {
+            self.whatsapp_cache = Some(v);
+        }
+    }
+
+    /// F4-1-6: o painel "WhatsApp conectado" + a trilha de auditoria narrada (pt-br). `None` quando não
+    /// há nada a mostrar (desconectado e sem trilha). Tom POSITIVO (`state.success`) — conectar é bom,
+    /// distinto do alerta sóbrio do badge de exposição. "Desconectar" zera o cano (gate d).
+    fn render_whatsapp_badge(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.refresh_whatsapp_cache();
+        let (connected, audit): (bool, Vec<gpui::SharedString>) = {
+            let (_, st) = self.whatsapp_cache.as_ref()?;
+            if st.is_empty() {
+                return None;
+            }
+            (
+                st.connected,
+                st.audit
+                    .iter()
+                    .map(|l| gpui::SharedString::from(l.clone()))
+                    .collect(),
+            )
+        };
+        let t = theme::active();
+        let title = if connected {
+            "WhatsApp conectado"
+        } else {
+            "WhatsApp"
+        };
+        let dot_color = if connected {
+            t.state.success
+        } else {
+            t.text.muted
+        };
+        // Cabeçalho: ponto de status + título; quando conectado, o botão "Desconectar".
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(f32::from(t.spacing.sm)))
+            .child(
+                div()
+                    .w(px(f32::from(t.spacing.sm)))
+                    .h(px(f32::from(t.spacing.sm)))
+                    .rounded_full()
+                    .bg(rgb(dot_color)),
+            )
+            .child(
+                div()
+                    .text_size(px(f32::from(t.typography.size.small)))
+                    .font_family(t.typography.family.ui)
+                    .font_weight(gpui::FontWeight(f32::from(t.typography.weight.semibold)))
+                    .text_color(rgb(t.text.bright))
+                    .child(title),
+            );
+        if connected {
+            header = header.child(
+                div()
+                    .id("whatsapp-disconnect")
+                    .ml_auto()
+                    .px(px(f32::from(t.spacing.sm)))
+                    .py(px(f32::from(t.spacing.xs)))
+                    .rounded_md()
+                    .bg(rgb(t.surface.raised))
+                    .text_size(px(f32::from(t.typography.size.small)))
+                    .font_family(t.typography.family.ui)
+                    .text_color(rgb(t.text.muted))
+                    .cursor_pointer()
+                    .child("Desconectar")
+                    .on_click(cx.listener(|v, _ev: &gpui::ClickEvent, _w, cx| {
+                        v.whatsapp_disconnect(cx);
+                    })),
+            );
+        }
+        let mut card = div()
+            .id("whatsapp-badge")
+            .absolute()
+            .bottom(px(f32::from(t.spacing.md)))
+            .right(px(f32::from(t.spacing.md)))
+            .flex()
+            .flex_col()
+            .gap(px(f32::from(t.spacing.xs)))
+            .px(px(f32::from(t.spacing.md)))
+            .py(px(f32::from(t.spacing.sm)))
+            .rounded_md()
+            .bg(rgb(t.surface.card))
+            .border_1()
+            .border_color(rgb(if connected {
+                t.state.success
+            } else {
+                t.surface.border
+            }))
+            .aria_label(gpui::SharedString::from(title))
+            .child(header);
+        // A trilha: o que a IA fez no seu WhatsApp, em pt-br (conteúdo NUNCA aqui — só metadados).
+        for line in audit {
+            card = card.child(
+                div()
+                    .text_size(px(f32::from(t.typography.size.small)))
+                    .font_family(t.typography.family.ui)
+                    .text_color(rgb(t.text.muted))
+                    .child(line),
+            );
+        }
+        Some(card.into_any_element())
     }
 
     /// F3-1-7: o painel das Goals VIVAS sobre o canvas — um card por meta que merece rosto
@@ -3174,6 +3361,77 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    // ── F4-1-2-UI · modal "Conectar seu WhatsApp" ──
+    /// Abre o modal de conexão do WhatsApp (paleta "Conectar seu WhatsApp"). Limpa qualquer progresso
+    /// de pareamento antigo para não ressurgir um QR velho.
+    fn open_whatsapp_modal(&mut self, cx: &mut Context<Self>) {
+        self.nodes.clear_channel_connect();
+        self.whatsapp_modal = Some(whatsapp_modal::WhatsAppModal::new());
+        cx.notify();
+    }
+
+    /// Move o foco entre os campos do modal (clique na tela).
+    fn whatsapp_focus(&mut self, f: whatsapp_modal::WaField, cx: &mut Context<Self>) {
+        if let Some(m) = self.whatsapp_modal.as_mut() {
+            m.set_focus(f);
+            cx.notify();
+        }
+    }
+
+    /// Fecha o modal sem conectar (ou após conectado) — some da tela e o progresso é limpo.
+    fn whatsapp_cancel(&mut self, cx: &mut Context<Self>) {
+        self.whatsapp_modal = None;
+        self.nodes.clear_channel_connect();
+        cx.notify();
+    }
+
+    /// "Tentar de novo" após falha: volta ao formulário e limpa o slot de progresso.
+    fn whatsapp_retry(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.whatsapp_modal.as_mut() {
+            m.reset_to_form();
+        }
+        self.nodes.clear_channel_connect();
+        cx.notify();
+    }
+
+    /// "Conectar": guarda a chave no cofre (gesto `credential.store` → cofre compartilhado) E dispara a
+    /// thread off-critical-path que conecta o WhatsApp por QR (ADR 0046 — a rede nunca trava o canvas).
+    /// A chave sai UMA vez do modal: uma cópia vai ao cofre (para o envio gated lê-la depois), a outra
+    /// vive só na thread de conexão. O modal segue aberto na fase de pareamento (mostra o QR/status).
+    fn whatsapp_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.whatsapp_modal.as_mut() else {
+            return;
+        };
+        let Some(plan) = m.commit() else {
+            cx.notify(); // incompleto: o modal já registrou o erro leve.
+            return;
+        };
+        let api_key = plan.api_key;
+        // Cópia rumo ao cofre (chave canônica `sessao` no escopo `channel:whatsapp`); `serde_json`
+        // escapa o texto livre com segurança. O VALOR nunca entra no log (só `CredentialStored`).
+        let cred_payload = serde_json::json!({
+            "channel": "whatsapp",
+            "key": "sessao",
+            "value": api_key.clone(),
+        })
+        .to_string();
+        self.nodes
+            .push_human_intent("credential.store", cred_payload);
+        // Dispara a conexão off-critical-path; o progresso (QR/status) chega pelo slot do NodeManager.
+        crate::bridge::spawn_whatsapp_connect(Arc::clone(&self.nodes), plan.base_url, api_key);
+        cx.notify();
+    }
+
+    /// F4-1-2-UI: o leigo pediu "Desconectar" (no badge) — zera o cano (`ChannelDisconnected` via a
+    /// `MailboxPump`); o próximo envio falha "não conectado" (gate d).
+    fn whatsapp_disconnect(&mut self, cx: &mut Context<Self>) {
+        self.nodes.push_human_intent(
+            "channel.disconnect",
+            serde_json::json!({ "channel": "whatsapp" }).to_string(),
+        );
+        cx.notify();
+    }
+
     // ── F4-WA-2c (UI) · modal "Receber um aviso de fora" (webhook) ──
     /// Nomes dos terminais VIVOS com CLI (alvos possíveis do aviso) — exclui notas/pastas e mortos.
     fn live_terminal_names(&self) -> Vec<String> {
@@ -3859,6 +4117,46 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
+        // F4-1-2-UI — MODAL "CONECTAR SEU WHATSAPP": na fase FORMULÁRIO o teclado dirige os campos
+        // (digitar/Tab/Backspace/Enter=conectar); na fase PAREAMENTO (já submetido) o teclado só fecha
+        // (Esc/Enter), pois quem age são os botões (Pronto/Tentar). A chave NUNCA vaza ao PTY.
+        if self.whatsapp_modal.is_some() {
+            let submitted = self.whatsapp_modal.as_ref().is_some_and(|m| m.submitted());
+            match ks.key.as_str() {
+                // `m.escape()` decide se fecha (vazio/2º Esc) ou só arma o descarte (segue aberto).
+                "escape" if self.whatsapp_modal.as_mut().is_some_and(|m| m.escape()) => {
+                    self.whatsapp_cancel(cx);
+                }
+                "escape" => {} // armou o descarte na fase formulário — segue aberto
+                "tab" if !submitted => {
+                    let dir = if ks.modifiers.shift { -1 } else { 1 };
+                    if let Some(m) = self.whatsapp_modal.as_mut() {
+                        m.cycle_focus(dir);
+                    }
+                }
+                "enter" | "return" if !submitted => self.whatsapp_commit(cx),
+                "backspace" if !submitted => {
+                    if let Some(m) = self.whatsapp_modal.as_mut() {
+                        m.backspace();
+                    }
+                }
+                _ if !submitted && !ks.modifiers.platform && !ks.modifiers.control => {
+                    if let Some(kc) = ks
+                        .key_char
+                        .as_ref()
+                        .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+                    {
+                        if let Some(m) = self.whatsapp_modal.as_mut() {
+                            m.type_char(kc);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         // F4-WA-2c (UI) — MODAL "RECEBER UM AVISO DE FORA": enquanto aberto, o teclado o dirige (digitar
         // monta a instrução; Tab cicla terminal↔instrução; ↑/↓ escolhem o terminal quando a lista está
         // focada; Enter cria — ou fecha no resultado; Esc arma/descarta; Backspace apaga). Mesma
@@ -4230,6 +4528,18 @@ impl WorkspaceView {
                                 eprintln!(
                                     "lina-gpui: [ATT] ⌘⏎ aprovou a permissão do toast (registro; sem write)"
                                 );
+                            }
+                            // Tela do fundador (2026-06-25): item de DISCO (proposta do probe) chega
+                            // pela fila de atenção, NÃO pelo gate do desk — o ⌘⏎ não o alcançava ("não
+                            // faz nada"). Enfileira a poda no desk com os caminhos da PROPOSTA no log e
+                            // confirma; a BrokerPump apaga só após este gesto humano (custódia intacta).
+                            Some(attention_ui::ToastView::Single(idx))
+                                if self.attention_items[idx].kind
+                                    == lina_core::AttentionKind::Custody
+                                    && self.attention_items[idx].node_id == "disco" =>
+                            {
+                                let sid = self.attention_items[idx].stable_id.clone();
+                                self.attention_confirm_disk(&sid, cx);
                             }
                             _ if !self.attention_items.is_empty() => {
                                 self.attention_open_panel(cx);
@@ -5843,6 +6153,11 @@ impl Render for WorkspaceView {
             Some(badge) => root.child(badge),
             None => root,
         };
+        // F4-1-6: badge "WhatsApp conectado" + trilha de auditoria (canto inferior direito).
+        let root = match self.render_whatsapp_badge(cx) {
+            Some(badge) => root.child(badge),
+            None => root,
+        };
         // F1-4-4 · M9: modal Criar Espaço (galeria de Focos + Diretório de Trabalho — T5).
         let root = match &self.create_space_modal {
             Some(m) => root.child(self.render_create_space(m, &th, window.viewport_size(), cx)),
@@ -5862,6 +6177,19 @@ impl Render for WorkspaceView {
         // F4-WA-2c (UI): o modal "Receber um aviso de fora" — mesmo nível de overlay.
         let root = match &self.webhook_modal {
             Some(m) => root.child(webhook_modal::render(m, window.viewport_size(), cx)),
+            None => root,
+        };
+        // F4-1-2-UI: o modal "Conectar seu WhatsApp" — lê o progresso (QR/status) do slot do NodeManager.
+        let root = match &self.whatsapp_modal {
+            Some(m) => {
+                let connect = self.nodes.channel_connect_state();
+                root.child(whatsapp_modal::render(
+                    m,
+                    connect.as_ref(),
+                    window.viewport_size(),
+                    cx,
+                ))
+            }
             None => root,
         };
         // W4-2 · M1: a PALETA, quando aberta, é o overlay mais ao TOPO (modal sobre o canvas/chrome).
