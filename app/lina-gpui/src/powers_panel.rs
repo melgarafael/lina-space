@@ -49,7 +49,9 @@ use gpui::{
 use lina_core::{Power, PowerInventory, PowerKind, PowerOrigin, PowerScope, PowerState};
 
 use crate::theme::{self, Theme};
-use crate::ui::{Badge, BadgeTone, Button, ButtonSize, ClickHandler, Panel, Space, Surface};
+use crate::ui::{
+    Badge, BadgeTone, Button, ButtonSize, ClickHandler, Panel, RadiusExt, Space, Surface,
+};
 
 // ───────────────────────────── Microcopy (pt-br, zero jargão) ─────────────────────────────
 
@@ -72,6 +74,9 @@ pub const ORIGIN_LABEL: &str = "De onde vem";
 
 /// Rótulo da aba que junta todos os tipos. Não se pluraliza ("Todos · 109") — é coletivo.
 pub const TAB_ALL: &str = "Todos";
+
+/// Rótulo acessível do ✕ — o leitor de tela ouve "Fechar"; o glifo visível fica mudo (icon button).
+pub const CLOSE_ARIA: &str = "Fechar";
 
 // Os 5 rótulos de estado (fonte: entrega-d4 §III.b — a PALAVRA que o leigo lê).
 const READY_LABEL: &str = "Pronto pra usar";
@@ -244,10 +249,7 @@ pub struct TabModel {
 ///
 /// Pura (testada). É o `tabs_for` da API: o call-site mapeia os modelos em [`PowerTab`] com o handler.
 #[must_use]
-pub fn tab_models(
-    counts: &BTreeMap<PowerKind, u32>,
-    active: Option<PowerKind>,
-) -> Vec<TabModel> {
+pub fn tab_models(counts: &BTreeMap<PowerKind, u32>, active: Option<PowerKind>) -> Vec<TabModel> {
     let total: u32 = counts.values().sum();
     if total == 0 {
         return Vec::new();
@@ -434,8 +436,8 @@ impl PowerTab {
 
 impl RenderOnce for PowerTab {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let id: ElementId = SharedString::from(format!("powers-tab-{}", tab_slug(self.model.id)))
-            .into();
+        let id: ElementId =
+            SharedString::from(format!("powers-tab-{}", tab_slug(self.model.id))).into();
         let label = tab_label(self.model);
         let mut btn = Button::new(id, label)
             .size(ButtonSize::Sm)
@@ -582,6 +584,9 @@ pub struct PowersPanel {
     summary: String,
     tabs: Vec<PowerTab>,
     cards: Vec<PowerCard>,
+    /// Gesto de fechar (✕ no canto sup. direito do header). `None` ⇒ painel sem ✕ (pré-visualização /
+    /// gate-de-tela). O call-site (main.rs) liga isto ao mesmo handler do clique-fora + Esc.
+    on_close: Option<ClickHandler>,
 }
 
 impl PowersPanel {
@@ -593,6 +598,7 @@ impl PowersPanel {
             summary: summary_line(&inventory.counts),
             tabs: Vec::new(),
             cards: Vec::new(),
+            on_close: None,
         }
     }
 
@@ -611,6 +617,17 @@ impl PowersPanel {
         self.cards = cards;
         self
     }
+
+    /// Handler do ✕ no canto sup. direito do header. Passe `cx.listener(|view, _ev, _w, cx| {
+    /// view.powers_panel_open = false; cx.notify(); })`. Sem handler = painel SEM ✕ (preview/teste).
+    #[must_use]
+    pub fn on_close(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_close = Some(Box::new(handler));
+        self
+    }
 }
 
 impl RenderOnce for PowersPanel {
@@ -618,7 +635,25 @@ impl RenderOnce for PowersPanel {
         let t = theme::active();
 
         // ── Cabeçalho fixo ───────────────────────────────────────────────────────────
+        // r3: 1ª linha = título (Fraunces, à esquerda, `flex_1`) + ✕ (`ghost icon`, à direita) — só
+        // existe quando o call-site passa `on_close`. Sem handler, o painel sobe SEM ✕ (preview/teste).
         let title = title_text(&t, SharedString::from(PANEL_TITLE));
+        let close_btn = self.on_close.map(|cb| {
+            Button::new("powers-close", "✕")
+                .icon()
+                .ghost()
+                .aria(SharedString::from(CLOSE_ARIA))
+                .on_click(cb)
+        });
+        let title_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(Space::Sm.px(&t)))
+            .child(div().flex_1().child(title))
+            .children(close_btn);
+
         let summary = (!self.summary.is_empty())
             .then(|| summary_text(&t, SharedString::from(self.summary.clone())));
         let intro = muted_text(&t, SharedString::from(PANEL_INTRO));
@@ -638,7 +673,7 @@ impl RenderOnce for PowersPanel {
             .flex()
             .flex_col()
             .gap(px(Space::Md.px(&t)))
-            .child(title)
+            .child(title_row)
             .children(summary)
             .child(intro)
             .children(tab_row);
@@ -679,22 +714,8 @@ impl RenderOnce for PowersPanel {
                         .flex()
                         .flex_row()
                         .gap(gap)
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(gap)
-                                .children(col_a),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .flex()
-                                .flex_col()
-                                .gap(gap)
-                                .children(col_b),
-                        ),
+                        .child(div().flex_1().flex().flex_col().gap(gap).children(col_a))
+                        .child(div().flex_1().flex().flex_col().gap(gap).children(col_b)),
                 )
                 .into_any_element()
         } else {
@@ -726,7 +747,7 @@ impl RenderOnce for PowersPanel {
             .bg(rgb(t.surface.card))
             .border_1()
             .border_color(rgb(t.surface.border))
-            .rounded_md()
+            .rounded_chrome()
             .child(header)
             .child(body)
     }
@@ -1061,10 +1082,27 @@ mod tests {
     /// Densidade: ≤ `GRID_THRESHOLD` ⇒ coluna única; acima ⇒ 2 colunas. Fronteira testada.
     #[test]
     fn use_grid_kicks_in_above_threshold() {
-        assert!(!use_grid(0), "vazio fica em col simples (cai no estado vazio)");
-        assert!(!use_grid(GRID_THRESHOLD), "fronteira inclusiva: ≤ ⇒ col simples");
+        assert!(
+            !use_grid(0),
+            "vazio fica em col simples (cai no estado vazio)"
+        );
+        assert!(
+            !use_grid(GRID_THRESHOLD),
+            "fronteira inclusiva: ≤ ⇒ col simples"
+        );
         assert!(use_grid(GRID_THRESHOLD + 1), "acima do limite ⇒ 2 col");
         assert!(use_grid(75), "skills volumosos ⇒ 2 col");
+    }
+
+    /// r3: o painel constrói com e sem `on_close` — o setter é opcional, a casca é a mesma. Sem
+    /// handler, o painel sobe SEM ✕ (preview/teste); com handler, ele entra no header. Não dá pra
+    /// inspecionar a árvore gpui headless, então o que provamos aqui é que o builder mantém o
+    /// contrato (não-vazio nos dois caminhos, sem panic).
+    #[test]
+    fn panel_builds_with_and_without_on_close() {
+        let inv = mock_inventory();
+        let _without = PowersPanel::new(&inv);
+        let _with = PowersPanel::new(&inv).on_close(|_ev, _w, _cx| {});
     }
 
     /// Slug da aba é estável e único por id (não depende do rótulo, que pluraliza).

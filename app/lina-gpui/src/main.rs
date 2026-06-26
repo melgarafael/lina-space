@@ -120,6 +120,8 @@ use bridge::{
     CwdPolicy, Desk, Grid, NodeAdmission, NodeManager, PtrAction, CARD_H, CARD_W,
 };
 
+use crate::ui::RadiusExt;
+
 /// Tamanho da fonte do grid, do token (contrato grid=13 — teste no theme.rs).
 fn grid_font_px() -> f32 {
     f32::from(theme::active().typography.size.grid)
@@ -1369,7 +1371,7 @@ impl WorkspaceView {
                     div()
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded_content()
                         .border_1()
                         .border_color(rgb(ring(focused)))
                         .bg(rgb(th.terminal.bg))
@@ -1401,7 +1403,7 @@ impl WorkspaceView {
             .gap_3()
             .flex()
             .flex_col()
-            .rounded_lg()
+            .rounded_chrome()
             .border_1()
             .border_color(rgb(th.surface.border))
             .bg(rgb(th.surface.panel))
@@ -1417,7 +1419,7 @@ impl WorkspaceView {
             // uma chave» expandindo o campo ALI MESMO, e a saída de compra no navegador.
             let mut card = div()
                 .p_3()
-                .rounded_md()
+                .rounded_content()
                 .border_1()
                 .border_color(rgb(ring(matches!(m.focus, M9Focus::Upsell))))
                 .bg(rgb(th.surface.raised))
@@ -1466,7 +1468,7 @@ impl WorkspaceView {
                         div()
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_content()
                             .border_2()
                             .border_color(rgb(ring(matches!(m.focus, M9Focus::KeyField))))
                             .bg(rgb(th.surface.card))
@@ -1479,7 +1481,7 @@ impl WorkspaceView {
                             .id("m9-key-activate")
                             .px_3()
                             .py_2()
-                            .rounded_md()
+                            .rounded_content()
                             .border_2()
                             .border_color(rgb(ring(matches!(m.focus, M9Focus::Activate))))
                             .bg(rgb(th.accent.action))
@@ -1514,7 +1516,7 @@ impl WorkspaceView {
                         .id("m9-key-toggle")
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .border_2()
                         .border_color(rgb(ring(matches!(m.focus, M9Focus::KeyToggle))))
                         .bg(rgb(th.surface.raised_alt))
@@ -1536,7 +1538,7 @@ impl WorkspaceView {
                         .id("m9-key-buy")
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .border_2()
                         .border_color(rgb(ring(matches!(m.focus, M9Focus::Buy))))
                         .bg(rgb(th.surface.raised))
@@ -1559,7 +1561,7 @@ impl WorkspaceView {
                         .id("m9-key-not-now")
                         .px_3()
                         .py_1()
-                        .rounded_md()
+                        .rounded_content()
                         .border_2()
                         .border_color(rgb(ring(matches!(m.focus, M9Focus::Cancel))))
                         .text_color(rgb(th.text.muted))
@@ -1581,7 +1583,7 @@ impl WorkspaceView {
             {
                 let mut ok = div()
                     .p_3()
-                    .rounded_md()
+                    .rounded_content()
                     .border_1()
                     .border_color(rgb(th.state.success))
                     .flex()
@@ -1627,7 +1629,7 @@ impl WorkspaceView {
                         .id(("m9-card", idx))
                         .flex_1()
                         .p_2()
-                        .rounded_md()
+                        .rounded_content()
                         .border_1()
                         .border_color(rgb(if selected {
                             ring(matches!(m.focus, M9Focus::Cards))
@@ -1673,7 +1675,7 @@ impl WorkspaceView {
                         .id(("m9-tpl-card", idx))
                         .flex_1()
                         .p_2()
-                        .rounded_md()
+                        .rounded_content()
                         .border_1()
                         .border_color(rgb(if selected {
                             th.accent.action
@@ -1765,7 +1767,7 @@ impl WorkspaceView {
                     .id(id)
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .border_1()
                     .border_color(rgb(ring(focused)))
                     .bg(rgb(if primario {
@@ -2425,7 +2427,7 @@ impl WorkspaceView {
                 div()
                     .px(px(f32::from(t.spacing.sm)))
                     .py(px(f32::from(t.spacing.xs)))
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(t.surface.raised))
                     .text_size(px(f32::from(t.typography.size.small)))
                     .font_family(t.typography.family.ui)
@@ -2511,7 +2513,7 @@ impl WorkspaceView {
                     .ml_auto()
                     .px(px(f32::from(t.spacing.sm)))
                     .py(px(f32::from(t.spacing.xs)))
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(t.surface.raised))
                     .text_size(px(f32::from(t.typography.size.small)))
                     .font_family(t.typography.family.ui)
@@ -2533,7 +2535,7 @@ impl WorkspaceView {
             .gap(px(f32::from(t.spacing.xs)))
             .px(px(f32::from(t.spacing.md)))
             .py(px(f32::from(t.spacing.sm)))
-            .rounded_md()
+            .rounded_chrome()
             .bg(rgb(t.surface.card))
             .border_1()
             .border_color(rgb(if connected {
@@ -2813,26 +2815,55 @@ impl WorkspaceView {
                     ))
                 })
                 .collect();
+        // r3: 4 contratos de modal — ✕ no header, scrim escuro (clique-fora fecha), painel central
+        // `.occlude()` (clique dentro NÃO vaza p/ o backdrop). Mesmo idioma do `ui::Modal`.
         let panel = powers_panel::PowersPanel::new(inventory)
             .tabs(tabs)
-            .powers(cards);
-        // r2: área CENTRAL dedicada (~0.72×0.82 da janela), centrada — não mais o flanco direito
-        // espremido. O pai com altura constrita engata o `overflow_y_scroll` no body do panel.
+            .powers(cards)
+            .on_close(cx.listener(|view, _ev, _w, cx| {
+                view.powers_panel_open = false;
+                cx.notify();
+            }));
+        let t = theme::active();
+        let scrim = div()
+            .id("powers-scrim")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .bg(gpui::rgb(t.surface.scrim))
+            .opacity(0.5)
+            .cursor_pointer()
+            .on_click(cx.listener(|view, _ev, _w, cx| {
+                view.powers_panel_open = false;
+                cx.notify();
+            }));
+        let panel_box = div()
+            .id("powers-panel-box")
+            .occlude()
+            .w(gpui::relative(0.72))
+            .h(gpui::relative(0.82))
+            .child(panel);
         let overlay = div()
             .absolute()
             .top_0()
             .left_0()
             .right_0()
             .bottom_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_center()
+            .child(scrim)
             .child(
                 div()
-                    .w(gpui::relative(0.72))
-                    .h(gpui::relative(0.82))
-                    .child(panel),
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .child(panel_box),
             );
         Some(overlay.into_any_element())
     }
@@ -2936,16 +2967,58 @@ impl WorkspaceView {
                     .on_choose(cx.listener(move |v, _e, _w, cx| v.choose_design_direction(idx, cx)))
             })
             .collect();
+        // r3: galeria vira ÁREA CENTRAL (mesmo padrão de Poderes). 4 contratos de modal: ✕ no header,
+        // scrim escuro c/ clique-fora, painel `.occlude()`.
         let gallery = DirectionsGallery::new()
             .lina(lina)
             .curated(curated)
-            .on_open_external(cx.listener(|_v, _e, _w, cx| cx.open_url(OPEN_DESIGN_URL)));
-        let col = div()
+            .on_open_external(cx.listener(|_v, _e, _w, cx| cx.open_url(OPEN_DESIGN_URL)))
+            .on_close(cx.listener(|view, _ev, _w, cx| {
+                view.design_gallery_open = false;
+                cx.notify();
+            }));
+        let t = theme::active();
+        let scrim = div()
+            .id("design-directions-scrim")
             .absolute()
-            .top_16()
+            .top_0()
+            .left_0()
             .right_0()
-            .child(div().w(gpui::relative(0.46)).child(gallery));
-        Some(col.into_any_element())
+            .bottom_0()
+            .bg(gpui::rgb(t.surface.scrim))
+            .opacity(0.5)
+            .cursor_pointer()
+            .on_click(cx.listener(|view, _ev, _w, cx| {
+                view.design_gallery_open = false;
+                cx.notify();
+            }));
+        let gallery_box = div()
+            .id("design-directions-box")
+            .occlude()
+            .w(gpui::relative(0.72))
+            .h(gpui::relative(0.82))
+            .child(gallery);
+        let overlay = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .child(scrim)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .child(gallery_box),
+            );
+        Some(overlay.into_any_element())
     }
 
     /// F2-4-5: o leigo escolheu uma direção visual (1 clique) — destaca a escolha (efeito visível). A
@@ -3259,7 +3332,7 @@ impl WorkspaceView {
                     div()
                         .id(("dash-effort", i as u64))
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .text_size(px(f32::from(th.typography.size.small)))
                         .text_color(rgb(th.text.secondary))
@@ -3271,7 +3344,7 @@ impl WorkspaceView {
                     div()
                         .id(("dash-edit", i as u64))
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .text_size(px(f32::from(th.typography.size.small)))
                         .text_color(rgb(th.accent.primary))
@@ -4887,6 +4960,18 @@ impl WorkspaceView {
                 cx.notify();
                 return;
             }
+            // r3: Esc fecha a Área de Poderes / a Galeria de Direções (se aberta). Mesma postura do
+            // attention_panel_open: tecla reflexa só RECOLHE a UI — nunca decide nada (sem evento).
+            if self.powers_panel_open {
+                self.powers_panel_open = false;
+                cx.notify();
+                return;
+            }
+            if self.design_gallery_open {
+                self.design_gallery_open = false;
+                cx.notify();
+                return;
+            }
         }
         let grid = lock(&self.nodes.grids).get(&self.focused).cloned();
         let app_cursor = grid.map(|g| lock(&g).mode().app_cursor).unwrap_or(false);
@@ -5450,7 +5535,7 @@ impl Render for WorkspaceView {
                             .id(("card-breaker", card_eid))
                             .flex_shrink_0()
                             .px_2()
-                            .rounded_md()
+                            .rounded_content()
                             .bg(rgb(th.accent.primary))
                             .text_color(rgb(th.text.on_accent))
                             .text_size(px(f32::from(th.typography.size.caption) * z))
@@ -5482,7 +5567,7 @@ impl Render for WorkspaceView {
                         .id(("card-effort", card_eid))
                         .flex_shrink_0()
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .text_size(px(f32::from(th.typography.size.caption) * z))
                         .text_color(rgb(th.text.secondary))
@@ -5544,7 +5629,7 @@ impl Render for WorkspaceView {
                         .aria_label(agent_modal::card_autonomy_aria(nv.autonomy))
                         .flex_shrink_0()
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(auto_bg))
                         .border_1()
                         .border_color(rgb(th.surface.border))
@@ -5561,7 +5646,7 @@ impl Render for WorkspaceView {
                         .id(("card-edit", card_eid))
                         .flex_shrink_0()
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .text_size(px(f32::from(th.typography.size.small) * z))
                         .text_color(rgb(th.accent.primary))
@@ -5578,7 +5663,7 @@ impl Render for WorkspaceView {
                 title = title.child(
                     div()
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .text_size(px(f32::from(th.typography.size.caption) * z))
                         .text_color(rgb(th.state.warning))
@@ -5594,7 +5679,7 @@ impl Render for WorkspaceView {
                 title = title.child(
                     div()
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .text_size(px(f32::from(th.typography.size.caption) * z))
                         .text_color(rgb(th.text.muted))
@@ -5609,7 +5694,7 @@ impl Render for WorkspaceView {
                         .id(("close", card_eid))
                         .flex_shrink_0()
                         .px_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.danger_muted))
                         .text_color(rgb(th.state.danger))
                         .cursor_pointer()
@@ -5743,7 +5828,7 @@ impl Render for WorkspaceView {
                 .bg(rgb(th.surface.card))
                 .border_2()
                 .border_color(card_border)
-                .rounded_md()
+                .rounded_content()
                 .overflow_hidden()
                 .on_click(cx.listener(move |view, _ev: &ClickEvent, _w, _cx| {
                     // Só foca se o nó ainda existe (o ✕ pode tê-lo removido neste clique). Focar
@@ -5950,7 +6035,7 @@ impl Render for WorkspaceView {
                     .id("a2a-btn")
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.accent.action))
                     .text_color(rgb(th.text.on_accent))
                     .cursor_pointer()
@@ -5974,7 +6059,7 @@ impl Render for WorkspaceView {
                 .id("powers-btn")
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.surface.raised))
                 .text_color(rgb(th.text.primary))
                 .cursor_pointer()
@@ -5993,7 +6078,7 @@ impl Render for WorkspaceView {
                 .id("visual-btn")
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.surface.raised))
                 .text_color(rgb(th.text.primary))
                 .cursor_pointer()
@@ -6009,7 +6094,7 @@ impl Render for WorkspaceView {
                 .id("add-terminal-btn")
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.accent.confirm))
                 .text_color(rgb(th.text.on_accent))
                 .cursor_pointer()
@@ -6028,7 +6113,7 @@ impl Render for WorkspaceView {
                 .id("new-agent-btn")
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.accent.create))
                 .text_color(rgb(th.text.on_accent))
                 .cursor_pointer()
@@ -6048,7 +6133,7 @@ impl Render for WorkspaceView {
                 div()
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.surface.raised_alt))
                     .text_color(rgb(th.text.bright))
                     .child(text!(format!(
@@ -6064,7 +6149,7 @@ impl Render for WorkspaceView {
                 .id("home-btn")
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.surface.raised))
                 .text_color(rgb(th.text.primary))
                 .cursor_pointer()
@@ -6082,7 +6167,7 @@ impl Render for WorkspaceView {
                 .id("settings-btn")
                 .px_3()
                 .py_1()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.surface.raised))
                 .text_color(rgb(th.text.primary))
                 .cursor_pointer()
@@ -6097,7 +6182,7 @@ impl Render for WorkspaceView {
                 div()
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.state.danger))
                     .text_color(rgb(th.text.on_emphasis))
                     .child(text!("⟳ Recuperando…")),
@@ -6111,7 +6196,7 @@ impl Render for WorkspaceView {
                 div()
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.state.danger))
                     .text_color(rgb(th.text.on_emphasis))
                     .child(text!(
@@ -6138,7 +6223,7 @@ impl Render for WorkspaceView {
                 div()
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(bg))
                     .text_color(rgb(fg))
                     .child(text!(banner)),
@@ -6194,7 +6279,7 @@ impl Render for WorkspaceView {
                     .id("freio-btn")
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(freio_bg))
                     .text_color(rgb(freio_fg))
                     .cursor_pointer()
@@ -6209,7 +6294,7 @@ impl Render for WorkspaceView {
                     .id("reduce-motion-btn")
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(anim_bg))
                     .text_color(rgb(anim_fg))
                     .cursor_pointer()
@@ -6293,7 +6378,7 @@ impl Render for WorkspaceView {
                     .gap_3()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_chrome()
                     .bg(rgb(th.surface.raised))
                     .border_1()
                     .border_color(rgb(th.surface.border))
@@ -6304,7 +6389,7 @@ impl Render for WorkspaceView {
                             .id("archive-undo")
                             .px_3()
                             .py_1()
-                            .rounded_md()
+                            .rounded_content()
                             .border_2()
                             .border_color(rgb(undo_ring))
                             .bg(rgb(th.surface.raised_alt))

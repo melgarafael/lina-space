@@ -226,6 +226,10 @@ mod scale {
     pub const SUCCESS_MUTED: ColorScale = ColorScale::new(0x26301d, 0xe6eccb);
     pub const BORDER: ColorScale = ColorScale::new(0x3a3128, 0xcbb99c);
     pub const BORDER_MUTED: ColorScale = ColorScale::new(0x2c2419, 0xe2d5be);
+    /// Scrim de overlay: preto puro no dark, carvão quente no light (a temperatura T3 do canvas
+    /// dark, levada ao modo claro como uma sombra quente — não cinza-azul). O call-site opacifica
+    /// (~0.5) para escurecer SEM apagar — separa o painel central do canvas atrás.
+    pub const SCRIM: ColorScale = ColorScale::new(0x000000, 0x1a1510);
 
     // texto — tinta quente nos 2 modos (papel quente pede tinta marrom-escura, não cinza-azul).
     pub const TEXT_PRIMARY: ColorScale = ColorScale::new(0xefe6d6, 0x33291f);
@@ -287,6 +291,12 @@ pub struct SurfaceTokens {
     pub border: u32,
     /// Borda apagada (aura do canvas sem time conectado).
     pub border_muted: u32,
+    /// **Scrim de overlay/modal** — a COR BASE do véu que escurece o canvas atrás de um painel
+    /// central (Área de Poderes, galeria de Direções). É só a cor: o call-site aplica
+    /// `.opacity(...)` no nó (`rgb()` não carrega alpha). Preto puro no dark, carvão quente no
+    /// light — mantém a temperatura T3 sem virar cinza-azul. Não é superfície de leitura (não entra
+    /// no gate WCAG de texto); é o "afastar o canvas".
+    pub scrim: u32,
 }
 
 /// Texto — cada token tem um alvo WCAG no gate (ver testes).
@@ -563,6 +573,7 @@ impl Theme {
                 success_muted: scale::SUCCESS_MUTED.pick(mode),
                 border: scale::BORDER.pick(mode),
                 border_muted: scale::BORDER_MUTED.pick(mode),
+                scrim: scale::SCRIM.pick(mode),
             },
             text: TextTokens {
                 primary: scale::TEXT_PRIMARY.pick(mode),
@@ -632,6 +643,7 @@ impl Theme {
             "superficie.sucesso_suave" => &mut self.surface.success_muted,
             "superficie.borda" => &mut self.surface.border,
             "superficie.borda_suave" => &mut self.surface.border_muted,
+            "superficie.scrim" => &mut self.surface.scrim,
             "texto.primario" => &mut self.text.primary,
             "texto.secundario" => &mut self.text.secondary,
             "texto.apagado" => &mut self.text.muted,
@@ -661,7 +673,7 @@ impl Theme {
 /// pt-br legível, espelhando a semântica dos grupos.
 // dead_code: consumido pelos testes hoje e pela superfície de Ajustes/F2-2 amanhã.
 #[allow(dead_code)]
-pub const TOKEN_PATHS: [&str; 30] = [
+pub const TOKEN_PATHS: [&str; 31] = [
     "superficie.canvas",
     "superficie.painel",
     "superficie.cartao",
@@ -673,6 +685,7 @@ pub const TOKEN_PATHS: [&str; 30] = [
     "superficie.sucesso_suave",
     "superficie.borda",
     "superficie.borda_suave",
+    "superficie.scrim",
     "texto.primario",
     "texto.secundario",
     "texto.apagado",

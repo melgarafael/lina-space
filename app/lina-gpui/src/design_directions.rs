@@ -39,6 +39,9 @@ use gpui::{
 use crate::theme::{self, Theme};
 use crate::ui::{Badge, BadgeTone, Button, ButtonSize, ClickHandler, Panel, Space};
 
+// r3 (`allow(dead_code)`): as constantes/itens novos do estado "Em uso" + ✕ ficam exercitados pelos
+// testes; o consumo de tela engata quando o Maestro fiar o overlay central + handlers em main.rs.
+
 // ───────────────────────────── Dados de uma direção (puro) ─────────────────────────────
 
 /// De onde a direção vem — decide o destaque na galeria e o tom do selo. A da **casa** sobe ao
@@ -297,10 +300,48 @@ pub const CURATED_SECTION_LABEL: &str = "Outras direções";
 /// Rótulo do gesto de escolher (no card). 1 clique escolhe e destaca.
 pub const CHOOSE_LABEL: &str = "Usar esta";
 
+/// Rótulo do botão quando a direção JÁ É a escolhida (r3 — bug do fundador: "usar esta" não dava
+/// feedback). "✓ Em uso" + variante `Confirm` deixam a escolha INEQUÍVOCA — sem sensação de morto.
+pub const IN_USE_LABEL: &str = "✓ Em uso";
+
+/// Selo "Sua direção atual" (no card escolhido) — REPLACE o selo de origem/clima quando selected.
+/// Mantém a geometria do header (badge único à direita) e some o ar de duplicação.
+pub const CURRENT_BADGE: &str = "Sua direção atual";
+
+/// Rótulo acessível do ✕ — o leitor de tela ouve "Fechar". O glifo visível segue mudo (icon button).
+pub const CLOSE_ARIA: &str = "Fechar";
+
 /// Nome acessível do gesto de escolher (o card já diz; o leitor de tela ganha o objeto).
 #[must_use]
 pub fn choose_aria(name: &str) -> String {
     format!("Usar a direção {name}")
+}
+
+/// r3 — DECISÃO PURA: o rótulo do botão "usar/em uso" a partir do estado de seleção. Casca de
+/// render lê daqui (padrão da casa: decisão testável, render fino). Selecionado ⇒ [`IN_USE_LABEL`];
+/// demais ⇒ [`CHOOSE_LABEL`].
+#[must_use]
+pub fn direction_button_label(selected: bool) -> &'static str {
+    if selected {
+        IN_USE_LABEL
+    } else {
+        CHOOSE_LABEL
+    }
+}
+
+/// r3 — DECISÃO PURA: rótulo e tom do selo do header do card. Selecionado ⇒ [`CURRENT_BADGE`]
+/// (Success — "Sua direção atual"); demais ⇒ selo de origem/clima (Lina = Info; curada = clima
+/// Neutro). Replace, não acúmulo — a geometria não duplica.
+#[must_use]
+pub fn direction_badge(direction: DesignDirection, selected: bool) -> (&'static str, BadgeTone) {
+    if selected {
+        (CURRENT_BADGE, BadgeTone::Success)
+    } else {
+        match direction.origin {
+            Origin::Lina => (LINA_BADGE, BadgeTone::Info),
+            Origin::Curated => (direction.climate, BadgeTone::Neutral),
+        }
+    }
 }
 
 /// Aviso honesto do único acesso externo: abre o navegador SÓ no clique (nada sai sozinho).
@@ -403,11 +444,9 @@ impl RenderOnce for DirectionCard {
         let t = theme::active();
         let d = self.direction;
 
-        // Selo: a da casa veste o acento ("feita pela casa"); as curadas mostram o clima, neutro.
-        let (badge_label, badge_tone) = match d.origin {
-            Origin::Lina => (LINA_BADGE, BadgeTone::Info),
-            Origin::Curated => (d.climate, BadgeTone::Neutral),
-        };
+        // r3: decisão de selo na função pura ([`direction_badge`]) — `selected` carrega
+        // "Sua direção atual" (Success), demais voltam ao selo de origem/clima.
+        let (badge_label, badge_tone) = direction_badge(d, self.selected);
         let badge = Badge::new(
             SharedString::from(format!("direction-badge-{}", d.id)),
             badge_label,
@@ -424,11 +463,13 @@ impl RenderOnce for DirectionCard {
             .child(card_name(&t, SharedString::from(d.name)))
             .child(badge);
 
-        // "Usar esta" — confirma a escolha; só quando há handler (na preview fica fora).
+        // r3: rótulo MUDA com `selected` ([`direction_button_label`]) — escolhido vira "✓ Em uso";
+        // demais ficam "Usar esta". Variante `Confirm` em ambos; o `selected` no Button rende o anel
+        // de foco (mesmo idioma do toggle de aba em [`Button::selected`]).
         let choose = self.on_choose.map(|h| {
             Button::new(
                 SharedString::from(format!("direction-choose-{}", d.id)),
-                CHOOSE_LABEL,
+                direction_button_label(self.selected),
             )
             .confirm()
             .size(ButtonSize::Sm)
@@ -460,6 +501,9 @@ pub struct DirectionsGallery {
     curated_cards: Vec<DirectionCard>,
     /// Abrir o link opt-in (`cx.open_url(OPEN_DESIGN_URL)`). `None` = link inerte (preview).
     on_open_external: Option<ClickHandler>,
+    /// r3: ✕ no canto sup. direito do header. `None` ⇒ galeria SEM ✕ (preview/teste). Mesmo idioma
+    /// do `PowersPanel::on_close`: o call-site (main.rs) liga ao Esc + clique-fora do scrim.
+    on_close: Option<ClickHandler>,
 }
 
 impl DirectionsGallery {
@@ -470,6 +514,7 @@ impl DirectionsGallery {
             lina_cards: Vec::new(),
             curated_cards: Vec::new(),
             on_open_external: None,
+            on_close: None,
         }
     }
 
@@ -497,6 +542,17 @@ impl DirectionsGallery {
         self.on_open_external = Some(Box::new(handler));
         self
     }
+
+    /// Handler do ✕. Passe `cx.listener(|view, _ev, _w, cx| { view.design_gallery_open = false;
+    /// cx.notify(); })`. Sem handler = galeria SEM ✕ (preview/teste).
+    #[must_use]
+    pub fn on_close(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_close = Some(Box::new(handler));
+        self
+    }
 }
 
 impl Default for DirectionsGallery {
@@ -509,15 +565,36 @@ impl RenderOnce for DirectionsGallery {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let t = theme::active();
 
-        // Cabeçalho: título-momento (Fraunces) + subtítulo honesto.
-        let head = div()
+        // ── Cabeçalho FIXO (r3 — mesmo padrão da Área de Poderes) ───────────────────
+        // 1ª linha: título Fraunces à esquerda (`flex_1`) + ✕ à direita (só com `on_close`).
+        let close_btn = self.on_close.map(|cb| {
+            Button::new("design-directions-close", "✕")
+                .icon()
+                .ghost()
+                .aria(SharedString::from(CLOSE_ARIA))
+                .on_click(cb)
+        });
+        let title_row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(Space::Sm.px(&t)))
+            .child(div().flex_1().child(hero_title(&t, GALLERY_TITLE)))
+            .children(close_btn);
+
+        let header = div()
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(Space::Xs.px(&t)))
-            .child(hero_title(&t, GALLERY_TITLE))
+            .child(title_row)
             .child(muted_text(&t, GALLERY_SUBTITLE));
 
-        // Seção da casa (destaque, topo).
+        // ── Body ROLÁVEL ────────────────────────────────────────────────────────────
+        // Seções (Lina + curadas) + footer com link opt-in. O `flex_1 + min_h(0) +
+        // overflow_y_scroll` é o idioma da casa (`onboarding.rs`/`attention_ui.rs`); `px(0.0)` é
+        // reset estrutural (catraca ignora — ver `tests/token_ratchet.rs:262`).
         let lina_section = div()
             .flex()
             .flex_col()
@@ -531,7 +608,6 @@ impl RenderOnce for DirectionsGallery {
                     .children(self.lina_cards),
             );
 
-        // Seção das curadas.
         let curated_section = div()
             .flex()
             .flex_col()
@@ -545,7 +621,6 @@ impl RenderOnce for DirectionsGallery {
                     .children(self.curated_cards),
             );
 
-        // Rodapé: o único acesso externo, claramente opt-in e sinalizado.
         let external = self.on_open_external.map(|h| {
             Button::new("design-directions-open-external", OPEN_DESIGN_CTA)
                 .ghost()
@@ -560,13 +635,36 @@ impl RenderOnce for DirectionsGallery {
             .child(muted_text(&t, OPEN_DESIGN_HINT))
             .children(external);
 
-        Panel::surface()
-            .gap(Space::Lg)
-            .pad(Space::Lg, Space::Lg)
-            .child(head)
-            .child(lina_section)
-            .child(curated_section)
-            .child(footer)
+        let body = div()
+            .id("design-directions-body")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(Space::Lg.px(&t)))
+                    .child(lina_section)
+                    .child(curated_section)
+                    .child(footer),
+            );
+
+        // ── Container raiz: `size_full` p/ casar com o pai de altura constrita do call-site
+        //    (modal-like, ~0.72×0.82 da janela). Identidade da casa via tokens (card + borda 1px).
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap(px(Space::Lg.px(&t)))
+            .px(px(Space::Lg.px(&t)))
+            .py(px(Space::Lg.px(&t)))
+            .bg(rgb(t.surface.card))
+            .border_1()
+            .border_color(rgb(t.surface.border))
+            .rounded_md()
+            .child(header)
+            .child(body)
     }
 }
 
@@ -620,7 +718,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(ids, expected, "exatamente os 12 sem marca da shortlist §VIII.3");
+        assert_eq!(
+            ids, expected,
+            "exatamente os 12 sem marca da shortlist §VIII.3"
+        );
 
         // (b) Agrupadas por clima: a sequência de climas distintos na ordem, sem repetir um clima já
         // fechado (cada clima é um bloco contíguo). `blocks` sem duplicata ⇒ contíguo.
@@ -702,6 +803,9 @@ mod tests {
             LINA_BADGE,
             CURATED_SECTION_LABEL,
             CHOOSE_LABEL,
+            IN_USE_LABEL,
+            CURRENT_BADGE,
+            CLOSE_ARIA,
             OPEN_DESIGN_HINT,
             OPEN_DESIGN_CTA,
         ];
@@ -780,5 +884,51 @@ mod tests {
         assert_eq!(lina.len(), 1);
         assert_eq!(curated.len(), 12);
         let _gallery = DirectionsGallery::new().lina(lina).curated(curated);
+    }
+
+    /// **r3 — `selected` PIVOTA SELO+LABEL (DECISÃO PURA):** quando uma direção é a escolhida, o
+    /// selo do header vira "Sua direção atual" (Success) e o botão vira "✓ Em uso" — feedback
+    /// inequívoco (mata o "parece morto"). Os não-escolhidos seguem com selo de origem/clima e
+    /// "Usar esta". Provo a fronteira para os 3 casos (Lina selected, curada selected, não-selected).
+    #[test]
+    fn selected_pivots_badge_and_button_label() {
+        let lina = lina_directions()[0];
+        let curada = curated_directions()[0];
+
+        // Não-selecionado: selo de origem/clima, "Usar esta".
+        assert_eq!(direction_button_label(false), CHOOSE_LABEL);
+        assert_eq!(
+            direction_badge(lina, false),
+            (LINA_BADGE, BadgeTone::Info),
+            "Lina não-selecionada veste 'feita pela casa'"
+        );
+        assert_eq!(
+            direction_badge(curada, false),
+            (curada.climate, BadgeTone::Neutral),
+            "curada não-selecionada mostra o clima neutro"
+        );
+
+        // Selecionado: "Sua direção atual" (Success) + "✓ Em uso" — PARA AMBAS as origens.
+        assert_eq!(direction_button_label(true), IN_USE_LABEL);
+        for d in [lina, curada] {
+            assert_eq!(
+                direction_badge(d, true),
+                (CURRENT_BADGE, BadgeTone::Success),
+                "{}: selecionada veste 'Sua direção atual' (Success)",
+                d.id
+            );
+        }
+
+        // Sanidade da copy do estado de uso: rotula a escolha + carrega o ✓ que afirma feedback.
+        assert!(IN_USE_LABEL.starts_with('✓'), "feedback visual com glifo");
+        assert!(!CURRENT_BADGE.is_empty() && CURRENT_BADGE.contains("atual"));
+    }
+
+    /// r3 — o builder da galeria aceita `on_close` opcional; sem handler sobe SEM ✕ (preview/teste),
+    /// com handler entra no header. gpui não roda headless, então provo o contrato do builder.
+    #[test]
+    fn gallery_builds_with_and_without_on_close() {
+        let _without = DirectionsGallery::new();
+        let _with = DirectionsGallery::new().on_close(|_ev, _w, _cx| {});
     }
 }
