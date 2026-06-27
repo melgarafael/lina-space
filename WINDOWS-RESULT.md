@@ -1,62 +1,73 @@
-# WINDOWS-RESULT - relatorio do bring-up Windows
+# WINDOWS-RESULT — relatório do bring-up Windows
 
-Relatorio preenchido com evidencia. Confirmacoes visuais do gpui devem vir do Gabriel olhando a tela, porque o app nao roda headless.
+> Confirmações visuais do gpui **devem** vir do Eduardo olhando a tela (o app não roda headless).
+> Tudo mais é evidência por exit code + log.
 
-**Maquina:** Windows (versao/CPU/GPU nao consultados: CIM bloqueado por permissao) - arquitetura AMD64
-**Data:** 2026-06-04 - **Branch:** windows-bringup - **Commit base:** e203c9476726a80eafbc99184df040b16b9ee5f8
+## Sessão 2 — 2026-06-27 (Eduardo)
 
-## Fase 0 - Ambiente
+**Máquina:** Windows (`C:\Users\lucas\`) — `PROCESSOR_ARCHITECTURE=AMD64` (x86_64) ✅
+**Branch:** `windows-bringup` (criada limpa de `origin/main`)
+**Commit base:** `9787765 perf(a2a): entrega viva não congela mais a UI (freeze do lina ask)`
+**Por que recomeçar:** a tentativa anterior (2026-06-04, abaixo) recomendava pivot pra Slint, mas
+desde então o Rafael mergeou fixes mainstream que podem ter atacado o sintoma "terminal sem prompt"
+da Fase 2 antiga (notadamente `9787765 perf(a2a)` e `24ad732 fix(render)`). Refazer a Fase 2 do zero
+no main atual decide se ainda vale o pivot — se passar, segue até o `.exe`.
 
-- Rust/cargo: OK (`rustc 1.96.0`, host `x86_64-pc-windows-msvc`; `cargo 1.96.0`)
-- MSVC: OK (`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`)
-- Windows SDK: OK (`10.0.26100.0`)
-- target x86_64-pc-windows-msvc: sim
-- `check-env.ps1` sem FALTA pendente? sim
-- Instalado nesta sessao: Rustup via `winget`; Visual Studio Build Tools 2022 via `winget` com workload `Microsoft.VisualStudio.Workload.VCTools`, `--includeRecommended` e SDK `Microsoft.VisualStudio.Component.Windows11SDK.26100`.
-- Outros achados: `PROCESSOR_ARCHITECTURE=AMD64`; `git` OK; `gh` ausente/opcional.
-- Evidencia inicial: `packaging/windows/check-env.log`; `LASTEXITCODE=0` em `packaging/windows/check-env.exit`.
-- Evidencia apos instalacao: `packaging/windows/check-env.after-install.log`; `LASTEXITCODE=0` em `packaging/windows/check-env.after-install.exit`.
+### Fase 0 — Ambiente ✅
 
-## Fase 1 - Build
+- Rust: `rustc 1.95.0` (host `x86_64-pc-windows-msvc`, target instalado idem)
+- MSVC: `Visual Studio 2022 BuildTools` em `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
+- Windows SDK: `10.0.26100.0`
+- git OK, gh OK (`v2.92.0`, logado em `EduargoGrigolo`)
+- **Sem FALTA pendente.** `check-env.ps1` retornou `EXIT=0`.
+- Evidência: `packaging/windows/check-env.log`
 
-- `cargo build` do app gpui: BUILD_EXIT = 0
-- Feature set do `gpui_platform` que funcionou no Windows: bloco `cfg(not(target_os = "macos"))` atual, com `features = ["font-kit"]` e default-features implicitas.
-- Erros/ajustes que precisei fazer: antes do build passar, o Cargo baixou dependencias e iniciou a compilacao, mas o Windows bloqueou a execucao dos build scripts Rust gerados localmente. Erro: `Uma politica de Controle de Aplicativo bloqueou este arquivo. (os error 4551)`. Ocorreu tanto no target padrao dentro do repo/OneDrive quanto com `CARGO_TARGET_DIR=C:\Temp\lina-target`.
-- Diagnostico do bloqueio inicial: Smart App Control / Code Integrity em enforcement. `reg query HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy` retornou `VerifiedAndReputablePolicyState=0x1` e `SAC_EnforcementReason=0x1`. Tentativa de mudar para Evaluation via `reg add` falhou com `Acesso negado`; `citool.exe -lp` falhou com `0x80070005`.
-- Gabriel desativou o Smart App Control visualmente. Nova evidencia: `VerifiedAndReputablePolicyState=0x0`, `SAC_PreviousState=0x1`.
-- Build bem-sucedido apos isso com `CARGO_TARGET_DIR=C:\Temp\lina-target`. Evidencia: `build-cargo-after-sac.log`; `LASTEXITCODE=0` em `packaging/windows/build-cargo-after-sac.exit`; binario `C:\Temp\lina-target\debug\lina-gpui.exe` gerado com 35.590.144 bytes.
+### Fase 1 — Build do app gpui ✅
 
-## Fase 2 - DE-RISK
+- `cargo build` → **BUILD_EXIT=0**
+- `Finished dev profile [unoptimized] target(s) in 54.57s` (cache quente desde a tentativa de junho)
+- Binário: `app/lina-gpui/target/debug/lina-gpui.exe` (48 195 584 bytes ≈ 48 MB)
+- Crate `gpui_windows v0.1.0` (zed rev `09165c15`) compilou — sinal de que o backend Windows do gpui foi puxado
+- Feature set: `target.'cfg(not(target_os = "macos"))'` herdado do `main` — sem ajuste necessário
+- 4 warnings de `dead_code` em `app/lina-gpui/src/main.rs` (funções `path_looks_hydrated`, `known_cli_dir_candidates`, `existing_dirs`, `parse_marked_path`) — não bloqueiam; vivem fora do caminho de produção
+- **Ajuste necessário pra rodar:** 1 linha em `packaging/windows/build.ps1` — `$ErrorActionPreference = "Stop"` → `"Continue"`. Sem isso, o PS 5.1 trata stderr do cargo como `NativeCommandError` fatal sob `Tee-Object` e mata o pipeline; o script reporta `BUILD_EXIT=0` mentiroso. Fix vai pro PR como parte do bring-up.
+- Evidência: `packaging/windows/build-win-host.log` (host), `build-win.log` (tee do script)
 
-- (Gabriel na tela) Renderiza terminais com texto/cores/cursor? FALHA. A janela renderiza os cards "Terminal A" e "Terminal B" com bordas/topbar, mas a area do terminal fica vazia: sem prompt, sem texto e sem cursor visivel.
-- (Gabriel na tela) Acentos: `'` + `a` = `a` acentuado? Teste `a c e o` com acentos: FALHA. Gabriel nao conseguiu digitar no terminal; nada aparece ao teclar.
-- (Gabriel na tela) Ctrl+T cria um novo agente? PASSA apos ajuste Windows: `Ctrl+T` criou novo terminal/agente.
-- (Gabriel na tela, opcional) Narrator le algo da janela? pendente
-- VEREDITO: FALHA
-- O que exatamente quebrou: gpui Windows abriu a janela e desenhou os cards, mas o conteudo do terminal nao apareceu e input humano nao chegou de forma observavel ao terminal. Logs confirmam PTYs vivos/desenhados (`panels_live=2`, `panels_drawn=2`) e processos `cmd.exe` filhos rodando, mas a tela validada por Gabriel mostrou terminal vazio e sem digitação. Evidencia visual: screenshot enviada pelo Gabriel em 2026-06-04.
-- Ajustes triviais tentados antes do veredito: (1) `shell_cmd` no Windows deixou de usar `sh` inexistente e passou por `powershell.exe`; depois foi simplificado para `cmd.exe /K`; (2) `Ctrl+T` passou a aceitar `control` no Windows; (3) fallback Windows para `key_char` imprimivel foi adicionado caso o IME nao chame `replace_text_in_range`. Mesmo assim, texto/prompt/input nao apareceram.
-- Recomendacao: pivotar para Slint, preservando o core e a trait `UiHost`. Nao tentei Slint nem WSL.
+### Fase 2 — DE-RISK (Eduardo olha a tela) 🔑
 
-## Fase 3 - ConPTY
+- (a iniciar; será o checkpoint que decide se segue ou para)
 
-- A2A A->B no Windows funciona sem vendoring? nao executado, porque a Fase 2 falhou.
-- Precisei vendorizar + patch 3 flags? nao executado.
-- (Gabriel na tela) B reage ao A2A disparado? nao executado.
-- `cargo test -p lina-pty`: EXIT nao executado.
+### Fase 3 — ConPTY
 
-## Fase 4 - Empacotamento
+- (depende da Fase 2 PASSAR)
 
-- `make-win.ps1`: gerou `dist\Lina-win\` + `.zip`? nao executado, porque a Fase 2 falhou.
-- DLLs ConPTY bundladas? nao executado.
-- (Gabriel na tela) Smoke fora do repo abre e renderiza? nao executado.
-- FPS real medido: durante Fase 2, logs variaram em torno de 100-120 FPS com 2 paineis quando ativo; houve janelas de 26-27 FPS em alguns periodos. Como o de-risk visual falhou, estes numeros nao aprovam o bring-up.
+### Fase 4 — Empacotamento
 
-## Pendencias / decisoes para o dono
+- (depende da Fase 2 PASSAR)
 
-- Decisao recomendada: pivotar a UI Windows para Slint usando a fronteira `UiHost`, mantendo core/PTY/event log. O gpui Windows nao passou no checkpoint minimo: terminal sem conteudo e sem input observavel.
-- Smart App Control foi desativado por Gabriel para permitir build Rust local. Antes disso, bloqueava build scripts do Cargo com `os error 4551`.
-- O instalador do Build Tools informou "Reiniciar seu PC para terminar a instalacao", mas o `check-env.ps1` detectou MSVC e Windows SDK com sucesso nesta sessao.
+### Fase 5 — PR
 
-## Resumo em 1 linha
+- (no fim)
 
-- Windows build compila, gpui abre a janela e desenha cards, mas o de-risk falhou: terminal sem prompt/texto/cursor e sem input; recomendacao e pivotar para Slint.
+---
+
+## Histórico — Sessão 1 (2026-06-04, Gabriel olhando a tela)
+
+> Tentativa anterior, em outra branch (`windows-bringup` original — descartada quando o merge
+> ficou ruim e essa nova branch nasceu limpa de `origin/main`). Preservado aqui pra contexto.
+
+**Resumo:** Fase 0 OK (instalou Rust + Build Tools 2022 + SDK 26100; Smart App Control teve que ser
+desativado pra build scripts do Cargo passarem — antes disso bloqueava com `os error 4551`).
+Fase 1 OK (`lina-gpui.exe` 35.6 MB gerado em `C:\Temp\lina-target\debug\`).
+**Fase 2 FALHOU**: janela abriu e desenhou cards "Terminal A" / "Terminal B", mas a área do terminal
+ficou vazia (sem prompt, texto ou cursor); input do Gabriel não chegava ao terminal visivelmente.
+`Ctrl+T` criou novo agente (passa); acentos não testáveis sem input. FPS variou 26–120.
+**Veredito daquela sessão:** pivotar pra Slint preservando `UiHost`.
+
+Ajustes Windows tentados naquela sessão (não estão nesta branch, foram descartados com a branch ruim):
+1. `shell_cmd` no Windows passou de `sh` (inexistente) → `powershell.exe` → `cmd.exe /K`
+2. `Ctrl+T` passou a aceitar `control` no Windows
+3. Fallback Windows pra `key_char` imprimível caso IME não chame `replace_text_in_range`
+
+Se a Fase 2 desta sessão falhar com os MESMOS sintomas, esses ajustes valem ser reaplicados antes do
+pivot — mas a ideia é primeiro rodar o main puro pra ter linha de base.
