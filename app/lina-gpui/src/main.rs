@@ -4222,12 +4222,16 @@ impl WorkspaceView {
             }
             return;
         }
-        // ⌘C copia a seleção; ⌘V cola no PTY focado (bracketed-paste). Ctrl+C/V seguem p/ o PTY.
-        if ks.modifiers.platform && ks.key == "c" {
+        // Mac: ⌘C copia / ⌘V cola; Windows: Ctrl+Shift+C copia / Ctrl+Shift+V cola (convenção dos
+        // terminais Windows Terminal/GNOME Terminal/Konsole — `Ctrl+C`/`Ctrl+V` seguem cru pro PTY
+        // pra serem signal de interrupção e literal). `platform` mapeia pra Win key no Windows, que
+        // tem semântica do SO (Win+V abre histórico de clipboard), por isso ele nunca foi a escolha
+        // certa lá — usar `control + shift` evita conflito com o PTY e com atalhos do Windows.
+        if is_terminal_copy_shortcut(ks) {
             self.copy_selection(cx);
             return;
         }
-        if ks.modifiers.platform && ks.key == "v" {
+        if is_terminal_paste_shortcut(ks) {
             self.paste_clipboard(cx);
             return;
         }
@@ -4370,6 +4374,33 @@ fn shortcut_modifier(ks: &Keystroke) -> bool {
 #[cfg(not(windows))]
 fn shortcut_modifier(ks: &Keystroke) -> bool {
     ks.modifiers.platform
+}
+
+/// Atalho de COPY do canvas/seleção (não vai pro PTY).
+/// - Mac: ⌘C (sem shift) — convenção do SO
+/// - Windows: Ctrl+Shift+C — convenção dos emuladores de terminal (Windows Terminal, GNOME Terminal,
+///   Konsole), porque `Ctrl+C` puro vai cru pro PTY (signal de interrupção do shell).
+#[cfg(windows)]
+fn is_terminal_copy_shortcut(ks: &Keystroke) -> bool {
+    ks.modifiers.control && ks.modifiers.shift && ks.key == "c"
+}
+#[cfg(not(windows))]
+fn is_terminal_copy_shortcut(ks: &Keystroke) -> bool {
+    ks.modifiers.platform && !ks.modifiers.shift && ks.key == "c"
+}
+
+/// Atalho de PASTE do clipboard no PTY focado.
+/// - Mac: ⌘V (sem shift) — convenção do SO
+/// - Windows: Ctrl+Shift+V — convenção dos emuladores de terminal. `Ctrl+V` puro segue pro PTY
+///   (literal) e `Win+V` é o histórico de clipboard do Windows, então `Ctrl+Shift+V` é a única
+///   opção sem conflito.
+#[cfg(windows)]
+fn is_terminal_paste_shortcut(ks: &Keystroke) -> bool {
+    ks.modifiers.control && ks.modifiers.shift && ks.key == "v"
+}
+#[cfg(not(windows))]
+fn is_terminal_paste_shortcut(ks: &Keystroke) -> bool {
+    ks.modifiers.platform && !ks.modifiers.shift && ks.key == "v"
 }
 
 impl Render for WorkspaceView {
