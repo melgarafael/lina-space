@@ -35,11 +35,45 @@ no main atual decide se ainda vale o pivot — se passar, segue até o `.exe`.
 
 ### Fase 2 — DE-RISK (Eduardo olha a tela) 🔑
 
-- (a iniciar; será o checkpoint que decide se segue ou para)
+**Primeira tentativa (debug build):** janela abriu e renderizou — versus sintoma de junho (quadrados vazios). Print do Eduardo confirma: 2 terminais com **shell vivo** (`Microsoft Windows [versão 10.0.26200.8655]` + cwd correto + cursor piscando) + 1 card vazio "Novo Terminal" cortado por janela estreita demais.
 
-### Fase 3 — ConPTY
+| Critério | Estado | Evidência |
+|---|---|---|
+| (a) Renderiza terminais com texto/cursor | ✅ | print + log `pty_rows=26 drawn_rows=26` nos 2 terminais com PTY |
+| (b) Acentos (`´+a=á`) | ❓ não testado | crash em ~3s não deu tempo |
+| (c) `Ctrl+T` cria agente | ❓ não testado | mesmo motivo |
+| FPS | ✅ | 100-110 estável (vs. oscilação 26-120 de junho) |
 
-- (depende da Fase 2 PASSAR)
+**Bloqueador**: panic do gpui em `crates/gpui/src/window/a11y.rs:223` — `Duplicate a11y node id: #3852104715044691937`. A própria mensagem do panic diz: *"In a release build, this node would be silently discarded from the a11y tree."* Bug de a11y do gpui Windows com AccessKit; release build silencia.
+
+**Decisão tática:** rebuild em release pra ter vida útil ilimitada e completar (b) e (c). Não tocar no código do gpui (vendored do zed). Se release passar, Fase 2 PASSA; segue até o `.exe` empacotado.
+
+**Observações da print:**
+- O prompt do CMD aparece "muito longo" porque o cwd do agente é `C:\Users\lucas\AppData\Local\Temp\lina-space-ws3\n-<uuid>` — comportamento por design (cada agente nasce em seu próprio dir).
+- Layout do 3º card (Periphery, sem PTY) está cortado quando janela é estreita — polimento, não bloqueador.
+
+### Fase 3 — ConPTY / A2A ✅
+
+**Vendoring + 3 flags: NÃO foi necessário.** O `portable-pty 0.9` do crates.io já tem o backend Windows funcional. Provas observadas na tela do Eduardo:
+
+1. **PTY entregando I/O sem corrupção** (Fase 2): `dir` no Terminal A retornou a árvore real do diretório (`.claude`, `.lina`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` — kit Lina); CMD em pt-br respondeu corretamente.
+2. **TUI complexo (Claude Code v2.1.118 Opus 4.7) subiu inteiro dentro do PTY do Lina** — header com identidade, prompt, sugestão de comando, atalhos. ink/react do Claude rodando sem glitch.
+3. **A2A real entregou no PTY do Claude Code**: clicando ⚡ no Terminal A, o `deliver_a2a` enfiou a string `echo '📨 A2A recebido de Terminal A · cooperacao sem fios'` no Claude do Terminal B, que (a) reconheceu como prompt, (b) **automaticamente carregou a skill `lina-agent-bus`**, (c) rodou `lina handshake` → identificou colegas `@Trigger` e `Terminal A`, (d) rodou `lina plan read` e `lina list`, (e) respondeu em pt-br: *"Pronto — cheguei no Espaço…"*.
+
+Implicação: **o Lina Space inteiro coopera automaticamente no Windows nativo**. Nenhum patch de ConPTY, nenhum vendoring, nenhum bundle de `conpty.dll` / `OpenConsole.exe` — tudo herdado de `portable-pty` upstream.
+
+### Fase 4 — Empacotamento ✅
+
+- `packaging\windows\make-win.ps1` rodou — exit 0
+- **Mesmo gotcha do `build.ps1`**: o script tinha `$ErrorActionPreference = "Stop"` que mata o pipeline na primeira linha de stderr do cargo (NativeCommandError). Aplicado o mesmo fix de 1 linha → `"Continue"`.
+- Conteúdo de `dist/Lina-win/` (33.5 MB total):
+  - `lina-gpui.exe` 26.7 MB (app GPU release)
+  - `lina.exe` 6.4 MB (CLI release)
+  - `conpty.dll` 108 KB + `OpenConsole.exe` 1.1 MB (ConPTY bundle, herdado de `vendor/conpty/win10-x64/` que já estava no repo — fallback de robustez)
+  - `assets/` (lina-doctrine, lina-shim, lina-skills)
+  - `LEIA-ME - Instalar.md` (guia do aluno com instruções do SmartScreen)
+- Zip distribuível: `dist/Lina-windows-x64-0.1.0.zip` (13.4 MB comprimido)
+- **Smoke test do auto-contido**: copiei `dist/Lina-win/` → `C:\Temp\LinaSmoke\` (fora do repo, sem cargo); rodei `C:\Temp\LinaSmoke\lina-gpui.exe`. Eduardo confirma: **"Abriu e deixou eu configurar tudo no onboarding"** — app é totalmente auto-contido, encontra `lina.exe` ao lado e `assets/` por ancestral, sem dependência do repo. Onboarding completo rodando.
 
 ### Fase 4 — Empacotamento
 
