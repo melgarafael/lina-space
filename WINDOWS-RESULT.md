@@ -113,6 +113,50 @@ panels_live=2  fps=138
 
 **Implicação:** o `dist/Lina-win/` que o aluno baixa agora cobre o caso REAL de uso (criar agente Claude via modal). Antes do achado, mesmo com Fase 4 PASS por critério da skill, o app teria falhado no primeiro clique do aluno em `✦ Novo Agente`.
 
+## Segundo achado pós-Fase 4 — atalhos copy/paste no Windows
+
+Eduardo reportou: `Ctrl+V` e `Ctrl+Shift+V` não funcionam pra colar no terminal.
+
+**Causa raiz:** `app/lina-gpui/src/main.rs:4226,4230` usava `ks.modifiers.platform` direto. No gpui, `platform` mapeia pra ⌘ no Mac (intenção do código) mas pra **tecla Windows (Win key)** no PC — `Win+V` é o histórico de clipboard do sistema, então o atalho do Lina ficava engolido pelo SO e nunca chegava ao handler.
+
+**Fix:** introduz dois helpers condicionados por `cfg(windows)`:
+
+```rust
+#[cfg(windows)]
+fn is_terminal_paste_shortcut(ks: &Keystroke) -> bool {
+    ks.modifiers.control && ks.modifiers.shift && ks.key == "v"
+}
+#[cfg(not(windows))]
+fn is_terminal_paste_shortcut(ks: &Keystroke) -> bool {
+    ks.modifiers.platform && !ks.modifiers.shift && ks.key == "v"
+}
+```
+
+(O mesmo pra copy.)
+
+| | Mac | Windows |
+|---|---|---|
+| Copia seleção | `⌘C` | `Ctrl+Shift+C` |
+| Cola no PTY | `⌘V` | `Ctrl+Shift+V` |
+| `Ctrl+C` / `Ctrl+V` | (vai cru pro PTY) | (vai cru pro PTY — signal, literal) |
+
+`Ctrl+Shift+C/V` é a convenção de Windows Terminal, GNOME Terminal, Konsole — reserva `Ctrl+C/V` puros pro PTY (interrupção do shell, literal). O comentário da linha 4225 já declarava essa intenção; faltava o gate condicional ao SO.
+
+**Validação na tela:** Eduardo confirmou *"Deu tudo certo. Works like a charm!"* após rebuild release + re-empacotar.
+
+## Resumo final dos commits do bring-up
+
+| Commit | Natureza |
+|---|---|
+| `5d0d68f` | fix: `build.ps1` não trata stderr do cargo como fatal (PowerShell 5.1 + ErrorActionPreference) |
+| `c5e5ead` | fix: `make-win.ps1` mesmo fix de PowerShell |
+| `8af13bb` | docs: `WINDOWS-RESULT.md` Fases 0–4 verdes com evidência |
+| `66a2ce2` | fix: resolve npm-shim do claude no spawn do PTY (cli_discovery + lina-pty) |
+| `a685566` | fix: atalhos copy/paste do canvas usam Ctrl+Shift+C/V no Windows |
+| (este) | docs: registra dois achados pós-Fase 4 |
+
+Total de mudança em código de produção: **3 arquivos** (`cli_discovery.rs`, `lina-pty/lib.rs`, `main.rs` da app gpui). Nenhuma feature nova; só portabilidade para Windows.
+
 ---
 
 ## Histórico — Sessão 1 (2026-06-04, Gabriel olhando a tela)
