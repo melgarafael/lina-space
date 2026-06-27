@@ -5,7 +5,7 @@
 
 ## Sessão 2 — 2026-06-27 (Eduardo)
 
-**Máquina:** Windows (`C:\Users\lucas\`) — `PROCESSOR_ARCHITECTURE=AMD64` (x86_64) ✅
+**Máquina:** Windows (`C:\Users\<USER>\`) — `PROCESSOR_ARCHITECTURE=AMD64` (x86_64) ✅
 **Branch:** `windows-bringup` (criada limpa de `origin/main`)
 **Commit base:** `9787765 perf(a2a): entrega viva não congela mais a UI (freeze do lina ask)`
 **Por que recomeçar:** a tentativa anterior (2026-06-04, abaixo) recomendava pivot pra Slint, mas
@@ -49,7 +49,7 @@ no main atual decide se ainda vale o pivot — se passar, segue até o `.exe`.
 **Decisão tática:** rebuild em release pra ter vida útil ilimitada e completar (b) e (c). Não tocar no código do gpui (vendored do zed). Se release passar, Fase 2 PASSA; segue até o `.exe` empacotado.
 
 **Observações da print:**
-- O prompt do CMD aparece "muito longo" porque o cwd do agente é `C:\Users\lucas\AppData\Local\Temp\lina-space-ws3\n-<uuid>` — comportamento por design (cada agente nasce em seu próprio dir).
+- O prompt do CMD aparece "muito longo" porque o cwd do agente é `C:\Users\<USER>\AppData\Local\Temp\lina-space-ws3\n-<uuid>` — comportamento por design (cada agente nasce em seu próprio dir).
 - Layout do 3º card (Periphery, sem PTY) está cortado quando janela é estreita — polimento, não bloqueador.
 
 ### Fase 3 — ConPTY / A2A ✅
@@ -91,7 +91,7 @@ Depois de declarar Fase 4 PASS e empacotar, no uso real (Eduardo tentando criar 
 
 ```
 M6 — commit falhou: falha ao spawnar comando no PTY ...
-CreateProcessW "C:\Users\lucas\AppData\Roaming\npm\claude --output-format stream-json --verbose"
+CreateProcessW "C:\Users\<USER>\AppData\Roaming\npm\claude --output-format stream-json --verbose"
 failed: %1 não é um aplicativo Win32 válido. (os error 193)
 ```
 
