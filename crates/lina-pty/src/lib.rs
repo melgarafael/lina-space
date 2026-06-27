@@ -158,7 +158,8 @@ impl PtyCommand {
     }
 
     fn to_builder(&self) -> CommandBuilder {
-        let mut builder = CommandBuilder::new(self.program.as_str());
+        let resolved = resolve_program(self.program.as_str());
+        let mut builder = CommandBuilder::new(resolved);
         for arg in &self.args {
             builder.arg(arg.as_str());
         }
@@ -170,6 +171,46 @@ impl PtyCommand {
         }
         builder
     }
+}
+
+/// No Windows, um `program` nu como `"claude"` é passado direto pro `CreateProcessW` pelo
+/// `portable-pty` — e o npm-shim do Claude Code instala TRÊS arquivos em `%AppData%\npm\`:
+/// `claude` (shell script Unix, sem extensão), `claude.cmd` (shim Windows que o kernel
+/// executa) e `claude.ps1`. A stdlib do Rust no Windows não tenta `.cmd`/`.bat` ao resolver
+/// pelo PATH — só `.exe`. Resultado: o kernel recebe o shell script Unix e devolve
+/// `os error 193` ("não é um aplicativo Win32 válido"), quebrando a criação de qualquer
+/// agente Claude no Lina Windows. Resolvemos AQUI, no momento do `to_builder`, varrendo
+/// o PATH na ordem `.cmd → .exe → .bat` e devolvendo o path absoluto resolvido. Se o
+/// nome já vem com separador (caller resolveu) ou com extensão executável, passa direto.
+#[cfg(windows)]
+fn resolve_program(name: &str) -> String {
+    if name.contains('\\') || name.contains('/') {
+        return name.to_string();
+    }
+    let lower = name.to_lowercase();
+    for ext in &[".exe", ".cmd", ".bat", ".com"] {
+        if lower.ends_with(ext) {
+            return name.to_string();
+        }
+    }
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    for dir in path_env.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in &[".cmd", ".exe", ".bat"] {
+            let cand = std::path::Path::new(dir).join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
+}
+
+#[cfg(not(windows))]
+fn resolve_program(name: &str) -> String {
+    name.to_string()
 }
 
 /// Um PTY vivo: o master (de posse do core), o processo filho e o PID.

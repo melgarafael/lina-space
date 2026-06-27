@@ -38,8 +38,16 @@ const PATH_SEP: char = ':';
 
 /// Sufixos de executável a testar por id. No Windows um CLI pode ser `.exe`/`.cmd`/`.bat`
 /// (CLIs Node viram `.cmd`); no unix, só o nome cru.
+///
+/// **Ordem no Windows importa:** o npm-shim do `claude` instala TRÊS arquivos em
+/// `%AppData%\npm\` — `claude` (shell script Unix, SEM extensão), `claude.cmd` (shim Windows
+/// que o `CreateProcessW` entende) e `claude.ps1`. Se a varredura aceita `claude` cru
+/// primeiro, o `CreateProcessW` recebe um shell script Unix e devolve `os error 193`
+/// ("não é um aplicativo Win32 válido") quando o app tenta spawnar o agente. Por isso
+/// tentamos `.cmd`/`.exe`/`.bat` ANTES — `""` fica como fallback para o caso raro de um
+/// binário Win32 instalado sem extensão.
 #[cfg(windows)]
-const EXE_EXTS: &[&str] = &["", ".exe", ".cmd", ".bat"];
+const EXE_EXTS: &[&str] = &[".cmd", ".exe", ".bat", ""];
 #[cfg(not(windows))]
 const EXE_EXTS: &[&str] = &[""];
 

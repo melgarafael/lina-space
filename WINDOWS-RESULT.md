@@ -81,7 +81,37 @@ Implicação: **o Lina Space inteiro coopera automaticamente no Windows nativo**
 
 ### Fase 5 — PR
 
-- (no fim)
+- (Eduardo abre quando quiser; comando pronto em `gh pr create --repo melgarafael/lina-space --base main --head EduargoGrigolo:windows-bringup`)
+
+---
+
+## Achado pós-Fase 4 (mesma sessão) — npm-shim do Claude no Windows
+
+Depois de declarar Fase 4 PASS e empacotar, no uso real (Eduardo tentando criar agente Claude pelo modal "Novo Agente"), o app explodiu com:
+
+```
+M6 — commit falhou: falha ao spawnar comando no PTY ...
+CreateProcessW "C:\Users\lucas\AppData\Roaming\npm\claude --output-format stream-json --verbose"
+failed: %1 não é um aplicativo Win32 válido. (os error 193)
+```
+
+**Causa raiz (dois fixes complementares):**
+
+1. **`crates/lina-core/src/cli_discovery.rs`** — a constante `EXE_EXTS` no Windows era `["", ".exe", ".cmd", ".bat"]`. O `find_in_path` aceitava o primeiro hit; o npm-shim do Claude Code instala `claude` (shell script Unix, sem extensão) NO MESMO DIRETÓRIO que `claude.cmd` e `claude.ps1`, então o discovery gravava o caminho do script Unix no event log. **Fix:** reordenar para `[".cmd", ".exe", ".bat", ""]` — `""` vira último fallback (caso raro de binário Win32 sem extensão).
+
+2. **`crates/lina-pty/src/lib.rs`** — o `to_builder()` da `CommandSpec` chamava `CommandBuilder::new(self.program.as_str())` direto com o `program` cru do TOML (`"claude"`). O `portable-pty` no Windows passa cru pro `CreateProcessW`, que **não tenta extensões** (a stdlib do Rust só tenta `.exe`). **Fix:** introduzir `resolve_program()` no `lina-pty` que, no Windows, varre o PATH na ordem `.cmd → .exe → .bat` e devolve o caminho absoluto resolvido (nome com separador ou com extensão executável passa direto). Não importa de `lina-core` (criaria dependência circular — `lina-core` já depende de `lina-pty`).
+
+**Validação na tela:** com os dois fixes + rebuild release + re-empacotamento, Eduardo refez "Novo Agente → Maestro → cwd `C:\Projetos\Testes Lina`". Log:
+
+```
+admissão — agente 'Maestro' criado (papel MAESTRO, cwd C:\Projetos\Testes Lina)
+[Maestro pty_rows=26 drawn_rows=26 zone=Focus dim=false]
+panels_live=2  fps=138
+```
+
+**Sem erro 193.** Agente nasceu com PTY vivo, Claude Code spawnado, pronto pra receber input do humano.
+
+**Implicação:** o `dist/Lina-win/` que o aluno baixa agora cobre o caso REAL de uso (criar agente Claude via modal). Antes do achado, mesmo com Fase 4 PASS por critério da skill, o app teria falhado no primeiro clique do aluno em `✦ Novo Agente`.
 
 ---
 
