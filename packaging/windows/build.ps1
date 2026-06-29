@@ -3,7 +3,7 @@
 # O Cargo.toml ja gateia `runtime_shaders` p/ macOS-only (bloco por-SO). Se o build reclamar de
 # feature/backend do gpui-Windows, ajuste o bloco [target.'cfg(not(target_os = "macos"))'.dependencies]
 # do app/lina-gpui/Cargo.toml (tente default-features=true, ou a feature que o erro indicar) e re-rode.
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"   # cargo escreve em stderr; "Stop" + Tee-Object dispara NativeCommandError e mata o pipeline antes do build terminar
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # packaging\windows -> repo
 $log  = Join-Path $repo "build-win.log"
 Set-Location (Join-Path $repo "app\lina-gpui")

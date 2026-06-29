@@ -3,7 +3,7 @@
 # Monta dist\Lina-win\ (lina-gpui.exe + lina.exe + assets\ [+ DLLs ConPTY se vendorizadas]) + .zip.
 # O resolver do app acha 'lina.exe' ao lado do exe e 'assets\' por ancestral - ZERO mudanca de codigo
 # (mesmo modelo do Mac). Executavel = 'lina-gpui.exe' (NAO 'Lina.exe' - evita confusao com o CLI).
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"   # mesmo gotcha do build.ps1: "Stop" dispara NativeCommandError em cada linha de stderr do cargo e mata o pipeline
 $repo   = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $ver    = "0.1.0"
 $dist   = Join-Path $repo "dist\Lina-win"
