@@ -1,0 +1,263 @@
+diff --git a/crates/lina-core/src/attention.rs b/crates/lina-core/src/attention.rs
+index 31ba16b..6eea7ac 100644
+--- a/crates/lina-core/src/attention.rs
++++ b/crates/lina-core/src/attention.rs
+@@ -98,6 +98,19 @@ pub const GUARD_ASK_TTL_MS: u64 = 180_000;
+ /// tokens → desarma, então o engolido (zero turno, zero token) é o que sobra.
+ pub const DELIVERED_NO_PROGRESS_WINDOW_MS: u64 = 90_000;
+ 
++/// "Alvo vivo mas surdo" — quanto tempo uma mensagem pode ficar RETIDA por `prompt_not_ready`
++/// (`MessageRetained{reason}`) sem nunca ser entregue antes de virar alarme. É o ponto-cego IRMÃO
++/// do engolido (W3): lá o handoff CHEGOU e o nó ignorou; aqui o handoff NUNCA chegou — o lifecycle
++/// julga o nó `Idle`/vivo (sem EOF do PTY → nunca `Dead`; stall-heartbeat só vigia `Busy`), mas o
++/// grid nunca volta a ficar pronto (CLI travado num menu/diálogo, ex.: seletor de `--resume`). A
++/// entrega faseada faz a coisa certa (retém + re-tenta + DLQ no teto de 600 s), mas até o DLQ
++/// NENHUM item de atenção sobe — a obra fica surda em silêncio. 60 s: bem acima do flicker
++/// fim-de-turno (um turno real ou ENTREGA ou vira `Busy` em segundos → desarma) e ~10× mais cedo
++/// que o `retention_timeout_ms` (600 s) do router, que segue sendo o backstop terminal (→ DLQ).
++/// **Conservador e tunável** (futuro `RouterConfig`).
++// ponytail: limiar fixo; vira knob de RouterConfig se algum CLI legítimo retiver >60s sem flicker.
++pub const RETAINED_DEAF_WINDOW_MS: u64 = 60_000;
++
+ /// Classe do item na fila — define a precedência (custódia > permissão > spawn > guard-ask).
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum AttentionKind {
+@@ -134,6 +147,17 @@ pub enum AttentionKind {
+     /// ao humano "o terminal recebeu?" (#15). Precedência MAIS BAIXA (alerta de monitoramento, nunca
+     /// trava um turno); NUNCA aprovável (alerta + foco — o Maestro age re-despachando, não com y/n).
+     DeliveredNoProgress,
++    /// "Alvo vivo mas surdo" (irmão do engolido): uma mensagem ficou RETIDA por `prompt_not_ready`
++    /// (`MessageRetained{reason}`) ≥ [`RETAINED_DEAF_WINDOW_MS`] sem nunca ser entregue. O lifecycle
++    /// julga o nó `Idle`/vivo, mas o grid nunca volta a ficar pronto — nem `Dead` (sem EOF do PTY) nem
++    /// `NodeStalled` (o stall só vigia `Busy`) o pegam, e o alarme do engolido (`DeliveredNoProgress`)
++    /// arma só em `MessageDelivered` — então a obra fica surda em silêncio até o DLQ (600 s). Fecha
++    /// essa janela ALARMANDO cedo. OBSERVABILIDADE (o Maestro re-despacha ou o humano destrava o CLI),
++    /// NUNCA aprovável (`Choice`). Precedência ACIMA do engolido (não-receber é mais grave que
++    /// receber-e-não-começar) e ABAIXO do `DeadLetter` (a perda consumada vence o aviso). Some quando
++    /// a MESMA `id` for entregue (`MessageDelivered{id}`) ou cair no DLQ (`MessageDeadLettered{id}` —
++    /// aí o item `DeadLetter` assume). NUNCA por TTL.
++    RetainedDeaf,
+     /// F4-WA-5 (ADR 0035 §4 · ADR 0020): uma entrega A2A esgotou retry/retenção e foi para a
+     /// **dead-letter queue** durável (`MessageDeadLettered`) — caso típico: um webhook chegou e o
+     /// terminal-alvo está MORTO/fechado (nunca ficou pronto). É a materialização de "nada some em
+@@ -350,6 +374,21 @@ struct PendingDeadLetter {
+     created_ts: u64,
+ }
+ 
++/// "Alvo vivo mas surdo": uma mensagem RETIDA por `prompt_not_ready` (`MessageRetained{reason}`) que
++/// ainda não foi entregue nem caiu no DLQ. Indexada por `id` (msg): chave de dedup (replay) E de
++/// resolução — `MessageDelivered{id}` (o nó acordou) ou `MessageDeadLettered{id}` (escalou ao DLQ).
++/// `retained_ts` é o relógio do alarme (`now - retained_ts ≥ RETAINED_DEAF_WINDOW_MS`). Projeção PURA
++/// (sem evento novo: `MessageRetained` já existe). Vários `id` ao MESMO `to` colapsam em 1 item no
++/// emit (1 alarme por nó, padrão do engolido) — o nó está surdo, não cada mensagem.
++#[derive(Debug, Clone)]
++struct PendingRetainedDeaf {
++    id: String,
++    /// Alvo (`to` do evento, `NodeId` serializado) — a UI humaniza (UUID→@Nome).
++    to: String,
++    /// `ts` do `MessageRetained` (1º a reter esta `id`) — início da contagem do alarme.
++    retained_ts: u64,
++}
++
+ /// A fila de atenção unificada — uma por workspace. Ver doc do módulo.
+ #[derive(Debug, Default)]
+ pub struct AttentionQueue {
+@@ -389,6 +428,11 @@ pub struct AttentionQueue {
+     /// `MessageDeadLettered`, resolvidas por `MessageDelivered{id}` (re-enfileiramento). NUNCA somem
+     /// por TTL — perder um aviso de fora em silêncio violaria "nada some" (ADR 0020) / inv #6.
+     dead_letters: Vec<PendingDeadLetter>,
++    /// "Alvo vivo mas surdo": mensagens retidas por `prompt_not_ready` que nunca chegaram. Armadas por
++    /// `MessageRetained{reason:"prompt_not_ready"}`, resolvidas por `MessageDelivered{id}` (acordou) ou
++    /// `MessageDeadLettered{id}` (virou DLQ). Viram [`AttentionKind::RetainedDeaf`] no
++    /// [`AttentionQueue::items`] ao cruzar [`RETAINED_DEAF_WINDOW_MS`]. NUNCA somem por TTL.
++    retained_deaf: Vec<PendingRetainedDeaf>,
+ }
+ 
+ impl AttentionQueue {
+@@ -491,6 +535,8 @@ impl AttentionQueue {
+                 // F4-WA-5: a MESMA id voltou a ser entregue (re-enfileiramento manual da DLQ, ADR
+                 // 0020) → a notificação de dead-letter resolve (some). No-op se id não estava na DLQ.
+                 self.dead_letters.retain(|d| d.id != *id);
++                // "Alvo surdo": a mensagem RETIDA finalmente foi entregue (o CLI acordou) → desarma.
++                self.retained_deaf.retain(|d| d.id != *id);
+                 self.arm_dispatch(&to.to_string(), ts);
+             }
+             // ───────── F4-WA-5 (ADR 0035 §4 · ADR 0020): a DLQ NOTIFICA o usuário ─────────
+@@ -498,6 +544,9 @@ impl AttentionQueue {
+             // DLQ (arquivo + evento); a fila de atenção é onde "nada some em silêncio" aparece ao dono
+             // do Espaço. Dedup por `id` (replay defensivo: o mesmo evento reaplicado não duplica).
+             DomainEvent::MessageDeadLettered { id, to, .. } => {
++                // "Alvo surdo": a retenção escalou ao DLQ → o item `DeadLetter` (abaixo) assume; o
++                // aviso precoce some. ANTES do early-return (idempotente sob replay/re-apresentação).
++                self.retained_deaf.retain(|d| d.id != *id);
+                 if self.dead_letters.iter().any(|d| d.id == *id) {
+                     return; // já registrada (replay/re-apresentação) — idempotente
+                 }
+@@ -507,6 +556,22 @@ impl AttentionQueue {
+                     created_ts: ts,
+                 });
+             }
++            // "Alvo vivo mas surdo": a entrega faseada achou o grid NÃO-pronto (`MessageRetained`,
++            // reason `prompt_not_ready`) — o lifecycle julga o nó `Idle`/vivo, mas o CLI nunca volta ao
++            // prompt (travado num menu/diálogo). Arma o aviso precoce (vira item ao cruzar a janela);
++            // o `retained_ts` da 1ª retenção desta `id` é o relógio (dedup por `id`: re-tentativas
++            // re-logam? NÃO — `MessageRetained` sobe 1× por id via `retained_since` no router, mas o
++            // dedup-por-id na guarda blinda contra re-apresentação no replay). SÓ `prompt_not_ready`:
++            // outras retenções (target_busy) são colega TRABALHANDO, não surdez — fora do escopo.
++            DomainEvent::MessageRetained { id, to, reason }
++                if reason == "prompt_not_ready" && !self.retained_deaf.iter().any(|d| d.id == *id) =>
++            {
++                self.retained_deaf.push(PendingRetainedDeaf {
++                    id: id.clone(),
++                    to: to.to_string(),
++                    retained_ts: ts,
++                });
++            }
+             // `TokenUsageReported` é o sinal POR-TURNO (todo turno real consome tokens; o engolido
+             // não roda turno → zero tokens → nunca chega aqui). `node` já é o NodeId serializado.
+             DomainEvent::TokenUsageReported { node, .. } => self.remove_dispatch(node),
+@@ -1035,6 +1100,36 @@ impl AttentionQueue {
+             prompt_kind: PromptKind::Yn, // gate aprovável: liberar o disco? (gesto custodiado)
+             vt_snapshot_hash: None,
+         });
++        // "Alvo vivo mas surdo" (irmão do engolido): mensagens RETIDAS por prompt-não-pronto que
++        // cruzaram [`RETAINED_DEAF_WINDOW_MS`] sem nunca chegar. 1 item por NÓ (o nó está surdo, não
++        // cada msg): colapsa as N retenções ao mesmo `to` na MAIS ANTIGA — o log é ts-ascendente
++        // (append-only), então a 1ª ocorrência do nó JÁ é a mais antiga ⇒ ordem determinística
++        // (replay reconstrói a fila idêntica), sem HashMap. `created_ts = retained_ts` ⇒ idade = há
++        // quanto está surdo. NUNCA aprovável (`Choice` — destravar é gesto no terminal, não y/n).
++        // ponytail: dedup O(n²) por `contains`; n = nós surdos simultâneos (punhado). Vira HashSet se crescer.
++        let mut deaf_seen: Vec<&str> = Vec::new();
++        let mut deaf_items: Vec<AttentionItem> = Vec::new();
++        for d in &self.retained_deaf {
++            if deaf_seen.contains(&d.to.as_str()) {
++                continue; // já tem item para o nó (a 1ª/mais-antiga venceu)
++            }
++            deaf_seen.push(d.to.as_str());
++            if now_ms.saturating_sub(d.retained_ts) >= RETAINED_DEAF_WINDOW_MS {
++                deaf_items.push(AttentionItem {
++                    stable_id: format!("retained-deaf:{}", d.to),
++                    node_id: d.to.clone(),
++                    kind: AttentionKind::RetainedDeaf,
++                    detail: Some(
++                        "recebeu trabalho mas não respondeu — pode estar travado".to_string(),
++                    ),
++                    evidence: AttentionEvidence::Hook, // projeção estrutural do log (não-heurística)
++                    created_ts: d.retained_ts,
++                    state: state_of(d.retained_ts),
++                    prompt_kind: PromptKind::Choice,
++                    vt_snapshot_hash: None,
++                });
++            }
++        }
+         let mut custody_items: Vec<AttentionItem> = custody.collect();
+         custody_items.extend(disk);
+         let mut out = round_robin_by_node(custody_items);
+@@ -1043,6 +1138,7 @@ impl AttentionQueue {
+         out.extend(round_robin_by_node(guard.collect()));
+         out.extend(round_robin_by_node(conflicts.collect()));
+         out.extend(round_robin_by_node(dead.collect()));
++        out.extend(round_robin_by_node(deaf_items));
+         out.extend(round_robin_by_node(swallowed.collect()));
+         out
+     }
+@@ -1279,6 +1375,99 @@ mod tests {
+         );
+     }
+ 
++    fn retained(id: &str, to: NodeId, reason: &str) -> DomainEvent {
++        DomainEvent::MessageRetained {
++            id: id.into(),
++            to,
++            reason: reason.into(),
++        }
++    }
++
++    fn deaf(q: &AttentionQueue, now: u64) -> Vec<AttentionItem> {
++        q.items(now)
++            .into_iter()
++            .filter(|i| i.kind == AttentionKind::RetainedDeaf)
++            .collect()
++    }
++
++    /// "Alvo vivo mas surdo": uma mensagem RETIDA por `prompt_not_ready` que nunca chega vira
++    /// EXATAMENTE 1 alarme ao cruzar a janela (antes, nada — absorve o flicker fim-de-turno), e some
++    /// quando a MESMA `id` é finalmente entregue. É o ponto-cego que o engolido (arma só em
++    /// `MessageDelivered`) e o liveness (Dead só por EOF do PTY) deixavam silencioso até o DLQ (600 s).
++    #[test]
++    fn retained_deaf_raises_one_alarm_after_window_and_resolves_on_delivery() {
++        let mut q = AttentionQueue::new();
++        let alvo = NodeId::now_v7();
++        q.observe(&retained("msg_1", alvo, "prompt_not_ready"), T0);
++        // Antes da janela: nada (um turno real ENTREGA ou vira Busy em segundos → não é surdez).
++        assert_eq!(deaf(&q, T0 + RETAINED_DEAF_WINDOW_MS - 1).len(), 0);
++        // Cruzou a janela: 1 alarme, carregando o alvo, NUNCA aprovável (Choice — destrava no terminal).
++        let d = deaf(&q, T0 + RETAINED_DEAF_WINDOW_MS);
++        assert_eq!(d.len(), 1, "surdez persistente → 1 alarme precoce");
++        assert_eq!(d[0].node_id, alvo.to_string(), "o item carrega o alvo");
++        assert_ne!(d[0].prompt_kind, PromptKind::Yn);
++        // O CLI acordou e a MESMA id foi entregue → o aviso some (0 lixo preso).
++        q.observe(
++            &DomainEvent::MessageDelivered {
++                id: "msg_1".into(),
++                to: alvo,
++            },
++            T0 + RETAINED_DEAF_WINDOW_MS + 1,
++        );
++        assert_eq!(
++            deaf(&q, T0 + 2 * RETAINED_DEAF_WINDOW_MS).len(),
++            0,
++            "entregue → surdez resolvida"
++        );
++    }
++
++    /// Retenção por `target_busy` (colega TRABALHANDO, não surdo) NUNCA vira surdez — só
++    /// `prompt_not_ready` (lifecycle-julga-Idle mas grid-nunca-pronto) é o sinal. E ao escalar ao DLQ,
++    /// o item `DeadLetter` ASSUME (o aviso precoce some — sem alarme duplo para a mesma perda).
++    #[test]
++    fn retained_deaf_ignores_busy_and_yields_to_dlq() {
++        let mut q = AttentionQueue::new();
++        let busy = NodeId::now_v7();
++        q.observe(&retained("msg_b", busy, "target_busy"), T0);
++        assert_eq!(
++            deaf(&q, T0 + 10 * RETAINED_DEAF_WINDOW_MS).len(),
++            0,
++            "colega ocupado não é surdo"
++        );
++        // Surdez real que escala ao DLQ: o RetainedDeaf cede lugar ao DeadLetter.
++        let mudo = NodeId::now_v7();
++        q.observe(&retained("msg_d", mudo, "prompt_not_ready"), T0);
++        assert_eq!(deaf(&q, T0 + RETAINED_DEAF_WINDOW_MS).len(), 1);
++        q.observe(
++            &dead_lettered("msg_d", &mudo.to_string(), "estourou o teto"),
++            T0 + RETAINED_DEAF_WINDOW_MS + 1,
++        );
++        let now = T0 + 2 * RETAINED_DEAF_WINDOW_MS;
++        assert_eq!(deaf(&q, now).len(), 0, "DLQ assumiu → sem alarme precoce duplo");
++        assert_eq!(
++            q.items(now)
++                .iter()
++                .filter(|i| i.kind == AttentionKind::DeadLetter)
++                .count(),
++            1,
++            "a perda consumada vira DeadLetter"
++        );
++    }
++
++    /// 1 alarme por NÓ, não por mensagem: o Maestro re-despachou 3× ao mesmo terminal surdo (3 `id`
++    /// distintos) → 1 item só (o nó está surdo, não cada mensagem), idade desde a 1ª retenção.
++    #[test]
++    fn retained_deaf_dedups_per_node() {
++        let mut q = AttentionQueue::new();
++        let alvo = NodeId::now_v7();
++        q.observe(&retained("msg_1", alvo, "prompt_not_ready"), T0);
++        q.observe(&retained("msg_2", alvo, "prompt_not_ready"), T0 + 30_000);
++        q.observe(&retained("msg_3", alvo, "prompt_not_ready"), T0 + 60_000);
++        let d = deaf(&q, T0 + 60_000 + RETAINED_DEAF_WINDOW_MS);
++        assert_eq!(d.len(), 1, "3 despachos ao mesmo nó surdo → 1 alarme");
++        assert_eq!(d[0].created_ts, T0, "idade ancora na 1ª retenção (mais antiga)");
++    }
++
+     /// Critério da story (teste headless do round-robin): nó A flooda 3 pedidos; o
+     /// pedido ÚNICO de B (posterior a todos) sai em 2º — alternância por nó, zero
+     /// starvation. A ordem completa prova a justiça.

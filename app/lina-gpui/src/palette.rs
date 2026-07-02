@@ -26,6 +26,8 @@ use std::collections::HashMap;
 use gpui::{div, prelude::*, px, rgb, text, AnyElement};
 use lina_host::{NodeId, NodeKind, NodeStatus};
 
+use crate::ui::RadiusExt;
+
 /// O que a paleta dispara. Genérico: o `WorkspaceView` executa (abre o modal M6, foca um
 /// nó, alterna o freio, ou — placeholder até `creators.rs` — cria nota/pasta).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,7 +519,7 @@ impl PaletteState {
                     .flex()
                     .flex_col()
                     .bg(rgb(th.surface.chrome))
-                    .rounded_md()
+                    .rounded_chrome()
                     .border_1()
                     .border_color(rgb(th.surface.raised_alt))
                     .overflow_hidden()

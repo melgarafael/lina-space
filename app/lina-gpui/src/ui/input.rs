@@ -14,6 +14,7 @@ use gpui::{
     div, prelude::*, px, rgb, App, ClickEvent, ElementId, IntoElement, SharedString, Window,
 };
 
+use super::RadiusExt;
 use crate::theme::{self, Theme};
 
 /// Glifo de caret (LEFT HALF BLOCK). No single-line é pintado como elemento separado de alto
@@ -200,7 +201,7 @@ impl RenderOnce for Input {
             .overflow_hidden()
             .px(px(f32::from(t.spacing.md)))
             .py(px(f32::from(t.spacing.sm)))
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(bg))
             .border_1()
             .border_color(rgb(border))

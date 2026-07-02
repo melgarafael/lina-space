@@ -32,7 +32,7 @@ use lina_cli_profiles::{InstallRecipe, Installers};
 
 use crate::dev_tools::DevToolsModel;
 use crate::obsidian::SecondBrainModel;
-use crate::ui::{Button, ButtonSize};
+use crate::ui::{Button, ButtonSize, RadiusExt};
 
 use gpui::{
     div, prelude::*, px, rgb, size, text, AnyElement, App, Bounds, ClickEvent, Context,
@@ -760,7 +760,11 @@ impl OnboardingView {
         Self {
             model: OnboardingModel::load(dir),
             dev_tools: DevToolsModel::new(),
-            second_brain: SecondBrainModel::new(lina_dir),
+            // ADR 0056: o segundo cérebro é config do USUÁRIO → grava no `~/.lina` global (herdado por
+            // todo Espaço), com fallback ao `.lina` do Espaço se `HOME` não resolver.
+            second_brain: SecondBrainModel::new(
+                crate::obsidian::global_lina_dir().unwrap_or(lina_dir),
+            ),
             focus,
         }
     }
@@ -882,7 +886,7 @@ impl OnboardingView {
                 div()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th().surface.panel))
                     .text_color(rgb(th().accent.primary))
                     .child(text!("Procurando assistentes no seu computador…")),
@@ -892,7 +896,7 @@ impl OnboardingView {
                 div()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th().surface.danger_muted))
                     .text_color(rgb(th().state.warning))
                     .child(text!(
@@ -925,7 +929,7 @@ impl OnboardingView {
                 .gap_3()
                 .px_4()
                 .py_3()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th().surface.panel))
                 .child(div().size(px(9.0)).rounded_full().bg(rgb(if present {
                     th().state.success
@@ -983,7 +987,7 @@ impl OnboardingView {
                 div()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th().surface.danger_muted))
                     .text_color(rgb(th().state.danger))
                     .child(text!(format!("⚠ {reason}"))),

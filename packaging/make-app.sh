@@ -21,8 +21,9 @@ cd "$REPO_ROOT"
 
 VERSION="0.1.0"
 APP_NAME="Lina"          # nome do bundle (Lina.app) e o que o aluno vê (via CFBundleDisplayName).
-EXE_NAME="lina-gpui"     # nome do executável GUI DENTRO do bundle. NÃO pode ser "Lina": APFS é
-                         # case-insensitive e colidiria com o CLI "lina" na mesma pasta MacOS/.
+EXE_NAME="lina-gpui-bin" # CFBundleExecutable: o binário GUI Mach-O DIRETO (sem launcher-script — o
+                         # macOS só libera microfone/device-TCC com entry-point Mach-O; achado /voice).
+                         # NÃO pode ser "lina": APFS é case-insensitive e colidiria com o CLI "lina".
 DIST="$REPO_ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 GPUI_BIN="$REPO_ROOT/app/lina-gpui/target/release/lina-gpui"
@@ -58,29 +59,32 @@ echo "==> [2/4] montando $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-# O binário GUI real entra como "lina-gpui-bin". O CFBundleExecutable ($EXE_NAME =
-# "lina-gpui") é o LAUNCHER (packaging/bundle-launcher.sh): recompila automaticamente
-# quando o app é aberto de DENTRO do repo e dá exec no binário real. Fora do repo
-# (ex.: copiado p/ /Applications) o launcher só executa — seguro p/ distribuição.
-cp "$GPUI_BIN" "$APP/Contents/MacOS/lina-gpui-bin"
+# O binário GUI real É o CFBundleExecutable ($EXE_NAME = "lina-gpui-bin"): Mach-O DIRETO, SEM
+# launcher-script no meio. Motivo (achado /voice 2026-06-29): o macOS só reconhece o app p/ conceder
+# permissão de DEVICE (microfone) quando o entry-point é Mach-O assinado; um script bash como
+# CFBundleExecutable quebra a correlação de identidade e o prompt de microfone nunca aparece. O
+# auto-rebuild que o antigo bundle-launcher.sh fazia ao abrir migrou p/ o vigia packaging/dev-watch.sh
+# (rode-o durante o dev; sem ele, abrir o app NÃO recompila — re-rode make-app.sh --skip-build à mão).
+cp "$GPUI_BIN" "$APP/Contents/MacOS/$EXE_NAME"
 cp "$LINA_BIN" "$APP/Contents/MacOS/lina"
-cp "$REPO_ROOT/packaging/bundle-launcher.sh" "$APP/Contents/MacOS/$EXE_NAME"
 # REGRA F1-4-7: o bundle copia por ALLOWLIST (acima). lina-keygen (ferramenta do fundador,
 # assina licencas) NUNCA entra no bundle — nao adicione cp dele aqui.
-chmod +x "$APP/Contents/MacOS/lina-gpui-bin" "$APP/Contents/MacOS/lina" "$APP/Contents/MacOS/$EXE_NAME"
+chmod +x "$APP/Contents/MacOS/$EXE_NAME" "$APP/Contents/MacOS/lina"
 # Guarda anti-colisão (APFS case-insensitive): o GUI e o CLI têm de ser arquivos DISTINTOS.
-if [[ "$(stat -f%z "$APP/Contents/MacOS/lina-gpui-bin")" == "$(stat -f%z "$APP/Contents/MacOS/lina")" ]]; then
+if [[ "$(stat -f%z "$APP/Contents/MacOS/$EXE_NAME")" == "$(stat -f%z "$APP/Contents/MacOS/lina")" ]]; then
   echo "AVISO: lina-gpui-bin e lina têm o mesmo tamanho — possível colisão de nome (case-insensitive)." >&2
 fi
 
-# assets/ (doutrina + skill) ao lado do executável → o resolver acha por ancestral. Sem .git/target.
-cp -R "$ASSETS_SRC" "$APP/Contents/MacOS/assets"
-rm -rf "$APP/Contents/MacOS/assets/.git" 2>/dev/null || true
+# assets/ (doutrina + skill) e profiles/ vão em Contents/Resources/ — NÃO em MacOS/. Motivo: o codesign
+# só SELA o bundle (e o macOS só dá ao TCC a âncora de identidade que o microfone/device exige — achado
+# /voice 2026-06-29) se Contents/MacOS/ contiver apenas Mach-O. O resolver do app acha em Resources/
+# pelo irmão do dir do exe (repo_root_candidates / injection_profile_candidates). Sem .git/target.
+cp -R "$ASSETS_SRC" "$APP/Contents/Resources/assets"
+rm -rf "$APP/Contents/Resources/assets/.git" 2>/dev/null || true
 
-# profiles/ (CLI Profiles TOML — F1-0-2: ready_timeout/busy_markers calibrados) ao lado do
-# executável → `injection_profile_candidates` acha por ancestral do exe (bundle auto-contido,
-# ANTES do caminho do repo). Mesmo padrão do assets/.
-cp -R "$PROFILES_SRC" "$APP/Contents/MacOS/profiles"
+# profiles/ (CLI Profiles TOML — F1-0-2: ready_timeout/busy_markers calibrados) em Resources/ →
+# `injection_profile_candidates` acha pelo Resources/ irmão do exe (bundle auto-contido, ANTES do repo).
+cp -R "$PROFILES_SRC" "$APP/Contents/Resources/profiles"
 
 # Info.plist (substitui a versão, caso queira bumpar via env VERSION).
 sed "s|<string>0\.1\.0</string>|<string>$VERSION</string>|g" \
@@ -96,6 +100,11 @@ fi
 
 # PkgInfo (cosmético, ajuda o Finder).
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# Assinatura LOCAL de dev (condicional): dá identidade estável ao TCC do macOS p/ as permissões
+# não sumirem a cada rebuild. No-op se o cert de dev não existir (build de distribuição segue
+# SEM assinatura, como decidido acima). Setup do cert: packaging/codesign-dev-setup.sh
+"$REPO_ROOT/packaging/codesign-dev.sh" "$APP" || true
 
 # Tamanho do bundle.
 echo "    bundle pronto: $(du -sh "$APP" | awk '{print $1}')"

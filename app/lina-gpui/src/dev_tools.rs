@@ -31,7 +31,7 @@ use lina_cli_profiles::{InstallRecipe, Installers, CURRENT_OS};
 use lina_core::{find_in_path, query_version, DiscoveredCli};
 
 use crate::onboarding::{install_recipe_with, run_install, InstallState, OnboardingView};
-use crate::ui::{Button, ButtonSize};
+use crate::ui::{Button, ButtonSize, RadiusExt};
 
 // ───────────────────────────── paleta (espelha o onboarding/canvas) ─────────────────────────────
 // Mantidas locais (as do `onboarding` são module-private); os valores ESPELHAM a paleta de lá.
@@ -608,7 +608,7 @@ impl DevToolsModel {
                 .gap_3()
                 .px_4()
                 .py_3()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th().surface.panel))
                 .child(div().size(px(9.0)).rounded_full().bg(rgb(if present {
                     th().state.success
@@ -764,7 +764,7 @@ fn banner(bg: u32, fg: u32, msg: &str) -> AnyElement {
     div()
         .px_4()
         .py_3()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(bg))
         .text_color(rgb(fg))
         .child(text!(msg.to_string()))

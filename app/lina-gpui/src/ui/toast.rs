@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use gpui::{div, prelude::*, px, rgb, ClickEvent, IntoElement, SharedString};
 
+use super::RadiusExt;
 use crate::a11y_live::{live_region, Politeness};
 use crate::theme::{self, Theme};
 
@@ -224,7 +225,7 @@ impl RenderOnce for ToastView {
             .px(px(pad_x))
             .py(px(pad_y))
             .bg(rgb(t.surface.raised))
-            .rounded_md()
+            .rounded_content()
             .border_l_2()
             .border_color(rgb(accent))
             .text_color(rgb(t.text.primary))

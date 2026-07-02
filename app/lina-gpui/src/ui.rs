@@ -15,12 +15,32 @@
 //! Mesmo padrão de [`crate::gallery`]/[`crate::canvas`]. Remover ao aterrissar o último consumidor.
 #![allow(dead_code)]
 
-use gpui::{App, ClickEvent, Window};
+use gpui::{px, App, ClickEvent, Styled, Window};
 
 /// Handler de clique **view-agnóstico** que os componentes guardam. O call-site o produz com
 /// `cx.listener(|view, ev, window, cx| …)`, que adapta um `Fn(&mut V, &E, &mut Window, &mut
 /// Context<V>)` para este tipo — por isso o mesmo componente serve qualquer view sem genéricos.
 pub type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
+/// **Geometria reta tokenizada (ADR 0055)** — a régua de raio do shell num lugar só. Substitui o
+/// `.rounded_md()` fixo de 6px (dívida invisível à catraca, porque não é literal `px`): `chrome` =
+/// molduras/painéis/barras/divisores → `radius.none` (0px); `content` = cards/inputs/botões/chips/
+/// menus → `radius.sm` (4px). A decisão de dois degraus (chrome reto / conteúdo 4px) é o selo do
+/// fundador (épico §0). Lê `theme::active().radius` a cada chamada (tema vivo); o argumento é
+/// `f32::from(token)`, **não** literal — a catraca de tokens (F2-1-5) NÃO conta (consumo de token,
+/// jamais magic number).
+pub trait RadiusExt: Styled + Sized {
+    /// Canto reto do chrome — ADR 0055 §1 (`radius.none`).
+    fn rounded_chrome(self) -> Self {
+        self.rounded(px(f32::from(crate::theme::active().radius.none)))
+    }
+    /// Canto de conteúdo tocável — ADR 0055 §1 (`radius.sm`, 4px).
+    fn rounded_content(self) -> Self {
+        self.rounded(px(f32::from(crate::theme::active().radius.sm)))
+    }
+}
+
+impl<T: Styled + Sized> RadiusExt for T {}
 
 mod badge;
 mod button;

@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 /// W3-6 (AC-6.3): lógica pura do hook `PreToolUse` do Claude Code (gate de execução tier 1).
 pub mod pretooluse;
 pub use pretooluse::{
-    autonomy_from_env, pretooluse_output, pretooluse_result, GatedAsk, PretooluseResult,
-    AUTONOMY_ENV,
+    allow_output, autonomy_from_env, pretooluse_output, pretooluse_result, GatedAsk,
+    PretooluseResult, AUTONOMY_ENV,
 };
 
 /// **Lina universal:** instala doutrina + skills no config GLOBAL de cada CLI (todo terminal/CLI
@@ -27,7 +27,7 @@ pub use pretooluse::{
 pub mod global_install;
 pub use global_install::{ensure_lina_globally_available, GlobalInstallReport};
 
-/// **F1-3 (ACHADO-1) — a safra COMPLETA de skills embutida** (`assets/lina-skills/*`, 13 skills
+/// **F1-3 (ACHADO-1) — a safra COMPLETA de skills embutida** (`assets/lina-skills/*`, 14 skills
 /// + `references/`). Instalada no kit por-nó ([`Bootstrapper::write_terminal_files_with_hooks`])
 /// E no global por-CLI ([`ensure_lina_globally_available`]).
 pub mod skills;
@@ -529,6 +529,24 @@ impl Bootstrapper {
         lina_bin: &str,
         wiring: Option<&HookWiring>,
     ) -> std::io::Result<()> {
+        self.write_terminal_files_with_hooks_guard(dir, input, lina_bin, wiring, true)
+    }
+
+    /// Como [`Self::write_terminal_files_with_hooks`], carregando o **toggle mestre do gate**
+    /// (`guard_on`) até o `settings.json` gerado. `guard_on == false` (o dono do Espaço pôs
+    /// `"guard": "off"`) escreve um settings SEM o hook `guard --pretooluse`; o resto do kit
+    /// (doutrina, skills, SessionStart, observabilidade) é idêntico. `true` = histórico byte-idêntico.
+    ///
+    /// # Errors
+    /// Propaga erros de I/O (criar dirs / escrever arquivos).
+    pub fn write_terminal_files_with_hooks_guard(
+        &self,
+        dir: &Path,
+        input: &BootstrapInput,
+        lina_bin: &str,
+        wiring: Option<&HookWiring>,
+        guard_on: bool,
+    ) -> std::io::Result<()> {
         let lina = dir.join(".lina");
         let claude = dir.join(".claude");
         std::fs::create_dir_all(&lina)?;
@@ -540,7 +558,9 @@ impl Bootstrapper {
         std::fs::write(lina.join("bootstrap.json"), json)?;
         std::fs::write(
             claude.join("settings.json"),
-            stamp_managed_settings(&hook_settings_json_with_observability(lina_bin, wiring)),
+            stamp_managed_settings(&hook_settings_json_with_observability_guard(
+                lina_bin, wiring, guard_on,
+            )),
         )?;
         // F1-3 (ACHADO-1): a safra COMPLETA de skills no kit por-nó — todo terminal nasce com
         // a Inteligência da Lina inteira em `.claude/skills/` (antes só a `lina-agent-bus`
@@ -656,6 +676,19 @@ pub fn hook_settings_json_with_observability(
     hook_settings_json_with_mode(lina_bin, wiring, None)
 }
 
+/// Como [`hook_settings_json_with_observability`], carregando o **toggle mestre do gate** (`guard_on`)
+/// para [`hook_settings_json_with_mode_guard`]. É o caminho que o app usa: `guard_on` vem do
+/// `workspace.json` do Espaço ([`lina_core::guard_enabled`]). `guard_on == true` é byte-idêntico ao
+/// histórico — o gate só some quando o dono do ambiente o desliga.
+#[must_use]
+pub fn hook_settings_json_with_observability_guard(
+    lina_bin: &str,
+    wiring: Option<&HookWiring>,
+    guard_on: bool,
+) -> String {
+    hook_settings_json_with_mode_guard(lina_bin, wiring, None, guard_on)
+}
+
 /// Como [`hook_settings_json_with_observability`], com o permission-mode POR TERMINAL.
 /// **ADR 0025:** `permission_mode == None` é PRODUÇÃO — **omite** a chave `permissions`
 /// inteira (o `~/.claude` do usuário decide o defaultMode). `permission_mode == Some(m)`
@@ -669,19 +702,40 @@ pub fn hook_settings_json_with_mode(
     wiring: Option<&HookWiring>,
     permission_mode: Option<&str>,
 ) -> String {
+    hook_settings_json_with_mode_guard(lina_bin, wiring, permission_mode, true)
+}
+
+/// Como [`hook_settings_json_with_mode`], com o **toggle mestre do gate por-Espaço** (`guard_on`).
+/// `guard_on == false` (o dono do ambiente pôs `"guard": "off"` no `workspace.json`) OMITE o handler
+/// `command` do `guard --pretooluse` do `PreToolUse` — o hook não é emitido, então o Claude Code nunca
+/// pausa a execução. Os DEMAIS hooks (SessionStart turno-0 W3-2 + observabilidade HTTP F1-1-3) ficam
+/// INTOCADOS; se o `PreToolUse` ficar sem NENHUMA entry (guard off + sem observabilidade), a chave é
+/// podada (settings limpo). `guard_on == true` é byte-idêntico ao histórico.
+#[must_use]
+pub fn hook_settings_json_with_mode_guard(
+    lina_bin: &str,
+    wiring: Option<&HookWiring>,
+    permission_mode: Option<&str>,
+    guard_on: bool,
+) -> String {
     let quoted = format!("'{}'", lina_bin.replace('\'', "'\\''"));
     let session_cmd = format!("{quoted} whoami --bootstrap");
-    let pretooluse_cmd = format!("{quoted} guard --pretooluse");
+    // R2c-2: matcher alargado p/ `Bash|Skill` — o MESMO gate cobre o gate de execução Bash (W3-6) E o
+    // guard de skill estrangeira (Skill(maestri*) → deny). Só é EMITIDO quando o gate está ligado.
+    let pretooluse_entries = if guard_on {
+        let pretooluse_cmd = format!("{quoted} guard --pretooluse");
+        serde_json::json!([
+            { "matcher": "Bash|Skill", "hooks": [ { "type": "command", "command": pretooluse_cmd } ] }
+        ])
+    } else {
+        serde_json::json!([])
+    };
     let mut v = serde_json::json!({
         "hooks": {
             "SessionStart": [
                 { "hooks": [ { "type": "command", "command": session_cmd } ] }
             ],
-            // R2c-2: matcher alargado p/ `Bash|Skill` — o MESMO gate cobre o gate de
-            // execução Bash (W3-6) E o guard de skill estrangeira (Skill(maestri*) → deny).
-            "PreToolUse": [
-                { "matcher": "Bash|Skill", "hooks": [ { "type": "command", "command": pretooluse_cmd } ] }
-            ]
+            "PreToolUse": pretooluse_entries
         }
     });
     // ADR 0025: só um pedido EXPLÍCITO (Some) escreve `permissions`; produção (None) omite
@@ -712,6 +766,12 @@ pub fn hook_settings_json_with_mode(
                 }
             }
         }
+    }
+    // Guard off + sem observabilidade deixa `PreToolUse: []` — poda a chave para um settings limpo
+    // (sem array órfão). SessionStart tem sempre 1 entry; os kinds de observabilidade só existem com
+    // wiring — então na prática isto só remove um PreToolUse esvaziado pelo gate desligado.
+    if let Some(hooks) = v["hooks"].as_object_mut() {
+        hooks.retain(|_, val| val.as_array().is_none_or(|a| !a.is_empty()));
     }
     serde_json::to_string_pretty(&v).unwrap_or_else(|_| String::from("{}"))
 }
@@ -1064,6 +1124,61 @@ mod tests {
         }
     }
 
+    /// **Toggle mestre (item #1-#2/#5).** `guard_on == false` OMITE o hook `guard --pretooluse` do
+    /// settings gerado — sem fiação, o `PreToolUse` some por inteiro (poda); com fiação, o `PreToolUse`
+    /// existe MAS só com o handler HTTP de observabilidade (nenhum `guard --pretooluse`). O SessionStart
+    /// turno-0 permanece SEMPRE. E `guard_on == true` é byte-idêntico ao histórico (nenhuma regressão).
+    #[test]
+    fn guard_off_omits_pretooluse_hook_but_keeps_the_rest() {
+        // (a) guard off, sem observabilidade → NENHUM PreToolUse; SessionStart intacto.
+        let j = hook_settings_json_with_observability_guard("/abs/lina", None, false);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("json");
+        assert!(
+            v["hooks"]["PreToolUse"].is_null(),
+            "guard off sem wiring: PreToolUse deve ser podado — {j}"
+        );
+        assert!(
+            v["hooks"]["SessionStart"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "SessionStart (turno-0) nunca some — {j}"
+        );
+        assert!(
+            !j.contains("guard --pretooluse"),
+            "sem o comando do guard — {j}"
+        );
+
+        // (b) guard off, COM observabilidade → PreToolUse existe, mas só o handler HTTP (sem guard).
+        let wiring = HookWiring {
+            port: 9,
+            token: "t".into(),
+        };
+        let j = hook_settings_json_with_observability_guard("/abs/lina", Some(&wiring), false);
+        let v: serde_json::Value = serde_json::from_str(&j).expect("json");
+        let pre = v["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse c/ observabilidade");
+        assert!(
+            pre.iter().all(|e| e["matcher"].is_null()),
+            "guard off: nenhuma entry `command` com matcher Bash|Skill — {j}"
+        );
+        assert!(
+            !j.contains("guard --pretooluse"),
+            "guard off nunca emite o comando do gate — {j}"
+        );
+        assert!(
+            j.contains("/hook/t/PreToolUse"),
+            "observabilidade HTTP intacta mesmo com guard off — {j}"
+        );
+
+        // (c) guard on → byte-idêntico ao caminho histórico (proteção anti-regressão).
+        assert_eq!(
+            hook_settings_json_with_observability_guard("/abs/lina", None, true),
+            hook_settings_json_with_observability("/abs/lina", None),
+            "guard on é o histórico byte-a-byte"
+        );
+    }
+
     /// Sem fiação (porta/token ausentes — app sem listener, CLI sem hooks, testes
     /// antigos): o settings é BYTE-IDÊNTICO ao histórico — degradação por omissão.
     #[test]
@@ -1310,7 +1425,7 @@ mod tests {
     }
 
     /// **F1-3 (ACHADO-1):** o kit por-nó instala a safra COMPLETA — todo terminal nasce com
-    /// as 13 skills em `.claude/skills/` (+`references/` da rubrica transversal), não só a
+    /// as 14 skills em `.claude/skills/` (+`references/` da rubrica transversal), não só a
     /// `lina-agent-bus`. Idempotente: o re-render por mudança de roster não quebra/duplica.
     #[test]
     fn write_terminal_files_installs_full_skill_kit() {
@@ -1320,7 +1435,7 @@ mod tests {
         bs.write_terminal_files(&dir, &sample("@Dev Backend"), "/abs/lina")
             .expect("escreve");
         let skills_root = dir.join(".claude").join("skills");
-        assert_eq!(LINA_SKILLS.len(), 13, "a safra embutida tem 13 skills");
+        assert_eq!(LINA_SKILLS.len(), 14, "a safra embutida tem 14 skills");
         for skill in LINA_SKILLS {
             assert!(
                 skills_root.join(skill.name).join("SKILL.md").is_file(),

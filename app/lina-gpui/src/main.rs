@@ -1398,7 +1398,10 @@ impl WorkspaceView {
             .top(px(96.0))
             .w(px(w))
             .max_h(px(max_h))
-            .overflow_y_scroll()
+            // DOUTRINA modais (lina-modal-doctrine): o painel CLIPA e só organiza
+            // header/corpo/footer; o scroll mora no CORPO. Pôr overflow no painel-flex faz
+            // o flex ENCOLHER os filhos ("comidos") em vez de transbordar — e nada rola.
+            .overflow_hidden()
             .p_4()
             .gap_3()
             .flex()
@@ -1408,11 +1411,27 @@ impl WorkspaceView {
             .border_color(rgb(th.surface.border))
             .bg(rgb(th.surface.panel))
             .child(
+                // Header FIXO: nunca rola, nunca encolhe (flex_none) — sempre visível.
                 div()
+                    .flex_none()
                     .text_lg()
                     .text_color(rgb(th.text.bright))
                     .child("Criar Espaço"),
             );
+        // Corpo ROLÁVEL: todo o conteúdo variável (vitrine, cards, campos) vive aqui. O
+        // min_h(0) destrava o encolhimento do filho flex-col (a linha que quase sempre falta);
+        // o excedente rola DENTRO do painel, sem estourar a janela nem comer opções.
+        let mut body = div()
+            .id("m9-body")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full();
+        // Footer FIXO (só no form): os botões de ação ficam sempre alcançáveis (flex_none).
+        let mut footer: Option<gpui::AnyElement> = None;
         if let Some(blocked) = &m.blocked {
             // F1-4-6 — vitrine 1b NO LUGAR do form (limite ANTES do esforço): título +
             // explicação honesta (copy §1b congelada), a linha-fato do motivo, «Já tenho
@@ -1572,7 +1591,7 @@ impl WorkspaceView {
                         }))
                         .child(format!("[ {} ]", license_ui::COPY_BLOCK_NOT_NOW)),
                 );
-            panel = panel.child(card);
+            body = body.child(card);
         } else {
             // F1-4-6: chave acabou de ativar NESTE modal → banner discreto «o que mudou»
             // sobre o form já destravado (sem restart; sem tela extra no caminho ≤3).
@@ -1617,7 +1636,7 @@ impl WorkspaceView {
                             .child(v.clone()),
                     );
                 }
-                panel = panel.child(ok);
+                body = body.child(ok);
             }
             // Cards de Foco (3 presets — os 5 do ux-flows são backlog §6-B4).
             let mut cards = div().flex().flex_row().gap_2();
@@ -1720,7 +1739,7 @@ impl WorkspaceView {
                         .child(gallery::COPY_M9_TEMPLATES_LABEL.to_string()),
                 )
                 .child(tpl_cards);
-            panel = panel
+            body = body
                 .child(cards)
                 .child(tpl_section)
                 .child(
@@ -1784,8 +1803,9 @@ impl WorkspaceView {
                     .cursor_pointer()
                     .child(rotulo)
             };
-            panel = panel.child(
+            footer = Some(
                 div()
+                    .flex_none()
                     .flex()
                     .flex_row()
                     .gap_2()
@@ -1823,8 +1843,15 @@ impl WorkspaceView {
                                 cx.notify();
                             },
                         )),
-                    ),
+                    )
+                    .into_any_element(),
             );
+        }
+        // Header já está no painel; o CORPO rolável e o FOOTER fixo entram depois, nesta
+        // ordem (doutrina de modal: header fixo · corpo rola · footer fixo).
+        panel = panel.child(body);
+        if let Some(f) = footer {
+            panel = panel.child(f);
         }
         // Véu transparente que captura o clique: o modal Criar Espaço não vaza pro canvas atrás
         // (mesma doutrina M2 do ui::modal::Modal — occlude por default).

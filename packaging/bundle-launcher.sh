@@ -1,5 +1,11 @@
 #!/bin/bash
-# bundle-launcher — executável do Lina.app (CFBundleExecutable).
+# bundle-launcher — LEGADO / NÃO USADO desde 2026-06-29. NÃO é mais copiado para o bundle.
+# Era o CFBundleExecutable do Lina.app (recompilava ao abrir + exec do binário real). REMOVIDO do
+# bundle porque um entry-point SCRIPT impede o macOS de conceder microfone/device-TCC ao app (o prompt
+# nunca aparece — achado /voice). Agora o CFBundleExecutable é o próprio lina-gpui-bin (Mach-O direto),
+# e o auto-rebuild ao salvar migrou p/ packaging/dev-watch.sh. Mantido só por referência histórica.
+#
+# (histórico) bundle-launcher — executável do Lina.app (CFBundleExecutable).
 #
 # Por que existe: o .app carrega binários JÁ compilados; abrir/fechar nunca
 # recompila. Este launcher faz o rebuild AUTOMÁTICO ao abrir, mas só quando o app
@@ -42,6 +48,8 @@ if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/app/lina-gpui/Cargo.toml" ]]; then
           && cd app/lina-gpui && cargo build --release ) >>"$LOG" 2>&1; then
       cp "$REPO_ROOT/app/lina-gpui/target/release/lina-gpui" "$BIN" && chmod +x "$BIN"
       cp "$REPO_ROOT/target/release/lina" "$HERE/lina" && chmod +x "$HERE/lina"
+      # Re-assina com o cert de dev → identidade de TCC estável (permissões não somem). No-op sem o cert.
+      "$REPO_ROOT/packaging/codesign-dev.sh" "$(cd "$HERE/../.." && pwd)" || true
       log "rebuild OK — abrindo versão nova."
     else
       log "rebuild FALHOU — abrindo a versão anterior (veja o erro acima)."

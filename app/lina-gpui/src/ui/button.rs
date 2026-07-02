@@ -15,6 +15,7 @@ use gpui::{
     SharedString, Window,
 };
 
+use super::RadiusExt;
 use crate::theme::{self, Theme};
 
 /// Variante **por SIGNIFICADO**, não por estilo (fusão §VIII.1 / OP-1): a cor do botão É a cor do
@@ -235,7 +236,7 @@ impl RenderOnce for Button {
                     d.px(px(pad_x)).py(px(pad_y))
                 }
             })
-            .rounded_md()
+            .rounded_content()
             .when_some(bg, |d, c| d.bg(rgb(c)))
             .text_color(rgb(fg))
             .text_size(px(text))

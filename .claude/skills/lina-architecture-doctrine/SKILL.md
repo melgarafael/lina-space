@@ -1,16 +1,16 @@
 ---
 name: lina-architecture-doctrine
 description: >-
-  Simplicidade primeiro em decisões de estrutura e design de sistema. Use SEMPRE que for
-  organizar código, criar abstração/interface/camada/factory, introduzir dependência, planejar
-  refactor ou escolher entre abordagens — gatilhos: "como organizo isso?", "vale criar uma
-  abstração?", "qual arquitetura pra X?", "isso tá over-engineering?", "como deixar
-  extensível?". Encarna a dimensão ARQUITETURA da rubrica anti-slop (ARQ-1..3): a MENOR mudança
-  que resolve; abstração só com ≥2 consumidores reais HOJE; sem complexidade não pedida; e a
-  pergunta de continuidade "isto fecha uma porta?" antes de decidir (se sim, ADR antes). NÃO é
-  para detalhe de implementação/nomes (lina-code-doctrine) nem layout visual
-  (lina-design-doctrine). Agnóstica de CLI.
+  Decisões de ESTRUTURA com simplicidade primeiro: quando criar (ou não) uma abstração, camada,
+  interface, dependência ou refactor. Use ao organizar código ou escolher entre abordagens: 'como
+  organizo isso?', 'vale criar uma abstração?', 'qual arquitetura pra X?', 'isso é
+  over-engineering?', 'como deixar extensível?'. Regras: a MENOR mudança que resolve; abstração
+  só com 2+ consumidores reais hoje; nada de complexidade especulativa; e a pergunta de
+  continuidade 'isto fecha uma porta?' antes de decidir (se fecha, registrar a decisão antes).
+  Trata a forma do sistema, não o detalhe de implementação nem a aparência.
 ---
+
+> **Skills irmãs:** detalhe de implementação e nomes → `lina-code-doctrine`; aparência/layout → `lina-design-doctrine`.
 
 # Lina Architecture Doctrine — a menor mudança que resolve
 

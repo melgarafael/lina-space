@@ -14,18 +14,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lina_bootstrap::{
-    autonomy_from_env, canonical_role, classify_retro_args, parse_log_records, pretooluse_result,
-    project_retro, render_report, Autonomy, BootstrapInput, Bootstrapper, GatedAsk,
-    RetroInvocation, AUTONOMY_ENV,
+    allow_output, autonomy_from_env, canonical_role, classify_retro_args, parse_log_records,
+    pretooluse_result, project_retro, render_report, Autonomy, BootstrapInput, Bootstrapper,
+    GatedAsk, RetroInvocation, AUTONOMY_ENV,
 };
 use lina_core::channel::ChannelRegistry;
 use lina_core::history::{self, ExportFormat, HistoryLimits, HistoryPage, SearchPage};
 use lina_core::mentality::{BeliefStatus, Mentality, PromotionPolicy};
 use lina_core::scrollback::ScrollbackStore;
 use lina_core::{
-    check_action, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion, AgentPresence,
-    CheckKind, DomainEvent, EventRecord, EventStore, Goal, GoalPhase, HandoffContract, MailMessage,
-    Mailbox, NodeId, ParamsLedger, SystemParams, CLASS_GATED_HARD_EXTERNAL,
+    check_action, guard_enabled, lookup_action, parse_autonomy, project_goals, AcceptanceCriterion,
+    AgentPresence, CheckKind, DomainEvent, EventRecord, EventStore, Goal, GoalPhase,
+    HandoffContract, MailMessage, Mailbox, NodeId, ParamsLedger, SystemParams,
+    CLASS_GATED_HARD_EXTERNAL,
 };
 
 /// Arquivo de estado, relativo ao cwd do terminal (o app o escreve antes de spawnar o shell).
@@ -3842,6 +3843,13 @@ fn run_guard(args: &[String]) -> ExitCode {
         }
     };
 
+    // Toggle mestre (item #3): gate desligado neste Espaço → `allow` imediato, sem apendar
+    // `ActionGated` (chamada residual/manual do `--check-action` não pode travar nem poluir o log).
+    if !guard_enabled(&mailbox_root()) {
+        println!("{}", lina_core::Decision::Allow.as_str());
+        return ExitCode::SUCCESS;
+    }
+
     let verdict = check_action(&cmd, level);
     // Sempre imprime a decisão (o hook/shim lê esta linha).
     println!("{}", verdict.decision.as_str());
@@ -3881,6 +3889,16 @@ fn run_guard(args: &[String]) -> ExitCode {
 /// falha (stdin ilegível, JSON inválido) emite um JSON fail-safe `ask` e loga em stderr. Sempre
 /// sai com `SUCCESS` — o gate fala pelo conteúdo do JSON, não pelo exit code (o harness lê o JSON).
 fn run_pretooluse() -> ExitCode {
+    // Toggle mestre (item #3): o dono do Espaço desligou o gate (`workspace.json → guard:off`). Uma
+    // chamada RESIDUAL do hook (settings antigo que ainda tinha o comando, antes da regeneração) NUNCA
+    // pode travar — devolve `allow` na hora, sem classificar nem tocar o event log.
+    if !guard_enabled(&mailbox_root()) {
+        println!(
+            "{}",
+            allow_output("gate desligado neste Espaço (workspace.json → guard:off)")
+        );
+        return ExitCode::SUCCESS;
+    }
     let autonomy = autonomy_from_env();
     let mut raw = String::new();
     let result = if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
@@ -4810,18 +4828,47 @@ struct VaultConfigJson {
     vaults: Vec<VaultLinkJson>,
 }
 
-/// Lê os vaults linkados de `<LINA_HOME>/vault.json`. `Err` acionável se não houver vault linkado (o
-/// agente é orientado a pedir ao usuário que rode o passo "Segundo cérebro" do onboarding).
+/// `~/.lina` GLOBAL do usuário (ADR 0056) — onde o vault herdado mora. `None` se `HOME`/`USERPROFILE`
+/// não resolvem. Espelha `obsidian::global_lina_dir` do app (o bin não importa o app — ADR 0004).
+fn global_lina_root() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|s| !s.is_empty())
+        .map(|h| PathBuf::from(h).join(".lina"))
+}
+
+/// Raízes do vault em ordem de precedência (ADR 0056): `$LINA_HOME` (override de projeto) → `~/.lina`
+/// (global herdado por todo Espaço). O 1º com o artefato pedido (`vault.json` / `vault-index/`) vence.
+fn vault_roots() -> Vec<PathBuf> {
+    let ws = mailbox_root();
+    let mut roots = vec![ws.clone()];
+    if let Some(g) = global_lina_root() {
+        if g != ws {
+            roots.push(g);
+        }
+    }
+    roots
+}
+
+/// Lê os vaults linkados na precedência do ADR 0056 (`$LINA_HOME/vault.json` → `~/.lina/vault.json`).
+/// `Err` acionável se não houver vault linkado em NENHUMA raiz (o agente é orientado a pedir ao usuário
+/// que rode o passo "Segundo cérebro" do onboarding).
 fn load_vault_config() -> Result<VaultConfigJson, String> {
-    let path = mailbox_root().join("vault.json");
-    let data = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "nenhum vault Obsidian linkado ainda ({}): {e}\n\
-             → peça ao usuário para concluir o passo \"Segundo cérebro\" do onboarding do Lina.",
-            path.display()
-        )
-    })?;
-    serde_json::from_str(&data).map_err(|e| format!("vault.json inválido: {e}"))
+    let roots = vault_roots();
+    for root in &roots {
+        if let Ok(data) = std::fs::read_to_string(root.join("vault.json")) {
+            return serde_json::from_str(&data).map_err(|e| format!("vault.json inválido: {e}"));
+        }
+    }
+    Err(format!(
+        "nenhum vault Obsidian linkado ainda (procurei em: {})\n\
+         → peça ao usuário para concluir o passo \"Segundo cérebro\" do onboarding do Lina.",
+        roots
+            .iter()
+            .map(|r| r.join("vault.json").display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// `lina vault <sub>` — roteia os subcomandos.
@@ -4864,7 +4911,12 @@ fn vault_path() -> ExitCode {
 /// determinísticos e LOCAIS (não re-baixa o vault). É a "porta de entrada": o agente navega o grafo de
 /// pastas/headings/links/hubs aqui e SÓ ENTÃO abre as notas certas com `read`.
 fn vault_index() -> ExitCode {
-    let dir = mailbox_root().join("vault-index");
+    // ADR 0056: o índice mora ao lado do vault — override de projeto (`$LINA_HOME`) → global (`~/.lina`).
+    let dir = vault_roots()
+        .into_iter()
+        .map(|r| r.join("vault-index"))
+        .find(|d| std::fs::read_dir(d).is_ok())
+        .unwrap_or_else(|| mailbox_root().join("vault-index"));
     let rd = match std::fs::read_dir(&dir) {
         Ok(rd) => rd,
         Err(_) => {

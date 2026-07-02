@@ -32,6 +32,7 @@ use gpui::{
 };
 
 use crate::theme;
+use crate::ui::RadiusExt;
 
 /// **Cortesia do anúncio** (F2-2-2 / ADR 0028). `Polite` não interrompe a fala corrente — o
 /// default de quase tudo (toast informativo, badge que mudou de cor). `Assertive` interrompe — RESERVADO
@@ -115,7 +116,7 @@ pub fn announce(msg: &str, politeness: Politeness) -> LiveRegion<Div> {
     let pill = div()
         .px_3()
         .py_1()
-        .rounded_md()
+        .rounded_content()
         .bg(gpui::rgb(th.surface.panel))
         .text_color(gpui::rgb(th.state.success))
         .child(text!(format!("🔊 {msg}")));

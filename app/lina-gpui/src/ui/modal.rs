@@ -18,7 +18,7 @@ use gpui::{
     SharedString, Window,
 };
 
-use super::{Button, ButtonVariant};
+use super::{Button, ButtonVariant, RadiusExt};
 use crate::theme;
 
 /// Onde a caixa ancora no eixo vertical.
@@ -262,7 +262,7 @@ impl RenderOnce for Modal {
             .px(px(f32::from(t.spacing.xl)))
             .py(px(f32::from(t.spacing.lg)))
             .gap(px(f32::from(t.spacing.sm)))
-            .rounded_lg()
+            .rounded_content()
             .bg(rgb(t.surface.card))
             .border_2()
             .border_color(rgb(self.border.unwrap_or(t.accent.create)));

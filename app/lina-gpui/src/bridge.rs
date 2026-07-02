@@ -833,6 +833,13 @@ fn injection_profile_candidates(lina_home: Option<&Path>) -> Vec<PathBuf> {
                 .skip(1) // o próprio arquivo do exe não tem `profiles/`
                 .map(|a| a.join("profiles").join(REL)),
         );
+        // Bundle .app: os profiles vivem em Contents/Resources/profiles, NÃO em MacOS/ — o codesign só
+        // sela o bundle (exigência do TCC p/ microfone/device; achado /voice 2026-06-29) se MacOS/
+        // tiver apenas Mach-O. O exe está em Contents/MacOS/<exe>, logo o Resources/ irmão do dir do
+        // exe é onde procurar (mantido junto dos candidatos do bundle, ANTES do repo).
+        if let Some(contents) = exe.parent().and_then(Path::parent) {
+            out.push(contents.join("Resources").join("profiles").join(REL));
+        }
     }
     if let Some(repo) = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -2623,6 +2630,13 @@ pub struct BrokerPump<S: SecretStore> {
     /// mensagens (HTTP, fora do lock); o `tick` drena → `ler_conversa` (gate de scope + apenda
     /// `ChannelMessageRead`, só metadados) → injeta o conteúdo no terminal que pediu (contexto da IA).
     channel_reads: ChannelReadQueue,
+    /// **Toggle mestre da custódia (item #4).** `<ws_root>/.lina` do Espaço, para reler
+    /// `workspace.json → guard` a cada pedido. `None` (default de `new`) = SEMPRE gated (custódia
+    /// intocada — o comportamento histórico e o de todos os testes). `.with_guard(...)` o fia no boot.
+    guard_lina_dir: Option<PathBuf>,
+    /// Nível de autonomia do Espaço (do bootstrap/env). O bypass da custódia exige `Autonomous`
+    /// **E** `guard:off` — nunca desliga o gate humano em `assistido`/`manual`. Default: `Assisted`.
+    autonomy: Autonomy,
 }
 
 /// F4-1-3: o desfecho de UMA leitura de canal, da thread off-critical-path para o `tick`. O conteúdo
@@ -2889,7 +2903,34 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             channel_vault: None,
             channel_sends: Arc::new(Mutex::new(VecDeque::new())),
             channel_reads: Arc::new(Mutex::new(VecDeque::new())),
+            // Default SEGURO: sem `.with_guard`, a custódia é SEMPRE gated (gate humano intocado). Só o
+            // boot de produção liga o bypass, e só quando o dono do Espaço o pediu (guard:off+autônomo).
+            guard_lina_dir: None,
+            autonomy: Autonomy::Assisted,
         }
+    }
+
+    /// **Item #4 — liga o toggle mestre da custódia** ao broker: o `.lina` do Espaço (fonte do
+    /// `workspace.json → guard`) + o nível de autonomia. Com `guard:off` **E** `autônomo`, os pedidos
+    /// de `lina do` (deploy/pay/send/envio-de-canal) EXECUTAM direto (o broker obtém o segredo do cofre)
+    /// em vez de esperar o gate humano (⌘⏎) — é o "zero pausas y/n" pedido pelo dono. Fora dessa
+    /// combinação o gate humano permanece a autoridade (ADR 0004). Ver ADR 0060.
+    #[must_use]
+    pub fn with_guard(mut self, lina_dir: PathBuf, autonomy: Autonomy) -> Self {
+        self.guard_lina_dir = Some(lina_dir);
+        self.autonomy = autonomy;
+        self
+    }
+
+    /// `true` quando o dono do Espaço desligou o gate (`workspace.json → guard:off`) **E** está em
+    /// `autônomo` — a ÚNICA combinação em que a custódia executa sem confirmação humana. Sem
+    /// `.with_guard` (`guard_lina_dir=None`) é sempre `false`: a custódia nunca degrada por acidente.
+    fn custody_bypass(&self) -> bool {
+        self.autonomy == Autonomy::Autonomous
+            && self
+                .guard_lina_dir
+                .as_deref()
+                .is_some_and(|d| !lina_core::guard_enabled(d))
     }
 
     /// F4-WA-2b: liga o cofre+porta do webhook ao broker, para o gesto `webhook.test`. Builder
@@ -3261,6 +3302,20 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             return;
         };
         let secret_key = parse_secret_key(&m.payload);
+        // Item #4: o dono do Espaço desligou o gate (guard:off) e está em autônomo → executa DIRETO
+        // (o broker obtém o segredo do cofre; o agente segue sem o token) em vez de esperar o ⌘⏎. O
+        // gate humano só é pulado nesta combinação explícita — em qualquer outra, cai no fluxo gated
+        // abaixo (autoridade do gate humano preservada, ADR 0004/0060).
+        if self.custody_bypass() {
+            eprintln!(
+                "lina-gpui: CUSTODIA (guard:off+autônomo) — '{action}' de {} executada direto, sem gate humano. msg {}",
+                m.from, m.id
+            );
+            let banner = self.execute_custody(action, &secret_key, &m.from);
+            lock(&self.desk).last_result = Some((banner, Instant::now()));
+            lock(&self.model).touch();
+            return;
+        }
         let req = BrokerRequest::new(custody, secret_key.clone(), m.from.clone());
 
         let outcome = {
@@ -3371,6 +3426,27 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         }
         // A chave do segredo no escopo `channel:<canal>` é o literal único `sessao` (o `credential.store`
         // da tela grava sob ele; aqui `for_channel` o lê server-side). O agente nunca o escolhe.
+        // Item #4: guard:off + autônomo → dispara o envio DIRETO (sem o gate humano ⌘⏎). A custódia é a
+        // mesma (a chave sai do cofre server-side; o agente nunca a vê) — só sem a confirmação, a
+        // combinação explícita que o dono do Espaço pediu. Fora dela, cai no fluxo gated abaixo.
+        if self.custody_bypass() {
+            eprintln!(
+                "lina-gpui: CUSTODIA canal (guard:off+autônomo) — envio '{channel}:{action}' de {} disparado direto, sem gate. msg {}",
+                m.from, m.id
+            );
+            let banner = self.execute_channel_send(
+                &m.id,
+                channel,
+                action,
+                WAHA_SECRET_KEY,
+                &chat_id,
+                &text,
+                &m.from,
+            );
+            lock(&self.desk).last_result = Some((banner, Instant::now()));
+            lock(&self.model).touch();
+            return;
+        }
         let req = BrokerRequest::for_channel(channel, action, WAHA_SECRET_KEY, m.from.clone());
         let outcome = {
             let mut store = lock(&self.store);
@@ -4650,6 +4726,12 @@ fn repo_root_candidates() -> Vec<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         roots.extend(exe.ancestors().map(Path::to_path_buf));
+        // Bundle .app: recursos (assets/) ficam em Contents/Resources/, NÃO em MacOS/ (que só pode
+        // conter Mach-O p/ o codesign selar o bundle — exigência do TCC/microfone, achado /voice).
+        // O exe está em Contents/MacOS/<exe>; o Resources/ irmão do dir do exe é onde procurar.
+        if let Some(contents) = exe.parent().and_then(Path::parent) {
+            roots.push(contents.join("Resources"));
+        }
     }
     roots
 }
@@ -5711,14 +5793,23 @@ impl BootstrapWriter {
             })
     }
 
-    /// Vault primário EFETIVO a injetar na doutrina. O que o usuário linkou no onboarding
-    /// (`<ws_root>/.lina/vault.json`) tem PRIORIDADE; só cai no `vault_path` do boot (fallback) se ainda
-    /// não houver vault linkado. **Re-lido a cada escrita** — corrige o bug de ORDEM: o `vault_path` era
-    /// congelado no boot (ANTES de o onboarding confirmar os vaults), então as doutrinas geradas depois
-    /// apontavam para o fallback `<ws_root>/vault` (inexistente) em vez do vault real do usuário.
+    /// Vault primário EFETIVO a injetar na doutrina. Precedência ADR 0056: override de projeto
+    /// (`<ws_root>/.lina/vault.json`) → global do usuário (`~/.lina/vault.json`); só cai no `vault_path`
+    /// do boot (fallback) se ainda não houver vault linkado em lugar nenhum. **Re-lido a cada escrita** —
+    /// corrige o bug de ORDEM: o `vault_path` era congelado no boot (ANTES de o onboarding confirmar os
+    /// vaults), então as doutrinas geradas depois apontavam para o fallback `<ws_root>/vault` (inexistente)
+    /// em vez do vault real do usuário.
     fn effective_vault(&self) -> String {
-        crate::obsidian::read_primary_vault(&self.ws_root.join(".lina"))
+        crate::obsidian::read_primary_vault_effective(&self.ws_root.join(".lina"))
             .unwrap_or_else(|| self.vault_path.clone())
+    }
+
+    /// Toggle mestre do gate deste Espaço, lido do `<ws_root>/.lina/workspace.json` a cada regeneração
+    /// (`lina_core::guard_enabled`). `false` = o dono pôs `"guard": "off"` → os settings gerados NÃO
+    /// levam o hook `guard --pretooluse`. Idempotência (item #5): como é lido a cada write, o hook nunca
+    /// "volta" numa regeneração por mudança de roster. Default seguro (ligado) quando o arquivo falta.
+    fn guard_on(&self) -> bool {
+        lina_core::guard_enabled(&self.ws_root.join(".lina"))
     }
 
     /// Escreve os arquivos de bootstrap de **UM** terminal (`key`/`name`) com o `roster` dado.
@@ -5741,11 +5832,12 @@ impl BootstrapWriter {
             port: h.port(),
             token: h.register(name),
         });
-        if let Err(e) = self.bootstrapper.write_terminal_files_with_hooks(
+        if let Err(e) = self.bootstrapper.write_terminal_files_with_hooks_guard(
             &dir,
             &input,
             &self.lina_bin,
             wiring.as_ref(),
+            self.guard_on(),
         ) {
             eprintln!("lina-gpui: bootstrap de {name} falhou: {e}");
         }
@@ -5852,9 +5944,10 @@ impl BootstrapWriter {
             ".claude/settings.json",
             &|existing: &str| managed_ns || settings_is_ours(existing),
             lina_bootstrap::stamp_managed_settings(
-                &lina_bootstrap::hook_settings_json_with_observability(
+                &lina_bootstrap::hook_settings_json_with_observability_guard(
                     &self.lina_bin,
                     wiring.as_ref(),
+                    self.guard_on(),
                 ),
             ),
         );
@@ -8984,6 +9077,77 @@ mod tests {
                 .banner()
                 .is_some_and(|b| b.contains("executado")),
             "banner de resultado visível"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Item #4 (ADR 0060) — custódia executa DIRETO em guard:off + autônomo.** Com o toggle mestre
+    /// desligado (`workspace.json → guard:off`) E autonomia autônoma, o MESMO `broker.do` do teste
+    /// acima (que normalmente BLOQUEIA no gate) executa no 1º tick, SEM nada na fila do gate humano:
+    /// `BrokerExecuted` + marcador no disco, fila vazia, token nunca vazado. É o "zero pausas y/n" do
+    /// dono do Espaço. (O default — sem `.with_guard` — segue provado gated pelo teste anterior.)
+    #[test]
+    fn broker_pump_guard_off_autonomous_executes_without_gate() {
+        let base = std::env::temp_dir().join(format!("lina-brokerbypass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir base");
+        // O dono do Espaço desligou o gate (guard:off) — a fonte que `custody_bypass` relê.
+        std::fs::write(base.join("workspace.json"), r#"{"guard":"off"}"#).expect("workspace.json");
+
+        let broker_root = base.join("broker");
+        let store = Arc::new(Mutex::new(
+            EventStore::open(base.join("events")).expect("abrir store"),
+        ));
+        let vault = SecretVault::with_store("lina-space/teste", lina_secrets::MockStore::new());
+        vault
+            .set("deploy", "prod", "DEPLOY-KEY-DO-COFRE")
+            .expect("semear");
+
+        let broker_mb = Mailbox::new(&broker_root);
+        let req =
+            MailMessage::new("@Dev", "broker", "broker.do", "--env prod").with_ref("do:deploy");
+        broker_mb.enqueue_as("@Dev", &req).expect("enqueue_as @Dev");
+
+        let desk: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let mut pump = BrokerPump::new(
+            broker_mb,
+            Arc::clone(&store),
+            vault,
+            Arc::clone(&desk),
+            Arc::clone(&model),
+            sup_with_nodes(&["@Dev"]),
+        )
+        // guard:off + autônomo → o bypass da custódia liga (a combinação explícita do dono).
+        .with_guard(base.clone(), Autonomy::Autonomous);
+
+        // UM tick: executa DIRETO (sem confirmação humana — nada foi para a fila do gate).
+        pump.tick();
+
+        assert!(
+            lock(&desk).front().is_none(),
+            "guard:off+autônomo NÃO enfileira gate humano — executa direto"
+        );
+        let events = lock(&store).events().expect("eventos");
+        assert!(
+            events
+                .iter()
+                .any(|r| r.kind == "BrokerExecuted" && r.payload["action"] == "deploy"),
+            "o broker executou com o segredo do cofre já no 1º tick"
+        );
+        let marker = broker_root.join("executed-deploy.txt");
+        assert!(
+            marker.exists(),
+            "marcador de execução no disco (prova observável)"
+        );
+        let dump = format!(
+            "{:?}",
+            events.iter().map(|r| &r.payload).collect::<Vec<_>>()
+        );
+        assert!(
+            !dump.contains("DEPLOY-KEY-DO-COFRE"),
+            "o token nunca vaza ao log, mesmo no bypass"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -12358,10 +12522,9 @@ mod tests {
         bw.write_one("X", "Terminal X", &["Terminal X".to_string()]);
         let x_md = ws.join("X").join("CLAUDE.md");
         let before = std::fs::read_to_string(&x_md).expect("CLAUDE.md de X");
-        assert!(
-            before.contains(&fallback),
-            "antes de linkar: usa o fallback"
-        );
+        // ADR 0056: sem vault LOCAL, o efetivo passou a ser o `~/.lina` GLOBAL (se houver) ou o
+        // fallback — depende da máquina de quem roda. O que este teste garante independe disso: ANTES
+        // de linkar, a doutrina NÃO conhece o vault que vamos linkar (o override local é o que importa).
         assert!(
             !before.contains(real_vault),
             "antes de linkar: não conhece o vault real"

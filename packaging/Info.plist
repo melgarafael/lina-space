@@ -2,13 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Info.plist do bundle Lina.app (macOS).
-  Distribuição SEM assinatura (decisão do fundador 2026-06-04): o app abre via bypass
-  do Gatekeeper (ver INSTALAR-LINA.md). NÃO há codesign/notarização nesta fase.
+  Distribuição SEM assinatura de distribuição (decisão do fundador 2026-06-04): o app abre via bypass
+  do Gatekeeper (ver INSTALAR-LINA.md). Em DEV há assinatura local condicional (codesign-dev.sh) que dá
+  identidade estável ao TCC — sem ela o macOS nega microfone/pastas EM SILÊNCIO.
   Layout do bundle (montado por make-app.sh):
-    Lina.app/Contents/MacOS/lina-gpui ← binário do app GUI (release). NOME != "lina" de propósito:
-                                         APFS é case-insensitive, então "Lina" colidiria com "lina".
-    Lina.app/Contents/MacOS/lina      ← CLI lina (release), achada "ao lado" pelo resolver do app
-    Lina.app/Contents/MacOS/assets/   ← doutrina + skill, achadas via ancestrais do exe (zero código)
+    Lina.app/Contents/MacOS/lina-gpui-bin ← binário do app GUI (release) E o CFBundleExecutable. É um
+                                            Mach-O DIRETO (não um script): o macOS só reconhece o app p/
+                                            conceder DEVICE (microfone) com entry-point Mach-O assinado —
+                                            um launcher-script como entry-point faz o prompt nunca aparecer
+                                            (achado /voice 2026-06-29). NOME != "lina": APFS é case-insensitive.
+    Lina.app/Contents/MacOS/lina          ← CLI lina (release), achada "ao lado" pelo resolver do app
+    Lina.app/Contents/Resources/assets/   ← doutrina + skill. Em Resources/ (não MacOS/) p/ o codesign
+                                            selar o bundle; o resolver acha pelo Resources/ irmão do exe.
+    Lina.app/Contents/Resources/profiles/ ← CLI Profiles TOML, achados pelo Resources/ irmão do exe.
 -->
 <plist version="1.0">
 <dict>
@@ -19,7 +25,7 @@
     <key>CFBundleIdentifier</key>
     <string>space.lina.app</string>
     <key>CFBundleExecutable</key>
-    <string>lina-gpui</string>
+    <string>lina-gpui-bin</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -56,5 +62,16 @@
     <string>A Lina pode ler anotações que você guarda em Downloads, caso seu vault esteja lá. Tudo fica no seu computador.</string>
     <key>NSRemovableVolumesUsageDescription</key>
     <string>A Lina pode ler um vault de anotações guardado num disco externo, se você escolher um. Tudo fica no seu computador.</string>
+    <!--
+      TCC microfone: o Claude (a IA que roda DENTRO de cada terminal da Lina) tem o recurso de
+      ditado de voz (/voice) — grava sua fala e transcreve. O Claude roda como processo-FILHO da
+      Lina (no PTY do terminal), então o macOS pede a permissão de microfone ao processo
+      RESPONSÁVEL — que é a Lina.app, não o Claude. Sem esta chave o macOS NEGA o microfone em
+      silêncio para a Lina e toda a sua árvore de filhos (mesmo padrão das chaves de pasta acima):
+      o /voice "não detecta voz" porque o sistema bloqueou a captura antes de chegar ao Claude.
+      Com a chave presente, o macOS mostra o prompt no 1º uso → o usuário Permite → o ditado funciona.
+    -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>A Lina usa o microfone quando você dita um comando de voz para a IA — sua fala é transcrita em texto. O microfone só é acionado quando você inicia o ditado.</string>
 </dict>
 </plist>

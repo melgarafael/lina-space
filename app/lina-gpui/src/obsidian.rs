@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dev_tools::{decide_plan, open_in_terminal, InstallPlan};
 use crate::onboarding::{install_recipe_with, run_install, InstallState, OnboardingView};
+use crate::ui::RadiusExt;
 
 // ───────────────────────────── paleta (espelha o onboarding/canvas) ─────────────────────────────
 /// F1-2-1: tokens VIVOS do design system — cada chamada lê o tema ATIVO (trocar dark/light ou
@@ -1406,6 +1407,129 @@ pub fn read_vault_config(lina_dir: &Path) -> Option<VaultConfig> {
     serde_json::from_str(&s).ok()
 }
 
+// ───────────────────────── ADR 0056 — vault é config do USUÁRIO (global `~/.lina/`) ─────────────────────────
+
+/// O `~/.lina` GLOBAL do usuário — a casa da config-de-usuário (par de `workspaces.json`/`license.json`).
+/// O vault é config do USUÁRIO (o segundo cérebro é dele, não do projeto), então mora aqui e é herdado por
+/// todo Espaço (ADR 0056). `None` se `HOME`/`USERPROFILE` não resolvem.
+#[must_use]
+pub fn global_lina_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|s| !s.is_empty())
+        .map(|h| PathBuf::from(h).join(".lina"))
+}
+
+/// `[<ws>/.lina, ~/.lina]` — a ordem de precedência do ADR 0056 (o global só entra se `HOME` resolver e
+/// não for o próprio `ws`). Override de projeto primeiro, global herdado depois.
+fn layered_dirs(ws_lina_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![ws_lina_dir.to_path_buf()];
+    if let Some(g) = global_lina_dir() {
+        if g != ws_lina_dir {
+            dirs.push(g);
+        }
+    }
+    dirs
+}
+
+/// PURO: o `primary` do 1º `lina_dir` (em ordem de precedência) que tiver `vault.json` válido.
+#[must_use]
+pub fn read_primary_vault_layered(dirs: &[PathBuf]) -> Option<String> {
+    dirs.iter().find_map(|d| read_primary_vault(d))
+}
+
+/// Precedência efetiva de PRODUÇÃO: `<ws>/.lina` (override) → `~/.lina` (global). Usada pelo boot do app
+/// e pela regeneração da doutrina.
+#[must_use]
+pub fn read_primary_vault_effective(ws_lina_dir: &Path) -> Option<String> {
+    read_primary_vault_layered(&layered_dirs(ws_lina_dir))
+}
+
+/// Uma entrada de `~/.lina/workspaces.json` — só o `path` interessa (campos extras ignorados).
+#[derive(Deserialize)]
+struct WorkspaceRegEntry {
+    #[serde(default)]
+    path: String,
+}
+#[derive(Deserialize)]
+struct WorkspaceReg {
+    #[serde(default)]
+    workspaces: Vec<WorkspaceRegEntry>,
+}
+
+/// Os `.lina/` dos Espaços conhecidos (lidos de `<global>/workspaces.json`) — candidatos a fonte da
+/// migração. Vazio se o registro não existe / é inválido. Varrer TODOS (não só o Espaço atual) é o que
+/// faz um Espaço novo, aberto direto, achar o vault que o usuário linkou num Espaço anterior.
+fn known_espaco_lina_dirs(global: &Path) -> Vec<PathBuf> {
+    let Ok(s) = std::fs::read_to_string(global.join("workspaces.json")) else {
+        return Vec::new();
+    };
+    let Ok(reg) = serde_json::from_str::<WorkspaceReg>(&s) else {
+        return Vec::new();
+    };
+    reg.workspaces
+        .into_iter()
+        .filter(|e| !e.path.is_empty())
+        .map(|e| PathBuf::from(e.path).join(".lina"))
+        .collect()
+}
+
+/// Copia 1 arquivo (cria o pai). Best-effort no caller.
+fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    std::fs::copy(src, dst).map(|_| ())
+}
+
+/// Copia os ARQUIVOS de `src` em `dst` (raso — o `vault-index` é plano). No-op se `src` não existe.
+fn copy_dir_shallow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// **Migração one-shot p/ o vault global (ADR 0056), TESTÁVEL** (dirs explícitos). Promove o `vault.json`
+/// (+ `vault-index/`) do 1º `candidate` que o tiver para `global` — SÓ se o global ainda não tem vault.
+/// Idempotente: global já populado → no-op (nunca sobrescreve a escolha viva do usuário).
+pub fn migrate_vault_to_global_from(candidates: &[PathBuf], global: &Path) {
+    if read_primary_vault(global).is_some() {
+        return; // já migrado
+    }
+    let Some(src) = candidates.iter().find(|d| read_primary_vault(d).is_some()) else {
+        return; // nenhum Espaço tem vault linkado ainda
+    };
+    if let Err(e) = copy_file(&src.join("vault.json"), &global.join("vault.json")) {
+        eprintln!("obsidian: migração do vault p/ global falhou (vault.json): {e}");
+        return;
+    }
+    // o índice é best-effort: o self-heal regenera o que faltar no próximo boot.
+    if let Err(e) = copy_dir_shallow(&src.join("vault-index"), &global.join("vault-index")) {
+        eprintln!("obsidian: migração do índice p/ global incompleta ({e}) — o self-heal regenera.");
+    }
+    eprintln!(
+        "obsidian: vault promovido p/ ~/.lina (global) a partir de {}",
+        src.display()
+    );
+}
+
+/// PRODUÇÃO: resolve o global + os Espaços de `workspaces.json` e migra (one-shot, idempotente).
+pub fn migrate_vault_to_global() {
+    let Some(global) = global_lina_dir() else {
+        return;
+    };
+    let candidates = known_espaco_lina_dirs(&global);
+    migrate_vault_to_global_from(&candidates, &global);
+}
+
 /// PURO: lista os vaults conectados cujo índice (PageIndex) está FALTANDO em `<lina_dir>/vault-index/`.
 /// Testável sem I/O de scan — só checa a existência do sidecar `.json` de cada vault do config.
 #[must_use]
@@ -2180,7 +2304,7 @@ impl SecondBrainModel {
             .gap_1()
             .px_4()
             .py_3()
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(if selected {
                 th().surface.selected_row
             } else {
@@ -2293,7 +2417,7 @@ impl SecondBrainModel {
                     .gap_1()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th().surface.panel))
                     .child(
                         div()
@@ -2435,7 +2559,7 @@ fn banner(bg: u32, fg: u32, msg: &str) -> AnyElement {
     div()
         .px_4()
         .py_3()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(bg))
         .text_color(rgb(fg))
         .child(text!(msg.to_string()))
@@ -2454,7 +2578,7 @@ fn action_button(
         .id(id)
         .px_5()
         .py_2()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(bg))
         .text_color(rgb(th().text.bright))
         .font_weight(FontWeight::BOLD)
@@ -2475,7 +2599,7 @@ fn ghost_button(
         .id(id)
         .px_4()
         .py_2()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(th().surface.raised))
         .text_color(rgb(th().text.primary))
         .cursor_pointer()
@@ -2496,7 +2620,7 @@ fn add_folder_button(
         .id(id)
         .px_4()
         .py_2()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(th().surface.raised))
         .text_color(rgb(th().text.primary))
         .cursor_pointer()
@@ -3166,6 +3290,58 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(lina.path().join("vault.json")).unwrap())
                 .unwrap();
         assert_eq!(back, cfg);
+    }
+
+    /// Helper: um `VaultConfig` mínimo com o `primary` dado.
+    fn cfg_with(primary: &str) -> VaultConfig {
+        VaultConfig {
+            primary: primary.into(),
+            vaults: vec![VaultEntry {
+                name: "V".into(),
+                path: primary.into(),
+                writable: format!("{primary}/Lina"),
+            }],
+        }
+    }
+
+    /// ADR 0056: precedência `<ws>/.lina` (override de projeto) → `~/.lina` (global herdado).
+    #[test]
+    fn vault_layered_prefers_workspace_then_global() {
+        let ws = TempDir::new("layered-ws");
+        let global = TempDir::new("layered-global");
+        let dirs = vec![ws.path().to_path_buf(), global.path().to_path_buf()];
+        // nenhum tem → None (cai no fallback do caller)
+        assert!(read_primary_vault_layered(&dirs).is_none());
+        // só o global tem → herda do global
+        write_vault_config(global.path(), &cfg_with("/G")).unwrap();
+        assert_eq!(read_primary_vault_layered(&dirs).as_deref(), Some("/G"));
+        // ws tem → override de projeto vence o global
+        write_vault_config(ws.path(), &cfg_with("/W")).unwrap();
+        assert_eq!(read_primary_vault_layered(&dirs).as_deref(), Some("/W"));
+    }
+
+    /// ADR 0056: a migração promove o 1º Espaço com vault e é idempotente (não sobrescreve o global vivo).
+    #[test]
+    fn migrate_promotes_first_candidate_and_is_idempotent() {
+        let espaco = TempDir::new("mig-espaco");
+        let global = TempDir::new("mig-global");
+        write_vault_config(espaco.path(), &cfg_with("/X")).unwrap();
+        // global vazio → migra de espaco
+        migrate_vault_to_global_from(&[espaco.path().to_path_buf()], global.path());
+        assert_eq!(read_primary_vault(global.path()).as_deref(), Some("/X"));
+        // idempotente: muda a fonte e re-migra → o global NÃO muda (já populado)
+        write_vault_config(espaco.path(), &cfg_with("/Y")).unwrap();
+        migrate_vault_to_global_from(&[espaco.path().to_path_buf()], global.path());
+        assert_eq!(read_primary_vault(global.path()).as_deref(), Some("/X"));
+    }
+
+    /// Migração sem nenhum candidato com vault → no-op (não cria `vault.json` vazio no global).
+    #[test]
+    fn migrate_noop_when_no_candidate_has_vault() {
+        let empty = TempDir::new("mig-empty");
+        let global = TempDir::new("mig-global2");
+        migrate_vault_to_global_from(&[empty.path().to_path_buf()], global.path());
+        assert!(read_primary_vault(global.path()).is_none());
     }
 
     /// O `second-brain.toml` REAL parseia e cobre os 3 SOs com `program` não-vazio.

@@ -13,7 +13,7 @@
 use gpui::{div, prelude::*, px, rgb, AnyElement, ClickEvent, Context, Pixels, SharedString, Size};
 
 use crate::theme;
-use crate::ui::{clamp_frame, ButtonVariant, Modal, ModalAction};
+use crate::ui::{clamp_frame, ButtonVariant, Modal, ModalAction, RadiusExt};
 use crate::WorkspaceView;
 
 // ═══════════════════════ copy (auditável — zero jargão; passa por `copy_has_no_jargon`) ═══════════════════════
@@ -344,7 +344,7 @@ fn field_row(
                 .overflow_hidden()
                 .px(px(f32::from(t.spacing.md)))
                 .py(px(f32::from(t.spacing.sm)))
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(t.surface.chrome))
                 .border_1()
                 .border_color(rgb(if focused {

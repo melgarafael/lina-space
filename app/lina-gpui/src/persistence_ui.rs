@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bridge::{lock, Model};
 use crate::theme;
-use crate::ui::{Button, ButtonVariant, Input};
+use crate::ui::{Button, ButtonVariant, Input, RadiusExt};
 
 /// Quantos frames o badge fica em "salvando…" após o contador subir (≈130ms a 60fps).
 const SAVING_FRAMES: u8 = 8;
@@ -883,7 +883,7 @@ impl PersistenceView {
             RecoveryStatus::InProgress => div()
                 .px_4()
                 .py_3()
-                .rounded_md()
+                .rounded_chrome()
                 .bg(rgb(th.state.warning))
                 .text_color(rgb(th.text.on_emphasis))
                 .child(text!("⟳ Recuperando seu trabalho…")),
@@ -906,7 +906,7 @@ impl PersistenceView {
                     .gap_2()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_chrome()
                     .bg(rgb(th.surface.panel))
                     .border_2()
                     .border_color(rgb(th.state.success))
@@ -974,7 +974,7 @@ impl PersistenceView {
                 .gap_3()
                 .px_4()
                 .py_3()
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(th.surface.panel))
                 .cursor_pointer()
                 .on_click(cx.listener(move |v, _ev: &ClickEvent, _w, _cx| {
@@ -1430,7 +1430,7 @@ impl PersistenceView {
                     body = body.child(
                         div()
                             .p_3()
-                            .rounded_md()
+                            .rounded_chrome()
                             .border_1()
                             .border_color(rgb(th.state.warning))
                             .flex()

@@ -437,13 +437,22 @@ pub fn boot_ws_runtime(
     // `primary`, ele tem prioridade — reflete a escolha REAL do usuário e faz `{{vault_writable_paths}}`/
     // `{{vault_tino_path}}` apontarem pro vault linkado na próxima reescrita do bootstrap. Senão, cai no
     // override de dev `LINA_VAULT` e, por fim, no default `<ws_root>/vault`.
-    let vault_path = obsidian::read_primary_vault(&mailbox_dir)
+    // ADR 0056: o vault é config do USUÁRIO → mora no `~/.lina` global e é herdado por todo Espaço.
+    // Migração one-shot (idempotente): promove p/ o global o vault que o usuário já linkou em qualquer
+    // Espaço conhecido — é o que faz um Espaço NOVO enxergar o vault sem refazer o onboarding.
+    obsidian::migrate_vault_to_global();
+    let vault_path = obsidian::read_primary_vault_effective(&mailbox_dir)
         .or_else(|| std::env::var("LINA_VAULT").ok())
         .unwrap_or_else(|| ws_root.join("vault").display().to_string());
     // Self-heal do segundo cérebro: se o vault está conectado (vault.json) mas o índice (PageIndex)
     // sumiu — a thread fire-and-forget do onboarding morreu, ou a 1ª execução foi negada no TCC de
     // Documentos — regenera-o agora, no contexto do app (já com o grant de Documentos do bundle).
     // No-op quando os índices já existem. Sem isso, o usuário não-técnico fica "conectado mas vazio".
+    // ADR 0056: o índice vive ao lado do vault — no global (onde ele agora mora) e, se houver override
+    // de projeto, no `.lina` do Espaço.
+    if let Some(global) = obsidian::global_lina_dir() {
+        obsidian::heal_missing_indices(&global);
+    }
     obsidian::heal_missing_indices(&mailbox_dir);
     let lina_bin = std::env::var("LINA_BIN").unwrap_or_else(|_| "lina".to_string());
     // SEAM-1 (M2): FONTE ÚNICA da autonomia do workspace — passada AO MESMO TEMPO ao `BootstrapWriter`
@@ -725,6 +734,10 @@ pub fn boot_ws_runtime(
     .with_webhook(webhook.as_deref()) // F4-WA-2b: cofre+porta p/ o gesto webhook.test (dogfooding)
     // F4-1-4: o envio gated de canal lê a chave do MESMO cofre que a tela gravou.
     .with_channel_vault(Some(Arc::clone(&channel_vault)))
+    // Item #4 (ADR 0060): toggle mestre da custódia. Com `<ws_root>/.lina/workspace.json → guard:off`
+    // E autonomia autônoma, os pedidos `lina do` executam direto (sem o gate humano ⌘⏎). Fonte relida
+    // a cada pedido; default (arquivo ausente / não-autônomo) mantém o gate — ADR 0004 preservado.
+    .with_guard(mailbox_dir.clone(), autonomy)
     .spawn();
 
     Ok(WsRuntime {

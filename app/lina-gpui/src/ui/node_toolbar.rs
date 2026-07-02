@@ -19,7 +19,7 @@ use gpui::{
 use crate::palette::{node_commands, NodeCtx, PaletteAction};
 use crate::theme;
 
-use super::{Button, ButtonSize, ButtonVariant};
+use super::{Button, ButtonSize, ButtonVariant, RadiusExt};
 
 // Strings — fonte única do módulo (padrão F1-4). PLACEHOLDERS da r6: o @Redator entrega a copy
 // congelada (R9 — zero jargão). Reconciliar com COPY_TB_* dele no fechamento da rodada.
@@ -122,7 +122,7 @@ impl RenderOnce for NodeToolbar {
         let cmds = node_commands(&self.ctx);
         let on_invoke = self.on_invoke;
 
-        // Container: superfície chrome + borda 1px + radius.md, FLAT (sem sombra). `id` próprio para
+        // Container: superfície chrome + borda 1px + canto reto (chrome, ADR 0055), FLAT (sem sombra). `id` próprio para
         // o nó `Toolbar` entrar na árvore a11y; `aria_label` com o nome do nó (leitor de tela).
         let mut bar = div()
             .id(ElementId::Name(
@@ -135,7 +135,7 @@ impl RenderOnce for NodeToolbar {
             .bg(rgb(t.surface.chrome))
             .border_1()
             .border_color(rgb(t.surface.border))
-            .rounded_md()
+            .rounded_chrome()
             .role(Role::Toolbar)
             .aria_label(format!("Ações de {}", self.node_label));
 

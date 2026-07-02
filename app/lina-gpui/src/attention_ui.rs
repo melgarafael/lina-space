@@ -499,7 +499,7 @@ use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, Role
 
 use crate::a11y_live::{live_region, Politeness};
 use crate::theme::Theme;
-use crate::ui::{Button, ButtonSize, ButtonVariant};
+use crate::ui::{Button, ButtonSize, ButtonVariant, RadiusExt};
 use crate::WorkspaceView;
 
 /// Largura do painel compacto da fila.
@@ -563,7 +563,7 @@ pub fn render_badge(
         .id("att-badge")
         .px_3()
         .py_1()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(bg))
         .text_color(rgb(fg))
         .opacity(alpha)
@@ -613,7 +613,7 @@ pub fn render_toast(
         .flex_col()
         .gap_2()
         .p_3()
-        .rounded_md()
+        .rounded_chrome()
         .bg(rgb(th.surface.panel))
         .border_2()
         .text_size(px(12.0))
@@ -657,7 +657,7 @@ pub fn render_toast(
                         .child(
                             div()
                                 .px_2()
-                                .rounded_md()
+                                .rounded_content()
                                 .bg(rgb(th.surface.raised_alt))
                                 .text_color(rgb(th.text.bright))
                                 .text_size(px(10.0))
@@ -725,13 +725,13 @@ pub fn render_toast(
                     div()
                         .h(px(3.0))
                         .w_full()
-                        .rounded_md()
+                        .rounded_chrome()
                         .bg(rgb(th.surface.raised))
                         .child(
                             div()
                                 .h(px(3.0))
                                 .w(px((rect.w - 24.0).max(0.0) * frac))
-                                .rounded_md()
+                                .rounded_chrome()
                                 .bg(rgb(th.accent.primary)),
                         ),
                 );
@@ -830,7 +830,7 @@ pub fn render_panel(
             .flex_col()
             .gap_1()
             .p_2()
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(th.surface.card))
             .border_1()
             .border_color(rgb(if escalated {
@@ -850,7 +850,7 @@ pub fn render_panel(
                     .child(
                         div()
                             .px_2()
-                            .rounded_md()
+                            .rounded_content()
                             .bg(rgb(th.surface.raised_alt))
                             .text_color(rgb(th.text.bright))
                             .text_size(px(10.0))
@@ -1013,7 +1013,7 @@ pub fn render_panel(
         .w(px(PANEL_W))
         .h(px(h))
         .overflow_hidden()
-        .rounded_md()
+        .rounded_chrome()
         .bg(rgb(th.surface.panel))
         .border_1()
         .border_color(rgb(th.surface.border))

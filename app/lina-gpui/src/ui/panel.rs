@@ -15,6 +15,7 @@ use gpui::{
     IntoElement, Role, SharedString, Window,
 };
 
+use super::RadiusExt;
 use crate::theme::{self, Theme};
 
 /// Qual fundo de superfície o painel usa (token, nunca cor crua).
@@ -232,7 +233,7 @@ impl RenderOnce for Panel {
             .px(px(px_x))
             .py(px(px_y))
             .gap(px(gap))
-            .rounded_md()
+            .rounded_chrome()
             .map(|d| match self.variant {
                 PanelVariant::Card => {
                     // Borda 2px SEMPRE (geometria uniforme); só a cor muda — anel quando

@@ -20,7 +20,7 @@
 use gpui::{div, prelude::*, px, rgb, AnyElement, ClickEvent, Context, Pixels, SharedString, Size};
 
 use crate::theme;
-use crate::ui::{clamp_frame, ButtonVariant, Modal, ModalAction};
+use crate::ui::{clamp_frame, ButtonVariant, Modal, ModalAction, RadiusExt};
 use crate::WorkspaceView;
 
 // ═══════════════════════ copy (auditável — zero jargão; passa por `copy_has_no_jargon`) ═══════════════════════
@@ -565,7 +565,7 @@ fn node_selector(modal: &WebhookModal, cx: &mut Context<WorkspaceView>) -> impl 
                 .gap(px(f32::from(t.spacing.sm)))
                 .px(px(f32::from(t.spacing.md)))
                 .py(px(f32::from(t.spacing.sm)))
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(if chosen {
                     t.surface.selected_row
                 } else {
@@ -619,7 +619,7 @@ fn instruction_field(modal: &WebhookModal, cx: &mut Context<WorkspaceView>) -> i
                 .min_h(px(INSTRUCTION_MIN_H))
                 .px(px(f32::from(t.spacing.md)))
                 .py(px(f32::from(t.spacing.sm)))
-                .rounded_md()
+                .rounded_content()
                 .bg(rgb(t.surface.chrome))
                 .border_1()
                 .border_color(rgb(if focused {
@@ -695,7 +695,7 @@ fn autonomy_segment(
         .justify_center()
         .px(px(f32::from(t.spacing.md)))
         .py(px(f32::from(t.spacing.sm)))
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(bg))
         .border_1()
         .border_color(rgb(if active {
@@ -739,7 +739,7 @@ fn readonly_value(
                         .overflow_hidden()
                         .px(px(f32::from(t.spacing.md)))
                         .py(px(f32::from(t.spacing.sm)))
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(t.surface.raised))
                         .border_1()
                         .border_color(rgb(t.surface.border))
@@ -756,7 +756,7 @@ fn readonly_value(
                         .justify_center()
                         .px(px(f32::from(t.spacing.md)))
                         .py(px(f32::from(t.spacing.sm)))
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(t.surface.raised))
                         .border_1()
                         .border_color(rgb(t.surface.border))

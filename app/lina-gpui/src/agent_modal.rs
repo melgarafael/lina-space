@@ -28,7 +28,7 @@ use lina_cli_profiles::ProfileRegistry;
 use lina_core::{CliProfile, DiscoveredCli, Effort};
 use lina_host::NodeId;
 
-use crate::ui::{Button, Frame, Modal, Panel, Space};
+use crate::ui::{Button, Frame, Modal, Panel, RadiusExt, Space};
 
 use crate::bridge::AgentEngine;
 use crate::role_suggester::{humanize, role_registry, RoleSuggester, RoleSuggestion};
@@ -1800,7 +1800,7 @@ pub fn render(
                 .items_center()
                 .px_3()
                 .py_2()
-                .rounded_md()
+                .rounded_chrome()
                 .bg(rgb(th.surface.panel))
                 .text_color(rgb(th.text.primary))
                 .cursor_pointer()
@@ -1865,7 +1865,7 @@ pub fn render(
                         .gap_2()
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised));
                     // Só linha resumível é clicável — a inerte não promete o que não cumpre.
                     if r.resumable {
@@ -1918,7 +1918,7 @@ pub fn render(
                     .gap_2()
                     .px_4()
                     .py_3()
-                    .rounded_md()
+                    .rounded_chrome()
                     .bg(rgb(th.surface.panel))
                     .child(
                         div()
@@ -1931,7 +1931,7 @@ pub fn render(
                             .id("m6-install-reco")
                             .px_4()
                             .py_2()
-                            .rounded_md()
+                            .rounded_content()
                             .bg(rgb(th.accent.action))
                             .text_color(rgb(th.text.on_accent))
                             .cursor_pointer()
@@ -1961,7 +1961,7 @@ pub fn render(
                     .id(("m6-engine", i))
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(if active {
                         th.surface.raised_alt
                     } else {
@@ -1983,7 +1983,7 @@ pub fn render(
                     .id("m6-install-other")
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.surface.raised))
                     .text_color(rgb(th.text.primary))
                     .cursor_pointer()
@@ -2000,7 +2000,7 @@ pub fn render(
                     div()
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .border_1()
                         .border_color(rgb(th.state.warning))
                         .text_color(rgb(th.state.warning))
@@ -2047,7 +2047,7 @@ pub fn render(
                     .overflow_hidden()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.surface.chrome))
                     .border_1()
                     .border_color(rgb(if modal.focus_field() == FocusField::Name {
@@ -2123,7 +2123,7 @@ pub fn render(
             .gap_1()
             .px_3()
             .py_2()
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(th.surface.panel))
             .border_1()
             .border_color(rgb(th.surface.border))
@@ -2146,7 +2146,7 @@ pub fn render(
             .gap_1()
             .px_3()
             .py_2()
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(th.surface.panel))
             .border_1()
             .border_color(rgb(th.accent.primary))
@@ -2174,7 +2174,7 @@ pub fn render(
         (None, None) if modal.copilot_no_match() => div()
             .px_3()
             .py_2()
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(th.surface.panel))
             .text_color(rgb(th.text.secondary))
             .child(text!(COPY_ROLE_NO_MATCH))
@@ -2182,7 +2182,7 @@ pub fn render(
         _ => div()
             .px_3()
             .py_2()
-            .rounded_md()
+            .rounded_content()
             .bg(rgb(th.surface.panel))
             .text_color(rgb(th.text.muted))
             .child(text!(COPY_ROLE_PLACEHOLDER))
@@ -2217,7 +2217,7 @@ pub fn render(
                     .flex_none()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.surface.raised))
                     .text_color(rgb(th.text.bright))
                     .cursor_pointer()
@@ -2320,7 +2320,7 @@ pub fn render(
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .overflow_hidden()
                     .bg(rgb(if active {
                         th.surface.raised_alt
@@ -2360,7 +2360,7 @@ pub fn render(
                             .flex_none()
                             .px_2()
                             .py_1()
-                            .rounded_md()
+                            .rounded_content()
                             .bg(rgb(th.surface.raised))
                             .line_height(px(GALLERY_LINE_H))
                             .text_color(rgb(th.text.bright))
@@ -2385,7 +2385,7 @@ pub fn render(
                     .gap_2()
                     .px_3()
                     .py_3()
-                    .rounded_md()
+                    .rounded_chrome()
                     .bg(rgb(th.surface.chrome))
                     .border_1()
                     .border_color(rgb(th.surface.raised_alt))
@@ -2422,7 +2422,7 @@ pub fn render(
                             .py_2()
                             .overflow_hidden()
                             .line_height(px(GALLERY_LINE_H))
-                            .rounded_md()
+                            .rounded_content()
                             .bg(rgb(th.surface.panel))
                             .text_color(rgb(qfg))
                             .child(text!(format!("🔎 {qtxt}"))),
@@ -2461,7 +2461,7 @@ pub fn render(
                     .flex_none()
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.surface.raised))
                     .text_color(rgb(th.text.bright))
                     .cursor_pointer()
@@ -2730,7 +2730,7 @@ pub fn render(
                         .overflow_hidden()
                         .px_3()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.chrome))
                         .border_1()
                         .border_color(rgb(if modal.focus_field() == FocusField::Command {
@@ -2839,7 +2839,7 @@ fn editor_field_box(
         .overflow_hidden()
         .px_3()
         .py_2()
-        .rounded_md()
+        .rounded_content()
         .bg(rgb(th.surface.panel))
         .border_1()
         .border_color(rgb(if focused {
@@ -2883,7 +2883,7 @@ fn render_template_editor(
         .gap_2()
         .px_3()
         .py_3()
-        .rounded_md()
+        .rounded_chrome()
         .bg(rgb(th.surface.chrome))
         .border_1()
         .border_color(rgb(th.surface.raised_alt))
@@ -2975,7 +2975,7 @@ fn render_template_editor(
                     .min_w(px(0.0))
                     .px_3()
                     .py_2()
-                    .rounded_md()
+                    .rounded_content()
                     .bg(rgb(th.surface.panel))
                     .border_1()
                     .border_color(rgb(if ed.focus == EditorField::Doctrine {
@@ -3031,7 +3031,7 @@ fn render_template_editor(
                         .flex_none()
                         .px_4()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.surface.raised))
                         .line_height(px(GALLERY_LINE_H))
                         .text_color(rgb(th.text.bright))
@@ -3047,7 +3047,7 @@ fn render_template_editor(
                         .flex_none()
                         .px_4()
                         .py_2()
-                        .rounded_md()
+                        .rounded_content()
                         .bg(rgb(th.accent.confirm))
                         .line_height(px(GALLERY_LINE_H))
                         .text_color(rgb(th.text.on_accent))
