@@ -17,9 +17,20 @@ const GOLDEN_CARGO_TEST: &str = include_str!("golden/pretooluse_cargo_test.json"
 /// `(stdout, stderr, success)`.
 fn run_pretooluse(input: &str) -> (String, String, bool) {
     let exe = env!("CARGO_BIN_EXE_lina");
+    // Hermético: isola `LINA_HOME` num dir temp SEM `workspace.json` → o gate fica LIGADO,
+    // independentemente do `LINA_HOME` do ambiente (num terminal Lina real ele pode apontar para um
+    // Espaço com `guard:off`, que curto-circuitaria o hook para `allow`). Assim o golden testa a
+    // CLASSIFICAÇÃO do comando, não o toggle-mestre do Espaço (esse tem cobertura própria).
+    let home = std::env::temp_dir().join(format!(
+        "lina-golden-home-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::create_dir_all(&home);
     let mut child = Command::new(exe)
         .args(["guard", "--pretooluse"])
         .env("LINA_AUTONOMY", "assistido")
+        .env("LINA_HOME", &home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
