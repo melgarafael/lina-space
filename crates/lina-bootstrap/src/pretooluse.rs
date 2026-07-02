@@ -184,6 +184,15 @@ pub fn pretooluse_output(input_json: &str, autonomy: &str) -> String {
     pretooluse_result(input_json, autonomy).json
 }
 
+/// Linha JSON de `allow` INCONDICIONAL do hook, no formato canônico do Claude Code. Usada quando o
+/// gate está DESLIGADO por escolha do dono do Espaço (`workspace.json → guard:off`): uma chamada
+/// residual do hook (settings antigo ainda com o comando) devolve `allow` na hora, sem classificar
+/// nada. Reusa o mesmo serializador dos demais caminhos — zero drift de formato.
+#[must_use]
+pub fn allow_output(reason: &str) -> String {
+    HookOutput::new("allow", reason.to_string()).render()
+}
+
 /// FIX-2: núcleo do hook — devolve o JSON E (quando `ask` sobre Bash) o `gated_ask` para a fila de
 /// atenção. PURA (sem IO): o append do `ActionGated` é do caller. Matriz de decisão:
 /// - `Bash` → extrai `tool_input.command`, classifica e decide pela matriz (ask → `gated_ask`).

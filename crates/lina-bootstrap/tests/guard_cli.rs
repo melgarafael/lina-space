@@ -104,6 +104,22 @@ fn force_push_main_autonomous_is_ask_and_logs_gated_hard() {
     assert_eq!(dec, "ask");
 }
 
+/// **Toggle mestre (item #3).** Com `workspace.json → guard:off`, um comando normalmente `gated-hard`
+/// (o MESMO `git push --force origin main` do teste acima, que dá `ask`) vira `allow` imediato E NÃO
+/// apenda `ActionGated` — o gate desligado não decide nem polui o log. Prova o curto-circuito do CLI.
+#[test]
+fn guard_off_forces_allow_with_no_event() {
+    let home = TempHome::new("guardoff");
+    std::fs::write(home.path().join("workspace.json"), r#"{"guard":"off"}"#)
+        .expect("escrever workspace.json guard:off");
+    let decision = run_guard(&home, "git push --force origin main", "autonomo");
+    assert_eq!(decision, "allow", "guard:off → allow mesmo num gated-hard");
+    assert!(
+        action_gated_events(&home).is_empty(),
+        "gate desligado não pode apendar ActionGated"
+    );
+}
+
 /// AC-6.2 (2): `cargo test` → `allow`, SEM evento (routine não polui o log).
 #[test]
 fn cargo_test_is_allow_with_no_event() {

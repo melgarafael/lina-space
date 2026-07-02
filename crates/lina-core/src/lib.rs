@@ -108,7 +108,8 @@ pub use workspace::{
 /// W3-6: núcleo determinístico do gate de execução (classe de ação × autonomia → decisão).
 mod guard;
 pub use guard::{
-    check_action, classify, decide, parse_autonomy, ActionClass, Decision, GateDecision, GuardError,
+    check_action, classify, decide, guard_enabled, parse_autonomy, ActionClass, Decision,
+    GateDecision, GuardError,
 };
 
 /// W3-6c (ADR 0004): broker de ação custodiada (`lina do`) — custódia de segredo é o gate duro real.

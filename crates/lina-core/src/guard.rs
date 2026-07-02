@@ -114,6 +114,24 @@ pub fn parse_autonomy(s: &str) -> Result<AutonomyLevel, GuardError> {
     }
 }
 
+/// **Chave-mestra do gate por-Espaço.** Lê `<lina_dir>/workspace.json → "guard"`. O gate só é
+/// desligado por escolha EXPLÍCITA do dono do ambiente (`"guard": "off"`); ausência do arquivo/campo,
+/// JSON ilegível ou qualquer outro valor ⇒ **ligado** (fail-safe: nunca desligar o gate por acidente).
+///
+/// É a FONTE ÚNICA lida por todos os consumidores (renderer do `settings.json`, `lina guard`,
+/// custódia do broker) — um só arquivo, zero drift entre superfície e enforcement. Ler o arquivo a
+/// cada chamada (custódia é rara; hook é curto-lived) mantém o toggle vivo sem reiniciar o app.
+#[must_use]
+pub fn guard_enabled(lina_dir: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(lina_dir.join("workspace.json")) else {
+        return true; // sem arquivo → default seguro (gate ligado)
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => v.get("guard").and_then(serde_json::Value::as_str) != Some("off"),
+        Err(_) => true, // JSON quebrado → NUNCA desliga o gate por acidente
+    }
+}
+
 // ───────────────────────────── ruleset embutido (design §1.1) ─────────────────────────────
 
 /// Tokens-chave (igualdade exata de token, NÃO substring) que classificam um comando como
@@ -799,6 +817,37 @@ mod tests {
         assert_eq!(parse_autonomy("autonomo"), Ok(AutonomyLevel::Autonomous));
         assert_eq!(parse_autonomy("AUTÔNOMO"), Ok(AutonomyLevel::Autonomous));
         assert!(parse_autonomy("ludico").is_err());
+    }
+
+    // ---- chave-mestra do gate por-Espaço ----
+
+    /// `guard_enabled` só desliga com `"off"` EXPLÍCITO; tudo mais (ausente, "on", lixo, JSON
+    /// quebrado) mantém o gate LIGADO — o fail-safe que impede desligar o gate por acidente.
+    #[test]
+    fn guard_enabled_only_off_disables_rest_is_fail_safe_on() {
+        let dir = std::env::temp_dir().join("lina_guard_enabled_case");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ws = dir.join("workspace.json");
+
+        // Sem arquivo → ligado.
+        assert!(guard_enabled(&dir), "ausente = ligado");
+
+        // "off" explícito → desligado (a ÚNICA forma).
+        std::fs::write(&ws, r#"{"guard":"off"}"#).unwrap();
+        assert!(!guard_enabled(&dir), "off = desligado");
+
+        // "on" / outro valor / campo ausente / JSON quebrado → ligado.
+        for body in [
+            r#"{"guard":"on"}"#,
+            r#"{"guard":"talvez"}"#,
+            r#"{}"#,
+            "{lixo",
+        ] {
+            std::fs::write(&ws, body).unwrap();
+            assert!(guard_enabled(&dir), "fail-safe on p/ {body:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ════════════ ROUND 5: 7 bypasses ALTA fechados ════════════
