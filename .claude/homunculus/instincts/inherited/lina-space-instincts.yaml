@@ -1,0 +1,176 @@
+# Instincts generated from https://github.com/melgarafael/lina-space
+# Generated: 2026-06-17T14:25:19.272Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: lina-space-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: fix, build, feat
+
+## Evidence
+
+- 6 commits analyzed
+- Detected conventional commit pattern
+- Examples: build(windows): ambiente de build Windows — SSL, linker MSVC, dev.bat, fix(windows/app): corrige crashes no boot e stack overflow
+
+---
+id: lina-space-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Commit Length
+
+## Action
+
+Write moderate-length commit messages (~66 characters)
+
+## Evidence
+
+- Average commit message length: 66 chars
+- Based on 6 commits
+
+---
+id: lina-space-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: lina-space-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: lina-space-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: lina-space-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: lina-space-workflow-windows-platform-feature-or-bugfix
+trigger: "when doing windows platform feature or bugfix"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Workflow Windows Platform Feature Or Bugfix
+
+## Action
+
+Follow the windows-platform-feature-or-bugfix workflow:
+1. Modify or add Rust source files under app/lina-gpui/src/ to implement or fix Windows-specific logic.
+2. Update WINDOWS-CONTRIB.md to document the change, rationale, or workaround.
+3. Optionally update docs/CORRECTIONS.md with error histories and solutions.
+4. If build or environment changes are needed, update .cargo/config.toml or related build scripts.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: app/lina-gpui/src/main.rs, app/lina-gpui/src/bridge.rs, WINDOWS-CONTRIB.md
+
+---
+id: lina-space-workflow-windows-keybinding-or-shortcut-update
+trigger: "when doing windows keybinding or shortcut update"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Workflow Windows Keybinding Or Shortcut Update
+
+## Action
+
+Follow the windows-keybinding-or-shortcut-update workflow:
+1. Modify app/lina-gpui/src/main.rs or bridge.rs to implement or adjust keybinding logic under cfg(windows).
+2. Document the new or changed shortcuts in WINDOWS-CONTRIB.md.
+3. Test to ensure the shortcut works as expected on Windows.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: app/lina-gpui/src/main.rs, app/lina-gpui/src/bridge.rs, WINDOWS-CONTRIB.md
+
