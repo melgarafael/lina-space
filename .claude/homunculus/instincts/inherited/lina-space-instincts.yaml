@@ -1,0 +1,388 @@
+# Instincts generated from https://github.com/melgarafael/lina-space
+# Generated: 2026-06-17T14:24:46.994Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: lina-space-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: fix, build, feat
+
+## Evidence
+
+- 6 commits analyzed
+- Detected conventional commit pattern
+- Examples: build(windows): ambiente de build Windows — SSL, linker MSVC, dev.bat, fix(windows/app): corrige crashes no boot e stack overflow
+
+---
+id: lina-space-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Commit Length
+
+## Action
+
+Write moderate-length commit messages (~66 characters)
+
+## Evidence
+
+- Average commit message length: 66 chars
+- Based on 6 commits
+
+---
+id: lina-space-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: lina-space-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: lina-space-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: lina-space-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: lina-space-workflow-windows-platform-feature-or-bugfix
+trigger: "when doing windows platform feature or bugfix"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Workflow Windows Platform Feature Or Bugfix
+
+## Action
+
+Follow the windows-platform-feature-or-bugfix workflow:
+1. Modify or add Rust source files under app/lina-gpui/src/ to implement or fix Windows-specific logic.
+2. Update WINDOWS-CONTRIB.md to document the change, rationale, or workaround.
+3. Optionally update docs/CORRECTIONS.md with error histories and solutions.
+4. If build or environment changes are needed, update .cargo/config.toml or related build scripts.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: app/lina-gpui/src/main.rs, app/lina-gpui/src/bridge.rs, WINDOWS-CONTRIB.md
+
+---
+id: lina-space-workflow-windows-keybinding-or-shortcut-update
+trigger: "when doing windows keybinding or shortcut update"
+confidence: 0.65
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/melgarafael/lina-space
+---
+
+# Lina Space Workflow Windows Keybinding Or Shortcut Update
+
+## Action
+
+Follow the windows-keybinding-or-shortcut-update workflow:
+1. Modify app/lina-gpui/src/main.rs or bridge.rs to implement or adjust keybinding logic under cfg(windows).
+2. Document the new or changed shortcuts in WINDOWS-CONTRIB.md.
+3. Test to ensure the shortcut works as expected on Windows.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~3x per month
+- Files: app/lina-gpui/src/main.rs, app/lina-gpui/src/bridge.rs, WINDOWS-CONTRIB.md
+
+---
+id: lina-space-instinct-file-naming
+trigger: "When creating or renaming a file in the codebase"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct File Naming
+
+## Action
+
+Use camelCase for file names
+
+## Evidence
+
+- Pattern in namingConventions.files: camelCase
+
+---
+id: lina-space-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: lina-space-instinct-class-naming
+trigger: "When defining a new class or struct"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Class Naming
+
+## Action
+
+Use PascalCase for class or struct names
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: lina-space-instinct-constant-naming
+trigger: "When declaring a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: lina-space-instinct-import-style
+trigger: "When importing modules in Rust files"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: lina-space-instinct-export-style
+trigger: "When exporting modules or items"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: lina-space-instinct-test-location
+trigger: "When writing tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Test Location
+
+## Action
+
+Place tests in a separate folder from source code
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: separate
+
+---
+id: lina-space-instinct-commit-prefix
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Commit Prefix
+
+## Action
+
+Start the commit message with a conventional prefix: fix, feat, or build
+
+## Evidence
+
+- Pattern in commits.prefixes: fix, feat, build
+- Seen in commit: fix(windows/app): corrige crashes no boot e stack overflow
+
+---
+id: lina-space-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Commit Length
+
+## Action
+
+Keep the commit message concise, around 66 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength: 66
+
+---
+id: lina-space-instinct-windows-platform-feature-or-bugfix
+trigger: "When adding, fixing, or improving Windows-specific functionality or resolving platform-specific bugs"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Windows Platform Feature Or Bugfix
+
+## Action
+
+Modify or add Rust source files under app/lina-gpui/src/, update WINDOWS-CONTRIB.md, optionally update docs/CORRECTIONS.md, and update .cargo/config.toml or build scripts if needed
+
+## Evidence
+
+- Workflow: windows-platform-feature-or-bugfix
+- Pattern in workflow files: app/lina-gpui/src/main.rs, WINDOWS-CONTRIB.md, .cargo/config.toml
+
+---
+id: lina-space-instinct-windows-keybinding-or-shortcut-update
+trigger: "When adding or changing keyboard shortcuts or keybindings for Windows users"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: melgarafael/lina-space
+---
+
+# Lina Space Instinct Windows Keybinding Or Shortcut Update
+
+## Action
+
+Modify app/lina-gpui/src/main.rs or bridge.rs under cfg(windows), document in WINDOWS-CONTRIB.md, and test the shortcut
+
+## Evidence
+
+- Workflow: windows-keybinding-or-shortcut-update
+- Pattern in workflow files: app/lina-gpui/src/main.rs, WINDOWS-CONTRIB.md
+
