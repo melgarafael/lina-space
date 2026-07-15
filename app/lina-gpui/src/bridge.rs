@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,6 @@ use lina_bootstrap::{Autonomy, BootstrapInput, Bootstrapper};
 // W4-2 (M2): deriva o papel do agente pelo nome ("Revisor" -> reviewer).
 // F3-3 (M-INJETOR): o papel da seção de Mentalidade ESPELHA o que o template declara em
 // "Seu papel: X" — mesma inferência (`infer_role(name).role`), para nunca divergir.
-use lina_role_discovery::RoleRegistry;
 
 use lina_core::{
     build_paste, deliver_a2a, discover_clis, lookup_action, now_ms, run_custody, A2aEnvelope,
@@ -92,6 +91,48 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Sinal de mudança para a barreira de desmontagem. O descarregamento espera
+/// uma transição observada em vez de adivinhar a duração de um tick com sleeps.
+#[derive(Debug, Default)]
+struct QuiescenceSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl QuiescenceSignal {
+    fn notify(&self) {
+        let mut generation = lock(&self.generation);
+        *generation = generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn generation(&self) -> u64 {
+        *lock(&self.generation)
+    }
+
+    fn wait_for_change(&self, observed: u64, deadline: Instant) -> bool {
+        let mut generation = lock(&self.generation);
+        while *generation == observed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timed_out) = match self.changed.wait_timeout(generation, remaining) {
+                Ok((next, result)) => (next, result.timed_out()),
+                Err(poisoned) => {
+                    let (next, result) = poisoned.into_inner();
+                    (next, result.timed_out())
+                }
+            };
+            generation = next;
+            if timed_out && *generation == observed {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// W5-5: os `NodeId` dos membros **vivos** do Espaço — a fonte de verdade dos pares de
 /// injeção confiados (invariante #5, *pertencimento = conexão*). A allow-list de produção
 /// ([`WorkspaceTrust`]) deriva daqui: um id fora deste roster vivo (desconhecido/forjado)
@@ -146,15 +187,205 @@ pub struct ReinjectItem {
     role: String,
 }
 
-/// Fila EM-PROCESSO de re-injeção, compartilhada (clone de `Arc`) entre o produtor
-/// (`NodeManager::assign_role`) e o consumidor (`MailboxPump::drain_reinject`). Substitui a antiga
-/// mailbox de filesystem (FIX-A3): zero superfície que um processo/agente externo alcance.
-pub type ReinjectQueue = Arc<Mutex<VecDeque<ReinjectItem>>>;
+struct EphemeralQueueState<T> {
+    items: VecDeque<T>,
+    reservations: usize,
+    draining: bool,
+    quiescing: bool,
+}
+
+impl<T> Default for EphemeralQueueState<T> {
+    fn default() -> Self {
+        Self {
+            items: VecDeque::new(),
+            reservations: 0,
+            draining: false,
+            quiescing: false,
+        }
+    }
+}
+
+/// Fila in-process cuja admissão, itens pendentes e dreno participam da quiescência do runtime.
+/// O mesmo contrato é consumido pelas filas reais de gesto humano e re-injeção de doutrina.
+pub struct EphemeralQueue<T> {
+    state: Arc<Mutex<EphemeralQueueState<T>>>,
+    signal: Arc<QuiescenceSignal>,
+}
+
+impl<T> Clone for EphemeralQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            signal: Arc::clone(&self.signal),
+        }
+    }
+}
+
+impl<T> Default for EphemeralQueue<T> {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(EphemeralQueueState::default())),
+            signal: Arc::new(QuiescenceSignal::default()),
+        }
+    }
+}
+
+struct EphemeralQueueReservation<T> {
+    queue: EphemeralQueue<T>,
+    active: bool,
+}
+
+struct EphemeralQueueDrain<T> {
+    queue: EphemeralQueue<T>,
+    active: bool,
+}
+
+struct EphemeralQueueQuiescence<T> {
+    queue: EphemeralQueue<T>,
+    sealed: bool,
+}
+
+impl<T> EphemeralQueue<T> {
+    fn with_signal(signal: Arc<QuiescenceSignal>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(EphemeralQueueState::default())),
+            signal,
+        }
+    }
+
+    fn try_reserve(&self) -> Result<EphemeralQueueReservation<T>, String> {
+        let mut state = lock(&self.state);
+        if state.quiescing {
+            return Err("o Espaço está concluindo o descarregamento".to_owned());
+        }
+        state.reservations = state
+            .reservations
+            .checked_add(1)
+            .ok_or_else(|| "contador de reservas da fila esgotado".to_owned())?;
+        drop(state);
+        self.signal.notify();
+        Ok(EphemeralQueueReservation {
+            queue: self.clone(),
+            active: true,
+        })
+    }
+
+    fn try_push(&self, item: T) -> Result<(), String> {
+        let mut state = lock(&self.state);
+        if state.quiescing {
+            return Err("o Espaço está concluindo o descarregamento".to_owned());
+        }
+        state.items.push_back(item);
+        drop(state);
+        self.signal.notify();
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<(Vec<T>, EphemeralQueueDrain<T>), String> {
+        let mut state = lock(&self.state);
+        if state.draining {
+            return Err("a fila efêmera já possui um dreno ativo".to_owned());
+        }
+        let items: Vec<T> = state.items.drain(..).collect();
+        state.draining = !items.is_empty();
+        let active = state.draining;
+        drop(state);
+        self.signal.notify();
+        Ok((
+            items,
+            EphemeralQueueDrain {
+                queue: self.clone(),
+                active,
+            },
+        ))
+    }
+
+    fn try_quiesce(&self) -> Option<EphemeralQueueQuiescence<T>> {
+        let mut state = lock(&self.state);
+        if state.quiescing || state.reservations != 0 || state.draining || !state.items.is_empty() {
+            return None;
+        }
+        state.quiescing = true;
+        Some(EphemeralQueueQuiescence {
+            queue: self.clone(),
+            sealed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        lock(&self.state).items.len()
+    }
+}
+
+impl<T> EphemeralQueueReservation<T> {
+    fn commit(mut self, item: T) {
+        let mut state = lock(&self.queue.state);
+        release_ephemeral_reservation(&mut state);
+        state.items.push_back(item);
+        drop(state);
+        self.queue.signal.notify();
+        self.active = false;
+    }
+}
+
+impl<T> Drop for EphemeralQueueReservation<T> {
+    fn drop(&mut self) {
+        if self.active {
+            release_ephemeral_reservation(&mut lock(&self.queue.state));
+            self.queue.signal.notify();
+        }
+    }
+}
+
+fn release_ephemeral_reservation<T>(state: &mut EphemeralQueueState<T>) {
+    match state.reservations.checked_sub(1) {
+        Some(remaining) => state.reservations = remaining,
+        None => eprintln!("lina-gpui: fila efêmera liberou reserva inexistente"),
+    }
+}
+
+impl<T> Drop for EphemeralQueueDrain<T> {
+    fn drop(&mut self) {
+        if self.active {
+            lock(&self.queue.state).draining = false;
+            self.queue.signal.notify();
+        }
+    }
+}
+
+impl<T> EphemeralQueueDrain<T> {
+    /// Recoloca trabalho já aceito. Um dreno ativo impede quiescência, portanto
+    /// retry não atravessa nem precisa reabrir o gate de novos produtores.
+    fn requeue_front(&self, item: T) {
+        lock(&self.queue.state).items.push_front(item);
+        self.queue.signal.notify();
+    }
+}
+
+impl<T> EphemeralQueueQuiescence<T> {
+    fn seal(mut self) {
+        self.sealed = true;
+    }
+}
+
+impl<T> Drop for EphemeralQueueQuiescence<T> {
+    fn drop(&mut self) {
+        if !self.sealed {
+            lock(&self.queue.state).quiescing = false;
+        }
+    }
+}
+
+/// Fila EM-PROCESSO de re-injeção, compartilhada entre o produtor
+/// (`NodeManager::assign_role`) e o consumidor (`MailboxPump::drain_reinject`).
+pub type ReinjectQueue = EphemeralQueue<ReinjectItem>;
 
 /// Cria uma fila de re-injeção vazia (em-processo).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn new_reinject_queue() -> ReinjectQueue {
-    Arc::new(Mutex::new(VecDeque::new()))
+    ReinjectQueue::default()
 }
 
 /// F3-1-7 (ADR 0036): um GESTO HUMANO DIRETO da UI (confirmar/ajustar uma Goal) a caminho do core.
@@ -437,24 +668,38 @@ fn run_skill_selection(
 
 /// Empurra uma re-injeção na fila EM-PROCESSO. `target` é o `NodeId` AUTENTICADO (já resolvido no
 /// `assign_role`); `role` regenera o texto no consumidor. SEM I/O e SEM filesystem — nenhum agente
-/// alcança esta fila (FIX-A3). Infalível (push em memória).
-fn enqueue_doctrine_reinjection(queue: &ReinjectQueue, target: NodeId, role: &str) {
-    lock(queue).push_back(ReinjectItem {
+/// alcança esta fila (FIX-A3). Recusa antes do efeito quando a desmontagem já selou o ingresso.
+#[cfg(test)]
+fn enqueue_doctrine_reinjection(
+    queue: &ReinjectQueue,
+    target: NodeId,
+    role: &str,
+) -> Result<(), String> {
+    queue.try_push(ReinjectItem {
         id: format!("reinject_{}", uuid::Uuid::now_v7()),
         target,
         role: role.to_string(),
-    });
+    })
 }
 
 /// **FREIO W4-3 aplicado à fila EM-PROCESSO.** Pausado → devolve `[]` SEM tocar a fila (nada se
 /// injeta; a doutrina fica enfileirada em RAM até o "Retomar"). Solto → drena TODOS os itens.
 /// (FIX-A3: não é mais crash-durável — tradeoff aceito; o papel em si segue durável via
 /// `NodeRoleAssigned`+CLAUDE.md, e o restore NÃO re-deriva a re-injeção.)
-fn drain_reinject_active(queue: &ReinjectQueue, paused: bool) -> Vec<ReinjectItem> {
+fn drain_reinject_active(
+    queue: &ReinjectQueue,
+    paused: bool,
+) -> Result<(Vec<ReinjectItem>, EphemeralQueueDrain<ReinjectItem>), String> {
     if paused {
-        return Vec::new();
+        return Ok((
+            Vec::new(),
+            EphemeralQueueDrain {
+                queue: queue.clone(),
+                active: false,
+            },
+        ));
     }
-    lock(queue).drain(..).collect()
+    queue.drain()
 }
 
 /// Injeção FASEADA da doutrina no PTY vivo de `target`, pela fila serial de escrita do Supervisor
@@ -549,6 +794,148 @@ impl Pulse {
     }
 }
 
+#[derive(Debug, Default)]
+struct EphemeralActivityState {
+    producers: usize,
+    work: usize,
+    quiescing: bool,
+}
+
+/// Contabiliza trabalho aceito que ainda existe apenas em RAM. Produtores reservam
+/// antes do efeito e cada item mantém um permit até desfecho ou persistência.
+#[derive(Clone, Debug)]
+pub(crate) struct EphemeralActivity {
+    state: Arc<Mutex<EphemeralActivityState>>,
+    signal: Arc<QuiescenceSignal>,
+}
+
+impl Default for EphemeralActivity {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(EphemeralActivityState::default())),
+            signal: Arc::new(QuiescenceSignal::default()),
+        }
+    }
+}
+
+struct EphemeralProduction {
+    activity: EphemeralActivity,
+    active: bool,
+}
+
+struct EphemeralWorkPermit {
+    activity: EphemeralActivity,
+    active: bool,
+}
+
+struct EphemeralActivityQuiescence {
+    activity: EphemeralActivity,
+    sealed: bool,
+}
+
+impl EphemeralActivity {
+    fn signal(&self) -> Arc<QuiescenceSignal> {
+        Arc::clone(&self.signal)
+    }
+
+    fn try_reserve(&self) -> Result<EphemeralProduction, String> {
+        let mut state = lock(&self.state);
+        if state.quiescing {
+            return Err("o Espaço está concluindo o descarregamento".to_owned());
+        }
+        state.producers = state
+            .producers
+            .checked_add(1)
+            .ok_or_else(|| "contador de produtores efêmeros esgotado".to_owned())?;
+        drop(state);
+        self.signal.notify();
+        Ok(EphemeralProduction {
+            activity: self.clone(),
+            active: true,
+        })
+    }
+
+    fn try_quiesce(&self) -> Option<EphemeralActivityQuiescence> {
+        let mut state = lock(&self.state);
+        if state.quiescing || state.producers != 0 || state.work != 0 {
+            return None;
+        }
+        state.quiescing = true;
+        Some(EphemeralActivityQuiescence {
+            activity: self.clone(),
+            sealed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn pending_work(&self) -> usize {
+        lock(&self.state).work
+    }
+}
+
+impl EphemeralProduction {
+    fn accept_work(&self) -> Result<EphemeralWorkPermit, String> {
+        if !self.active {
+            return Err("a reserva do produtor efêmero já foi encerrada".to_owned());
+        }
+        let mut state = lock(&self.activity.state);
+        state.work = state
+            .work
+            .checked_add(1)
+            .ok_or_else(|| "contador de trabalho efêmero esgotado".to_owned())?;
+        drop(state);
+        self.activity.signal.notify();
+        Ok(EphemeralWorkPermit {
+            activity: self.activity.clone(),
+            active: true,
+        })
+    }
+}
+
+impl Drop for EphemeralProduction {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = lock(&self.activity.state);
+            match state.producers.checked_sub(1) {
+                Some(remaining) => state.producers = remaining,
+                None => eprintln!("lina-gpui: produtor efêmero liberado sem reserva"),
+            }
+            drop(state);
+            self.activity.signal.notify();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for EphemeralWorkPermit {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = lock(&self.activity.state);
+            match state.work.checked_sub(1) {
+                Some(remaining) => state.work = remaining,
+                None => eprintln!("lina-gpui: trabalho efêmero concluído sem admissão"),
+            }
+            drop(state);
+            self.activity.signal.notify();
+            self.active = false;
+        }
+    }
+}
+
+impl EphemeralActivityQuiescence {
+    fn seal(mut self) {
+        self.sealed = true;
+    }
+}
+
+impl Drop for EphemeralActivityQuiescence {
+    fn drop(&mut self) {
+        if !self.sealed {
+            lock(&self.activity.state).quiescing = false;
+        }
+    }
+}
+
 /// Estado projetado (metadados + pulso + persistência). SÓ dados.
 #[derive(Debug, Default)]
 pub struct SharedModel {
@@ -566,6 +953,9 @@ pub struct SharedModel {
     /// «Novo começo…», copy-f1-4 §4). Efêmero por sessão (some na 1ª interação — o render
     /// remove); nós não-restaurados não aparecem aqui.
     pub restore_badges: BTreeMap<NodeId, RestoreBadge>,
+    /// Trabalho aceito que ainda só existe em RAM; não é renderizado, mas compartilha
+    /// o ciclo de vida do mesmo runtime/model com UI, pump e gatilho A2A.
+    pub(crate) ephemeral_activity: EphemeralActivity,
 }
 
 impl SharedModel {
@@ -706,7 +1096,20 @@ pub struct A2aTrigger {
     registry: Arc<ProfileRegistry>,
     store: Arc<Mutex<EventStore>>,
     model: Model,
+    ephemeral_activity: EphemeralActivity,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct A2aTaskGate {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+    bypass_delivery: bool,
+}
+
+#[cfg(test)]
+static A2A_TASK_GATE: OnceLock<Mutex<Option<A2aTaskGate>>> = OnceLock::new();
 
 impl A2aTrigger {
     // A2A UNIVERSAL: +1 arg (registry) levou de 7→8 — mesma natureza do `MailboxPump::new`.
@@ -722,6 +1125,7 @@ impl A2aTrigger {
         store: Arc<Mutex<EventStore>>,
         model: Model,
     ) -> Self {
+        let ephemeral_activity = lock(&model).ephemeral_activity.clone();
         Self {
             sup,
             from,
@@ -731,6 +1135,8 @@ impl A2aTrigger {
             registry,
             store,
             model,
+            ephemeral_activity,
+            tasks: Mutex::new(Vec::new()),
         }
     }
 
@@ -738,6 +1144,21 @@ impl A2aTrigger {
     /// (→ o pulso, via o pub/sub); (2) `deliver_a2a` injeta o texto FASEADO no PTY do alvo
     /// (chega no grid de B); (3) persiste `BusMessageSent` no EventStore.
     pub fn fire(&self, text: String) {
+        self.reap_finished();
+        let production = match self.ephemeral_activity.try_reserve() {
+            Ok(production) => production,
+            Err(error) => {
+                eprintln!("lina-gpui: A2A recusado antes do efeito: {error}");
+                return;
+            }
+        };
+        let work = match production.accept_work() {
+            Ok(work) => work,
+            Err(error) => {
+                eprintln!("lina-gpui: A2A não admitido: {error}");
+                return;
+            }
+        };
         let sup = Arc::clone(&self.sup);
         let grid_to = Arc::clone(&self.grid_to);
         let store = Arc::clone(&self.store);
@@ -747,40 +1168,72 @@ impl A2aTrigger {
         let fallback = self.profile.clone();
         let from = self.from;
         let to = self.to;
-        thread::spawn(move || {
-            let env = A2aEnvelope::new(from, Recipient::Node(to), Some("a2a-demo".into()));
-            let id = env.id.clone();
-            let _targets = sup.route(&env, RolePolicy::All);
-            // W5-5: allow-list REAL — pares confiados = membros vivos do mesmo Espaço
-            // (default-deny par fora do Espaço); substitui o `InjectPolicy::AllowAll` (dead code).
-            let trust = WorkspaceTrust::from_members(&live_member_ids(&sup));
-            // A2A UNIVERSAL: profile_id do ALVO pela projeção (`CliProfileSet`) → profile DELE;
-            // fallback ao global se ausente/desconhecido. Projeta ANTES do lock de append abaixo
-            // (o guard do `project` é solto ao fim deste statement — sem double-lock).
-            let to_cli = lock(&store)
-                .project()
-                .ok()
-                .and_then(|st| st.nodes.get(&to).and_then(|n| n.cli.clone()));
-            let profile = target_profile(to_cli.as_deref(), &registry, &fallback);
-            match deliver_a2a(&sup, to, from, &text, profile, &grid_to, trust.policy()) {
-                Ok(DeliveryOutcome::Injected { .. } | DeliveryOutcome::SessionResume) => {}
-                Err(e) => eprintln!("lina-gpui: deliver_a2a falhou: {e}"),
+        let task = thread::Builder::new()
+            .name("lina-a2a-trigger".into())
+            .spawn(move || {
+                let _work = work;
+                #[cfg(test)]
+                let task_gate = { lock(A2A_TASK_GATE.get_or_init(|| Mutex::new(None))).clone() };
+                #[cfg(test)]
+                if let Some(gate) = task_gate {
+                    gate.entered.wait();
+                    gate.release.wait();
+                    if gate.bypass_delivery {
+                        return;
+                    }
+                }
+                let env = A2aEnvelope::new(from, Recipient::Node(to), Some("a2a-demo".into()));
+                let id = env.id.clone();
+                let _targets = sup.route(&env, RolePolicy::All);
+                // W5-5: allow-list REAL — pares confiados = membros vivos do mesmo Espaço
+                // (default-deny par fora do Espaço); substitui o `InjectPolicy::AllowAll` (dead code).
+                let trust = WorkspaceTrust::from_members(&live_member_ids(&sup));
+                // A2A UNIVERSAL: profile_id do ALVO pela projeção (`CliProfileSet`) → profile DELE;
+                // fallback ao global se ausente/desconhecido. Projeta ANTES do lock de append abaixo
+                // (o guard do `project` é solto ao fim deste statement — sem double-lock).
+                let to_cli = lock(&store)
+                    .project()
+                    .ok()
+                    .and_then(|st| st.nodes.get(&to).and_then(|n| n.cli.clone()));
+                let profile = target_profile(to_cli.as_deref(), &registry, &fallback);
+                match deliver_a2a(&sup, to, from, &text, profile, &grid_to, trust.policy()) {
+                    Ok(DeliveryOutcome::Injected { .. } | DeliveryOutcome::SessionResume) => {}
+                    Err(e) => eprintln!("lina-gpui: deliver_a2a falhou: {e}"),
+                }
+                let count = {
+                    let mut s = lock(&store);
+                    let _ = s.append(&DomainEvent::BusMessageSent {
+                        id,
+                        from,
+                        to: format!("node:{to}"),
+                    });
+                    s.event_count().ok()
+                };
+                let mut m = lock(&model);
+                if let Some(c) = count {
+                    m.event_count = c;
+                }
+                m.touch();
+            });
+        match task {
+            Ok(task) => lock(&self.tasks).push(task),
+            Err(error) => eprintln!("lina-gpui: não consegui iniciar o A2A: {error}"),
+        }
+    }
+
+    fn reap_finished(&self) {
+        let mut tasks = lock(&self.tasks);
+        let mut index = 0;
+        while index < tasks.len() {
+            if tasks[index].is_finished() {
+                let task = tasks.swap_remove(index);
+                if task.join().is_err() {
+                    eprintln!("lina-gpui: thread do gatilho A2A encerrou com panic");
+                }
+            } else {
+                index += 1;
             }
-            let count = {
-                let mut s = lock(&store);
-                let _ = s.append(&DomainEvent::BusMessageSent {
-                    id,
-                    from,
-                    to: format!("node:{to}"),
-                });
-                s.event_count().ok()
-            };
-            let mut m = lock(&model);
-            if let Some(c) = count {
-                m.event_count = c;
-            }
-            m.touch();
-        });
+        }
     }
 
     /// O gatilho A→B só faz sentido com **ambos** os nós vivos. A UI usa isto para esconder o
@@ -789,6 +1242,16 @@ impl A2aTrigger {
     pub fn ready(&self) -> bool {
         let m = lock(&self.model);
         m.nodes.contains_key(&self.from) && m.nodes.contains_key(&self.to)
+    }
+}
+
+impl Drop for A2aTrigger {
+    fn drop(&mut self) {
+        for task in lock(&self.tasks).drain(..) {
+            if task.join().is_err() {
+                eprintln!("lina-gpui: thread do gatilho A2A encerrou com panic");
+            }
+        }
     }
 }
 
@@ -1013,9 +1476,13 @@ pub struct MailboxPump {
     /// F3-3 (ELO2): a reflexão EM VOO (disparada ao sombra, aguardando resposta) + o `ts` do disparo
     /// (base do timeout). `None` = sombra livre para a próxima. Serial → no máximo uma em voo.
     reflector_inflight: Option<(ReflectionRequest, u64)>,
+    /// Um permit por correção ainda somente em fila/backlog/inflight.
+    reflector_work: BTreeMap<String, EphemeralWorkPermit>,
     /// ADR 0049 (R45-EMIT): fila serial de seleções automáticas de skill (tarefa entregue →
     /// `SkillSelected`). Dedup por `(root_cause, node)`. Drenada FORA do hot-path (throttle).
     skill_selection: SkillSelectionQueue,
+    /// Um permit por seleção aceita e ainda não emitida.
+    skill_selection_work: BTreeMap<(String, NodeId), EphemeralWorkPermit>,
     /// ADR 0049: último tick do drain de seleção — throttle a [`SKILL_SELECTION_DRAIN_INTERVAL_MS`].
     last_skill_selection_drain_ms: u64,
     /// F3-5-8: último nível de pressão de disco sinalizado (cache de anti-amplificação, espelha o
@@ -1209,7 +1676,9 @@ impl MailboxPump {
             last_reflection_drain_ms: 0,
             reflector_backlog: std::collections::VecDeque::new(),
             reflector_inflight: None,
+            reflector_work: BTreeMap::new(),
             skill_selection: SkillSelectionQueue::default(),
+            skill_selection_work: BTreeMap::new(),
             last_skill_selection_drain_ms: 0,
             last_disk_pressure: None,
             // F4-0-2: cofre de credenciais de canal (demo MockStore; ver field). Namespaceado por
@@ -1444,13 +1913,26 @@ impl MailboxPump {
         }
     }
 
-    /// Sobe a thread que observa a mailbox (drena → roteia → entrega) a cada ~120 ms.
-    pub fn spawn(mut self) -> JoinHandle<()> {
-        thread::spawn(move || loop {
-            self.refresh_agents();
-            self.tick();
-            thread::sleep(Duration::from_millis(120));
-        })
+    /// Sobe a thread que observa a mailbox (drena → roteia → entrega) com ciclo de
+    /// vida explícito. O handle encerra e aguarda a thread no `stop`/`Drop`, permitindo
+    /// desmontar um workspace sem deixar store, listener e fila presos no processo.
+    pub fn spawn_stoppable(self) -> std::io::Result<Pump> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = self.spawn_loop(Arc::clone(&stop))?;
+        Ok(Pump::from_join(stop, join))
+    }
+
+    fn spawn_loop(mut self, stop: Arc<AtomicBool>) -> std::io::Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("lina-mailbox-pump".into())
+            .spawn(move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.refresh_agents();
+                self.tick();
+                thread::park_timeout(Duration::from_millis(120));
+            })
     }
 
     /// Reescreve `agents.json` (o mapa do time que a skill `lina-agent-bus` lê) quando o roster
@@ -1480,6 +1962,12 @@ impl MailboxPump {
     /// Um tick: aplica o freio pedido pela UI, drena a mailbox e roteia. A entrega resolve o grid do
     /// alvo, injeta faseado e acende o pulso (via [`Self::deliver_fn`]).
     fn tick(&mut self) {
+        let Ok(ephemeral_production) = self.nodes.begin_ephemeral_production() else {
+            return;
+        };
+        let Ok(_activity) = self.nodes.begin_external_task() else {
+            return; // quiescência: a mensagem permanece durável para a próxima montagem.
+        };
         // A2A UNIVERSAL: projeta `node → profile_id` ANTES de qualquer lock do `store` — o
         // `deliver_fn` roda DENTRO do lock do `pump`/`resume`, então projetar lá dentro re-travaria
         // o mesmo `Mutex` (deadlock, pois `std::sync::Mutex` não é reentrante). O mapa é capturado
@@ -1530,7 +2018,7 @@ impl MailboxPump {
                 RouteOutcome::Delivered { targets } => {
                     routed = true;
                     for &node in targets {
-                        self.enqueue_skill_selection(node);
+                        self.enqueue_skill_selection(node, &ephemeral_production);
                     }
                 }
                 RouteOutcome::Queued => {} // freio ativo: enfileirada de propósito, sem ruído
@@ -1565,7 +2053,7 @@ impl MailboxPump {
                 // destilação (1 CLI-call ao sombra) roda no drain, FORA do hot-path (ELO2). `id` é o
                 // `correction_id` (estável → belief_id determinístico); `role` é server-side.
                 RouteOutcome::CorrectionObserved { role } => {
-                    self.enqueue_reflection(id, role);
+                    self.enqueue_reflection(id, role, &ephemeral_production);
                     routed = true;
                 }
                 other => eprintln!("lina-gpui: mensagem {id} não roteada: {other:?}"),
@@ -1609,7 +2097,7 @@ impl MailboxPump {
     /// O(1) no hot-path: lê `delivered_query`/`delivered_root_id` (server-side, correlacionados na
     /// entrega) e enfileira; a seleção cara (retrieval+outcome) roda no drain. Sem query/turno ativo
     /// (ex.: nó só-semeado) → não enfileira.
-    fn enqueue_skill_selection(&mut self, node: NodeId) {
+    fn enqueue_skill_selection(&mut self, node: NodeId, production: &EphemeralProduction) {
         let (Some(root_cause_id), Some(query)) = (
             self.router.delivered_root_id(node),
             self.router.delivered_query(node),
@@ -1619,11 +2107,21 @@ impl MailboxPump {
         if query.trim().is_empty() {
             return;
         }
-        self.skill_selection.enqueue(SkillSelectionRequest {
+        let key = (root_cause_id.clone(), node);
+        let permit = match production.accept_work() {
+            Ok(permit) => permit,
+            Err(error) => {
+                eprintln!("lina-gpui: seleção de skill não admitida: {error}");
+                return;
+            }
+        };
+        if self.skill_selection.enqueue(SkillSelectionRequest {
             node,
             query,
             root_cause_id,
-        });
+        }) {
+            self.skill_selection_work.insert(key, permit);
+        }
     }
 
     /// **ADR 0049 (R45-EMIT) — drena as seleções FORA do hot-path (throttle).** Constrói o índice
@@ -1658,6 +2156,8 @@ impl MailboxPump {
                 &scores,
                 req,
             );
+            self.skill_selection_work
+                .remove(&(req.root_cause_id.clone(), req.node));
         }
     }
 
@@ -1850,13 +2350,28 @@ impl MailboxPump {
     /// (sem I/O); a destilação cara (1 CLI-call ao sombra) roda no drain FORA do hot-path (ELO2).
     /// `correction_id` é o id da mensagem que carregou `[LINA::CORRECTION]` (estável → `belief_id`
     /// determinístico, ADR 0048); `role` é server-side (do binding, jamais do payload do agente).
-    fn enqueue_reflection(&mut self, correction_id: &str, role: &str) {
+    fn enqueue_reflection(
+        &mut self,
+        correction_id: &str,
+        role: &str,
+        production: &EphemeralProduction,
+    ) {
         let req = {
             let store = lock(&self.store);
             build_reflection_request(&store, correction_id, role, now_ms())
         };
         if let Some(req) = req {
-            self.reflector_queue.enqueue(req);
+            let permit = match production.accept_work() {
+                Ok(permit) => permit,
+                Err(error) => {
+                    eprintln!("lina-gpui: reflexão não admitida: {error}");
+                    return;
+                }
+            };
+            let key = req.correction_id.clone();
+            if self.reflector_queue.enqueue(req) {
+                self.reflector_work.insert(key, permit);
+            }
         }
     }
 
@@ -1878,15 +2393,19 @@ impl MailboxPump {
                             eprintln!("lina-gpui: refletor — falha ao apendar {}: {e}", ev.kind());
                         }
                     }
+                    self.reflector_work.remove(&req.correction_id);
                 }
                 None if now_ms.saturating_sub(dispatch_ms) <= REFLECTION_TIMEOUT_MS => {
                     // ainda destilando — recoloca em voo e espera o próximo tick.
                     self.reflector_inflight = Some((req, dispatch_ms));
                 }
-                None => eprintln!(
-                    "lina-gpui: refletor — reflexão {} expirou sem resposta do sombra",
-                    req.correction_id
-                ),
+                None => {
+                    eprintln!(
+                        "lina-gpui: refletor — reflexão {} expirou sem resposta do sombra",
+                        req.correction_id
+                    );
+                    self.reflector_work.remove(&req.correction_id);
+                }
             }
             return;
         }
@@ -1903,7 +2422,10 @@ impl MailboxPump {
             self.last_reflection_drain_ms = now_ms;
             match self.dispatch_to_shadow(&req) {
                 Ok(()) => self.reflector_inflight = Some((req, now_ms)),
-                Err(e) => eprintln!("lina-gpui: refletor — dispatch ao sombra falhou: {e}"),
+                Err(e) => {
+                    eprintln!("lina-gpui: refletor — dispatch ao sombra falhou: {e}");
+                    self.reflector_work.remove(&req.correction_id);
+                }
             }
         }
     }
@@ -2044,7 +2566,13 @@ impl MailboxPump {
     /// NARRADA (stderr), nunca silenciosa; ao aplicar, bumpa o `event_count` da UI para o card
     /// re-projetar no próximo tick.
     fn drain_human_intents(&mut self) {
-        let items = self.nodes.drain_human_intents();
+        let (items, _drain) = match self.nodes.drain_human_intents() {
+            Ok(drained) => drained,
+            Err(error) => {
+                eprintln!("lina-gpui: não consegui drenar gestos humanos: {error}");
+                return;
+            }
+        };
         if items.is_empty() {
             return;
         }
@@ -2294,7 +2822,14 @@ impl MailboxPump {
     /// (nunca silenciosa). TRADEOFF FIX-A3: fila em RAM não é crash-durável — a mudança de papel em si
     /// segue durável (`NodeRoleAssigned`+CLAUDE.md) e o restore NÃO re-deriva a re-injeção.
     fn drain_reinject(&mut self) {
-        let items = drain_reinject_active(&self.reinject_queue, self.router.is_paused());
+        let (items, drain) =
+            match drain_reinject_active(&self.reinject_queue, self.router.is_paused()) {
+                Ok(drained) => drained,
+                Err(error) => {
+                    eprintln!("lina-gpui: não consegui drenar re-injeções: {error}");
+                    return;
+                }
+            };
         let mut retry: Vec<ReinjectItem> = Vec::new();
         for item in items {
             // O alvo é o `NodeId` AUTENTICADO cunhado no `assign_role` — nenhum campo forjável
@@ -2341,9 +2876,8 @@ impl MailboxPump {
         }
         // Re-enfileira NA FRENTE (preserva a ordem relativa) os itens que pediram retry.
         if !retry.is_empty() {
-            let mut q = lock(&self.reinject_queue);
             for item in retry.into_iter().rev() {
-                q.push_front(item);
+                drain.requeue_front(item);
             }
         }
     }
@@ -2595,6 +3129,212 @@ fn post_local_hook(port: u16, hook_id: &str, sig: &str, body: &str) -> Result<u1
         .ok_or_else(|| format!("resposta sem status HTTP: {:?}", resp.lines().next()))
 }
 
+#[derive(Default)]
+struct RuntimeActivityState {
+    quiescing: bool,
+    admissions: usize,
+    external_tasks: usize,
+}
+
+/// Barreira compartilhada entre admissão, tarefas externas e desmontagem do runtime.
+/// A desmontagem só ganha exclusividade quando não existe operação em voo; enquanto
+/// possui a guarda, nenhuma nova admissão/tarefa pode nascer no workspace.
+pub(crate) struct RuntimeActivity {
+    state: Mutex<RuntimeActivityState>,
+    signal: Arc<QuiescenceSignal>,
+}
+
+impl Default for RuntimeActivity {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RuntimeActivityState::default()),
+            signal: Arc::new(QuiescenceSignal::default()),
+        }
+    }
+}
+
+enum RuntimeActivityKind {
+    Admission,
+    External,
+}
+
+pub(crate) struct RuntimeActivityGuard {
+    activity: Arc<RuntimeActivity>,
+    kind: RuntimeActivityKind,
+}
+
+impl Drop for RuntimeActivityGuard {
+    fn drop(&mut self) {
+        let mut state = lock(&self.activity.state);
+        match self.kind {
+            RuntimeActivityKind::Admission => {
+                state.admissions = state.admissions.saturating_sub(1);
+            }
+            RuntimeActivityKind::External => {
+                state.external_tasks = state.external_tasks.saturating_sub(1);
+            }
+        }
+        drop(state);
+        self.activity.signal.notify();
+    }
+}
+
+pub(crate) struct RuntimeQuiescence {
+    activity: Arc<RuntimeActivity>,
+    system_deliveries: Option<lina_webhooks::SystemDeliveryQuiescence>,
+    human_intents: Option<EphemeralQueueQuiescence<HumanIntentItem>>,
+    reinjections: Option<EphemeralQueueQuiescence<ReinjectItem>>,
+    ephemeral_activity: Option<EphemeralActivityQuiescence>,
+    sealed: bool,
+}
+
+impl RuntimeQuiescence {
+    fn with_ephemeral_state(
+        mut self,
+        system_deliveries: lina_webhooks::SystemDeliveryQuiescence,
+        human_intents: EphemeralQueueQuiescence<HumanIntentItem>,
+        reinjections: EphemeralQueueQuiescence<ReinjectItem>,
+        ephemeral_activity: EphemeralActivityQuiescence,
+    ) -> Self {
+        self.system_deliveries = Some(system_deliveries);
+        self.human_intents = Some(human_intents);
+        self.reinjections = Some(reinjections);
+        self.ephemeral_activity = Some(ephemeral_activity);
+        self
+    }
+
+    fn is_idle(&self) -> bool {
+        let state = lock(&self.activity.state);
+        state.admissions == 0 && state.external_tasks == 0
+    }
+
+    pub(crate) fn wait_until_idle(&self, deadline: Instant) -> bool {
+        loop {
+            if self.is_idle() {
+                return true;
+            }
+            let observed = self.activity.change_generation();
+            if self.is_idle() {
+                return true;
+            }
+            if !self.activity.wait_for_change(observed, deadline) {
+                return false;
+            }
+        }
+    }
+
+    /// Confirma que o runtime será descartado. Depois disto não há motivo para
+    /// reabrir a barreira; o próprio `Arc` morre junto com o runtime.
+    pub(crate) fn seal(mut self) {
+        if let Some(system_deliveries) = self.system_deliveries.take() {
+            system_deliveries.seal();
+        }
+        if let Some(human_intents) = self.human_intents.take() {
+            human_intents.seal();
+        }
+        if let Some(reinjections) = self.reinjections.take() {
+            reinjections.seal();
+        }
+        if let Some(ephemeral_activity) = self.ephemeral_activity.take() {
+            ephemeral_activity.seal();
+        }
+        self.sealed = true;
+    }
+}
+
+impl Drop for RuntimeQuiescence {
+    fn drop(&mut self) {
+        if !self.sealed {
+            if let Some(system_deliveries) = self.system_deliveries.take() {
+                drop(system_deliveries);
+            }
+            if let Some(human_intents) = self.human_intents.take() {
+                drop(human_intents);
+            }
+            if let Some(reinjections) = self.reinjections.take() {
+                drop(reinjections);
+            }
+            if let Some(ephemeral_activity) = self.ephemeral_activity.take() {
+                drop(ephemeral_activity);
+            }
+            lock(&self.activity.state).quiescing = false;
+            self.activity.signal.notify();
+        }
+    }
+}
+
+impl RuntimeActivity {
+    fn with_signal(signal: Arc<QuiescenceSignal>) -> Self {
+        Self {
+            state: Mutex::new(RuntimeActivityState::default()),
+            signal,
+        }
+    }
+
+    fn begin(self: &Arc<Self>, kind: RuntimeActivityKind) -> Result<RuntimeActivityGuard, String> {
+        let mut state = lock(&self.state);
+        if state.quiescing {
+            return Err(
+                "o Espaço está concluindo o descarregamento; tente novamente em instantes"
+                    .to_string(),
+            );
+        }
+        match kind {
+            RuntimeActivityKind::Admission => state.admissions += 1,
+            RuntimeActivityKind::External => state.external_tasks += 1,
+        }
+        drop(state);
+        self.signal.notify();
+        Ok(RuntimeActivityGuard {
+            activity: Arc::clone(self),
+            kind,
+        })
+    }
+
+    fn begin_admission(self: &Arc<Self>) -> Result<RuntimeActivityGuard, String> {
+        self.begin(RuntimeActivityKind::Admission)
+    }
+
+    fn begin_external(self: &Arc<Self>) -> Result<RuntimeActivityGuard, String> {
+        self.begin(RuntimeActivityKind::External)
+    }
+
+    fn begin_quiescence(self: &Arc<Self>) -> Option<RuntimeQuiescence> {
+        let mut state = lock(&self.state);
+        if state.quiescing {
+            return None;
+        }
+        state.quiescing = true;
+        drop(state);
+        Some(RuntimeQuiescence {
+            activity: Arc::clone(self),
+            system_deliveries: None,
+            human_intents: None,
+            reinjections: None,
+            ephemeral_activity: None,
+            sealed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn try_quiesce(self: &Arc<Self>) -> Option<RuntimeQuiescence> {
+        let quiescence = self.begin_quiescence()?;
+        quiescence.is_idle().then_some(quiescence)
+    }
+
+    fn is_quiescing(&self) -> bool {
+        lock(&self.state).quiescing
+    }
+
+    fn change_generation(&self) -> u64 {
+        self.signal.generation()
+    }
+
+    fn wait_for_change(&self, observed: u64, deadline: Instant) -> bool {
+        self.signal.wait_for_change(observed, deadline)
+    }
+}
+
 /// **Observador da FILA DE BROKER (`<LINA_HOME>/broker/`).** Numa thread própria, drena os pedidos
 /// privilegiados (`broker.do` = custódia; `resume.request` = retomada do teto), enfileira-os no gate
 /// humano e — só após confirmação na janela — executa: custódia chama [`run_custody`] (segredo do
@@ -2637,6 +3377,9 @@ pub struct BrokerPump<S: SecretStore> {
     /// Nível de autonomia do Espaço (do bootstrap/env). O bypass da custódia exige `Autonomous`
     /// **E** `guard:off` — nunca desliga o gate humano em `assistido`/`manual`. Default: `Assisted`.
     autonomy: Autonomy,
+    /// A tarefa de rede e o desfecho ainda não drenado mantêm o runtime inelegível
+    /// para desmontagem; assim nenhuma resposta some junto com a pump.
+    activity: Arc<RuntimeActivity>,
 }
 
 /// F4-1-3: o desfecho de UMA leitura de canal, da thread off-critical-path para o `tick`. O conteúdo
@@ -2649,6 +3392,7 @@ struct ChannelReadOutcome {
     conversation_ref: String,
     /// nome do nó que pediu (origem autenticada) — vira `read_by_node` no rastro e o alvo da injeção.
     requester: String,
+    _activity: RuntimeActivityGuard,
 }
 
 /// F4-1-3: fila in-process produtor(thread de leitura)→consumidor(`tick`), como `ChannelSendQueue`.
@@ -2667,6 +3411,7 @@ struct ChannelSendOutcome {
     requester: String,
     /// correlação com a custódia (`BrokerExecuted`) — o id do gate humano.
     broker_exec_ref: String,
+    _activity: RuntimeActivityGuard,
 }
 
 /// F4-1-4: fila in-process produtor(thread de envio)→consumidor(`tick` do broker). Mesma disciplina
@@ -2806,47 +3551,76 @@ const WAHA_POLL_INTERVAL_MS: u64 = 2_000;
 pub(crate) fn spawn_whatsapp_connect(nodes: Arc<NodeManager>, base_url: String, api_key: String) {
     use crate::whatsapp_modal::ChannelConnectState as S;
     use lina_core::channel_waha::{SessionStatus, UreqHttp, WahaClient};
-    thread::spawn(move || {
-        let client = WahaClient::new(UreqHttp::new(base_url.clone()), WAHA_SESSION);
-        nodes.push_channel_connect(S::Connecting);
-        // Conectar (cria/inicia a sessão). Falha = Waha fora do ar / endereço errado → erro humano.
-        if let Err(e) = client.connect(&api_key) {
-            eprintln!("lina-gpui: whatsapp connect falhou: {e}");
-            nodes.push_channel_connect(S::Failed(WAHA_ERR_REACH.to_string()));
+    let activity = match nodes.begin_external_task() {
+        Ok(activity) => activity,
+        Err(error) => {
+            nodes.push_channel_connect(S::Failed(error));
             return;
         }
-        // Buscar o QR e mostrá-lo (o leigo escaneia).
-        match client.qr(&api_key) {
-            Ok(qr) => nodes.push_channel_connect(S::AwaitingScan { qr_png: qr.bytes }),
-            Err(e) => {
-                eprintln!("lina-gpui: whatsapp qr falhou: {e}");
+    };
+    let human_intent = match nodes.reserve_human_intent() {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            nodes.push_channel_connect(S::Failed(error));
+            return;
+        }
+    };
+    let failed_nodes = Arc::clone(&nodes);
+    let connect_task = thread::Builder::new()
+        .name("lina-whatsapp-connect".into())
+        .spawn(move || {
+            let _activity = activity;
+            let client = WahaClient::new(UreqHttp::new(base_url.clone()), WAHA_SESSION);
+            nodes.push_channel_connect(S::Connecting);
+            // Conectar (cria/inicia a sessão). Falha = Waha fora do ar / endereço errado → erro humano.
+            if let Err(e) = client.connect(&api_key) {
+                eprintln!("lina-gpui: whatsapp connect falhou: {e}");
                 nodes.push_channel_connect(S::Failed(WAHA_ERR_REACH.to_string()));
                 return;
             }
-        }
-        // Poll do status até parear (WORKING), cair (FAILED/STOPPED) ou esgotar o tempo.
-        for _ in 0..WAHA_CONNECT_POLLS {
-            thread::sleep(Duration::from_millis(WAHA_POLL_INTERVAL_MS));
-            match client.status(&api_key) {
-                Ok(SessionStatus::Working) => {
-                    nodes.push_channel_connect(S::Connected);
-                    nodes.push_human_intent(
-                        "channel.connected",
-                        serde_json::json!({ "channel": "whatsapp", "base_url": base_url })
-                            .to_string(),
-                    );
+            // Buscar o QR e mostrá-lo (o leigo escaneia).
+            match client.qr(&api_key) {
+                Ok(qr) => nodes.push_channel_connect(S::AwaitingScan { qr_png: qr.bytes }),
+                Err(e) => {
+                    eprintln!("lina-gpui: whatsapp qr falhou: {e}");
+                    nodes.push_channel_connect(S::Failed(WAHA_ERR_REACH.to_string()));
                     return;
                 }
-                Ok(SessionStatus::Failed | SessionStatus::Stopped) => {
-                    nodes.push_channel_connect(S::Failed(WAHA_ERR_DROPPED.to_string()));
-                    return;
-                }
-                // STARTING / SCAN_QR_CODE → ainda aguardando o leigo; erro transitório → re-tenta.
-                Ok(_) | Err(_) => continue,
             }
+            // Poll do status até parear (WORKING), cair (FAILED/STOPPED) ou esgotar o tempo.
+            for _ in 0..WAHA_CONNECT_POLLS {
+                thread::sleep(Duration::from_millis(WAHA_POLL_INTERVAL_MS));
+                match client.status(&api_key) {
+                    Ok(SessionStatus::Working) => {
+                        nodes.push_channel_connect(S::Connected);
+                        human_intent.commit(HumanIntentItem {
+                            intent: "channel.connected".to_owned(),
+                            payload: serde_json::json!({
+                                "channel": "whatsapp",
+                                "base_url": base_url
+                            })
+                            .to_string(),
+                        });
+                        return;
+                    }
+                    Ok(SessionStatus::Failed | SessionStatus::Stopped) => {
+                        nodes.push_channel_connect(S::Failed(WAHA_ERR_DROPPED.to_string()));
+                        return;
+                    }
+                    // STARTING / SCAN_QR_CODE → ainda aguardando o leigo; erro transitório → re-tenta.
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+            nodes.push_channel_connect(S::Failed(WAHA_ERR_TIMEOUT.to_string()));
+        });
+    match connect_task {
+        Ok(task) => lock(&failed_nodes.cleanup_threads).push(task),
+        Err(error) => {
+            failed_nodes.push_channel_connect(S::Failed(format!(
+                "Não consegui iniciar a conexão do WhatsApp ({error}). Tente novamente."
+            )));
         }
-        nodes.push_channel_connect(S::Failed(WAHA_ERR_TIMEOUT.to_string()));
-    });
+    }
 }
 
 /// Mensagens humanas do pareamento (zero jargão; nunca expõem segredo — o erro do transporte só carrega
@@ -2907,7 +3681,14 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             // boot de produção liga o bypass, e só quando o dono do Espaço o pediu (guard:off+autônomo).
             guard_lina_dir: None,
             autonomy: Autonomy::Assisted,
+            activity: Arc::new(RuntimeActivity::default()),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_activity(mut self, activity: Arc<RuntimeActivity>) -> Self {
+        self.activity = activity;
+        self
     }
 
     /// **Item #4 — liga o toggle mestre da custódia** ao broker: o `.lina` do Espaço (fonte do
@@ -2957,15 +3738,30 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
         self
     }
 
-    /// Sobe a thread que observa a fila de broker (gate humano + execução) a cada ~150 ms.
-    pub fn spawn(mut self) -> JoinHandle<()> {
-        thread::spawn(move || loop {
-            self.tick();
-            thread::sleep(Duration::from_millis(150));
-        })
+    /// Sobe a thread encerrável que observa a fila de broker. O `Pump` mantém
+    /// a thread viva enquanto o workspace está montado e garante `join` ao desmontar.
+    pub fn spawn_stoppable(self) -> std::io::Result<Pump> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let join = self.spawn_loop(Arc::clone(&stop))?;
+        Ok(Pump::from_join(stop, join))
+    }
+
+    fn spawn_loop(mut self, stop: Arc<AtomicBool>) -> std::io::Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("lina-broker-pump".into())
+            .spawn(move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.tick();
+                thread::park_timeout(Duration::from_millis(150));
+            })
     }
 
     fn tick(&mut self) {
+        let Ok(_activity) = self.activity.begin_external() else {
+            return; // quiescência: pedidos em disco e desfechos em RAM não são abandonados.
+        };
         // (1) Recusa humana? → tira a FRENTE da fila SEM executar (dismiss; hole 2 — saída do flood).
         let reject = lock(&self.desk).reject_requested.take();
         if let Some(id) = reject {
@@ -3573,21 +4369,36 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             conversation_ref,
             m.from.clone(),
         );
-        thread::spawn(move || {
-            let client = lina_core::channel_waha::WahaClient::new(
-                lina_core::channel_waha::UreqHttp::new(base),
-                WAHA_SESSION,
-            );
-            let result = client
-                .read(&api_key, &conv, READ_LIMIT)
-                .map_err(|e| e.to_string());
-            lock(&queue).push_back(ChannelReadOutcome {
-                result,
-                channel: ch,
-                conversation_ref: conv,
-                requester: reqr,
-            });
-        });
+        let activity = match self.activity.begin_external() {
+            Ok(activity) => activity,
+            Err(error) => {
+                self.note_channel_result(format!("⛔ leitura adiada: {error}"));
+                return;
+            }
+        };
+        match thread::Builder::new()
+            .name("lina-channel-read".into())
+            .spawn(move || {
+                let client = lina_core::channel_waha::WahaClient::new(
+                    lina_core::channel_waha::UreqHttp::new(base),
+                    WAHA_SESSION,
+                );
+                let result = client
+                    .read(&api_key, &conv, READ_LIMIT)
+                    .map_err(|e| e.to_string());
+                lock(&queue).push_back(ChannelReadOutcome {
+                    result,
+                    channel: ch,
+                    conversation_ref: conv,
+                    requester: reqr,
+                    _activity: activity,
+                });
+            }) {
+            Ok(_) => {}
+            Err(error) => {
+                self.note_channel_result(format!("⛔ não consegui iniciar a leitura: {error}"))
+            }
+        }
         eprintln!(
             "lina-gpui: CANAL — lendo '{}' de {} (off-critical-path)",
             channel, m.from
@@ -3906,6 +4717,10 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
             return format!("⛔ seu {channel} nao esta conectado — conecte primeiro");
         };
         let req = BrokerRequest::for_channel(channel, action, secret_key, requester.to_string());
+        let activity = match self.activity.begin_external() {
+            Ok(activity) => activity,
+            Err(error) => return format!("⛔ envio adiado: {error}"),
+        };
         // Capturas para a thread (donas, sem `self` lá dentro): a fila de desfechos + os DADOS do envio.
         let queue = Arc::clone(&self.channel_sends);
         let (base, ch, cid, txt, reqr, exref) = (
@@ -3922,24 +4737,28 @@ impl<S: SecretStore + Send + 'static> BrokerPump<S> {
                 // Sob o lock: SÓ spawna (rápido). A chave (do cofre) é movida para a thread; o agente
                 // nunca a teve. O `POST` roda LÁ, fora deste lock (ADR 0046).
                 let secret = secret.to_owned();
-                thread::spawn(move || {
-                    let client = lina_core::channel_waha::WahaClient::new(
-                        lina_core::channel_waha::UreqHttp::new(base),
-                        WAHA_SESSION,
-                    );
-                    let ok = client
-                        .send(&secret, &cid, &txt)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string());
-                    lock(&queue).push_back(ChannelSendOutcome {
-                        ok,
-                        channel: ch,
-                        chat_id: cid,
-                        requester: reqr,
-                        broker_exec_ref: exref,
-                    });
-                });
-                Ok(())
+                thread::Builder::new()
+                    .name("lina-channel-send".into())
+                    .spawn(move || {
+                        let client = lina_core::channel_waha::WahaClient::new(
+                            lina_core::channel_waha::UreqHttp::new(base),
+                            WAHA_SESSION,
+                        );
+                        let ok = client
+                            .send(&secret, &cid, &txt)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string());
+                        lock(&queue).push_back(ChannelSendOutcome {
+                            ok,
+                            channel: ch,
+                            chat_id: cid,
+                            requester: reqr,
+                            broker_exec_ref: exref,
+                            _activity: activity,
+                        });
+                    })
+                    .map(|_| ())
+                    .map_err(|error| format!("iniciar transporte do canal: {error}"))
             })
         };
         match outcome {
@@ -4583,6 +5402,46 @@ pub fn wire_terminal_capturing(
     rows: u16,
     scrollback: Option<Arc<Mutex<ScrollbackStore>>>,
 ) -> Result<(NodeId, Grid), String> {
+    let (node, grid, _reader) = wire_terminal_capturing_owned(
+        pty, sup, delta_tx, key, name, role, cmd, cols, rows, scrollback, None,
+    )?;
+    // Esta porta legada e independente do `NodeManager` continua usada só por
+    // harnesses que possuem o `PtyManager` diretamente. O caminho de produção usa
+    // `wire_terminal_capturing_owned` e conserva o handle até kill+join.
+    Ok((node, grid))
+}
+
+struct ReaderLiveness {
+    active: Arc<AtomicUsize>,
+}
+
+impl ReaderLiveness {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::AcqRel);
+        Self { active }
+    }
+}
+
+impl Drop for ReaderLiveness {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_terminal_capturing_owned(
+    pty: &mut PtyManager,
+    sup: &Supervisor,
+    delta_tx: &Sender<GridDelta>,
+    key: &str,
+    name: &str,
+    role: &str,
+    cmd: PtyCommand,
+    cols: u16,
+    rows: u16,
+    scrollback: Option<Arc<Mutex<ScrollbackStore>>>,
+    live_readers: Option<Arc<AtomicUsize>>,
+) -> Result<(NodeId, Grid, JoinHandle<()>), String> {
     pty.spawn(key, cmd, cols, rows).map_err(|e| e.to_string())?;
     let writer = pty.take_writer(key).map_err(|e| e.to_string())?;
     // W4-2 (M2): o nó nasce com o PAPEL no roster do Supervisor → flui para `agents.json` (lina list).
@@ -4624,9 +5483,11 @@ pub fn wire_terminal_capturing(
     let reader_grid = Arc::clone(&grid);
     let reader_tx = delta_tx.clone();
     let sink = scrollback.map(|store| (store, node.to_string()));
-    let spawned = thread::Builder::new()
+    let reader_liveness = live_readers.map(ReaderLiveness::new);
+    let reader = thread::Builder::new()
         .name(format!("lina-reader-{key}"))
         .spawn(move || {
+            let _reader_liveness = reader_liveness;
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
@@ -4668,12 +5529,12 @@ pub fn wire_terminal_capturing(
                     }
                 }
             }
-        });
-    if let Err(e) = spawned {
-        compensate_wire(pty, sup, node, key);
-        return Err(e.to_string());
-    }
-    Ok((node, grid))
+        })
+        .map_err(|error| {
+            compensate_wire(pty, sup, node, key);
+            error.to_string()
+        })?;
+    Ok((node, grid, reader))
 }
 
 /// **COMPENSAÇÃO da janela de [`wire_terminal`] (ADR 0022 §5 / inv#4).** Após `sup.register`
@@ -5179,6 +6040,10 @@ fn next_free_slot(model: &SharedModel) -> (f32, f32) {
         .filter_map(|n| model.nodes.get(n))
         .map(|v| (v.x, v.y))
         .collect();
+    next_free_slot_from_positions(&existing)
+}
+
+fn next_free_slot_from_positions(existing: &[(f32, f32)]) -> (f32, f32) {
     for k in 0u32..10_000 {
         let (x, y) = grid_slot(k);
         let collides = existing.iter().any(|&(ex, ey)| {
@@ -5509,15 +6374,12 @@ pub struct BootstrapWriter {
     lina_bin: String,
     /// F1-1-3 (wiring): listener de hooks compartilhado do app. `None` = degradação
     /// limpa (CLI sem `capabilities.hooks` OU bind falhou) → settings SEM hooks, como hoje.
-    hooks: Option<Arc<HooksShared>>,
+    hooks: Option<WorkspaceHooks>,
     /// F3-3 (M-INJETOR): o `EventStore` para projetar `Mentality(papel)` por replay e anexar a
     /// seção de Mentalidade à doutrina do spawn. `None` = degradação limpa (doutrina SEM a seção,
     /// byte-idêntica ao que era antes desta feature) — usado pelos harnesses headless e por boot
     /// degradado. Fiado em [`NodeManager::new`] (nunca em `main.rs` — fronteira do G).
     mentality_store: Option<Arc<Mutex<EventStore>>>,
-    /// F3-3 (M-INJETOR): inferência de papel ESPELHADA da doutrina (`infer_role(name).role`), para
-    /// a seção de Mentalidade casar com o "Seu papel: X" que o template já declara (mesma fonte).
-    role_registry: RoleRegistry,
 }
 
 /// **F4-WA-1 — a engine de webhook ativo do app, ÚNICA por Espaço.** Molde do [`HooksShared`]:
@@ -5525,6 +6387,27 @@ pub struct BootstrapWriter {
 /// com `axum::serve` rodando nele. Registra o nó-Gatilho `@Trigger`, religa hooks do log
 /// (`replay_configured`) e deposita a entrega-de-sistema na fila que o pump drena. Guarda um clone da
 /// engine + o cofre + a porta para o handler de `webhook.configure` registrar hooks em runtime.
+static ACTIVE_HOOK_LISTENERS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_WEBHOOK_LISTENERS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_PUMP_HANDLES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeListenerStats {
+    pub hook_listeners: usize,
+    pub webhook_listeners: usize,
+    pub pump_handles: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_listener_stats() -> RuntimeListenerStats {
+    RuntimeListenerStats {
+        hook_listeners: ACTIVE_HOOK_LISTENERS.load(Ordering::Acquire),
+        webhook_listeners: ACTIVE_WEBHOOK_LISTENERS.load(Ordering::Acquire),
+        pump_handles: ACTIVE_PUMP_HANDLES.load(Ordering::Acquire),
+    }
+}
+
 pub struct WebhookShared {
     /// Mantém o serve vivo — dropar o runtime mataria o listener.
     _rt: tokio::runtime::Runtime,
@@ -5532,6 +6415,54 @@ pub struct WebhookShared {
     vault: Arc<SecretVault<lina_secrets::MockStore>>,
     port: u16,
     trigger: NodeId,
+    sup: Arc<Supervisor>,
+    trigger_registered: Arc<AtomicBool>,
+    listener_registered: Arc<AtomicBool>,
+}
+
+/// Guarda da janela entre registrar `@Trigger` e publicar a engine. Qualquer `return`
+/// antecipado desregistra automaticamente; só `publish` transfere a posse ao runtime.
+struct PendingWebhookTrigger {
+    sup: Arc<Supervisor>,
+    trigger: NodeId,
+    compensate_on_drop: bool,
+}
+
+impl PendingWebhookTrigger {
+    fn register(sup: Arc<Supervisor>) -> Self {
+        let trigger = sup.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        Self {
+            sup,
+            trigger,
+            compensate_on_drop: true,
+        }
+    }
+
+    fn id(&self) -> NodeId {
+        self.trigger
+    }
+
+    fn publish(mut self) -> NodeId {
+        self.compensate_on_drop = false;
+        self.trigger
+    }
+}
+
+impl Drop for PendingWebhookTrigger {
+    fn drop(&mut self) {
+        if self.compensate_on_drop {
+            if let Err(error) = self.sup.unregister(self.trigger) {
+                eprintln!(
+                    "lina-gpui: [WEBHOOK] compensação do gatilho {} falhou: {error}",
+                    self.trigger
+                );
+            }
+        }
+    }
 }
 
 impl WebhookShared {
@@ -5554,38 +6485,69 @@ impl WebhookShared {
                 return None;
             }
         };
-        // Nó-Gatilho desta geração (o `from` reservado; o `NodeId` muda a cada processo).
-        let trigger = sup.register(
-            "@Trigger",
-            Some("trigger".into()),
-            Box::new(std::io::sink()),
-        );
+        // O bind acontece ANTES de tocar o roster. Assim a falha de porta mais comum
+        // não cria um `@Trigger` que não corresponde a engine alguma.
+        let listener = match rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("lina-gpui: [WEBHOOK] bind loopback falhou ({e}) — seguindo sem webhook");
+                return None;
+            }
+        };
+        let port = match listener.local_addr() {
+            Ok(address) => address.port(),
+            Err(e) => {
+                eprintln!(
+                    "lina-gpui: [WEBHOOK] endereço do listener indisponível ({e}) — seguindo sem webhook"
+                );
+                return None;
+            }
+        };
         // Cofre namespaceado do webhook (demo MockStore; o MESMO é compartilhado com o handler de
         // configure via `vault()`, p/ o secret casar entre replay e registro em runtime).
         let vault = Arc::new(SecretVault::with_store(
             "lina-space/webhook",
             lina_secrets::MockStore::new(),
         ));
-        let engine = lina_webhooks::WebhookEngine::new(store, sup).with_delivery_queue(queue);
+        let engine =
+            lina_webhooks::WebhookEngine::new(store, Arc::clone(&sup)).with_delivery_queue(queue);
+        // Nó-Gatilho desta geração (o `from` reservado; o `NodeId` muda a cada processo).
+        // Daqui em diante toda saída antecipada precisa compensar o registro.
+        let pending_trigger = PendingWebhookTrigger::register(Arc::clone(&sup));
+        let trigger = pending_trigger.id();
+        #[cfg(test)]
+        if tests::take_webhook_start_fault() {
+            return None;
+        }
         if let Err(e) = engine.replay_configured(&vault, trigger) {
             eprintln!(
                 "lina-gpui: [WEBHOOK] replay falhou ({e}); hooks pré-existentes não religados"
             );
         }
-        let listener = match rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("lina-gpui: [WEBHOOK] bind loopback falhou ({e}) — seguindo sem webhook");
-                return None;
-            }
-        };
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         let serve_engine = engine.clone();
+        let serve_sup = Arc::clone(&sup);
+        let trigger_registered = Arc::new(AtomicBool::new(true));
+        let serve_trigger_registered = Arc::clone(&trigger_registered);
+        let listener_registered = Arc::new(AtomicBool::new(true));
+        let serve_listener_registered = Arc::clone(&listener_registered);
+        ACTIVE_WEBHOOK_LISTENERS.fetch_add(1, Ordering::AcqRel);
         rt.spawn(async move {
-            if let Err(e) = serve_engine.serve(listener).await {
+            let serve_result = serve_engine.serve(listener).await;
+            if serve_listener_registered.swap(false, Ordering::AcqRel) {
+                ACTIVE_WEBHOOK_LISTENERS.fetch_sub(1, Ordering::AcqRel);
+            }
+            if let Err(e) = serve_result {
                 eprintln!("lina-gpui: [WEBHOOK] serve encerrou: {e}");
             }
+            if serve_trigger_registered.swap(false, Ordering::AcqRel) {
+                if let Err(error) = serve_sup.unregister(trigger) {
+                    eprintln!(
+                        "lina-gpui: [WEBHOOK] serve encerrou e @Trigger {trigger} não pôde ser compensado: {error}"
+                    );
+                }
+            }
         });
+        let trigger = pending_trigger.publish();
         eprintln!("lina-gpui: [WEBHOOK] engine viva em http://127.0.0.1:{port}/hook/<id>");
         Some(Arc::new(Self {
             _rt: rt,
@@ -5593,6 +6555,9 @@ impl WebhookShared {
             vault,
             port,
             trigger,
+            sup,
+            trigger_registered,
+            listener_registered,
         }))
     }
 
@@ -5610,20 +6575,156 @@ impl WebhookShared {
     }
 }
 
-/// **F1-1-3 (wiring) — o listener de hooks do app, ÚNICO por processo.** Faz o
-/// `HookListener::bind()` 1x no boot (porta efêmera em loopback — inv#2) e mantém o
-/// runtime tokio dedicado VIVO (1 worker; o `serve` do axum roda nele). Cada spawn
-/// pede um token por nó ([`Self::register`]); a timeline consome [`Self::subscribe`].
+impl Drop for WebhookShared {
+    fn drop(&mut self) {
+        if self.listener_registered.swap(false, Ordering::AcqRel) {
+            ACTIVE_WEBHOOK_LISTENERS.fetch_sub(1, Ordering::AcqRel);
+        }
+        if self.trigger_registered.swap(false, Ordering::AcqRel) {
+            if let Err(error) = self.sup.unregister(self.trigger) {
+                eprintln!(
+                    "lina-gpui: [WEBHOOK] não consegui desregistrar @Trigger {}: {error}",
+                    self.trigger
+                );
+            }
+        }
+    }
+}
+
+/// **F1-1-3 (wiring) — o listener de hooks do app, ÚNICO por processo.** O singleton
+/// mantém uma porta e um worker durante toda a vida do processo. Cada workspace recebe
+/// um [`WorkspaceHooks`] que prefixa identidades e filtra o seu dreno; nomes iguais em
+/// workspaces diferentes nunca chegam à timeline errada.
 pub struct HooksShared {
     /// Mantém o serve vivo — dropar o runtime mataria o listener.
     _rt: tokio::runtime::Runtime,
     listener: lina_hooks::HookListener,
+    /// Rewrites de bootstrap reutilizam o mesmo token por `(workspace, node)` em vez
+    /// de inflar a tabela interna do listener a cada mudança de roster.
+    tokens: Mutex<BTreeMap<(String, String), String>>,
+    /// Observadores assíncronos usados somente quando um Drop acontece dentro do
+    /// próprio runtime singleton; cada um aguarda o JoinHandle cancelado até Ready.
+    join_observers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    listener_registered: bool,
+}
+
+static PROCESS_HOOKS: OnceLock<Mutex<Option<Arc<HooksShared>>>> = OnceLock::new();
+
+#[derive(Clone)]
+pub struct WorkspaceHooks {
+    shared: Arc<HooksShared>,
+    scope: String,
+}
+
+pub struct HookDrain {
+    task: Option<tokio::task::JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
+    join_observers: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+struct ThreadUnparker(thread::Thread);
+
+impl std::task::Wake for ThreadUnparker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on_hook_join(
+    task: &mut tokio::task::JoinHandle<()>,
+) -> Result<(), tokio::task::JoinError> {
+    use std::future::Future as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match Pin::new(&mut *task).poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+impl HookDrain {
+    /// Cancela a assinatura e observa o término da task antes de liberar o runtime do workspace.
+    pub(crate) fn stop_and_join(&mut self) -> Result<(), String> {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        // Uma task ainda pendente no próprio runtime precisa transferir a observação.
+        // Decidir antes do abort evita que o scheduler escolha aleatoriamente entre
+        // o join síncrono e a transferência durante a mesma chamada.
+        let must_defer = !task.is_finished()
+            && tokio::runtime::Handle::try_current()
+                .is_ok_and(|current| current.id() == self.runtime.id());
+        task.abort();
+        if must_defer {
+            return Err(
+                "o dreno de hooks tentou aguardar dentro do próprio runtime; descarregamento adiado"
+                    .to_owned(),
+            );
+        }
+        let result = block_on_hook_join(task);
+        self.task.take();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(format!("o dreno de hooks encerrou com erro: {error}")),
+        }
+    }
+
+    fn transfer_join_observation(&mut self) -> bool {
+        let Some(task) = self.task.take() else {
+            return false;
+        };
+        task.abort();
+        let observer = self.runtime.spawn(async move {
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    eprintln!("lina-gpui: [DASH] dreno de hooks encerrou com erro: {error}")
+                }
+            }
+        });
+        lock(&self.join_observers).push(observer);
+        true
+    }
+}
+
+impl Drop for HookDrain {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop_and_join() {
+            if self.transfer_join_observation() {
+                eprintln!("lina-gpui: [DASH] {error}; observação transferida ao runtime singleton");
+            } else {
+                eprintln!("lina-gpui: [DASH] {error}");
+            }
+        }
+    }
 }
 
 impl HooksShared {
-    /// Sobe runtime + listener. Falha NUNCA derruba o app: `None` + stderr (degradação
-    /// VISÍVEL — sem hooks o app funciona exatamente como antes desta fiação).
+    /// Obtém o listener global. A célula guarda `None` apenas enquanto segura o lock;
+    /// uma falha de bind não é cacheada, então uma abertura posterior pode tentar de novo.
     pub fn start() -> Option<Arc<Self>> {
+        let slot = PROCESS_HOOKS.get_or_init(|| Mutex::new(None));
+        let mut process_hooks = lock(slot);
+        if let Some(shared) = process_hooks.as_ref() {
+            return Some(Arc::clone(shared));
+        }
+        let shared = Self::bind_new()?;
+        *process_hooks = Some(Arc::clone(&shared));
+        Some(shared)
+    }
+
+    fn bind_new() -> Option<Arc<Self>> {
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -5643,7 +6744,14 @@ impl HooksShared {
                     "lina-gpui: [DASH] hook listener vivo em 127.0.0.1:{}",
                     listener.local_addr().port()
                 );
-                Some(Arc::new(Self { _rt: rt, listener }))
+                ACTIVE_HOOK_LISTENERS.fetch_add(1, Ordering::AcqRel);
+                Some(Arc::new(Self {
+                    _rt: rt,
+                    listener,
+                    tokens: Mutex::new(BTreeMap::new()),
+                    join_observers: Arc::new(Mutex::new(Vec::new())),
+                    listener_registered: true,
+                }))
             }
             Err(e) => {
                 eprintln!(
@@ -5654,33 +6762,72 @@ impl HooksShared {
         }
     }
 
+    #[must_use]
+    pub fn for_workspace(self: &Arc<Self>, scope: impl Into<String>) -> WorkspaceHooks {
+        WorkspaceHooks {
+            shared: Arc::clone(self),
+            scope: scope.into(),
+        }
+    }
+}
+
+impl Drop for HooksShared {
+    fn drop(&mut self) {
+        if self.listener_registered {
+            ACTIVE_HOOK_LISTENERS.fetch_sub(1, Ordering::AcqRel);
+            self.listener_registered = false;
+        }
+    }
+}
+
+impl WorkspaceHooks {
+    fn node_prefix(&self) -> String {
+        format!("{}:{}:", self.scope.len(), self.scope)
+    }
+
     /// Porta efêmera do listener (entra no settings de cada terminal via `HookWiring`).
     #[must_use]
     pub fn port(&self) -> u16 {
-        self.listener.local_addr().port()
+        self.shared.listener.local_addr().port()
     }
 
-    /// Token de atribuição do nó `key` — a ÚNICA fonte de identidade do POST.
+    /// Token estável no processo, atribuído à identidade escopada do nó. O prefixo
+    /// não vem do payload HTTP e só é removido depois de o dreno validar o workspace.
     #[must_use]
     pub fn register(&self, key: &str) -> String {
-        self.listener.register_node(key)
+        let cache_key = (self.scope.clone(), key.to_string());
+        let mut tokens = lock(&self.shared.tokens);
+        if let Some(token) = tokens.get(&cache_key) {
+            return token.clone();
+        }
+        let token = self
+            .shared
+            .listener
+            .register_node(&format!("{}{key}", self.node_prefix()));
+        tokens.insert(cache_key, token.clone());
+        token
     }
 
-    /// Stream dos eventos normalizados (a timeline do dashboard drena daqui).
-    #[must_use]
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<lina_hooks::HookEvent> {
-        self.listener.subscribe()
-    }
-
-    /// Drena o stream NO runtime do próprio listener (sem thread extra): cada evento
-    /// vai ao callback (timeline + sonda `[DASH]`). Lag é CONTADO no stderr, nunca
-    /// silencioso; o loop morre junto com o listener.
-    pub fn spawn_drain(&self, mut on_event: impl FnMut(lina_hooks::HookEvent) + Send + 'static) {
-        let mut rx = self.subscribe();
-        self._rt.spawn(async move {
+    /// Drena somente eventos cujo token foi registrado neste workspace e remove o
+    /// prefixo antes de entregar à timeline. O handle aborta a assinatura quando o
+    /// runtime do workspace é desmontado; o listener global permanece vivo.
+    pub fn spawn_drain(
+        &self,
+        mut on_event: impl FnMut(lina_hooks::HookEvent) + Send + 'static,
+    ) -> HookDrain {
+        lock(&self.shared.join_observers).retain(|observer| !observer.is_finished());
+        let mut rx = self.shared.listener.subscribe();
+        let prefix = self.node_prefix();
+        let task = self.shared._rt.spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(ev) => on_event(ev),
+                    Ok(mut event) => {
+                        let Some(node) = event.node_id.strip_prefix(&prefix) else {
+                            continue;
+                        };
+                        event.node_id = node.to_string();
+                        on_event(event);
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("lina-gpui: [DASH] timeline perdeu {n} eventos (lag)");
                     }
@@ -5688,6 +6835,11 @@ impl HooksShared {
                 }
             }
         });
+        HookDrain {
+            task: Some(task),
+            runtime: self.shared._rt.handle().clone(),
+            join_observers: Arc::clone(&self.shared.join_observers),
+        }
     }
 }
 
@@ -5708,7 +6860,6 @@ impl BootstrapWriter {
             lina_bin,
             hooks: None,
             mentality_store: None,
-            role_registry: RoleRegistry::with_defaults().map_err(|e| e.to_string())?,
         })
     }
 
@@ -5722,7 +6873,7 @@ impl BootstrapWriter {
     /// Papel canônico deste terminal, ESPELHANDO a inferência da doutrina (`infer_role(name).role`):
     /// a seção de Mentalidade tem de casar o papel que o template declara em "Seu papel: X".
     fn role_of(&self, name: &str) -> String {
-        self.role_registry.infer_role(name).role
+        self.bootstrapper.infer_role(name).role
     }
 
     /// A seção "Mentalidade do `<papel>`" para ANEXAR à doutrina renderizada (spec 35 §4.4), ou
@@ -5770,7 +6921,7 @@ impl BootstrapWriter {
     /// F1-1-3 (wiring): liga os hooks de observabilidade nos PRÓXIMOS writes — chamado
     /// no boot quando o perfil do CLI declara `capabilities.hooks=true` (TOML, F1-1-1)
     /// E o listener subiu. Sem esta chamada = degradação (settings como hoje).
-    pub fn set_hooks(&mut self, hooks: Arc<HooksShared>) {
+    pub fn set_hooks(&mut self, hooks: WorkspaceHooks) {
         self.hooks = Some(hooks);
     }
 
@@ -6498,6 +7649,31 @@ pub struct RestoredTerminal {
     pub shadows: Vec<NodeId>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESTORE_FAILURE_AFTER_AGENT: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn arm_restore_failure_after_agent(prepared_agents: usize) {
+    assert!(prepared_agents > 0, "o corte de restore é 1-based");
+    RESTORE_FAILURE_AFTER_AGENT.with(|fault| fault.set(Some(prepared_agents)));
+}
+
+#[cfg(test)]
+fn take_restore_failure_after_agent(prepared_agents: usize) -> bool {
+    RESTORE_FAILURE_AFTER_AGENT.with(|fault| {
+        if fault.get() == Some(prepared_agents) {
+            fault.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// **F1-4-3 — o PLANO de restore do quit limpo, derivável SÓ de estado durável.** Dado o estado
 /// projetado do log (`proj` = `store.project()`), o registry de perfis e — opcional — o store de
 /// scrollback, devolve os terminais a re-erguer: posições/nomes/papéis do log, scrollback
@@ -6693,8 +7869,8 @@ pub fn plan_restore_resuming(
 /// [`RestoredTerminal`]: re-admite pelo funil único (`admit_node` — mesma sequência canônica
 /// de eventos do ⌘T), re-hidrata o grid com a janela viva persistida (a conversa de antes
 /// "continua na tela — é só rolar para cima", copy-f1-4 §4) e registra o badge honesto na
-/// projeção (`SharedModel::restore_badges`). Falha de UM terminal degrada com log e segue
-/// (inv#6 — o restore parcial vale mais que nenhum). Devolve quantos re-ergueram.
+/// projeção (`SharedModel::restore_badges`). A publicação é atômica no runtime: qualquer
+/// falha obrigatória compensa todos os PTYs/cards desta tentativa e devolve `Err`.
 impl NodeManager {
     /// O store de scrollback do workspace (compartilhado com a fiação de boot — `plan_restore`
     /// lê a janela viva dele). `None` = boot degradado sem persistência de histórico.
@@ -6703,8 +7879,22 @@ impl NodeManager {
         self.scrollback.clone()
     }
 
-    pub fn restore_terminals(&self, plans: &[RestoredTerminal]) -> usize {
+    pub(crate) fn restore_terminals_quiesced(
+        &self,
+        plans: &[RestoredTerminal],
+    ) -> Result<usize, String> {
+        self.restore_terminals_with_prefix(plans, &[])
+    }
+
+    pub(crate) fn restore_terminals_with_prefix(
+        &self,
+        plans: &[RestoredTerminal],
+        prefix_events: &[DomainEvent],
+    ) -> Result<usize, String> {
         let mut up = 0;
+        let mut prepared = Vec::new();
+        let mut pending_events = prefix_events.to_vec();
+        let mut replacements = Vec::new();
         // 2026-06-11 — re-layout anti-colisão: o log herdou posições da era pré-fix (49 cards
         // em 8 coordenadas; até 10 no MESMO ponto — "um terminal em cima do outro" na tela do
         // fundador). O PRIMEIRO ocupante de cada coordenada a mantém; os demais caem para
@@ -6720,11 +7910,31 @@ impl NodeManager {
         let (kept, relocated): (Vec<&RestoredTerminal>, Vec<&RestoredTerminal>) = plans
             .iter()
             .partition(|p| taken_slots.insert((p.x.round() as i64, p.y.round() as i64)));
-        for (plan, position) in kept
+        let replaced_nodes: std::collections::BTreeSet<NodeId> = plans
+            .iter()
+            .flat_map(|plan| std::iter::once(plan.node).chain(plan.shadows.iter().copied()))
+            .collect();
+        let mut occupied: Vec<(f32, f32)> = {
+            let model = lock(&self.model);
+            model
+                .order
+                .iter()
+                .filter(|node| !replaced_nodes.contains(node))
+                .filter_map(|node| model.nodes.get(node))
+                .map(|view| (view.x, view.y))
+                .collect()
+        };
+        occupied.extend(kept.iter().map(|plan| (plan.x as f32, plan.y as f32)));
+        let mut scheduled: Vec<(&RestoredTerminal, (f32, f32))> = kept
             .into_iter()
-            .map(|p| (p, Some((p.x, p.y))))
-            .chain(relocated.into_iter().map(|p| (p, None)))
-        {
+            .map(|plan| (plan, (plan.x as f32, plan.y as f32)))
+            .collect();
+        for plan in relocated {
+            let position = next_free_slot_from_positions(&occupied);
+            occupied.push(position);
+            scheduled.push((plan, position));
+        }
+        for (plan, position) in scheduled {
             // Comando do restore → motor (mesmo caminho do M6): `[program, args…]` do perfil,
             // já com o verbo de resume quando o badge observou sessão anterior. Vazio = shell
             // puro (fábrica do workspace).
@@ -6751,7 +7961,10 @@ impl NodeManager {
                     },
                     None => CwdPolicy::Managed,
                 },
-                position, // colisão de coordenada → None → `next_free_slot` (re-layout durável)
+                // A sobreposição foi resolvida acima num overlay local. Preparar o lote não
+                // publica cards provisórios no modelo, portanto `next_free_slot` não poderia
+                // enxergar admissões anteriores desta mesma transação.
+                position: Some((f64::from(position.0), f64::from(position.1))),
                 requested_by: None, // restore é gesto do BOOT (origem humana: reabrir o app)
                 autonomy: Autonomy::Assisted,
                 // F3-0-4: restore não re-deriva o effort do log ainda (Medium neutro); quando o
@@ -6761,112 +7974,145 @@ impl NodeManager {
             // Reescrita do kit em LOTE (1× após o loop): com N restores, o rewrite por-admissão
             // era O(N²) de I/O — o vilão do boot lento medido em 2026-06-11 (~80 nós).
             let mut badge = plan.badge;
-            let node = match self.admit_node_inner(build_admission(engine), false) {
-                Ok(n) => n,
-                // 2026-06-11 (tela do fundador): o spawn do MOTOR falha quando o ambiente
-                // degrada (PATH sem o binário — hidratação do shell de login estourou o
-                // timeout). Falha TRANSITÓRIA não pode virar dano permanente: re-ergue como
-                // terminal comum, preservando nome/papel/cwd/posição; a linhagem do CLI é
-                // re-apendada abaixo e o próximo boot re-tenta o motor.
-                Err(e) if had_engine => {
-                    eprintln!(
-                        "lina-gpui: restore de '{}' com o motor falhou ({e}); re-erguendo \
+            let mut admitted =
+                match self.admit_node_inner(build_admission(engine), false, false, false) {
+                    Ok(admitted) => admitted,
+                    // 2026-06-11 (tela do fundador): o spawn do MOTOR falha quando o ambiente
+                    // degrada (PATH sem o binário — hidratação do shell de login estourou o
+                    // timeout). Falha TRANSITÓRIA não pode virar dano permanente: re-ergue como
+                    // terminal comum, preservando nome/papel/cwd/posição; a linhagem do CLI é
+                    // re-apendada abaixo e o próximo boot re-tenta o motor.
+                    Err(e) if had_engine => {
+                        eprintln!(
+                            "lina-gpui: restore de '{}' com o motor falhou ({e}); re-erguendo \
                          como terminal comum (o motor volta no próximo boot)",
-                        plan.name
-                    );
-                    match self.admit_node_inner(build_admission(None), false) {
-                        Ok(n) => {
-                            badge = RestoreBadge::EngineMissing;
-                            n
-                        }
-                        Err(e2) => {
-                            eprintln!(
-                                "lina-gpui: restore de '{}' falhou ({e2}); seguindo sem ele",
-                                plan.name
-                            );
-                            continue;
+                            plan.name
+                        );
+                        match self.admit_node_inner(build_admission(None), false, false, false) {
+                            Ok(admitted) => {
+                                badge = RestoreBadge::EngineMissing;
+                                admitted
+                            }
+                            Err(e2) => {
+                                self.discard_prepared_nodes(&prepared);
+                                return Err(format!(
+                                    "restore de '{}' falhou após o motor também falhar ({e2})",
+                                    plan.name
+                                ));
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "lina-gpui: restore de '{}' falhou ({e}); seguindo sem ele",
-                        plan.name
-                    );
-                    continue;
-                }
-            };
+                    Err(e) => {
+                        self.discard_prepared_nodes(&prepared);
+                        return Err(format!("restore de '{}' falhou ({e})", plan.name));
+                    }
+                };
+            let node = admitted.node;
+            pending_events.extend(admitted.events.iter().cloned());
             // Linhagem do CLI do nó DEGRADADO: o log continua declarando o profile (intenção
             // do nó), senão o próximo `plan_restore` o veria como shell PARA SEMPRE.
             if badge == RestoreBadge::EngineMissing {
                 if let Some(pid) = &plan.profile_id {
-                    if let Err(e) = lock(&self.store).append(&DomainEvent::CliProfileSet {
+                    pending_events.push(DomainEvent::CliProfileSet {
                         node,
                         profile: pid.clone(),
-                    }) {
-                        eprintln!(
-                            "lina-gpui: CRÍTICO — linhagem de CLI de '{}' não persistiu ({e}); \
-                             o próximo boot pode re-erguê-lo sem motor",
-                            plan.name
-                        );
-                    }
+                    });
                 }
             }
             // SUPERSEDE: o nó da geração anterior é APOSENTADO no log — o re-erguido é um nó
             // NOVO (Dead é terminal, ADR 0020) e sem o `NodeRemoved` o antigo re-erguia DE NOVO
             // a cada boot (canvas dobrando, cards empilhados). Auditável: o remove fica no log.
-            if let Err(e) = lock(&self.store).append(&DomainEvent::NodeRemoved { node: plan.node })
-            {
-                eprintln!(
-                    "lina-gpui: CRÍTICO — '{}' re-erguido (node {node}) mas o antigo {} NÃO foi \
-                     aposentado no log: {e} (pode reaparecer duplicado no próximo boot)",
-                    plan.name, plan.node
-                );
-            }
+            pending_events.push(DomainEvent::NodeRemoved { node: plan.node });
             // Sombras: gerações Dead mais antigas do MESMO nome se aposentam JUNTO — senão
             // fechar o card depois ressuscita a próxima da fila no boot seguinte.
             for shadow in &plan.shadows {
-                if let Err(e) =
-                    lock(&self.store).append(&DomainEvent::NodeRemoved { node: *shadow })
-                {
-                    eprintln!(
-                        "lina-gpui: sombra {shadow} de '{}' não aposentada no log ({e})",
-                        plan.name
-                    );
-                }
+                pending_events.push(DomainEvent::NodeRemoved { node: *shadow });
             }
             // Re-hidrata o grid: a janela viva entra ANTES do output novo do shell — o leigo
             // reabre e a conversa está lá. CRLF por linha (o VT trata como output normal).
             if !plan.scrollback_tail.is_empty() {
-                if let Some(grid) = lock(&self.grids).get(&node) {
-                    let mut bytes = Vec::new();
-                    for line in &plan.scrollback_tail {
-                        bytes.extend_from_slice(line.as_bytes());
-                        bytes.extend_from_slice(b"\r\n");
-                    }
-                    lock(grid).advance(&bytes);
+                let mut bytes = Vec::new();
+                for line in &plan.scrollback_tail {
+                    bytes.extend_from_slice(line.as_bytes());
+                    bytes.extend_from_slice(b"\r\n");
+                }
+                lock(&admitted.grid).advance(&bytes);
+            }
+            for previous in &mut prepared {
+                if shared_cwd_path(&previous.cwd) == shared_cwd_path(&admitted.cwd)
+                    && shared_cwd_path(&admitted.cwd).is_some()
+                {
+                    previous.view.cwd_shared = true;
+                    admitted.view.cwd_shared = true;
+                    admitted.cwd_sharers.push(previous.node);
                 }
             }
-            // Badge honesto na projeção (render lê daqui; chave = nó NOVO re-erguido).
-            {
-                let mut m = lock(&self.model);
-                m.restore_badges.insert(node, badge);
-                m.touch();
-            }
-            eprintln!(
-                "lina-gpui: [RESTORE] '{}' re-erguido ({}; {} linhas re-hidratadas)",
-                plan.name,
-                badge.label(),
-                plan.scrollback_tail.len()
-            );
+            admitted.prompt_cli = plan.profile_id.clone();
+            replacements.push((plan.node, plan.shadows.clone(), node, badge));
+            prepared.push(admitted);
             up += 1;
+            #[cfg(test)]
+            if take_restore_failure_after_agent(up) {
+                self.discard_prepared_nodes(&prepared);
+                return Err(format!(
+                    "falha injetada depois de preparar {up} agente(s); lote não publicado"
+                ));
+            }
         }
+        let event_count = {
+            let mut store = lock(&self.store);
+            match store.append_batch(&pending_events) {
+                Ok(count) => count,
+                Err(error) => {
+                    drop(store);
+                    self.discard_prepared_nodes(&prepared);
+                    return Err(format!(
+                        "restore não confirmou o lote atômico ({error}); nenhum agente foi alterado"
+                    ));
+                }
+            }
+        };
+        for admitted in &prepared {
+            self.publish_admitted_runtime_handles(admitted);
+        }
+        {
+            let mut model = lock(&self.model);
+            for (previous, shadows, _, _) in &replacements {
+                model.nodes.remove(previous);
+                model.order.retain(|known| known != previous);
+                model.restore_badges.remove(previous);
+                for shadow in shadows {
+                    model.nodes.remove(shadow);
+                    model.order.retain(|known| known != shadow);
+                    model.restore_badges.remove(shadow);
+                }
+            }
+            for admitted in &prepared {
+                model.nodes.insert(admitted.node, admitted.view.clone());
+                if !model.order.contains(&admitted.node) {
+                    model.order.push(admitted.node);
+                }
+            }
+            for admitted in &prepared {
+                for sharer in &admitted.cwd_sharers {
+                    if let Some(view) = model.nodes.get_mut(sharer) {
+                        view.cwd_shared = true;
+                    }
+                }
+            }
+            for (_, _, node, badge) in &replacements {
+                model.restore_badges.insert(*node, *badge);
+            }
+            model.event_count = event_count;
+            model.touch();
+        }
+        eprintln!("lina-gpui: [RESTORE] {up} terminal(is) re-erguidos atomicamente");
         // A reescrita adiada do lote: TODOS os kits ganham o roster completo (e a porta de
         // hooks DESTE boot) numa passada só — ver nota no `admit_node_inner(…, false)` acima.
         if up > 0 {
             self.rewrite_bootstrap();
         }
-        up
+        Ok(up)
     }
 }
 
@@ -6889,6 +8135,54 @@ fn effective_managed_policy(default_cwd: Option<&Path>, ws_root: &Path, key: &st
             consent: true,
         },
         ResolvedCwd::ManagedVirgin(_) => CwdPolicy::Managed,
+    }
+}
+
+#[derive(Default)]
+struct PromptEpoch {
+    generation: u64,
+    baseline: Option<lina_core::PromptObservation>,
+    captured_before_input: Option<Option<lina_core::PromptObservation>>,
+    saw_not_ready: bool,
+    ready_generation: Option<u64>,
+}
+
+struct AdmittedNode {
+    node: NodeId,
+    key: String,
+    grid: Grid,
+    cwd: CwdPolicy,
+    view: NodeView,
+    cwd_sharers: Vec<NodeId>,
+    prompt_cli: Option<String>,
+    events: Vec<DomainEvent>,
+}
+
+struct OwnedPtyReader {
+    key: String,
+    join: JoinHandle<()>,
+}
+
+struct PtyRetirement {
+    pty: Arc<Mutex<PtyManager>>,
+    key: String,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl PtyRetirement {
+    fn finish(mut self) {
+        if let Err(error) = lock(&self.pty).kill(self.key.as_str(), Duration::from_secs(2)) {
+            eprintln!("lina-gpui: kill do PTY {} falhou: {error}", self.key);
+        }
+        let _ = lock(&self.pty).remove(self.key.as_str());
+        if let Some(reader) = self.reader.take() {
+            if reader.join().is_err() {
+                eprintln!(
+                    "lina-gpui: reader do PTY {} encerrou com panic durante a limpeza",
+                    self.key
+                );
+            }
+        }
     }
 }
 
@@ -6920,7 +8214,7 @@ pub struct NodeManager {
     /// F3-1-7 (ADR 0036): fila EM-PROCESSO de GESTOS HUMANOS DIRETOS (confirmar/ajustar Goal). A view
     /// gpui enfileira pelo `Arc<NodeManager>` compartilhado; a `MailboxPump` (escritor único do log)
     /// drena e carimba `by="human"`. Mesmo padrão do `reinject_queue`, sem superfície de filesystem.
-    human_intents: Mutex<VecDeque<HumanIntentItem>>,
+    human_intents: EphemeralQueue<HumanIntentItem>,
     /// F4-WA-1: fila EM-PROCESSO da entrega-de-sistema (webhook). Produtor: `WebhookEngine` (thread
     /// tokio); consumidor: `MailboxPump` (drena no tick → `Router::dispatch_webhook`). Compartilhada
     /// por `Arc` clone com a engine via [`NodeManager::system_deliveries`]; sem superfície de FS.
@@ -6946,6 +8240,24 @@ pub struct NodeManager {
     /// store no app; para no Drop. `None` quando não há store (nada a proteger).
     #[allow(dead_code)] // mantido vivo só pelo Drop (RAII): para o job ao encerrar o manager.
     flush_guard: Option<FlushGuard>,
+    /// Perfil por-nó usado para distinguir prompt ocioso de comando silencioso.
+    prompt_profiles: Mutex<Option<(Arc<ProfileRegistry>, CliProfile)>>,
+    prompt_cli_by_node: Mutex<BTreeMap<NodeId, String>>,
+    prompt_epochs: Mutex<BTreeMap<NodeId, PromptEpoch>>,
+    /// Admissões e efeitos externos compartilham esta barreira com a desmontagem.
+    activity: Arc<RuntimeActivity>,
+    /// Payloads internos ainda não persistidos (reflexão, seleção de skill, A2A demo).
+    ephemeral_activity: EphemeralActivity,
+    /// Kills assíncronos continuam sob posse do manager e são aguardados antes de
+    /// liberar um runtime. Descartar o `JoinHandle` criava órfãos sob navegação intensa.
+    cleanup_threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Cada leitor bloqueante pertence ao mesmo ciclo de vida do PTY. O handle só sai
+    /// daqui para a tarefa de aposentadoria, que fecha o master e faz `join` antes de
+    /// sinalizar conclusão.
+    reader_threads: Mutex<BTreeMap<NodeId, OwnedPtyReader>>,
+    /// Sonda observável usada pelo teste de ciclo de vida; também permite diagnosticar
+    /// uma thread que não terminou mesmo depois de o mapa de handles esvaziar.
+    active_readers: Arc<AtomicUsize>,
 }
 
 impl NodeManager {
@@ -7007,6 +8319,8 @@ impl NodeManager {
             bw.set_mentality_store(Arc::clone(&store));
             bw
         });
+        let ephemeral_activity = lock(&model).ephemeral_activity.clone();
+        let quiescence_signal = ephemeral_activity.signal();
         Self {
             pty,
             sup,
@@ -7022,9 +8336,12 @@ impl NodeManager {
             seq: Mutex::new(seq_start),
             bootstrap,
             lina_dir,
-            reinject_queue: new_reinject_queue(),
-            human_intents: Mutex::new(VecDeque::new()),
-            system_deliveries: Arc::new(Mutex::new(VecDeque::new())),
+            reinject_queue: EphemeralQueue::with_signal(Arc::clone(&quiescence_signal)),
+            human_intents: EphemeralQueue::with_signal(Arc::clone(&quiescence_signal)),
+            system_deliveries: lina_webhooks::SystemDeliveryQueue::with_change_notifier({
+                let signal = Arc::clone(&quiescence_signal);
+                move || signal.notify()
+            }),
             webhook_outcome: Arc::new(Mutex::new(None)),
             channel_connect: Arc::new(Mutex::new(None)),
             // #7: produção resolve o motor do spawn por DISCOVERY no momento do spawn (sem
@@ -7032,7 +8349,67 @@ impl NodeManager {
             spawn_engine: Arc::new(|| default_spawn_engine(&discover_clis())),
             scrollback,
             flush_guard,
+            prompt_profiles: Mutex::new(None),
+            prompt_cli_by_node: Mutex::new(BTreeMap::new()),
+            prompt_epochs: Mutex::new(BTreeMap::new()),
+            activity: Arc::new(RuntimeActivity::with_signal(quiescence_signal)),
+            ephemeral_activity,
+            cleanup_threads: Mutex::new(Vec::new()),
+            reader_threads: Mutex::new(BTreeMap::new()),
+            active_readers: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn set_prompt_profiles(&self, registry: Arc<ProfileRegistry>, fallback: CliProfile) {
+        *lock(&self.prompt_profiles) = Some((registry, fallback));
+    }
+
+    #[must_use]
+    pub(crate) fn runtime_activity(&self) -> Arc<RuntimeActivity> {
+        Arc::clone(&self.activity)
+    }
+
+    pub(crate) fn begin_external_task(&self) -> Result<RuntimeActivityGuard, String> {
+        self.activity.begin_external()
+    }
+
+    fn begin_ephemeral_production(&self) -> Result<EphemeralProduction, String> {
+        self.ephemeral_activity.try_reserve()
+    }
+
+    pub(crate) fn try_quiesce(&self) -> Option<RuntimeQuiescence> {
+        let quiescence = self.try_begin_quiescence()?;
+        quiescence.is_idle().then_some(quiescence)
+    }
+
+    pub(crate) fn try_begin_quiescence(&self) -> Option<RuntimeQuiescence> {
+        // Todos os ingressos efêmeros fecham antes da atividade geral. Qualquer
+        // reserva/item/dreno impede o fechamento. Depois disso a intenção geral
+        // bloqueia o próximo tick mesmo se o atual ainda estiver terminando; as
+        // guardas permanecem vivas durante a espera em duas fases.
+        let system_deliveries = self.system_deliveries.try_quiesce()?;
+        let human_intents = self.human_intents.try_quiesce()?;
+        let reinjections = self.reinject_queue.try_quiesce()?;
+        let ephemeral_activity = self.ephemeral_activity.try_quiesce()?;
+        let activity = self.activity.begin_quiescence()?;
+        Some(activity.with_ephemeral_state(
+            system_deliveries,
+            human_intents,
+            reinjections,
+            ephemeral_activity,
+        ))
+    }
+
+    pub(crate) fn quiescence_generation(&self) -> u64 {
+        self.activity.change_generation()
+    }
+
+    pub(crate) fn wait_for_quiescence_change(&self, observed: u64, deadline: Instant) -> bool {
+        self.activity.wait_for_change(observed, deadline)
+    }
+
+    fn runtime_is_quiescing(&self) -> bool {
+        self.activity.is_quiescing()
     }
 
     /// **#7 — injeta a fábrica do motor de spawn** (testes: determinismo — a discovery real
@@ -7050,36 +8427,46 @@ impl NodeManager {
     /// manager — é o canal produtor→consumidor sem superfície de filesystem.
     #[must_use]
     pub(crate) fn reinject_queue(&self) -> ReinjectQueue {
-        Arc::clone(&self.reinject_queue)
+        self.reinject_queue.clone()
     }
 
     /// F3-1-7 (ADR 0036): a UI empurra um GESTO HUMANO DIRETO (confirmar/ajustar uma Goal). A
     /// `MailboxPump` (escritor único do log) drena e o carimba `by="human"` pelo canal in-process —
     /// a view NÃO escolhe `by`, só enfileira o intent + payload. Produtor→consumidor sem filesystem.
-    pub(crate) fn push_human_intent(&self, intent: impl Into<String>, payload: impl Into<String>) {
-        lock(&self.human_intents).push_back(HumanIntentItem {
+    pub(crate) fn push_human_intent(
+        &self,
+        intent: impl Into<String>,
+        payload: impl Into<String>,
+    ) -> Result<(), String> {
+        self.human_intents.try_push(HumanIntentItem {
             intent: intent.into(),
             payload: payload.into(),
-        });
+        })
+    }
+
+    fn reserve_human_intent(&self) -> Result<EphemeralQueueReservation<HumanIntentItem>, String> {
+        self.human_intents.try_reserve()
     }
 
     /// F3-1-7: a `MailboxPump` (mesmo módulo) drena os gestos humanos pendentes (FIFO) para roteá-los
     /// pelo core. Privado (não pub) para não expor `HumanIntentItem` na superfície do crate.
-    fn drain_human_intents(&self) -> Vec<HumanIntentItem> {
-        lock(&self.human_intents).drain(..).collect()
+    fn drain_human_intents(
+        &self,
+    ) -> Result<(Vec<HumanIntentItem>, EphemeralQueueDrain<HumanIntentItem>), String> {
+        self.human_intents.drain()
     }
 
     /// F4-WA-1: a fila de entrega-de-sistema, compartilhada (clone de `Arc`) com a `WebhookEngine`
     /// (produtor). O boot a passa à engine via `with_delivery_queue`; o pump a drena no tick.
     #[must_use]
     pub(crate) fn system_deliveries(&self) -> lina_webhooks::SystemDeliveryQueue {
-        Arc::clone(&self.system_deliveries)
+        self.system_deliveries.clone()
     }
 
     /// F4-WA-1: a `MailboxPump` drena as entregas-de-sistema pendentes (FIFO) para roteá-las pelo
     /// `Router::dispatch_webhook`. Privado (mesmo módulo) — não expõe `SystemDelivery` na superfície.
     fn drain_system_deliveries(&self) -> Vec<lina_webhooks::SystemDelivery> {
-        lock(&self.system_deliveries).drain(..).collect()
+        self.system_deliveries.drain()
     }
 
     /// F4-WA-1: o handler de `webhook.configure` deposita o retorno (url + secret) para a View mostrar
@@ -7288,6 +8675,7 @@ impl NodeManager {
         if role.is_empty() || role.chars().any(char::is_control) {
             return Err(format!("papel inválido: {role:?}"));
         }
+        let reinjection = self.reinject_queue.try_reserve()?;
         let count = {
             let mut s = lock(&self.store);
             s.append(&DomainEvent::NodeRoleAssigned {
@@ -7310,7 +8698,11 @@ impl NodeManager {
         // a partir do `role`. Nenhuma superfície de filesystem: nenhum agente alcança esta fila. O nó
         // acabou de ser persistido (`NodeRoleAssigned`); se sumir do roster antes do drain, o consumidor
         // descarta com log (nunca injeta às cegas).
-        enqueue_doctrine_reinjection(&self.reinject_queue, node, role);
+        reinjection.commit(ReinjectItem {
+            id: format!("reinject_{}", uuid::Uuid::now_v7()),
+            target: node,
+            role: role.to_string(),
+        });
         Ok(())
     }
 
@@ -7781,7 +9173,8 @@ impl NodeManager {
     /// `main`) são tradutores finos de intenção → [`NodeAdmission`] — proibidos de apendar
     /// eventos ou tocar o Supervisor diretamente.
     pub fn admit_node(&self, plan: NodeAdmission) -> Result<NodeId, String> {
-        self.admit_node_inner(plan, true)
+        self.admit_node_inner(plan, true, true, true)
+            .map(|admitted| admitted.node)
     }
 
     /// O corpo do funil. `rewrite_roster=false` SÓ no restore (F1-4-3): N admissões em lote
@@ -7791,7 +9184,13 @@ impl NodeManager {
         &self,
         plan: NodeAdmission,
         rewrite_roster: bool,
-    ) -> Result<NodeId, String> {
+        persist_events: bool,
+        track_activity: bool,
+    ) -> Result<AdmittedNode, String> {
+        let _admission = track_activity
+            .then(|| self.activity.begin_admission())
+            .transpose()?;
+        crate::runtime::ensure_fd_headroom(6)?;
         // 1) seq/key — a identidade local do PTY (o NodeId canônico nasce no register).
         let seq = {
             let mut s = lock(&self.seq);
@@ -7855,6 +9254,10 @@ impl NodeManager {
         if role.is_empty() || role.chars().any(char::is_control) {
             return Err(format!("papel inválido: {role:?}"));
         }
+        let prompt_cli = plan
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.profile_id.clone());
 
         // 3) Comando: motor escolhido (M6) ou fábrica default — TODO nó nasce com a IDENTIDADE
         //    no env (ADR 0026): `VIBE_ROLE` ("terminal" também é papel) + `LINA_NODE_NAME`/
@@ -8074,9 +9477,9 @@ impl NodeManager {
             None => next_free_slot(&lock(&self.model)),
         };
 
-        let (node, grid) = {
+        let (node, grid, reader) = {
             let mut p = lock(&self.pty);
-            wire_terminal_capturing(
+            wire_terminal_capturing_owned(
                 &mut p,
                 &self.sup,
                 &self.delta_tx,
@@ -8088,8 +9491,27 @@ impl NodeManager {
                 self.rows,
                 // F1-5-2: o terminal nasce capturando no store do workspace (cabo append-on-scroll).
                 self.scrollback.clone(),
+                Some(Arc::clone(&self.active_readers)),
             )?
         };
+        {
+            let mut readers = lock(&self.reader_threads);
+            if readers.contains_key(&node) {
+                drop(readers);
+                compensate_wire(&mut lock(&self.pty), &self.sup, node, &key);
+                let _ = reader.join();
+                return Err(format!(
+                    "a identidade interna {node} já possui um leitor de terminal"
+                ));
+            }
+            readers.insert(
+                node,
+                OwnedPtyReader {
+                    key: key.clone(),
+                    join: reader,
+                },
+            );
+        }
 
         // 6) PERSISTE a sequência CANÔNICA (§2) antes de projetar — log = fonte da verdade.
         //    Falha em QUALQUER append → compensação (§5): `retire_pty` desregistra do roster
@@ -8116,66 +9538,77 @@ impl NodeManager {
             task_difficulty: None,
             by: plan.requested_by,
         });
-        let count = {
+        let count = if persist_events {
             let mut s = lock(&self.store);
-            let mut appended = Ok(());
-            for ev in &events {
-                if let Err(e) = s.append(ev) {
-                    appended = Err(e.to_string());
-                    break;
+            match s.append_batch(&events) {
+                Ok(count) => Some(count),
+                Err(error) => {
+                    drop(s);
+                    self.retire_pty(node, key);
+                    return Err(error.to_string());
                 }
             }
-            if let Err(e) = appended {
-                drop(s);
-                self.retire_pty(node, key);
-                return Err(e);
-            }
-            s.event_count().ok()
+        } else {
+            None
         };
 
-        // 7) Projeção ATÔMICA: model (INSERE sobrescrevendo qualquer placeholder do pump) +
-        //    grids + keys + política de cwd (o `rewrite_bootstrap` itera por ela).
+        let mut view = NodeView::new(name.clone(), NodeKind::Terminal, x, y);
+        view.kit_missing = kit_missing;
+        view.cwd_shared = cwd_shared;
+        view.autonomy = plan.autonomy;
+        let admitted = AdmittedNode {
+            node,
+            key,
+            grid,
+            cwd: plan_cwd,
+            view,
+            cwd_sharers,
+            prompt_cli,
+            events,
+        };
+        if persist_events {
+            self.publish_admitted_node(&admitted, count);
+            if rewrite_roster {
+                self.rewrite_bootstrap();
+            }
+            eprintln!(
+                "lina-gpui: admissão — agente '{name}' criado (papel {role}, cwd {}). node {node}",
+                cwd_real
+                    .as_deref()
+                    .map_or_else(|| "herdado".to_string(), |p| p.display().to_string())
+            );
+        }
+        Ok(admitted)
+    }
+
+    fn publish_admitted_node(&self, admitted: &AdmittedNode, event_count: Option<u64>) {
+        self.publish_admitted_runtime_handles(admitted);
         {
-            let mut m = lock(&self.model);
-            let mut view = NodeView::new(name.clone(), NodeKind::Terminal, x, y);
-            view.kit_missing = kit_missing;
-            view.cwd_shared = cwd_shared;
-            view.autonomy = plan.autonomy;
-            m.nodes.insert(node, view);
-            // FIX-1: os nós que JÁ estavam nesta pasta agora têm companhia → badge honesto
-            // neles também (o compartilhamento é mútuo; nenhum card esconde que divide a pasta).
-            for sharer in &cwd_sharers {
-                if let Some(v) = m.nodes.get_mut(sharer) {
-                    v.cwd_shared = true;
+            let mut model = lock(&self.model);
+            model.nodes.insert(admitted.node, admitted.view.clone());
+            for sharer in &admitted.cwd_sharers {
+                if let Some(view) = model.nodes.get_mut(sharer) {
+                    view.cwd_shared = true;
                 }
             }
-            if !m.order.contains(&node) {
-                m.order.push(node);
+            if !model.order.contains(&admitted.node) {
+                model.order.push(admitted.node);
             }
-            if let Some(c) = count {
-                m.event_count = c;
+            if let Some(count) = event_count {
+                model.event_count = count;
             }
-            m.touch();
+            model.touch();
         }
-        // Running (emite NodeStatus → o pump pinta o ponto de status do card).
-        let _ = self.sup.set_status(node, CoreStatus::Running);
-        lock(&self.grids).insert(node, grid);
-        lock(&self.keys).insert(node, key);
-        // A política EFETIVA (pós-resolução FIX-2) — o `rewrite_bootstrap` itera por ela.
-        lock(&self.cwds).insert(node, plan_cwd);
+    }
 
-        // 8) Roster mudou → reescreve as doutrinas (os existentes ganham o colega novo).
-        //    No restore em lote a reescrita é ADIADA para o fim (ver `admit_node_inner`).
-        if rewrite_roster {
-            self.rewrite_bootstrap();
+    fn publish_admitted_runtime_handles(&self, admitted: &AdmittedNode) {
+        let _ = self.sup.set_status(admitted.node, CoreStatus::Running);
+        lock(&self.grids).insert(admitted.node, Arc::clone(&admitted.grid));
+        lock(&self.keys).insert(admitted.node, admitted.key.clone());
+        lock(&self.cwds).insert(admitted.node, admitted.cwd.clone());
+        if let Some(profile) = &admitted.prompt_cli {
+            lock(&self.prompt_cli_by_node).insert(admitted.node, profile.clone());
         }
-        eprintln!(
-            "lina-gpui: admissão — agente '{name}' criado (papel {role}, cwd {}). node {node}",
-            cwd_real
-                .as_deref()
-                .map_or_else(|| "herdado".to_string(), |p| p.display().to_string())
-        );
-        Ok(node)
     }
 
     /// **SEAM-1 (M3) — executa um spawn aprovado pelo funil único, idempotente por `spawn_id`.**
@@ -8244,6 +9677,7 @@ impl NodeManager {
     /// congela a UI; o reader fecha sozinho no EOF). **NUNCA** remove o último — o canvas jamais
     /// fica em branco (invariante não-técnico). Sem panic.
     pub fn remove_node(&self, node: NodeId) -> Result<(), String> {
+        let _activity = self.activity.begin_external()?;
         if self.count() <= 1 {
             return Err("o canvas nunca fica em branco: não removo o último nó".into());
         }
@@ -8272,6 +9706,8 @@ impl NodeManager {
         lock(&self.grids).remove(&node);
         lock(&self.keys).remove(&node);
         lock(&self.cwds).remove(&node);
+        lock(&self.prompt_cli_by_node).remove(&node);
+        lock(&self.prompt_epochs).remove(&node);
 
         // Encerra o PTY em background (não bloqueia o thread de UI por até 2s) — SÓ se houver (um
         // nó-artefato Note/Folder não tem PTY).
@@ -8285,22 +9721,137 @@ impl NodeManager {
 
     /// Encerra um PTY já fora do canvas **sem bloquear o thread de UI**: desregistra do
     /// Supervisor na hora e mata o processo (SIGTERM→SIGKILL, até 2s) numa thread de fundo.
+    /// A mesma tarefa fecha o master e aguarda o reader; concluir a tarefa significa que
+    /// não existe mais nenhuma thread capaz de tocar o grid/scrollback desse nó.
     fn retire_pty(&self, node: NodeId, key: String) {
         if let Err(e) = self.sup.unregister(node) {
             eprintln!("lina-gpui: unregister do nó {node} falhou: {e}");
         }
-        let pty = Arc::clone(&self.pty);
-        if let Err(e) = thread::Builder::new()
-            .name(format!("lina-kill-{key}"))
+        let mut retirement_key = key;
+        let reader = lock(&self.reader_threads).remove(&node).map(|owned| {
+            if owned.key != retirement_key {
+                eprintln!(
+                    "lina-gpui: chave do reader de {node} divergiu ({} != {}); usando a chave do handle",
+                    owned.key, retirement_key
+                );
+            }
+            retirement_key = owned.key;
+            owned.join
+        });
+        let retirement = Arc::new(Mutex::new(Some(PtyRetirement {
+            pty: Arc::clone(&self.pty),
+            key: retirement_key.clone(),
+            reader,
+        })));
+        let background_retirement = Arc::clone(&retirement);
+        match thread::Builder::new()
+            .name(format!("lina-kill-{retirement_key}"))
             .spawn(move || {
-                if let Err(e) = lock(&pty).kill(key.as_str(), Duration::from_secs(2)) {
-                    eprintln!("lina-gpui: kill do PTY {key} falhou: {e}");
+                if let Some(retirement) = lock(&background_retirement).take() {
+                    retirement.finish();
                 }
-                let _ = lock(&pty).remove(key.as_str());
-            })
-        {
-            eprintln!("lina-gpui: thread de kill não pôde subir: {e}");
+            }) {
+            Ok(handle) => {
+                let mut cleanup = lock(&self.cleanup_threads);
+                let finished = std::mem::take(&mut *cleanup);
+                let mut pending = Vec::new();
+                for old in finished {
+                    if old.is_finished() {
+                        let _ = old.join();
+                    } else {
+                        pending.push(old);
+                    }
+                }
+                pending.push(handle);
+                *cleanup = pending;
+            }
+            Err(e) => {
+                // Sob pressão de threads/FDs, falhar em criar justamente a thread de
+                // limpeza não pode abandonar o filho nem destacar o reader. O estado da
+                // aposentadoria continua neste thread e é concluído sincronamente.
+                eprintln!(
+                    "lina-gpui: thread de kill não pôde subir ({e}); encerrando {retirement_key} sincronamente"
+                );
+                if let Some(retirement) = lock(&retirement).take() {
+                    retirement.finish();
+                }
+            }
         }
+    }
+
+    /// Aguarda todas as limpezas iniciadas por este manager. Deve rodar dentro da
+    /// barreira de quiescência antes do re-check final de PTYs.
+    pub(crate) fn join_cleanup_tasks(&self) {
+        loop {
+            let handles = std::mem::take(&mut *lock(&self.cleanup_threads));
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn current_prompt_observation(&self, node: NodeId) -> Option<lina_core::PromptObservation> {
+        let (registry, fallback) = lock(&self.prompt_profiles).clone()?;
+        let cli = lock(&self.prompt_cli_by_node).get(&node).cloned();
+        let profile = target_profile(cli.as_deref(), &registry, &fallback);
+        let grid = lock(&self.grids).get(&node).cloned()?;
+        let input_region = grid.input_region_text();
+        let screen = {
+            let grid = lock(&grid);
+            let (_, rows) = grid.dims();
+            (0..rows)
+                .map(|row| grid.row_text(row))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        lina_core::prompt_observation(
+            &screen,
+            &input_region,
+            &profile.prompt_ready_regex,
+            &profile.busy_markers,
+        )
+    }
+
+    pub(crate) fn capture_prompt_before_input(&self, node: NodeId) {
+        let baseline = self.current_prompt_observation(node);
+        let mut epochs = lock(&self.prompt_epochs);
+        let epoch = epochs.entry(node).or_default();
+        epoch.captured_before_input = Some(baseline);
+    }
+
+    fn observe_prompt_epoch(&self, node: NodeId) -> bool {
+        let current = self.current_prompt_observation(node);
+        let input_generation = self.sup.terminal_input_generation(node).unwrap_or(0);
+        let mut epochs = lock(&self.prompt_epochs);
+        let epoch = epochs.entry(node).or_default();
+        if input_generation != epoch.generation {
+            epoch.generation = input_generation;
+            epoch.baseline = epoch.captured_before_input.take().unwrap_or(None);
+            epoch.saw_not_ready = false;
+            epoch.ready_generation = None;
+        }
+        if epoch.generation == 0 {
+            return current.is_some();
+        }
+        let Some(current) = current else {
+            epoch.saw_not_ready = true;
+            return false;
+        };
+        if epoch.saw_not_ready || epoch.baseline.as_ref() != Some(&current) {
+            epoch.ready_generation = Some(epoch.generation);
+        }
+        epoch.ready_generation == Some(epoch.generation)
+    }
+
+    pub(crate) fn note_terminal_output(&self, node: NodeId) {
+        let _ = self.observe_prompt_epoch(node);
+    }
+
+    pub(crate) fn terminal_has_fresh_prompt(&self, node: NodeId) -> bool {
+        self.observe_prompt_epoch(node)
     }
 
     /// **r5 park-seam — Descarregar Espaço: desliga PTYs OCIOSOS sem remover nós.** O card
@@ -8308,64 +9859,243 @@ impl NodeManager {
     /// Religação = resgate de órfão-nomeado do `plan_restore` no próximo foco (F1-4-3).
     /// A restrição do fundador ("sem interferir nos processos rodando") é re-checada AQUI,
     /// no instante da execução (defesa em profundidade contra lista velha do chamador):
-    /// só quem está `Idle` AGORA estaciona. Devolve quantos desligou.
+    /// só `Idle`/`Ready`/`Running` com entrada quieta estacionam; `Starting`, `Busy` e
+    /// `Blocked` permanecem vivos. Devolve quantos desligou; falha de persistência
+    /// devolve erro e mantém todos os PTYs vivos.
     //
     // Consumido por `runtime::unload_workspace` (callback do botão do rail — costura do C);
     // `dead_code` até a fiação entrar, como `plan_restore` na F1-4-3.
     #[allow(dead_code)]
-    pub fn park_terminals(&self, candidates: &[NodeId]) -> usize {
-        let roster = self.sup.list();
-        let plan = lina_core::suspend::unload_plan(&roster);
-        let safe: std::collections::BTreeSet<NodeId> = plan.park.iter().copied().collect();
-        let mut parked: Vec<String> = Vec::new();
+    pub fn park_terminals(&self, candidates: &[NodeId]) -> Result<usize, String> {
+        self.park_terminals_after_quiet(candidates, Duration::from_secs(2))
+    }
+
+    fn park_terminals_after_quiet(
+        &self,
+        candidates: &[NodeId],
+        minimum_input_quiet: Duration,
+    ) -> Result<usize, String> {
+        let mut prepared: Vec<(NodeId, String, lina_core::NodeStatus)> = Vec::new();
+        let mut input_guards = Vec::new();
+        // Uma única transação lógica cobre TODOS os terminais do gesto. O lock do
+        // store precede os locks de PTY, a mesma ordem usada pela entrega A2A.
+        let mut store = lock(&self.store);
         for &node in candidates {
-            if !safe.contains(&node) {
-                continue; // Busy/Blocked/em-atividade preservados (ou já fora do roster)
-            }
             let Some(key) = lock(&self.keys).get(&node).cloned() else {
                 continue; // artefato (Note/Folder) ou já estacionado — sem PTY a desligar
             };
-            // Fato-antes-do-efeito: a morte entra no LOG antes do kill — é o que faz a
-            // projeção ver `Dead{unloaded_bg}` e o resgate do plan_restore religar depois.
-            // Falha de append → NÃO desliga (nenhum efeito sem registro).
-            let from = roster
-                .iter()
-                .find(|i| i.id == node)
-                .map_or("", |i| i.status.as_str());
-            if let Err(e) = lock(&self.store).append(&DomainEvent::NodeStatusChanged {
-                node,
-                status: lina_core::NodeStatus::Dead.as_str().to_string(),
-                from: from.to_string(),
-                reason: "unloaded_bg".to_string(),
-            }) {
-                eprintln!("lina-gpui: park de {node} ABORTADO (morte não registrável): {e}");
+            // O lock barra novas entradas humanas/A2A enquanto reservamos o nó. A
+            // janela de quietude cobre o intervalo entrega→Busy: uma mensagem que acabou
+            // de ser enfileirada não pode parecer Idle e ser morta antes do status virar.
+            // A entrega A2A usa a ordem store→PTY. Repetir essa ordem aqui evita
+            // deadlock (desmontagem segurando PTY enquanto a entrega segura store).
+            let Ok(input_guard) =
+                self.sup
+                    .lock_pty(node, lina_core::Writer::Human, Duration::from_millis(25))
+            else {
+                continue;
+            };
+            if !self.sup.terminal_input_is_quiet(node, minimum_input_quiet) {
                 continue;
             }
+            // Silêncio/idle_ms sozinho não prova ociosidade: `sleep 60`, build sem
+            // output e processos aguardando rede são silenciosos e continuam vivos.
+            // Só o prompt declarado pelo CLI Profile autoriza estacionar.
+            if !self.terminal_has_fresh_prompt(node) {
+                continue;
+            }
+            let Some(from_status) = self.sup.get(node).map(|info| info.status) else {
+                continue;
+            };
+            if !matches!(
+                from_status,
+                lina_core::NodeStatus::Idle
+                    | lina_core::NodeStatus::Ready
+                    | lina_core::NodeStatus::Running
+            ) {
+                continue;
+            }
+            let reserved = self
+                .sup
+                .set_status_if(
+                    node,
+                    from_status,
+                    lina_core::NodeStatus::Dead,
+                    Some("unloaded_bg".to_string()),
+                )
+                .unwrap_or(false);
+            if !reserved {
+                continue; // Busy/Blocked/Ready/Running ou já fora do roster.
+            }
+            prepared.push((node, key, from_status));
+            input_guards.push(input_guard);
+        }
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+
+        let parked: Vec<String> = prepared
+            .iter()
+            .map(|(node, _, _)| node.to_string())
+            .collect();
+        let parked_ids: std::collections::BTreeSet<NodeId> =
+            prepared.iter().map(|(node, _, _)| *node).collect();
+        let kept: Vec<String> = lock(&self.keys)
+            .keys()
+            .filter(|node| !parked_ids.contains(node))
+            .map(ToString::to_string)
+            .collect();
+        let mut events: Vec<DomainEvent> = prepared
+            .iter()
+            .map(|(node, _, from_status)| DomainEvent::NodeStatusChanged {
+                node: *node,
+                status: lina_core::NodeStatus::Dead.as_str().to_string(),
+                from: from_status.as_str().to_string(),
+                reason: "unloaded_bg".to_string(),
+            })
+            .collect();
+        events.push(DomainEvent::WorkspaceUnloaded {
+            parked: parked.clone(),
+            kept: kept.clone(),
+        });
+
+        #[cfg(test)]
+        let injected_failure = tests::take_park_batch_fault();
+        #[cfg(not(test))]
+        let injected_failure = false;
+        let persisted = if injected_failure {
+            Err("falha final de append injetada".to_owned())
+        } else {
+            store
+                .append_batch(&events)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        if let Err(error) = persisted {
+            for (node, _, from_status) in &prepared {
+                match self.sup.set_status_if(
+                    *node,
+                    lina_core::NodeStatus::Dead,
+                    *from_status,
+                    Some("unload_persist_failed".to_string()),
+                ) {
+                    Ok(true) => {}
+                    Ok(false)
+                        if self
+                            .sup
+                            .get(*node)
+                            .is_some_and(|info| info.status == lina_core::NodeStatus::Dead) =>
+                    {
+                        if let Err(rollback_error) = self.sup.set_status(*node, *from_status) {
+                            eprintln!(
+                                "lina-gpui: rollback do park de {node} falhou: {rollback_error}"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(rollback_error) => eprintln!(
+                        "lina-gpui: rollback do park de {node} não pôde restaurar o roster: {rollback_error}"
+                    ),
+                }
+            }
+            return Err(format!(
+                "não consegui registrar o descarregamento; nenhum agente foi desligado ({error})"
+            ));
+        }
+        drop(store);
+
+        // Só depois do batch completo e confirmado começam os efeitos irreversíveis.
+        // As guardas impedem entrada nova entre o certificado e o unregister.
+        for (node, key, _) in prepared {
             lock(&self.keys).remove(&node);
             lock(&self.grids).remove(&node);
+            lock(&self.prompt_cli_by_node).remove(&node);
+            lock(&self.prompt_epochs).remove(&node);
             self.retire_pty(node, key); // desregistra do roster + SIGTERM→SIGKILL em fundo
-            parked.push(node.to_string());
         }
-        if parked.is_empty() {
-            return 0;
-        }
-        // Livro-razão do GESTO (estacionados + preservados) — religação/auditoria leem daqui.
-        if let Err(e) = lock(&self.store).append(&DomainEvent::WorkspaceUnloaded {
-            parked: parked.clone(),
-            kept: plan.keep.iter().map(ToString::to_string).collect(),
-        }) {
-            eprintln!(
-                "lina-gpui: WorkspaceUnloaded não logado ({e}); as mortes individuais estão no log"
-            );
-        }
+        drop(input_guards);
         // Roster mudou → os CLAUDE.md dos colegas não listam os estacionados.
         self.rewrite_bootstrap();
         eprintln!(
             "lina-gpui: [PARK] {} terminal(is) ocioso(s) desligado(s); {} em atividade preservado(s)",
             parked.len(),
-            plan.keep.len()
+            kept.len()
         );
-        parked.len()
+        Ok(parked.len())
+    }
+
+    /// Nós que ainda possuem um PTY neste runtime. Filtrar o roster por esta lista evita
+    /// tratar gatilhos internos (`@Trigger`) e artefatos sem terminal como trabalho humano
+    /// que impediria a desmontagem segura do workspace.
+    pub(crate) fn terminal_ids(&self) -> std::collections::BTreeSet<NodeId> {
+        lock(&self.keys).keys().copied().collect()
+    }
+
+    fn discard_prepared_nodes(&self, nodes: &[AdmittedNode]) {
+        for admitted in nodes {
+            self.retire_pty(admitted.node, admitted.key.clone());
+        }
+        self.join_cleanup_tasks();
+        let mut model = lock(&self.model);
+        let mut removed_visible_state = false;
+        for admitted in nodes {
+            removed_visible_state |= model.nodes.remove(&admitted.node).is_some();
+            let order_len = model.order.len();
+            model.order.retain(|known| *known != admitted.node);
+            removed_visible_state |= model.order.len() != order_len;
+            removed_visible_state |= model.restore_badges.remove(&admitted.node).is_some();
+        }
+        if removed_visible_state {
+            model.touch();
+        }
+    }
+
+    /// Remove somente os nós criados por uma tentativa de restore. Os fatos já
+    /// confirmados ficam no log append-only para a próxima abertura convergir; o
+    /// runtime parcial, porém, não conserva PTY, card ou registro vivo algum.
+    fn rollback_restored_nodes(&self, nodes: &[NodeId]) {
+        let mut terminals = Vec::new();
+        for node in nodes.iter().copied() {
+            if let Some(key) = lock(&self.keys).remove(&node) {
+                terminals.push((node, key));
+            }
+            lock(&self.grids).remove(&node);
+            lock(&self.cwds).remove(&node);
+            lock(&self.prompt_cli_by_node).remove(&node);
+            lock(&self.prompt_epochs).remove(&node);
+            let mut model = lock(&self.model);
+            model.nodes.remove(&node);
+            model.order.retain(|known| *known != node);
+            model.restore_badges.remove(&node);
+            model.touch();
+        }
+        for (node, key) in terminals {
+            self.retire_pty(node, key);
+        }
+        self.join_cleanup_tasks();
+    }
+
+    /// Rollback síncrono do boot: encerra e remove todos os PTYs que este runtime
+    /// chegou a restaurar antes de uma falha posterior. Não grava `Dead` no log — o
+    /// runtime nunca ficou pronto/focado e a próxima abertura deve poder restaurá-los.
+    pub(crate) fn shutdown_terminals_after_failed_boot(&self) {
+        self.join_cleanup_tasks();
+        let terminals: Vec<NodeId> = self.terminal_ids().into_iter().collect();
+        self.rollback_restored_nodes(&terminals);
+    }
+}
+
+impl Drop for NodeManager {
+    fn drop(&mut self) {
+        self.join_cleanup_tasks();
+        let mut terminals: BTreeMap<NodeId, String> = lock(&self.keys).clone();
+        for (node, reader) in lock(&self.reader_threads).iter() {
+            terminals.entry(*node).or_insert_with(|| reader.key.clone());
+        }
+        for (node, key) in terminals {
+            self.retire_pty(node, key);
+        }
+        self.join_cleanup_tasks();
     }
 }
 
@@ -8522,11 +10252,35 @@ pub struct Pump {
 }
 
 impl Pump {
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
+    fn from_join(stop: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
+        ACTIVE_PUMP_HANDLES.fetch_add(1, Ordering::AcqRel);
+        Self {
+            stop,
+            join: Some(join),
         }
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(join) = &self.join {
+            join.thread().unpark();
+        }
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.wake();
+    }
+
+    pub(crate) fn join(&mut self) {
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+            ACTIVE_PUMP_HANDLES.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.request_stop();
+        self.join();
     }
 }
 
@@ -8534,6 +10288,41 @@ impl Drop for Pump {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn finish_turn_if_fresh_prompt(
+    nodes: Option<&NodeManager>,
+    lifecycle: &mut lina_core::lifecycle::LifecycleEngine,
+    sup: &Supervisor,
+    store: &Arc<Mutex<EventStore>>,
+    node: NodeId,
+) -> Result<bool, String> {
+    if nodes.is_some_and(|nodes| !nodes.terminal_has_fresh_prompt(node)) {
+        return Ok(false);
+    }
+    lifecycle
+        .on_end_of_response(sup, &mut lock(store), node)
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+type PendingFinishedTurns = BTreeMap<NodeId, (u64, u64)>;
+
+fn discard_finished_turn_if_terminal_gone(
+    pending: &mut PendingFinishedTurns,
+    active: &mut std::collections::HashSet<NodeId>,
+    sup: &Supervisor,
+    node: NodeId,
+) -> bool {
+    if sup
+        .get(node)
+        .is_some_and(|info| info.status != CoreStatus::Dead)
+    {
+        return false;
+    }
+    pending.remove(&node);
+    active.remove(&node);
+    true
 }
 
 /// Sobe a thread-bomba: drena o Bus (lifecycle/status + **`Message` → pulso**) e os `GridDelta`.
@@ -8559,6 +10348,7 @@ pub fn spawn_pump(
     grids: Arc<Mutex<BTreeMap<NodeId, Grid>>>,
     attention: Arc<AttentionHub>,
     live_detection: bool,
+    nodes: Option<Arc<NodeManager>>,
 ) -> std::io::Result<Pump> {
     let stop = Arc::new(AtomicBool::new(false));
     let join = {
@@ -8575,6 +10365,10 @@ pub fn spawn_pump(
                 // transição (não a cada delta → sem busy-loop/churn de render). Idle = "resposta pronta".
                 let mut active: std::collections::HashSet<NodeId> =
                     std::collections::HashSet::new();
+                // O medidor consome o turno quando o output fica quieto, mas silêncio
+                // não prova prompt novo (comando como `sleep`). Retemos o uso até a época
+                // de prompt confirmar o fim e reavaliamos em todos os ticks.
+                let mut pending_finished = PendingFinishedTurns::new();
                 // R2b: metade-app do loop vivo de detecção (detector canônico do core
                 // sobre os grids do app; tick ≤1s ⇒ claude real bloqueado vira
                 // PermissionAsked no log em <3s — o hub re-projeta e o toast aparece).
@@ -8586,6 +10380,26 @@ pub fn spawn_pump(
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    // O boot sobe a thread antes do commit do restore para eliminar a
+                    // última falha possível de `spawn`. Enquanto a quiescência está armada,
+                    // porém, nenhum `NodeSpawned` provisório pode virar card visível.
+                    if nodes
+                        .as_ref()
+                        .is_some_and(|nodes| nodes.runtime_is_quiescing())
+                    {
+                        thread::park_timeout(Duration::from_millis(2));
+                        continue;
+                    }
+                    let activity = match nodes.as_ref() {
+                        Some(nodes) => match nodes.begin_external_task() {
+                            Ok(activity) => Some(activity),
+                            Err(_) => {
+                                thread::park_timeout(Duration::from_millis(2));
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
                     let mut worked = false;
                     loop {
                         match bus_rx.try_recv() {
@@ -8603,6 +10417,9 @@ pub fn spawn_pump(
                     // Mede o output de cada nó (node+bytes do GridDelta) — fonte do teto de custo.
                     while let Ok(delta) = delta_rx.try_recv() {
                         meter.record_output(delta.node, delta.bytes, now);
+                        if let Some(nodes) = &nodes {
+                            nodes.note_terminal_output(delta.node);
+                        }
                         // R2b: output vivo re-arma o relógio de idle da detecção (sinal
                         // do PRODUTOR — o mesmo do `metrics.bytes_read` da metade-core).
                         watch.note_output(delta.node, now);
@@ -8650,13 +10467,44 @@ pub fn spawn_pump(
                         last_autodeny_ms = now;
                         attention.drive_auto_deny(now);
                     }
-                    // Fim-de-turno por idle → apenda TokenUsageReported (estimado) no store autoritativo.
+                    // O medidor sinaliza CANDIDATOS. `(total, já_reportado)` evita perder
+                    // o candidato quando o prompt ainda é antigo e evita duplicar uso se
+                    // a transição event-sourced precisar ser repetida após uma falha.
                     for (node, tokens) in meter.poll_finished_turns(now, idle_ms) {
-                        if let Err(e) = lock(&store).append(&DomainEvent::TokenUsageReported {
-                            node: node.to_string(),
-                            tokens,
-                        }) {
-                            eprintln!("lina-gpui: falha ao apendar TokenUsageReported: {e}");
+                        let pending = pending_finished.entry(node).or_insert((0, 0));
+                        pending.0 = pending.0.saturating_add(tokens);
+                    }
+                    let finished_nodes: Vec<NodeId> = pending_finished.keys().copied().collect();
+                    for node in finished_nodes {
+                        if discard_finished_turn_if_terminal_gone(
+                            &mut pending_finished,
+                            &mut active,
+                            &sup,
+                            node,
+                        ) {
+                            continue;
+                        }
+                        if nodes
+                            .as_ref()
+                            .is_some_and(|nodes| !nodes.terminal_has_fresh_prompt(node))
+                        {
+                            continue;
+                        }
+                        let (total_tokens, reported_tokens) = pending_finished[&node];
+                        if total_tokens > reported_tokens {
+                            let unreported = total_tokens - reported_tokens;
+                            if let Err(e) =
+                                lock(&store).append(&DomainEvent::TokenUsageReported {
+                                    node: node.to_string(),
+                                    tokens: unreported,
+                                })
+                            {
+                                eprintln!("lina-gpui: falha ao apendar TokenUsageReported: {e}");
+                                continue;
+                            }
+                            if let Some(pending) = pending_finished.get_mut(&node) {
+                                pending.1 = total_tokens;
+                            }
                         }
                         // FIX DE GATE F1-0: fim-de-resposta REAL (o MESMO sinal do medidor W0-10 —
                         // idle do perfil fecha o turno; nunca um flush qualquer) → transição
@@ -8664,12 +10512,23 @@ pub fn spawn_pump(
                         // no log + roster). É o que destrava a retenção F1-0-4: a próxima msg ao
                         // mesmo alvo ENTREGA em vez de reter até a DLQ. Best-effort com erro ALTO
                         // (nó morto entre o turno e o tick é corrida legítima — Dead é terminal).
-                        if let Err(e) = lifecycle.on_end_of_response(&sup, &mut lock(&store), node)
-                        {
-                            eprintln!(
-                                "lina-gpui: fim-de-resposta de {node} não virou Idle no roster: {e}"
-                            );
+                        match finish_turn_if_fresh_prompt(
+                            nodes.as_deref(),
+                            &mut lifecycle,
+                            &sup,
+                            &store,
+                            node,
+                        ) {
+                            Ok(false) => continue,
+                            Ok(true) => {}
+                            Err(e) => {
+                                eprintln!(
+                                    "lina-gpui: fim-de-resposta de {node} não virou Idle no roster: {e}"
+                                );
+                                continue;
+                            }
                         }
+                        pending_finished.remove(&node);
                         // W4-6 gap2: fim-de-turno → Idle → a `LiveRegion` computa "resposta pronta"
                         // (1×/turno) e o badge vira "💤 dormindo". Transição → sem churn.
                         active.remove(&node);
@@ -8678,17 +10537,16 @@ pub fn spawn_pump(
                             status: NodeStatus::Idle,
                             reason: None,
                         });
+                        worked = true;
                     }
+                    drop(activity);
                     if !worked {
-                        thread::sleep(Duration::from_millis(2));
+                        thread::park_timeout(Duration::from_millis(2));
                     }
                 }
             })?
     };
-    Ok(Pump {
-        stop,
-        join: Some(join),
-    })
+    Ok(Pump::from_join(stop, join))
 }
 
 #[cfg(test)]
@@ -8740,6 +10598,12 @@ mod tests {
         /// o caminho REAL de COMPENSAÇÃO em `wire_terminal` (não um substituto). Consumido na 1ª
         /// checada (replace→false): nunca vaza entre testes na mesma thread.
         static WIRE_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// Falha determinística depois de `@Trigger` entrar no roster e antes de a
+        /// engine ser publicada. Prova a compensação da única janela pós-register.
+        static WEBHOOK_START_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// Sabota o batch final do gesto de descarregar antes do commit. Nenhum
+        /// PTY pode ser morto e nenhum subconjunto pode aparecer no log.
+        static PARK_BATCH_FAULT: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Arma a próxima [`wire_terminal`] para falhar logo após o `register` (consumido 1×).
@@ -8750,6 +10614,155 @@ mod tests {
     /// `wire_terminal` consulta isto pós-`register` (sob `#[cfg(test)]`): toma-e-limpa a flag.
     pub(super) fn take_wire_fault() -> bool {
         WIRE_FAULT.with(|f| f.replace(false))
+    }
+
+    fn arm_webhook_start_fault() {
+        WEBHOOK_START_FAULT.with(|fault| fault.set(true));
+    }
+
+    pub(super) fn take_webhook_start_fault() -> bool {
+        WEBHOOK_START_FAULT.with(|fault| fault.replace(false))
+    }
+
+    fn arm_park_batch_fault() {
+        PARK_BATCH_FAULT.with(|fault| fault.set(true));
+    }
+
+    pub(super) fn take_park_batch_fault() -> bool {
+        PARK_BATCH_FAULT.with(|fault| fault.replace(false))
+    }
+
+    #[test]
+    fn workspace_reliability_webhook_start_failure_compensates_trigger_roster() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-webhook-start-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("store")));
+        let sup = Arc::new(Supervisor::new());
+        let roster_snapshot = |supervisor: &Supervisor| {
+            supervisor
+                .list()
+                .into_iter()
+                .map(|node| (node.id, node.name, node.role, node.status))
+                .collect::<Vec<_>>()
+        };
+        let before = roster_snapshot(&sup);
+        arm_webhook_start_fault();
+
+        let shared = WebhookShared::start(
+            store,
+            Arc::clone(&sup),
+            lina_webhooks::SystemDeliveryQueue::default(),
+        );
+        // Em sandboxes que proíbem bind, o start sai antes do seam. Limpa a flag
+        // thread-local para não contaminar o próximo teste; a guarda abaixo exercita
+        // a janela pós-register sem depender de permissão de rede.
+        let _ = take_webhook_start_fault();
+
+        assert!(shared.is_none(), "a falha pós-register aborta o start");
+        assert_eq!(
+            roster_snapshot(&sup),
+            before,
+            "o roster fica byte-semanticamente idêntico após compensar @Trigger"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_reliability_webhook_post_register_guard_restores_roster() {
+        let sup = Arc::new(Supervisor::new());
+        let snapshot = |supervisor: &Supervisor| {
+            supervisor
+                .list()
+                .into_iter()
+                .map(|node| (node.id, node.name, node.role, node.status))
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot(&sup);
+        {
+            let pending = PendingWebhookTrigger::register(Arc::clone(&sup));
+            assert!(
+                sup.get(pending.id())
+                    .is_some_and(|node| node.name == "@Trigger"),
+                "controle negativo: @Trigger entrou no roster antes da falha de setup"
+            );
+            // Simula qualquer `return` de setup após register e antes de `publish`.
+        }
+        assert_eq!(
+            snapshot(&sup),
+            before,
+            "Drop da guarda compensa integralmente o registro provisório"
+        );
+    }
+
+    fn post_observability_hook(port: u16, token: &str) -> String {
+        use std::io::Write as _;
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("listener global de hooks");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout de leitura");
+        let body = r#"{"message":"escopado"}"#;
+        let request = format!(
+            "POST /hook/{token}/Notification HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("enviar hook");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("ler resposta do hook");
+        response
+    }
+
+    #[test]
+    fn workspace_reliability_hooks_use_one_listener_and_isolate_equal_node_names() {
+        let shared = HooksShared::start().expect("listener global");
+        let same_process = HooksShared::start().expect("reuso do listener global");
+        assert!(
+            Arc::ptr_eq(&shared, &same_process),
+            "todos os runtimes recebem exatamente o mesmo listener"
+        );
+        assert_eq!(
+            shared.listener.local_addr(),
+            same_process.listener.local_addr()
+        );
+
+        let unique = uuid::Uuid::now_v7();
+        let workspace_a = shared.for_workspace(format!("ws-a-{unique}"));
+        let workspace_b = shared.for_workspace(format!("ws-b-{unique}"));
+        let (tx_a, rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let _drain_a = workspace_a.spawn_drain(move |event| {
+            let _ = tx_a.send(event);
+        });
+        let _drain_b = workspace_b.spawn_drain(move |event| {
+            let _ = tx_b.send(event);
+        });
+        let token_a = workspace_a.register("Terminal A");
+        let token_b = workspace_b.register("Terminal A");
+        assert_ne!(token_a, token_b, "tokens iguais não atravessam workspace");
+        assert_eq!(
+            workspace_a.register("Terminal A"),
+            token_a,
+            "rewrite de roster reutiliza o token do mesmo nó"
+        );
+
+        let response = post_observability_hook(workspace_a.port(), &token_a);
+        assert!(response.starts_with("HTTP/1.1 200"), "resposta: {response}");
+        let event_a = rx_a
+            .recv_timeout(Duration::from_secs(2))
+            .expect("timeline A recebe seu evento");
+        assert_eq!(
+            event_a.node_id, "Terminal A",
+            "a timeline recebe a identidade sem o prefixo interno"
+        );
+        assert!(
+            rx_b.recv_timeout(Duration::from_millis(150)).is_err(),
+            "timeline B não recebe evento de nó homônimo do workspace A"
+        );
     }
 
     // ─────────────── FIX-2: política efetiva de cwd `Managed` (puro, gpui-free) ───────────────
@@ -10127,15 +12140,15 @@ mod tests {
         // freio (`drain_reinject_active`) não toca o roster, só decide SE drena.
         let queue = new_reinject_queue();
         let target: NodeId = uuid::Uuid::now_v7();
-        enqueue_doctrine_reinjection(&queue, target, "reviewer");
+        enqueue_doctrine_reinjection(&queue, target, "reviewer").expect("enqueue");
 
-        let under_brake = drain_reinject_active(&queue, true);
+        let (under_brake, _paused_drain) = drain_reinject_active(&queue, true).expect("freio");
         assert!(
             under_brake.is_empty(),
             "sob o freio a re-injeção NÃO drena (fica enfileirada em RAM)"
         );
 
-        let resumed = drain_reinject_active(&queue, false);
+        let (resumed, _active_drain) = drain_reinject_active(&queue, false).expect("retomar");
         assert_eq!(
             resumed.len(),
             1,
@@ -10188,7 +12201,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&grids),
             Mailbox::new(&mailbox_root),
-            Arc::clone(&reinject_queue),
+            reinject_queue.clone(),
             Arc::clone(&model),
             Arc::clone(&brake),
             0,
@@ -10231,7 +12244,7 @@ mod tests {
         );
 
         // (POSITIVO) a fila EM-PROCESSO legítima injeta — o pump FUNCIONA (teste não-vacuoso).
-        enqueue_doctrine_reinjection(&reinject_queue, node_a, "reviewer");
+        enqueue_doctrine_reinjection(&reinject_queue, node_a, "reviewer").expect("enqueue");
         pump.tick();
         assert_eq!(
             bus_count(&store),
@@ -10348,7 +12361,7 @@ mod tests {
         nm.assign_role(node, "reviewer").expect("assign role");
 
         let queue = nm.reinject_queue();
-        let drained = drain_reinject_active(&queue, false);
+        let (drained, _drain) = drain_reinject_active(&queue, false).expect("drain");
         assert_eq!(drained.len(), 1, "assign_role enfileira UMA re-injeção");
         assert_eq!(
             drained[0].target, node,
@@ -10398,7 +12411,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&grids),
             Mailbox::new(&mailbox_root),
-            Arc::clone(&reinject_queue),
+            reinject_queue.clone(),
             Arc::clone(&model),
             Arc::clone(&brake),
             0,
@@ -10423,7 +12436,7 @@ mod tests {
         assert!(lock(&brake).paused, "freio pausado");
 
         // (2) Enfileira a re-injeção SOB o freio (fila em-processo, target = NodeId autenticado).
-        enqueue_doctrine_reinjection(&reinject_queue, node_a, "reviewer");
+        enqueue_doctrine_reinjection(&reinject_queue, node_a, "reviewer").expect("enqueue");
         let bus_before = bus_count(&store);
 
         // (3) Tick sob o freio: NÃO injeta → sem BusMessageSent novo (enfileirada até Retomar).
@@ -10682,6 +12695,7 @@ mod tests {
                 .expect("wire seed")
             };
             lock(&model).seed_node(node, NodeView::new(name, NodeKind::Terminal, 0.0, 0.0));
+            lock(&grid).advance(b"> ");
             lock(&grids).insert(node, grid);
             keys.insert(node, k.to_string());
         }
@@ -10704,6 +12718,7 @@ mod tests {
         // #7: motor de spawn FIXO (None) — a discovery real leria o PATH do runner e um
         // spawn de teste LANÇARIA o CLI de verdade. `None` = fábrica `cat` (como sempre).
         nm.set_spawn_engine_factory(Arc::new(|| None));
+        nm.set_prompt_profiles(Arc::new(ProfileRegistry::new()), demo_profile());
         (nm, store, model, sup)
     }
 
@@ -10910,7 +12925,9 @@ mod tests {
 
         // O "clique para liberar" do card: a view só ENFILEIRA o gesto (by=human é a NATUREZA do
         // canal in-process, jamais o payload). `node` é o UUID cunhado server-side.
-        nodes.push_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#));
+        nodes
+            .push_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#))
+            .expect("gesto aceito");
         pump.tick();
 
         // (1) o nó SAIU de Blocked → Idle: o card volta ao estado normal (a projeção do card lê o
@@ -10965,12 +12982,14 @@ mod tests {
         // Gesto da UI: o leigo preencheu o modal e clicou guardar. O VALOR transita no payload do
         // gesto IN-PROCESSO (jamais pelo PTY ou pelo log).
         let secret = "s3gr3do-de-canal-whatsapp-64hex-inforjavel";
-        nodes.push_human_intent(
-            "credential.store",
-            format!(
-                r#"{{"channel":"whatsapp","scope":"channel:whatsapp","key":"sessao","value":"{secret}"}}"#
-            ),
-        );
+        nodes
+            .push_human_intent(
+                "credential.store",
+                format!(
+                    r#"{{"channel":"whatsapp","scope":"channel:whatsapp","key":"sessao","value":"{secret}"}}"#
+                ),
+            )
+            .expect("gesto aceito");
         pump.tick();
 
         let recs = lock(&store).events().expect("eventos");
@@ -11223,6 +13242,51 @@ mod tests {
         (pump, store, dir)
     }
 
+    /// Regressão do vazamento por workspace: a variante usada pelo runtime precisa ser
+    /// encerrável e aguardar a thread, em vez de deixá-la segurando o EventStore para sempre.
+    #[test]
+    fn workspace_reliability_mailbox_pump_stops_and_joins() {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let (pump, _store, dir) = pump_for_test("stoppable", sessions);
+
+        let mut running = pump.spawn_stoppable().expect("subir pump de teste");
+        assert!(
+            running.join.is_some(),
+            "a thread nasce sob posse do runtime"
+        );
+        running.stop();
+        assert!(
+            running.join.is_none(),
+            "stop aguarda e consome o JoinHandle"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_reliability_broker_pump_stops_and_joins() {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let (_mailbox, store, dir) = pump_for_test("broker-stoppable", sessions);
+        let broker = BrokerPump::new(
+            Mailbox::new(dir.join("broker")),
+            store,
+            SecretVault::with_store("lina-test/broker", lina_secrets::MockStore::new()),
+            Arc::new(Mutex::new(CustodyDesk::default())),
+            Arc::new(Mutex::new(SharedModel::default())),
+            Arc::new(Supervisor::new()),
+        );
+
+        let mut running = broker.spawn_stoppable().expect("subir broker de teste");
+        assert!(
+            running.join.is_some(),
+            "a thread nasce sob posse do runtime"
+        );
+        running.stop();
+        assert!(running.join.is_none(), "stop aguarda o broker");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Uma `Session` do `lina-session-watch` com o `cwd`/`session_id`/`cli` dados (demais campos zerados).
     fn test_session(cwd: &str, session_id: &str, cli: &str) -> Session {
         Session {
@@ -11455,7 +13519,9 @@ mod tests {
         sup.set_status(b, lina_core::NodeStatus::Busy)
             .expect("B Busy");
 
-        let parked = nm.park_terminals(&[a, b]);
+        let parked = nm
+            .park_terminals_after_quiet(&[a, b], Duration::ZERO)
+            .expect("batch do park");
         assert_eq!(parked, 1, "só o ocioso (A) estaciona; B Busy é preservado");
 
         // Fato no log: morte registrada de A + o livro-razão do gesto; NUNCA NodeRemoved.
@@ -11500,10 +13566,689 @@ mod tests {
         );
         assert!(!lock(&nm.grids).contains_key(&a), "grid de A liberado");
         assert_eq!(
-            nm.park_terminals(&[a]),
+            nm.park_terminals(&[a]).expect("re-park"),
             0,
             "re-park do já-estacionado é no-op"
         );
+    }
+
+    #[test]
+    fn workspace_reliability_park_batch_failure_keeps_every_terminal_and_projection() {
+        let (nm, store, model, sup) = test_manager_full("park-batch-fault", None);
+        let ids = lock(&model).order.clone();
+        let (quiet, busy) = (ids[0], ids[1]);
+        sup.set_status(quiet, lina_core::NodeStatus::Idle)
+            .expect("quiet Idle");
+        sup.set_status(busy, lina_core::NodeStatus::Busy)
+            .expect("busy Busy");
+
+        let records_before = format!("{:?}", lock(&store).events().expect("log antes"));
+        let projection_before = format!("{:?}", lock(&store).project().expect("projeção antes"));
+        let model_before = format!("{:?}", &*lock(&model));
+        let terminals_before = nm.terminal_ids();
+        let ptys_before = lock(&nm.pty).len();
+        arm_park_batch_fault();
+
+        let error = nm
+            .park_terminals_after_quiet(&[quiet, busy], Duration::ZERO)
+            .expect_err("o batch final falha inteiro");
+        assert!(
+            error.contains("nenhum agente foi desligado"),
+            "erro visível confirma o aborto seguro: {error}"
+        );
+        assert_eq!(
+            format!("{:?}", lock(&store).events().expect("log depois")),
+            records_before,
+            "nenhum Dead nem WorkspaceUnloaded parcial apareceu"
+        );
+        assert_eq!(
+            format!("{:?}", lock(&store).project().expect("projeção depois")),
+            projection_before,
+            "a projeção reconstruída ficou idêntica"
+        );
+        assert_eq!(
+            format!("{:?}", &*lock(&model)),
+            model_before,
+            "o modelo de tela ficou idêntico"
+        );
+        assert_eq!(nm.terminal_ids(), terminals_before);
+        assert_eq!(lock(&nm.pty).len(), ptys_before, "zero PTY perdido");
+        assert_eq!(
+            sup.get(quiet).map(|info| info.status),
+            Some(lina_core::NodeStatus::Idle),
+            "o quieto foi restaurado imediatamente"
+        );
+        assert_eq!(
+            sup.get(busy).map(|info| info.status),
+            Some(lina_core::NodeStatus::Busy),
+            "o Busy jamais entrou na transação"
+        );
+        assert!(lock(&nm.grids).contains_key(&quiet));
+        assert!(lock(&nm.grids).contains_key(&busy));
+
+        nm.shutdown_terminals_after_failed_boot();
+    }
+
+    /// Fecha a janela entrega→Busy: mesmo que o roster ainda diga `Idle`, entrada
+    /// recém-enfileirada torna o terminal inelegível para desmontagem.
+    #[test]
+    fn workspace_reliability_recent_terminal_input_blocks_eviction() {
+        let (nm, _store, model, sup) = test_manager_full("park-recent-input", None);
+        let node = lock(&model).order[0];
+        sup.set_status(node, lina_core::NodeStatus::Idle)
+            .expect("Idle");
+        sup.write_human(node, b"x", Duration::from_millis(100))
+            .expect("entrada recente");
+
+        assert_eq!(
+            nm.park_terminals_after_quiet(&[node], Duration::from_secs(60))
+                .expect("check de quietude"),
+            0,
+            "a entrada recente vence um snapshot Idle"
+        );
+        assert!(
+            nm.terminal_ids().contains(&node),
+            "o PTY continua sob posse do runtime"
+        );
+    }
+
+    #[test]
+    fn workspace_reliability_concurrent_admission_blocks_quiescence() {
+        let activity = Arc::new(RuntimeActivity::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker_activity = Arc::clone(&activity);
+        let worker_entered = Arc::clone(&entered);
+        let worker_release = Arc::clone(&release);
+        let worker = thread::spawn(move || {
+            let _admission = worker_activity
+                .begin_admission()
+                .expect("admissão concorrente");
+            worker_entered.wait();
+            worker_release.wait();
+        });
+
+        entered.wait();
+        assert!(
+            activity.try_quiesce().is_none(),
+            "uma admissão em voo impede a desmontagem"
+        );
+        release.wait();
+        worker.join().expect("worker terminou");
+
+        let quiescence = activity.try_quiesce().expect("quiescência após join");
+        assert!(
+            activity.begin_admission().is_err(),
+            "nenhuma admissão nasce durante a quiescência"
+        );
+        assert!(
+            activity.begin_external().is_err(),
+            "nenhuma entrega de mensagem nasce durante a quiescência"
+        );
+        drop(quiescence);
+        assert!(
+            activity.begin_admission().is_ok(),
+            "barreira reabre ao abortar"
+        );
+        let external = activity.begin_external().expect("efeito externo");
+        assert!(
+            activity.try_quiesce().is_none(),
+            "efeito externo/desfecho pendente também impede o descarte"
+        );
+        drop(external);
+    }
+
+    #[test]
+    fn workspace_reliability_quiescence_intent_blocks_consecutive_ticks() {
+        let (nodes, _store, _model, _supervisor) = test_manager_full("tick-barrier", None);
+        let current_tick = nodes.begin_external_task().expect("tick atual");
+        let quiescence = nodes
+            .try_begin_quiescence()
+            .expect("ingressos vazios fecham mesmo com tick atual em voo");
+
+        for _ in 0..1_000 {
+            assert!(
+                nodes.begin_external_task().is_err(),
+                "nenhum tick consecutivo atravessa a intenção de unload"
+            );
+        }
+        drop(current_tick);
+        assert!(
+            quiescence.wait_until_idle(Instant::now() + Duration::from_secs(1)),
+            "o tick já admitido termina sob as guardas mantidas"
+        );
+        drop(quiescence);
+        assert!(
+            nodes.begin_external_task().is_ok(),
+            "abortar o unload reabre atividades"
+        );
+        nodes.shutdown_terminals_after_failed_boot();
+    }
+
+    #[test]
+    fn workspace_reliability_hook_drain_joins_cancelled_task_inside_tokio_runtime() {
+        struct MarkFinished(Arc<AtomicBool>);
+        impl Drop for MarkFinished {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let target_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime alvo");
+        let caller_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime caller");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_finished = Arc::clone(&finished);
+        let task = target_runtime.spawn(async move {
+            let _finished = MarkFinished(task_finished);
+            task_entered.wait();
+            std::future::pending::<()>().await;
+        });
+        entered.wait();
+        let mut drain = HookDrain {
+            task: Some(task),
+            runtime: target_runtime.handle().clone(),
+            join_observers: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        caller_runtime.block_on(async {
+            drain.stop_and_join().expect("join dentro de outro Tokio");
+        });
+        assert!(drain.task.is_none(), "JoinHandle foi consumido");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "a future terminou antes de stop_and_join devolver"
+        );
+        drop(drain);
+        drop(caller_runtime);
+        drop(target_runtime);
+    }
+
+    #[test]
+    fn workspace_reliability_hook_drain_joins_cancelled_task_outside_tokio_runtime() {
+        struct MarkFinished(Arc<AtomicBool>);
+        impl Drop for MarkFinished {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime de teste");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered);
+        let task_finished = Arc::clone(&finished);
+        let task = runtime.spawn(async move {
+            let _finished = MarkFinished(task_finished);
+            task_entered.wait();
+            std::future::pending::<()>().await;
+        });
+        entered.wait();
+        let mut drain = HookDrain {
+            task: Some(task),
+            runtime: runtime.handle().clone(),
+            join_observers: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        drain.stop_and_join().expect("join fora de Tokio");
+        assert!(drain.task.is_none(), "JoinHandle foi consumido");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "a future terminou antes de stop_and_join devolver"
+        );
+        drop(drain);
+        drop(runtime);
+    }
+
+    #[test]
+    fn workspace_reliability_hook_drain_defers_join_inside_its_own_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime alvo");
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let task_entered = Arc::clone(&entered);
+        let task = runtime.spawn(async move {
+            task_entered.wait();
+            std::future::pending::<()>().await;
+        });
+        entered.wait();
+        let mut drain = HookDrain {
+            task: Some(task),
+            runtime: runtime.handle().clone(),
+            join_observers: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        runtime.block_on(async {
+            assert!(
+                drain.stop_and_join().is_err(),
+                "aguardar a própria worker é recusado, não bloqueado"
+            );
+            assert!(drain.task.is_some(), "handle permanece recuperável");
+        });
+        drain
+            .stop_and_join()
+            .expect("caller externo observa o cancelamento");
+        assert!(drain.task.is_none());
+    }
+
+    #[test]
+    fn workspace_reliability_hook_drain_drop_transfers_observation_in_own_runtime() {
+        struct NotifyFinished(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for NotifyFinished {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime singleton");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            let _finished = NotifyFinished(Some(finished_tx));
+            let _ = entered_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let observers = Arc::new(Mutex::new(Vec::new()));
+        let drain = HookDrain {
+            task: Some(task),
+            runtime: runtime.handle().clone(),
+            join_observers: Arc::clone(&observers),
+        };
+
+        runtime.block_on(async move {
+            entered_rx.await.expect("task iniciou");
+            drop(drain); // same-runtime: transfere, nunca descarta o JoinHandle cru
+            let observer = {
+                let mut observers = lock(&observers);
+                assert_eq!(observers.len(), 1, "um observador recebeu o JoinHandle");
+                observers.pop().expect("observador registrado")
+            };
+            tokio::time::timeout(Duration::from_secs(1), observer)
+                .await
+                .expect("observador concluiu dentro do prazo")
+                .expect("observador terminou sem falha");
+            finished_rx.await.expect("cancelamento executou Drop");
+        });
+    }
+
+    #[test]
+    fn workspace_reliability_delivery_gate_reopens_when_activity_quiesce_fails() {
+        let (nodes, _store, _model, _supervisor) = test_manager_full("delivery-gate", None);
+        let queue = nodes.system_deliveries();
+        let external = nodes.begin_external_task().expect("atividade em voo");
+
+        assert!(
+            nodes.try_quiesce().is_none(),
+            "atividade impede a desmontagem depois de a fila tentar fechar"
+        );
+        let queue_guard = queue
+            .try_quiesce()
+            .expect("falha da segunda barreira reabre a fila");
+        drop(queue_guard);
+        drop(external);
+
+        let runtime_guard = nodes.try_quiesce().expect("runtime agora quiescente");
+        assert!(
+            queue.try_quiesce().is_none(),
+            "guarda composta mantém o ingresso fechado"
+        );
+        drop(runtime_guard);
+        assert!(
+            queue.try_quiesce().is_some(),
+            "abortar a evicção reabre fila e atividade"
+        );
+    }
+
+    #[test]
+    fn workspace_reliability_pending_human_intent_blocks_unload_until_drain() {
+        let (nodes, _store, _model, _supervisor) = test_manager_full("human-gate", None);
+        nodes
+            .push_human_intent("goal.confirm", r#"{"goal_id":"g1"}"#)
+            .expect("gesto aceito");
+        assert_eq!(nodes.human_intents.len(), 1);
+        assert!(
+            nodes.try_quiesce().is_none(),
+            "gesto aceito e ainda não drenado impede unload"
+        );
+
+        let (items, drain) = nodes.drain_human_intents().expect("drain humano");
+        assert_eq!(items.len(), 1, "nenhum gesto se perdeu");
+        assert!(
+            nodes.try_quiesce().is_none(),
+            "o item continua contado enquanto o pump o processa"
+        );
+        drop(drain);
+
+        let quiescence = nodes.try_quiesce().expect("fila consumida permite unload");
+        quiescence.seal();
+        assert!(
+            nodes
+                .push_human_intent("goal.confirm", r#"{"goal_id":"g2"}"#)
+                .is_err(),
+            "depois do seal o produtor é recusado antes do efeito"
+        );
+        assert_eq!(nodes.human_intents.len(), 0);
+    }
+
+    #[test]
+    fn workspace_reliability_pending_reinjection_blocks_unload_and_seal_precedes_role_event() {
+        let (nodes, store, _model, _supervisor) = test_manager_full("reinject-gate", None);
+        let node = *lock(&nodes.model).order.first().expect("nó seed");
+        nodes.assign_role(node, "reviewer").expect("papel aceito");
+        assert_eq!(nodes.reinject_queue.len(), 1);
+        assert!(nodes.try_quiesce().is_none());
+
+        let (items, drain) = nodes.reinject_queue.drain().expect("drain reinject");
+        assert_eq!(items.len(), 1);
+        assert!(nodes.try_quiesce().is_none(), "dreno ativo ainda conta");
+        drop(drain);
+        let before = lock(&store).event_count().expect("head");
+        let quiescence = nodes.try_quiesce().expect("sem pendências");
+        quiescence.seal();
+        assert!(nodes.assign_role(node, "backend").is_err());
+        assert_eq!(
+            lock(&store).event_count().expect("head final"),
+            before,
+            "seal recusa antes de NodeRoleAssigned"
+        );
+        assert_eq!(nodes.reinject_queue.len(), 0);
+    }
+
+    #[test]
+    fn workspace_reliability_internal_ephemeral_work_blocks_unload_until_completion() {
+        let (nodes, _store, _model, _supervisor) = test_manager_full("internal-gate", None);
+        let production = nodes
+            .begin_ephemeral_production()
+            .expect("produtor interno");
+        let work = production.accept_work().expect("payload aceito");
+        drop(production);
+        assert_eq!(nodes.ephemeral_activity.pending_work(), 1);
+        assert!(nodes.try_quiesce().is_none());
+        drop(work);
+        assert_eq!(nodes.ephemeral_activity.pending_work(), 0);
+
+        let quiescence = nodes.try_quiesce().expect("trabalho concluído");
+        quiescence.seal();
+        assert!(
+            nodes.begin_ephemeral_production().is_err(),
+            "seal barra A2A/pump antes de aceitar payload novo"
+        );
+    }
+
+    #[test]
+    fn workspace_reliability_a2a_trigger_owns_thread_and_blocks_unload() {
+        let (nodes, store, model, supervisor) = test_manager_full("a2a-gate", None);
+        let nodes = Arc::new(nodes);
+        let ids = lock(&model).order.clone();
+        let from = ids[0];
+        let to = ids[1];
+        let grid_to = lock(&nodes.grids).get(&to).cloned().expect("grid alvo");
+        let trigger = A2aTrigger::new(
+            supervisor,
+            from,
+            to,
+            grid_to,
+            demo_profile(),
+            Arc::new(ProfileRegistry::new()),
+            store,
+            model,
+        );
+        let gate = A2aTaskGate {
+            entered: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+            bypass_delivery: true,
+        };
+        *lock(A2A_TASK_GATE.get_or_init(|| Mutex::new(None))) = Some(gate.clone());
+
+        trigger.fire("echo a2a".to_owned());
+        gate.entered.wait();
+        assert_eq!(nodes.ephemeral_activity.pending_work(), 1);
+        assert!(
+            nodes.try_quiesce().is_none(),
+            "thread A2A aceita mantém runtime montado"
+        );
+        *lock(A2A_TASK_GATE.get_or_init(|| Mutex::new(None))) = None;
+        gate.release.wait();
+        drop(trigger); // join obrigatório do handle possuído
+
+        assert_eq!(nodes.ephemeral_activity.pending_work(), 0);
+        assert!(nodes.try_quiesce().is_some());
+    }
+
+    #[test]
+    fn workspace_reliability_removed_terminal_drops_pending_finished_turn() {
+        let sup = Supervisor::new();
+        let node = sup.register("@removido", None, Box::new(std::io::sink()));
+        sup.set_status(node, CoreStatus::Busy).expect("Busy");
+        let mut pending = PendingFinishedTurns::from([(node, (17, 0))]);
+        let mut active = std::collections::HashSet::from([node]);
+
+        sup.unregister(node)
+            .expect("remover durante turno pendente");
+        assert!(discard_finished_turn_if_terminal_gone(
+            &mut pending,
+            &mut active,
+            &sup,
+            node
+        ));
+        assert!(pending.is_empty());
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn workspace_reliability_silent_sleep_is_never_parked_as_idle() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-silent-sleep-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("store")));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids = Arc::new(Mutex::new(BTreeMap::new()));
+        let (delta_tx, delta_rx) = std::sync::mpsc::channel();
+        let command: CmdFactory =
+            Arc::new(|_| PtyCommand::new("sh").arg("-i").env("PS1", "READY> "));
+        let mut manager = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            Arc::clone(&grids),
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            command,
+            None,
+            dir.join(".lina"),
+        );
+        manager.set_spawn_engine_factory(Arc::new(|| None));
+        let mut profile = demo_profile();
+        profile.prompt_ready_regex = "(?m)^READY> ".to_string();
+        manager.set_prompt_profiles(Arc::new(ProfileRegistry::new()), profile);
+        let manager = Arc::new(manager);
+        let prompt_manager = Arc::downgrade(&manager);
+        sup.set_input_observer(Arc::new(move |node| {
+            if let Some(manager) = prompt_manager.upgrade() {
+                manager.capture_prompt_before_input(node);
+            }
+        }));
+        let attention = Arc::new(AttentionHub::new(
+            Arc::clone(&store),
+            Arc::new(Mutex::new(CustodyDesk::default())),
+            Arc::clone(&model),
+            ApprovalWiring::new(
+                Arc::clone(&sup),
+                Arc::clone(&grids),
+                ApprovalKeys::default(),
+            ),
+            Arc::clone(&manager),
+        ));
+        let mut pump = spawn_pump(
+            GpuiBridgeHost::new(Arc::clone(&model)),
+            delta_rx,
+            sup.subscribe(),
+            Arc::clone(&store),
+            50,
+            Arc::clone(&sup),
+            Arc::clone(&grids),
+            attention,
+            false,
+            Some(Arc::clone(&manager)),
+        )
+        .expect("pump real");
+        let node = manager.add_node().expect("subir sleep silencioso");
+        let prompt_deadline = Instant::now() + Duration::from_secs(3);
+        while !manager.terminal_has_fresh_prompt(node) && Instant::now() < prompt_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            manager.terminal_has_fresh_prompt(node),
+            "prompt inicial real apareceu"
+        );
+        sup.set_status(node, lina_core::NodeStatus::Idle)
+            .expect("Idle inicial");
+
+        sup.write_human(node, b"sleep 1\r", Duration::from_secs(1))
+            .expect("enviar comando silencioso");
+        assert_eq!(
+            sup.get(node).map(|info| info.status),
+            Some(lina_core::NodeStatus::Busy),
+            "o submit torna o terminal Busy antes de qualquer output"
+        );
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            manager
+                .park_terminals_after_quiet(&[node], Duration::ZERO)
+                .expect("park durante comando"),
+            0,
+            "o prompt velho não autoriza matar o comando"
+        );
+        assert_eq!(
+            sup.get(node).map(|info| info.status),
+            Some(CoreStatus::Busy)
+        );
+
+        let return_deadline = Instant::now() + Duration::from_secs(3);
+        while sup.get(node).map(|info| info.status) != Some(CoreStatus::Idle)
+            && Instant::now() < return_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            manager.terminal_has_fresh_prompt(node),
+            "o prompt novo após o retorno foi observado"
+        );
+        assert_eq!(
+            sup.get(node).map(|info| info.status),
+            Some(CoreStatus::Idle)
+        );
+
+        pump.stop();
+        manager.shutdown_terminals_after_failed_boot();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn workspace_reliability_restore_failure_keeps_log_and_model_identical() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-restore-atomic-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let store = Arc::new(Mutex::new(EventStore::open(&dir).expect("store")));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids = Arc::new(Mutex::new(BTreeMap::new()));
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel();
+        let command: CmdFactory = Arc::new(|name| {
+            if name == "Segundo" {
+                PtyCommand::new("/definitely/missing/lina-restore-second")
+            } else {
+                PtyCommand::new("cat")
+            }
+        });
+        let manager = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            Arc::clone(&store),
+            Arc::clone(&model),
+            grids,
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            command,
+            None,
+            dir.join(".lina"),
+        );
+        let plan = |name: &str| RestoredTerminal {
+            node: uuid::Uuid::now_v7(),
+            name: name.to_string(),
+            role: Some("terminal".to_string()),
+            x: 0.0,
+            y: 0.0,
+            cwd: None,
+            profile_id: None,
+            command: Vec::new(),
+            badge: RestoreBadge::FreshStart,
+            scrollback_tail: Vec::new(),
+            shadows: Vec::new(),
+        };
+        let count_before = lock(&store).event_count().expect("count inicial");
+        let model_before = {
+            let model = lock(&model);
+            (
+                model.nodes.keys().copied().collect::<Vec<_>>(),
+                model.order.clone(),
+                model.generation,
+            )
+        };
+
+        manager
+            .restore_terminals_quiesced(&[plan("Primeiro"), plan("Segundo")])
+            .expect_err("o segundo preparo deve abortar o lote");
+
+        assert_eq!(
+            lock(&store).event_count().expect("count final"),
+            count_before
+        );
+        let model_after = lock(&model);
+        assert_eq!(
+            model_after.nodes.keys().copied().collect::<Vec<_>>(),
+            model_before.0
+        );
+        assert_eq!(model_after.order, model_before.1);
+        assert_eq!(model_after.generation, model_before.2);
+        drop(model_after);
+        assert!(sup.list().is_empty(), "nenhum roster provisório sobrevive");
+        assert_eq!(lock(&pty).len(), 0, "nenhum PTY provisório sobrevive");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// **r5 park-seam (gate 2): religar restaura.** Após o park, o nó estacionado é um
@@ -11512,14 +14257,20 @@ mod tests {
     /// `NodeRemoved`. É o ciclo completo do Descarregar sem mecanismo novo de restore.
     #[test]
     fn relight_after_park_restores_terminal_with_same_name() {
-        let (nm, store, _model, sup) = test_manager_full("relight", None);
+        let (nm, store, model, sup) = test_manager_full("relight", None);
         // Nó ADMITIDO de verdade (NodeAdded+NodeRenamed no log) — os seeds do harness entram
         // direto no model e não existem na projeção; o religar é dirigido pela PROJEÇÃO.
         let a = nm.add_node().expect("admitir terminal");
         let name = sup.get(a).expect("no roster").name;
+        let cards_before = lock(&model).order.len();
         sup.set_status(a, lina_core::NodeStatus::Idle)
             .expect("Idle");
-        assert_eq!(nm.park_terminals(&[a]), 1, "estacionado");
+        assert_eq!(
+            nm.park_terminals_after_quiet(&[a], Duration::ZERO)
+                .expect("batch do park"),
+            1,
+            "estacionado"
+        );
 
         let proj = lock(&store).project().expect("projeção");
         let reg = ProfileRegistry::new();
@@ -11530,11 +14281,20 @@ mod tests {
         assert_eq!(plans.len(), 1, "o estacionado entra no plano de religação");
         assert_eq!(plans[0].name, name, "identidade-nome atravessa o park");
 
-        assert_eq!(nm.restore_terminals(&plans), 1, "religou");
+        assert_eq!(nm.restore_terminals_quiesced(&plans).expect("religou"), 1);
         let new_id = sup
             .node_by_name(&name)
             .expect("nome de volta ao roster VIVO");
         assert_ne!(new_id, a, "re-erguido é nó NOVO (Dead é terminal)");
+        let model = lock(&model);
+        assert_eq!(
+            model.order.len(),
+            cards_before,
+            "relight substitui o card antigo em vez de duplicá-lo"
+        );
+        assert!(!model.nodes.contains_key(&a));
+        assert!(model.nodes.contains_key(&new_id));
+        drop(model);
         let recs = lock(&store).events().expect("events");
         assert!(
             recs.iter()
@@ -11632,6 +14392,7 @@ mod tests {
         // (sem grids) → `live_detection=false` mantém o foco no fim-de-resposta.
         let grids: Arc<Mutex<BTreeMap<NodeId, Grid>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let desk_t: Desk = Arc::new(Mutex::new(CustodyDesk::default()));
+        let nodes = test_nodes(Arc::clone(&store));
         let attention_t = Arc::new(AttentionHub::new(
             Arc::clone(&store),
             desk_t,
@@ -11641,7 +14402,7 @@ mod tests {
                 Arc::clone(&grids),
                 ApprovalKeys::default(),
             ),
-            test_nodes(Arc::clone(&store)),
+            Arc::clone(&nodes),
         ));
         let mut pump = spawn_pump(
             GpuiBridgeHost::new(Arc::clone(&model)),
@@ -11653,6 +14414,7 @@ mod tests {
             grids,
             attention_t,
             false,
+            None,
         )
         .expect("pump");
 
@@ -13713,8 +16475,9 @@ mod tests {
     /// **COMPENSAÇÃO (ADR 0022 §5):** o NodeId nasce no `register` (antes do append), então
     /// uma FALHA de persistência compensa com `retire_pty` (unregister + kill) — o nó NUNCA
     /// fica no roster vivo (Supervisor → agents.json) nem no model sem existir no log.
-    /// Falha forçada: o espelho `log.jsonl` vira DIRETÓRIO → todo append erra em I/O.
-    /// (A atomicidade SQLite↔JSONL dentro do store é assunto do core, não deste funil.)
+    /// Falha forçada: outra conexão segura o write-lock por mais que o busy timeout, então
+    /// o SQLite recusa ANTES do commit. Falha do espelho depois do commit não pode compensar
+    /// um fato que já existe — esse contrato pertence ao EventStore.
     #[test]
     fn falha_de_append_compensa_e_nada_fica_no_roster() {
         let dir = std::env::temp_dir().join(format!("lina-compensa-{}", std::process::id()));
@@ -13742,15 +16505,24 @@ mod tests {
             dir.join(".lina"),
         );
 
-        // Sabotagem determinística do espelho: `log.jsonl` vira diretório → append falha.
-        let jsonl = dir.join("log.jsonl");
-        let _ = std::fs::remove_file(&jsonl);
-        std::fs::create_dir_all(&jsonl).expect("log.jsonl como dir");
+        // Uma transação concorrente segura o write-lock; após o busy_timeout do EventStore,
+        // o append falha sem ter confirmado qualquer evento.
+        let mut blocker = rusqlite::Connection::open(dir.join("lina.db")).expect("2ª conexão");
+        let write_lock = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("write-lock concorrente");
 
         let before_roster = sup.list().len();
+        let before_events = lock(&store).event_count().expect("eventos antes");
         let result = nm.add_node();
 
-        assert!(result.is_err(), "append falhou → admissão devolve Err");
+        assert!(result.is_err(), "falha pré-commit → admissão devolve Err");
+        drop(write_lock);
+        assert_eq!(
+            lock(&store).event_count().expect("eventos depois"),
+            before_events,
+            "nenhum fato foi confirmado antes da compensação"
+        );
         assert_eq!(
             sup.list().len(),
             before_roster,
@@ -14100,6 +16872,63 @@ mod tests {
             .expect("admissão seguinte sobe normal (flag consumida)");
         assert!(sup.list().iter().any(|n| n.id == ok));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_reliability_node_manager_joins_reader_before_runtime_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "lina-reader-lifecycle-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let store = Arc::new(Mutex::new(
+            EventStore::open(dir.join("events")).expect("store"),
+        ));
+        let pty = Arc::new(Mutex::new(PtyManager::new()));
+        let sup = Arc::new(Supervisor::new());
+        let (delta_tx, _delta_rx) = std::sync::mpsc::channel::<GridDelta>();
+        let model: Model = Arc::new(Mutex::new(SharedModel::default()));
+        let grids = Arc::new(Mutex::new(BTreeMap::new()));
+        let manager = NodeManager::new(
+            Arc::clone(&pty),
+            Arc::clone(&sup),
+            store,
+            model,
+            grids,
+            BTreeMap::new(),
+            delta_tx,
+            80,
+            24,
+            0,
+            Arc::new(|_| PtyCommand::new("cat")),
+            None,
+            dir.join(".lina"),
+        );
+
+        manager.add_node().expect("terminal com reader real");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.active_readers.load(Ordering::Acquire) != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            manager.active_readers.load(Ordering::Acquire),
+            1,
+            "controle negativo: o reader estava vivo antes da limpeza"
+        );
+
+        manager.shutdown_terminals_after_failed_boot();
+        assert_eq!(
+            manager.active_readers.load(Ordering::Acquire),
+            0,
+            "shutdown só retorna depois de o reader sair"
+        );
+        assert!(
+            lock(&manager.reader_threads).is_empty(),
+            "todos os JoinHandles foram consumidos"
+        );
+        assert!(lock(&pty).is_empty(), "nenhum PTY sobrevive à limpeza");
+        drop(manager);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// **Fix 2 (red-team 360, inv 1 — PRESERVAÇÃO):** um `settings.json` do USUÁRIO que apenas
@@ -15900,7 +18729,9 @@ mod tests {
                 shadows: Vec::new(),
             },
         ];
-        let up = nm.restore_terminals(&plans);
+        let up = nm
+            .restore_terminals_quiesced(&plans)
+            .expect("restore completo");
         assert_eq!(up, 2, "os dois terminais do plano re-ergueram");
 
         // Roster vivo: nomes/papéis re-erguidos pelo funil (NodeIds NOVOS desta geração).
@@ -16194,7 +19025,8 @@ mod tests {
         );
 
         assert_eq!(
-            nm.restore_terminals(&plans),
+            nm.restore_terminals_quiesced(&plans)
+                .expect("restore completo"),
             1,
             "o nó re-ergue mesmo com o motor indisponível (nunca descartado)"
         );
@@ -16241,7 +19073,11 @@ mod tests {
         let proj = lock(&store).project().expect("project");
         let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
         assert_eq!(plans.len(), 3);
-        assert_eq!(nm.restore_terminals(&plans), 3);
+        assert_eq!(
+            nm.restore_terminals_quiesced(&plans)
+                .expect("restore completo"),
+            3
+        );
 
         let m = lock(&model);
         let mut posicoes: Vec<(i64, i64)> = m
@@ -16291,7 +19127,11 @@ mod tests {
         let proj = lock(&store).project().expect("project");
         let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
         assert_eq!(plans.len(), 3);
-        assert_eq!(nm.restore_terminals(&plans), 3);
+        assert_eq!(
+            nm.restore_terminals_quiesced(&plans)
+                .expect("restore completo"),
+            3
+        );
 
         let m = lock(&model);
         let mut posicoes: Vec<(i64, i64)> = m
@@ -16340,7 +19180,7 @@ mod tests {
         let proj = lock(&store).project().expect("project");
         let plans = plan_restore(&proj, &ProfileRegistry::new(), None);
         assert_eq!(plans.len(), 1, "o antigo entra no plano");
-        assert_eq!(nm.restore_terminals(&plans), 1, "re-ergueu");
+        assert_eq!(nm.restore_terminals_quiesced(&plans).expect("re-ergueu"), 1);
 
         let proj2 = lock(&store).project().expect("re-project");
         assert!(

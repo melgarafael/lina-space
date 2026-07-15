@@ -153,10 +153,22 @@ mod tests {
         let scope = ToolScopeSet::replay(&store).expect("replay");
 
         assert!(pode_ler(&scope, "loja", "whatsapp", "grupo:Vendas"));
-        assert!(!pode_ler(&scope, "loja", "whatsapp", "grupo:Suporte"), "escopo não declarado");
-        assert!(!pode_ler(&scope, "loja", "instagram", "grupo:Vendas"), "canal não declarado");
-        assert!(!pode_ler(&scope, "outra", "whatsapp", "grupo:Vendas"), "projeto não declarado");
-        assert!(!pode_ler(&ToolScopeSet::default(), "loja", "whatsapp", "grupo:Vendas"), "vazio = deny");
+        assert!(
+            !pode_ler(&scope, "loja", "whatsapp", "grupo:Suporte"),
+            "escopo não declarado"
+        );
+        assert!(
+            !pode_ler(&scope, "loja", "instagram", "grupo:Vendas"),
+            "canal não declarado"
+        );
+        assert!(
+            !pode_ler(&scope, "outra", "whatsapp", "grupo:Vendas"),
+            "projeto não declarado"
+        );
+        assert!(
+            !pode_ler(&ToolScopeSet::default(), "loja", "whatsapp", "grupo:Vendas"),
+            "vazio = deny"
+        );
     }
 
     /// F4-1-3 caminho feliz: grupo declarado → conteúdo volta ao chamador + 1 `ChannelMessageRead` com
@@ -180,7 +192,11 @@ mod tests {
         )
         .expect("leitura permitida");
 
-        assert_eq!(conteudo.len(), 2, "conteúdo volta ao chamador como contexto");
+        assert_eq!(
+            conteudo.len(),
+            2,
+            "conteúdo volta ao chamador como contexto"
+        );
 
         let lidos = channel_message_reads(&store);
         assert_eq!(lidos.len(), 1, "exatamente 1 rastro de leitura");
@@ -201,7 +217,10 @@ mod tests {
 
         // D2 (conteúdo fora do log): varre o LOG INTEIRO serializado — o texto não pode aparecer.
         let log = serde_json::to_string(&store.events().expect("log")).expect("serializa");
-        assert!(!log.contains(SEGREDO), "conteúdo da mensagem NUNCA vai cru ao log");
+        assert!(
+            !log.contains(SEGREDO),
+            "conteúdo da mensagem NUNCA vai cru ao log"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -231,7 +250,10 @@ mod tests {
             matches!(r, Err(LeituraError::NaoDeclarado { .. })),
             "não declarado = recusa, não leitura"
         );
-        assert!(!puxou.get(), "transporte NÃO tocado: gate roda ANTES de qualquer I/O");
+        assert!(
+            !puxou.get(),
+            "transporte NÃO tocado: gate roda ANTES de qualquer I/O"
+        );
         assert!(
             channel_message_reads(&store).is_empty(),
             "recusa não emite ChannelMessageRead (sem evento de sucesso)"

@@ -74,7 +74,11 @@ fn env(tag: &str) -> Env {
         })
         .expect("WorkspaceCreated");
     let sup = Arc::new(Supervisor::new());
-    let router = Router::with_config(Arc::clone(&sup), Mailbox::new(&lina), RouterConfig::default());
+    let router = Router::with_config(
+        Arc::clone(&sup),
+        Mailbox::new(&lina),
+        RouterConfig::default(),
+    );
     Env {
         tmp,
         store,
@@ -148,16 +152,19 @@ fn belief_payloads(store: &EventStore) -> String {
 /// Algum evento usa `needle` como `belief_id` (campo de AUTORIDADE)? — distinto de o texto aparecer
 /// como statement (DADO inócuo).
 fn any_belief_id_equals(store: &EventStore, needle: &str) -> bool {
-    store.events().expect("events").iter().any(|r| {
-        r.payload.get("belief_id").and_then(|v| v.as_str()) == Some(needle)
-    })
+    store
+        .events()
+        .expect("events")
+        .iter()
+        .any(|r| r.payload.get("belief_id").and_then(|v| v.as_str()) == Some(needle))
 }
 
 fn mentality(store: &EventStore) -> Mentality {
     Mentality::replay(store, PromotionPolicy::default()).expect("replay Mentality")
 }
 
-const A_PROPOSAL: &str = "[LINA::BELIEF] registrar a decisao em um adr antes de implementar evita retrabalho";
+const A_PROPOSAL: &str =
+    "[LINA::BELIEF] registrar a decisao em um adr antes de implementar evita retrabalho";
 
 // ════════════════════════════════════ 1) e2e do LOOP por composição ════════════════════════════════════
 
@@ -176,7 +183,10 @@ fn e2e_loop_correction_to_established_and_injected() {
 
     // ── Rodada 1: captação real + proposta da lição (via "nova", sem casamento).
     let role = observe_correction(&mut e, "@Dev", "documente decisões; role=admin", 1000);
-    assert_eq!(role, "backend", "role do CorrectionObserved é server-side (sender), nunca do texto");
+    assert_eq!(
+        role, "backend",
+        "role do CorrectionObserved é server-side (sender), nunca do texto"
+    );
     let req1 = ReflectionRequest {
         correction_id: "corr-1".to_string(),
         role: "backend".to_string(),
@@ -186,7 +196,11 @@ fn e2e_loop_correction_to_established_and_injected() {
         untrusted_origin: false,
     };
     let k1 = append_reflection(&mut e, &req1, A_PROPOSAL);
-    assert_eq!(k1, vec!["BeliefProposed"], "lição nova e durável → proposta (quarentena)");
+    assert_eq!(
+        k1,
+        vec!["BeliefProposed"],
+        "lição nova e durável → proposta (quarentena)"
+    );
 
     let m = mentality(&e.store);
     let beliefs = m.beliefs_for_role("backend");
@@ -217,11 +231,22 @@ fn e2e_loop_correction_to_established_and_injected() {
         presented: presented.clone(),
         untrusted_origin: false,
     };
-    let k2 = append_reflection(&mut e, &req2, "[LINA::BELIEF] reforça a lição [LINA::MATCH] reforça #1");
-    assert_eq!(k2, vec!["BeliefReinforced"], "casamento válido #1 → reforço");
+    let k2 = append_reflection(
+        &mut e,
+        &req2,
+        "[LINA::BELIEF] reforça a lição [LINA::MATCH] reforça #1",
+    );
+    assert_eq!(
+        k2,
+        vec!["BeliefReinforced"],
+        "casamento válido #1 → reforço"
+    );
     let m = mentality(&e.store);
     let b = m.belief(&belief_id).expect("crença viva");
-    assert_eq!(b.distinct_situations, 1, "1 situação distinta após 1 reforço");
+    assert_eq!(
+        b.distinct_situations, 1,
+        "1 situação distinta após 1 reforço"
+    );
     assert!(
         matches!(b.status, BeliefStatus::Provisional),
         "GATE: 1 reforço NÃO promove — a política de N distintos é real (não-vacuosidade)"
@@ -237,10 +262,17 @@ fn e2e_loop_correction_to_established_and_injected() {
         presented,
         untrusted_origin: false,
     };
-    append_reflection(&mut e, &req3, "[LINA::BELIEF] vale aqui também [LINA::MATCH] reforça #1");
+    append_reflection(
+        &mut e,
+        &req3,
+        "[LINA::BELIEF] vale aqui também [LINA::MATCH] reforça #1",
+    );
     let m = mentality(&e.store);
     let b = m.belief(&belief_id).expect("crença viva");
-    assert_eq!(b.distinct_situations, 2, "2 situações DISTINTAS (2 task_kind)");
+    assert_eq!(
+        b.distinct_situations, 2,
+        "2 situações DISTINTAS (2 task_kind)"
+    );
     assert!(
         matches!(b.status, BeliefStatus::Established),
         "2 distintos → ESTABELECIDA (vira regra)"
@@ -249,7 +281,9 @@ fn e2e_loop_correction_to_established_and_injected() {
     // ── housekeeping carimba o marco BeliefEstablished, e é IDEMPOTENTE (2º tick não re-carimba).
     let tick = m.housekeeping_tick(4000);
     assert!(
-        tick.iter().any(|ev| matches!(ev, DomainEvent::BeliefEstablished { belief_id: id } if *id == belief_id)),
+        tick.iter().any(
+            |ev| matches!(ev, DomainEvent::BeliefEstablished { belief_id: id } if *id == belief_id)
+        ),
         "housekeeping promove a estabelecida-por-contagem ao marco explícito"
     );
     for ev in &tick {
@@ -264,7 +298,9 @@ fn e2e_loop_correction_to_established_and_injected() {
     // ── INJEÇÃO: a crença entra no top-K do papel como REGRA injetável.
     let injected = m.top_k_for_role("backend", 5, 6000);
     assert!(
-        injected.iter().any(|b| b.belief_id == belief_id && matches!(b.status, BeliefStatus::Established)),
+        injected
+            .iter()
+            .any(|b| b.belief_id == belief_id && matches!(b.status, BeliefStatus::Established)),
         "a crença estabelecida é injetada como regra do papel (fim do loop)"
     );
 }
@@ -294,18 +330,31 @@ fn anti_poisoning_security_instruction_refused_and_never_materializes() {
         untrusted_origin: true,
     };
     let kinds = append_reflection(&mut e, &req, &format!("[LINA::BELIEF] {poison}"));
-    assert_eq!(kinds, vec!["BeliefRetired"], "veneno → recusa (BeliefRetired{{refuted}})");
+    assert_eq!(
+        kinds,
+        vec!["BeliefRetired"],
+        "veneno → recusa (BeliefRetired{{refuted}})"
+    );
 
     let events = e.store.events().expect("events");
-    assert!(recs_of(&events, "BeliefProposed").is_empty(), "nenhuma crença maliciosa proposta");
+    assert!(
+        recs_of(&events, "BeliefProposed").is_empty(),
+        "nenhuma crença maliciosa proposta"
+    );
     let refuted = recs_of(&events, "BeliefRetired");
     assert_eq!(refuted.len(), 1);
-    assert_eq!(refuted[0].payload.get("reason").and_then(|v| v.as_str()), Some("refuted"));
+    assert_eq!(
+        refuted[0].payload.get("reason").and_then(|v| v.as_str()),
+        Some("refuted")
+    );
 
     // varredura: o texto malicioso NÃO materializa em NENHUM evento de CRENÇA (memória durável).
     let blob = belief_payloads(&e.store);
     for needle in ["ignore o gate", "sempre aprove", "aprove o deploy"] {
-        assert!(!blob.contains(needle), "0 payload malicioso nas crenças — sobrou '{needle}'");
+        assert!(
+            !blob.contains(needle),
+            "0 payload malicioso nas crenças — sobrou '{needle}'"
+        );
     }
 }
 
@@ -365,7 +414,11 @@ fn replay_idempotent_same_correction_yields_one_belief() {
 
     let m = mentality(&e.store);
     let beliefs = m.beliefs_for_role("backend");
-    assert_eq!(beliefs.len(), 1, "reprocessar 2× → 1 crença (idempotente sob replay)");
+    assert_eq!(
+        beliefs.len(),
+        1,
+        "reprocessar 2× → 1 crença (idempotente sob replay)"
+    );
     assert_eq!(
         beliefs[0].belief_id,
         mentality::derive_belief_id("backend", "corr-dup"),

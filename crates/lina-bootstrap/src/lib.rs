@@ -11,6 +11,7 @@
 //! no markdown (sem newline/`{{`/backtick → estrutura dos 8 blocos à prova de injeção).
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use lina_role_discovery::{RegistryError, RoleAssignment, RoleRegistry};
 use serde::{Deserialize, Serialize};
@@ -294,7 +295,7 @@ fn vault_tino_path(vault: &str) -> String {
 
 /// **Motor de bootstrap.** Detém o `RoleRegistry` (compila os regexes uma vez) e reusa.
 pub struct Bootstrapper {
-    registry: RoleRegistry,
+    registry: Arc<RoleRegistry>,
 }
 
 impl Bootstrapper {
@@ -303,9 +304,23 @@ impl Bootstrapper {
     /// # Errors
     /// Propaga [`RegistryError`] se o YAML default não parsear (não deve ocorrer em produção).
     pub fn new() -> Result<Self, RegistryError> {
+        static DEFAULT_REGISTRY: OnceLock<Arc<RoleRegistry>> = OnceLock::new();
+        if let Some(registry) = DEFAULT_REGISTRY.get() {
+            return Ok(Self {
+                registry: Arc::clone(registry),
+            });
+        }
+        let built = Arc::new(RoleRegistry::with_defaults()?);
+        let registry = DEFAULT_REGISTRY.get_or_init(|| Arc::clone(&built));
         Ok(Self {
-            registry: RoleRegistry::with_defaults()?,
+            registry: Arc::clone(registry),
         })
+    }
+
+    /// Resolve um nome pelo mesmo registry compilado usado para renderizar a doutrina.
+    #[must_use]
+    pub fn infer_role(&self, name: &str) -> RoleAssignment {
+        self.registry.infer_role(name)
     }
 
     /// Os colegas de `input.terminal_name`: todos do roster MENOS ele, com papel resolvido.

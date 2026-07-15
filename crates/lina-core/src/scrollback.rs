@@ -50,8 +50,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -799,27 +799,9 @@ extern "C" fn flush_signal_handler(sig: libc::c_int) {
     PENDING_SIGNAL.store(sig, Ordering::SeqCst);
 }
 
-/// Instala o handler de flush para os três sinais de término "educado".
+/// Os três sinais de término "educado" observados pelo coordenador.
 #[cfg(unix)]
-/// (revisão) Os três sinais de término "educado" e o bit de cada um na máscara de
-/// instalados (para o último Drop restaurar SÓ o que foi instalado).
-#[cfg(unix)]
-const FLUSH_SIGNALS: [(libc::c_int, u32); 3] = [
-    (libc::SIGTERM, 0b001),
-    (libc::SIGINT, 0b010),
-    (libc::SIGHUP, 0b100),
-];
-
-/// (revisão) Guards vivos que pediram sinais: o ÚLTIMO Drop restaura a disposição
-/// default — sem isso, um guard dropado deixaria o processo "imatável" (o handler
-/// gravaria a flag e ninguém re-emitiria o sinal).
-#[cfg(unix)]
-static SIGNAL_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// (revisão) Bitmask dos sinais cujo handler FOI instalado de fato (`SIG_IGN` herdado
-/// é respeitado — convenção POSIX de `nohup`/background-shell: o bit fica 0).
-#[cfg(unix)]
-static INSTALLED_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const FLUSH_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
 #[cfg(unix)]
 fn install_flush_signal_handlers() {
@@ -828,27 +810,10 @@ fn install_flush_signal_handlers() {
     // A disposição ANTERIOR é consultada: `SIG_IGN` herdado (nohup, shell sem
     // job-control) é restaurado na hora — quem pediu para ignorar segue ignorando.
     unsafe {
-        for (sig, bit) in FLUSH_SIGNALS {
+        for sig in FLUSH_SIGNALS {
             let prev = libc::signal(sig, flush_signal_handler as *const () as libc::sighandler_t);
             if prev == libc::SIG_IGN {
                 libc::signal(sig, libc::SIG_IGN);
-            } else {
-                INSTALLED_MASK.fetch_or(bit, Ordering::SeqCst);
-            }
-        }
-    }
-}
-
-/// (revisão) Restaura `SIG_DFL` para os sinais que NÓS instalamos — chamado pelo
-/// Drop do ÚLTIMO guard com sinais (o processo volta ao comportamento default).
-#[cfg(unix)]
-fn uninstall_flush_signal_handlers() {
-    // SAFETY: restaura a disposição default apenas dos sinais marcados na máscara.
-    unsafe {
-        let mask = INSTALLED_MASK.swap(0, Ordering::SeqCst);
-        for (sig, bit) in FLUSH_SIGNALS {
-            if mask & bit != 0 {
-                libc::signal(sig, libc::SIG_DFL);
             }
         }
     }
@@ -877,57 +842,226 @@ impl Default for FlushGuardConfig {
     }
 }
 
-/// F1-5-6: o job ÚNICO de durabilidade do scrollback — **uma** thread para todos os
-/// painéis (nota load-bearing do 13.16: nunca uma thread por painel disputando o Mutex
-/// global do store — a BAIXA-iii do red-team não piora: este é +1 cliente breve por tick,
-/// pela MESMA serialização de sempre). Responsabilidades, no mesmo loop:
-/// 1. idle-drain: painel ocioso 1-2s com write-behind → `flush(panel)`;
-/// 2. sinais fatais: `SIGTERM`/`SIGINT`/`SIGHUP` → `flush_all` + re-raise (zero perda);
-/// 3. F1-5-9: o job DIÁRIO de retenção (sem segunda thread).
+/// Uma inscrição no job global de durabilidade. Todos os stores do processo compartilham
+/// uma thread e os mesmos handlers; derrubar este valor desregistra somente o seu store e
+/// aguarda qualquer passada que já o tenha reservado. A thread e os handlers permanecem como
+/// serviço único do processo: desligá-los no último `Drop` abriria uma janela capaz de engolir
+/// um sinal já capturado.
 ///
-/// Pare-o dropando (sinaliza e dá join). O `Drop` do store continua cobrindo o
-/// encerramento limpo; o guard cobre o que o `Drop` não vê (sinal fatal, ociosidade).
+/// Responsabilidades do coordenador, no mesmo loop:
+/// 1. idle-drain: painel ocioso 1-2s com write-behind → `flush(panel)`;
+/// 2. sinais fatais: `SIGTERM`/`SIGINT`/`SIGHUP` → `flush_all` de **todos** os stores
+///    registrados + re-raise (zero perda);
+/// 3. F1-5-9: o job DIÁRIO de retenção (sem segunda thread).
 pub struct FlushGuard {
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-    /// O guard pediu handlers de sinal (participa do contador global e da
-    /// restauração no Drop).
+    coordinator: Arc<FlushCoordinator>,
+    registration_id: u64,
     handle_signals: bool,
 }
 
+struct FlushRegistration {
+    store: Arc<Mutex<ScrollbackStore>>,
+    cfg: FlushGuardConfig,
+    activity: Mutex<FlushRegistrationActivity>,
+    quiesced: Condvar,
+}
+
+struct FlushRegistrationActivity {
+    active: bool,
+    in_flight: usize,
+}
+
+struct FlushRegistrationLease {
+    registration: Arc<FlushRegistration>,
+}
+
+impl FlushRegistration {
+    fn new(store: Arc<Mutex<ScrollbackStore>>, cfg: FlushGuardConfig) -> Self {
+        Self {
+            store,
+            cfg,
+            activity: Mutex::new(FlushRegistrationActivity {
+                active: true,
+                in_flight: 0,
+            }),
+            quiesced: Condvar::new(),
+        }
+    }
+
+    fn try_reserve(registration: &Arc<Self>) -> Option<FlushRegistrationLease> {
+        let mut activity = crate::lock(&registration.activity);
+        if !activity.active {
+            return None;
+        }
+        let Some(in_flight) = activity.in_flight.checked_add(1) else {
+            tracing::error!("contador de passadas do scrollback se esgotou");
+            return None;
+        };
+        activity.in_flight = in_flight;
+        drop(activity);
+        Some(FlushRegistrationLease {
+            registration: Arc::clone(registration),
+        })
+    }
+
+    fn deactivate_and_wait(&self) {
+        let mut activity = crate::lock(&self.activity);
+        activity.active = false;
+        while activity.in_flight != 0 {
+            activity = self
+                .quiesced
+                .wait(activity)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for FlushRegistrationLease {
+    fn drop(&mut self) {
+        let mut activity = crate::lock(&self.registration.activity);
+        let Some(in_flight) = activity.in_flight.checked_sub(1) else {
+            tracing::error!("reserva de passada do scrollback sem registro correspondente");
+            return;
+        };
+        activity.in_flight = in_flight;
+        if activity.in_flight == 0 {
+            self.registration.quiesced.notify_all();
+        }
+    }
+}
+
+#[derive(Default)]
+struct FlushCoordinatorState {
+    next_registration_id: u64,
+    registrations: BTreeMap<u64, Arc<FlushRegistration>>,
+    signal_registrations: usize,
+    handlers_installed: bool,
+}
+
+struct FlushCoordinator {
+    state: Mutex<FlushCoordinatorState>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+static FLUSH_COORDINATOR: OnceLock<Mutex<Option<Arc<FlushCoordinator>>>> = OnceLock::new();
+
+/// Contadores internos do coordenador. O soak de workspaces usa estes dados em vez de
+/// inferir posse por `ps`/`lsof`, que podem não estar disponíveis no runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushCoordinatorStats {
+    pub registrations: usize,
+    pub threads: usize,
+    pub signal_registrations: usize,
+    pub handlers_installed: bool,
+}
+
+/// Foto O(1) da posse global de scrollback deste processo.
+#[must_use]
+pub fn flush_coordinator_stats() -> FlushCoordinatorStats {
+    let slot = crate::lock(FLUSH_COORDINATOR.get_or_init(|| Mutex::new(None)));
+    match slot.as_ref() {
+        Some(coordinator) => {
+            let state = crate::lock(&coordinator.state);
+            let threads = usize::from(
+                crate::lock(&coordinator.join)
+                    .as_ref()
+                    .is_some_and(|join| !join.is_finished()),
+            );
+            FlushCoordinatorStats {
+                registrations: state.registrations.len(),
+                threads,
+                signal_registrations: state.signal_registrations,
+                handlers_installed: state.handlers_installed,
+            }
+        }
+        None => FlushCoordinatorStats {
+            registrations: 0,
+            threads: 0,
+            signal_registrations: 0,
+            handlers_installed: false,
+        },
+    }
+}
+
+fn ensure_flush_coordinator_worker(
+    coordinator: &Arc<FlushCoordinator>,
+) -> Result<(), ScrollbackError> {
+    let mut join_slot = crate::lock(&coordinator.join);
+    if join_slot.as_ref().is_some_and(|join| !join.is_finished()) {
+        return Ok(());
+    }
+    if let Some(finished) = join_slot.take() {
+        if finished.join().is_err() {
+            tracing::error!("worker anterior de scrollback terminou em panic; recriando");
+        }
+    }
+    let worker = Arc::clone(coordinator);
+    let join = std::thread::Builder::new()
+        .name("lina-scrollback-flush-coordinator".into())
+        .spawn(move || flush_coordinator_loop(&worker))?;
+    *join_slot = Some(join);
+    Ok(())
+}
+
 impl FlushGuard {
-    /// Sobe a thread do guard sobre o store COMPARTILHADO do workspace (a mesma
-    /// serialização dos reader-threads do `PtyHost`).
+    /// Registra o store no coordenador do processo. A primeira inscrição sobe a thread;
+    /// inscrições seguintes apenas entram no mapa. Handlers são instalados na transição
+    /// zero→um assinante de sinais, sempre depois de a thread existir. O coordenador
+    /// contém panic de um store; se a thread ainda assim tiver terminado, esta entrada a
+    /// recria antes de publicar a inscrição.
     ///
-    /// **Contrato de sinais (revisão):** os handlers são INSTALADOS só depois de a
-    /// thread subir (falha de spawn não deixa handler órfão) e são processo-globais —
-    /// no máximo **um caminho de sinal por processo**: com 2+ guards (futuro
-    /// multi-workspace, ADR 0010), o guard que observar o sinal drena só o SEU store
-    /// antes do re-raise; quando isso virar caso real, o caminho de sinal precisa de
-    /// um registro de stores (registrado na entrega da fatia). `SIG_IGN` herdado
-    /// (nohup) é respeitado por sinal.
-    ///
-    /// ⚠️ Nunca drope o guard segurando o lock do store NA MESMA thread: o Drop dá
-    /// `join` numa thread que pega esse lock — deadlock garantido.
+    /// ⚠️ Nunca drope o guard segurando o lock do store NA MESMA thread: o Drop
+    /// aguarda uma passada já reservada, e ela pode estar esperando esse mesmo lock.
     pub fn start(
         store: Arc<Mutex<ScrollbackStore>>,
         cfg: FlushGuardConfig,
     ) -> Result<Self, ScrollbackError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let join = std::thread::Builder::new()
-            .name("lina-scrollback-flush-guard".into())
-            .spawn({
-                let stop = Arc::clone(&stop);
-                move || guard_loop(&store, cfg, &stop)
-            })?;
+        let mut slot = crate::lock(FLUSH_COORDINATOR.get_or_init(|| Mutex::new(None)));
+        let coordinator = match slot.as_ref() {
+            Some(coordinator) => Arc::clone(coordinator),
+            None => {
+                let coordinator = Arc::new(FlushCoordinator {
+                    state: Mutex::new(FlushCoordinatorState::default()),
+                    join: Mutex::new(None),
+                });
+                ensure_flush_coordinator_worker(&coordinator)?;
+                *slot = Some(Arc::clone(&coordinator));
+                coordinator
+            }
+        };
+        ensure_flush_coordinator_worker(&coordinator)?;
+
+        let (registration_id, install_signals) = {
+            let mut state = crate::lock(&coordinator.state);
+            let registration_id = state.next_registration_id;
+            state.next_registration_id =
+                state.next_registration_id.checked_add(1).ok_or_else(|| {
+                    std::io::Error::other("o contador de registros do scrollback se esgotou")
+                })?;
+            let install_signals = cfg.handle_signals && !state.handlers_installed;
+            if cfg.handle_signals {
+                state.signal_registrations += 1;
+            }
+            state.handlers_installed |= install_signals;
+            state.registrations.insert(
+                registration_id,
+                Arc::new(FlushRegistration::new(store, cfg)),
+            );
+            (registration_id, install_signals)
+        };
         #[cfg(unix)]
-        if cfg.handle_signals {
-            SIGNAL_GUARDS.fetch_add(1, Ordering::SeqCst);
+        if install_signals {
             install_flush_signal_handlers();
         }
+        #[cfg(not(unix))]
+        let _ = install_signals;
+
+        if let Some(join) = crate::lock(&coordinator.join).as_ref() {
+            join.thread().unpark();
+        }
         Ok(Self {
-            stop,
-            join: Some(join),
+            coordinator,
+            registration_id,
             handle_signals: cfg.handle_signals,
         })
     }
@@ -935,61 +1069,150 @@ impl FlushGuard {
 
 impl Drop for FlushGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        let mut state = crate::lock(&self.coordinator.state);
+        let registration = state.registrations.remove(&self.registration_id);
+        if registration.is_none() {
+            tracing::error!(
+                registration_id = self.registration_id,
+                "registro de scrollback já havia sido removido"
+            );
         }
-        // (revisão) O ÚLTIMO guard com sinais restaura a disposição default — um
-        // processo sem guard nunca fica "imatável" (handler gravando flag que ninguém
-        // consome). Na SUBSTITUIÇÃO (start_flush_guard re-chamado), o guard novo já
-        // incrementou o contador antes deste Drop → nada é desinstalado.
-        #[cfg(unix)]
-        if self.handle_signals && SIGNAL_GUARDS.fetch_sub(1, Ordering::SeqCst) == 1 {
-            uninstall_flush_signal_handlers();
+        if self.handle_signals {
+            match state.signal_registrations.checked_sub(1) {
+                Some(remaining) => state.signal_registrations = remaining,
+                None => tracing::error!("contador de registros de sinal já estava em zero"),
+            }
+        }
+        drop(state);
+        if let Some(registration) = registration {
+            registration.deactivate_and_wait();
+        }
+        // A thread e os handlers são serviços do PROCESSO depois do primeiro uso.
+        // Encerrá-los no último Drop abre uma janela em que o handler já capturou
+        // SIGTERM, mas o worker sai antes de reemiti-lo. Mantê-los vivos custa uma
+        // thread constante e garante que, mesmo com zero stores, todo sinal capturado
+        // volte à disposição default em vez de ser engolido.
+    }
+}
+
+fn registered_flush_targets(coordinator: &FlushCoordinator) -> Vec<Arc<FlushRegistration>> {
+    crate::lock(&coordinator.state)
+        .registrations
+        .values()
+        .cloned()
+        .collect()
+}
+
+fn flush_registered_for_signal(targets: &[Arc<FlushRegistration>], sig: i32) {
+    for target in targets {
+        let Some(_lease) = FlushRegistration::try_reserve(target) else {
+            continue;
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut store = crate::lock(&target.store);
+            if let Err(error) = store.flush_all_for_signal() {
+                tracing::error!(
+                    %sig,
+                    path = %store.db_path().display(),
+                    %error,
+                    "flush de sinal falhou — write-behind pode se perder"
+                );
+            } else {
+                tracing::info!(
+                    %sig,
+                    path = %store.db_path().display(),
+                    pendentes = store.drain_stats().last_pending,
+                    "scrollback drenado pelo handler de sinal"
+                );
+            }
+        }));
+        if outcome.is_err() {
+            tracing::error!(
+                %sig,
+                "panic contido ao drenar um scrollback; os demais stores ainda serão drenados"
+            );
         }
     }
 }
 
-/// O loop do guard (ver [`FlushGuard`]). Erros de disco são LOGADOS e a próxima passada
-/// re-tenta (o write-behind não avança em erro — nada se perde em silêncio).
-fn guard_loop(store: &Arc<Mutex<ScrollbackStore>>, cfg: FlushGuardConfig, stop: &AtomicBool) {
-    while !stop.load(Ordering::Relaxed) {
-        #[cfg(unix)]
-        {
-            let sig = PENDING_SIGNAL.swap(0, Ordering::SeqCst);
-            if sig != 0 {
-                {
-                    let mut s = crate::lock(store);
-                    if let Err(e) = s.flush_all_for_signal() {
-                        tracing::error!(%sig, error = %e, "flush de sinal falhou — write-behind pode se perder");
-                    } else {
-                        tracing::info!(
-                            %sig,
-                            pendentes = s.drain_stats().last_pending,
-                            "scrollback drenado pelo handler de sinal"
-                        );
-                    }
-                }
-                // SAFETY: restaura a disposição DEFAULT e re-emite o MESMO sinal — o
-                // processo morre com a semântica correta (o pai vê SIGTERM/SIGINT/SIGHUP).
-                unsafe {
-                    libc::signal(sig, libc::SIG_DFL);
-                    libc::raise(sig);
-                }
-                return; // inalcançável: a disposição default dos 3 sinais termina o processo
-            }
+fn flush_registered_tick(target: &Arc<FlushRegistration>) {
+    let Some(_lease) = FlushRegistration::try_reserve(target) else {
+        return;
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut store = crate::lock(&target.store);
+        if let Err(error) = store.drain_idle(target.cfg.idle_for) {
+            tracing::warn!(
+                path = %store.db_path().display(),
+                %error,
+                "idle-drain falhou; re-tenta no próximo tick"
+            );
         }
-        {
-            let mut s = crate::lock(store);
-            if let Err(e) = s.drain_idle(cfg.idle_for) {
-                tracing::warn!(error = %e, "idle-drain falhou; re-tenta no próximo tick");
-            }
-            if let Err(e) = s.maybe_run_retention() {
-                tracing::warn!(error = %e, "job de retenção falhou; re-tenta no próximo tick");
-            }
+        if let Err(error) = store.maybe_run_retention() {
+            tracing::warn!(
+                path = %store.db_path().display(),
+                %error,
+                "job de retenção falhou; re-tenta no próximo tick"
+            );
         }
-        std::thread::sleep(cfg.tick);
+    }));
+    if outcome.is_err() {
+        tracing::error!("panic contido em um scrollback; coordenador continua vivo");
     }
+}
+
+#[cfg(unix)]
+fn terminate_after_signal_flush(sig: i32) -> ! {
+    // SAFETY: restaura a disposição default, desbloqueia o sinal nesta thread e reemite
+    // o MESMO sinal. `_exit` é apenas o backstop caso o SO devolva de `raise`.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(signals.as_mut_ptr());
+        libc::sigaddset(signals.as_mut_ptr(), sig);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, signals.as_ptr(), std::ptr::null_mut());
+        libc::raise(sig);
+        libc::_exit(128 + sig);
+    }
+}
+
+/// Loop único do processo. Erros de um store são logados sem impedir os demais;
+/// write-behind não avança em erro e a próxima passada tenta de novo.
+fn flush_coordinator_loop(coordinator: &FlushCoordinator) {
+    loop {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flush_coordinator_iteration(coordinator);
+        }));
+        if outcome.is_err() {
+            tracing::error!("panic inesperado contido no coordenador de scrollback");
+            std::thread::park_timeout(Duration::from_millis(10));
+        }
+    }
+}
+
+fn flush_coordinator_iteration(coordinator: &FlushCoordinator) {
+    #[cfg(unix)]
+    {
+        let sig = PENDING_SIGNAL.swap(0, Ordering::SeqCst);
+        if sig != 0 {
+            // O snapshot vem DEPOIS de observar o sinal. Assim todo `start` que já
+            // retornou antes do SIGTERM participa do drain; capturá-lo antes abriria
+            // uma janela em que o worker reemitiria usando uma lista antiga.
+            let targets = registered_flush_targets(coordinator);
+            flush_registered_for_signal(&targets, sig);
+            terminate_after_signal_flush(sig);
+        }
+    }
+    let targets = registered_flush_targets(coordinator);
+    for target in &targets {
+        flush_registered_tick(target);
+    }
+    let tick = targets
+        .iter()
+        .map(|target| target.cfg.tick)
+        .min()
+        .unwrap_or_else(|| Duration::from_millis(250));
+    std::thread::park_timeout(tick);
 }
 
 // ───────────────────────────────────── testes ─────────────────────────────────────
@@ -1325,6 +1548,159 @@ mod tests {
              teto(janela)={ceiling}B teto_duro={hard_ceiling}B unbounded~={unbounded}B | \
              ram_pos-flush={flushed_ram:?} pico_raw={raw_ram_peak}B \
              disk_rows={disk_rows} db_file={db_len}B peak_rss={rss:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_reliability_flush_coordinator_flushes_every_registered_store() {
+        let first_dir = TempDir::new("coordinator-first");
+        let second_dir = TempDir::new("coordinator-second");
+        let cfg = ScrollbackConfig {
+            cap: 16,
+            flush_batch: 100,
+            retention_days: 0,
+        };
+        let first = Arc::new(Mutex::new(
+            ScrollbackStore::open(first_dir.path(), cfg).expect("first store"),
+        ));
+        let second = Arc::new(Mutex::new(
+            ScrollbackStore::open(second_dir.path(), cfg).expect("second store"),
+        ));
+        crate::lock(&first)
+            .push_line("A", "pendente-a")
+            .expect("push first");
+        crate::lock(&second)
+            .push_line("B", "pendente-b")
+            .expect("push second");
+
+        let guard_cfg = FlushGuardConfig {
+            idle_for: Duration::from_secs(60),
+            tick: Duration::from_secs(60),
+            handle_signals: false,
+        };
+        let first_guard = FlushGuard::start(Arc::clone(&first), guard_cfg).expect("first guard");
+        let second_guard = FlushGuard::start(Arc::clone(&second), guard_cfg).expect("second guard");
+        assert!(
+            Arc::ptr_eq(&first_guard.coordinator, &second_guard.coordinator),
+            "dois workspaces compartilham exatamente o mesmo coordenador"
+        );
+        let stats = flush_coordinator_stats();
+        assert!(stats.registrations >= 2);
+        assert_eq!(stats.threads, 1, "há uma thread, nunca uma por store");
+
+        let targets = registered_flush_targets(&first_guard.coordinator);
+        flush_registered_for_signal(&targets, libc::SIGTERM);
+        for (store, panel) in [(&first, "A"), (&second, "B")] {
+            let store = crate::lock(store);
+            assert_eq!(store.pending_lines(panel), 0);
+            assert_eq!(store.disk_rows(panel).expect("disk rows"), 1);
+            assert_eq!(store.drain_stats().signal_flushes, 1);
+        }
+
+        let coordinator = Arc::clone(&first_guard.coordinator);
+        drop(first_guard);
+        let remaining = registered_flush_targets(&coordinator);
+        assert!(remaining
+            .iter()
+            .all(|target| !Arc::ptr_eq(&target.store, &first)));
+        assert!(remaining
+            .iter()
+            .any(|target| Arc::ptr_eq(&target.store, &second)));
+        drop(second_guard);
+        let remaining = registered_flush_targets(&coordinator);
+        assert!(remaining.iter().all(|target| {
+            !Arc::ptr_eq(&target.store, &first) && !Arc::ptr_eq(&target.store, &second)
+        }));
+        assert!(flush_coordinator_stats().threads <= 1);
+    }
+
+    #[test]
+    fn workspace_reliability_flush_guard_drop_quiesces_stale_snapshots() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let dir = TempDir::new("coordinator-drop-quiescence");
+        let mut store = ScrollbackStore::open(
+            dir.path(),
+            ScrollbackConfig {
+                cap: 16,
+                flush_batch: 100,
+                retention_days: 30,
+            },
+        )
+        .expect("store");
+        let clock_calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        store.set_clock({
+            let clock_calls = Arc::clone(&clock_calls);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move || {
+                clock_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let (entered_lock, entered_signal) = &*entered;
+                *crate::lock(entered_lock) = true;
+                entered_signal.notify_all();
+
+                let (release_lock, release_signal) = &*release;
+                let mut released = crate::lock(release_lock);
+                while !*released {
+                    released = release_signal
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                DAY_MS * 40
+            }
+        });
+        let store = Arc::new(Mutex::new(store));
+        let guard = FlushGuard::start(
+            Arc::clone(&store),
+            FlushGuardConfig {
+                idle_for: Duration::from_secs(60),
+                tick: Duration::from_secs(60),
+                handle_signals: false,
+            },
+        )
+        .expect("guard");
+        let stale_target = registered_flush_targets(&guard.coordinator)
+            .into_iter()
+            .find(|target| Arc::ptr_eq(&target.store, &store))
+            .expect("snapshot contém a inscrição deste store");
+
+        let (entered_lock, entered_signal) = &*entered;
+        let mut did_enter = crate::lock(entered_lock);
+        while !*did_enter {
+            did_enter = entered_signal
+                .wait(did_enter)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(did_enter);
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::channel();
+        let drop_thread = std::thread::spawn(move || {
+            drop(guard);
+            drop_done_tx.send(()).expect("notificar Drop");
+        });
+        assert!(
+            drop_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "Drop não pode retornar enquanto uma passada reservada ainda usa o store"
+        );
+
+        let (release_lock, release_signal) = &*release;
+        *crate::lock(release_lock) = true;
+        release_signal.notify_all();
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("Drop converge depois da passada");
+        drop_thread.join().expect("thread do Drop");
+
+        let calls_after_drop = clock_calls.load(AtomicOrdering::SeqCst);
+        flush_registered_tick(&stale_target);
+        assert_eq!(
+            clock_calls.load(AtomicOrdering::SeqCst),
+            calls_after_drop,
+            "snapshot capturado antes do Drop não pode tocar o store depois que ele retorna"
         );
     }
 }

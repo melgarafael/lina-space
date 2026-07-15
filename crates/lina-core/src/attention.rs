@@ -1491,7 +1491,11 @@ mod tests {
             1,
             "permission + guard-ask + dead-letter do nó morto saíram juntos"
         );
-        assert_eq!(items[0].node_id, vivo.to_string(), "só o do nó vivo permanece");
+        assert_eq!(
+            items[0].node_id,
+            vivo.to_string(),
+            "só o do nó vivo permanece"
+        );
     }
 
     /// Tela do fundador (2026-06-25, REGRESSÃO do botão "Limpar"): o botão chamava `dismiss(id)`, mas
@@ -1521,11 +1525,15 @@ mod tests {
         assert_eq!(q.items(T0 + 1_000).len(), 2);
 
         // O PRODUTOR reconhece dead-letter e guard-ask (não só permissão) e emite o evento.
-        let ev_dl = q.dismiss("dead-letter:m1").expect("dismiss reconhece dead-letter");
+        let ev_dl = q
+            .dismiss("dead-letter:m1")
+            .expect("dismiss reconhece dead-letter");
         assert!(
             matches!(&ev_dl, DomainEvent::PermissionDismissed { stable_id } if stable_id == "dead-letter:m1")
         );
-        let ev_g = q.dismiss("guard:Maestro 01").expect("dismiss reconhece guard-ask");
+        let ev_g = q
+            .dismiss("guard:Maestro 01")
+            .expect("dismiss reconhece guard-ask");
 
         // Caminho REAL: observar os eventos produzidos LIMPA de verdade (não o fold à mão).
         q.observe(&ev_dl, T0 + 2_000);
@@ -1564,7 +1572,11 @@ mod tests {
             T0,
         );
         q.observe(&ask("Z", PermissionEvidence::Hook, "perm1"), T0);
-        assert_eq!(q.items(T0 + 1_000).len(), 3, "dead-letter + guard-ask + permissão");
+        assert_eq!(
+            q.items(T0 + 1_000).len(),
+            3,
+            "dead-letter + guard-ask + permissão"
+        );
 
         // "Limpar" dispensa o dead-letter pelo stable_id exibido (`dead-letter:<id>`).
         q.observe(

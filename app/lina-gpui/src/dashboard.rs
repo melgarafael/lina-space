@@ -655,6 +655,18 @@ pub fn workspace_mini_status(
         return WorkspaceMiniStatus::unreachable();
     };
 
+    workspace_mini_status_from_projection(&state, ws_root, sessions, today_prefix)
+}
+
+/// Calcula o mini-status a partir de uma projeção que o catálogo já produziu.
+/// Não toca disco; sidebar e validação passam a consumir a mesma foto atômica.
+#[must_use]
+pub fn workspace_mini_status_from_projection(
+    state: &ProjectedState,
+    ws_root: &str,
+    sessions: &[Session],
+    today_prefix: &str,
+) -> WorkspaceMiniStatus {
     let states: Vec<UiState> = state
         .nodes
         .values()
@@ -665,7 +677,7 @@ pub fn workspace_mini_status(
     let agents_alive = states.iter().filter(|s| **s != UiState::Encerrado).count();
     let dominant = states.iter().copied().min_by_key(|s| dominance_rank(*s));
 
-    let cost = workspace_cost_today(sessions, ws_root, &adopted_cwds(&state), today_prefix);
+    let cost = workspace_cost_today(sessions, ws_root, &adopted_cwds(state), today_prefix);
     let (cost_short, cost_tooltip) = if cost.line.has_data {
         (
             Some(short_money(cost.line.usd, cost.line.estimated)),
@@ -745,6 +757,43 @@ impl MiniStatusCache {
                 let root = ws_root_of(dir);
                 let status =
                     workspace_mini_status(dir, &root.to_string_lossy(), sessions, today_prefix);
+                (
+                    dir.clone(),
+                    MiniStatusEntry {
+                        status,
+                        computed_at_ms,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Atualiza o cache sem reabrir stores: cada diretório usa a projeção da
+    /// leitura canônica do catálogo. Ausência significa indisponível nesta foto,
+    /// nunca autoriza uma segunda leitura divergente.
+    pub fn refresh_from_projections(
+        &mut self,
+        entries: &[PathBuf],
+        projections: &BTreeMap<PathBuf, ProjectedState>,
+        sessions: &[Session],
+        today_prefix: &str,
+        computed_at_ms: u64,
+    ) {
+        self.by_dir = entries
+            .iter()
+            .map(|dir| {
+                let root = ws_root_of(dir);
+                let status =
+                    projections
+                        .get(&root)
+                        .map_or_else(WorkspaceMiniStatus::unreachable, |state| {
+                            workspace_mini_status_from_projection(
+                                state,
+                                &root.to_string_lossy(),
+                                sessions,
+                                today_prefix,
+                            )
+                        });
                 (
                     dir.clone(),
                     MiniStatusEntry {

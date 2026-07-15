@@ -41,6 +41,7 @@ use lina_core::{
 use lina_core::workspace_template::{builtin_templates, WorkspaceTemplate};
 use lina_host::NodeId;
 use lina_role_discovery::RoleRegistry;
+use uuid::Uuid;
 
 use crate::workspace_boot::{self, WorkdirError};
 
@@ -163,6 +164,16 @@ pub fn apply_preset(
         focus_preset: preset.id().to_string(),
     })?;
 
+    apply_preset_roster(team, store)
+}
+
+/// Persiste somente o roster de um preset cuja criação já foi confirmada no log.
+/// A separação permite que o funil de criação prove a fronteira durável entre
+/// `WorkspaceCreated` e os agentes sem duplicar a sequência canônica do preset.
+pub(crate) fn apply_preset_roster(
+    team: &[PlacedAgent],
+    store: &mut EventStore,
+) -> Result<(), StoreError> {
     // FIX-3: coordenadas-semente na MESMA grade do canvas vivo (`bridge::grid_slot` — fonte
     // única de CARD_W/CARD_H/GAP). A fila linear antiga (passo 360px < card de 710px) fazia
     // os terminais do template nascerem sobrepostos.
@@ -228,6 +239,10 @@ pub const COPY_M9_ERR_EXIT_BROWSE: &str = "Procurar…";
 pub const COPY_M9_ERR_EXIT_OTHER: &str = "Escolher outra";
 /// Saída do erro «falha ao criar» (reuso literal do M9 — ux-flows:774).
 pub const COPY_M9_ERR_EXIT_OTHER_PLACE: &str = "Escolher outro lugar";
+/// Catálogo ilegível: criar sem conhecer os Espaços existentes arriscaria
+/// duplicar nomes e furar o limite do plano.
+pub const COPY_M9_CATALOG_ERROR: &str =
+    "Não consegui ler a lista de Espaços. Seus Espaços continuam no disco; tente novamente.";
 
 /// Sugestão de Diretório de Trabalho quando `Settings.default_cwd` não existe
 /// (ux-flows:681 — `~/EspaçosDeTrabalho/{nome}`). Exposta p/ o render exibir o template.
@@ -309,6 +324,9 @@ pub enum UpsellAction {
 ///   só para `⌘⏎` — spec §4, correção da banca);
 /// - `Esc` fecha sem criar (o shell dropa o modal; nada a desfazer — estado é RAM).
 pub struct CreateSpaceModal {
+    /// Identidade da tentativa lógica. Repetir Enter/erro de disco conserva este UUID;
+    /// alterar nome, foco, gabarito ou diretório inicia outra intenção.
+    creation_id: Uuid,
     /// Card de Foco selecionado (índice em [`FocusPreset::all`]).
     pub preset_idx: usize,
     /// Nome do Espaço (pré-preenchido pelo Foco até o usuário tocar).
@@ -321,6 +339,9 @@ pub struct CreateSpaceModal {
     pub workdir_touched: bool,
     /// Erro corrente do Diretório (validação CEDO: na seleção E na criação).
     pub error: Option<WorkdirErrorView>,
+    /// Falha do registry, separada do erro de pasta para não culpar o Diretório
+    /// de Trabalho por um problema do catálogo.
+    pub catalog_error: Option<String>,
     /// Linha-fato do bloqueio (F1-4-6: por `BlockReason`, via `license_ui::blocked_copy`)
     /// — `Some` ⇒ criação indisponível, a vitrine 1b no lugar do form.
     pub blocked: Option<String>,
@@ -357,12 +378,14 @@ impl CreateSpaceModal {
             M9Focus::Cards
         };
         let mut m = Self {
+            creation_id: Uuid::now_v7(),
             preset_idx: 0,
             name: String::new(),
             name_touched: false,
             workdir: String::new(),
             workdir_touched: false,
             error: None,
+            catalog_error: None,
             blocked,
             focus,
             key: crate::license_ui::KeyEntry::default(),
@@ -385,7 +408,11 @@ impl CreateSpaceModal {
     /// acompanha o rótulo do Foco (e o Diretório acompanha o nome, mesma regra).
     /// F3-5-10: escolher um Foco DESMARCA o gabarito (mutuamente exclusivos na tela).
     pub fn select_preset(&mut self, idx: usize) {
-        self.preset_idx = idx.min(FocusPreset::all().len() - 1);
+        let next = idx.min(FocusPreset::all().len() - 1);
+        if self.preset_idx != next || self.template_idx.is_some() {
+            self.creation_id = Uuid::now_v7();
+        }
+        self.preset_idx = next;
         self.template_idx = None;
         self.refresh_prefills();
     }
@@ -424,6 +451,9 @@ impl CreateSpaceModal {
         let Some(t) = templates.get(idx) else {
             return;
         };
+        if self.template_idx != Some(idx) {
+            self.creation_id = Uuid::now_v7();
+        }
         self.template_idx = Some(idx);
         if !self.name_touched {
             self.name = t.name.clone();
@@ -468,6 +498,9 @@ impl CreateSpaceModal {
     /// acompanhando (enquanto não tocado); editar o Diretório o destaca para sempre
     /// e limpa o erro corrente (re-valida na seleção/criação, não a cada tecla).
     pub fn type_char(&mut self, s: &str) {
+        if !s.is_empty() && matches!(self.focus, M9Focus::Name | M9Focus::Workdir) {
+            self.creation_id = Uuid::now_v7();
+        }
         match self.focus {
             M9Focus::Name => {
                 self.name.push_str(s);
@@ -494,6 +527,14 @@ impl CreateSpaceModal {
 
     /// Backspace no campo focado (mesmas regras de acompanhamento do [`Self::type_char`]).
     pub fn backspace(&mut self) {
+        let changes_creation = match self.focus {
+            M9Focus::Name => !self.name.is_empty(),
+            M9Focus::Workdir => !self.workdir.is_empty(),
+            _ => false,
+        };
+        if changes_creation {
+            self.creation_id = Uuid::now_v7();
+        }
         match self.focus {
             M9Focus::Name => {
                 self.name.pop();
@@ -567,6 +608,9 @@ impl CreateSpaceModal {
     /// campo/botões da ativação com rótulo a11y (F1-4-6 critério 5).
     #[must_use]
     pub fn announcement(&self) -> Option<String> {
+        if let Some(error) = &self.catalog_error {
+            return Some(error.clone());
+        }
         use crate::license_ui as lic;
         match self.focus {
             M9Focus::Workdir => self.error.as_ref().map(|e| e.message.clone()),
@@ -589,6 +633,17 @@ impl CreateSpaceModal {
             )),
             _ => None,
         }
+    }
+
+    /// Torna uma falha do catálogo visível e audível sem perder o que o
+    /// usuário já preencheu no modal.
+    pub fn set_catalog_error(&mut self, message: impl Into<String>) {
+        self.catalog_error = Some(message.into());
+    }
+
+    /// O shell chama depois de reler o registry com sucesso numa nova tentativa.
+    pub fn clear_catalog_error(&mut self) {
+        self.catalog_error = None;
     }
 
     /// `[[ Já tenho uma chave ]]`: expande o campo de colar ALI MESMO (copy §1b) e
@@ -627,7 +682,11 @@ impl CreateSpaceModal {
     /// `prompt_for_paths`, mesmo mecanismo do M6, e entrega o resultado aqui).
     /// Valida na SELEÇÃO (spec §2.2 — cedo, nunca só no fim).
     pub fn set_workdir_picked(&mut self, path: &Path) {
-        self.workdir = path.display().to_string();
+        let picked = path.display().to_string();
+        if self.workdir != picked {
+            self.creation_id = Uuid::now_v7();
+        }
+        self.workdir = picked;
         self.workdir_touched = true;
         self.error = workspace_boot::validate_workdir(path).err().map(Into::into);
     }
@@ -688,7 +747,7 @@ impl CreateSpaceModal {
         tier: LicenseTier,
         on_created: impl FnOnce(PathBuf),
     ) -> bool {
-        if self.blocked.is_some() {
+        if self.blocked.is_some() || self.catalog_error.is_some() {
             return false; // vitrine §1a no lugar do form — nada a submeter.
         }
         if !self.validate() {
@@ -699,7 +758,7 @@ impl CreateSpaceModal {
         // F3-5-10: gabarito escolhido → o MESMO funil gated semeia o template (gating+dedup+registry
         // preservados); sem gabarito → criação pelo Foco, inalterada (gate f).
         let template = self.selected_template();
-        match workspace_boot::create_workspace(
+        match workspace_boot::create_workspace_for_user_intent(
             parent,
             &self.name,
             &self.preset(),
@@ -708,6 +767,7 @@ impl CreateSpaceModal {
             now_ms,
             tier,
             template.as_ref(),
+            self.creation_id,
         ) {
             Ok(ws_root) => {
                 on_created(ws_root);
@@ -738,7 +798,6 @@ impl CreateSpaceModal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid; // `uuid` é dev-dependency — fabrica `NodeId` no teste (o que o Supervisor faria).
 
     fn registry() -> RoleRegistry {
         RoleRegistry::with_defaults().expect("default-roles.yaml embutido compila")
@@ -1196,6 +1255,10 @@ mod tests {
         assert!(ok, "submit criou; erro: {:?}", m.error);
         let ws_root = created.expect("ws_root devolvido ao caller");
         assert!(ws_root.starts_with(&parent) && ws_root.exists());
+        assert!(
+            workdir.is_dir(),
+            "Diretório inexistente escolhido no modal foi criado"
+        );
 
         // A fonte da verdade nasceu certa: preset + Diretório no log do Espaço NOVO.
         let store = EventStore::open(lina_core::Workspace::events_dir(&ws_root)).expect("abrir");
@@ -1203,11 +1266,69 @@ mod tests {
         assert_eq!(state.focus_preset.as_deref(), Some("blank"));
         assert_eq!(
             state.default_cwd.as_deref(),
-            Some(workdir.display().to_string().as_str()),
+            workdir.canonicalize().expect("canonical workdir").to_str(),
             "WorkspaceDefaultCwdSet com o caminho expandido"
         );
         assert_eq!(registry.entries().len(), 1, "inscrito no registry global");
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn workspace_reliability_modal_retry_keeps_one_creation_intent() {
+        let parent = temp_dir("submit-retry-id");
+        let registry_path = parent.join("registry.json");
+        let blocked_tmp = parent.join(format!("registry.tmp-{}", std::process::id()));
+        std::fs::create_dir(&blocked_tmp).expect("bloquear save do registry");
+        let mut registry = WorkspaceRegistry::load(&registry_path).expect("registry vazio");
+        let mut modal = open_modal(LicenseTier::Pro, 0);
+        modal.select_preset(2);
+        modal.set_workdir_picked(&parent.join("projeto-grande"));
+
+        assert!(
+            !modal.submit(&parent, &mut registry, 1, LicenseTier::Pro, |_| {}),
+            "a primeira tentativa publica, mas o catálogo injetado falha"
+        );
+        std::fs::remove_dir(&blocked_tmp).expect("desbloquear catálogo");
+
+        let mut created = None;
+        assert!(
+            modal.submit(&parent, &mut registry, 2, LicenseTier::Pro, |root| {
+                created = Some(root)
+            },)
+        );
+        let root = created.expect("retry concluiu");
+        assert_eq!(root, parent.join("Em Branco"));
+        assert!(!parent.join("Em Branco (2)").exists());
+        assert_eq!(registry.entries().len(), 1);
+
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn workspace_reliability_catalog_error_is_inline_announced_and_blocks_creation() {
+        let parent = temp_dir("catalog-error-inline");
+        let mut registry =
+            WorkspaceRegistry::load(parent.join("registry.json")).expect("registry vazio");
+        let mut modal = open_modal(LicenseTier::Pro, 0);
+        modal.select_preset(2);
+        modal.set_catalog_error(COPY_M9_CATALOG_ERROR);
+
+        assert_eq!(
+            modal.announcement().as_deref(),
+            Some(COPY_M9_CATALOG_ERROR),
+            "a live-region recebe o erro do catálogo"
+        );
+        assert!(
+            !modal.submit(&parent, &mut registry, 1, LicenseTier::Pro, |_| panic!(
+                "catálogo ilegível não pode criar"
+            ),)
+        );
+        assert!(registry.entries().is_empty());
+        assert!(
+            std::fs::read_dir(&parent).expect("parent").next().is_none(),
+            "nenhum store foi criado sem catálogo confiável"
+        );
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     // ───────── F3-5-10 · galeria de gabaritos (estado do CreateSpaceModal) ─────────

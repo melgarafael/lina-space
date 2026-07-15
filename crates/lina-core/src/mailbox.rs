@@ -1882,17 +1882,32 @@ mod tests {
             "9f86d0818884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             "lance o pedido no painel e me avise",
         );
-        assert!(block.starts_with("[LINA::WEBHOOK]\n"), "abre com a sentinela");
+        assert!(
+            block.starts_with("[LINA::WEBHOOK]\n"),
+            "abre com a sentinela"
+        );
         assert!(
             block.contains("origin: sistema/webhook\n"),
             "origem server-side fixa, nunca de campo"
         );
         assert!(block.contains("method: POST\n"));
         assert!(block.contains("webhook_id: hk_abc123\n"));
-        assert!(block.contains("payload_sha256: 9f86d081"), "hash de correlação presente");
-        assert!(block.contains("--- DADOS"), "fronteira do bloco de dados não-confiável");
-        assert!(block.contains("--- INSTRUÇÃO"), "fronteira do bloco de autoridade");
-        assert!(block.contains(r#"{"valor": 4200}"#), "payload aparece no bloco DADOS");
+        assert!(
+            block.contains("payload_sha256: 9f86d081"),
+            "hash de correlação presente"
+        );
+        assert!(
+            block.contains("--- DADOS"),
+            "fronteira do bloco de dados não-confiável"
+        );
+        assert!(
+            block.contains("--- INSTRUÇÃO"),
+            "fronteira do bloco de autoridade"
+        );
+        assert!(
+            block.contains(r#"{"valor": 4200}"#),
+            "payload aparece no bloco DADOS"
+        );
         assert!(
             block.contains("lance o pedido no painel e me avise"),
             "a instrução do dono é a autoridade"
@@ -1929,7 +1944,10 @@ mod tests {
             1,
             "só o cabeçalho REAL abre o bloco"
         );
-        assert!(block.contains("[/LINA:WEBHOOK]"), "o forjado fica visível porém inerte");
+        assert!(
+            block.contains("[/LINA:WEBHOOK]"),
+            "o forjado fica visível porém inerte"
+        );
     }
 
     /// Defesa M1: um header HTTP (dado externo) com quebra de linha não forja um campo de cabeçalho
@@ -1991,8 +2009,14 @@ mod tests {
             "abc",
             "ok",
         );
-        assert!(block.contains("[truncado:"), "marca de truncamento presente");
-        assert!(block.len() < big.len(), "o bloco é menor que o payload original");
+        assert!(
+            block.contains("[truncado:"),
+            "marca de truncamento presente"
+        );
+        assert!(
+            block.len() < big.len(),
+            "o bloco é menor que o payload original"
+        );
         assert!(
             block.contains("payload_size: 71680\n"),
             "size reporta os bytes REAIS recebidos, não o truncado"

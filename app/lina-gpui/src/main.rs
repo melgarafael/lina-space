@@ -580,6 +580,9 @@ struct WorkspaceView {
     reduce_motion: bool,
     /// W4-6: anunciador da live-region ("resposta pronta" 1×/turno na transição →Idle, não por byte).
     a11y_live: a11y::LiveRegion,
+    /// Recusa do canal humano durante descarregamento. Fica visível no rodapé até
+    /// o próximo gesto aceito, para o usuário poder tentar novamente sem perda silenciosa.
+    human_intent_error: Option<String>,
     /// W4-2 · M1: paleta de comandos (Cmd-K). Fechada por padrão.
     palette: palette::PaletteState,
     /// F1-1-5 (P6/fluxo c): painel "Atividade e custos" aberto? (toggle pela paleta).
@@ -674,8 +677,964 @@ struct WorkspaceView {
     design_gallery_open: bool,
 }
 
+/// Snapshot headless do catálogo. O registry fornece ordem/atalhos quando
+/// confiável; a varredura continua suficiente para a primeira carga quando esse
+/// ponteiro está corrompido.
+struct WorkspaceCatalogSnapshot {
+    registry: lina_core::WorkspaceRegistry,
+    registry_entries: Vec<sidebar::VerifiedRegistryEntry>,
+    attention_rows: Vec<sidebar::SidebarAttentionRow>,
+    scan_entries: Vec<persistence_ui::WorkspaceEntry>,
+    projected_states: std::collections::BTreeMap<PathBuf, lina_core::ProjectedState>,
+    issues: Vec<persistence_ui::WorkspaceScanIssue>,
+    active_count: usize,
+    registry_rebuilt: bool,
+    creation_blocked: bool,
+}
+
+impl WorkspaceCatalogSnapshot {
+    fn is_complete(&self) -> bool {
+        !self
+            .issues
+            .iter()
+            .any(persistence_ui::WorkspaceScanIssue::blocks_publication)
+    }
+
+    fn issue_summary(&self) -> String {
+        self.issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    fn allows_creation(&self) -> bool {
+        self.is_complete() && !self.creation_blocked
+    }
+}
+
+fn verified_shortcut_target(
+    catalog: &WorkspaceCatalogSnapshot,
+    shortcut_index: usize,
+) -> Option<PathBuf> {
+    catalog
+        .registry_entries
+        .iter()
+        .find(|entry| entry.shortcut_index == Some(shortcut_index) && !entry.entry.archived)
+        .map(|entry| entry.entry.path.clone())
+}
+
+/// Sincroniza o ponteiro depois que `WorkspaceArchived` já foi confirmado no
+/// store. Um store saudável continua sendo re-derivado da autoridade. O único
+/// fallback é o ponteiro previamente classificado como criação incompleta: nesse
+/// caso preservamos identidade/caminho e mudamos apenas `archived`, sob o lock do
+/// `WorkspaceRegistry::save`.
+fn sync_registry_after_archived_event(
+    registry_path: &Path,
+    root: &Path,
+    known_incomplete: bool,
+) -> Result<(), String> {
+    let mut registry = lina_core::WorkspaceRegistry::load(registry_path)
+        .map_err(|error| format!("não consegui carregar o ponteiro global: {error}"))?;
+    match lina_core::WorkspaceRegistry::rederive_entry(root) {
+        Ok(entry) => registry.upsert(entry),
+        Err(lina_core::WorkspaceError::IncompleteWorkspace { .. }) if known_incomplete => {
+            let pointers = registry
+                .entries()
+                .iter()
+                .filter(|entry| entry.path == root)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut pointer = match pointers.as_slice() {
+                [pointer] => pointer.clone(),
+                _ => {
+                    return Err(format!(
+                        "a criação incompleta {} não tem um único ponteiro no registry",
+                        root.display()
+                    ));
+                }
+            };
+            if registry
+                .entries()
+                .iter()
+                .filter(|entry| entry.id == pointer.id)
+                .count()
+                != 1
+            {
+                return Err(format!(
+                    "a criação incompleta {} tem identidade ambígua no registry",
+                    root.display()
+                ));
+            }
+            pointer.archived = true;
+            registry.upsert(pointer);
+        }
+        Err(error) => {
+            return Err(format!(
+                "não consegui re-derivar {} depois do arquivamento: {error}",
+                root.display()
+            ));
+        }
+    }
+    registry
+        .save()
+        .map_err(|error| format!("não consegui salvar o ponteiro global: {error}"))
+}
+
+/// Apenda um fato no store montado quando ele existe; caso contrário abre apenas
+/// o store do alvo. É o único seam usado por rename, pelo commit do toast e pelo
+/// gate de restart, para o teste não substituir a operação real por escrita direta.
+fn append_workspace_event(
+    root: &Path,
+    mounted_store: Option<&Arc<Mutex<lina_core::EventStore>>>,
+    event: &lina_core::DomainEvent,
+) -> Result<(), String> {
+    match mounted_store {
+        Some(store) => lock(store)
+            .append(event)
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        None => lina_core::EventStore::open(sidebar::events_dir_of(root))
+            .and_then(|mut store| store.append(event).map(|_| ()))
+            .map_err(|error| error.to_string()),
+    }
+}
+
+/// Confirma a mesma intenção que a UI guarda no toast. Para uma criação
+/// incompleta, o ponteiro é arquivado primeiro: se o processo cair entre as duas
+/// persistências, o alvo continua oculto e nunca ressuscita. Para um workspace
+/// completo, o evento autoritativo vem primeiro e a varredura consegue re-derivar
+/// o ponteiro mesmo após um crash no corte seguinte.
+fn commit_archive_toast(
+    toast: &sidebar::ArchiveToast,
+    registry_path: Option<&Path>,
+    mounted_store: Option<&Arc<Mutex<lina_core::EventStore>>>,
+) -> Result<(), String> {
+    let sync_registry = || {
+        let path = registry_path.ok_or_else(|| {
+            "HOME indisponível; o ponteiro global não pôde ser arquivado".to_owned()
+        })?;
+        sync_registry_after_archived_event(path, &toast.root, toast.known_incomplete)
+    };
+    let append_event = || {
+        append_workspace_event(
+            &toast.root,
+            mounted_store,
+            &lina_core::DomainEvent::WorkspaceArchived,
+        )
+    };
+
+    if toast.known_incomplete {
+        sync_registry()?;
+        append_event()
+    } else {
+        append_event()?;
+        sync_registry()
+    }
+}
+
+fn confirmed_incomplete_roots(
+    registry_entries: &[lina_core::WorkspaceEntry],
+    quarantined_roots: &std::collections::BTreeSet<PathBuf>,
+) -> std::collections::BTreeSet<PathBuf> {
+    quarantined_roots
+        .iter()
+        .filter(|root| {
+            let pointers = registry_entries
+                .iter()
+                .filter(|entry| entry.path == **root)
+                .collect::<Vec<_>>();
+            pointers.len() == 1
+                && registry_entries
+                    .iter()
+                    .filter(|entry| entry.id == pointers[0].id)
+                    .count()
+                    == 1
+                && matches!(
+                    lina_core::WorkspaceRegistry::rederive_entry(root),
+                    Err(lina_core::WorkspaceError::IncompleteWorkspace { .. })
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+struct WorkspaceRegistryRecoveryLoad {
+    catalog: persistence_ui::WorkspaceRegistryCatalog,
+    creation_issues: Vec<String>,
+}
+
+fn load_registry_with_creation_recovery(
+    registry_path: &Path,
+    base: &Path,
+    active_events_dir: &Path,
+) -> Result<WorkspaceRegistryRecoveryLoad, String> {
+    let mut catalog =
+        persistence_ui::load_or_rebuild_workspace_registry(registry_path, base, active_events_dir)?;
+    let recovery = workspace_boot::recover_pending_workspace_creations(base, registry_path);
+    let (creation_issues, reload_catalog) = match recovery {
+        Ok(report) => {
+            let reload_catalog = !report.recovered_roots.is_empty();
+            (report.issues, reload_catalog)
+        }
+        Err(error) => (
+            vec![format!("Uma criação pendente requer atenção: {error}")],
+            true,
+        ),
+    };
+    if reload_catalog {
+        catalog = persistence_ui::load_or_rebuild_workspace_registry(
+            registry_path,
+            base,
+            active_events_dir,
+        )?;
+    }
+    Ok(WorkspaceRegistryRecoveryLoad {
+        catalog,
+        creation_issues,
+    })
+}
+
+fn load_workspace_catalog(
+    active_root: &Path,
+    registry_path: Option<PathBuf>,
+) -> Result<WorkspaceCatalogSnapshot, String> {
+    let registry_path =
+        registry_path.ok_or_else(|| "HOME/USERPROFILE indisponível para o catálogo".to_owned())?;
+    let base = active_root
+        .parent()
+        .ok_or_else(|| format!("{} não tem diretório-base", active_root.display()))?;
+    let recovered = load_registry_with_creation_recovery(
+        &registry_path,
+        base,
+        &sidebar::events_dir_of(active_root),
+    )?;
+    let loaded = recovered.catalog;
+    let incomplete_roots =
+        confirmed_incomplete_roots(loaded.registry.entries(), &loaded.quarantined_roots);
+    let attention_rows =
+        sidebar::build_incomplete_attention_rows(loaded.registry.entries(), &incomplete_roots);
+    let shortcut_positions: std::collections::BTreeMap<(String, PathBuf), usize> = loaded
+        .registry
+        .entries()
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| ((entry.id.clone(), entry.path.clone()), position))
+        .collect();
+    let registry_entries = loaded
+        .verified_entries
+        .into_iter()
+        .map(|entry| {
+            let shortcut_index = shortcut_positions
+                .get(&(entry.id.clone(), entry.path.clone()))
+                .and_then(|position| (*position < 9).then_some(*position + 1));
+            sidebar::VerifiedRegistryEntry {
+                entry,
+                shortcut_index,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut scan = loaded.scan;
+    let creation_blocked = !recovered.creation_issues.is_empty();
+    scan.issues.extend(
+        recovered
+            .creation_issues
+            .into_iter()
+            .map(persistence_ui::WorkspaceScanIssue::invalid_workspace),
+    );
+    let mut scan_entries = std::mem::take(&mut scan.entries);
+    scan_entries.retain(|entry| {
+        !loaded
+            .quarantined_roots
+            .contains(&dashboard::ws_root_of(&entry.events_dir))
+    });
+    let issues = std::mem::take(&mut scan.issues);
+
+    let mut active_roots = std::collections::BTreeSet::new();
+    for verified in &registry_entries {
+        if !verified.entry.archived {
+            active_roots.insert(verified.entry.path.clone());
+        }
+    }
+    for entry in &scan_entries {
+        if !entry.archived {
+            active_roots.insert(dashboard::ws_root_of(&entry.events_dir));
+        }
+    }
+
+    Ok(WorkspaceCatalogSnapshot {
+        registry: loaded.registry,
+        registry_entries,
+        attention_rows,
+        scan_entries,
+        projected_states: scan.projected_states,
+        issues,
+        active_count: active_roots.len(),
+        registry_rebuilt: loaded.rebuilt,
+        creation_blocked,
+    })
+}
+
+fn build_last_good_sidebar_rows(
+    catalog: &WorkspaceCatalogSnapshot,
+    active_root: &Path,
+    mini_cache: &dashboard::MiniStatusCache,
+) -> Vec<sidebar::SidebarRow> {
+    sidebar::build_rows(&catalog.registry_entries, &[], active_root, mini_cache)
+}
+
+#[cfg(test)]
+mod workspace_catalog_reliability_tests {
+    use super::*;
+
+    fn write_pending_creation_intent(
+        parent: &Path,
+        creation_id: uuid::Uuid,
+        requested_name: &str,
+        final_name: &str,
+    ) {
+        std::fs::create_dir_all(parent).expect("creation parent");
+        let path = parent.join(format!(".lina-create-{creation_id}.intent.json"));
+        let intent = serde_json::json!({
+            "version": 1,
+            "creation_id": creation_id.to_string(),
+            "requested_name": requested_name,
+            "final_name": final_name,
+            "seed": { "kind": "preset", "id": "blank" },
+            "canonical_cwd": null,
+            "final_root": parent.join(final_name),
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&intent).expect("serialize intent"),
+        )
+        .expect("write intent");
+    }
+
+    #[test]
+    fn workspace_reliability_corrupt_registry_first_load_is_visible_and_preserves_bytes() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-corrupt-first-load-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let active_root = base.join("ativo");
+        let other_root = base.join("outro");
+        drop(
+            lina_core::Workspace::create(&active_root, "Ativo", "blank", None)
+                .expect("workspace ativo"),
+        );
+        drop(
+            lina_core::Workspace::create(&other_root, "Outro", "blank", None)
+                .expect("outro workspace"),
+        );
+        let registry_path = base.join("workspaces.json");
+        std::fs::write(&registry_path, b"{ registry quebrado")
+            .expect("injetar registry corrompido");
+
+        let original = std::fs::read(&registry_path).expect("snapshot corrompido");
+        let error = load_workspace_catalog(&active_root, Some(registry_path.clone()))
+            .err()
+            .expect("cold-start sem last-good não fabrica catálogo");
+        assert!(error.contains("inconclusivo"), "{error}");
+        assert_eq!(
+            std::fs::read(&registry_path).expect("registry preservado"),
+            original,
+            "parse inválido nunca é sobrescrito por uma varredura parcial"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_corrupt_registry_blocks_pending_recovery_without_mutation() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-corrupt-pending-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let active_root = base.join("ativo");
+        drop(
+            lina_core::Workspace::create(&active_root, "Ativo", "blank", None)
+                .expect("workspace saudável"),
+        );
+        let registry_path = base.join("workspaces.json");
+        std::fs::write(&registry_path, b"{ registry quebrado").expect("registry corrompido");
+        let pending_id = uuid::Uuid::now_v7();
+        write_pending_creation_intent(&base, pending_id, "Pendente", "Pendente");
+
+        let original = std::fs::read(&registry_path).expect("snapshot corrompido");
+        let error = load_workspace_catalog(&active_root, Some(registry_path.clone()))
+            .err()
+            .expect("registry inconclusivo interrompe a recuperação antes de publicar");
+        assert!(error.contains("inconclusivo"), "{error}");
+        assert_eq!(
+            std::fs::read(&registry_path).expect("registry preservado"),
+            original
+        );
+        assert!(
+            base.join(format!(".lina-create-{pending_id}.intent.json"))
+                .exists(),
+            "journal fica intacto para uma recuperação futura com registry confiável"
+        );
+        assert!(
+            !base.join("Pendente").exists(),
+            "nenhuma criação é fabricada"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_invalid_creation_journal_blocks_only_creation_not_healthy_catalog() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-invalid-journal-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let active_root = base.join("ativo");
+        drop(
+            lina_core::Workspace::create(&active_root, "Ativo", "blank", None)
+                .expect("workspace saudável"),
+        );
+        let registry_path = base.join("workspaces.json");
+        let mut registry =
+            lina_core::WorkspaceRegistry::load(&registry_path).expect("registry novo");
+        let mut active =
+            lina_core::WorkspaceRegistry::rederive_entry(&active_root).expect("entrada ativa");
+        active.last_focus = 1;
+        registry.upsert(active);
+        registry.save().expect("registry saudável");
+        let registry_bytes = std::fs::read(&registry_path).expect("snapshot registry");
+        std::fs::write(
+            base.join(format!(".lina-create-{}.intent.json", uuid::Uuid::now_v7())),
+            b"{ journal truncado",
+        )
+        .expect("journal inválido");
+
+        let catalog = load_workspace_catalog(&active_root, Some(registry_path.clone()))
+            .expect("journal inválido não derruba catálogo saudável");
+        assert!(
+            catalog.is_complete(),
+            "sidebar e boot continuam publicáveis"
+        );
+        assert!(
+            !catalog.allows_creation(),
+            "nova criação fica bloqueada até resolver o journal"
+        );
+        assert_eq!(catalog.registry_entries.len(), 1);
+        assert_eq!(catalog.registry_entries[0].entry.name, "Ativo");
+        assert_eq!(
+            workspace_boot::pick_verified_production_root(
+                &catalog
+                    .registry_entries
+                    .iter()
+                    .map(|entry| entry.entry.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("boot mantém workspace saudável"),
+            active_root
+        );
+        assert!(catalog.issue_summary().contains("criação pendente"));
+        assert_eq!(
+            std::fs::read(&registry_path).expect("registry final"),
+            registry_bytes,
+            "journal inválido não regrava o last-good"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_incomplete_pointer_is_attention_only_and_archive_is_durable() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-incomplete-attention-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let healthy_root = base.join("saudavel");
+        let partial_root = base.join("interrompido");
+        drop(
+            lina_core::Workspace::create(&healthy_root, "Saudável", "blank", None)
+                .expect("workspace saudável"),
+        );
+        let partial_events = sidebar::events_dir_of(&partial_root);
+        let mut partial_store =
+            lina_core::EventStore::open(&partial_events).expect("store parcial");
+        partial_store
+            .append(&lina_core::DomainEvent::WorkspaceCreated {
+                name: "Interrompido".to_owned(),
+                focus_preset: "blank".to_owned(),
+            })
+            .expect("primeiro fato da criação");
+        drop(partial_store);
+
+        let registry_path = base.join("workspaces.json");
+        let mut registry =
+            lina_core::WorkspaceRegistry::load(&registry_path).expect("registry novo");
+        let mut healthy =
+            lina_core::WorkspaceRegistry::rederive_entry(&healthy_root).expect("entrada saudável");
+        healthy.last_focus = 10;
+        registry.upsert(healthy);
+        registry.upsert(lina_core::WorkspaceEntry {
+            id: "ponteiro-da-criacao-interrompida".to_owned(),
+            name: "Interrompido".to_owned(),
+            path: partial_root.clone(),
+            last_focus: 0,
+            archived: false,
+        });
+        registry.save().expect("registry com ponteiro parcial");
+
+        let catalog = load_workspace_catalog(&healthy_root, Some(registry_path.clone()))
+            .expect("o parcial não derruba o saudável");
+        assert_eq!(catalog.registry_entries.len(), 1);
+        assert_eq!(catalog.registry_entries[0].entry.path, healthy_root);
+        assert_eq!(catalog.attention_rows.len(), 1);
+        assert_eq!(catalog.attention_rows[0].ws_root, partial_root);
+        assert_eq!(
+            verified_shortcut_target(&catalog, 1),
+            Some(healthy_root.clone())
+        );
+        assert_eq!(
+            verified_shortcut_target(&catalog, 2),
+            None,
+            "o atalho do ponteiro parcial nunca tenta boot"
+        );
+
+        let dirs = [sidebar::events_dir_of(&healthy_root)];
+        let mut cache = dashboard::MiniStatusCache::default();
+        cache.refresh_from_projections(&dirs, &catalog.projected_states, &[], "2099-01-01", 1);
+        let healthy_rows = sidebar::build_rows(
+            &catalog.registry_entries,
+            &catalog.scan_entries,
+            &healthy_root,
+            &cache,
+        );
+        let mut sidebar_state = sidebar::SidebarState::default();
+        sidebar_state.set_rows(healthy_rows);
+        sidebar_state.set_attention_rows(catalog.attention_rows.clone());
+        assert_eq!(
+            sidebar_state.selected_row().map(|row| row.ws_root.clone()),
+            Some(healthy_root.clone()),
+            "Enter continua navegando somente no saudável"
+        );
+
+        let toast = sidebar::ArchiveToast::new(
+            partial_root.clone(),
+            "Interrompido".to_owned(),
+            lina_core::now_ms(),
+            true,
+        );
+        assert!(
+            sync_registry_after_archived_event(&registry_path, &partial_root, false).is_err(),
+            "sem a classificação prévia, a falha de re-derivação não ganha fallback"
+        );
+        assert!(
+            !lina_core::WorkspaceRegistry::load(&registry_path)
+                .expect("registry intacto")
+                .entries()
+                .iter()
+                .find(|entry| entry.path == partial_root)
+                .expect("ponteiro parcial")
+                .archived
+        );
+        commit_archive_toast(&toast, Some(&registry_path), None)
+            .expect("o commit usa a classificação capturada no gesto");
+
+        let archived_pointer = lina_core::WorkspaceRegistry::load(&registry_path)
+            .expect("registry final")
+            .entries()
+            .iter()
+            .find(|entry| entry.path == partial_root)
+            .cloned()
+            .expect("ponteiro preservado");
+        assert!(archived_pointer.archived);
+        assert!(
+            lina_core::EventStore::open(&partial_events)
+                .expect("store continua no disco")
+                .project()
+                .expect("replay do parcial")
+                .archived
+        );
+        assert!(partial_root.exists(), "arquivar não apaga dados");
+
+        let refreshed = load_workspace_catalog(&healthy_root, Some(registry_path.clone()))
+            .expect("refresh após arquivar");
+        assert!(refreshed.attention_rows.is_empty());
+        assert_eq!(refreshed.registry_entries.len(), 1);
+        assert_eq!(refreshed.registry_entries[0].entry.path, healthy_root);
+        assert_eq!(verified_shortcut_target(&refreshed, 2), None);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_non_incomplete_quarantine_stays_generic_without_fallback() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-generic-quarantine-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let healthy_root = base.join("saudavel");
+        let first_root = base.join("duplicado-a");
+        let second_root = base.join("duplicado-b");
+        drop(
+            lina_core::Workspace::create(&healthy_root, "Saudável", "blank", None)
+                .expect("healthy"),
+        );
+        drop(
+            lina_core::Workspace::create(&first_root, "Duplicado A", "blank", None).expect("first"),
+        );
+        drop(
+            lina_core::Workspace::create(&second_root, "Duplicado B", "blank", None)
+                .expect("second"),
+        );
+        let mut healthy =
+            lina_core::WorkspaceRegistry::rederive_entry(&healthy_root).expect("healthy entry");
+        healthy.last_focus = 10;
+        let first = lina_core::WorkspaceRegistry::rederive_entry(&first_root).expect("first entry");
+        lina_core::EventStore::open(sidebar::events_dir_of(&second_root))
+            .expect("second store")
+            .append(&lina_core::DomainEvent::WorkspaceIdAssigned {
+                workspace_id: first.id.clone(),
+            })
+            .expect("duplicate id");
+        let second =
+            lina_core::WorkspaceRegistry::rederive_entry(&second_root).expect("second entry");
+        let registry_path = base.join("workspaces.json");
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "workspaces": [healthy, first, second],
+            }))
+            .expect("registry json"),
+        )
+        .expect("registry duplicado");
+
+        let catalog = load_workspace_catalog(&healthy_root, Some(registry_path.clone()))
+            .expect("ambiguidade não derruba o saudável");
+        assert_eq!(catalog.registry_entries.len(), 1);
+        assert_eq!(catalog.registry_entries[0].entry.path, healthy_root);
+        assert!(
+            catalog.attention_rows.is_empty(),
+            "duplicata não é criação incompleta"
+        );
+        assert!(
+            !catalog.issues.is_empty(),
+            "o warning genérico permanece visível"
+        );
+        assert!(confirmed_incomplete_roots(
+            catalog.registry.entries(),
+            &std::collections::BTreeSet::from([first_root.clone(), second_root.clone(),]),
+        )
+        .is_empty());
+
+        lina_core::EventStore::open(sidebar::events_dir_of(&first_root))
+            .expect("first store")
+            .append(&lina_core::DomainEvent::WorkspaceArchived)
+            .expect("archive confirmado");
+        sync_registry_after_archived_event(&registry_path, &first_root, false)
+            .expect("store completo sincroniza por re-derivação sem fallback");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_corrupt_registry_and_missing_base_block_catalog_actions() {
+        let root = std::env::temp_dir().join(format!(
+            "lina-catalog-corrupt-missing-base-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let missing_base = root.join("missing-workspaces");
+        let active_root = missing_base.join("active");
+        let registry_path = root.join("catalog/workspaces.json");
+        std::fs::create_dir_all(registry_path.parent().expect("catalog dir")).expect("catalog dir");
+        let corrupt = b"{ registry ainda quebrado";
+        std::fs::write(&registry_path, corrupt).expect("corrupt registry");
+
+        let error = match load_workspace_catalog(&active_root, Some(registry_path.clone())) {
+            Ok(_) => panic!("sem scan completo, criação e troca não recebem catálogo publicável"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("inconclusiv"), "{error}");
+        assert_eq!(std::fs::read(&registry_path).expect("registry"), corrupt);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_reliability_catalog_publication_uses_issue_kind_not_message() {
+        let read_failure = persistence_ui::WorkspaceScanIssue::read_failure(
+            "falha transitória sem texto de errno",
+        );
+        let invalid =
+            persistence_ui::WorkspaceScanIssue::invalid_workspace("faltou WorkspaceIdAssigned");
+
+        assert!(read_failure.blocks_publication());
+        assert!(!invalid.blocks_publication());
+    }
+
+    #[test]
+    fn workspace_reliability_missing_registry_counts_scanned_workspaces_for_creation_gate() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-missing-registry-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let active_root = base.join("ativo");
+        let other_root = base.join("outro");
+        drop(
+            lina_core::Workspace::create(&active_root, "Ativo", "blank", None)
+                .expect("workspace ativo"),
+        );
+        drop(
+            lina_core::Workspace::create(&other_root, "Outro", "blank", None)
+                .expect("outro workspace"),
+        );
+
+        let registry_path = base.join("workspaces-ainda-ausente.json");
+        let catalog = load_workspace_catalog(&active_root, Some(registry_path.clone()))
+            .expect("registry ausente é ponteiro vazio, não falha");
+        assert!(catalog.registry_rebuilt);
+        assert_eq!(catalog.active_count, 2);
+        assert_eq!(
+            lina_core::WorkspaceRegistry::load(registry_path)
+                .expect("registry ausente foi criado")
+                .entries()
+                .len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_invalid_utf8_registry_is_visible_and_preserved() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-invalid-utf8-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let active_root = base.join("ativo");
+        drop(
+            lina_core::Workspace::create(&active_root, "Ativo", "blank", None)
+                .expect("workspace ativo"),
+        );
+        let registry_path = base.join("workspaces.json");
+        let invalid_utf8 = [0xff, 0xfe, 0xfd];
+        std::fs::write(&registry_path, invalid_utf8).expect("invalid utf8");
+
+        let error = load_workspace_catalog(&active_root, Some(registry_path.clone()))
+            .err()
+            .expect("UTF-8 inválido é inconclusivo no cold-start");
+
+        assert!(error.contains("inconclusivo"), "{error}");
+        assert_eq!(
+            std::fs::read(registry_path).expect("registry preservado"),
+            invalid_utf8
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_clean_home_bootstrap_is_complete_before_selection() {
+        let home = std::env::temp_dir().join(format!(
+            "lina-clean-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let workspaces_base = home.join("Library/Application Support/Lina");
+        let default_root = workspaces_base.join("walking-skeleton");
+        let registry_path = home.join(".lina/workspaces.json");
+        let mut catalog = persistence_ui::load_or_rebuild_workspace_registry(
+            &registry_path,
+            &workspaces_base,
+            &lina_core::Workspace::events_dir(&default_root),
+        )
+        .expect("HOME ausente no disco é catálogo vazio confiável");
+        assert!(catalog.scan.entries.is_empty());
+        assert!(catalog.scan.issues.is_empty());
+
+        let selected =
+            workspace_boot::create_initial_workspace(&default_root, &mut catalog.registry)
+                .expect("primeiro Espaço completo");
+
+        assert_eq!(selected, default_root);
+        assert!(lina_core::WorkspaceRegistry::rederive_entry(&selected).is_ok());
+        assert_eq!(
+            lina_core::WorkspaceRegistry::load(registry_path)
+                .expect("registry persistido")
+                .focused()
+                .map(|entry| entry.path.clone()),
+            Some(selected.clone())
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn workspace_reliability_catalog_projects_each_large_store_once_and_reuses_snapshot() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-one-pass-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&base).expect("base");
+        let registry_path = base.join("workspaces.json");
+        let mut registry = lina_core::WorkspaceRegistry::load(&registry_path).expect("registry");
+        let mut roots = Vec::new();
+        for index in 0..30_u64 {
+            let root = base.join(format!("workspace-{index:02}"));
+            let mut workspace = lina_core::Workspace::create(
+                &root,
+                &format!("Workspace {index:02}"),
+                "blank",
+                None,
+            )
+            .expect("workspace");
+            let fillers: Vec<_> = (0..698)
+                .map(|event| lina_core::DomainEvent::NoteCreated {
+                    name: format!("nota-{index:02}-{event:03}"),
+                })
+                .collect();
+            assert_eq!(
+                workspace
+                    .store_mut()
+                    .append_batch(&fillers)
+                    .expect("batch grande"),
+                700,
+                "cada fixture tem 700 eventos"
+            );
+            let mut entry = workspace.registry_entry().expect("entry");
+            entry.last_focus = index + 1;
+            registry.upsert(entry);
+            roots.push(root);
+        }
+        registry.save().expect("registry completo");
+
+        let catalog = persistence_ui::load_or_rebuild_workspace_registry(
+            &registry_path,
+            &base,
+            &lina_core::Workspace::events_dir(&roots[0]),
+        )
+        .expect("catálogo one-pass");
+        assert_eq!(catalog.scan.projected_store_reads, 30);
+        assert_eq!(catalog.scan.projected_states.len(), 30);
+        assert_eq!(catalog.verified_entries.len(), 30);
+
+        let dirs: Vec<_> = catalog
+            .verified_entries
+            .iter()
+            .map(|entry| sidebar::events_dir_of(&entry.path))
+            .collect();
+        let mut mini_cache = dashboard::MiniStatusCache::default();
+        mini_cache.refresh_from_projections(
+            &dirs,
+            &catalog.scan.projected_states,
+            &[],
+            "2099-01-01",
+            1,
+        );
+        assert!(dirs.iter().all(|dir| {
+            mini_cache
+                .get(dir)
+                .is_some_and(|entry| !entry.status.unreachable)
+        }));
+        let reads_before_pick = catalog.scan.projected_store_reads;
+        assert_eq!(
+            workspace_boot::pick_verified_production_root(&catalog.verified_entries)
+                .expect("seleção usa a foto verificada"),
+            roots[29]
+        );
+        assert_eq!(
+            catalog.scan.projected_store_reads, reads_before_pick,
+            "mini-status e seleção não rederivam stores"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn workspace_reliability_first_frame_incomplete_scan_uses_integral_last_good_registry() {
+        let base = std::env::temp_dir().join(format!(
+            "lina-catalog-first-frame-last-good-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let active_root = base.join("active");
+        let unreadable_root = base.join("unreadable");
+        drop(lina_core::Workspace::create(&active_root, "Ativo", "blank", None).expect("active"));
+        drop(
+            lina_core::Workspace::create(&unreadable_root, "Conhecido", "blank", None)
+                .expect("known"),
+        );
+        let registry_path = base.join("workspaces.json");
+        let mut registry = lina_core::WorkspaceRegistry::load(&registry_path).expect("registry");
+        let mut active =
+            lina_core::WorkspaceRegistry::rederive_entry(&active_root).expect("active entry");
+        active.last_focus = 10;
+        registry.upsert(active);
+        registry.upsert(
+            lina_core::WorkspaceRegistry::rederive_entry(&unreadable_root).expect("known entry"),
+        );
+        registry.save().expect("last-good");
+
+        let unreadable_events = lina_core::Workspace::events_dir(&unreadable_root);
+        let connection =
+            rusqlite::Connection::open(unreadable_events.join("lina.db")).expect("sqlite");
+        connection
+            .execute(
+                "UPDATE events SET payload = ?1 WHERE seq = 1",
+                ["{ payload inválido"],
+            )
+            .expect("corrupt known");
+        drop(connection);
+        std::fs::remove_file(unreadable_events.join("log.recovery.json"))
+            .expect("disable recovery");
+
+        let catalog = load_workspace_catalog(&active_root, Some(registry_path))
+            .expect("last-good catalog remains available");
+        assert!(!catalog.is_complete());
+        assert_eq!(catalog.registry_entries.len(), 2);
+        let dirs: Vec<_> = catalog
+            .registry_entries
+            .iter()
+            .map(|entry| sidebar::events_dir_of(&entry.entry.path))
+            .collect();
+        let mut cache = dashboard::MiniStatusCache::default();
+        cache.refresh_from_projections(&dirs, &catalog.projected_states, &[], "2099-01-01", 1);
+        let rows = build_last_good_sidebar_rows(&catalog, &active_root, &cache);
+        assert_eq!(
+            rows.len(),
+            2,
+            "primeiro frame não reduz o last-good ao ativo"
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.ws_root == active_root && row.focused));
+        assert!(rows
+            .iter()
+            .any(|row| row.ws_root == unreadable_root && row.status.unreachable));
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
 impl WorkspaceView {
-    #[allow(clippy::too_many_arguments)]
+    fn submit_human_intent(
+        &mut self,
+        intent: impl Into<String>,
+        payload: impl Into<String>,
+    ) -> bool {
+        match self.nodes.push_human_intent(intent, payload) {
+            Ok(()) => {
+                self.human_intent_error = None;
+                true
+            }
+            Err(error) => {
+                let message = format!(
+                    "Não consegui registrar sua ação porque este Espaço está sendo descarregado. Tente novamente. ({error})"
+                );
+                self.a11y_live.announce(message.clone());
+                self.human_intent_error = Some(message);
+                false
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)] // construtor único do root; os fios entram aqui.
     fn new(
         nodes: Arc<NodeManager>,
@@ -826,6 +1785,7 @@ impl WorkspaceView {
             // `a11y::reduce_motion_effective` (fonte única) no pulso/rótulo. Começa sem override.
             reduce_motion: false,
             a11y_live: a11y::LiveRegion::default(),
+            human_intent_error: None,
             palette: palette::PaletteState::default(),
             // LINA_DASH=1 abre o painel no BOOT (validação por dados/roteiro do fundador,
             // mesmo idioma de LINA_DEMO). Produção: fechado; abre pela paleta (Cmd+K).
@@ -959,9 +1919,10 @@ impl WorkspaceView {
     /// foco durável (log do alvo + ponteiro global) e re-aponta a view. Os PIDs do Espaço que
     /// sai NÃO são tocados (decisão do fundador: fundos VIVOS — pumps/PTYs/threads seguem).
     /// Falha NÃO troca nada: o Espaço atual segue na tela (inv#6).
-    fn switch_to_workspace(&mut self, target_root: PathBuf, cx: &mut Context<Self>) {
+    fn switch_to_workspace(&mut self, target_root: PathBuf, cx: &mut Context<Self>) -> bool {
         if lock(&self.runtimes).active == target_root {
-            return;
+            self.sidebar.state.finish_switch();
+            return true;
         }
         let t0 = Instant::now();
         if let Err(e) =
@@ -971,9 +1932,17 @@ impl WorkspaceView {
                 "lina-gpui: [WS] troca para {} falhou ({e}); permanecendo no Espaço atual",
                 target_root.display()
             );
-            return;
+            let warning =
+                "Não consegui abrir esse Espaço. O Espaço atual continua aberto.".to_owned();
+            self.sidebar
+                .state
+                .apply_catalog_refresh(Err(warning.clone()));
+            self.a11y_live.announce(warning);
+            cx.notify();
+            return false;
         }
         self.point_to_active();
+        self.sidebar.state.finish_switch();
         // F1-4-4 crit 1 (<1s): o log diz quanto a troca levou — validação por DADOS.
         eprintln!(
             "lina-gpui: [WS] troca para {} em {:?} (PIDs preservados — fundos vivos)",
@@ -981,6 +1950,7 @@ impl WorkspaceView {
             t0.elapsed()
         );
         cx.notify();
+        true
     }
 
     /// Re-aponta os handles cacheados da view para o runtime ATIVO e re-deriva o estado de UI
@@ -1042,52 +2012,146 @@ impl WorkspaceView {
 
     /// Linhas do rail: registry canônico (ordem de criação = ⌘n estável) + varredura T6 como
     /// fallback de recuperação + mini-status honesto por Espaço (cache com staleness declarada).
+    fn sidebar_catalog_failed(&mut self, active_root: &Path, detail: &str) {
+        eprintln!("lina-gpui: [WS] lista de Espaços não atualizada: {detail}");
+        let warning = sidebar::COPY_M8_CATALOG_STALE.to_owned();
+        let should_announce = self.sidebar.state.catalog_warning.as_deref() != Some(&warning);
+        self.sidebar
+            .state
+            .apply_catalog_refresh(Err(warning.clone()));
+
+        // Se o foco mudou pouco antes da falha, o snapshot anterior ainda é útil,
+        // mas precisa refletir o runtime que está realmente na tela. Caso ele ainda
+        // não existisse no snapshot, injeta apenas essa linha viva — nunca resultados
+        // incompletos da varredura que poderiam ressuscitar arquivados.
+        for row in &mut self.sidebar.state.rows {
+            row.focused = row.ws_root == active_root;
+        }
+        if !self
+            .sidebar
+            .state
+            .rows
+            .iter()
+            .any(|row| row.ws_root == active_root)
+        {
+            self.sidebar.state.rows.extend(sidebar::build_rows(
+                &[],
+                &[],
+                active_root,
+                &self.mini_cache,
+            ));
+        }
+        if should_announce {
+            self.a11y_live.announce(warning);
+        }
+    }
+
     fn refresh_sidebar_rows(&mut self) {
         let now_ms = lina_core::now_ms();
         let active_root = lock(&self.runtimes).active.clone();
-        let registry = lina_core::default_registry_path()
-            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok());
-        let mut entries: Vec<lina_core::WorkspaceEntry> = registry
-            .as_ref()
-            .map(|r| r.entries().to_vec())
-            .unwrap_or_default();
+        let catalog = match load_workspace_catalog(&active_root, lina_core::default_registry_path())
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.sidebar_catalog_failed(&active_root, &error);
+                return;
+            }
+        };
+        if !catalog.is_complete() {
+            if self.sidebar.state.rows.is_empty() {
+                let dirs: Vec<PathBuf> = catalog
+                    .registry_entries
+                    .iter()
+                    .map(|entry| sidebar::events_dir_of(&entry.entry.path))
+                    .chain(std::iter::once(sidebar::events_dir_of(&active_root)))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let sessions = lock(&self.dash.sessions).clone();
+                let today = dashboard::utc_day_prefix(now_ms);
+                self.mini_cache.refresh_from_projections(
+                    &dirs,
+                    &catalog.projected_states,
+                    &sessions,
+                    &today,
+                    now_ms,
+                );
+                self.sidebar
+                    .state
+                    .apply_catalog_refresh(Ok(build_last_good_sidebar_rows(
+                        &catalog,
+                        &active_root,
+                        &self.mini_cache,
+                    )));
+            }
+            self.sidebar.create_blocked = true;
+            self.sidebar_catalog_failed(&active_root, &catalog.issue_summary());
+            return;
+        }
+        if catalog.registry_rebuilt {
+            eprintln!("lina-gpui: [WS] registry reconstruído a partir dos stores verificados");
+        }
+        let quarantined_issue_summary =
+            (!catalog.issues.is_empty()).then(|| catalog.issue_summary());
+        let catalog_active_count = catalog.active_count;
+        let mut entries = catalog.registry_entries;
+        let mut attention_rows = catalog.attention_rows;
         // Arquivamento PENDENTE (janela do Desfazer): a linha já sai da lista padrão como se
         // arquivada — marcado na CÓPIA local (o registry só muda no commit), preservando a
         // posição do `⌘{n}` (arquivado segura a posição — contrato T4 §4).
         if let Some(t) = &self.archive_toast {
             for e in &mut entries {
-                if e.path == t.root {
-                    e.archived = true;
+                if e.entry.path == t.root {
+                    e.entry.archived = true;
                 }
             }
+            attention_rows.retain(|row| row.ws_root != t.root);
         }
-        let scan = active_root
-            .parent()
-            .map(|base| {
-                persistence_ui::list_workspaces(base, &sidebar::events_dir_of(&active_root))
-            })
-            .unwrap_or_default();
+        let scan_entries = catalog.scan_entries;
         // Chaves do cache = MESMA derivação do build_rows (contrato T4 §2 — byte a byte).
         let dirs: Vec<PathBuf> = entries
             .iter()
-            .map(|e| sidebar::events_dir_of(&e.path))
-            .chain(scan.iter().map(|s| s.events_dir.clone()))
+            .map(|e| sidebar::events_dir_of(&e.entry.path))
+            .chain(scan_entries.iter().map(|s| s.events_dir.clone()))
+            .chain(std::iter::once(sidebar::events_dir_of(&active_root)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         let sessions = lock(&self.dash.sessions).clone();
         let today = dashboard::utc_day_prefix(now_ms);
-        self.mini_cache.refresh(&dirs, &sessions, &today, now_ms);
-        self.sidebar.state.set_rows(sidebar::build_rows(
-            &entries,
-            &scan,
-            &active_root,
-            &self.mini_cache,
-        ));
+        self.mini_cache.refresh_from_projections(
+            &dirs,
+            &catalog.projected_states,
+            &sessions,
+            &today,
+            now_ms,
+        );
+        self.sidebar.state.set_attention_rows(attention_rows);
+        self.sidebar
+            .state
+            .apply_catalog_refresh(Ok(sidebar::build_rows(
+                &entries,
+                &scan_entries,
+                &active_root,
+                &self.mini_cache,
+            )));
+        if let Some(issue_summary) = quarantined_issue_summary {
+            let warning = sidebar::COPY_M8_CATALOG_QUARANTINED.to_owned();
+            let should_announce = self.sidebar.state.catalog_warning.as_deref() != Some(&warning);
+            eprintln!(
+                "lina-gpui: [WS] entradas inválidas isoladas: {}",
+                issue_summary
+            );
+            self.sidebar.state.catalog_warning = Some(warning.clone());
+            if should_announce {
+                self.a11y_live.announce(warning);
+            }
+        }
         // F1-4-6: o selo «PRO» do `+ Novo Espaço…` segue o gate REAL da licença
         // (vitrine §1a ANTES do esforço — o stub `Pro` morreu nesta fatia).
-        let active = registry
-            .as_ref()
-            .map_or(0, lina_core::WorkspaceRegistry::active_count);
-        self.sidebar.create_blocked = self.license_gate_blocked_copy(active).is_some();
+        self.sidebar.create_blocked = self
+            .license_gate_blocked_copy(catalog_active_count)
+            .is_some();
     }
 
     /// F1-4-6: o GATE REAL de criação — veredito do `lina-license` (assinatura ed25519
@@ -1108,26 +2172,43 @@ impl WorkspaceView {
     /// Abre o M9 — o gating roda NA ABERTURA (antes do esforço, spec §3) com o gate
     /// REAL da licença (F1-4-6); bloqueado ⇒ vitrine 1b com o campo de colar a chave.
     fn open_create_space_modal(&mut self, cx: &mut Context<Self>) {
-        let registry = lina_core::default_registry_path()
-            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok());
-        let active = registry
-            .as_ref()
-            .map_or(0, lina_core::WorkspaceRegistry::active_count);
-        let existing: Vec<String> = registry
-            .as_ref()
-            .map(|r| r.entries().iter().map(|e| e.name.clone()).collect())
-            .unwrap_or_default();
+        let active_root = lock(&self.runtimes).active.clone();
+        let (active, existing, catalog_error) =
+            match load_workspace_catalog(&active_root, lina_core::default_registry_path()) {
+                Ok(catalog) if catalog.allows_creation() => {
+                    let mut names = std::collections::BTreeSet::new();
+                    names.extend(
+                        catalog
+                            .registry_entries
+                            .iter()
+                            .map(|entry| entry.entry.name.clone()),
+                    );
+                    names.extend(catalog.scan_entries.iter().map(|entry| entry.name.clone()));
+                    (catalog.active_count, names.into_iter().collect(), None)
+                }
+                Ok(catalog) => {
+                    eprintln!(
+                        "lina-gpui: [WS] catálogo inconclusivo ao abrir criação: {}",
+                        catalog.issue_summary()
+                    );
+                    (0, Vec::new(), Some(gallery::COPY_M9_CATALOG_ERROR))
+                }
+                Err(error) => {
+                    eprintln!("lina-gpui: [WS] catálogo indisponível ao abrir criação: {error}");
+                    (0, Vec::new(), Some(gallery::COPY_M9_CATALOG_ERROR))
+                }
+            };
         let default_cwd = {
             let s = persistence_ui::load_settings(&self.settings_dir);
             let trimmed = s.default_cwd.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
         };
         let blocked = self.license_gate_blocked_copy(active);
-        self.create_space_modal = Some(gallery::CreateSpaceModal::new(
-            blocked,
-            default_cwd,
-            existing,
-        ));
+        let mut modal = gallery::CreateSpaceModal::new(blocked, default_cwd, existing);
+        if let Some(error) = catalog_error {
+            modal.set_catalog_error(error);
+        }
+        self.create_space_modal = Some(modal);
         // a11y (spec §4): nascer bloqueado (vitrine 1b) já é anunciado — o foco nasce no upsell.
         self.m9_announce();
         cx.notify();
@@ -1211,25 +2292,44 @@ impl WorkspaceView {
         let Some(mut m) = self.create_space_modal.take() else {
             return;
         };
-        let Some(parent) = lock(&self.runtimes).active.parent().map(Path::to_path_buf) else {
+        let active_root = lock(&self.runtimes).active.clone();
+        let Some(parent) = active_root.parent().map(Path::to_path_buf) else {
             eprintln!("lina-gpui: [WS] raiz ativa sem diretório-pai — criação abortada");
             return;
         };
-        let Some(mut registry) = lina_core::default_registry_path()
-            .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok())
-        else {
-            eprintln!("lina-gpui: [WS] ponteiro global indisponível — criação abortada");
-            self.create_space_modal = Some(m);
-            return;
-        };
+        let creation_catalog =
+            match load_workspace_catalog(&active_root, lina_core::default_registry_path()) {
+                Ok(catalog) if catalog.allows_creation() => catalog,
+                Ok(catalog) => {
+                    eprintln!(
+                        "lina-gpui: [WS] criação aguardando catálogo completo: {}",
+                        catalog.issue_summary()
+                    );
+                    m.set_catalog_error(gallery::COPY_M9_CATALOG_ERROR);
+                    self.create_space_modal = Some(m);
+                    self.a11y_live
+                        .announce(gallery::COPY_M9_CATALOG_ERROR.to_owned());
+                    cx.notify();
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("lina-gpui: [WS] criação aguardando varredura completa: {error}");
+                    m.set_catalog_error(gallery::COPY_M9_CATALOG_ERROR);
+                    self.create_space_modal = Some(m);
+                    self.a11y_live
+                        .announce(gallery::COPY_M9_CATALOG_ERROR.to_owned());
+                    cx.notify();
+                    return;
+                }
+            };
+        m.clear_catalog_error();
+        let active_count = creation_catalog.active_count;
+        let mut registry = creation_catalog.registry;
         // F1-4-6: re-check de corrida do submit com o gate REAL (outro processo pode
         // ter criado um Espaço entre abrir e submeter) — Allowed→Pro, Blocked→Free.
         // Nota honesta: PRO com teto finito N>1 projeta em `Pro` (ilimitado no core);
         // o teto data-driven é garantido pelo gate de ABERTURA, que é o do produto.
-        let tier = if self
-            .license_gate_blocked_copy(registry.active_count())
-            .is_none()
-        {
+        let tier = if self.license_gate_blocked_copy(active_count).is_none() {
             lina_core::LicenseTier::Pro
         } else {
             lina_core::LicenseTier::Free
@@ -1432,6 +2532,22 @@ impl WorkspaceView {
             .w_full();
         // Footer FIXO (só no form): os botões de ação ficam sempre alcançáveis (flex_none).
         let mut footer: Option<gpui::AnyElement> = None;
+        if let Some(error) = &m.catalog_error {
+            body = body.child(
+                div()
+                    .id("m9-catalog-error")
+                    .role(Role::Status)
+                    .aria_label(error.clone())
+                    .p_3()
+                    .rounded_content()
+                    .border_1()
+                    .border_color(rgb(th.state.danger))
+                    .bg(rgb(th.surface.raised))
+                    .text_sm()
+                    .text_color(rgb(th.state.danger))
+                    .child(error.clone()),
+            );
+        }
         if let Some(blocked) = &m.blocked {
             // F1-4-6 — vitrine 1b NO LUGAR do form (limite ANTES do esforço): título +
             // explicação honesta (copy §1b congelada), a linha-fato do motivo, «Já tenho
@@ -1881,15 +2997,7 @@ impl WorkspaceView {
             let r = lock(&self.runtimes);
             r.map.get(root).map(|rt| Arc::clone(&rt.store))
         };
-        let res = match mounted {
-            Some(store) => lock(&store)
-                .append(ev)
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            None => lina_core::EventStore::open(sidebar::events_dir_of(root))
-                .and_then(|mut s| s.append(ev).map(|_| ()))
-                .map_err(|e| e.to_string()),
-        };
+        let res = append_workspace_event(root, mounted.as_ref(), ev);
         if let Err(e) = res {
             eprintln!(
                 "lina-gpui: [WS] evento não persistiu no Espaço {}: {e}",
@@ -1951,6 +3059,14 @@ impl WorkspaceView {
             eprintln!("lina-gpui: [WS] arquivar o Espaço ATIVO não é permitido (troque antes)");
             return;
         }
+        // A classificação pertence ao gesto, não ao timeout. Ela precisa ser
+        // capturada enquanto a linha de atenção que originou o clique ainda existe.
+        let known_incomplete = self
+            .sidebar
+            .state
+            .attention_rows
+            .iter()
+            .any(|row| row.ws_root == root);
         // Um arquivamento pendente por vez: iniciar o 2º COMMITA o 1º (não o perde).
         self.commit_pending_archive(cx);
         let name = lina_core::default_registry_path()
@@ -1962,7 +3078,12 @@ impl WorkspaceView {
                     .map(|e| e.name.clone())
             })
             .unwrap_or_else(|| root.display().to_string());
-        let toast = sidebar::ArchiveToast::new(root.to_path_buf(), name, lina_core::now_ms());
+        let toast = sidebar::ArchiveToast::new(
+            root.to_path_buf(),
+            name,
+            lina_core::now_ms(),
+            known_incomplete,
+        );
         self.a11y_live
             .announce(sidebar::copy_archive_announce(&toast.name));
         self.archive_toast = Some(toast);
@@ -1981,8 +3102,22 @@ impl WorkspaceView {
         if lock(&self.runtimes).active == t.root {
             self.a11y_live
                 .announce(sidebar::copy_archive_undone(&t.name));
-        } else if self.append_to_workspace(&t.root, &lina_core::DomainEvent::WorkspaceArchived) {
-            self.sync_registry_entry(&t.root);
+        } else {
+            let mounted = {
+                let runtimes = lock(&self.runtimes);
+                runtimes
+                    .map
+                    .get(&t.root)
+                    .map(|runtime| Arc::clone(&runtime.store))
+            };
+            let registry_path = lina_core::default_registry_path();
+            if let Err(error) = commit_archive_toast(&t, registry_path.as_deref(), mounted.as_ref())
+            {
+                eprintln!(
+                    "lina-gpui: [WS] arquivamento de {} não foi confirmado ({error})",
+                    t.root.display()
+                );
+            }
         }
         self.refresh_sidebar_rows();
         cx.notify();
@@ -1991,7 +3126,7 @@ impl WorkspaceView {
     /// `[ Desfazer ]` (clique, Tab+Enter ou ⌘Z): cancela o arquivamento pendente — a linha
     /// volta à lista; nada foi gravado, nada a reverter. Anunciado na live-region.
     fn undo_pending_archive(&mut self, cx: &mut Context<Self>) {
-        let Some(t) = self.archive_toast.take() else {
+        let Some(t) = sidebar::undo_archive_toast(&mut self.archive_toast) else {
             return;
         };
         self.a11y_live
@@ -2795,8 +3930,7 @@ impl WorkspaceView {
     /// `belief.retire`→`BeliefRetired` é costura do `bridge.rs::drain_human_intents` (M-INJETOR).
     /// `belief_id` é id cunhado server-side (vem da projeção) — sem escape JSON, como o `goal_id`.
     fn retire_belief(&mut self, belief_id: &str, cx: &mut Context<Self>) {
-        self.nodes
-            .push_human_intent("belief.retire", format!(r#"{{"belief_id":"{belief_id}"}}"#));
+        self.submit_human_intent("belief.retire", format!(r#"{{"belief_id":"{belief_id}"}}"#));
         cx.notify();
     }
 
@@ -2909,7 +4043,7 @@ impl WorkspaceView {
             lina_core::PowerState::Ready => return,
         };
         let payload = serde_json::json!({ "power": name, "verb": verb }).to_string();
-        self.nodes.push_human_intent("power.action", payload);
+        self.submit_human_intent("power.action", payload);
         cx.notify();
     }
 
@@ -3065,8 +4199,7 @@ impl WorkspaceView {
     fn confirm_goal(&mut self, goal_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
         // ADR 0036: a view DISPARA o gesto pelo canal in-process; a `MailboxPump` carimba `by="human"`
         // SERVER-SIDE (a view NÃO escolhe `by`). `goal_id` é UUID cunhado server-side — sem escape JSON.
-        self.nodes
-            .push_human_intent("goal.confirm", format!(r#"{{"goal_id":"{goal_id}"}}"#));
+        self.submit_human_intent("goal.confirm", format!(r#"{{"goal_id":"{goal_id}"}}"#));
         cx.notify();
     }
 
@@ -3078,8 +4211,7 @@ impl WorkspaceView {
     /// `human_intent` (que é de Goal e o rejeitaria): fecha o disjuntor e tira o nó de `Blocked`.
     /// `node` é UUID cunhado server-side — sem escape JSON.
     fn release_breaker(&mut self, node: NodeId, _window: &mut Window, cx: &mut Context<Self>) {
-        self.nodes
-            .push_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#));
+        self.submit_human_intent("breaker.reset", format!(r#"{{"node":"{node}"}}"#));
         cx.notify();
     }
 
@@ -3428,11 +4560,20 @@ impl WorkspaceView {
             let _ = handle.update(cx, |_, window, _| window.activate_window());
             return;
         }
+        let workspace_view = cx.entity();
+        let on_switch: persistence_ui::WorkspaceSwitchCallback =
+            std::rc::Rc::new(move |target_root, window, cx| {
+                let switched =
+                    workspace_view.update(cx, |view, cx| view.switch_to_workspace(target_root, cx));
+                if switched {
+                    window.remove_window();
+                }
+            });
         persistence_ui::open_window(
             cx,
             Arc::clone(&self.nodes.model),
-            self.nodes.store_handle(),
             self.nodes.lina_home().join("events"),
+            Some(on_switch),
         );
     }
 
@@ -3662,8 +4803,9 @@ impl WorkspaceView {
             "value": plan.value,
         })
         .to_string();
-        self.nodes.push_human_intent("credential.store", payload);
-        self.credential_modal = None;
+        if self.submit_human_intent("credential.store", payload) {
+            self.credential_modal = None;
+        }
         cx.notify();
     }
 
@@ -3721,8 +4863,10 @@ impl WorkspaceView {
             "value": api_key.clone(),
         })
         .to_string();
-        self.nodes
-            .push_human_intent("credential.store", cred_payload);
+        if !self.submit_human_intent("credential.store", cred_payload) {
+            cx.notify();
+            return;
+        }
         // Dispara a conexão off-critical-path; o progresso (QR/status) chega pelo slot do NodeManager.
         crate::bridge::spawn_whatsapp_connect(Arc::clone(&self.nodes), plan.base_url, api_key);
         cx.notify();
@@ -3731,7 +4875,7 @@ impl WorkspaceView {
     /// F4-1-2-UI: o leigo pediu "Desconectar" (no badge) — zera o cano (`ChannelDisconnected` via a
     /// `MailboxPump`); o próximo envio falha "não conectado" (gate d).
     fn whatsapp_disconnect(&mut self, cx: &mut Context<Self>) {
-        self.nodes.push_human_intent(
+        self.submit_human_intent(
             "channel.disconnect",
             serde_json::json!({ "channel": "whatsapp" }).to_string(),
         );
@@ -3811,7 +4955,7 @@ impl WorkspaceView {
             "autonomy_level": plan.autonomy_level,
         })
         .to_string();
-        self.nodes.push_human_intent("webhook.configure", payload);
+        self.submit_human_intent("webhook.configure", payload);
         cx.notify();
     }
 
@@ -4529,17 +5673,19 @@ impl WorkspaceView {
                 "escape" => self.editing_goal = None,
                 "enter" | "return" => {
                     if let Some((goal_id, buf)) = self.editing_goal.take() {
-                        let understanding = buf.trim();
+                        let understanding = buf.trim().to_owned();
                         if !understanding.is_empty() {
                             // `by="human"` é carimbado SERVER-SIDE na MailboxPump; a view só enfileira o
                             // intent. `serde_json` escapa o texto livre do usuário (aspas etc.) com segurança.
                             let payload = serde_json::json!({
-                                "goal_id": goal_id,
+                                "goal_id": &goal_id,
                                 "interpretation": understanding,
                                 "strategy": "ajustado por voce",
                             })
                             .to_string();
-                            self.nodes.push_human_intent("goal.interpret", payload);
+                            if !self.submit_human_intent("goal.interpret", payload) {
+                                self.editing_goal = Some((goal_id, buf));
+                            }
                         }
                     }
                 }
@@ -4748,14 +5894,17 @@ impl WorkspaceView {
         if ks.modifiers.platform {
             if let Ok(n) = ks.key.parse::<usize>() {
                 if (1..=9).contains(&n) {
-                    let target = lina_core::default_registry_path()
-                        .and_then(|p| lina_core::WorkspaceRegistry::load(p).ok())
-                        .and_then(|r| {
-                            r.entries()
-                                .get(n - 1)
-                                .filter(|e| !e.archived)
-                                .map(|e| e.path.clone())
-                        });
+                    let active_root = lock(&self.runtimes).active.clone();
+                    let target = match load_workspace_catalog(
+                        &active_root,
+                        lina_core::default_registry_path(),
+                    ) {
+                        Ok(catalog) => verified_shortcut_target(&catalog, n),
+                        Err(error) => {
+                            self.sidebar_catalog_failed(&active_root, &error);
+                            None
+                        }
+                    };
                     if let Some(root) = target {
                         self.switch_to_workspace(root, cx);
                         self.refresh_sidebar_rows();
@@ -6370,6 +7519,13 @@ impl Render for WorkspaceView {
                 "⏸ pausado · novas delegações ficam na FILA (nada se perde; nenhum trabalho some)"
             )));
         }
+        if let Some(error) = &self.human_intent_error {
+            footer = footer.child(
+                div()
+                    .text_color(rgb(th.state.danger))
+                    .child(text!(error.clone())),
+            );
+        }
 
         // W4-6: a live-region (Role::Status) entra na cena — anunciada ao leitor de tela quando muda.
         if let Some(msg) = &a11y_announce {
@@ -6453,6 +7609,8 @@ impl Render for WorkspaceView {
                             .bg(rgb(th.surface.raised_alt))
                             .text_color(rgb(th.text.bright))
                             .cursor_pointer()
+                            .role(Role::Button)
+                            .aria_label(sidebar::copy_archive_undo_action(&t.name))
                             .on_click(cx.listener(|v, _ev: &ClickEvent, _w, cx| {
                                 v.undo_pending_archive(cx);
                             }))
@@ -7112,13 +8270,52 @@ fn main() {
     // `~/.lina/workspaces.json` decide QUAL Espaço abre — o focado por último (é o que o
     // switcher M8 carimba ao trocar). Ponteiro vazio/quebrado degrada para o default acima
     // (inv#6); `LINA_WS_ROOT` e DEMO seguem soberanos (escapes de dev intactos).
-    let ws_root = if !demo && std::env::var("LINA_WS_ROOT").map_or(true, |v| v.trim().is_empty()) {
-        match lina_core::default_registry_path().map(lina_core::WorkspaceRegistry::load) {
-            Some(Ok(reg)) => workspace_boot::pick_production_root(&reg, ws_root),
-            _ => ws_root,
-        }
-    } else {
+    let has_developer_override =
+        std::env::var("LINA_WS_ROOT").is_ok_and(|value| !value.trim().is_empty());
+    let ws_root = if demo {
         ws_root
+    } else {
+        let registry_path = lina_core::default_registry_path()
+            .ok_or_else(|| "HOME/USERPROFILE indisponível para o catálogo".to_owned());
+        let workspaces_base = ws_root
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("{} não tem diretório-base", ws_root.display()));
+        let selected = match (registry_path, workspaces_base) {
+            (Ok(registry_path), Ok(workspaces_base)) => load_registry_with_creation_recovery(
+                &registry_path,
+                &workspaces_base,
+                &lina_core::Workspace::events_dir(&ws_root),
+            )
+            .and_then(|recovered| {
+                for issue in recovered.creation_issues {
+                    eprintln!("lina-gpui: [WS] {issue}");
+                }
+                let mut catalog = recovered.catalog;
+                if has_developer_override {
+                    workspace_boot::validate_production_root(&catalog.registry, &ws_root)
+                } else if catalog.scan.entries.is_empty()
+                    && catalog.scan.issues.is_empty()
+                    && catalog.registry.entries().is_empty()
+                {
+                    workspace_boot::create_initial_workspace(&ws_root, &mut catalog.registry)
+                } else if catalog.scan.is_complete() {
+                    workspace_boot::pick_verified_production_root(&catalog.verified_entries)
+                } else {
+                    workspace_boot::pick_production_root(&catalog.registry, ws_root.clone())
+                }
+            }),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        match selected {
+            Ok(root) => root,
+            Err(error) => {
+                eprintln!(
+                    "lina-gpui: nenhum Espaço íntegro pôde ser aberto ({error}) — encerrando sem montar dados incompletos."
+                );
+                std::process::exit(1);
+            }
+        }
     };
     // F1-2-1: aplica o tema PERSISTIDO (T7 `settings.json`, ao lado do event log) ANTES de abrir
     // qualquer janela — a escolha dark/light + acento sobrevive ao restart, 100% local (inv #2).
@@ -7159,6 +8356,21 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // O ponteiro global muda só AGORA: store, restore, listeners e pumps do alvo já
+    // terminaram o boot. Uma falha anterior nunca publica um runtime parcial como foco.
+    if !demo {
+        match runtime::register_ready_runtime(&rt) {
+            Ok(id) => {
+                eprintln!("lina-gpui: [WS] Espaço '{id}' terminou o boot e foi focado no catálogo")
+            }
+            Err(error) => {
+                eprintln!(
+                    "lina-gpui: o Espaço terminou o boot, mas o foco durável não pôde ser confirmado ({error}) — encerrando sem publicar um estado divergente."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     // F1-4-4 fatia (ii): o runtime do boot NÃO é desmontado — entra INTEIRO no mapa de
     // runtimes do processo (fundos VIVOS). Demo/load-gen/janela operam por handles CLONADOS
     // (tudo Arc, barato); a view lê sempre o runtime ATIVO e o switch re-aponta.
@@ -7400,10 +8612,9 @@ fn main() {
         });
     }
 
-    // W4-4: handles compartilhados p/ o painel de persistência (lê event_count/recovering do model;
-    // loga WorkspaceFocusSet no store; settings.json ao lado de `dir`). Clones ANTES do `move`.
+    // W4-4: handle compartilhado p/ o painel de persistência (lê event_count/recovering;
+    // settings.json ao lado de `dir`). O painel env-gated abre read-only para Espaços.
     let panel_model = Arc::clone(&model);
-    let panel_store = Arc::clone(&store);
     let panel_dir = dir.clone();
     // F1-4-4 fatia (ii): handle do epílogo (parada limpa de TODOS os drenos pós-app.run).
     let runtimes_epilogue = Arc::clone(&runtimes);
@@ -7495,12 +8706,7 @@ fn main() {
         }
         // W4-4: painel de persistência (env-gated LINA_PERSIST_PANEL; não perturba a demo do canvas).
         if persistence_ui::should_show() {
-            persistence_ui::open_window(
-                cx,
-                Arc::clone(&panel_model),
-                Arc::clone(&panel_store),
-                panel_dir.clone(),
-            );
+            persistence_ui::open_window(cx, Arc::clone(&panel_model), panel_dir.clone(), None);
         }
         // Onboarding turno-0 por cima (1ª execução / progresso < Done). Demo pula por padrão; dev força
         // com `LINA_ONBOARDING=1|0`. Aberto por ÚLTIMO → fica em foco sobre o canvas.

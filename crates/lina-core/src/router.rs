@@ -4862,7 +4862,12 @@ mod tests {
             1000,
             &mut deliver,
         );
-        assert_eq!(out, RouteOutcome::Delivered { targets: vec![target] });
+        assert_eq!(
+            out,
+            RouteOutcome::Delivered {
+                targets: vec![target]
+            }
+        );
 
         let calls = rec.borrow();
         assert_eq!(calls.len(), 1, "uma injeção");
@@ -4879,7 +4884,10 @@ mod tests {
 
         let events = ts.store.events().expect("events");
         let kinds: Vec<&str> = events.iter().map(|r| r.kind.as_str()).collect();
-        assert!(kinds.contains(&"WebhookDispatched"), "despacho logado (metadados)");
+        assert!(
+            kinds.contains(&"WebhookDispatched"),
+            "despacho logado (metadados)"
+        );
         assert!(kinds.contains(&"MessageDelivered"), "entrega logada");
         let wd = events
             .iter()
@@ -4944,8 +4952,14 @@ mod tests {
             .into_iter()
             .map(|r| r.kind)
             .collect();
-        assert!(kinds.contains(&"WebhookDispatched".to_string()), "despacho logado");
-        assert!(kinds.contains(&"MessageRetained".to_string()), "retenção logada");
+        assert!(
+            kinds.contains(&"WebhookDispatched".to_string()),
+            "despacho logado"
+        );
+        assert!(
+            kinds.contains(&"MessageRetained".to_string()),
+            "retenção logada"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4981,15 +4995,24 @@ mod tests {
             (calls[0].2.clone(), calls[0].1)
         };
         assert!(block.starts_with("[LINA::WEBHOOK]\n"), "bloco montado");
-        assert!(block.contains("--- DADOS"), "fronteira de dados não-confiável");
+        assert!(
+            block.contains("--- DADOS"),
+            "fronteira de dados não-confiável"
+        );
         assert!(block.contains("--- INSTRUÇÃO"), "fronteira de autoridade");
-        assert!(block.contains("lance o pedido e me avise"), "instrução = autoridade");
+        assert!(
+            block.contains("lance o pedido e me avise"),
+            "instrução = autoridade"
+        );
         assert_eq!(
             block.matches("[/LINA::WEBHOOK]").count(),
             1,
             "a sentinela forjada no payload foi neutralizada (só o fim real)"
         );
-        assert_eq!(from, WEBHOOK_SYSTEM, "origem inforjável (sentinela de sistema)");
+        assert_eq!(
+            from, WEBHOOK_SYSTEM,
+            "origem inforjável (sentinela de sistema)"
+        );
 
         // delivery_id correlaciona: o WebhookDispatched.delivery_id == o id do bloco (wh_<uuid>).
         let events = ts.store.events().expect("events");
@@ -5058,9 +5081,18 @@ mod tests {
         assert!(is_reserved_role(REFLECTOR_ROLE));
         assert!(!is_reserved_role("BACKEND"));
         assert!(!is_reserved_role("backend"));
-        assert!(!is_reserved_role("__"), "só pontas, sem miolo → não reservado");
-        assert!(!is_reserved_role("____"), "4 chars (sem miolo) → não reservado");
-        assert!(!is_reserved_role("_reflector_"), "uma barra só → não reservado");
+        assert!(
+            !is_reserved_role("__"),
+            "só pontas, sem miolo → não reservado"
+        );
+        assert!(
+            !is_reserved_role("____"),
+            "4 chars (sem miolo) → não reservado"
+        );
+        assert!(
+            !is_reserved_role("_reflector_"),
+            "uma barra só → não reservado"
+        );
     }
 
     #[test]
@@ -5070,11 +5102,19 @@ mod tests {
         assert!(reserved_role_admission_ok("backend", agent, 0));
         assert!(reserved_role_admission_ok("backend", agent, 3));
         // role RESERVADO: SÓ com o gatilho de sistema NA ORIGEM (hops 0).
-        assert!(reserved_role_admission_ok(REFLECTOR_ROLE, REFLECTOR_TRIGGER, 0));
+        assert!(reserved_role_admission_ok(
+            REFLECTOR_ROLE,
+            REFLECTOR_TRIGGER,
+            0
+        ));
         // requested_by FORJADO (um agente) → recusado, mesmo na origem.
         assert!(!reserved_role_admission_ok(REFLECTOR_ROLE, agent, 0));
         // gatilho certo mas em CASCATA (hops > 0) → recusado.
-        assert!(!reserved_role_admission_ok(REFLECTOR_ROLE, REFLECTOR_TRIGGER, 1));
+        assert!(!reserved_role_admission_ok(
+            REFLECTOR_ROLE,
+            REFLECTOR_TRIGGER,
+            1
+        ));
     }
 
     #[test]
@@ -5086,7 +5126,8 @@ mod tests {
         let mut ts = TmpStore::new("reserved-spawn");
         let (_rec, mut deliver) = recorder();
 
-        let m = MailMessage::new("@A", "@Sombra", "spawn", "reflita").with_ref("role:__reflector__");
+        let m =
+            MailMessage::new("@A", "@Sombra", "spawn", "reflita").with_ref("role:__reflector__");
         let out = router.route_message(&m, &mut ts.store, 1000, &mut deliver);
         assert!(
             matches!(out, RouteOutcome::SpawnBlocked),

@@ -70,7 +70,10 @@ fn nenhum_overlay_absolute_rola_a_si_mesmo() {
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            violacoes.push(format!("  {rel} (perto da linha {})", first_scroll_line(&content)));
+            violacoes.push(format!(
+                "  {rel} (perto da linha {})",
+                first_scroll_line(&content)
+            ));
         }
     }
     assert!(

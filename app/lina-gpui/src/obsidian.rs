@@ -1513,7 +1513,9 @@ pub fn migrate_vault_to_global_from(candidates: &[PathBuf], global: &Path) {
     }
     // o índice é best-effort: o self-heal regenera o que faltar no próximo boot.
     if let Err(e) = copy_dir_shallow(&src.join("vault-index"), &global.join("vault-index")) {
-        eprintln!("obsidian: migração do índice p/ global incompleta ({e}) — o self-heal regenera.");
+        eprintln!(
+            "obsidian: migração do índice p/ global incompleta ({e}) — o self-heal regenera."
+        );
     }
     eprintln!(
         "obsidian: vault promovido p/ ~/.lina (global) a partir de {}",

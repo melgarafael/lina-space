@@ -47,6 +47,9 @@ serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v7"] }
 # Bus do core é `tokio::sync::broadcast` — nomeamos o `Receiver`/`TryRecvError` aqui.
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "net"] }
+# Classificação estruturada de corrupção determinística vs. falha transitória do
+# SQLite ao varrer o catálogo (sem inferir errno pela mensagem).
+rusqlite = { version = "0.40.0", features = ["bundled"] }
 # gpui: MESMO SHA auditado + features do spike W1-1 (runtime_shaders dispensa o Metal
 # Toolchain offline; ver spikes/spike-gpui/RESULTADO.md §1).
 gpui = { git = "https://github.com/zed-industries/zed", rev = "09165c15dc5d1fea93604231eaf30ca4c25f1cd6" }
@@ -60,6 +63,9 @@ uuid = { version = "1", features = ["v7"] }
 # mesma versão/features do dev-deps do lina-license (os tipos precisam unificar).
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # === gpui_platform POR-SO ===========================================================
 # macOS: runtime_shaders compila shaders Metal em runtime (dispensa o Metal Toolchain offline).

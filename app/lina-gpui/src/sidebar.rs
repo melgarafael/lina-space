@@ -22,12 +22,14 @@
 // Maestro nesta rodada — `switch_to_workspace`/mount/atalhos). Remover ao wirar o render.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{div, prelude::*, px, rgb, text, AnyElement, ClickEvent, Context, Role, Window};
 use lina_core::WorkspaceEntry as RegistryEntry;
 
+use crate::a11y_live::{live_region, Politeness};
 use crate::dashboard::{self, MiniStatusCache, UiState, WorkspaceMiniStatus};
 use crate::persistence_ui::WorkspaceEntry as ScanEntry;
 use crate::theme::Theme;
@@ -60,6 +62,20 @@ pub const COPY_M8_FOLDER_MISSING: &str = "pasta não encontrada";
 pub const COPY_M8_SEARCH_PLACEHOLDER: &str = "( buscar… )";
 /// Busca sem resultado (copy-f1-4.md §5 — congelada).
 pub const COPY_M8_SEARCH_EMPTY: &str = "Nenhum Espaço com esse nome.";
+/// Falha transitória ao reler o catálogo. A lista continua sendo o último
+/// snapshot completo; o aviso explica por que ela pode estar momentaneamente antiga.
+pub const COPY_M8_CATALOG_STALE: &str =
+    "Não consegui atualizar a lista agora. Mantive a última versão completa.";
+/// Stores deterministicamente inválidos ficam em quarentena sem apagar os válidos.
+pub const COPY_M8_CATALOG_QUARANTINED: &str =
+    "Alguns Espaços precisam de atenção; os demais continuam disponíveis.";
+/// Estado explícito de um ponteiro conhecido cujo store não concluiu os fatos
+/// obrigatórios da criação. Ele vive fora das linhas navegáveis.
+pub const COPY_M8_INCOMPLETE_CREATION: &str = "criação incompleta";
+/// Explicação e saída segura da linha de atenção. Arquivar remove o ponteiro da
+/// lista sem apagar o diretório parcial.
+pub const COPY_M8_INCOMPLETE_HINT: &str =
+    "não pode ser aberto; arquive para tirar da lista sem apagar os dados";
 
 // F2-2-4 — strings da PORTA VISÍVEL da paleta de comandos. Não há fonte única de strings (R9) neste
 // crate: a convenção é `COPY_*` por módulo (ver acima). Rótulo LEIGO ("Buscar comandos") + o atalho
@@ -98,6 +114,19 @@ pub fn copy_archive_announce(name: &str) -> String {
 #[must_use]
 pub fn copy_archive_undone(name: &str) -> String {
     format!("Arquivamento de “{name}” desfeito — o Espaço voltou à lista.")
+}
+
+/// Nome acessível da ação de arquivar. O alvo viaja com a ação para que duas
+/// linhas nunca virem botões indistinguíveis no leitor de tela ou na automação.
+#[must_use]
+pub fn copy_archive_action(name: &str) -> String {
+    format!("{COPY_M8_ARCHIVE} “{name}” — {COPY_M8_ARCHIVE_HINT}")
+}
+
+/// Nome acessível do botão temporário que cancela o arquivamento.
+#[must_use]
+pub fn copy_archive_undo_action(name: &str) -> String {
+    format!("{COPY_ARCHIVE_UNDO} arquivamento de “{name}”")
 }
 
 // ═══════════════ r5 BUG 4 — roteador de teclado do rail (puro, testável) ═══════════════
@@ -184,17 +213,22 @@ pub struct ArchiveToast {
     pub name: String,
     /// Instante (epoch ms) em que o commit acontece.
     pub deadline_ms: u64,
+    /// A raiz foi classificada como uma criação incompleta no instante do gesto.
+    /// Esse fato acompanha a intenção: uma falha transitória de catálogo durante o
+    /// timeout não pode reclassificar o alvo e fazê-lo reaparecer depois do restart.
+    pub known_incomplete: bool,
     /// `[ Desfazer ]` focado pelo teclado (Tab) — Enter o ativa.
     pub undo_focused: bool,
 }
 
 impl ArchiveToast {
     #[must_use]
-    pub fn new(root: PathBuf, name: String, now_ms: u64) -> Self {
+    pub fn new(root: PathBuf, name: String, now_ms: u64, known_incomplete: bool) -> Self {
         Self {
             root,
             name,
             deadline_ms: now_ms.saturating_add(ARCHIVE_TOAST_TIMEOUT_MS),
+            known_incomplete,
             undo_focused: false,
         }
     }
@@ -210,6 +244,13 @@ impl ArchiveToast {
     pub fn remaining_secs(&self, now_ms: u64) -> u64 {
         self.deadline_ms.saturating_sub(now_ms).div_ceil(1000)
     }
+}
+
+/// Cancela uma intenção de arquivamento antes do timeout. O shell e o gate de
+/// restart usam este mesmo seam, portanto “Desfazer” significa remover a intenção
+/// sem gravar evento — não uma simulação diferente em teste.
+pub fn undo_archive_toast(pending: &mut Option<ArchiveToast>) -> Option<ArchiveToast> {
+    pending.take()
 }
 
 /// Efeito de uma tecla sobre o toast vivo (puro — a fiação do shell aplica).
@@ -256,6 +297,15 @@ pub struct SidebarRow {
     pub shortcut_index: Option<usize>,
 }
 
+/// Ponteiro conhecido que foi isolado do catálogo navegável. A separação por
+/// tipo impede que clique, Enter, rename, unload ou atalho o tratem como um
+/// [`SidebarRow`] válido.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarAttentionRow {
+    pub name: String,
+    pub ws_root: PathBuf,
+}
+
 /// O `events_dir` canônico de um Espaço (`<ws>/.lina/events`) — a MESMA derivação que
 /// o caller usa para popular o [`MiniStatusCache`] (chaves têm de bater byte a byte).
 #[must_use]
@@ -280,36 +330,72 @@ fn status_of(cache: &MiniStatusCache, events_dir: &Path) -> WorkspaceMiniStatus 
     )
 }
 
-/// Monta as linhas do M8. **Fonte canônica = `WorkspaceRegistry`** (ordem de criação);
+/// Entrada do registry cuja identidade e fatos foram conferidos no store. O
+/// índice fica separado para que remover um ponteiro inválido não reaproveite o
+/// atalho dele para outro Espaço.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedRegistryEntry {
+    pub entry: RegistryEntry,
+    pub shortcut_index: Option<usize>,
+}
+
+/// Monta a seção de atenção exclusivamente a partir dos ponteiros conhecidos
+/// cuja re-derivação confirmou [`lina_core::WorkspaceError::IncompleteWorkspace`].
+/// Arquivados não ressuscitam e raízes duplicadas aparecem uma única vez.
+#[must_use]
+pub fn build_incomplete_attention_rows(
+    registry_entries: &[RegistryEntry],
+    incomplete_roots: &BTreeSet<PathBuf>,
+) -> Vec<SidebarAttentionRow> {
+    let mut seen = BTreeSet::new();
+    registry_entries
+        .iter()
+        .filter(|entry| {
+            !entry.archived
+                && incomplete_roots.contains(&entry.path)
+                && seen.insert(entry.path.clone())
+        })
+        .map(|entry| SidebarAttentionRow {
+            name: entry.name.clone(),
+            ws_root: entry.path.clone(),
+        })
+        .collect()
+}
+
+/// Monta as linhas do M8. **Fonte canônica = registry já conferido no store**
+/// (ordem de criação);
 /// a varredura T6 entra como FALLBACK de recuperação (Espaço no disco que o ponteiro
 /// perdeu) — deduplicada por raiz, sem `⌘{n}` (índice estável é privilégio do registry).
 /// Arquivados saem da lista padrão (vivem sob «Espaços arquivados ▸»), mas SEGURAM a
 /// posição deles no índice `⌘{n}` — arquivar o 1º não re-aponta ⌘2 em silêncio.
 #[must_use]
 pub fn build_rows(
-    registry_entries: &[RegistryEntry],
+    registry_entries: &[VerifiedRegistryEntry],
     varredura_fallback: &[ScanEntry],
     active_root: &Path,
     cache: &MiniStatusCache,
 ) -> Vec<SidebarRow> {
     let mut rows: Vec<SidebarRow> = Vec::new();
-    for (pos, entry) in registry_entries.iter().enumerate() {
+    for verified in registry_entries {
+        let entry = &verified.entry;
         if entry.archived {
             continue;
         }
-        let shortcut = pos + 1;
         rows.push(SidebarRow {
             name: entry.name.clone(),
             ws_root: entry.path.clone(),
             focused: entry.path == active_root,
             status: status_of(cache, &events_dir_of(&entry.path)),
-            shortcut_index: (shortcut <= 9).then_some(shortcut),
+            shortcut_index: verified.shortcut_index,
         });
     }
     for scan in varredura_fallback {
+        if scan.archived {
+            continue;
+        }
         let root = dashboard::ws_root_of(&scan.events_dir);
         let known = rows.iter().any(|r| r.ws_root == root)
-            || registry_entries.iter().any(|e| e.path == root);
+            || registry_entries.iter().any(|e| e.entry.path == root);
         if known {
             continue;
         }
@@ -319,6 +405,36 @@ pub fn build_rows(
             focused: scan.focused || root == active_root,
             status: status_of(cache, &scan.events_dir),
             shortcut_index: None,
+        });
+    }
+    // O runtime ativo é um fato vivo mais forte que o ponteiro/scan. Mesmo com um
+    // registry novo ou um store individual ilegível, a navegação nunca pode apagar
+    // justamente o Espaço que a janela está mostrando.
+    if !rows.iter().any(|row| row.ws_root == active_root) {
+        let registry_match = registry_entries
+            .iter()
+            .find(|verified| verified.entry.path == active_root);
+        let name = registry_match
+            .map(|verified| verified.entry.name.clone())
+            .or_else(|| {
+                varredura_fallback.iter().find_map(|scan| {
+                    (dashboard::ws_root_of(&scan.events_dir) == active_root)
+                        .then(|| scan.name.clone())
+                })
+            })
+            .or_else(|| {
+                active_root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "Espaço atual".to_owned());
+        let shortcut_index = registry_match.and_then(|verified| verified.shortcut_index);
+        rows.push(SidebarRow {
+            name,
+            ws_root: active_root.to_path_buf(),
+            focused: true,
+            status: status_of(cache, &events_dir_of(active_root)),
+            shortcut_index,
         });
     }
     rows
@@ -370,6 +486,12 @@ pub struct SidebarState {
     pub selected: usize,
     /// Linhas correntes (saída de [`build_rows`], injetada pelo shell a cada abertura).
     pub rows: Vec<SidebarRow>,
+    /// Ponteiros conhecidos incompletos, mostrados numa seção de atenção separada.
+    /// Nunca entram no roving nem em qualquer caminho de navegação.
+    pub attention_rows: Vec<SidebarAttentionRow>,
+    /// Falha da última tentativa de refresh. `Some` NUNCA significa `rows=[]`:
+    /// as linhas continuam sendo o último snapshot completo aceito.
+    pub catalog_warning: Option<String>,
     /// Buffer do rename inline da linha selecionada (campo ADITIVO ao despacho —
     /// `on_rename(ws_root, novo)` exige coletar o `novo` em algum lugar, e o padrão
     /// do app para input inline é estado headless, como o `creating` de M3/M4).
@@ -381,9 +503,24 @@ impl SidebarState {
     /// seleção quando ainda válida — sem saltos de foco gratuitos.
     pub fn set_rows(&mut self, rows: Vec<SidebarRow>) {
         self.rows = rows;
+        self.catalog_warning = None;
         let len = self.filtered().len();
         if self.selected >= len {
             self.selected = len.saturating_sub(1);
+        }
+    }
+
+    /// Substitui a seção de atenção sem afetar seleção/roving das linhas saudáveis.
+    pub fn set_attention_rows(&mut self, rows: Vec<SidebarAttentionRow>) {
+        self.attention_rows = rows;
+    }
+
+    /// Aplica um refresh do catálogo atomicamente. Um `Err` é indisponibilidade,
+    /// não um snapshot vazio: preserva linhas/seleção e só torna a falha visível.
+    pub fn apply_catalog_refresh(&mut self, refresh: Result<Vec<SidebarRow>, String>) {
+        match refresh {
+            Ok(rows) => self.set_rows(rows),
+            Err(message) => self.catalog_warning = Some(message),
         }
     }
 
@@ -399,6 +536,16 @@ impl SidebarState {
     /// Fecha SEM trocar (Esc, spec §4): zera busca/seleção/rename/foco — reabrir nasce limpo.
     pub fn close(&mut self) {
         self.expanded = false;
+        self.kbd = false;
+        self.query.clear();
+        self.selected = 0;
+        self.renaming = None;
+    }
+
+    /// Uma navegação concluída devolve o teclado ao canvas e limpa o filtro que
+    /// serviu para chegar ao alvo. Sem isso, a próxima digitação continuava na
+    /// busca invisível e podia fazer todas as linhas parecerem ter sumido.
+    pub fn finish_switch(&mut self) {
         self.kbd = false;
         self.query.clear();
         self.selected = 0;
@@ -499,6 +646,9 @@ impl SidebarState {
 
     /// `[ Renomear ]` clicado numa linha específica: seleciona-a e abre o rename inline.
     pub fn start_rename_for(&mut self, root: &Path) {
+        if !self.rows.iter().any(|row| row.ws_root == root) {
+            return;
+        }
         self.select_root(root);
         self.start_rename();
     }
@@ -639,6 +789,16 @@ pub fn row_aria_label(row: &SidebarRow) -> String {
         parts.push(format!("{COPY_M8_COST_TOOLTIP}: {short}"));
     }
     parts.join(" · ")
+}
+
+/// A linha incompleta explica o estado, a impossibilidade de abrir e a única
+/// saída disponível. O leitor de tela nunca a anuncia como botão de navegação.
+#[must_use]
+pub fn attention_row_aria_label(row: &SidebarAttentionRow) -> String {
+    format!(
+        "{} · {} · {}",
+        row.name, COPY_M8_INCOMPLETE_CREATION, COPY_M8_INCOMPLETE_HINT
+    )
 }
 
 /// aria-label do item de criação: bloqueado (free no limite) lê «Novo Espaço — PRO»
@@ -863,6 +1023,18 @@ impl Sidebar {
         if let Some(btn) = self.palette_button(th, cx, true) {
             rail = rail.child(btn);
         }
+        if let Some(warning) = &self.state.catalog_warning {
+            let visual = div()
+                .id("sb-catalog-warning-compact")
+                .text_color(rgb(th.state.warning))
+                .child(text!("⚠"));
+            rail = rail.child(live_region(
+                "sb-catalog-warning-live",
+                warning.clone(),
+                Politeness::Polite,
+                visual,
+            ));
+        }
         for (idx, row) in self.state.rows.iter().enumerate() {
             let switch = self.on_switch.clone();
             let root = row.ws_root.clone();
@@ -886,6 +1058,25 @@ impl Sidebar {
                 icon = icon.border_2().border_color(rgb(th.focus.ring));
             }
             rail = rail.child(icon);
+        }
+        for (idx, row) in self.state.attention_rows.iter().enumerate() {
+            let announce = format!(
+                "{} · abra a lista para Arquivar",
+                attention_row_aria_label(row)
+            );
+            let visual = div()
+                .id(("sb-attention-compact", idx))
+                .px_2()
+                .py_1()
+                .rounded_content()
+                .text_color(rgb(th.state.warning))
+                .child(text!("⚠"));
+            rail = rail.child(live_region(
+                format!("sb-attention-live:{}", row.ws_root.display()),
+                announce,
+                Politeness::Polite,
+                visual,
+            ));
         }
         let create = self.on_create.clone();
         rail = rail.child(
@@ -1027,6 +1218,22 @@ impl Sidebar {
                 .child(create_btn);
         }
 
+        let attention_rows = (!self.state.attention_rows.is_empty()).then(|| {
+            div()
+                .id("sb-attention-list")
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(
+                    self.state
+                        .attention_rows
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, row)| self.render_attention_row(idx, row, th, cx)),
+                )
+        });
+
         let archived = self.on_archived.clone();
         let create = self.on_create.clone();
         let mut create_item = div()
@@ -1087,6 +1294,24 @@ impl Sidebar {
             // F2-2-4: porta ROTULADA da paleta de comandos (≠ busca de Espaços acima). Logo no topo,
             // modelo Notion search-first: o leigo clica e descobre o que o Lina faz.
             .children(self.palette_button(th, cx, false))
+            .children(self.state.catalog_warning.as_ref().map(|warning| {
+                let visual = div()
+                    .id("sb-catalog-warning")
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .rounded_content()
+                    .bg(rgb(th.surface.raised))
+                    .text_color(rgb(th.state.warning))
+                    .child(text!(format!("⚠ {warning}")));
+                live_region(
+                    "sb-catalog-warning-live",
+                    warning.clone(),
+                    Politeness::Polite,
+                    visual,
+                )
+            }))
+            .children(attention_rows)
             .child(list)
             .child(footer)
             .into_any_element()
@@ -1272,7 +1497,7 @@ impl Sidebar {
                                 .rounded_content()
                                 .cursor_pointer()
                                 .role(Role::Button)
-                                .aria_label(format!("{COPY_M8_ARCHIVE} — {COPY_M8_ARCHIVE_HINT}"))
+                                .aria_label(copy_archive_action(&row.name))
                                 .text_size(px(10.0))
                                 .text_color(rgb(th.text.muted))
                                 .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
@@ -1326,6 +1551,83 @@ impl Sidebar {
             row_el = row_el.border_2().border_color(rgb(th.focus.ring));
         }
         row_el.into_any_element()
+    }
+
+    /// Linha compacta de continuidade operacional: informa a criação incompleta,
+    /// não possui clique de navegação e expõe somente o arquivamento sem exclusão.
+    fn render_attention_row(
+        &self,
+        idx: usize,
+        row: &SidebarAttentionRow,
+        th: &Theme,
+        cx: &mut Context<WorkspaceView>,
+    ) -> AnyElement {
+        let archive = self.on_archive.clone();
+        let root = row.ws_root.clone();
+        let announce = attention_row_aria_label(row);
+        let visual = div()
+            .id(("sb-attention-row", idx))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_content()
+            .bg(rgb(th.surface.raised))
+            .border_1()
+            .border_color(rgb(th.state.warning))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(rgb(th.state.warning))
+                            .child(text!("⚠")),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(rgb(th.text.primary))
+                            .child(text!(row.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(("sb-attention-archive", idx))
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_content()
+                            .cursor_pointer()
+                            .role(Role::Button)
+                            .aria_label(copy_archive_action(&row.name))
+                            .text_size(px(f32::from(th.typography.size.caption)))
+                            .text_color(rgb(th.state.warning))
+                            .on_click(cx.listener(move |v, _ev: &ClickEvent, w, cx| {
+                                archive(v, &root, w, cx)
+                            }))
+                            .child(text!(COPY_M8_ARCHIVE)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(f32::from(th.typography.size.caption)))
+                    .text_color(rgb(th.text.muted))
+                    .child(text!(format!(
+                        "{} · {}",
+                        COPY_M8_INCOMPLETE_CREATION, COPY_M8_INCOMPLETE_HINT
+                    ))),
+            );
+        live_region(
+            format!("sb-attention-live:{}", row.ws_root.display()),
+            announce,
+            Politeness::Polite,
+            visual,
+        )
+        .into_any_element()
     }
 }
 
@@ -1421,6 +1723,11 @@ mod tests {
                 focus_preset: String::new(),
             })
             .expect("ws");
+        store
+            .append(&DomainEvent::WorkspaceIdAssigned {
+                workspace_id: format!("id-{name}"),
+            })
+            .expect("workspace id");
         for status in statuses {
             let node = Uuid::now_v7();
             store
@@ -1454,6 +1761,18 @@ mod tests {
         }
     }
 
+    fn verified_registry_entry(
+        name: &str,
+        path: &Path,
+        archived: bool,
+        shortcut_index: Option<usize>,
+    ) -> VerifiedRegistryEntry {
+        VerifiedRegistryEntry {
+            entry: registry_entry(name, path, archived),
+            shortcut_index,
+        }
+    }
+
     /// Mini-status sintético (campos públicos) para as células puras.
     fn ms(alive: usize, total: usize, dominant: Option<UiState>) -> WorkspaceMiniStatus {
         WorkspaceMiniStatus {
@@ -1478,6 +1797,37 @@ mod tests {
 
     const TODAY: &str = "2026-06-11";
 
+    fn rows_from_real_catalog(
+        catalog: &crate::persistence_ui::WorkspaceRegistryCatalog,
+        active_root: &Path,
+    ) -> Vec<SidebarRow> {
+        let positions: std::collections::BTreeMap<(String, PathBuf), usize> = catalog
+            .registry
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| ((entry.id.clone(), entry.path.clone()), position))
+            .collect();
+        let verified: Vec<VerifiedRegistryEntry> = catalog
+            .verified_entries
+            .iter()
+            .cloned()
+            .map(|entry| VerifiedRegistryEntry {
+                shortcut_index: positions
+                    .get(&(entry.id.clone(), entry.path.clone()))
+                    .and_then(|position| (*position < 9).then_some(*position + 1)),
+                entry,
+            })
+            .collect();
+        let events_dirs: Vec<PathBuf> = verified
+            .iter()
+            .map(|verified| events_dir_of(&verified.entry.path))
+            .collect();
+        let mut cache = MiniStatusCache::default();
+        cache.refresh_from_projections(&events_dirs, &catalog.scan.projected_states, &[], TODAY, 1);
+        build_rows(&verified, &catalog.scan.entries, active_root, &cache)
+    }
+
     // ── build_rows: canônico + fallback + ⚠ ──
 
     /// Registry é a fonte canônica (ordem de criação); a varredura entra como fallback
@@ -1493,22 +1843,31 @@ mod tests {
         let ev_d = events_dir_of(d.path());
 
         let registry = vec![
-            registry_entry("Alfa", a.path(), false),
-            registry_entry("Beta (arquivado)", Path::new("/tmp/lina-sb-beta"), true),
-            registry_entry("Gama", c.path(), false),
+            verified_registry_entry("Alfa", a.path(), false, Some(1)),
+            verified_registry_entry(
+                "Beta (arquivado)",
+                Path::new("/tmp/lina-sb-beta"),
+                true,
+                Some(2),
+            ),
+            verified_registry_entry("Gama", c.path(), false, Some(3)),
         ];
         let scan = vec![
             // Duplicata do canônico (a varredura também enxerga o Alfa) → deduplicada.
             ScanEntry {
                 name: "Alfa".into(),
+                workspace_id: "id-Alfa".into(),
                 events_dir: ev_a.clone(),
                 focused: false,
+                archived: false,
                 nodes: 1,
             },
             ScanEntry {
                 name: "Delta (fora do registry)".into(),
+                workspace_id: "id-delta".into(),
                 events_dir: ev_d.clone(),
                 focused: false,
+                archived: false,
                 nodes: 0,
             },
         ];
@@ -1532,14 +1891,75 @@ mod tests {
         assert_eq!(rows[2].shortcut_index, None, "fallback não ganha ⌘n");
     }
 
+    /// Criações incompletas ficam numa coleção estruturalmente não navegável:
+    /// aparecem uma vez, não recebem atalho/Enter e não podem iniciar rename.
+    #[test]
+    fn workspace_reliability_incomplete_workspace_is_attention_only_and_never_navigable() {
+        let healthy_root = PathBuf::from("/tmp/lina-sb-healthy");
+        let partial_root = PathBuf::from("/tmp/lina-sb-partial");
+        let archived_partial_root = PathBuf::from("/tmp/lina-sb-partial-archived");
+        let registry = vec![
+            registry_entry("Saudável", &healthy_root, false),
+            registry_entry("Interrompido", &partial_root, false),
+            RegistryEntry {
+                id: "id-duplicado-do-ponteiro".to_owned(),
+                name: "Interrompido duplicado".to_owned(),
+                path: partial_root.clone(),
+                last_focus: 0,
+                archived: false,
+            },
+            registry_entry("Interrompido arquivado", &archived_partial_root, true),
+        ];
+        let incomplete = BTreeSet::from([partial_root.clone(), archived_partial_root]);
+        let attention = build_incomplete_attention_rows(&registry, &incomplete);
+
+        assert_eq!(
+            attention.len(),
+            1,
+            "a raiz incompleta aparece uma única vez"
+        );
+        assert_eq!(attention[0].ws_root, partial_root);
+        assert!(attention_row_aria_label(&attention[0]).contains(COPY_M8_INCOMPLETE_CREATION));
+        assert!(attention_row_aria_label(&attention[0]).contains("não pode ser aberto"));
+
+        let healthy_rows = build_rows(
+            &[verified_registry_entry(
+                "Saudável",
+                &healthy_root,
+                false,
+                Some(1),
+            )],
+            &[],
+            &healthy_root,
+            &MiniStatusCache::default(),
+        );
+        assert!(healthy_rows.iter().all(|row| row.ws_root != partial_root));
+
+        let mut state = SidebarState::default();
+        state.set_rows(healthy_rows);
+        state.set_attention_rows(attention);
+        assert_eq!(
+            state.selected_row().map(|row| row.ws_root.as_path()),
+            Some(healthy_root.as_path()),
+            "Enter só pode devolver uma linha saudável"
+        );
+        state.start_rename_for(&partial_root);
+        assert_eq!(state.renaming, None, "atenção não admite rename");
+        assert!(state
+            .filtered()
+            .iter()
+            .all(|index| state.rows[*index].ws_root != partial_root));
+    }
+
     /// Contrato de integração violado (cache sem a entrada) degrada VISÍVEL: linha-⚠,
     /// nunca um "sem Agentes ainda" inventado.
     #[test]
     fn build_rows_cache_sem_entrada_degrada_para_warn() {
-        let registry = vec![registry_entry(
+        let registry = vec![verified_registry_entry(
             "Solto",
             Path::new("/tmp/lina-sb-solto"),
             false,
+            Some(1),
         )];
         let rows = build_rows(
             &registry,
@@ -1547,9 +1967,209 @@ mod tests {
             Path::new("/tmp/outro"),
             &MiniStatusCache::default(),
         );
-        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.len(),
+            2,
+            "além do canônico, o runtime ativo nunca desaparece"
+        );
         assert!(rows[0].status.unreachable);
         assert!(!rows[0].focused);
+        assert_eq!(rows[1].ws_root, PathBuf::from("/tmp/outro"));
+        assert!(rows[1].focused);
+        assert!(rows[1].status.unreachable);
+    }
+
+    /// Regressão do incidente `os error 24`: uma atualização que não conseguiu
+    /// ler o catálogo não é um snapshot vazio. A última lista completa continua
+    /// navegável, inclusive o ativo, e a falha fica observável sem ressuscitar um
+    /// Espaço arquivado que estava ausente do snapshot válido.
+    #[test]
+    fn workspace_reliability_transient_read_error_keeps_last_good_sidebar() {
+        let active_root = PathBuf::from("/tmp/lina-sb-active");
+        let archived_root = PathBuf::from("/tmp/lina-sb-archived");
+        let mut active = row_with(ms(1, 1, Some(UiState::Trabalhando)));
+        active.name = "Ativo".into();
+        active.ws_root = active_root.clone();
+        active.focused = true;
+
+        let mut other = row_with(ms(0, 0, None));
+        other.name = "Outro".into();
+        other.ws_root = PathBuf::from("/tmp/lina-sb-other");
+
+        let mut state = SidebarState::default();
+        state.apply_catalog_refresh(Ok(vec![active.clone(), other.clone()]));
+        state.apply_catalog_refresh(Err(
+            "não foi possível reler a lista de Espaços (os error 24)".into(),
+        ));
+
+        assert_eq!(
+            state.rows,
+            vec![active, other],
+            "erro transitório preserva o último snapshot completo"
+        );
+        assert!(
+            state
+                .rows
+                .iter()
+                .any(|row| row.focused && row.ws_root == active_root),
+            "o Espaço ativo nunca desaparece"
+        );
+        assert!(
+            state.rows.iter().all(|row| row.ws_root != archived_root),
+            "fallback não pode ressuscitar um Espaço arquivado"
+        );
+        assert_eq!(
+            state.catalog_warning.as_deref(),
+            Some("não foi possível reler a lista de Espaços (os error 24)"),
+            "a falha precisa ficar observável"
+        );
+    }
+
+    /// Gate E integrado: o mesmo catálogo e a mesma porta usados pelo shell
+    /// publicam A/B uma vez; inválido determinístico só adverte, enquanto falhas
+    /// transitórias preservam integralmente linhas, foco e atalhos.
+    #[cfg(unix)]
+    #[test]
+    fn workspace_reliability_real_catalog_failures_preserve_sidebar_snapshot() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new("gate-e-real-catalog");
+        let workspaces_base = temp.path().join("workspaces");
+        let active_root = workspaces_base.join("A");
+        let archived_root = workspaces_base.join("Arquivado");
+        let other_root = workspaces_base.join("B");
+        drop(lina_core::Workspace::create(&active_root, "A", "blank", None).expect("workspace A"));
+        drop(
+            lina_core::Workspace::create(&archived_root, "Arquivado", "blank", None)
+                .expect("workspace arquivado"),
+        );
+        lina_core::EventStore::open(events_dir_of(&archived_root))
+            .expect("archived store")
+            .append(&DomainEvent::WorkspaceArchived)
+            .expect("archive fact");
+        drop(lina_core::Workspace::create(&other_root, "B", "blank", None).expect("workspace B"));
+
+        let registry_path = temp.path().join("catalog/workspaces.json");
+        let mut registry = lina_core::WorkspaceRegistry::load(&registry_path).expect("registry");
+        registry
+            .upsert(lina_core::WorkspaceRegistry::rederive_entry(&active_root).expect("entry A"));
+        registry.upsert(
+            lina_core::WorkspaceRegistry::rederive_entry(&archived_root).expect("entry archived"),
+        );
+        registry
+            .upsert(lina_core::WorkspaceRegistry::rederive_entry(&other_root).expect("entry B"));
+        registry.save().expect("last-good registry");
+        let registry_bytes = std::fs::read(&registry_path).expect("last-good bytes");
+
+        let catalog = crate::persistence_ui::load_or_rebuild_workspace_registry(
+            &registry_path,
+            &workspaces_base,
+            &events_dir_of(&active_root),
+        )
+        .expect("healthy catalog");
+        assert!(catalog.scan.is_complete());
+        let mut state = SidebarState::default();
+        state.apply_catalog_refresh(Ok(rows_from_real_catalog(&catalog, &active_root)));
+        assert_eq!(
+            state
+                .rows
+                .iter()
+                .map(|row| (row.name.as_str(), row.shortcut_index, row.focused))
+                .collect::<Vec<_>>(),
+            vec![("A", Some(1), true), ("B", Some(3), false)],
+            "arquivado segura ⌘2, mas não aparece"
+        );
+
+        let invalid_root = workspaces_base.join("Invalido");
+        let mut invalid_store =
+            lina_core::EventStore::open(events_dir_of(&invalid_root)).expect("invalid store");
+        invalid_store
+            .append(&DomainEvent::WorkspaceCreated {
+                name: "Inválido".to_owned(),
+                focus_preset: "blank".to_owned(),
+            })
+            .expect("created without identity");
+        drop(invalid_store);
+        let catalog_with_invalid = crate::persistence_ui::load_or_rebuild_workspace_registry(
+            &registry_path,
+            &workspaces_base,
+            &events_dir_of(&active_root),
+        )
+        .expect("invalid deterministic is quarantined");
+        assert!(catalog_with_invalid.scan.is_complete());
+        assert!(catalog_with_invalid
+            .scan
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("WorkspaceIdAssigned")));
+        state.apply_catalog_refresh(Ok(rows_from_real_catalog(
+            &catalog_with_invalid,
+            &active_root,
+        )));
+        state.catalog_warning = Some(COPY_M8_CATALOG_QUARANTINED.to_owned());
+        let last_good_rows = state.rows.clone();
+        assert_eq!(last_good_rows.len(), 2, "inválido não esconde A/B");
+        assert!(last_good_rows
+            .iter()
+            .all(|row| row.ws_root != archived_root && row.ws_root != invalid_root));
+        assert_eq!(
+            std::fs::read(&registry_path).expect("registry after quarantine"),
+            registry_bytes
+        );
+
+        let renamed_base = temp.path().join("workspaces-renamed");
+        std::fs::rename(&workspaces_base, &renamed_base).expect("rename base");
+        std::fs::write(&workspaces_base, b"read_dir deve falhar").expect("base is now a file");
+        let incomplete = crate::persistence_ui::load_or_rebuild_workspace_registry(
+            &registry_path,
+            &workspaces_base,
+            &events_dir_of(&active_root),
+        )
+        .expect("last-good remains available on read_dir failure");
+        assert!(!incomplete.scan.is_complete());
+        state.apply_catalog_refresh(Err(COPY_M8_CATALOG_STALE.to_owned()));
+        assert_eq!(state.rows, last_good_rows);
+
+        let original_permissions = std::fs::metadata(&registry_path)
+            .expect("registry metadata")
+            .permissions();
+        std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o000))
+            .expect("registry unreadable");
+        let unreadable = crate::persistence_ui::load_or_rebuild_workspace_registry(
+            &registry_path,
+            &workspaces_base,
+            &events_dir_of(&active_root),
+        );
+        match unreadable {
+            Ok(_) => panic!("registry ilegível não pode publicar snapshot"),
+            Err(_) => state.apply_catalog_refresh(Err(COPY_M8_CATALOG_STALE.to_owned())),
+        }
+        std::fs::set_permissions(&registry_path, original_permissions)
+            .expect("restore registry permissions");
+
+        assert_eq!(state.rows, last_good_rows, "dupla falha preserva snapshot");
+        assert_eq!(
+            state.catalog_warning.as_deref(),
+            Some(COPY_M8_CATALOG_STALE)
+        );
+        assert!(state
+            .rows
+            .iter()
+            .any(|row| row.focused && row.ws_root == active_root));
+        assert_eq!(
+            state
+                .rows
+                .iter()
+                .map(|row| row.shortcut_index)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(3)]
+        );
+        assert!(state.rows.iter().all(|row| row.ws_root != archived_root));
+        assert_eq!(
+            std::fs::read(&registry_path).expect("registry bytes final"),
+            registry_bytes,
+            "nenhuma falha regrava o last-good"
+        );
     }
 
     // ── índice ⌘n estável ──
@@ -1559,15 +2179,16 @@ mod tests {
     #[test]
     fn indice_cmd_n_estavel_com_lista_reordenada_e_arquivado_segura_posicao() {
         let mut registry = vec![
-            registry_entry("Primeiro", Path::new("/tmp/sb-1"), false),
-            registry_entry("Segundo (arquivado)", Path::new("/tmp/sb-2"), true),
-            registry_entry("Terceiro", Path::new("/tmp/sb-3"), false),
+            verified_registry_entry("Primeiro", Path::new("/tmp/sb-1"), false, Some(1)),
+            verified_registry_entry("Segundo (arquivado)", Path::new("/tmp/sb-2"), true, Some(2)),
+            verified_registry_entry("Terceiro", Path::new("/tmp/sb-3"), false, Some(3)),
         ];
         for i in 4..=11 {
-            registry.push(registry_entry(
+            registry.push(verified_registry_entry(
                 &format!("Espaço {i}"),
                 Path::new(&format!("/tmp/sb-{i}")),
                 false,
+                (i <= 9).then_some(i),
             ));
         }
         let cache = MiniStatusCache::default();
@@ -1759,6 +2380,35 @@ mod tests {
         assert!(!st.expanded);
         assert!(st.query.is_empty(), "reabrir nasce limpo");
         assert_eq!(st.renaming, None);
+    }
+
+    /// Trocar por uma busca é uma navegação concluída, não um novo modo de
+    /// entrada. O filtro precisa sair junto com o foco para a digitação seguinte
+    /// continuar no canvas e a lista inteira reaparecer.
+    #[test]
+    fn workspace_reliability_successful_switch_releases_search_and_restores_all_rows() {
+        let mut st = SidebarState::default();
+        st.set_rows(vec![
+            SidebarRow {
+                name: "Meu Espaço".into(),
+                ..row_with(ms(0, 0, None))
+            },
+            SidebarRow {
+                name: "TomikOS".into(),
+                ..row_with(ms(0, 0, None))
+            },
+        ]);
+        st.open();
+        st.focus_search();
+        st.type_char("TomikOS");
+        assert_eq!(st.filtered(), vec![1]);
+
+        st.finish_switch();
+
+        assert!(st.expanded, "a lista pode continuar aberta após a troca");
+        assert!(!st.kbd, "o teclado volta ao canvas");
+        assert!(st.query.is_empty(), "o filtro usado na navegação termina");
+        assert_eq!(st.filtered(), vec![0, 1], "nenhuma linha fica escondida");
     }
 
     // ── rename inline (headless) ──
@@ -1994,7 +2644,7 @@ mod tests {
     #[test]
     fn archive_toast_window_and_countdown() {
         let t0 = 1_000_000_u64;
-        let t = ArchiveToast::new(PathBuf::from("/tmp/sb-arch"), "Loja".into(), t0);
+        let t = ArchiveToast::new(PathBuf::from("/tmp/sb-arch"), "Loja".into(), t0, false);
         assert!(!t.expired(t0), "nasce dentro da janela");
         assert!(!t.expired(t0 + ARCHIVE_TOAST_TIMEOUT_MS - 1));
         assert!(t.expired(t0 + ARCHIVE_TOAST_TIMEOUT_MS), "fecha no prazo");
@@ -2008,6 +2658,19 @@ mod tests {
         // O anúncio da live-region carrega o NOME (o leigo sabe O QUE foi arquivado).
         assert!(copy_archive_announce("Loja").contains("“Loja”"));
         assert!(copy_archive_undone("Loja").contains("“Loja”"));
+        assert_eq!(
+            copy_archive_action("Loja"),
+            "Arquivar “Loja” — some da lista; nada é apagado do disco"
+        );
+        assert_eq!(
+            copy_archive_undo_action("Loja"),
+            "Desfazer arquivamento de “Loja”"
+        );
+        assert_ne!(
+            copy_archive_action("Loja"),
+            copy_archive_action("TomikOS"),
+            "cada botão Arquivar identifica seu próprio Espaço"
+        );
     }
 
     /// Spec §M8: `[ Desfazer ]` é alcançável por TECLADO antes do timeout — `Tab` foca,

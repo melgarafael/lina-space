@@ -696,8 +696,13 @@ mod tests {
         let tmp = TempDir::new("connect-lifecycle");
         let mut store = EventStore::open(tmp.path()).expect("abrir store");
         let manifest = ChannelManifest::parse(WELL_FORMED).expect("parse");
-        register_channel(&mut store, &manifest, "channels/whatsapp/manifest.toml", TrustTier::Curado)
-            .expect("registra");
+        register_channel(
+            &mut store,
+            &manifest,
+            "channels/whatsapp/manifest.toml",
+            TrustTier::Curado,
+        )
+        .expect("registra");
 
         // Registrado, ainda não conectado.
         let registry = ChannelRegistry::replay(&store).expect("replay");
@@ -706,8 +711,13 @@ mod tests {
         assert_eq!(ch.session_ref, None);
 
         // Conectar → Connected + session_ref + rótulo pt-br "conectado".
-        connect_channel(&mut store, "whatsapp", "keyring:channel:whatsapp", "waha@127.0.0.1:3000")
-            .expect("conecta");
+        connect_channel(
+            &mut store,
+            "whatsapp",
+            "keyring:channel:whatsapp",
+            "waha@127.0.0.1:3000",
+        )
+        .expect("conecta");
         let registry = ChannelRegistry::replay(&store).expect("replay");
         let ch = registry.get("whatsapp").expect("registrado");
         assert_eq!(ch.status, ChannelStatus::Connected);
@@ -735,7 +745,11 @@ mod tests {
         let registry = ChannelRegistry::from_records(&log);
         let ch = registry.get("wa").expect("registrado");
         assert_eq!(ch.status, ChannelStatus::Connected);
-        assert_eq!(ch.session_ref.as_deref(), Some("sref-2"), "último connect vence");
+        assert_eq!(
+            ch.session_ref.as_deref(),
+            Some("sref-2"),
+            "último connect vence"
+        );
         assert_eq!(
             ChannelRegistry::from_records(&log),
             ChannelRegistry::from_records(&log),

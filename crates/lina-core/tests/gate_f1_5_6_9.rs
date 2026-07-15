@@ -118,6 +118,52 @@ fn signal_child_mode() {
     std::process::exit(86);
 }
 
+/// Modo filho da regressão do coordenador: um callback público entra em panic em
+/// passadas consecutivas. O coordenador precisa conter o panic e continuar apto a
+/// observar/reemitir SIGTERM; caso contrário o handler deixaria o processo imortal.
+#[test]
+fn coordinator_panic_child_mode() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some(dir) = std::env::var_os("LINA_F1569_PANIC_CHILD_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let mut store = ScrollbackStore::open(&dir, cfg(100, 10_000, 30)).expect("filho: open");
+    let clock_calls = Arc::new(AtomicUsize::new(0));
+    store.set_clock({
+        let clock_calls = Arc::clone(&clock_calls);
+        move || {
+            clock_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("panic injetado no relógio do scrollback")
+        }
+    });
+    let store = Arc::new(Mutex::new(store));
+    let _guard = FlushGuard::start(
+        Arc::clone(&store),
+        FlushGuardConfig {
+            idle_for: Duration::from_secs(3_600),
+            tick: Duration::from_millis(10),
+            handle_signals: true,
+        },
+    )
+    .expect("subir coordenador");
+    assert!(
+        poll_until(Duration::from_secs(5), || clock_calls
+            .load(Ordering::SeqCst)
+            >= 2),
+        "o worker não continuou depois do primeiro panic"
+    );
+    let stats = lina_core::scrollback::flush_coordinator_stats();
+    assert_eq!(stats.threads, 1, "thread real segue viva depois do panic");
+    assert!(stats.handlers_installed, "handlers seguem observáveis");
+    std::fs::write(dir.join("panic-child-ready"), b"ok").expect("marker");
+    for _ in 0..1_200 {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::process::exit(87);
+}
+
 /// **Critério (a)**: processo REAL com ~500B pendentes recebe `SIGTERM` → reabrir o
 /// store de fora → zero perda, byte-idêntica. (Estilo 13.16; o filho é este mesmo
 /// binário de teste re-executado em modo filho.)
@@ -169,6 +215,55 @@ fn a_sigterm_com_pendentes_zero_perda_byte_identica() {
         store.range("sinal", 0, 100).expect("range"),
         child_lines(),
         "perda ou corrupção: o flush de sinal não salvou byte-idêntico"
+    );
+}
+
+/// Regressão: panic de um store não pode matar a thread global e transformar os
+/// handlers permanentes em um sumidouro de SIGTERM.
+#[cfg(unix)]
+#[test]
+fn workspace_reliability_coordinator_survives_store_panic_and_reemits_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let tmp = TempDir::new("coordinator-panic");
+    let dir = tmp.path().join("sb");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let exe = std::env::current_exe().expect("exe do teste");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "coordinator_panic_child_mode",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("LINA_F1569_PANIC_CHILD_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn do filho");
+
+    assert!(
+        poll_until(Duration::from_secs(20), || dir
+            .join("panic-child-ready")
+            .exists()),
+        "filho não provou contenção do panic"
+    );
+    // SAFETY: kill(2) somente no processo filho criado por este teste.
+    unsafe {
+        assert_eq!(libc::kill(child.id() as i32, libc::SIGTERM), 0);
+    }
+    assert!(
+        poll_until(Duration::from_secs(10), || matches!(
+            child.try_wait(),
+            Ok(Some(_))
+        )),
+        "coordenador engoliu SIGTERM depois do panic"
+    );
+    let status = child.wait().expect("status do filho");
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "o processo precisa preservar a semântica do sinal original: {status:?}"
     );
 }
 

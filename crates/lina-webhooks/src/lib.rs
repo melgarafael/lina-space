@@ -228,9 +228,132 @@ pub struct SystemDelivery {
     pub received_ts: u64,
 }
 
+#[derive(Default)]
+struct SystemDeliveryQueueState {
+    deliveries: VecDeque<SystemDelivery>,
+    reservations: usize,
+    quiescing: bool,
+}
+
 /// Fila in-process da entrega-de-sistema (produtor: engine tokio; consumidor: pump-thread do app).
-/// Mesmo padrão de `human_intents`/`ReinjectQueue` — sem superfície de filesystem (ADR 0035 §1).
-pub type SystemDeliveryQueue = Arc<Mutex<VecDeque<SystemDelivery>>>;
+/// Uma reserva nasce antes do append durável: desmontagem só fecha a fila quando não há reserva nem
+/// entrega pendente. Depois do fechamento, o handler responde `503` antes de registrar recepção.
+#[derive(Clone, Default)]
+pub struct SystemDeliveryQueue {
+    state: Arc<Mutex<SystemDeliveryQueueState>>,
+    change_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Reserva de admissão anterior ao append durável. Se o produtor abortar, o
+/// `Drop` libera a contagem e acorda qualquer desmontagem aguardando a fila.
+pub struct SystemDeliveryReservation {
+    queue: SystemDeliveryQueue,
+    active: bool,
+}
+
+/// Guarda exclusiva usada pela desmontagem do runtime. Enquanto viva, nenhuma nova recepção
+/// consegue reservar espaço na fila; soltá-la sem [`Self::seal`] reabre o ingresso.
+pub struct SystemDeliveryQuiescence {
+    queue: SystemDeliveryQueue,
+    sealed: bool,
+}
+
+impl SystemDeliveryQueue {
+    /// Liga a fila ao sinal de quiescência do runtime que a possui. O callback
+    /// só anuncia mudança de estado; nenhuma dependência do app entra neste crate.
+    pub fn with_change_notifier(notify: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SystemDeliveryQueueState::default())),
+            change_notifier: Some(Arc::new(notify)),
+        }
+    }
+
+    fn notify_change(&self) {
+        if let Some(notify) = &self.change_notifier {
+            notify();
+        }
+    }
+
+    /// Reserva uma futura entrega; `None` quando o runtime já fechou o ingresso.
+    pub fn try_reserve(&self) -> Option<SystemDeliveryReservation> {
+        let mut state = lock(&self.state);
+        if state.quiescing {
+            return None;
+        }
+        state.reservations = state.reservations.checked_add(1)?;
+        drop(state);
+        self.notify_change();
+        Some(SystemDeliveryReservation {
+            queue: self.clone(),
+            active: true,
+        })
+    }
+
+    /// Drena as entregas aceitas em ordem FIFO.
+    pub fn drain(&self) -> Vec<SystemDelivery> {
+        let deliveries = lock(&self.state).deliveries.drain(..).collect();
+        self.notify_change();
+        deliveries
+    }
+
+    /// Fecha o ingresso apenas quando nada aceito continua em voo ou aguardando dreno.
+    pub fn try_quiesce(&self) -> Option<SystemDeliveryQuiescence> {
+        let mut state = lock(&self.state);
+        if state.quiescing || state.reservations != 0 || !state.deliveries.is_empty() {
+            return None;
+        }
+        state.quiescing = true;
+        Some(SystemDeliveryQuiescence {
+            queue: self.clone(),
+            sealed: false,
+        })
+    }
+}
+
+impl SystemDeliveryReservation {
+    fn commit(mut self, delivery: SystemDelivery) {
+        let mut state = lock(&self.queue.state);
+        release_delivery_reservation(&mut state);
+        state.deliveries.push_back(delivery);
+        drop(state);
+        self.queue.notify_change();
+        self.active = false;
+    }
+}
+
+impl Drop for SystemDeliveryReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = lock(&self.queue.state);
+            release_delivery_reservation(&mut state);
+            drop(state);
+            self.queue.notify_change();
+        }
+    }
+}
+
+fn release_delivery_reservation(state: &mut SystemDeliveryQueueState) {
+    match state.reservations.checked_sub(1) {
+        Some(remaining) => state.reservations = remaining,
+        None => tracing::error!("reserva de entrega foi liberada sem admissão correspondente"),
+    }
+}
+
+impl SystemDeliveryQuiescence {
+    /// Mantém o ingresso fechado até o runtime e todos os clones da fila desaparecerem.
+    pub fn seal(mut self) {
+        self.sealed = true;
+    }
+}
+
+impl Drop for SystemDeliveryQuiescence {
+    fn drop(&mut self) {
+        if !self.sealed {
+            lock(&self.queue.state).quiescing = false;
+            self.queue.notify_change();
+        }
+    }
+}
 
 /// Resumo do replay de boot ([`WebhookEngine::replay_configured`]): quantos hooks foram religados
 /// e quantos foram pulados por secret ausente no vault (perda sinalizada, nunca silenciosa).
@@ -676,6 +799,17 @@ async fn handle_hook(
         return StatusCode::TOO_MANY_REQUESTS;
     }
 
+    // Reserva a entrega ANTES do fato durável. A reserva mantém a desmontagem bloqueada até o
+    // append virar item drenável; se o runtime já fechou o ingresso, 503 pede retry sem registrar
+    // uma recepção que este processo não poderá encaminhar.
+    let delivery_reservation = match state.delivery_queue.as_ref() {
+        Some(queue) => match queue.try_reserve() {
+            Some(reservation) => Some(reservation),
+            None => return StatusCode::SERVICE_UNAVAILABLE,
+        },
+        None => None,
+    };
+
     // 5. DURABILIDADE PRIMEIRO (#4): o handler AGUARDA o append do FATO ANTES de responder. O
     //    append toca disco (bloqueante), então roda em `spawn_blocking` — thread de bloqueio do
     //    Tokio — para NÃO prender a worker async sob disco lento/cheio/NFS (MEDIA-2, F1-6-2). A
@@ -722,22 +856,19 @@ async fn handle_hook(
         };
         match appended {
             Ok(()) => {
-                // 6. Efeito NÃO-durável fora do caminho da resposta: o DESPACHO server-side. Com a
-                //    fila ligada (produção F4-WA), DEPOSITA a entrega-de-sistema (origem System
-                //    carimbada no core, no pump); sem ela (legado), publica no bus. O FATO durável já
-                //    está no log (passo 5); o conteúdo do payload viaja efêmero, nunca persiste.
-                tokio::spawn(async move {
-                    state.dispatch_or_publish(
-                        &binding,
-                        &webhook_id,
-                        &method_str,
-                        &content_type,
-                        &payload_str,
-                        &payload_sha256,
-                        payload_size,
-                        ts,
-                    );
-                });
+                // 6. O despacho efêmero entra na fila antes do 202. A reserva começou antes do
+                //    append, portanto a desmontagem não pode cair entre o fato e sua entrega.
+                state.dispatch_or_publish(
+                    &binding,
+                    &webhook_id,
+                    &method_str,
+                    &content_type,
+                    &payload_str,
+                    &payload_sha256,
+                    payload_size,
+                    ts,
+                    delivery_reservation,
+                );
                 Ok(())
             }
             Err(e) => {
@@ -795,14 +926,15 @@ impl AppState {
         payload_sha256: &str,
         payload_size: u64,
         received_ts: u64,
+        reservation: Option<SystemDeliveryReservation>,
     ) {
-        let Some(queue) = &self.delivery_queue else {
+        let Some(reservation) = reservation else {
             self.publish(binding);
             return;
         };
         match self.supervisor.node_by_name(&binding.target_ref) {
             Some(target) => {
-                lock(queue).push_back(SystemDelivery {
+                reservation.commit(SystemDelivery {
                     target,
                     target_name: binding.target_ref.clone(),
                     webhook_id: webhook_id.to_string(),
@@ -1216,6 +1348,161 @@ mod tests {
             rx.try_recv().is_err(),
             "append falho não pode publicar mensagem no bus (sem 202, sem efeito)"
         );
+    }
+
+    #[test]
+    fn workspace_reliability_delivery_reservation_abort_notifies_waiter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        let queue = SystemDeliveryQueue::with_change_notifier(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        let reservation = queue.try_reserve().expect("reserva aceita");
+        let after_reserve = notifications.load(Ordering::SeqCst);
+        assert!(after_reserve >= 1, "a admissão publica mudança");
+        assert!(queue.try_quiesce().is_none(), "reserva bloqueia unload");
+
+        drop(reservation);
+        assert!(
+            notifications.load(Ordering::SeqCst) > after_reserve,
+            "aborto sem item também acorda o unload"
+        );
+        assert!(queue.try_quiesce().is_some(), "fila vazia converge");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn workspace_reliability_delivery_reservation_closes_the_durable_append_eviction_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        struct BlockingLog {
+            entered: Mutex<Option<mpsc::Sender<()>>>,
+            release: Mutex<mpsc::Receiver<()>>,
+            appended: Arc<AtomicUsize>,
+        }
+
+        impl DurableLog for BlockingLog {
+            fn append(&self, _event: &DomainEvent) -> Result<(), WebhookError> {
+                if let Some(entered) = lock(&self.entered).take() {
+                    entered
+                        .send(())
+                        .map_err(|error| WebhookError::Store(error.to_string()))?;
+                    lock(&self.release)
+                        .recv()
+                        .map_err(|error| WebhookError::Store(error.to_string()))?;
+                }
+                self.appended.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn configured_hooks(&self) -> Result<Vec<ConfiguredHook>, WebhookError> {
+                Ok(Vec::new())
+            }
+        }
+
+        const HOOK: &str = "GATEDHOOKAAAAAAAAAAAAAAAAAAAAAAA";
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let appended = Arc::new(AtomicUsize::new(0));
+        let log = Arc::new(BlockingLog {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(release_rx),
+            appended: Arc::clone(&appended),
+        });
+        let supervisor = Arc::new(Supervisor::new());
+        let trigger = supervisor.register(
+            "@Trigger",
+            Some("trigger".into()),
+            Box::new(std::io::sink()),
+        );
+        let target = supervisor.register("@Dev", Some("dev".into()), Box::new(std::io::sink()));
+        let mut hooks = HashMap::new();
+        hooks.insert(
+            HOOK.to_string(),
+            HookBinding {
+                secret: "secret-gated".into(),
+                from: trigger,
+                target_ref: "@Dev".into(),
+                instruction: "processe".into(),
+            },
+        );
+        let queue = SystemDeliveryQueue::default();
+        let state = AppState {
+            hooks: Arc::new(RwLock::new(hooks)),
+            store: log,
+            supervisor,
+            delivery_queue: Some(queue.clone()),
+            rate_route: Arc::new(Mutex::new(RouteBuckets::new())),
+            rate_global: Arc::new(Mutex::new(RateWindow {
+                start: Instant::now(),
+                count: 0,
+            })),
+            rate_hook: Arc::new(Mutex::new(HashMap::new())),
+            rate_cfg: RateLimitConfig::default(),
+        };
+        let body = Bytes::from_static(br#"{"accepted":true}"#);
+        let signature = sign_hex("secret-gated", &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-signature",
+            signature.parse().expect("assinatura vira header"),
+        );
+        let peer = SocketAddr::from(([127, 0, 0, 1], 41000));
+
+        let first_state = state.clone();
+        let first_headers = headers.clone();
+        let first_body = body.clone();
+        let first = tokio::spawn(async move {
+            handle_hook(
+                State(first_state),
+                Path(HOOK.to_string()),
+                ConnectInfo(peer),
+                Method::POST,
+                first_headers,
+                first_body,
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .expect("join da barreira")
+            .expect("append entrou");
+        assert!(
+            queue.try_quiesce().is_none(),
+            "reserva aceita antes do gate bloqueia evicção"
+        );
+
+        release_tx.send(()).expect("liberar append");
+        assert_eq!(first.await.expect("join do request"), StatusCode::ACCEPTED);
+        assert!(
+            queue.try_quiesce().is_none(),
+            "entrega aceita aguarda dreno antes da evicção"
+        );
+        let deliveries = queue.drain();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].target, target);
+        assert_eq!(deliveries[0].webhook_id, HOOK);
+
+        let quiescence = queue.try_quiesce().expect("fechar fila drenada");
+        let rejected = handle_hook(
+            State(state),
+            Path(HOOK.to_string()),
+            ConnectInfo(peer),
+            Method::POST,
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(rejected, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            appended.load(Ordering::SeqCst),
+            1,
+            "request após o gate não registra WebhookReceived sem entrega possível"
+        );
+        assert!(queue.drain().is_empty());
+        drop(quiescence);
     }
 
     /// F1-6-2 / MEDIA-2: append LENTO (2s, bloqueante — disco lento/cheio/NFS simulado) com **UMA

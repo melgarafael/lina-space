@@ -19,6 +19,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use lina_pty::PtyError;
+use regex::Regex;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -65,6 +66,49 @@ pub use a2a::{
     WorkspaceTrust, INTERACTIVE_READY_BUDGET_MS,
 };
 
+/// Identidade observável da última ocorrência de prompt numa tela. O prefixo termina
+/// no próprio match: ecoar texto depois do prompt mantém a identidade; um prompt que
+/// aparece depois do comando muda o prefixo mesmo quando usa o mesmo glifo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptObservation {
+    pub prefix: String,
+}
+
+/// Observa a última ocorrência de prompt na tela inteira, mas só quando a região de
+/// input está realmente pronta. Regex inválida e marcador de ocupado falham fechados.
+#[must_use]
+pub fn prompt_observation(
+    screen: &str,
+    input_region: &str,
+    prompt_ready_regex: &str,
+    busy_markers: &[String],
+) -> Option<PromptObservation> {
+    let prompt = Regex::new(prompt_ready_regex).ok()?;
+    if busy_markers
+        .iter()
+        .any(|marker| input_region.contains(marker.as_str()))
+    {
+        return None;
+    }
+    let occurrence = prompt.find_iter(screen).last()?;
+    Some(PromptObservation {
+        prefix: screen[..occurrence.end()].to_string(),
+    })
+}
+
+/// Veredito instantâneo de prontidão para consumidores que não precisam distinguir
+/// gerações de prompt. Quem decide encerrar processo deve usar [`prompt_observation`]
+/// junto da época de entrada do terminal.
+#[must_use]
+pub fn prompt_ready_now(region: &str, prompt_ready_regex: &str, busy_markers: &[String]) -> bool {
+    Regex::new(prompt_ready_regex).ok().is_some_and(|prompt| {
+        prompt.is_match(region)
+            && !busy_markers
+                .iter()
+                .any(|marker| region.contains(marker.as_str()))
+    })
+}
+
 /// W3-4: mailbox de arquivo (`.lina/`) — contrato `lina/msg@1` CLI↔supervisor.
 mod mailbox;
 pub use mailbox::{
@@ -102,7 +146,8 @@ pub use goal::{project_goals, Goal, GoalPhase};
 mod workspace;
 pub use workspace::{
     can_create_workspace, default_registry_path, resolve_spawn_cwd, workspace_limit, LicenseTier,
-    ResolvedCwd, Workspace, WorkspaceEntry, WorkspaceError, WorkspaceRegistry,
+    PendingWorkspaceFocus, ResolvedCwd, Workspace, WorkspaceEntry, WorkspaceError,
+    WorkspaceFocusCommit, WorkspaceFocusRecovery, WorkspaceRegistry,
 };
 
 /// W3-6: núcleo determinístico do gate de execução (classe de ação × autonomia → decisão).
@@ -467,9 +512,9 @@ pub struct PtyHost {
     /// W5-2 FIAÇÃO: Store de scrollback do workspace. Quando presente, todo terminal aberto a
     /// partir daí nasce **capturando** (cap = `store.cap()`) e tem o cabo `append-on-scroll` ligado.
     scrollback: Option<Arc<Mutex<scrollback::ScrollbackStore>>>,
-    /// F1-5-6: o job ÚNICO de durabilidade (idle-drain + sinais + retenção diária F1-5-9).
-    /// Vive aqui porque o `PtyHost` é o dono natural do ciclo de vida do scrollback
-    /// (decisão da story: "idle-drain como job único no PtyHost"). Para no Drop.
+    /// F1-5-6: inscrição deste host no coordenador global de durabilidade
+    /// (idle-drain + sinais + retenção diária F1-5-9). O `PtyHost` é dono do
+    /// registro; todos os hosts do processo compartilham uma única thread.
     flush_guard: Option<scrollback::FlushGuard>,
 }
 
@@ -511,11 +556,11 @@ impl PtyHost {
         self.scrollback = Some(store);
     }
 
-    /// F1-5-6: sobe o **job único de durabilidade** sobre o store ligado em
+    /// F1-5-6: registra o store ligado em
     /// [`PtyHost::set_scrollback_store`] — idle-drain (painel ocioso 1-2s → flush),
     /// handlers de sinal (`SIGTERM`/`SIGINT`/`SIGHUP` → `flush_all` antes de morrer) e o
-    /// job diário de retenção (F1-5-9), tudo numa ÚNICA thread (a nota load-bearing do
-    /// 13.16 — nunca uma thread por painel sobre o Mutex global). `Ok(false)` = sem store
+    /// job diário de retenção (F1-5-9), tudo na ÚNICA thread do processo (nunca
+    /// uma thread por painel nem por workspace). `Ok(false)` = sem store
     /// ligado (nada a proteger). Idempotente: re-chamar substitui o guard anterior
     /// (o velho para no drop).
     pub fn start_flush_guard(
@@ -1374,6 +1419,10 @@ struct TermChannel {
     tx: Sender<WriteOp>,
     lock: PtyLock,
     applied: Arc<Mutex<Vec<WriteOp>>>,
+    /// Última entrada humana/agente enfileirada ou aprovação escrita. A desmontagem
+    /// usa esta janela de quietude sob o lock lógico do PTY para não confundir o breve
+    /// intervalo entrega→Busy com um terminal realmente ocioso.
+    last_input_at: Arc<Mutex<Instant>>,
     consumer: Option<JoinHandle<()>>,
     /// F1-1-8 (ADR 0024): o writer do master, COMPARTILHADO entre a thread `serial_writer`
     /// (fila A2A/humano) e a porta atômica de aprovação
@@ -1422,6 +1471,9 @@ fn serial_writer(
     }
 }
 
+/// Callback leve chamado antes de uma entrada ser enfileirada no terminal.
+pub type TerminalInputObserver = Arc<dyn Fn(NodeId) + Send + Sync>;
+
 /// Broker in-process: roster, filas serial por terminal, locks lógicos, wait-for-graph,
 /// endereçamento e pub/sub. `Send + Sync` — compartilhe via `Arc<Supervisor>`.
 pub struct Supervisor {
@@ -1432,6 +1484,8 @@ pub struct Supervisor {
     rr: Mutex<HashMap<String, usize>>,
     events: broadcast::Sender<BusEvent>,
     config: SupervisorConfig,
+    input_observer: Mutex<Option<TerminalInputObserver>>,
+    input_generations: Mutex<HashMap<NodeId, u64>>,
 }
 
 impl Default for Supervisor {
@@ -1459,7 +1513,35 @@ impl Supervisor {
             rr: Mutex::new(HashMap::new()),
             events,
             config,
+            input_observer: Mutex::new(None),
+            input_generations: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Liga um observador chamado imediatamente antes de cada entrada chegar à fila
+    /// serial. O app usa este instante para fotografar o prompt anterior ao comando.
+    pub fn set_input_observer(&self, observer: TerminalInputObserver) {
+        *lock(&self.input_observer) = Some(observer);
+    }
+
+    fn observe_input(&self, node: NodeId) {
+        let observer = lock(&self.input_observer).clone();
+        if let Some(observer) = observer {
+            observer(node);
+        }
+    }
+
+    fn confirm_input(&self, node: NodeId) {
+        let mut generations = lock(&self.input_generations);
+        let generation = generations.entry(node).or_insert(0);
+        *generation = generation.wrapping_add(1);
+    }
+
+    /// Geração confirmada de entrada do terminal. Só avança depois que a escrita
+    /// entrou na fila serial ou foi gravada pela porta síncrona de aprovação.
+    #[must_use]
+    pub fn terminal_input_generation(&self, node: NodeId) -> Option<u64> {
+        lock(&self.input_generations).get(&node).copied()
     }
 
     /// Assina o pub/sub. O assinante recebe os eventos publicados DEPOIS da assinatura.
@@ -1484,6 +1566,7 @@ impl Supervisor {
         let id = Uuid::now_v7();
         let (tx, rx) = mpsc::channel::<WriteOp>();
         let applied = Arc::new(Mutex::new(Vec::new()));
+        let last_input_at = Arc::new(Mutex::new(Instant::now()));
         let cap = self.config.applied_log_cap;
 
         // ADR 0024: o writer do master é COMPARTILHADO entre o consumidor serial (fila A2A/
@@ -1509,12 +1592,14 @@ impl Supervisor {
             },
         );
         lock(&self.order).push(id);
+        lock(&self.input_generations).insert(id, 0);
         lock(&self.terminals).insert(
             id,
             TermChannel {
                 tx,
                 lock: PtyLock::new(self.config.lock_ttl),
                 applied,
+                last_input_at,
                 consumer,
                 sync_writer,
             },
@@ -1545,6 +1630,7 @@ impl Supervisor {
     /// Remove um nó por completo (roster + fila). Publica `NodeDied`.
     pub fn unregister(&self, node: NodeId) -> Result<(), SupervisorError> {
         let existed = lock(&self.registry).remove(&node).is_some();
+        lock(&self.input_generations).remove(&node);
         lock(&self.order).retain(|n| *n != node);
         self.stop_terminal(node);
         // Round 5 #7: limpa o nó do grafo multi-aresta — como waiter E como alvo (não trava quem
@@ -1596,6 +1682,34 @@ impl Supervisor {
             reason,
         });
         Ok(())
+    }
+
+    /// Troca o status somente se ele ainda for `expected`, sob o mesmo lock do
+    /// registry. Serve para efeitos destrutivos que precisam reservar um nó ocioso
+    /// sem a janela `get(Idle)` → outro thread marca `Busy` → shutdown.
+    pub fn set_status_if(
+        &self,
+        node: NodeId,
+        expected: NodeStatus,
+        status: NodeStatus,
+        reason: Option<String>,
+    ) -> Result<bool, SupervisorError> {
+        {
+            let mut registry = lock(&self.registry);
+            let info = registry
+                .get_mut(&node)
+                .ok_or(SupervisorError::NodeNotFound(node))?;
+            if info.status != expected {
+                return Ok(false);
+            }
+            info.status = status;
+        }
+        self.publish(BusEvent::NodeStatus {
+            node,
+            status,
+            reason,
+        });
+        Ok(true)
     }
 
     /// Define/atualiza o papel de um nó.
@@ -1765,11 +1879,21 @@ impl Supervisor {
     /// Enfileira um `WriteOp` na fila SERIAL do terminal (1 consumidor → sem
     /// interleave de bytes). Base da entrega A2A faseada de W0-9 (ver `a2a::deliver_a2a`).
     pub fn enqueue_write(&self, node: NodeId, op: WriteOp) -> Result<(), SupervisorError> {
+        self.observe_input(node);
+        let submits_command = matches!(&op, WriteOp::Submit { .. })
+            || matches!(&op, WriteOp::HumanKeys(bytes) if bytes.contains(&b'\r'));
         let map = lock(&self.terminals);
         let tc = map.get(&node).ok_or(SupervisorError::NodeNotFound(node))?;
+        *lock(&tc.last_input_at) = Instant::now();
         tc.tx
             .send(op)
-            .map_err(|_| SupervisorError::NodeNotFound(node))
+            .map_err(|_| SupervisorError::NodeNotFound(node))?;
+        drop(map);
+        self.confirm_input(node);
+        if submits_command {
+            self.set_status(node, NodeStatus::Busy)?;
+        }
+        Ok(())
     }
 
     /// Escrita do humano: transação atômica (lock lógico → `HumanKeys` → solta).
@@ -1832,14 +1956,20 @@ impl Supervisor {
         region_rows: usize,
     ) -> Result<approval::PortOutcome, SupervisorError> {
         // Handle do writer compartilhado (lock breve do mapa, solto antes do grid).
-        let sync_writer = lock(&self.terminals)
+        let (sync_writer, last_input_at) = lock(&self.terminals)
             .get(&node)
-            .map(|t| Arc::clone(&t.sync_writer))
+            .map(|terminal| {
+                (
+                    Arc::clone(&terminal.sync_writer),
+                    Arc::clone(&terminal.last_input_at),
+                )
+            })
             .ok_or(SupervisorError::NodeNotFound(node))?;
 
         // Trava o grid (o MESMO lock que o reader-loop do app segura antes de `advance`): nenhum
         // byte do PTY é aplicado ao grid entre o check e o write — atomicidade local. O guard
         // permanece VIVO por todo o `match` (inclusive durante write+flush).
+        self.observe_input(node);
         let vt = lock(grid);
         match approval::check_screen(&**vt, expected_hash, region_rows) {
             approval::ScreenCheck::Changed { current_hash } => {
@@ -1855,6 +1985,8 @@ impl Supervisor {
                     .map_err(|e| SupervisorError::WriteFailed(node, e.to_string()))?;
                 w.flush()
                     .map_err(|e| SupervisorError::WriteFailed(node, e.to_string()))?;
+                self.confirm_input(node);
+                *lock(&last_input_at) = Instant::now();
                 Ok(approval::PortOutcome::Written { vt_snapshot_hash })
             }
         }
@@ -1867,6 +1999,16 @@ impl Supervisor {
             .get(&node)
             .map(|t| lock(&t.applied).clone())
             .unwrap_or_default()
+    }
+
+    /// `true` quando nenhuma entrada foi enviada ao terminal durante `minimum`.
+    /// O chamador que pretende desmontá-lo deve manter [`Self::lock_pty`] enquanto
+    /// consulta, impedindo que uma nova entrada passe entre a checagem e o shutdown.
+    #[must_use]
+    pub fn terminal_input_is_quiet(&self, node: NodeId, minimum: Duration) -> bool {
+        lock(&self.terminals)
+            .get(&node)
+            .is_some_and(|terminal| lock(&terminal.last_input_at).elapsed() >= minimum)
     }
 
     /// Registra que `waiter` espera o `reply` de `target` (ask bloqueante) — CONVENIÊNCIA (1 aresta
@@ -1962,6 +2104,18 @@ mod bus_tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn prompt_observation_distinguishes_echo_from_a_later_prompt() {
+        let regex = r"(?m)^READY> ";
+        let baseline = prompt_observation("READY> ", "READY> ", regex, &[]).expect("prompt");
+        let echoed = prompt_observation("READY> sleep 1", "READY> sleep 1", regex, &[])
+            .expect("echo mantém prompt");
+        let returned = prompt_observation("READY> sleep 1\nREADY> ", "READY> ", regex, &[])
+            .expect("prompt posterior");
+        assert_eq!(baseline, echoed, "eco na mesma ocorrência não cria época");
+        assert_ne!(baseline, returned, "prompt posterior cria nova ocorrência");
     }
 
     fn sink() -> Box<dyn Write + Send> {

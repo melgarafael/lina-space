@@ -21,13 +21,14 @@
 //! passa por [`upcast`] antes de desserializar — o schema evolui sem quebrar o log.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write as _};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lina_host::{HostEvent, NodeId, UiHost};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::cli_discovery::DiscoveredCli;
@@ -742,6 +743,10 @@ pub enum DomainEvent {
     /// é por-workspace; este evento registra o foco vigente para a projeção do Switcher.)
     WorkspaceFocusSet {
         workspace: String,
+        /// Identifica uma tentativa de foco de ponta a ponta. Ausente nos logs anteriores
+        /// à troca transacional de workspace; não altera a projeção último-vence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus_id: Option<String>,
     },
     /// r5 perf-ws — **Descarregar Espaço** (modelo Maestri do fundador): os PTYs OCIOSOS de um
     /// Espaço de fundo foram desligados SEM remover os nós (religam no próximo foco via o fluxo
@@ -1862,13 +1867,30 @@ fn upcast(kind: &str, version: u32, mut payload: serde_json::Value) -> serde_jso
 }
 
 /// Registro persistido de um evento (forma comum ao SQLite e ao espelho JSONL).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventRecord {
     pub seq: u64,
     pub ts: u64,
     pub kind: String,
     pub version: u32,
     pub payload: serde_json::Value,
+}
+
+struct PreparedEvent {
+    kind: String,
+    version: u32,
+    payload: serde_json::Value,
+}
+
+struct CommittedBatch {
+    seqs: Vec<u64>,
+    event_count: u64,
+}
+
+struct ProjectionAtSeq {
+    state: ProjectedState,
+    seq: u64,
+    replayed: u64,
 }
 
 // ───────────────────────────── estado projetado + reducer ─────────────────────────────
@@ -2110,7 +2132,7 @@ pub fn apply(state: &mut ProjectedState, event: &DomainEvent) {
             }
         }
         // W4-4 (T6): o foco de workspace é projetado (último vence).
-        DomainEvent::WorkspaceFocusSet { workspace } => {
+        DomainEvent::WorkspaceFocusSet { workspace, .. } => {
             state.focused_workspace = Some(workspace.clone());
         }
         // F1-4-1: identidade durável do Espaço (a criação emite 1×; último vence).
@@ -2312,7 +2334,18 @@ CREATE TABLE IF NOT EXISTS snapshots (
     ts    INTEGER NOT NULL,
     state TEXT    NOT NULL
 );
+CREATE TABLE IF NOT EXISTS jsonl_mirror (
+    seq INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS jsonl_state (
+    singleton    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    file_len     INTEGER NOT NULL,
+    modified_ns  TEXT    NOT NULL,
+    event_count  INTEGER NOT NULL
+);
 ";
+
+const EVENT_BY_SEQ_SQL: &str = "SELECT seq, ts, kind, version, payload FROM events WHERE seq = ?1";
 
 /// **W3-7b §4.3 — reconciliação do path do espelho.** O design e o gate da Onda 3 verificam
 /// `.lina/events/log.jsonl`; o código histórico escrevia `<store>/bus.jsonl`. DECISÃO: o espelho
@@ -2322,6 +2355,59 @@ CREATE TABLE IF NOT EXISTS snapshots (
 /// migração no MVP, pois não há dados persistentes de produção.)
 const JSONL_FILE: &str = "log.jsonl";
 
+/// Certificado externo do espelho. Não é uma terceira autoridade: só prova que o
+/// JSONL contém exatamente o último conjunto que o SQLite confirmou. Recuperação
+/// sem este certificado, com `pending` ou com digest divergente é recusada.
+const JSONL_RECOVERY_STATE_FILE: &str = "log.recovery.json";
+const JSONL_RECOVERY_STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct JsonlRecoveryState {
+    version: u32,
+    #[serde(flatten)]
+    status: JsonlRecoveryStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum JsonlRecoveryStatus {
+    /// Gravado e sincronizado ANTES do commit SQLite. Enquanto existir, nenhum
+    /// prefixo do JSONL pode ser promovido a banco recuperado.
+    Pending {
+        target_event_count: u64,
+        target_last_seq: u64,
+    },
+    /// Publicado somente depois do `sync_data` do JSONL canônico.
+    Complete {
+        event_count: u64,
+        last_seq: u64,
+        digest_sha256: String,
+    },
+}
+
+impl JsonlRecoveryState {
+    fn pending(target_event_count: u64, target_last_seq: u64) -> Self {
+        Self {
+            version: JSONL_RECOVERY_STATE_VERSION,
+            status: JsonlRecoveryStatus::Pending {
+                target_event_count,
+                target_last_seq,
+            },
+        }
+    }
+
+    fn complete(event_count: u64, last_seq: u64, digest_sha256: String) -> Self {
+        Self {
+            version: JSONL_RECOVERY_STATE_VERSION,
+            status: JsonlRecoveryStatus::Complete {
+                event_count,
+                last_seq,
+                digest_sha256,
+            },
+        }
+    }
+}
+
 /// Event store de um workspace: SQLite WAL (`events`) + espelho `log.jsonl` (§4.3) +
 /// snapshots. Single-thread (a `Connection` do rusqlite não é `Sync`); o supervisor
 /// futuro a embrulha sob lock.
@@ -2330,6 +2416,7 @@ pub struct EventStore {
     dir: PathBuf,
     db_path: PathBuf,
     jsonl_path: PathBuf,
+    jsonl_recovery_state_path: PathBuf,
     snapshots_dir: PathBuf,
     next_seq: u64,
     /// r5 perf-ws: cache incremental de [`EventStore::project`] — `(último seq aplicado,
@@ -2341,6 +2428,9 @@ pub struct EventStore {
     /// Contador observável de eventos reaplicados por `project()` desde o open — a prova
     /// DETERMINÍSTICA do incremental nos testes (timing seria flaky).
     replayed_total: std::cell::Cell<u64>,
+    /// Estado SHA-256 incremental do arquivo físico observado por esta conexão.
+    /// Outra conexão alterando o arquivo invalida o cache por tamanho/mtime/count.
+    jsonl_digest_cache: Option<JsonlDigestCache>,
 }
 
 /// r5 perf-ws: cadência do snapshot AUTOMÁTICO no append (1 a cada N eventos). Sem isso,
@@ -2350,104 +2440,312 @@ pub struct EventStore {
 const SNAPSHOT_EVERY: u64 = 4096;
 
 impl EventStore {
-    /// Abre (ou cria) o event store em `dir`. **Não** faz recuperação — use
-    /// [`EventStore::open_or_recover`] para a abertura resiliente a corrupção (W0-6).
+    /// Abre (ou cria) o event store em `dir` pelo caminho rápido. Um banco existente
+    /// recebe somente validação estrutural e posicional (`events` + primeiro/último
+    /// `seq`); o histórico e o JSONL nunca são varridos nesta etapa. Corrupção interna
+    /// aparece naturalmente no consumidor que projeta o log — use
+    /// [`EventStore::project_or_recover`] quando esse consumidor puder recuperar.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let dir = dir.as_ref().to_path_buf();
+        let dir = dir.as_ref();
+        let db = dir.join("lina.db");
+        let jsonl = dir.join(JSONL_FILE);
+        let recovery_state = dir.join(JSONL_RECOVERY_STATE_FILE);
+        if !db.try_exists()? && recovery_artifacts_exist(&jsonl, &recovery_state)? {
+            return Err(invalid_recovery_data(format!(
+                "há artefatos de recuperação em {} sem o SQLite autoritativo; use open_or_recover",
+                dir.display()
+            )));
+        }
+        Self::open_inner(dir, true)
+    }
+
+    /// Abre a conexão e o schema. O rebuild usa `reconcile=false` porque, nesse instante,
+    /// o JSONL é a única cópia íntegra: reconciliá-lo contra um SQLite recém-criado e vazio
+    /// apagaria justamente a fonte de recuperação.
+    fn open_inner(dir: &Path, reconcile: bool) -> Result<Self, StoreError> {
+        let dir = dir.to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let snapshots_dir = dir.join("snapshots");
         std::fs::create_dir_all(&snapshots_dir)?;
         let db_path = dir.join("lina.db");
         let jsonl_path = dir.join(JSONL_FILE);
+        let jsonl_recovery_state_path = dir.join(JSONL_RECOVERY_STATE_FILE);
+        let db_existed = db_path.try_exists()?;
 
         let conn = Connection::open(&db_path)?;
         // FURO A (parte 1): com o store ws2/ws3 unificado, APP e bin (`lina do/guard`) escrevem no MESMO
         // log → escritores CONCORRENTES. Sem `busy_timeout`, o 2º escritor recebe `SQLITE_BUSY` IMEDIATO
         // ao disputar o write-lock e PERDE o evento (de segurança!). Com o timeout, ele ESPERA o lock
-        // (3s é folgado; o WAL deixa leituras passarem em paralelo). DEFINIDO ANTES de qualquer escrita:
+        // (30s cobre inclusive uma sequência de fsyncs do certificado durável; o WAL deixa leituras
+        // passarem em paralelo). DEFINIDO ANTES de qualquer escrita:
         // o próprio `journal_mode=WAL` e o `CREATE TABLE` (schema) pegam write-lock, então a ABERTURA
         // concorrente já precisa do timeout (senão é a `open()` do 2º processo que estoura `BUSY`).
-        // Complementa o retry anti-colisão de `seq` (parte 2): este resolve a disputa de LOCK; aquele, a
-        // colisão de PK (dois processos calculando o mesmo `seq` cacheado).
-        conn.busy_timeout(std::time::Duration::from_millis(3000))?;
+        // O mesmo lock serializa a leitura fresca de `MAX(seq)` e o INSERT transacional do batch;
+        // nenhum escritor aloca sequência a partir de cache local.
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        let existing_position = db_existed
+            .then(|| validate_existing_store_head(&conn))
+            .transpose()?;
         enable_wal(&conn)?;
         conn.execute_batch(SCHEMA)?;
-        let next_seq: i64 =
-            conn.query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM events", [], |r| {
-                r.get(0)
-            })?;
+        let (event_count, last_seq) = match existing_position {
+            Some(position) => position,
+            None => event_log_position(&conn)?,
+        };
+        let next_seq = last_seq.checked_add(1).ok_or_else(|| {
+            invalid_recovery_data("sequência do event log excedeu u64".to_owned())
+        })?;
 
-        Ok(Self {
+        let mut store = Self {
             conn,
             dir,
             db_path,
             jsonl_path,
+            jsonl_recovery_state_path,
             snapshots_dir,
-            next_seq: next_seq as u64,
+            next_seq,
             proj_cache: std::cell::RefCell::new(None),
             replayed_total: std::cell::Cell::new(0),
-        })
+            jsonl_digest_cache: None,
+        };
+
+        if reconcile {
+            // SQLite é a autoridade. Se um append anterior confirmou o INSERT e o espelho falhou
+            // depois (por exemplo EMFILE), repõe o arquivo canônico inteiro. A reconciliação é
+            // best-effort porque indisponibilidade do espelho não pode tornar indisponível o log
+            // autoritativo; a falha permanece observável e será tentada no próximo append/open.
+            if let Err(error) = store.reconcile_jsonl_from_db(event_count, last_seq) {
+                tracing::error!(
+                    path = %store.jsonl_path.display(),
+                    %error,
+                    "espelho JSONL degradado; SQLite segue autoritativo e a reconciliação será repetida"
+                );
+            }
+        }
+
+        Ok(store)
     }
 
-    /// Abertura RESILIENTE (W0-6): roda `PRAGMA integrity_check`; se o `.db` estiver
-    /// corrompido, **preserva** o arquivo (`lina.db.corrupt-<ts>`), reconstrói do
-    /// `log.jsonl` e emite `Recovering` → `Recovered` no `UiHost` — nunca silencioso.
+    /// Abertura resiliente a falhas ESTRUTURAIS detectáveis pelo cabeçalho do store.
+    /// O caminho saudável chama [`EventStore::open`] uma única vez e permanece O(1).
+    /// Para corrupção encontrada durante o replay, abra com [`EventStore::open`] e
+    /// finalize com [`EventStore::project_or_recover`].
     pub fn open_or_recover(dir: impl AsRef<Path>, ui: &mut dyn UiHost) -> Result<Self, StoreError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let db_path = dir.join("lina.db");
+        let jsonl_path = dir.join(JSONL_FILE);
+        let recovery_state_path = dir.join(JSONL_RECOVERY_STATE_FILE);
 
-        if !db_path.exists() || !db_is_corrupt(&db_path) {
-            return Self::open(&dir); // novo ou saudável → abertura normal, sem recovery
+        if !db_path.try_exists()? {
+            if recovery_artifacts_exist(&jsonl_path, &recovery_state_path)? {
+                let records = recoverable_jsonl_records(&jsonl_path, &recovery_state_path)?;
+                ui.on_event(HostEvent::Recovering);
+                let store = Self::rebuild_database_atomic(&dir, &records, |_| Ok(()))?;
+                ui.on_event(HostEvent::Recovered);
+                return Ok(store);
+            }
+            return Self::open(&dir); // store realmente novo: não há DB nem espelho recuperável
         }
+
+        let open_error = match Self::open(&dir) {
+            Ok(store) => return Ok(store),
+            Err(error) => error,
+        };
+        if !is_recoverable_store_corruption(&open_error) || !db_is_corrupt(&db_path) {
+            return Err(open_error);
+        }
+        Self::recover_existing_database(&dir, ui)
+    }
+
+    /// Abre e projeta com recuperação completa nos dois pontos onde corrupção pode
+    /// aparecer: no cabeçalho estrutural ou durante o replay semântico. Este é o helper
+    /// indicado para boot/loaders que precisam do estado projetado imediatamente.
+    pub fn open_projected_or_recover(
+        dir: impl AsRef<Path>,
+        ui: &mut dyn UiHost,
+    ) -> Result<(Self, ProjectedState), StoreError> {
+        Self::open_or_recover(dir, ui)?.project_or_recover(ui)
+    }
+
+    /// Projeta um store já aberto pelo fast path e só aciona disaster recovery quando
+    /// o replay observa corrupção determinística. Erros transitórios (lock, permissão,
+    /// I/O) continuam sendo devolvidos sem preservar ou substituir um banco saudável.
+    ///
+    /// O retorno conserva o store porque consumidores quentes normalmente precisam do
+    /// estado projetado e da conexão que o produziu.
+    pub fn project_or_recover(
+        self,
+        ui: &mut dyn UiHost,
+    ) -> Result<(Self, ProjectedState), StoreError> {
+        match self.project() {
+            Ok(projected) => Ok((self, projected)),
+            Err(error) if is_recoverable_store_corruption(&error) => {
+                let dir = self.dir.clone();
+                drop(self);
+                let recovered = Self::recover_existing_database(&dir, ui)?;
+                let projected = recovered.project()?;
+                Ok((recovered, projected))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn recover_existing_database(dir: &Path, ui: &mut dyn UiHost) -> Result<Self, StoreError> {
+        let db_path = dir.join("lina.db");
+        let jsonl_path = dir.join(JSONL_FILE);
+        let recovery_state_path = dir.join(JSONL_RECOVERY_STATE_FILE);
+        let records =
+            recoverable_jsonl_records(&jsonl_path, &recovery_state_path).map_err(|error| {
+                invalid_recovery_data(format!(
+                    "{} está corrompido e o espelho não é recuperável: {error}",
+                    db_path.display()
+                ))
+            })?;
 
         // Corrompido (lição Codex #21750): recuperação VISÍVEL.
         ui.on_event(HostEvent::Recovering);
         let preserved = preserve_corrupt(&db_path)?;
         tracing::warn!(corrupt = %preserved.display(), "banco corrompido preservado; reconstruindo do JSONL");
-        let store = Self::rebuild_from_jsonl(&dir)?;
+        let store = Self::rebuild_database_atomic(dir, &records, |_| Ok(()))?;
         ui.on_event(HostEvent::Recovered);
         Ok(store)
     }
 
-    /// Reconstrói o `.db` (novo) reaplicando o espelho `log.jsonl`. Linhas ilegíveis
-    /// são postas em **quarentena** (warn + segue) — não engole erro silenciosamente.
-    fn rebuild_from_jsonl(dir: &Path) -> Result<Self, StoreError> {
-        let mut store = Self::open(dir)?; // `lina.db` novo+schema (o corrompido já foi renomeado)
-        let jsonl = dir.join(JSONL_FILE);
-        if !jsonl.exists() {
-            return Ok(store);
-        }
-        let file = std::fs::File::open(&jsonl)?;
-        let reader = std::io::BufReader::new(file);
-        for (lineno, line) in reader.lines().enumerate() {
-            let line = match line {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(line = lineno, "linha JSONL ilegível, quarentena: {e}");
-                    continue;
+    /// Constrói o SQLite recuperado fora do caminho final, fecha/checkpointa a conexão e
+    /// só então publica `lina.db` por rename. Qualquer falha intermediária deixa o JSONL
+    /// original intacto e nenhum banco parcial que um retry possa confundir com saudável.
+    fn rebuild_database_atomic(
+        dir: &Path,
+        records: &[EventRecord],
+        mut checkpoint: impl FnMut(usize) -> Result<(), StoreError>,
+    ) -> Result<Self, StoreError> {
+        let staging = dir.join(format!(
+            ".lina-db-recovery-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir(&staging)?;
+        let build = (|| -> Result<(), StoreError> {
+            let mut store = Self::open_inner(&staging, false)?;
+            {
+                let tx = store
+                    .conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                for (index, record) in records.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO events (seq, ts, kind, version, payload) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            i64::try_from(record.seq).map_err(|_| {
+                                invalid_recovery_data(format!(
+                                    "seq {} não cabe no SQLite",
+                                    record.seq
+                                ))
+                            })?,
+                            i64::try_from(record.ts).map_err(|_| {
+                                invalid_recovery_data(format!(
+                                    "timestamp {} não cabe no SQLite",
+                                    record.ts
+                                ))
+                            })?,
+                            record.kind,
+                            i64::from(record.version),
+                            serde_json::to_string(&record.payload)?
+                        ],
+                    )?;
+                    checkpoint(index + 1)?;
                 }
-            };
-            if line.trim().is_empty() {
-                continue;
+                tx.commit()?;
             }
-            match serde_json::from_str::<EventRecord>(&line) {
-                Ok(rec) => store.db_insert(&rec)?,
-                Err(e) => tracing::warn!(line = lineno, "linha JSONL corrompida, quarentena: {e}"),
+            if query_all_events(&store.conn)? != records {
+                return Err(invalid_recovery_data(
+                    "o SQLite de staging não reproduziu todos os eventos do espelho".to_owned(),
+                ));
             }
+            let integrity: String = store
+                .conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            if integrity != "ok" {
+                return Err(invalid_recovery_data(format!(
+                    "integrity_check do DB recuperado retornou {integrity}"
+                )));
+            }
+            store
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            drop(store);
+
+            let staged_db = staging.join("lina.db");
+            std::fs::File::open(&staged_db)?.sync_all()?;
+            let final_db = dir.join("lina.db");
+            if final_db.try_exists()? {
+                return Err(invalid_recovery_data(format!(
+                    "{} apareceu durante a recuperação; o candidato completo ficou isolado",
+                    final_db.display()
+                )));
+            }
+            std::fs::rename(&staged_db, &final_db)?;
+            #[cfg(unix)]
+            if let Err(error) = std::fs::File::open(dir).and_then(|parent| parent.sync_all()) {
+                tracing::error!(
+                    path = %dir.display(),
+                    %error,
+                    "DB recuperado já foi publicado; fsync do diretório falhou"
+                );
+            }
+            Ok(())
+        })();
+        match std::fs::remove_dir_all(&staging) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if build.is_ok() => return Err(error.into()),
+            Err(error) => tracing::warn!(
+                path = %staging.display(),
+                %error,
+                "não consegui remover staging de recuperação após falha"
+            ),
         }
-        Ok(store)
+        build?;
+        Self::open(dir)
     }
 
     /// Anexa um evento do domínio (versão CORRENTE) ao log: INSERT no SQLite +
     /// linha no espelho JSONL append-only. Devolve o `seq` atribuído.
     pub fn append(&mut self, event: &DomainEvent) -> Result<u64, StoreError> {
-        let payload = serde_json::to_value(event)?;
-        self.insert_raw(event.kind(), event.current_version(), payload)
+        let committed = self.insert_prepared_batch(vec![PreparedEvent {
+            kind: event.kind().to_owned(),
+            version: event.current_version(),
+            payload: serde_json::to_value(event)?,
+        }])?;
+        committed.seqs.into_iter().next().ok_or_else(|| {
+            invalid_recovery_data("append unitário não recebeu sequência".to_owned())
+        })
+    }
+
+    /// Persiste `events` em uma única transação SQLite, preservando a ordem e
+    /// devolvendo a contagem confirmada do log (igual ao último `seq`, pois o log é
+    /// contíguo). Slice vazio devolve a contagem atual. Qualquer erro até o commit
+    /// deixa zero subconjunto visível. Depois do commit confirmado, falha do espelho
+    /// não vira falso `Err`: o certificado permanece `pending` e um DB saudável o
+    /// repara na próxima abertura/append.
+    pub fn append_batch(&mut self, events: &[DomainEvent]) -> Result<u64, StoreError> {
+        let prepared = events
+            .iter()
+            .map(|event| {
+                Ok(PreparedEvent {
+                    kind: event.kind().to_owned(),
+                    version: event.current_version(),
+                    payload: serde_json::to_value(event)?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(self.insert_prepared_batch(prepared)?.event_count)
     }
 
     /// W4-4: como [`append`], mas **observa a durabilidade** para a UI: chama `on_flush(Saving)`
-    /// antes de escrever e `on_flush(Saved)` após o append durável (JSONL flushed). O shell liga
+    /// antes de escrever e `on_flush(Saved)` após o append autoritativo no SQLite. O espelho
+    /// JSONL é reconciliável e pode estar temporariamente degradado sem tornar o fato incerto. O shell liga
     /// `on_flush` ao indicador "salvando…/Tudo salvo ✓" (e ao seu `HostEvent`) **sem o core importar
     /// o contrato de UI**. NÃO reimplementa persistência — só envolve [`append`] (W0-5) com a
     /// notificação. Devolve o `seq` atribuído.
@@ -2471,74 +2769,253 @@ impl EventStore {
         version: u32,
         payload: serde_json::Value,
     ) -> Result<u64, StoreError> {
-        // Monta com o `seq` OTIMISTA (cache em-memória) — o caminho rápido do escritor único NÃO paga
-        // nada (1 tentativa, sem SELECT extra). `ts`/`payload` carimbados UMA vez: o retry reusa os
-        // mesmos (a colisão não deve alterar o conteúdo do evento, só seu `seq`).
-        let mut rec = EventRecord {
-            seq: self.next_seq,
-            ts: now_millis(),
-            kind: kind.to_string(),
+        let committed = self.insert_prepared_batch(vec![PreparedEvent {
+            kind: kind.to_owned(),
             version,
             payload,
-        };
-        // FURO A (parte 2): `next_seq` é cache POR-PROCESSO (nasce de `MAX(seq)+1` no open()). Sob 2
-        // escritores, ambos podem calcular o MESMO `seq` → o 2º INSERT viola o PK e o evento de SEGURANÇA
-        // some. Em colisão, re-lê `MAX(seq)` FRESCO do banco (o que o outro processo gravou), bumpa e
-        // RE-INSERE — retry BOUNDED. Não é autoincrement (mudaria contrato/migração): é o mínimo correto.
-        const MAX_RETRIES: u32 = 8;
-        let mut attempt: u32 = 0;
-        loop {
-            match self.db_insert(&rec) {
-                Ok(()) => break,
-                Err(e) if is_seq_conflict(&e) && attempt < MAX_RETRIES => {
-                    attempt += 1;
-                    // Re-lê o seq REALMENTE gravado e mira o próximo livre. `db_insert` (no sucesso)
-                    // re-sincroniza `self.next_seq`; aqui só corrigimos o alvo da re-tentativa.
-                    let max: i64 = self.conn.query_row(
-                        "SELECT COALESCE(MAX(seq), 0) FROM events",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    let next = (max as u64).saturating_add(1);
-                    self.next_seq = next;
-                    rec.seq = next;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // Espelha no JSONL com o `seq` EFETIVAMENTE gravado (não o otimista) — DB e espelho casam.
-        append_jsonl(&self.jsonl_path, &rec)?;
-        // r5 perf-ws: snapshot AUTOMÁTICO a cada SNAPSHOT_EVERY appends — limita o replay
-        // de conexões FRESCAS (sidebar/bin) ao delta pós-snapshot. Best-effort: o append já
-        // é durável; falha de snapshot loga ALTO e nunca derruba o caminho de escrita.
-        if rec.seq.is_multiple_of(SNAPSHOT_EVERY) {
-            if let Err(e) = self.take_snapshot() {
-                eprintln!(
-                    "lina-core: snapshot automático no seq {} falhou ({e}); replay segue \
-                     correto, só mais lento",
-                    rec.seq
-                );
-            }
-        }
-        Ok(rec.seq)
+        }])?;
+        committed.seqs.into_iter().next().ok_or_else(|| {
+            invalid_recovery_data("insert_raw unitário não recebeu sequência".to_owned())
+        })
     }
 
-    /// INSERT apenas no SQLite (sem tocar no JSONL) — usado pelo rebuild, em que o
-    /// JSONL é a FONTE (re-escrevê-lo duplicaria o espelho).
-    fn db_insert(&mut self, rec: &EventRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO events (seq, ts, kind, version, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                rec.seq as i64,
-                rec.ts as i64,
-                rec.kind,
-                rec.version as i64,
-                serde_json::to_string(&rec.payload)?
-            ],
-        )?;
-        if rec.seq + 1 > self.next_seq {
-            self.next_seq = rec.seq + 1;
+    fn insert_prepared_batch(
+        &mut self,
+        prepared: Vec<PreparedEvent>,
+    ) -> Result<CommittedBatch, StoreError> {
+        if prepared.is_empty() {
+            return Ok(CommittedBatch {
+                seqs: Vec::new(),
+                event_count: self.event_count()?,
+            });
         }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (_, current_last_seq) = event_log_position(&tx)?;
+        let max_seq = i64::try_from(current_last_seq)
+            .map_err(|_| invalid_recovery_data("sequência atual não cabe no SQLite".to_owned()))?;
+        // `seq` é alocado sob `BEGIN IMMEDIATE`, sempre como `MAX(seq) + 1`, e nunca
+        // sofre UPDATE/DELETE. Logo o próprio head é a contagem confirmada; `COUNT(*)`
+        // aqui faria todo append crescer linearmente com o histórico.
+        let event_count = max_seq;
+        let batch_len = i64::try_from(prepared.len())
+            .map_err(|_| invalid_recovery_data("batch grande demais para o SQLite".to_owned()))?;
+        let target_last_seq = max_seq.checked_add(batch_len).ok_or_else(|| {
+            invalid_recovery_data("sequência do event log excedeu i64".to_owned())
+        })?;
+        let target_event_count = event_count
+            .checked_add(batch_len)
+            .ok_or_else(|| invalid_recovery_data("contagem do event log excedeu i64".to_owned()))?;
+
+        let ts = now_millis();
+        let mut records = Vec::with_capacity(prepared.len());
+        for (index, event) in prepared.into_iter().enumerate() {
+            let offset = i64::try_from(index + 1)
+                .map_err(|_| invalid_recovery_data("offset do batch excedeu i64".to_owned()))?;
+            let seq = u64::try_from(max_seq + offset)
+                .map_err(|_| invalid_recovery_data("sequência inválida no batch".to_owned()))?;
+            records.push(EventRecord {
+                seq,
+                ts,
+                kind: event.kind,
+                version: event.version,
+                payload: event.payload,
+            });
+        }
+        let payloads = records
+            .iter()
+            .map(|record| serde_json::to_string(&record.payload))
+            .collect::<Result<Vec<_>, _>>()?;
+        let target_event_count_u64 = u64::try_from(target_event_count)
+            .map_err(|_| invalid_recovery_data("contagem alvo inválida".to_owned()))?;
+        let target_last_seq_u64 = u64::try_from(target_last_seq)
+            .map_err(|_| invalid_recovery_data("sequência alvo inválida".to_owned()))?;
+
+        // O certificado pending é a barreira de write-ahead externa: se não ficar
+        // durável, a transação nem começa a inserir eventos.
+        write_recovery_state_atomic(
+            &self.jsonl_recovery_state_path,
+            &JsonlRecoveryState::pending(target_event_count_u64, target_last_seq_u64),
+        )?;
+        for (record, payload) in records.iter().zip(payloads) {
+            tx.execute(
+                "INSERT INTO events (seq, ts, kind, version, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    i64::try_from(record.seq).map_err(|_| {
+                        invalid_recovery_data("sequência não cabe no SQLite".to_owned())
+                    })?,
+                    i64::try_from(record.ts).map_err(|_| {
+                        invalid_recovery_data("timestamp não cabe no SQLite".to_owned())
+                    })?,
+                    &record.kind,
+                    i64::from(record.version),
+                    payload
+                ],
+            )?;
+        }
+        tx.commit()?;
+
+        self.next_seq = target_last_seq_u64.saturating_add(1);
+        if let Err(error) = self.mirror_committed_records(&records) {
+            tracing::error!(
+                first_seq = records.first().map(|record| record.seq),
+                last_seq = records.last().map(|record| record.seq),
+                path = %self.jsonl_path.display(),
+                %error,
+                "batch confirmado no SQLite; espelho permanece pending e será reconciliado"
+            );
+        }
+        if records
+            .iter()
+            .any(|record| record.seq.is_multiple_of(SNAPSHOT_EVERY))
+        {
+            if let Err(error) = self.take_snapshot() {
+                tracing::error!(%error, "snapshot automático falhou; replay segue correto");
+            }
+        }
+        Ok(CommittedBatch {
+            seqs: records.iter().map(|record| record.seq).collect(),
+            event_count: target_event_count_u64,
+        })
+    }
+
+    /// Reconstrói o espelho canônico quando o arquivo físico diverge do estado confirmado.
+    /// Reescrever por temporário + rename evita cauda parcial, duplicata e payload divergente;
+    /// o SQLite permanece a única autoridade durante toda a reparação.
+    fn reconcile_jsonl_from_db(
+        &mut self,
+        event_count: u64,
+        last_seq: u64,
+    ) -> Result<(), StoreError> {
+        if event_count == 0
+            && !recovery_artifacts_exist(&self.jsonl_path, &self.jsonl_recovery_state_path)?
+        {
+            return Ok(());
+        }
+        if jsonl_state_matches(&self.conn, &self.jsonl_path, event_count)?
+            && jsonl_certificate_matches_position(
+                &self.jsonl_recovery_state_path,
+                event_count,
+                last_seq,
+            )?
+        {
+            return Ok(());
+        }
+
+        // O lock SQLite serializa reconciliação e appends do espelho entre processos.
+        let jsonl_path = self.jsonl_path.clone();
+        let recovery_state_path = self.jsonl_recovery_state_path.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (event_count, last_seq) = event_log_position(&tx)?;
+        if jsonl_state_matches(&tx, &jsonl_path, event_count)?
+            && jsonl_certificate_matches_position(&recovery_state_path, event_count, last_seq)?
+        {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        let records = query_all_events(&tx)?;
+        write_recovery_state_atomic(
+            &recovery_state_path,
+            &JsonlRecoveryState::pending(event_count, last_seq),
+        )?;
+        let synced = rewrite_jsonl_atomic(&jsonl_path, &records)?;
+        replace_jsonl_confirmation(&tx, &records, &synced.file_state)?;
+        write_complete_recovery_state(&recovery_state_path, event_count, last_seq, &synced.hasher)?;
+        tx.commit()?;
+        self.jsonl_digest_cache = Some(JsonlDigestCache::from_synced(event_count, &synced));
+        Ok(())
+    }
+
+    /// Espelha um batch já confirmado no SQLite sob o mesmo lock usado pela reconciliação.
+    /// Se outro escritor já reparou toda a cauda, apenas confirma o estado atual. Se o
+    /// prefixo observado por esta conexão ainda é o confirmado, faz append incremental;
+    /// qualquer dúvida força reescrita canônica a partir da autoridade SQLite.
+    fn mirror_committed_records(&mut self, committed: &[EventRecord]) -> Result<(), StoreError> {
+        if committed.is_empty() {
+            return Ok(());
+        }
+        let jsonl_path = self.jsonl_path.clone();
+        let recovery_state_path = self.jsonl_recovery_state_path.clone();
+        let cached_digest = self.jsonl_digest_cache.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (event_count, last_seq) = event_log_position(&tx)?;
+        if jsonl_state_matches(&tx, &jsonl_path, event_count)?
+            && jsonl_certificate_matches_position(&recovery_state_path, event_count, last_seq)?
+        {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        write_recovery_state_atomic(
+            &recovery_state_path,
+            &JsonlRecoveryState::pending(event_count, last_seq),
+        )?;
+
+        let committed_count = u64::try_from(committed.len())
+            .map_err(|_| invalid_recovery_data("batch espelhado excede u64".to_owned()))?;
+        let previous_count = event_count.checked_sub(committed_count).ok_or_else(|| {
+            invalid_recovery_data("batch espelhado é maior que o log SQLite".to_owned())
+        })?;
+        let expected_first_seq = previous_count
+            .checked_add(1)
+            .ok_or_else(|| invalid_recovery_data("sequência do espelho excedeu u64".to_owned()))?;
+        let is_current_tail = committed.first().map(|record| record.seq)
+            == Some(expected_first_seq)
+            && committed.last().map(|record| record.seq) == Some(last_seq)
+            && committed.iter().enumerate().all(|(index, record)| {
+                record.seq == expected_first_seq.saturating_add(index as u64)
+            });
+        let prefix_is_confirmed =
+            is_current_tail && jsonl_state_matches(&tx, &jsonl_path, previous_count)?;
+
+        let (synced, canonical_records) =
+            if prefix_is_confirmed && previous_count == 0 && mirror_is_empty(&jsonl_path)? {
+                (
+                    append_jsonl_records(&jsonl_path, committed, Sha256::new())?,
+                    None,
+                )
+            } else if prefix_is_confirmed {
+                let physical_state = mirror_file_state(&jsonl_path)?;
+                if let Some(cache) = cached_digest.as_ref().filter(|cache| {
+                    cache.event_count == previous_count
+                        && physical_state.as_ref() == Some(&cache.file_state)
+                }) {
+                    (
+                        append_jsonl_records(&jsonl_path, committed, cache.hasher.clone())?,
+                        None,
+                    )
+                } else {
+                    let records = query_all_events(&tx)?;
+                    let synced = rewrite_jsonl_atomic(&jsonl_path, &records)?;
+                    (synced, Some(records))
+                }
+            } else {
+                let records = query_all_events(&tx)?;
+                let synced = rewrite_jsonl_atomic(&jsonl_path, &records)?;
+                (synced, Some(records))
+            };
+
+        if let Some(records) = canonical_records {
+            replace_jsonl_confirmation(&tx, &records, &synced.file_state)?;
+        } else {
+            for record in committed {
+                let seq = i64::try_from(record.seq).map_err(|_| {
+                    invalid_recovery_data("sequência não cabe no SQLite".to_owned())
+                })?;
+                tx.execute("INSERT INTO jsonl_mirror (seq) VALUES (?1)", [seq])?;
+            }
+            upsert_jsonl_state(&tx, &synced.file_state, event_count)?;
+        }
+        write_complete_recovery_state(&recovery_state_path, event_count, last_seq, &synced.hasher)?;
+        tx.commit()?;
+        self.jsonl_digest_cache = Some(JsonlDigestCache::from_synced(event_count, &synced));
         Ok(())
     }
 
@@ -2550,35 +3027,22 @@ impl EventStore {
     /// processo entram pelo mesmo delta de seq (log append-only — nunca reescrito).
     pub fn project(&self) -> Result<ProjectedState, StoreError> {
         let cached = self.proj_cache.borrow().clone();
-        let (mut state, from_seq) = match cached {
+        let (state, from_seq) = match cached {
             Some((seq, st)) => (st, seq),
             None => match self.latest_snapshot()? {
                 Some((seq, st)) => (st, seq),
                 None => (ProjectedState::default(), 0),
             },
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, kind, version, payload FROM events WHERE seq > ?1 ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map([from_seq as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut last_seq = from_seq;
-        for row in rows {
-            let (seq, kind, version, payload_str) = row?;
-            let payload: serde_json::Value = serde_json::from_str(&payload_str)?;
-            let event = DomainEvent::from_record(&kind, version as u32, payload)?;
-            apply(&mut state, &event);
-            last_seq = seq as u64;
-            self.replayed_total.set(self.replayed_total.get() + 1);
-        }
-        *self.proj_cache.borrow_mut() = Some((last_seq, state.clone()));
-        Ok(state)
+        let projection = replay_projection(&self.conn, state, from_seq, None)?;
+        let replayed_total = self
+            .replayed_total
+            .get()
+            .checked_add(projection.replayed)
+            .ok_or_else(|| invalid_recovery_data("contador de replay excedeu u64".to_owned()))?;
+        self.replayed_total.set(replayed_total);
+        *self.proj_cache.borrow_mut() = Some((projection.seq, projection.state.clone()));
+        Ok(projection.state)
     }
 
     /// Total de eventos REAPLICADOS por [`EventStore::project`] desde o open — o
@@ -2592,12 +3056,49 @@ impl EventStore {
     /// Materializa um snapshot do estado projetado (tabela + arquivo espelho em
     /// `snapshots/`, para resiliência §4.6). Devolve o `seq` coberto.
     pub fn take_snapshot(&mut self) -> Result<u64, StoreError> {
-        let state = self.project()?;
-        let seq = self.next_seq.saturating_sub(1);
-        let state_json = serde_json::to_string(&state)?;
+        let cached = self.proj_cache.borrow().clone();
+        let projection = {
+            // A transação é somente de leitura durante o replay. Assim o head e o
+            // estado vêm da mesma visão WAL, mas nenhum escritor fica serializado
+            // enquanto o snapshot é persistido em SQLite/arquivo.
+            let transaction = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+            let (_, head_seq) = event_log_position(&transaction)?;
+            let (state, from_seq) = match cached {
+                Some((seq, state)) => (state, seq),
+                None => match latest_snapshot_from(&transaction)? {
+                    Some((seq, state)) => (state, seq),
+                    None => (ProjectedState::default(), 0),
+                },
+            };
+            if from_seq > head_seq {
+                return Err(invalid_recovery_data(format!(
+                    "checkpoint da projeção está adiante do event log: seq {from_seq}, head {head_seq}"
+                )));
+            }
+            let projection = replay_projection(&transaction, state, from_seq, Some(head_seq))?;
+            transaction.commit()?;
+            projection
+        };
+
+        let replayed_total = self
+            .replayed_total
+            .get()
+            .checked_add(projection.replayed)
+            .ok_or_else(|| invalid_recovery_data("contador de replay excedeu u64".to_owned()))?;
+        self.replayed_total.set(replayed_total);
+        *self.proj_cache.borrow_mut() = Some((projection.seq, projection.state.clone()));
+
+        let seq = projection.seq;
+        let seq_sql = i64::try_from(seq)
+            .map_err(|_| invalid_recovery_data("seq do snapshot excedeu i64".to_owned()))?;
+        let timestamp_sql = i64::try_from(now_millis())
+            .map_err(|_| invalid_recovery_data("timestamp do snapshot excedeu i64".to_owned()))?;
+        let state_json = serde_json::to_string(&projection.state)?;
         self.conn.execute(
             "INSERT OR REPLACE INTO snapshots (seq, ts, state) VALUES (?1, ?2, ?3)",
-            params![seq as i64, now_millis() as i64, state_json],
+            params![seq_sql, timestamp_sql, &state_json],
         )?;
         std::fs::write(
             self.snapshots_dir.join(format!("snap-{seq}.json")),
@@ -2607,58 +3108,66 @@ impl EventStore {
     }
 
     fn latest_snapshot(&self) -> Result<Option<(u64, ProjectedState)>, StoreError> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT seq, state FROM snapshots ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            )
-            .ok();
-        match row {
-            Some((seq, state_json)) => {
-                let state: ProjectedState = serde_json::from_str(&state_json)?;
-                Ok(Some((seq as u64, state)))
-            }
-            None => Ok(None),
-        }
+        latest_snapshot_from(&self.conn)
     }
 
     /// Nº de eventos no log (queries só-leitura).
     pub fn event_count(&self) -> Result<u64, StoreError> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
-        Ok(n as u64)
+        let (event_count, _) = event_log_position(&self.conn)?;
+        Ok(event_count)
     }
 
     /// Registros do log em ordem de `seq` (só-leitura). Permite inspecionar os CAMPOS de um evento
     /// no registro (ex.: asserir `id`/`item`/`by` de um `PlanClaimed`), não só sua presença.
     pub fn events(&self) -> Result<Vec<EventRecord>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT seq, ts, kind, version, payload FROM events ORDER BY seq ASC")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (seq, ts, kind, version, payload_str) = row?;
-            out.push(EventRecord {
-                seq: seq as u64,
-                ts: ts as u64,
-                kind,
-                version: version as u32,
-                payload: serde_json::from_str(&payload_str)?,
-            });
+        query_all_events(&self.conn)
+    }
+
+    /// Busca pontual pelo `seq`, que é a chave primária do log. Não projeta nem
+    /// percorre o histórico; valida o registro antes de devolvê-lo ao chamador.
+    pub fn event_at(&self, seq: u64) -> Result<Option<EventRecord>, StoreError> {
+        if seq == 0 {
+            return Err(invalid_recovery_data(
+                "seq zero não identifica um evento".to_owned(),
+            ));
         }
-        Ok(out)
+        let seq_sql = i64::try_from(seq)
+            .map_err(|_| invalid_recovery_data(format!("seq {seq} não cabe no SQLite")))?;
+        let raw = self
+            .conn
+            .query_row(EVENT_BY_SEQ_SQL, [seq_sql], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((stored_seq, timestamp, kind, version, payload)) = raw else {
+            return Ok(None);
+        };
+        let stored_seq = u64::try_from(stored_seq)
+            .map_err(|_| invalid_recovery_data("evento contém seq negativo".to_owned()))?;
+        if stored_seq != seq {
+            return Err(invalid_recovery_data(format!(
+                "índice retornou seq {stored_seq} para a busca por {seq}"
+            )));
+        }
+        let record = EventRecord {
+            seq: stored_seq,
+            ts: u64::try_from(timestamp).map_err(|_| {
+                invalid_recovery_data(format!("evento seq {seq} contém timestamp negativo"))
+            })?,
+            kind,
+            version: u32::try_from(version).map_err(|_| {
+                invalid_recovery_data(format!("evento seq {seq} contém versão fora de u32"))
+            })?,
+            payload: serde_json::from_str(&payload)?,
+        };
+        validate_event_record(&record)?;
+        Ok(Some(record))
     }
 
     /// Registros do log com `seq > after_seq`, em ordem de `seq` (só-leitura). É a leitura
@@ -2708,6 +3217,180 @@ impl EventStore {
 
 // ───────────────────────────── helpers ─────────────────────────────
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FullReadProbe {
+    sqlite_history_scans: u64,
+    jsonl_history_reads: u64,
+    head_queries: u64,
+    head_vm_steps: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_READ_PROBE: std::cell::Cell<FullReadProbe> =
+        const { std::cell::Cell::new(FullReadProbe {
+            sqlite_history_scans: 0,
+            jsonl_history_reads: 0,
+            head_queries: 0,
+            head_vm_steps: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn reset_full_read_probe() {
+    FULL_READ_PROBE.with(|probe| probe.set(FullReadProbe::default()));
+}
+
+#[cfg(test)]
+fn full_read_probe() -> FullReadProbe {
+    FULL_READ_PROBE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_sqlite_history_scan() {
+    FULL_READ_PROBE.with(|probe| {
+        let mut value = probe.get();
+        value.sqlite_history_scans += 1;
+        probe.set(value);
+    });
+}
+
+#[cfg(test)]
+fn record_jsonl_history_read() {
+    FULL_READ_PROBE.with(|probe| {
+        let mut value = probe.get();
+        value.jsonl_history_reads += 1;
+        probe.set(value);
+    });
+}
+
+#[cfg(test)]
+fn record_head_query(vm_steps: i32) {
+    FULL_READ_PROBE.with(|probe| {
+        let mut value = probe.get();
+        value.head_queries += 1;
+        value.head_vm_steps += u64::try_from(vm_steps).unwrap_or(0);
+        probe.set(value);
+    });
+}
+
+fn latest_snapshot_from(conn: &Connection) -> Result<Option<(u64, ProjectedState)>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT seq, state FROM snapshots ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((seq, state_json)) => {
+            let seq = u64::try_from(seq).map_err(|_| {
+                invalid_recovery_data("snapshot contém sequência negativa".to_owned())
+            })?;
+            let state = serde_json::from_str(&state_json)?;
+            Ok(Some((seq, state)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn replay_projection(
+    conn: &Connection,
+    mut state: ProjectedState,
+    from_seq: u64,
+    through_seq: Option<u64>,
+) -> Result<ProjectionAtSeq, StoreError> {
+    let from_seq_sql = i64::try_from(from_seq)
+        .map_err(|_| invalid_recovery_data("seq inicial do replay excedeu i64".to_owned()))?;
+    let mut statement = match through_seq {
+        Some(_) => conn.prepare(
+            "SELECT seq, kind, version, payload FROM events \
+             WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC",
+        )?,
+        None => conn.prepare(
+            "SELECT seq, kind, version, payload FROM events WHERE seq > ?1 ORDER BY seq ASC",
+        )?,
+    };
+    let mut rows = match through_seq {
+        Some(seq) => {
+            let through_seq_sql = i64::try_from(seq)
+                .map_err(|_| invalid_recovery_data("seq final do replay excedeu i64".to_owned()))?;
+            statement.query(params![from_seq_sql, through_seq_sql])?
+        }
+        None => statement.query([from_seq_sql])?,
+    };
+
+    let mut last_seq = from_seq;
+    let mut replayed = 0_u64;
+    while let Some(row) = rows.next()? {
+        let seq = u64::try_from(row.get::<_, i64>(0)?).map_err(|_| {
+            invalid_recovery_data("evento projetado contém seq negativo".to_owned())
+        })?;
+        let expected_seq = last_seq
+            .checked_add(1)
+            .ok_or_else(|| invalid_recovery_data("sequência projetada excedeu u64".to_owned()))?;
+        if seq != expected_seq {
+            return Err(invalid_recovery_data(format!(
+                "event log não é contíguo durante o replay: esperava seq {expected_seq}, encontrou {seq}"
+            )));
+        }
+        let kind = row.get::<_, String>(1)?;
+        let version = u32::try_from(row.get::<_, i64>(2)?).map_err(|_| {
+            invalid_recovery_data(format!(
+                "evento seq {seq} contém versão fora do intervalo u32"
+            ))
+        })?;
+        let payload = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        let event = decode_validated_domain_event(seq, &kind, version, &payload)?;
+        apply(&mut state, &event);
+        last_seq = seq;
+        replayed = replayed
+            .checked_add(1)
+            .ok_or_else(|| invalid_recovery_data("replay excedeu u64".to_owned()))?;
+    }
+
+    if let Some(expected_head) = through_seq.filter(|expected_head| last_seq != *expected_head) {
+        return Err(invalid_recovery_data(format!(
+            "replay não alcançou o head da mesma visão SQLite: terminou em {last_seq}, head {expected_head}"
+        )));
+    }
+
+    Ok(ProjectionAtSeq {
+        state,
+        seq: last_seq,
+        replayed,
+    })
+}
+
+fn query_all_events(conn: &Connection) -> Result<Vec<EventRecord>, StoreError> {
+    #[cfg(test)]
+    record_sqlite_history_scan();
+    let mut stmt =
+        conn.prepare("SELECT seq, ts, kind, version, payload FROM events ORDER BY seq ASC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (seq, ts, kind, version, payload) = row?;
+        records.push(EventRecord {
+            seq: seq as u64,
+            ts: ts as u64,
+            kind,
+            version: version as u32,
+            payload: serde_json::from_str(&payload)?,
+        });
+    }
+    Ok(records)
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2729,18 +3412,6 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// `true` se `e` é uma violação de PK/UNIQUE do SQLite. O ÚNICO constraint do INSERT de evento é o PK
-/// `seq` (schema: `seq INTEGER PRIMARY KEY`), então qualquer `ConstraintViolation` aqui É a colisão de
-/// `seq` entre dois escritores — habilita o retry com re-leitura fresca (FURO A). Outros erros (I/O,
-/// serde, db corrompido) NÃO casam → propagam sem retry (não mascaramos falha real).
-fn is_seq_conflict(e: &StoreError) -> bool {
-    matches!(
-        e,
-        StoreError::Sqlite(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation
-    )
 }
 
 /// `true` se o erro do rusqlite é `SQLITE_BUSY` ("database is locked") — disputa de lock transitória.
@@ -2772,57 +3443,648 @@ fn enable_wal(conn: &Connection) -> Result<(), StoreError> {
     }
 }
 
-/// Anexa um registro de evento ao espelho JSONL (append-only, uma linha por evento).
-fn append_jsonl(path: &Path, rec: &EventRecord) -> Result<(), StoreError> {
-    // FURO B: UM único buffer (`linha` + `\n`) e UM único `write_all`. O espelho JSONL agora recebe
-    // append CONCORRENTE de 2 processos (app + bin); com DOIS `write_all` (a linha e depois o `\n`), as
-    // escritas O_APPEND dos dois podem INTERLEAVIAR no EOF → linha corrompida que cai na quarentena do
-    // rebuild (W0-6) e some no replay. Com um `write_all` só, o kernel mantém a escrita contígua no EOF
-    // (atomicidade do O_APPEND p/ um único write de uma linha de evento). O flush durável é mantido.
-    let mut line = serde_json::to_string(rec)?;
-    line.push('\n');
+/// Confere somente o contrato estrutural e as duas extremidades do log existente.
+/// Preparar a projeção valida as colunas obrigatórias sem ler linhas; buscar primeiro
+/// e último `seq` usa a chave primária. A validação semântica fica para `project()`.
+fn validate_existing_store_head(conn: &Connection) -> Result<(u64, u64), StoreError> {
+    let has_events = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !has_events {
+        return Err(invalid_recovery_data(
+            "SQLite existente não contém a tabela events".to_owned(),
+        ));
+    }
+    let mut columns_statement = conn.prepare("PRAGMA table_info(events)")?;
+    let columns = columns_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let required_columns = ["seq", "ts", "kind", "version", "payload"];
+    if required_columns
+        .iter()
+        .any(|required| !columns.iter().any(|(name, _)| name == required))
+        || !columns
+            .iter()
+            .any(|(name, primary_key)| name == "seq" && *primary_key > 0)
+    {
+        return Err(invalid_recovery_data(
+            "tabela events existente não tem o schema posicional exigido".to_owned(),
+        ));
+    }
+    conn.prepare("SELECT seq, ts, kind, version, payload FROM events WHERE seq > ?1")?;
+    event_log_position(conn)
+}
+
+fn is_recoverable_store_corruption(error: &StoreError) -> bool {
+    match error {
+        StoreError::Json(_) => true,
+        StoreError::Io(error) => error.kind() == std::io::ErrorKind::InvalidData,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
+            error.code,
+            rusqlite::ErrorCode::DatabaseCorrupt
+                | rusqlite::ErrorCode::NotADatabase
+                | rusqlite::ErrorCode::TypeMismatch
+        ),
+        StoreError::Sqlite(
+            rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+            | rusqlite::Error::InvalidColumnType(..),
+        ) => true,
+        StoreError::Sqlite(_) => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MirrorFileState {
+    len: u64,
+    modified_ns: u128,
+}
+
+#[derive(Clone)]
+struct JsonlDigestCache {
+    file_state: MirrorFileState,
+    event_count: u64,
+    hasher: Sha256,
+}
+
+struct SyncedJsonl {
+    file_state: MirrorFileState,
+    hasher: Sha256,
+}
+
+impl JsonlDigestCache {
+    fn from_synced(event_count: u64, synced: &SyncedJsonl) -> Self {
+        Self {
+            file_state: synced.file_state,
+            event_count,
+            hasher: synced.hasher.clone(),
+        }
+    }
+}
+
+fn validate_indexed_seq_bounds(
+    label: &str,
+    first_seq: Option<i64>,
+    last_seq: Option<i64>,
+) -> Result<Option<u64>, StoreError> {
+    match (first_seq, last_seq) {
+        (None, None) => Ok(None),
+        (Some(1), Some(last_seq)) if last_seq >= 1 => {
+            let last_seq = u64::try_from(last_seq)
+                .map_err(|_| invalid_recovery_data(format!("{label} contém sequência inválida")))?;
+            Ok(Some(last_seq))
+        }
+        bounds => Err(invalid_recovery_data(format!(
+            "{label} tem extremidades inválidas: primeiro seq={:?}, último seq={:?}",
+            bounds.0, bounds.1
+        ))),
+    }
+}
+
+fn event_log_position(conn: &Connection) -> Result<(u64, u64), StoreError> {
+    let mut statement = conn.prepare(
+        "SELECT \
+         (SELECT seq FROM events ORDER BY seq ASC LIMIT 1), \
+         (SELECT seq FROM events ORDER BY seq DESC LIMIT 1)",
+    )?;
+    let (first_seq, last_seq): (Option<i64>, Option<i64>) =
+        statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    #[cfg(test)]
+    record_head_query(statement.get_status(rusqlite::StatementStatus::VmStep));
+    let last_seq: u64 =
+        validate_indexed_seq_bounds("event log SQLite", first_seq, last_seq)?.unwrap_or_default();
+    // O escritor mantém `seq` contíguo sob a mesma transação e o log é imutável.
+    // Assim o último `seq` também é a contagem, sem `COUNT(*)` linear.
+    Ok((last_seq, last_seq))
+}
+
+fn mirror_file_state(path: &Path) -> Result<Option<MirrorFileState>, StoreError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Ok(Some(MirrorFileState {
+        len: metadata.len(),
+        modified_ns,
+    }))
+}
+
+/// Valida o marcador lógico E a identidade física observada após `sync_data`. Metadados
+/// iguais permitem o fast path sem reler históricos grandes; qualquer alteração externa
+/// (truncate, replace, corrupção in-place) muda tamanho ou mtime e força rewrite canônico.
+fn jsonl_state_matches(
+    conn: &Connection,
+    path: &Path,
+    expected_count: u64,
+) -> Result<bool, StoreError> {
+    let (first_marker, last_marker): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT \
+         (SELECT seq FROM jsonl_mirror ORDER BY seq ASC LIMIT 1), \
+         (SELECT seq FROM jsonl_mirror ORDER BY seq DESC LIMIT 1)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let marker_last = validate_indexed_seq_bounds("jsonl_mirror", first_marker, last_marker)?;
+    let markers_match = match (expected_count, marker_last) {
+        (0, None) => true,
+        (expected_count, Some(last_marker)) => last_marker == expected_count,
+        _ => false,
+    };
+    if !markers_match {
+        return Ok(false);
+    }
+    if expected_count == 0 {
+        return Ok(match mirror_file_state(path)? {
+            None => true,
+            Some(state) => state.len == 0,
+        });
+    }
+    let Some((stored_len, stored_modified, stored_count)) = conn
+        .query_row(
+            "SELECT file_len, modified_ns, event_count FROM jsonl_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+    if stored_count < 0 || stored_count as u64 != expected_count || stored_len < 0 {
+        return Ok(false);
+    }
+    let Some(actual) = mirror_file_state(path)? else {
+        return Ok(false);
+    };
+    Ok(actual.len == stored_len as u64 && actual.modified_ns.to_string() == stored_modified)
+}
+
+fn upsert_jsonl_state(
+    conn: &Connection,
+    state: &MirrorFileState,
+    event_count: u64,
+) -> Result<(), StoreError> {
+    let file_len = i64::try_from(state.len).map_err(|_| {
+        invalid_recovery_data(format!(
+            "espelho JSONL grande demais para registrar: {} bytes",
+            state.len
+        ))
+    })?;
+    let event_count = i64::try_from(event_count)
+        .map_err(|_| invalid_recovery_data("contagem do espelho excede i64".to_owned()))?;
+    conn.execute(
+        "INSERT INTO jsonl_state (singleton, file_len, modified_ns, event_count) \
+         VALUES (1, ?1, ?2, ?3) \
+         ON CONFLICT(singleton) DO UPDATE SET \
+         file_len = excluded.file_len, modified_ns = excluded.modified_ns, \
+         event_count = excluded.event_count",
+        params![file_len, state.modified_ns.to_string(), event_count],
+    )?;
+    Ok(())
+}
+
+fn replace_jsonl_confirmation(
+    conn: &Connection,
+    records: &[EventRecord],
+    state: &MirrorFileState,
+) -> Result<(), StoreError> {
+    conn.execute("DELETE FROM jsonl_mirror", [])?;
+    for record in records {
+        let seq = i64::try_from(record.seq)
+            .map_err(|_| invalid_recovery_data(format!("seq {} não cabe no SQLite", record.seq)))?;
+        conn.execute("INSERT INTO jsonl_mirror (seq) VALUES (?1)", [seq])?;
+    }
+    let event_count = u64::try_from(records.len())
+        .map_err(|_| invalid_recovery_data("event log excede u64".to_owned()))?;
+    upsert_jsonl_state(conn, state, event_count)
+}
+
+/// Anexa o batch em uma única abertura O_APPEND. Cada linha é enviada por um único
+/// `write_all`, e o arquivo inteiro é sincronizado antes de qualquer certificado `complete`.
+fn append_jsonl_records(
+    path: &Path,
+    records: &[EventRecord],
+    mut hasher: Sha256,
+) -> Result<SyncedJsonl, StoreError> {
+    let existed = path.try_exists()?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    file.write_all(line.as_bytes())?;
-    file.flush()?;
+    for record in records {
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+        hasher.update(&line);
+    }
+    file.sync_data()?;
+    drop(file);
+    let parent = path.parent().ok_or_else(|| {
+        invalid_recovery_data(format!("{} não tem diretório-pai", path.display()))
+    })?;
+    #[cfg(unix)]
+    if !existed {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    let file_state = mirror_file_state(path)?.ok_or_else(|| {
+        invalid_recovery_data(format!(
+            "{} deixou de ser um arquivo após o append",
+            path.display()
+        ))
+    })?;
+    Ok(SyncedJsonl { file_state, hasher })
+}
+
+/// Reescreve o espelho completo sem expor um arquivo intermediário a leitores JSONL-only.
+fn rewrite_jsonl_atomic(path: &Path, records: &[EventRecord]) -> Result<SyncedJsonl, StoreError> {
+    let parent = path.parent().ok_or_else(|| {
+        invalid_recovery_data(format!("{} não tem diretório-pai", path.display()))
+    })?;
+    let tmp = parent.join(format!(
+        ".log.jsonl.reconcile-{}-{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let mut hasher = Sha256::new();
+    let write_result = (|| -> Result<(), StoreError> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        for record in records {
+            let mut line = serde_json::to_vec(record)?;
+            line.push(b'\n');
+            file.write_all(&line)?;
+            hasher.update(&line);
+        }
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %tmp.display(),
+                %error,
+                "não consegui remover temporário de reconciliação"
+            ),
+        }
+    }
+    write_result?;
+    let file_state = mirror_file_state(path)?.ok_or_else(|| {
+        invalid_recovery_data(format!(
+            "{} não é arquivo depois da reconciliação",
+            path.display()
+        ))
+    })?;
+    Ok(SyncedJsonl { file_state, hasher })
+}
+
+fn recovery_artifacts_exist(
+    jsonl_path: &Path,
+    recovery_state_path: &Path,
+) -> Result<bool, StoreError> {
+    Ok(jsonl_path.try_exists()? || recovery_state_path.try_exists()?)
+}
+
+fn mirror_is_empty(path: &Path) -> Result<bool, StoreError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_recovery_state_atomic(path: &Path, state: &JsonlRecoveryState) -> Result<(), StoreError> {
+    let parent = path.parent().ok_or_else(|| {
+        invalid_recovery_data(format!("{} não tem diretório-pai", path.display()))
+    })?;
+    let tmp = parent.join(format!(
+        ".log.recovery-{}-{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let bytes = serde_json::to_vec(state)?;
+    let write_result = (|| -> Result<(), StoreError> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %tmp.display(),
+                %error,
+                "não consegui remover certificado temporário"
+            ),
+        }
+    }
+    write_result
+}
+
+fn write_complete_recovery_state(
+    path: &Path,
+    event_count: u64,
+    last_seq: u64,
+    hasher: &Sha256,
+) -> Result<(), StoreError> {
+    write_recovery_state_atomic(
+        path,
+        &JsonlRecoveryState::complete(event_count, last_seq, sha256_hex(hasher)),
+    )
+}
+
+fn read_recovery_state(path: &Path) -> Result<Option<JsonlRecoveryState>, StoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn sha256_hex(hasher: &Sha256) -> String {
+    format!("{:x}", hasher.clone().finalize())
+}
+
+fn hash_jsonl_file(path: &Path) -> Result<SyncedJsonl, StoreError> {
+    #[cfg(test)]
+    record_jsonl_history_read();
+    let before = mirror_file_state(path)?.ok_or_else(|| {
+        invalid_recovery_data(format!("{} não é um arquivo JSONL", path.display()))
+    })?;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = mirror_file_state(path)?.ok_or_else(|| {
+        invalid_recovery_data(format!("{} desapareceu durante o hash", path.display()))
+    })?;
+    if before != after {
+        return Err(invalid_recovery_data(format!(
+            "{} mudou durante o cálculo SHA-256",
+            path.display()
+        )));
+    }
+    Ok(SyncedJsonl {
+        file_state: after,
+        hasher,
+    })
+}
+
+/// Confere apenas o certificado pequeno que acompanha a posição já confirmada no
+/// SQLite. O SHA continua sendo obrigatório em [`recoverable_jsonl_records`], mas
+/// calculá-lo em toda reabertura tornaria o caminho saudável O(tamanho do histórico).
+fn jsonl_certificate_matches_position(
+    recovery_state_path: &Path,
+    expected_count: u64,
+    expected_last_seq: u64,
+) -> Result<bool, StoreError> {
+    let state = match read_recovery_state(recovery_state_path) {
+        Ok(Some(state)) if state.version == JSONL_RECOVERY_STATE_VERSION => state,
+        Ok(Some(_)) | Ok(None) => return Ok(false),
+        Err(error) => {
+            tracing::warn!(
+                path = %recovery_state_path.display(),
+                %error,
+                "certificado JSONL ilegível; SQLite saudável fará reconciliação"
+            );
+            return Ok(false);
+        }
+    };
+    let JsonlRecoveryStatus::Complete {
+        event_count,
+        last_seq,
+        digest_sha256,
+    } = state.status
+    else {
+        return Ok(false);
+    };
+    Ok(event_count == expected_count
+        && last_seq == expected_last_seq
+        && digest_sha256.len() == 64
+        && digest_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn load_canonical_jsonl_records(path: &Path) -> Result<Vec<EventRecord>, StoreError> {
+    #[cfg(test)]
+    record_jsonl_history_read();
+    let bytes = std::fs::read(path)?;
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        return Err(invalid_recovery_data(format!(
+            "{} termina em linha JSONL parcial",
+            path.display()
+        )));
+    }
+    let content = if bytes.is_empty() {
+        bytes.as_slice()
+    } else {
+        &bytes[..bytes.len() - 1]
+    };
+    if content.is_empty() {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(invalid_recovery_data(format!(
+            "{} contém uma linha JSONL vazia",
+            path.display()
+        )));
+    }
+    let mut records = Vec::new();
+    for (index, raw_line) in content.split(|byte| *byte == b'\n').enumerate() {
+        let line_number = index + 1;
+        if raw_line.is_empty() || raw_line.ends_with(b"\r") {
+            return Err(invalid_recovery_data(format!(
+                "{} contém linha não canônica em {line_number}",
+                path.display()
+            )));
+        }
+        let record: EventRecord = serde_json::from_slice(raw_line).map_err(|error| {
+            invalid_recovery_data(format!(
+                "{} contém JSON inválido na linha {line_number}: {error}",
+                path.display()
+            ))
+        })?;
+        if serde_json::to_vec(&record)? != raw_line {
+            return Err(invalid_recovery_data(format!(
+                "{} contém JSON não canônico na linha {line_number}",
+                path.display()
+            )));
+        }
+        let expected_seq = u64::try_from(line_number)
+            .map_err(|_| invalid_recovery_data("JSONL excede u64".to_owned()))?;
+        if record.seq != expected_seq {
+            return Err(invalid_recovery_data(format!(
+                "{} não é contíguo: esperava seq {expected_seq}, encontrou {}",
+                path.display(),
+                record.seq
+            )));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn recoverable_jsonl_records(
+    jsonl_path: &Path,
+    recovery_state_path: &Path,
+) -> Result<Vec<EventRecord>, StoreError> {
+    let state = read_recovery_state(recovery_state_path)?.ok_or_else(|| {
+        invalid_recovery_data(format!(
+            "{} não tem certificado de recuperação",
+            jsonl_path.display()
+        ))
+    })?;
+    if state.version != JSONL_RECOVERY_STATE_VERSION {
+        return Err(invalid_recovery_data(format!(
+            "versão incompatível do certificado JSONL: {}",
+            state.version
+        )));
+    }
+    let JsonlRecoveryStatus::Complete {
+        event_count,
+        last_seq,
+        digest_sha256,
+    } = state.status
+    else {
+        return Err(invalid_recovery_data(format!(
+            "{} está pending; um prefixo não prova recuperação completa",
+            recovery_state_path.display()
+        )));
+    };
+    if digest_sha256.len() != 64 || !digest_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_recovery_data(
+            "certificado JSONL não contém SHA-256 válido".to_owned(),
+        ));
+    }
+    let records = load_canonical_jsonl_records(jsonl_path)?;
+    let actual_count = u64::try_from(records.len())
+        .map_err(|_| invalid_recovery_data("JSONL excede u64".to_owned()))?;
+    let actual_last_seq = records.last().map_or(0, |record| record.seq);
+    if actual_count != event_count || actual_last_seq != last_seq {
+        return Err(invalid_recovery_data(format!(
+            "certificado promete count={event_count}/last_seq={last_seq}, mas o JSONL tem count={actual_count}/last_seq={actual_last_seq}"
+        )));
+    }
+    let synced = hash_jsonl_file(jsonl_path)?;
+    if sha256_hex(&synced.hasher) != digest_sha256.to_ascii_lowercase() {
+        return Err(invalid_recovery_data(
+            "SHA-256 do JSONL diverge do certificado complete".to_owned(),
+        ));
+    }
+    for record in &records {
+        validate_event_record(record)?;
+    }
+    Ok(records)
+}
+
+fn validate_event_record(record: &EventRecord) -> Result<(), StoreError> {
+    i64::try_from(record.seq)
+        .map_err(|_| invalid_recovery_data(format!("seq {} não cabe no SQLite", record.seq)))?;
+    i64::try_from(record.ts).map_err(|_| {
+        invalid_recovery_data(format!("timestamp {} não cabe no SQLite", record.ts))
+    })?;
+    decode_validated_domain_event(record.seq, &record.kind, record.version, &record.payload)?;
     Ok(())
 }
 
-/// `true` se o `.db` está corrompido: `integrity_check` falha/≠ "ok", OU uma varredura
-/// completa da tabela `events` (se existir) erra ("disk image is malformed").
+fn decode_validated_domain_event(
+    seq: u64,
+    kind: &str,
+    version: u32,
+    payload: &serde_json::Value,
+) -> Result<DomainEvent, StoreError> {
+    if seq == 0 {
+        return Err(invalid_recovery_data(
+            "evento não pode usar seq zero".to_owned(),
+        ));
+    }
+    if version == 0 {
+        return Err(invalid_recovery_data(format!(
+            "evento seq {} tem versão zero",
+            seq
+        )));
+    }
+    let event = DomainEvent::from_record(kind, version, payload.clone()).map_err(|error| {
+        invalid_recovery_data(format!(
+            "evento seq {} não é um DomainEvent válido: {error}",
+            seq
+        ))
+    })?;
+    if event.kind() != kind {
+        return Err(invalid_recovery_data(format!(
+            "evento seq {} declara kind {}, mas o payload é {}",
+            seq,
+            kind,
+            event.kind()
+        )));
+    }
+    if version > event.current_version() {
+        return Err(invalid_recovery_data(format!(
+            "evento seq {} usa versão futura {} para {} (máxima conhecida {})",
+            seq,
+            version,
+            kind,
+            event.current_version()
+        )));
+    }
+    Ok(event)
+}
+
+fn invalid_recovery_data(message: String) -> StoreError {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message).into()
+}
+
+/// Sonda estrutural O(1) usada somente DEPOIS que o fast open falhou. Não executa
+/// `integrity_check` nem varre eventos: corrupção interna é observada por `project()`.
 fn db_is_corrupt(path: &Path) -> bool {
-    let Ok(conn) = Connection::open(path) else {
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
         return true;
     };
-    let integrity_bad = conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
-        .map(|s| s != "ok")
-        .unwrap_or(true);
-    if integrity_bad {
-        return true;
-    }
-    // `integrity_check` pode passar com corrupção localizada; varre a tabela para
-    // forçar a leitura das páginas. Tabela ausente = db novo/vazio (não é corrupção).
-    let has_events = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .is_ok();
-    if !has_events {
-        return false;
-    }
-    let scan_ok = match conn.prepare("SELECT seq, kind, version, payload FROM events") {
-        Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, i64>(0)) {
-            Ok(rows) => rows.collect::<Result<Vec<i64>, _>>().is_ok(),
-            Err(_) => false,
-        },
-        Err(_) => false,
-    };
-    !scan_ok
+    validate_existing_store_head(&conn).is_err()
 }
 
 /// Renomeia o `.db` corrompido para `<nome>.corrupt-<ts>` (PRESERVA, nunca apaga) e
@@ -2837,7 +4099,11 @@ fn preserve_corrupt(db_path: &Path) -> Result<PathBuf, StoreError> {
     for ext in ["-wal", "-shm"] {
         let mut side = db_path.as_os_str().to_os_string();
         side.push(ext);
-        let _ = std::fs::remove_file(PathBuf::from(side));
+        match std::fs::remove_file(PathBuf::from(side)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(corrupt)
 }
@@ -2848,6 +4114,7 @@ fn preserve_corrupt(db_path: &Path) -> Result<PathBuf, StoreError> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::io::BufRead as _;
     use uuid::Uuid;
 
     /// Diretório temporário único; removido no `Drop` (best-effort).
@@ -2917,6 +4184,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_writer_snapshot_labels_the_exact_projected_head() {
+        let tmp = TempDir::new("snapshot-concurrent-writer");
+        let sender = Uuid::now_v7();
+        let hot = {
+            let mut first = EventStore::open(tmp.path()).expect("abrir conexão A");
+            first
+                .append(&DomainEvent::BusMessageSent {
+                    id: "msg-a".into(),
+                    from: sender,
+                    to: "node:b".into(),
+                })
+                .expect("A grava seq 1");
+
+            let mut second = EventStore::open(tmp.path()).expect("abrir conexão B");
+            second
+                .append(&DomainEvent::BusMessageSent {
+                    id: "msg-b".into(),
+                    from: sender,
+                    to: "node:c".into(),
+                })
+                .expect("B grava seq 2");
+
+            let snapshot_seq = first.take_snapshot().expect("A materializa snapshot");
+            assert_eq!(
+                snapshot_seq, 2,
+                "o rótulo deve vir da mesma visão SQLite que projetou seq 2"
+            );
+            let hot = first.project().expect("estado quente após snapshot");
+            assert_eq!(hot.bus_messages, 2, "cada mensagem incrementa a projeção");
+            assert_eq!(
+                first
+                    .latest_snapshot()
+                    .expect("ler snapshot")
+                    .map(|(seq, _)| seq),
+                Some(2),
+                "a tabela precisa persistir o head exato projetado"
+            );
+            hot
+        };
+
+        let reopened = EventStore::open(tmp.path()).expect("reabrir store");
+        let restored = reopened.project().expect("projetar após reabertura");
+        assert_eq!(
+            restored, hot,
+            "seq 2 não pode ser reaplicado sobre um snapshot que já o contém"
+        );
+        assert_eq!(
+            restored.bus_messages, 2,
+            "evento não idempotente não pode ser contado duas vezes"
+        );
+        assert_eq!(
+            reopened.replayed_events_total(),
+            0,
+            "snapshot em seq 2 cobre integralmente o log reaberto"
+        );
+    }
+
     /// **r5 perf-ws — auto-snapshot a cada [`SNAPSHOT_EVERY`] appends.** `take_snapshot`
     /// tinha ZERO chamadores em produção → conexões NOVAS (refresh do sidebar por Espaço,
     /// verbos do bin) re-parseavam o log INTEIRO, e o custo crescia sem teto com o log.
@@ -2925,14 +4250,22 @@ mod tests {
     fn append_auto_snapshots_to_bound_fresh_connection_replay() {
         let tmp = TempDir::new("auto-snap");
         let mut store = EventStore::open(tmp.path()).expect("abrir");
-        for i in 0..(SNAPSHOT_EVERY + 10) {
-            store
-                .append(&DomainEvent::TokenUsageReported {
-                    node: format!("nó-{}", i % 3),
-                    tokens: i,
-                })
-                .expect("append");
-        }
+        let checkpoint_batch: Vec<_> = (0..SNAPSHOT_EVERY)
+            .map(|i| DomainEvent::TokenUsageReported {
+                node: format!("nó-{}", i % 3),
+                tokens: i,
+            })
+            .collect();
+        store
+            .append_batch(&checkpoint_batch)
+            .expect("batch até o checkpoint");
+        let tail: Vec<_> = (SNAPSHOT_EVERY..SNAPSHOT_EVERY + 10)
+            .map(|i| DomainEvent::TokenUsageReported {
+                node: format!("nó-{}", i % 3),
+                tokens: i,
+            })
+            .collect();
+        store.append_batch(&tail).expect("batch pós-checkpoint");
         let fresh = EventStore::open(tmp.path()).expect("conexão fresca");
         let p_fresh = fresh.project().expect("project fresco");
         assert!(
@@ -3383,7 +4716,10 @@ mod tests {
                 assert_eq!(hook_id, "legacy");
                 assert_eq!(target_ref, "@Time");
                 assert_eq!(target_node, "", "campo aditivo ausente → vazio");
-                assert_eq!(instruction, "", "sem instrução no legado → sem autoridade de ação");
+                assert_eq!(
+                    instruction, "",
+                    "sem instrução no legado → sem autoridade de ação"
+                );
                 assert_eq!(
                     autonomy_level, "notify_before",
                     "default CONSERVADOR — replay antigo nunca fabrica autonomia"
@@ -3475,25 +4811,414 @@ mod tests {
         );
     }
 
+    /// Regressão do fast path: reabrir um store já certificado não pode ler uma linha
+    /// sequer do histórico SQLite nem um byte do JSONL completo. O contador é local à
+    /// thread, portanto a prova não depende de timing nem da carga da máquina.
+    #[test]
+    #[serial]
+    fn healthy_reopen_performs_zero_full_history_reads() {
+        let tmp = TempDir::new("healthy-zero-full-read");
+        let events = (0..2_048)
+            .map(|index| DomainEvent::NoteCreated {
+                name: format!("nota-{index}.md"),
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut store = EventStore::open(tmp.path()).expect("criar store");
+            store.append_batch(&events).expect("popular histórico");
+        }
+
+        reset_full_read_probe();
+        let mut ui = RecordingUi::default();
+        let reopened = EventStore::open_or_recover(tmp.path(), &mut ui)
+            .expect("reabrir resiliente pelo fast path");
+        assert_eq!(reopened.event_count().expect("head"), 2_048);
+        let probe = full_read_probe();
+        assert_eq!(probe.sqlite_history_scans, 0, "open varreu events");
+        assert_eq!(probe.jsonl_history_reads, 0, "open releu/hashou log.jsonl");
+        assert_eq!(
+            probe.head_queries, 2,
+            "open + event_count consultam só o head"
+        );
+        assert!(ui.events.is_empty(), "fast path não anuncia recuperação");
+    }
+
+    /// Benchmark determinístico por trabalho SQLite, não por cronômetro: 16k eventos
+    /// exigem exatamente os mesmos VM steps e zero full reads que 32 eventos. Tempos são
+    /// impressos apenas como diagnóstico; a asserção estável mede o algoritmo executado.
+    #[test]
+    #[serial]
+    fn benchmark_healthy_reopen_work_does_not_grow_with_history() {
+        fn populated_store(tag: &str, event_count: usize) -> TempDir {
+            let tmp = TempDir::new(tag);
+            let events = (0..event_count)
+                .map(|index| DomainEvent::NoteCreated {
+                    name: format!("bench-{index}.md"),
+                })
+                .collect::<Vec<_>>();
+            let mut store = EventStore::open(tmp.path()).expect("criar benchmark store");
+            store
+                .append_batch(&events)
+                .expect("popular benchmark store");
+            drop(store);
+            tmp
+        }
+
+        fn measured_reopen(dir: &Path) -> (FullReadProbe, std::time::Duration) {
+            reset_full_read_probe();
+            let started = std::time::Instant::now();
+            drop(EventStore::open(dir).expect("reabrir benchmark store"));
+            (full_read_probe(), started.elapsed())
+        }
+
+        let small = populated_store("open-bench-small", 32);
+        let large = populated_store("open-bench-large", 16_384);
+        let (small_probe, small_elapsed) = measured_reopen(small.path());
+        let (large_probe, large_elapsed) = measured_reopen(large.path());
+
+        eprintln!(
+            "healthy reopen: 32={small_elapsed:?}, 16384={large_elapsed:?}, work={large_probe:?}"
+        );
+        assert_eq!(small_probe.sqlite_history_scans, 0);
+        assert_eq!(small_probe.jsonl_history_reads, 0);
+        assert_eq!(large_probe.sqlite_history_scans, 0);
+        assert_eq!(large_probe.jsonl_history_reads, 0);
+        assert_eq!(small_probe.head_queries, 1);
+        assert_eq!(large_probe.head_queries, 1);
+        assert_eq!(
+            large_probe.head_vm_steps, small_probe.head_vm_steps,
+            "custo do head SQLite não pode depender do número de eventos"
+        );
+    }
+
+    /// O open O(1) não lê payloads. Se a corrupção só aparece no replay, o helper de
+    /// produção detecta o erro semântico, valida integralmente o JSONL e recupera.
+    #[test]
+    #[serial]
+    fn projected_open_recovers_semantically_corrupt_sqlite_payload() {
+        let tmp = TempDir::new("semantic-db-recovery");
+        let expected = {
+            let mut store = EventStore::open(tmp.path()).expect("criar store");
+            seed(&mut store);
+            store.project().expect("projeção original")
+        };
+        let conn = Connection::open(tmp.path().join("lina.db")).expect("abrir SQLite cru");
+        conn.execute("UPDATE events SET payload = 'não-é-json' WHERE seq = 2", [])
+            .expect("corromper payload SQLite");
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .expect("checkpoint da corrupção");
+        drop(conn);
+
+        let opened = EventStore::open(tmp.path()).expect("head estrutural segue válido");
+        assert!(
+            opened.project().is_err(),
+            "a corrupção interna só deve aparecer no replay"
+        );
+        drop(opened);
+
+        reset_full_read_probe();
+        let mut ui = RecordingUi::default();
+        let (_store, recovered) = EventStore::open_projected_or_recover(tmp.path(), &mut ui)
+            .expect("recuperar no replay");
+        assert_eq!(recovered, expected);
+        assert!(matches!(
+            ui.events.as_slice(),
+            [HostEvent::Recovering, HostEvent::Recovered]
+        ));
+        let probe = full_read_probe();
+        assert!(
+            probe.jsonl_history_reads >= 2,
+            "rebuild precisa parsear e verificar SHA do JSONL inteiro"
+        );
+        assert!(std::fs::read_dir(tmp.path())
+            .expect("listar preservado")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")));
+    }
+
+    #[test]
+    #[serial]
+    fn replay_rejects_kind_mismatch_and_future_version_before_apply() {
+        for corruption in ["kind_mismatch", "future_version"] {
+            for certified in [true, false] {
+                let tmp = TempDir::new(&format!("semantic-{corruption}-{certified}"));
+                {
+                    let mut store = EventStore::open(tmp.path()).expect("criar store");
+                    store
+                        .append(&DomainEvent::WorkspaceCreated {
+                            name: "Estado íntegro".into(),
+                            focus_preset: String::new(),
+                        })
+                        .expect("append íntegro");
+                }
+
+                let conn = Connection::open(tmp.path().join("lina.db")).expect("abrir SQLite cru");
+                match corruption {
+                    "kind_mismatch" => {
+                        conn.execute("UPDATE events SET kind = 'NodeAdded' WHERE seq = 1", [])
+                            .expect("divergir kind do payload");
+                    }
+                    "future_version" => {
+                        conn.execute("UPDATE events SET version = 99 WHERE seq = 1", [])
+                            .expect("injetar versão futura");
+                    }
+                    _ => unreachable!("caso de teste fechado"),
+                }
+                conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                    .expect("checkpoint da corrupção");
+                drop(conn);
+
+                let opened = EventStore::open(tmp.path()).expect("head estrutural continua válido");
+                if !certified {
+                    std::fs::remove_file(tmp.path().join(JSONL_RECOVERY_STATE_FILE))
+                        .expect("remover certificado após o fast open");
+                }
+                assert!(
+                    opened.project().is_err(),
+                    "{corruption} não pode alcançar apply"
+                );
+
+                let mut ui = RecordingUi::default();
+                let result = opened.project_or_recover(&mut ui);
+                if certified {
+                    let (_, recovered) = result.expect("recuperar do JSONL certificado");
+                    assert_eq!(recovered.workspace_name.as_deref(), Some("Estado íntegro"));
+                    assert!(matches!(
+                        ui.events.as_slice(),
+                        [HostEvent::Recovering, HostEvent::Recovered]
+                    ));
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "{corruption} sem certificado deve permanecer erro"
+                    );
+                    assert!(
+                        ui.events.is_empty(),
+                        "sem fonte recuperável não anuncia sucesso"
+                    );
+                }
+            }
+        }
+    }
+
     /// W4-4 (T6): `WorkspaceFocusSet` projeta `focused_workspace` e sobrevive ao replay.
     #[test]
     #[serial]
     fn workspace_focus_set_projects_and_replays() {
         let tmp = TempDir::new("focus");
+        let focus = DomainEvent::WorkspaceFocusSet {
+            workspace: "App X".into(),
+            focus_id: Some("focus-001".into()),
+        };
+        {
+            let mut store = EventStore::open(tmp.path()).expect("open");
+            store
+                .append(&DomainEvent::WorkspaceCreated {
+                    name: "App X".into(),
+                    focus_preset: String::new(),
+                })
+                .unwrap();
+            let encoded = serde_json::to_value(&focus).expect("serializar foco correlacionado");
+            assert_eq!(encoded["focus_id"], "focus-001");
+            assert_eq!(
+                serde_json::from_value::<DomainEvent>(encoded).expect("roundtrip do foco"),
+                focus
+            );
+            store.append(&focus).unwrap();
+            let state = store.project().expect("project");
+            assert_eq!(state.focused_workspace.as_deref(), Some("App X"));
+
+            let record = store
+                .events()
+                .expect("ler registros")
+                .into_iter()
+                .find(|record| record.kind == "WorkspaceFocusSet")
+                .expect("registro de foco");
+            assert_eq!(
+                record.payload["focus_id"], "focus-001",
+                "o registro durável expõe a correlação para recuperação"
+            );
+            assert_eq!(
+                DomainEvent::from_record(&record.kind, record.version, record.payload)
+                    .expect("reconstruir evento pelo registro"),
+                focus
+            );
+        }
+
+        let reopened = EventStore::open(tmp.path()).expect("reabrir");
+        assert_eq!(
+            reopened
+                .project()
+                .expect("replay do foco")
+                .focused_workspace
+                .as_deref(),
+            Some("App X")
+        );
+    }
+
+    #[test]
+    fn workspace_focus_set_legacy_json_defaults_missing_focus_id() {
+        let legacy = serde_json::json!({
+            "event": "WorkspaceFocusSet",
+            "workspace": "Legado"
+        });
+        let decoded: DomainEvent =
+            serde_json::from_value(legacy.clone()).expect("desserializar foco legado");
+        assert!(matches!(
+            &decoded,
+            DomainEvent::WorkspaceFocusSet {
+                workspace,
+                focus_id: None,
+            } if workspace == "Legado"
+        ));
+        assert!(
+            serde_json::to_value(&decoded)
+                .expect("serializar foco legado")
+                .get("focus_id")
+                .is_none(),
+            "None preserva o formato anterior sem campo artificial"
+        );
+
+        let tmp = TempDir::new("focus-legacy");
         let mut store = EventStore::open(tmp.path()).expect("open");
         store
+            .insert_raw("WorkspaceFocusSet", 1, legacy)
+            .expect("persistir payload legado");
+        assert_eq!(
+            store
+                .project()
+                .expect("projetar foco legado")
+                .focused_workspace
+                .as_deref(),
+            Some("Legado")
+        );
+    }
+
+    #[test]
+    fn event_at_uses_primary_key_and_preserves_focus_correlation() {
+        let tmp = TempDir::new("event-at");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        let first_seq = store
             .append(&DomainEvent::WorkspaceCreated {
-                name: "App X".into(),
+                name: "Busca pontual".into(),
                 focus_preset: String::new(),
             })
-            .unwrap();
-        store
+            .expect("gravar primeiro evento");
+        let focus_seq = store
             .append(&DomainEvent::WorkspaceFocusSet {
-                workspace: "App X".into(),
+                workspace: "Busca pontual".into(),
+                focus_id: Some("focus-journal-001".into()),
             })
-            .unwrap();
-        let state = store.project().expect("project");
-        assert_eq!(state.focused_workspace.as_deref(), Some("App X"));
+            .expect("gravar foco");
+
+        reset_full_read_probe();
+        assert_eq!(
+            store
+                .event_at(first_seq)
+                .expect("buscar primeiro")
+                .expect("primeiro existe")
+                .kind,
+            "WorkspaceCreated"
+        );
+        let focus = store
+            .event_at(focus_seq)
+            .expect("buscar foco")
+            .expect("foco existe");
+        assert_eq!(focus.seq, focus_seq);
+        assert_eq!(focus.kind, "WorkspaceFocusSet");
+        assert_eq!(focus.payload["focus_id"], "focus-journal-001");
+        assert!(store
+            .event_at(focus_seq + 1)
+            .expect("buscar ausente")
+            .is_none());
+        assert!(
+            store.event_at(u64::MAX).is_err(),
+            "seq fora do intervalo SQLite não pode sofrer conversão truncada"
+        );
+        assert_eq!(
+            full_read_probe().sqlite_history_scans,
+            0,
+            "busca pontual não pode cair no leitor integral"
+        );
+
+        let query_plan: String = store
+            .conn
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {EVENT_BY_SEQ_SQL}"),
+                [i64::try_from(focus_seq).expect("seq cabe no SQLite")],
+                |row| row.get(3),
+            )
+            .expect("explicar query pontual");
+        assert!(
+            query_plan.contains("INTEGER PRIMARY KEY"),
+            "SQLite deve buscar pela PK, plano observado: {query_plan}"
+        );
+    }
+
+    #[test]
+    fn seq_zero_is_never_treated_as_an_empty_store() {
+        let tmp = TempDir::new("seq-zero");
+        {
+            let mut store = EventStore::open(tmp.path()).expect("criar store vazio");
+            let event = DomainEvent::WorkspaceCreated {
+                name: "Inválido".into(),
+                focus_preset: String::new(),
+            };
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events (seq, ts, kind, version, payload) \
+                     VALUES (0, ?1, ?2, ?3, ?4)",
+                    params![
+                        i64::try_from(now_millis()).expect("timestamp cabe no SQLite"),
+                        event.kind(),
+                        i64::from(event.current_version()),
+                        serde_json::to_string(&event).expect("serializar evento")
+                    ],
+                )
+                .expect("injetar seq zero");
+
+            assert!(
+                store.event_count().is_err(),
+                "head zero não representa vazio"
+            );
+            assert!(store.event_at(0).is_err(), "seq zero nunca é consultável");
+            assert!(
+                store
+                    .append(&DomainEvent::NoteCreated {
+                        name: "não-gravar.md".into(),
+                    })
+                    .is_err(),
+                "o escritor não pode alocar seq 1 sobre um log iniciado em zero"
+            );
+        }
+        assert!(
+            EventStore::open(tmp.path()).is_err(),
+            "reabertura deve recusar o banco com única seq zero"
+        );
+    }
+
+    #[test]
+    fn jsonl_marker_zero_is_rejected_instead_of_meaning_empty() {
+        let tmp = TempDir::new("jsonl-marker-zero");
+        let mut store = EventStore::open(tmp.path()).expect("open");
+        store
+            .append(&DomainEvent::NoteCreated {
+                name: "marcador.md".into(),
+            })
+            .expect("append");
+        store
+            .conn
+            .execute("DELETE FROM jsonl_mirror", [])
+            .expect("limpar marcador");
+        store
+            .conn
+            .execute("INSERT INTO jsonl_mirror (seq) VALUES (0)", [])
+            .expect("injetar marcador zero");
+        assert!(
+            jsonl_state_matches(&store.conn, &store.jsonl_path, 1).is_err(),
+            "marcador zero é corrupção, não ausência de confirmação"
+        );
     }
 
     /// W4-5: `WorkspaceCreated` v2 projeta `focus_preset`; um log v1 (sem o campo) passa pelo
@@ -3645,6 +5370,710 @@ mod tests {
         assert_eq!(seq, 1);
     }
 
+    fn append_with_legacy_post_commit_error_contract(
+        store: &mut EventStore,
+        event: &DomainEvent,
+    ) -> Result<u64, StoreError> {
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (_, last_seq) = event_log_position(&tx)?;
+        let seq = last_seq.checked_add(1).ok_or_else(|| {
+            invalid_recovery_data("sequência do controle legado excedeu u64".into())
+        })?;
+        let next_seq = seq.checked_add(1).ok_or_else(|| {
+            invalid_recovery_data("próxima sequência do controle legado excedeu u64".into())
+        })?;
+        let record = EventRecord {
+            seq,
+            ts: now_millis(),
+            kind: event.kind().to_owned(),
+            version: event.current_version(),
+            payload: serde_json::to_value(event)?,
+        };
+        tx.execute(
+            "INSERT INTO events (seq, ts, kind, version, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                i64::try_from(record.seq).map_err(|_| {
+                    invalid_recovery_data("sequência do controle legado excedeu i64".into())
+                })?,
+                i64::try_from(record.ts).map_err(|_| {
+                    invalid_recovery_data("timestamp do controle legado excedeu i64".into())
+                })?,
+                &record.kind,
+                i64::from(record.version),
+                serde_json::to_string(&record.payload)?
+            ],
+        )?;
+        tx.commit()?;
+        store.next_seq = next_seq;
+
+        // Este `?` é deliberadamente o contrato defeituoso anterior: comunica falha
+        // ao chamador mesmo depois de o fato semântico já estar durável no SQLite.
+        store.mirror_committed_records(std::slice::from_ref(&record))?;
+        Ok(seq)
+    }
+
+    fn eventstore_post_commit_mirror_failure_child(dir: &Path) -> ! {
+        let mut store = EventStore::open(dir).expect("abrir store no processo filho");
+        let jsonl = dir.join(JSONL_FILE);
+        std::fs::create_dir(&jsonl).expect("injetar falha real no caminho do espelho");
+
+        let committed = store.append(&DomainEvent::WorkspaceCreated {
+            name: "TomikOS".into(),
+            focus_preset: "developer".into(),
+        });
+
+        let committed_seq =
+            committed.expect("o contrato atual deve reportar Committed/Ok após o commit SQLite");
+        assert_eq!(committed_seq, 1);
+        assert_eq!(store.event_count().expect("contar SQLite no filho"), 1);
+        assert_eq!(store.events().expect("ler evento no filho").len(), 1);
+        assert!(jsonl.is_dir(), "a falha do espelho precisa ser efetiva");
+        let mirrored: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM jsonl_mirror", [], |row| row.get(0))
+            .expect("contar confirmações no filho");
+        assert_eq!(mirrored, 0, "nenhum espelho foi confirmado antes do corte");
+        let state = read_recovery_state(&dir.join(JSONL_RECOVERY_STATE_FILE))
+            .expect("ler certificado pending no filho")
+            .expect("certificado pending existe");
+        assert!(matches!(
+            state.status,
+            JsonlRecoveryStatus::Pending {
+                target_event_count: 1,
+                target_last_seq: 1
+            }
+        ));
+        std::process::exit(0);
+    }
+
+    /// Regressão de confiabilidade: uma falha do espelho acontece DEPOIS do commit SQLite e,
+    /// portanto, jamais pode induzir o chamador a repetir a operação semântica. O escritor roda
+    /// em um processo filho que termina com o espelho indisponível; uma conexão nova no processo
+    /// pai reconcilia exatamente o único evento a partir da autoridade SQLite.
+    #[test]
+    #[serial]
+    fn workspace_reliability_eventstore_never_reports_uncommitted_after_db_commit() {
+        const CHILD_DIR_ENV: &str = "LINA_EVENTSTORE_POST_COMMIT_CHILD_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR_ENV) {
+            eventstore_post_commit_mirror_failure_child(Path::new(&dir));
+        }
+
+        let legacy = TempDir::new("legacy-post-commit-error");
+        let legacy_jsonl = legacy.path().join(JSONL_FILE);
+        let mut legacy_store = EventStore::open(legacy.path()).expect("abrir controle legado");
+        std::fs::create_dir(&legacy_jsonl).expect("injetar falha no controle legado");
+        let legacy_error = append_with_legacy_post_commit_error_contract(
+            &mut legacy_store,
+            &DomainEvent::WorkspaceCreated {
+                name: "TomikOS legado".into(),
+                focus_preset: "developer".into(),
+            },
+        )
+        .expect_err("o contrato legado deve expor Err depois da falha do espelho");
+        assert!(
+            matches!(&legacy_error, StoreError::Io(_)),
+            "o controle legado precisa falhar no I/O real do espelho: {legacy_error}"
+        );
+        assert_eq!(
+            legacy_store
+                .event_count()
+                .expect("contar commit legado apesar do Err"),
+            1,
+            "controle não-vácuo: o Err legado esconderia do caller um commit real"
+        );
+        assert_eq!(legacy_store.events().expect("ler commit legado").len(), 1);
+        assert!(legacy_jsonl.is_dir(), "o erro legado veio do espelho real");
+        let legacy_mirrored: i64 = legacy_store
+            .conn
+            .query_row("SELECT COUNT(*) FROM jsonl_mirror", [], |row| row.get(0))
+            .expect("contar confirmações do controle legado");
+        assert_eq!(legacy_mirrored, 0);
+        let legacy_state = read_recovery_state(&legacy.path().join(JSONL_RECOVERY_STATE_FILE))
+            .expect("ler pending do controle legado")
+            .expect("pending legado existe");
+        assert!(matches!(
+            legacy_state.status,
+            JsonlRecoveryStatus::Pending {
+                target_event_count: 1,
+                target_last_seq: 1
+            }
+        ));
+        drop(legacy_store);
+
+        let tmp = TempDir::new("mirror-after-commit-process");
+        let jsonl = tmp.path().join(JSONL_FILE);
+        let child_status = std::process::Command::new(
+            std::env::current_exe().expect("localizar binário do teste"),
+        )
+        .args([
+            "--exact",
+            "events::tests::workspace_reliability_eventstore_never_reports_uncommitted_after_db_commit",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(CHILD_DIR_ENV, tmp.path())
+        .status()
+        .expect("executar processo filho no corte pós-commit");
+        assert!(
+            child_status.success(),
+            "processo filho falhou: {child_status}"
+        );
+        assert!(
+            jsonl.is_dir(),
+            "o processo terminou deixando o espelho realmente indisponível"
+        );
+
+        std::fs::remove_dir(&jsonl).expect("restaurar caminho do espelho no processo pai");
+        let reopened = EventStore::open(tmp.path()).expect("reabrir e reconciliar no processo pai");
+        assert_eq!(reopened.event_count().expect("contar após reabrir"), 1);
+        let records = reopened.events().expect("ler SQLite reconciliado");
+        assert_eq!(records.len(), 1, "o caller não repetiu o evento semântico");
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[0].kind, "WorkspaceCreated");
+        assert_eq!(records[0].payload["name"], "TomikOS");
+        let mirrored_after_reopen: i64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM jsonl_mirror", [], |row| row.get(0))
+            .expect("contar confirmações reconciliadas");
+        assert_eq!(mirrored_after_reopen, 1);
+        let first_reconciliation = read_jsonl_records(&jsonl);
+        assert_eq!(
+            first_reconciliation.len(),
+            1,
+            "evento ausente foi reconciliado"
+        );
+        assert_eq!(first_reconciliation, records);
+        let mirror_bytes = std::fs::read(&jsonl).expect("ler bytes do espelho reconciliado");
+        let mut mirror_hasher = Sha256::new();
+        mirror_hasher.update(&mirror_bytes);
+        let recovery_state = read_recovery_state(&tmp.path().join(JSONL_RECOVERY_STATE_FILE))
+            .expect("ler certificado completo")
+            .expect("certificado completo existe");
+        assert_eq!(recovery_state.version, JSONL_RECOVERY_STATE_VERSION);
+        assert!(matches!(
+            recovery_state.status,
+            JsonlRecoveryStatus::Complete {
+                event_count: 1,
+                last_seq: 1,
+                ref digest_sha256,
+            } if digest_sha256 == &sha256_hex(&mirror_hasher)
+        ));
+        drop(reopened);
+
+        let healthy_reopen = EventStore::open(tmp.path()).expect("reabrir idempotente");
+        assert_eq!(
+            healthy_reopen.conn.total_changes(),
+            0,
+            "espelho saudável usa o fast path sem regravar confirmações"
+        );
+        drop(healthy_reopen);
+        let second_reconciliation = read_jsonl_records(&jsonl);
+        assert_eq!(
+            second_reconciliation.len(),
+            1,
+            "reconciliar novamente não pode duplicar o evento"
+        );
+        assert_eq!(second_reconciliation[0].seq, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_eventstore_repairs_truncated_corrupt_and_duplicate_mirror() {
+        let tmp = TempDir::new("mirror-canonical-repair");
+        let expected = {
+            let mut store = EventStore::open(tmp.path()).expect("store");
+            for index in 0..3 {
+                store
+                    .insert_raw("MirrorRepair", 1, serde_json::json!({ "index": index }))
+                    .expect("append");
+            }
+            store.events().expect("eventos SQLite")
+        };
+        let jsonl = tmp.path().join(JSONL_FILE);
+
+        let original_len = std::fs::metadata(&jsonl).expect("metadata").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&jsonl)
+            .expect("abrir para truncar")
+            .set_len(original_len / 2)
+            .expect("truncar");
+        drop(EventStore::open(tmp.path()).expect("reparar truncamento"));
+        assert_eq!(read_jsonl_records(&jsonl), expected);
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        corrupt_middle(&jsonl);
+        drop(EventStore::open(tmp.path()).expect("reparar corrupção in-place"));
+        assert_eq!(read_jsonl_records(&jsonl), expected);
+
+        let duplicate = serde_json::to_string(&expected[0]).expect("serializar duplicata");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl)
+            .expect("abrir para duplicar");
+        writeln!(file, "{duplicate}").expect("duplicar linha");
+        file.sync_data().expect("sincronizar duplicata");
+        drop(file);
+        drop(EventStore::open(tmp.path()).expect("deduplicar canonicamente"));
+        assert_eq!(read_jsonl_records(&jsonl), expected);
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_zero_sqlite_recovers_only_from_certified_jsonl() {
+        let tmp = TempDir::new("zero-db-certified-recovery");
+        let workspace_id = Uuid::now_v7().to_string();
+        let expected = {
+            let mut store = EventStore::open(tmp.path()).expect("store");
+            store
+                .append_batch(&[
+                    DomainEvent::WorkspaceCreated {
+                        name: "Certificado".into(),
+                        focus_preset: "blank".into(),
+                    },
+                    DomainEvent::WorkspaceIdAssigned {
+                        workspace_id: workspace_id.clone(),
+                    },
+                ])
+                .expect("batch inicial");
+            store.events().expect("eventos")
+        };
+        let jsonl = tmp.path().join(JSONL_FILE);
+        let mirror_before = std::fs::read(&jsonl).expect("espelho certificado");
+        remove_sqlite_store_files(tmp.path());
+        let zero_db = tmp.path().join("lina.db");
+        std::fs::File::create(&zero_db)
+            .and_then(|file| file.sync_all())
+            .expect("criar SQLite zero bytes");
+
+        assert!(
+            db_is_corrupt(&zero_db),
+            "DB existente sem schema é corrupto"
+        );
+        assert!(
+            EventStore::open(tmp.path()).is_err(),
+            "open comum não pode inicializar silenciosamente um DB já existente"
+        );
+        assert_eq!(
+            std::fs::read(&jsonl).expect("JSONL após open recusado"),
+            mirror_before,
+            "o JSONL válido nunca é canonizado contra o DB vazio"
+        );
+
+        let mut ui = RecordingUi::default();
+        let recovered = EventStore::open_or_recover(tmp.path(), &mut ui)
+            .expect("recuperar DB zero pelo JSONL certificado");
+        assert_eq!(recovered.events().expect("eventos recuperados"), expected);
+        let projected = recovered.project().expect("projeção recuperada");
+        assert_eq!(projected.workspace_name.as_deref(), Some("Certificado"));
+        assert_eq!(
+            projected.workspace_id.as_deref(),
+            Some(workspace_id.as_str())
+        );
+        drop(recovered);
+        assert_eq!(
+            std::fs::read(&jsonl).expect("espelho após recovery"),
+            mirror_before,
+            "recovery não reescreve a única cópia íntegra"
+        );
+        assert!(matches!(
+            ui.events.as_slice(),
+            [HostEvent::Recovering, HostEvent::Recovered]
+        ));
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .expect("listar artefatos")
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "o DB zero original foi preservado"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_pending_certificate_rejects_committed_prefix() {
+        let tmp = TempDir::new("pending-prefix");
+        let mut store = EventStore::open(tmp.path()).expect("store");
+        store
+            .append(&DomainEvent::WorkspaceCreated {
+                name: "Prefixo".into(),
+                focus_preset: "blank".into(),
+            })
+            .expect("primeiro evento");
+        let jsonl = tmp.path().join(JSONL_FILE);
+        let saved_prefix = tmp.path().join("saved-prefix.jsonl");
+        std::fs::rename(&jsonl, &saved_prefix).expect("isolar prefixo");
+        std::fs::create_dir(&jsonl).expect("injetar falha no caminho do espelho");
+
+        let second_seq = store
+            .append(&DomainEvent::WorkspaceIdAssigned {
+                workspace_id: Uuid::now_v7().to_string(),
+            })
+            .expect("commit SQLite não vira falso erro após falha do espelho");
+        assert_eq!(second_seq, 2);
+        assert_eq!(store.event_count().expect("contagem SQLite"), 2);
+        let state = read_recovery_state(&tmp.path().join(JSONL_RECOVERY_STATE_FILE))
+            .expect("ler certificado")
+            .expect("certificado existente");
+        assert!(matches!(
+            state.status,
+            JsonlRecoveryStatus::Pending {
+                target_event_count: 2,
+                target_last_seq: 2
+            }
+        ));
+        drop(store);
+
+        std::fs::remove_dir(&jsonl).expect("remover falha injetada");
+        std::fs::rename(&saved_prefix, &jsonl).expect("restaurar apenas prefixo seq=1");
+        let prefix_before = std::fs::read(&jsonl).expect("prefixo");
+        remove_sqlite_store_files(tmp.path());
+        let mut ui = RecordingUi::default();
+        assert!(
+            EventStore::open_or_recover(tmp.path(), &mut ui).is_err(),
+            "pending precisa recusar o prefixo mesmo que cada linha seja válida"
+        );
+        assert!(
+            !tmp.path().join("lina.db").exists(),
+            "prefixo incompleto não publica DB parcial"
+        );
+        assert_eq!(
+            std::fs::read(&jsonl).expect("prefixo preservado"),
+            prefix_before
+        );
+        assert!(ui.events.is_empty(), "recusa não anuncia recuperação");
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_semantically_invalid_jsonl_never_publishes_db() {
+        let tmp = TempDir::new("semantic-invalid-recovery");
+        let jsonl = tmp.path().join(JSONL_FILE);
+        {
+            let mut store = EventStore::open(tmp.path()).expect("store");
+            store
+                .insert_raw(
+                    "WorkspaceCreated",
+                    1,
+                    serde_json::to_value(DomainEvent::WorkspaceIdAssigned {
+                        workspace_id: Uuid::now_v7().to_string(),
+                    })
+                    .expect("payload"),
+                )
+                .expect("registro estruturalmente persistível");
+            let state = read_recovery_state(&tmp.path().join(JSONL_RECOVERY_STATE_FILE))
+                .expect("ler certificado")
+                .expect("certificado existente");
+            assert!(matches!(
+                state.status,
+                JsonlRecoveryStatus::Complete {
+                    event_count: 1,
+                    last_seq: 1,
+                    ..
+                }
+            ));
+        }
+        let mirror_before = std::fs::read(&jsonl).expect("espelho semanticamente inválido");
+        remove_sqlite_store_files(tmp.path());
+
+        let mut ui = RecordingUi::default();
+        assert!(
+            EventStore::open_or_recover(tmp.path(), &mut ui).is_err(),
+            "kind persistido divergente do DomainEvent precisa abortar recovery"
+        );
+        assert!(!tmp.path().join("lina.db").exists());
+        assert_eq!(
+            std::fs::read(&jsonl).expect("espelho preservado"),
+            mirror_before
+        );
+        assert!(ui.events.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_append_batch_rolls_back_every_event_before_commit() {
+        let tmp = TempDir::new("batch-rollback");
+        let mut store = EventStore::open(tmp.path()).expect("store");
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_workspace_id \
+                 BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'WorkspaceIdAssigned' \
+                 BEGIN SELECT RAISE(ABORT, 'falha precommit injetada'); END;",
+            )
+            .expect("trigger de falha");
+        let events = [
+            DomainEvent::WorkspaceCreated {
+                name: "Nunca parcial".into(),
+                focus_preset: "blank".into(),
+            },
+            DomainEvent::WorkspaceIdAssigned {
+                workspace_id: Uuid::now_v7().to_string(),
+            },
+        ];
+
+        assert!(store.append_batch(&events).is_err());
+        assert_eq!(store.event_count().expect("contagem"), 0);
+        assert!(store.events().expect("eventos").is_empty());
+        assert_eq!(
+            store.append_batch(&[]).expect("batch vazio"),
+            0,
+            "batch vazio devolve a contagem confirmada atual"
+        );
+        assert!(
+            !tmp.path().join(JSONL_FILE).exists(),
+            "falha precommit não expõe subconjunto no JSONL"
+        );
+        let state = read_recovery_state(&tmp.path().join(JSONL_RECOVERY_STATE_FILE))
+            .expect("ler pending")
+            .expect("pending existe");
+        assert!(matches!(
+            state.status,
+            JsonlRecoveryStatus::Pending {
+                target_event_count: 2,
+                target_last_seq: 2
+            }
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_append_batch_commits_orders_and_certifies_once() {
+        let tmp = TempDir::new("batch-success");
+        let workspace_id = Uuid::now_v7().to_string();
+        let events = [
+            DomainEvent::WorkspaceCreated {
+                name: "Batch íntegro".into(),
+                focus_preset: "developer".into(),
+            },
+            DomainEvent::WorkspaceIdAssigned {
+                workspace_id: workspace_id.clone(),
+            },
+        ];
+        let mut store = EventStore::open(tmp.path()).expect("store");
+        assert_eq!(
+            store.append_batch(&events).expect("batch atômico"),
+            2,
+            "retorno é a contagem SQLite confirmada"
+        );
+        assert_eq!(store.append_batch(&[]).expect("batch vazio"), 2);
+        let expected_records = store.events().expect("eventos");
+        assert_eq!(
+            expected_records
+                .iter()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for (record, expected_event) in expected_records.iter().zip(&events) {
+            assert_eq!(
+                DomainEvent::from_record(&record.kind, record.version, record.payload.clone())
+                    .expect("roundtrip"),
+                *expected_event
+            );
+        }
+        let projected = store.project().expect("projetar batch");
+        assert_eq!(projected.workspace_name.as_deref(), Some("Batch íntegro"));
+        assert_eq!(
+            projected.workspace_id.as_deref(),
+            Some(workspace_id.as_str())
+        );
+        let jsonl = tmp.path().join(JSONL_FILE);
+        assert_eq!(read_jsonl_records(&jsonl), expected_records);
+        let state = read_recovery_state(&tmp.path().join(JSONL_RECOVERY_STATE_FILE))
+            .expect("ler complete")
+            .expect("complete existe");
+        assert!(matches!(
+            state.status,
+            JsonlRecoveryStatus::Complete {
+                event_count: 2,
+                last_seq: 2,
+                ..
+            }
+        ));
+        drop(store);
+
+        remove_sqlite_store_files(tmp.path());
+        let mut ui = RecordingUi::default();
+        let recovered = EventStore::open_or_recover(tmp.path(), &mut ui)
+            .expect("certificado do batch recupera o DB inteiro");
+        assert_eq!(
+            recovered.events().expect("eventos recuperados"),
+            expected_records
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_missing_or_incompatible_certificate_refuses_recovery() {
+        let tmp = TempDir::new("certificate-required");
+        {
+            let mut store = EventStore::open(tmp.path()).expect("store");
+            store
+                .append(&DomainEvent::WorkspaceCreated {
+                    name: "Sem certificado".into(),
+                    focus_preset: "blank".into(),
+                })
+                .expect("evento");
+        }
+        let state_path = tmp.path().join(JSONL_RECOVERY_STATE_FILE);
+        let mut state = read_recovery_state(&state_path)
+            .expect("ler certificado")
+            .expect("certificado");
+        std::fs::remove_file(&state_path).expect("remover certificado");
+        remove_sqlite_store_files(tmp.path());
+        let mut ui = RecordingUi::default();
+        assert!(EventStore::open_or_recover(tmp.path(), &mut ui).is_err());
+        assert!(!tmp.path().join("lina.db").exists());
+
+        state.version = JSONL_RECOVERY_STATE_VERSION + 1;
+        write_recovery_state_atomic(&state_path, &state).expect("certificado incompatível");
+        assert!(EventStore::open_or_recover(tmp.path(), &mut ui).is_err());
+        assert!(!tmp.path().join("lina.db").exists());
+        assert!(ui.events.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_missing_db_rebuilds_from_unique_jsonl() {
+        let tmp = TempDir::new("missing-db-recovery");
+        let expected = {
+            let mut store = EventStore::open(tmp.path()).expect("store");
+            store
+                .append(&DomainEvent::WorkspaceCreated {
+                    name: "Recuperável".into(),
+                    focus_preset: "blank".into(),
+                })
+                .expect("workspace");
+            store
+                .append(&DomainEvent::WorkspaceIdAssigned {
+                    workspace_id: Uuid::now_v7().to_string(),
+                })
+                .expect("id");
+            store.events().expect("eventos")
+        };
+        let jsonl = tmp.path().join(JSONL_FILE);
+        remove_sqlite_store_files(tmp.path());
+
+        let mirror_before = std::fs::read(&jsonl).expect("espelho antes");
+        let injected = EventStore::rebuild_database_atomic(tmp.path(), &expected, |inserted| {
+            if inserted == 1 {
+                Err(invalid_recovery_data(
+                    "falha injetada no meio do rebuild".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(injected.is_err(), "controle negativo interrompe o rebuild");
+        assert!(
+            !tmp.path().join("lina.db").exists(),
+            "falha intermediária não publica DB parcial"
+        );
+        assert_eq!(
+            std::fs::read(&jsonl).expect("espelho após corte"),
+            mirror_before,
+            "a única cópia recuperável fica byte-idêntica"
+        );
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .expect("listar staging")
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".lina-db-recovery-")),
+            "staging falho foi removido"
+        );
+        assert!(
+            EventStore::open(tmp.path()).is_err(),
+            "abertura sem recovery não pode tratar JSONL existente como store novo"
+        );
+        assert_eq!(
+            std::fs::read(&jsonl).expect("espelho preservado"),
+            mirror_before,
+            "open comum nunca apaga a única cópia recuperável"
+        );
+
+        let mut ui = RecordingUi::default();
+        let recovered =
+            EventStore::open_or_recover(tmp.path(), &mut ui).expect("reconstruir DB ausente");
+        assert_eq!(recovered.events().expect("eventos recuperados"), expected);
+        assert!(matches!(
+            ui.events.as_slice(),
+            [HostEvent::Recovering, HostEvent::Recovered]
+        ));
+        drop(recovered);
+        assert_eq!(
+            read_jsonl_records(&jsonl),
+            expected,
+            "a recuperação preserva o espelho certificado"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_reliability_ambiguous_or_absent_mirror_never_claims_recovery() {
+        let conflicting = TempDir::new("conflicting-recovery");
+        let jsonl = conflicting.path().join(JSONL_FILE);
+        let original = {
+            let mut store = EventStore::open(conflicting.path()).expect("store");
+            store
+                .insert_raw("Original", 1, serde_json::json!({ "value": 1 }))
+                .expect("evento");
+            store.events().expect("eventos")[0].clone()
+        };
+        let mut forged = original.clone();
+        forged.payload = serde_json::json!({ "value": "divergente" });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&jsonl)
+            .expect("jsonl");
+        writeln!(file, "{}", serde_json::to_string(&forged).expect("forjado")).expect("conflito");
+        file.sync_data().expect("sync");
+        drop(file);
+        remove_sqlite_store_files(conflicting.path());
+        let mut ui = RecordingUi::default();
+        assert!(EventStore::open_or_recover(conflicting.path(), &mut ui).is_err());
+        assert!(ui.events.is_empty(), "conflito não pode anunciar Recovered");
+
+        let absent = TempDir::new("absent-recovery");
+        let db = absent.path().join("lina.db");
+        std::fs::write(&db, b"banco corrompido sem espelho").expect("corromper DB");
+        let mut ui = RecordingUi::default();
+        assert!(EventStore::open_or_recover(absent.path(), &mut ui).is_err());
+        assert!(db.exists(), "sem espelho, o banco original fica intocado");
+        assert!(
+            ui.events.is_empty(),
+            "sem fonte não existe falsa recuperação"
+        );
+    }
+
+    fn remove_sqlite_store_files(dir: &Path) {
+        for name in ["lina.db", "lina.db-wal", "lina.db-shm"] {
+            match std::fs::remove_file(dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remover {name}: {error}"),
+            }
+        }
+    }
+
+    fn read_jsonl_records(path: &Path) -> Vec<EventRecord> {
+        let file = std::fs::File::open(path).expect("abrir log.jsonl");
+        std::io::BufReader::new(file)
+            .lines()
+            .filter_map(|line| {
+                let line = line.expect("ler linha do log.jsonl");
+                (!line.trim().is_empty()).then_some(line)
+            })
+            .map(|line| serde_json::from_str(&line).expect("desserializar evento do log.jsonl"))
+            .collect()
+    }
+
     /// Sobrescreve um trecho contíguo no MEIO do arquivo com lixo (0xEE).
     fn corrupt_middle(path: &Path) {
         use std::io::{Seek, SeekFrom, Write};
@@ -3708,7 +6137,7 @@ mod tests {
             "nenhum evento pode sumir sob escrita concorrente (FURO A: colisão de seq perderia o 2º)"
         );
 
-        // (b) seqs ÚNICOS e CONTÍGUOS — sem buraco nem duplicata (PK retry-on-colisão).
+        // (b) seqs ÚNICOS e CONTÍGUOS — sem buraco nem duplicata (alocação sob BEGIN IMMEDIATE).
         let db_seqs: Vec<u64> = store.events().unwrap().into_iter().map(|r| r.seq).collect();
         assert_eq!(
             db_seqs, expected_seqs,

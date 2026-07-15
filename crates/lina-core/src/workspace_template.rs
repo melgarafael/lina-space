@@ -17,9 +17,8 @@
 //! Doutrinas-como-hooks (F3-5-9) **não têm evento próprio**: são ativadas pelo `focus_preset` do
 //! Espaço (`briefing.rs::focus_builds_software` casa `dev_app`) e não existe evento pós-`create`
 //! que mude o foco. Logo a única forma fiel de "semear a doutrina certa" é o template **carregar o
-//! `focus_preset`**, gravado por [`Workspace::create`] (que NÃO tocamos — apenas o invocamos com o
-//! foco do template). [`create_workspace_from_template`] materializa o "encadeie DEPOIS do create"
-//! do despacho: `create(foco do template)` → [`instanciar`].
+//! `focus_preset`**, gravado pela criação atômica. [`create_workspace_from_template`]
+//! persiste criação e seed em um único batch antes de publicar o store.
 //!
 //! ## Invariantes honrados
 //! - **Template é DADO, JAMAIS autoridade (regra-mãe da onda).** `requested_by` dos spawns semeados
@@ -36,7 +35,7 @@
 //! - **Compat total:** sem template → [`Workspace::create`] segue inalterado (nenhum dos eventos
 //!   acima é emitido).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::events::{AcceptanceCriterion, CheckKind, DomainEvent, Effort, EventStore, StoreError};
 use crate::workspace::{Workspace, WorkspaceError};
@@ -206,16 +205,13 @@ pub fn instanciar(
     requested_by: NodeId,
 ) -> Result<usize, StoreError> {
     let events = seed_events(template, requested_by);
-    for ev in &events {
-        store.append(ev)?;
-    }
+    store.append_batch(&events)?;
     Ok(events.len())
 }
 
-/// Cria um Espaço A PARTIR de um template: `create(name, foco do template)` → [`instanciar`]. É o
-/// "instanciar um template" COMPLETO do gate (f) — o `create` grava o `focus_preset` (que liga as
-/// doutrinas-como-hooks), e o seed encadeia roster + params + pistas + backlog DEPOIS. Não toca
-/// `Workspace::create` (apenas o invoca com o foco do template).
+/// Cria um Espaço A PARTIR de um template. `WorkspaceCreated`, seed, identidade e
+/// Diretório de Trabalho formam um único batch no staging; a raiz só se torna
+/// catalogável depois que a projeção completa foi conferida.
 ///
 /// # Errors
 /// Falha ao criar o Espaço (já existe / I/O) ou ao semear os eventos.
@@ -225,9 +221,34 @@ pub fn create_workspace_from_template(
     requested_by: NodeId,
     default_cwd: Option<&Path>,
 ) -> Result<Workspace, WorkspaceError> {
-    let mut ws = Workspace::create(root, &template.name, &template.focus_preset, default_cwd)?;
-    instanciar(template, ws.store_mut(), requested_by)?;
-    Ok(ws)
+    create_workspace_from_template_with_persist(
+        root.as_ref().to_path_buf(),
+        template,
+        requested_by,
+        default_cwd,
+        |store, events| {
+            store.append_batch(events)?;
+            Ok(())
+        },
+    )
+}
+
+fn create_workspace_from_template_with_persist(
+    root: PathBuf,
+    template: &WorkspaceTemplate,
+    requested_by: NodeId,
+    default_cwd: Option<&Path>,
+    persist: impl FnMut(&mut EventStore, &[DomainEvent]) -> Result<(), WorkspaceError>,
+) -> Result<Workspace, WorkspaceError> {
+    let seed = seed_events(template, requested_by);
+    Workspace::create_seeded_with_persist(
+        root,
+        &template.name,
+        &template.focus_preset,
+        default_cwd,
+        &seed,
+        persist,
+    )
 }
 
 // ───────────────────────────── catálogo de gabaritos embutidos ─────────────────────────────
@@ -627,6 +648,21 @@ mod tests {
         let events = ws.store_mut().events().expect("ler log");
         assert_eq!(count_kind(&events, "SpawnRequested"), 4);
         assert_eq!(count_kind(&events, "WorkspaceCreated"), 1);
+        assert_eq!(
+            events.len(),
+            seed_events(&saas, caller()).len() + 2,
+            "create + seed + identidade foram publicados juntos"
+        );
+        assert_eq!(
+            events.first().map(|event| event.kind.as_str()),
+            Some("WorkspaceCreated")
+        );
+        assert_eq!(
+            events
+                .get(seed_events(&saas, caller()).len() + 1)
+                .map(|event| event.kind.as_str()),
+            Some("WorkspaceIdAssigned")
+        );
 
         let tmp_mkt = TempDir::new("create-mkt");
         let mkt = template_marketing();
@@ -637,6 +673,56 @@ mod tests {
             !focus_builds_software(proj2.focus_preset.as_deref().unwrap_or("")),
             "marketing não é dev de software → sem doutrinas-como-hooks"
         );
+    }
+
+    #[test]
+    fn workspace_reliability_template_batch_failure_leaves_no_catalogable_root() {
+        let base = TempDir::new("atomic-template-failure");
+        let template = template_saas();
+
+        for fail_after_batch in [false, true] {
+            let root = base.path().join(if fail_after_batch {
+                "falha-depois-do-batch"
+            } else {
+                "falha-antes-do-batch"
+            });
+            let result = create_workspace_from_template_with_persist(
+                root.clone(),
+                &template,
+                caller(),
+                None,
+                |store, events| {
+                    if fail_after_batch {
+                        store.append_batch(events)?;
+                    }
+                    Err(WorkspaceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "falha de batch injetada",
+                    )))
+                },
+            );
+
+            assert!(result.is_err(), "o seam precisa abortar a criação");
+            assert!(
+                !Workspace::events_dir(&root).exists(),
+                "nenhum estado do batch ocupa o caminho publicado"
+            );
+            assert!(matches!(
+                crate::workspace::WorkspaceRegistry::rederive_entry(&root),
+                Err(WorkspaceError::NotAWorkspace { .. })
+            ));
+            let hidden_stagings = std::fs::read_dir(root.join(".lina"))
+                .expect("diretório interno existe")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".events-create-")
+                })
+                .count();
+            assert_eq!(hidden_stagings, 0, "staging abortado foi removido");
+        }
     }
 
     /// Critério (f): SEM template → `Workspace::create` segue INALTERADO (nenhum evento de seed).
